@@ -81,6 +81,47 @@ fn any_key_in_detail_returns_to_menu() {
 }
 
 #[test]
+fn delete_branch_setting_renders_yes_no_toggle() {
+    let mut s = ready();
+    for _ in 0..5 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::DeleteBranch);
+
+    let dumped = dump(80, 14, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Delete Branch with Worktree"));
+    assert!(dumped.contains("Yes"));
+    assert!(dumped.contains("No"));
+    assert!(dumped.contains("Never deletes current or default branches"));
+}
+
+#[test]
+fn delete_branch_setting_emits_true_when_yes_selected() {
+    let mut s = ready();
+    for _ in 0..5 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::SetDeleteBranchWithWorktree(true));
+}
+
+#[test]
+fn delete_branch_setting_emits_false_when_no_selected() {
+    let mut s = ready();
+    for _ in 0..5 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('n')));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::SetDeleteBranchWithWorktree(false));
+}
+
+#[test]
 fn select_check_updates_emits_action() {
     let mut s = ready();
     // Navigate to last entry "Check for Updates" — 6 downs from the first.

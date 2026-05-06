@@ -1,11 +1,14 @@
-//! Settings screen — read-only view of the current `WorktreeConfig` plus a
+//! Settings screen — mostly read-only view of the global `WorktreeConfig`
+//! plus a writable `Delete Branch with Worktree` toggle and a
 //! "Check for Updates" entry. Mirrors upstream `SettingsMenu` (steps:
-//! `Menu`, six per-field detail views, and `CheckUpdates`).
+//! `Menu`, five read-only field detail views, the toggle view, and
+//! `CheckUpdates`).
 //!
 //! Async work is owned by `App`: when the user picks "Check for updates",
 //! the screen emits `SettingsAction::CheckUpdates`; `App` runs the async
 //! call and feeds the outcome back via `set_update_result`. Likewise the
-//! reset-to-defaults flow is signalled with `SettingsAction::Reset`.
+//! reset-to-defaults flow and delete-branch toggle persistence are signalled
+//! back to `App`.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -20,7 +23,10 @@ use crate::messages::{
     UPDATE_UP_TO_DATE,
 };
 use crate::services::UpdateCheckResult;
-use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
+use crate::tui::widgets::{
+    ConfirmChoice, ConfirmDialog, ConfirmVariant, SelectOption, SelectOutcome, SelectPrompt,
+    Status, StatusIndicator,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsStep {
@@ -39,6 +45,7 @@ pub enum SettingsAction {
     Continue,
     Back,
     CheckUpdates,
+    SetDeleteBranchWithWorktree(bool),
     Reset,
 }
 
@@ -48,6 +55,7 @@ pub struct SettingsScreen {
     config_path: String,
     error: Option<String>,
     select: Option<SelectPrompt<SettingsStep>>,
+    delete_branch_dialog: Option<ConfirmDialog>,
     update_result: Option<UpdateCheckResult>,
     checking_updates: bool,
     pub tick: usize,
@@ -61,6 +69,7 @@ impl SettingsScreen {
             config_path,
             error: None,
             select: None,
+            delete_branch_dialog: None,
             update_result: None,
             checking_updates: false,
             tick: 0,
@@ -100,7 +109,9 @@ impl SettingsScreen {
     pub fn set_config(&mut self, config: WorktreeConfig, config_path: String) {
         self.config = config;
         self.config_path = config_path;
+        self.step = SettingsStep::Menu;
         self.select = Some(self.build_menu());
+        self.delete_branch_dialog = None;
         self.error = None;
     }
 
@@ -158,6 +169,7 @@ impl SettingsScreen {
         }
         match self.step {
             SettingsStep::Menu => self.handle_menu(key),
+            SettingsStep::DeleteBranch => self.handle_delete_branch(key),
             SettingsStep::CheckUpdates => self.handle_check_updates(key),
             _ => match key.code {
                 KeyCode::Esc => {
@@ -183,10 +195,39 @@ impl SettingsScreen {
                 if matches!(value, SettingsStep::CheckUpdates) {
                     return SettingsAction::CheckUpdates;
                 }
+                if matches!(value, SettingsStep::DeleteBranch) {
+                    self.delete_branch_dialog = Some(self.build_delete_branch_dialog());
+                }
                 SettingsAction::Continue
             }
             SelectOutcome::Cancelled => SettingsAction::Back,
             SelectOutcome::Pending => SettingsAction::Continue,
+        }
+    }
+
+    fn handle_delete_branch(&mut self, key: KeyEvent) -> SettingsAction {
+        if self.delete_branch_dialog.is_none() {
+            self.delete_branch_dialog = Some(self.build_delete_branch_dialog());
+        }
+        let dialog = self
+            .delete_branch_dialog
+            .as_mut()
+            .expect("dialog initialized above");
+
+        match key.code {
+            KeyCode::Esc => {
+                self.step = SettingsStep::Menu;
+                self.delete_branch_dialog = None;
+                SettingsAction::Continue
+            }
+            KeyCode::Enter => SettingsAction::SetDeleteBranchWithWorktree(matches!(
+                dialog.selected,
+                ConfirmChoice::Confirm
+            )),
+            _ => {
+                let _ = dialog.handle_key(key);
+                SettingsAction::Continue
+            }
         }
     }
 
@@ -205,6 +246,25 @@ impl SettingsScreen {
                 self.update_result = None;
                 SettingsAction::Continue
             }
+        }
+    }
+
+    /// Inner content height for the panel (excludes the rounded border).
+    pub fn preferred_content_height(&self) -> u16 {
+        if self.error.is_some() {
+            return 6;
+        }
+        match self.step {
+            // Settings menu select prompt: ~7 entries + label + spacer + hint.
+            SettingsStep::Menu => 14,
+            SettingsStep::CheckUpdates => 6,
+            // Detail panes: header + value lines + hint.
+            SettingsStep::CopyPatterns
+            | SettingsStep::IgnorePatterns
+            | SettingsStep::PathTemplate
+            | SettingsStep::PostCmd
+            | SettingsStep::TerminalCmd => 12,
+            SettingsStep::DeleteBranch => 14,
         }
     }
 
@@ -464,63 +524,31 @@ impl SettingsScreen {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
+    fn build_delete_branch_dialog(&self) -> ConfirmDialog {
+        let default_choice = if self.config.delete_branch_with_worktree {
+            ConfirmChoice::Confirm
+        } else {
+            ConfirmChoice::Cancel
+        };
+
+        ConfirmDialog::new(
+            "Delete Branch with Worktree",
+            "Also delete the associated git branch when deleting a worktree?\n\n\
+Safety features:\n\
+  • Never deletes current or default branches\n\
+  • Shows branch status (commits ahead/behind)\n\
+  • Requires explicit confirmation",
+        )
+        .with_variant(ConfirmVariant::Warning)
+        .with_default(default_choice)
+    }
+
     fn render_delete_branch(&self, frame: &mut Frame, area: Rect) {
-        let enabled = self.config.delete_branch_with_worktree;
-        let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                "Delete Branch with Worktree",
-                Style::default()
-                    .fg(colors::INFO)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Also delete the associated git branch when deleting a worktree:",
-                Style::default().fg(colors::MUTED),
-            )),
-            Line::from(Span::styled(
-                if enabled {
-                    "  ✓ Enabled"
-                } else {
-                    "  ✗ Disabled"
-                },
-                Style::default().fg(if enabled {
-                    colors::SUCCESS
-                } else {
-                    colors::MUTED
-                }),
-            )),
-        ];
-        if enabled {
-            lines.push(Line::from(Span::styled(
-                "⚠ This is a more destructive operation. Branches will be permanently deleted.",
-                Style::default().fg(colors::WARNING),
-            )));
+        if let Some(dialog) = &self.delete_branch_dialog {
+            dialog.render(frame, area);
+        } else {
+            self.build_delete_branch_dialog().render(frame, area);
         }
-        lines.extend([
-            Line::from(Span::styled(
-                "Safety features:",
-                Style::default().fg(colors::INFO),
-            )),
-            Line::from(Span::styled(
-                "  • Never deletes current or default branches",
-                Style::default().fg(colors::MUTED),
-            )),
-            Line::from(Span::styled(
-                "  • Shows branch status (commits ahead/behind)",
-                Style::default().fg(colors::MUTED),
-            )),
-            Line::from(Span::styled(
-                "  • Requires explicit confirmation",
-                Style::default().fg(colors::MUTED),
-            )),
-            Line::from(Span::styled(
-                format!("Edit in {}. Press any key to go back.", self.config_path),
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            )),
-        ]);
-        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_check_updates(&self, frame: &mut Frame, area: Rect) {

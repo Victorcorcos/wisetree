@@ -442,6 +442,13 @@ impl App {
                 }
                 kick_off_update_check(tx.clone());
             }
+            SettingsAction::SetDeleteBranchWithWorktree(enabled) => {
+                if let Err(err) = self.save_delete_branch_with_worktree(enabled) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to update configuration: {err}"));
+                    }
+                }
+            }
             SettingsAction::Reset => {
                 if let Err(err) = self.reset_settings_config() {
                     if let Some(settings) = self.settings.as_mut() {
@@ -580,13 +587,18 @@ impl App {
                 kick_off_delete_load(self.git_root.clone(), tx.clone());
             }
             Screen::Settings => {
-                let (config, config_path) = self.current_config_snapshot().unwrap_or_else(|| {
-                    (
-                        WorktreeConfig::default(),
-                        global_config_file().display().to_string(),
-                    )
-                });
-                self.settings = Some(SettingsScreen::new(config, config_path));
+                let settings = match self.global_settings_snapshot() {
+                    Ok((config, config_path)) => SettingsScreen::new(config, config_path),
+                    Err(err) => {
+                        let mut settings = SettingsScreen::new(
+                            WorktreeConfig::default(),
+                            global_config_file().display().to_string(),
+                        );
+                        settings.set_error(err);
+                        settings
+                    }
+                };
+                self.settings = Some(settings);
             }
             Screen::Setup => {
                 self.setup = Some(SetupScreen::new(self.shell_integration_status.as_ref()));
@@ -625,31 +637,74 @@ impl App {
             .map(|service| service.config_service().config())
     }
 
-    fn current_config_snapshot(&self) -> Option<(WorktreeConfig, String)> {
-        self.worktree_service.as_ref().map(|service| {
-            let path = service
-                .config_service()
-                .config_path()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| global_config_file().display().to_string());
-            (service.config_service().config().clone(), path)
-        })
+    fn global_settings_snapshot(&self) -> Result<(WorktreeConfig, String), String> {
+        let mut config_service = ConfigService::new();
+        let config = config_service.load_global().map_err(|e| e.to_string())?;
+        let path = config_service
+            .config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| global_config_file().display().to_string());
+        Ok((config, path))
+    }
+
+    fn active_config_uses_global(&self) -> bool {
+        let global_path = global_config_file();
+        self.worktree_service
+            .as_ref()
+            .and_then(|service| service.config_service().config_path())
+            .map(|path| path == global_path.as_path())
+            .unwrap_or(false)
+    }
+
+    fn save_delete_branch_with_worktree(&mut self, enabled: bool) -> Result<(), String> {
+        let mut config_service = ConfigService::new();
+        let mut config = config_service.load_global().map_err(|e| e.to_string())?;
+        config.delete_branch_with_worktree = enabled;
+        config_service
+            .save(&config, None)
+            .map_err(|e| e.to_string())?;
+
+        if self.active_config_uses_global() {
+            let service = self
+                .worktree_service
+                .as_mut()
+                .ok_or_else(|| "Worktree service not initialized".to_string())?;
+            service
+                .config_service_mut()
+                .load_global()
+                .map_err(|e| e.to_string())?;
+        }
+
+        let path = config_service
+            .config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| global_config_file().display().to_string());
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.set_config(config, path);
+        }
+        Ok(())
     }
 
     fn reset_settings_config(&mut self) -> Result<(), String> {
-        let service = self
-            .worktree_service
-            .as_mut()
-            .ok_or_else(|| "Worktree service not initialized".to_string())?;
-
-        service
-            .config_service_mut()
+        let mut config_service = ConfigService::new();
+        config_service
             .create_global_config()
             .map_err(|e| e.to_string())?;
 
-        let config = service.config_service().config().clone();
-        let path = service
-            .config_service()
+        if self.active_config_uses_global() {
+            let service = self
+                .worktree_service
+                .as_mut()
+                .ok_or_else(|| "Worktree service not initialized".to_string())?;
+            service
+                .config_service_mut()
+                .load_global()
+                .map_err(|e| e.to_string())?;
+        }
+
+        let config = config_service.config().clone();
+        let path = config_service
             .config_path()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| global_config_file().display().to_string());
@@ -796,9 +851,16 @@ fn reset_global_config() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::WorktreeConfig;
     use crate::config::service::ConfigService;
     use crate::git::types::GitWorktree;
     use crossterm::event::{KeyEventKind, KeyEventState};
+    use once_cell::sync::Lazy;
+    use std::fs;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static HOME_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -812,6 +874,19 @@ mod tests {
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
+    }
+
+    fn with_home<F: FnOnce(&TempDir)>(f: F) {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        f(&tmp);
+        if let Some(p) = prev {
+            std::env::set_var("HOME", p);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
     fn ready_app(is_from_wrapper: bool) -> App {
@@ -906,6 +981,59 @@ mod tests {
 
         assert_eq!(app.screen, Screen::Settings);
         assert!(app.settings.is_some());
+    }
+
+    #[test]
+    fn settings_delete_branch_toggle_updates_global_config_file() {
+        with_home(|home| {
+            let mut config_service = ConfigService::new();
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let initial = WorktreeConfig {
+                terminal_command: "code $WORKTREE_PATH".into(),
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+            config_service.save(&initial, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(None);
+            service.config_service_mut().load_global().unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.screen = Screen::Settings;
+            app.worktree_service = Some(service);
+            app.git_root = Some("/tmp/repo".into());
+
+            let tx = app_event_tx();
+            app.enter_screen(Screen::Settings, &tx);
+
+            for _ in 0..5 {
+                app.handle_key(key(KeyCode::Down), &tx);
+            }
+            app.handle_key(key(KeyCode::Enter), &tx);
+            app.handle_key(key(KeyCode::Char('y')), &tx);
+            app.handle_key(key(KeyCode::Enter), &tx);
+
+            let saved: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert!(saved.delete_branch_with_worktree);
+            assert_eq!(saved.terminal_command, "code $WORKTREE_PATH");
+            assert!(
+                app.settings
+                    .as_ref()
+                    .unwrap()
+                    .config()
+                    .delete_branch_with_worktree
+            );
+            assert!(
+                app.worktree_service
+                    .as_ref()
+                    .unwrap()
+                    .config_service()
+                    .config()
+                    .delete_branch_with_worktree
+            );
+        });
     }
 
     #[test]
