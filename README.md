@@ -136,7 +136,7 @@ Install it from the menu (`Setup Shell Integration`) or the wizard:
 wisetree   # then pick "Setup Shell Integration"
 ```
 
-The wizard appends a marked block to `~/.zshrc` or `~/.bashrc`:
+The wizard appends a marked block to `~/.zshrc`, `~/.bash_profile` for macOS bash, or `~/.bashrc` elsewhere:
 
 ```sh
 # Wisetree setup: added on YYYY-MM-DD
@@ -154,9 +154,7 @@ wisetree() {
 # End Wisetree setup
 ```
 
-Re-running the wizard replaces the existing block in place, so you can safely upgrade.
-
-> **macOS bash users**: bash login shells on macOS read `~/.bash_profile` rather than `~/.bashrc`. If the integration doesn't activate in new terminals, add `[ -f ~/.bashrc ] && source ~/.bashrc` to your `~/.bash_profile`. Wisetree writes to `~/.bashrc` for cross-platform consistency.
+Re-running the wizard replaces the existing block in place, so you can safely upgrade. On macOS bash, re-running setup also migrates older Wisetree blocks out of `~/.bashrc` and into `~/.bash_profile`.
 
 ## Configuration
 
