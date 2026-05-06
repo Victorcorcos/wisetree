@@ -88,6 +88,8 @@ pub const UPDATE_INSTALL_CMD: &str = "npm install -g wisetree";
 pub mod colors {
     use ratatui::style::Color;
 
+    /// `#17141d`
+    pub const APP_BG: Color = Color::Rgb(0x17, 0x14, 0x1d);
     /// `#61dafb`
     pub const PRIMARY: Color = Color::Rgb(0x61, 0xda, 0xfb);
     /// `#28a745`
@@ -102,4 +104,28 @@ pub mod colors {
     pub const MUTED: Color = Color::Rgb(0x6c, 0x75, 0x7d);
     /// `#007bff`
     pub const HIGHLIGHT: Color = Color::Rgb(0x00, 0x7b, 0xff);
+
+    // Menu screen theme.
+    /// Dark forest backdrop for the welcome header.
+    pub const HEADER_BG: Color = Color::Rgb(0x1f, 0x2e, 0x1f);
+    /// Sage border around the welcome header.
+    pub const HEADER_BORDER: Color = Color::Rgb(0x6b, 0x8c, 0x4f);
+    /// Bright sage title text inside the welcome header.
+    pub const HEADER_TITLE: Color = Color::Rgb(0xd4, 0xea, 0x9a);
+    /// Muted parchment text used for the cwd line.
+    pub const HEADER_SUBTITLE: Color = Color::Rgb(0xb0, 0xa8, 0x8c);
+    /// Dark teal backdrop for the menu panel.
+    pub const MENU_BG: Color = Color::Rgb(0x14, 0x2a, 0x33);
+    /// Cyan border around the menu panel.
+    pub const MENU_BORDER: Color = Color::Rgb(0x6c, 0xc6, 0xd6);
+    /// Highlighted background on the currently selected menu row.
+    pub const MENU_SELECTION_BG: Color = Color::Rgb(0x18, 0x6e, 0x82);
+    /// Foreground used on the highlighted menu row.
+    pub const MENU_SELECTION_FG: Color = Color::Rgb(0xfb, 0xee, 0xb6);
+    /// Cream-colored body text for menu rows.
+    pub const MENU_TEXT: Color = Color::Rgb(0xe8, 0xe1, 0xc8);
+    /// Dark slate footer backdrop.
+    pub const STATUS_BG: Color = Color::Rgb(0x2b, 0x2d, 0x38);
+    /// Status bar foreground.
+    pub const STATUS_TEXT: Color = Color::Rgb(0xc8, 0xc0, 0xa8);
 }

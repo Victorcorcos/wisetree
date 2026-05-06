@@ -2,8 +2,11 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 use ratatui::Terminal;
 
+use wisetree::messages::colors;
 use wisetree::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use wisetree::tui::widgets::welcome_header::fold_home;
 
@@ -20,16 +23,52 @@ fn dump<F>(width: u16, height: u16, draw: F) -> String
 where
     F: FnOnce(&mut ratatui::Frame),
 {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(draw).unwrap();
-    terminal
-        .backend()
-        .buffer()
+    render(width, height, draw)
         .content
         .iter()
         .map(|c| c.symbol())
         .collect()
+}
+
+fn render<F>(width: u16, height: u16, draw: F) -> Buffer
+where
+    F: FnOnce(&mut ratatui::Frame),
+{
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(draw).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn find_text_start(buffer: &Buffer, text: &str) -> Option<(u16, u16)> {
+    let needle: Vec<String> = text.chars().map(|ch| ch.to_string()).collect();
+    let width = buffer.area.width;
+    let needle_len = needle.len() as u16;
+    if needle_len == 0 || needle_len > width {
+        return None;
+    }
+
+    for y in 0..buffer.area.height {
+        for x in 0..=width - needle_len {
+            if needle.iter().enumerate().all(|(offset, expected)| {
+                buffer[(x + offset as u16, y)].symbol() == expected.as_str()
+            }) {
+                return Some((x, y));
+            }
+        }
+    }
+
+    None
+}
+
+fn assert_text_style(buffer: &Buffer, text: &str, fg: Color, bg: Color) {
+    let (x, y) = find_text_start(buffer, text).unwrap_or_else(|| panic!("{text:?} not found"));
+
+    for (offset, _) in text.chars().enumerate() {
+        let cell = &buffer[(x + offset as u16, y)];
+        assert_eq!(cell.fg, fg, "unexpected fg for {text:?} at offset {offset}");
+        assert_eq!(cell.bg, bg, "unexpected bg for {text:?} at offset {offset}");
+    }
 }
 
 #[test]
@@ -118,6 +157,45 @@ fn menu_render_includes_welcome_header_and_cwd() {
     assert!(dumped.contains("Welcome to"));
     assert!(dumped.contains("Wisetree"));
     assert!(dumped.contains("/tmp/repo"));
+}
+
+#[test]
+fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
+    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None);
+    let buffer = render(80, 20, |f| menu.render(f, f.area()));
+
+    assert_text_style(
+        &buffer,
+        "Welcome to Wisetree",
+        colors::HEADER_TITLE,
+        colors::HEADER_BG,
+    );
+    assert_text_style(&buffer, "/tmp/repo", colors::MENU_TEXT, colors::HEADER_BG);
+    assert_text_style(
+        &buffer,
+        "What would you like to do?",
+        colors::MENU_TEXT,
+        colors::MENU_BG,
+    );
+    assert_text_style(
+        &buffer,
+        "Create new worktree",
+        colors::MENU_SELECTION_FG,
+        colors::MENU_SELECTION_BG,
+    );
+    assert_text_style(
+        &buffer,
+        "List worktrees",
+        colors::MENU_TEXT,
+        colors::MENU_BG,
+    );
+    assert_text_style(&buffer, "Nav", colors::MENU_TEXT, colors::STATUS_BG);
+    assert_text_style(
+        &buffer,
+        "Active Repo:",
+        colors::HEADER_SUBTITLE,
+        colors::STATUS_BG,
+    );
 }
 
 // -- WelcomeHeader fold_home -------------------------------------------------

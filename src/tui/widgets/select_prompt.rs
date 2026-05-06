@@ -4,10 +4,10 @@
 //! and the empty-state message when filters eliminate every option.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
@@ -56,12 +56,25 @@ pub enum SelectOutcome<T> {
     Pending,
 }
 
+/// Visual style applied when rendering the prompt. The default `Plain`
+/// matches the historical look used by every screen except the main menu;
+/// `Boxed` wraps the prompt in a rounded panel with numbered rows and a
+/// full-width selection bar to match the menu mock-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectStyle {
+    #[default]
+    Plain,
+    Boxed,
+}
+
 pub struct SelectPrompt<T: Clone> {
     pub label: String,
     pub options: Vec<SelectOption<T>>,
     pub selected: usize,
     pub query: String,
     pub searchable: bool,
+    pub style: SelectStyle,
+    pub show_hint: bool,
 }
 
 impl<T: Clone> SelectPrompt<T> {
@@ -72,6 +85,8 @@ impl<T: Clone> SelectPrompt<T> {
             selected: 0,
             query: String::new(),
             searchable: false,
+            style: SelectStyle::Plain,
+            show_hint: true,
         }
     }
 
@@ -84,6 +99,16 @@ impl<T: Clone> SelectPrompt<T> {
         if !self.options.is_empty() {
             self.selected = idx.min(self.options.len() - 1);
         }
+        self
+    }
+
+    pub fn with_style(mut self, style: SelectStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    pub fn without_hint(mut self) -> Self {
+        self.show_hint = false;
         self
     }
 
@@ -211,6 +236,13 @@ impl<T: Clone> SelectPrompt<T> {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        match self.style {
+            SelectStyle::Plain => self.render_plain(frame, area),
+            SelectStyle::Boxed => self.render_boxed(frame, area),
+        }
+    }
+
+    fn render_plain(&self, frame: &mut Frame, area: Rect) {
         let filtered = self.filtered_indices();
         let (start, end) = self.visible_window(filtered.len());
         let has_more_above = start > 0;
@@ -236,7 +268,9 @@ impl<T: Clone> SelectPrompt<T> {
         if has_more_below {
             constraints.push(Constraint::Length(1));
         }
-        constraints.push(Constraint::Length(1)); // hint
+        if self.show_hint {
+            constraints.push(Constraint::Length(1));
+        }
         constraints.push(Constraint::Min(0)); // remainder
 
         let chunks = Layout::default()
@@ -339,18 +373,172 @@ impl<T: Clone> SelectPrompt<T> {
             idx += 1;
         }
 
-        let hint = if self.searchable {
-            "Use ↑↓ arrows to navigate, Enter to select, Esc to clear search/cancel"
+        if self.show_hint {
+            let hint = if self.searchable {
+                "Use ↑↓ arrows to navigate, Enter to select, Esc to clear search/cancel"
+            } else {
+                "Use ↑↓ arrows to navigate, Enter to select, Esc to cancel"
+            };
+            frame.render_widget(
+                Paragraph::new(hint).style(
+                    Style::default()
+                        .fg(colors::MUTED)
+                        .add_modifier(Modifier::DIM),
+                ),
+                chunks[idx],
+            );
+        }
+    }
+
+    fn render_boxed(&self, frame: &mut Frame, area: Rect) {
+        let panel_style = Style::default().bg(colors::MENU_BG);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(colors::MENU_BORDER).bg(colors::MENU_BG))
+            .style(panel_style);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let filtered = self.filtered_indices();
+        let (start, end) = self.visible_window(filtered.len());
+        let has_more_above = start > 0;
+        let has_more_below = end < filtered.len();
+        let visible_rows = if filtered.is_empty() {
+            1
         } else {
-            "Use ↑↓ arrows to navigate, Enter to select, Esc to cancel"
+            (end - start) as u16
         };
-        frame.render_widget(
-            Paragraph::new(hint).style(
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            ),
-            chunks[idx],
-        );
+
+        let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
+        if self.searchable {
+            constraints.push(Constraint::Length(1));
+            constraints.push(Constraint::Length(1));
+        }
+        if has_more_above {
+            constraints.push(Constraint::Length(1));
+        }
+        for _ in 0..visible_rows {
+            constraints.push(Constraint::Length(1));
+        }
+        if has_more_below {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(0));
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .horizontal_margin(2)
+            .constraints(constraints)
+            .split(inner);
+
+        let mut idx = 0;
+        let title = Paragraph::new(Line::from(Span::styled(
+            self.label.clone(),
+            Style::default()
+                .fg(colors::MENU_TEXT)
+                .bg(colors::MENU_BG)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center)
+        .style(panel_style);
+        frame.render_widget(title, chunks[idx]);
+        idx += 1;
+        // blank spacer
+        idx += 1;
+
+        if self.searchable {
+            let line = Line::from(vec![
+                Span::styled(
+                    "Search: ",
+                    Style::default().fg(colors::MUTED).bg(colors::MENU_BG),
+                ),
+                Span::styled(
+                    self.query.clone(),
+                    Style::default()
+                        .fg(colors::MENU_SELECTION_FG)
+                        .bg(colors::MENU_BG),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line).style(panel_style), chunks[idx]);
+            idx += 1;
+            idx += 1;
+        }
+
+        if has_more_above {
+            frame.render_widget(
+                Paragraph::new(format!("↑ {start} more above"))
+                    .style(Style::default().fg(colors::MUTED).bg(colors::MENU_BG)),
+                chunks[idx],
+            );
+            idx += 1;
+        }
+
+        if filtered.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No matching options").style(
+                    Style::default()
+                        .fg(colors::MUTED)
+                        .bg(colors::MENU_BG)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+                chunks[idx],
+            );
+            idx += 1;
+        } else {
+            for (offset, &original_idx) in filtered[start..end].iter().enumerate() {
+                let visible_idx = start + offset;
+                let option = &self.options[original_idx];
+                let is_selected = visible_idx == self.selected;
+                let row_bg = if is_selected {
+                    colors::MENU_SELECTION_BG
+                } else {
+                    colors::MENU_BG
+                };
+                let row_style = if option.disabled {
+                    Style::default()
+                        .fg(colors::MUTED)
+                        .bg(row_bg)
+                        .add_modifier(Modifier::DIM)
+                } else if is_selected {
+                    Style::default()
+                        .fg(colors::MENU_SELECTION_FG)
+                        .bg(row_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else if let Some(c) = option.color {
+                    Style::default().fg(c).bg(row_bg)
+                } else {
+                    Style::default().fg(colors::MENU_TEXT).bg(row_bg)
+                };
+
+                let marker = if is_selected { "🪄✨ " } else { "    " };
+                let mut spans = vec![
+                    Span::styled(marker, Style::default().bg(row_bg)),
+                    Span::styled(format!("{}. ", original_idx + 1), row_style),
+                    Span::styled(option.label.clone(), row_style),
+                ];
+                if let Some(desc) = &option.description {
+                    spans.push(Span::styled(
+                        format!(" ({desc})"),
+                        Style::default()
+                            .fg(colors::MUTED)
+                            .bg(row_bg)
+                            .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                    ));
+                }
+                let row = Paragraph::new(Line::from(spans)).style(Style::default().bg(row_bg));
+                frame.render_widget(row, chunks[idx]);
+                idx += 1;
+            }
+        }
+
+        if has_more_below {
+            let remaining = filtered.len() - end;
+            frame.render_widget(
+                Paragraph::new(format!("↓ {remaining} more below"))
+                    .style(Style::default().fg(colors::MUTED).bg(colors::MENU_BG)),
+                chunks[idx],
+            );
+        }
     }
 }
