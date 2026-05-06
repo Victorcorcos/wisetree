@@ -3,3 +3,11 @@
 
 .claude/
 *.tsbuildinfo
+
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Generated artifacts
+.idea/
+.vscode/

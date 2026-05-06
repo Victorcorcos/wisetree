@@ -1,0 +1,22 @@
+{
+  "name": "wisetree-win32-x64-msvc",
+  "version": "1.2.0",
+  "description": "Prebuilt wisetree binary for Windows x64 (msvc)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/victorcorcos/wisetree.git"
+  },
+  "files": [
+    "bin/"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

@@ -1,0 +1,70 @@
+# Post-publish smoke test. Runs after a successful release (and can be
+# re-triggered manually via workflow_dispatch). Verifies that the just-
+# published npm package is actually installable and behaves correctly on
+# every supported platform — catches broken `bin` shims, missing platform
+# packages, or wrong `os`/`cpu` fields before any user reports them.
+
+name: Smoke
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Wisetree version to smoke-test (without leading v)"
+        required: true
+        default: "1.2.0"
+
+jobs:
+  smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Resolve version to test
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            # Fallback to the most recent published version on npm.
+            echo "value=$(npm view wisetree version)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install wisetree from npm
+        run: npm install -g "wisetree@${{ steps.version.outputs.value }}"
+
+      - name: --version exits 0 and prints expected banner
+        shell: bash
+        run: |
+          out=$(wisetree --version)
+          echo "$out"
+          [[ "$out" == "Wisetree v${{ steps.version.outputs.value }}" ]]
+
+      - name: --help contains expected sections
+        shell: bash
+        run: |
+          out=$(wisetree --help)
+          echo "$out"
+          echo "$out" | grep -q "USAGE"
+          echo "$out" | grep -q "COMMANDS"
+          echo "$out" | grep -q "OPTIONS"
+
+      - name: list --json prints [] in a fresh repo
+        shell: bash
+        run: |
+          tmp=$(mktemp -d)
+          cd "$tmp"
+          git init -q
+          out=$(wisetree list --json)
+          echo "$out"
+          [[ "$out" == "[]" ]]

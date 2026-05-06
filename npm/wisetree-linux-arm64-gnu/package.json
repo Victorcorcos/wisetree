@@ -1,0 +1,22 @@
+{
+  "name": "wisetree-linux-arm64-gnu",
+  "version": "1.2.0",
+  "description": "Prebuilt wisetree binary for Linux arm64 (gnu)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/victorcorcos/wisetree.git"
+  },
+  "files": [
+    "bin/"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
