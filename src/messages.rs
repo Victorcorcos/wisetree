@@ -105,25 +105,33 @@ pub mod colors {
     /// `#007bff`
     pub const HIGHLIGHT: Color = Color::Rgb(0x00, 0x7b, 0xff);
 
-    // Menu screen theme.
+    // Menu screen theme — values eyedroppered from `images/design.png`.
+    // Truecolor terminals (iTerm2, Ghostty, WezTerm, Kitty, modern xterm with
+    // `COLORTERM=truecolor`) display these literal RGBs. Terminals that only
+    // advertise 256 colors will see them collapse onto the gray ramp under
+    // `AdaptiveBackend`'s downgrade — that's an accepted trade-off; we'd
+    // rather match the design accurately on capable terminals than ship
+    // saturated stand-ins that read wrong everywhere.
     /// Dark forest backdrop for the welcome header.
-    pub const HEADER_BG: Color = Color::Rgb(0x1f, 0x2e, 0x1f);
+    pub const HEADER_BG: Color = Color::Rgb(0x1c, 0x30, 0x1c);
     /// Sage border around the welcome header.
     pub const HEADER_BORDER: Color = Color::Rgb(0x6b, 0x8c, 0x4f);
-    /// Bright sage title text inside the welcome header.
-    pub const HEADER_TITLE: Color = Color::Rgb(0xd4, 0xea, 0x9a);
+    /// Soft sage title text inside the welcome header.
+    pub const HEADER_TITLE: Color = Color::Rgb(0xc8, 0xd9, 0x95);
     /// Muted parchment text used for the cwd line.
     pub const HEADER_SUBTITLE: Color = Color::Rgb(0xb0, 0xa8, 0x8c);
-    /// Dark teal backdrop for the menu panel.
-    pub const MENU_BG: Color = Color::Rgb(0x14, 0x2a, 0x33);
+    /// Dark slate-teal backdrop for the menu panel.
+    pub const MENU_BG: Color = Color::Rgb(0x12, 0x2c, 0x38);
     /// Cyan border around the menu panel.
     pub const MENU_BORDER: Color = Color::Rgb(0x6c, 0xc6, 0xd6);
-    /// Highlighted background on the currently selected menu row.
-    pub const MENU_SELECTION_BG: Color = Color::Rgb(0x18, 0x6e, 0x82);
-    /// Foreground used on the highlighted menu row.
-    pub const MENU_SELECTION_FG: Color = Color::Rgb(0xfb, 0xee, 0xb6);
-    /// Cream-colored body text for menu rows.
-    pub const MENU_TEXT: Color = Color::Rgb(0xe8, 0xe1, 0xc8);
+    /// Highlighted background on the currently selected menu row — sits
+    /// distinctly lighter than `MENU_BG`, but stays muted enough to read
+    /// as part of the same teal family rather than a saturated accent.
+    pub const MENU_SELECTION_BG: Color = Color::Rgb(0x1e, 0x55, 0x68);
+    /// Pale-cream foreground used on the highlighted menu row.
+    pub const MENU_SELECTION_FG: Color = Color::Rgb(0xf0, 0xe5, 0xb0);
+    /// Warm parchment body text for menu rows.
+    pub const MENU_TEXT: Color = Color::Rgb(0xdc, 0xd0, 0xa8);
     /// Dark slate footer backdrop.
     pub const STATUS_BG: Color = Color::Rgb(0x2b, 0x2d, 0x38);
     /// Status bar foreground.

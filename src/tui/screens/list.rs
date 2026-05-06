@@ -229,6 +229,22 @@ impl ListScreen {
         }
     }
 
+    /// Inner content height for the framed panel (excludes the rounded
+    /// border). Used by `App::render_framed_panel` to size the panel to fit.
+    pub fn preferred_content_height(&self) -> u16 {
+        if self.loading || self.error.is_some() {
+            return 4;
+        }
+        if matches!(self.mode, NavigationMode::ActionMenu) {
+            return 10;
+        }
+        if self.worktrees.is_empty() {
+            return 4;
+        }
+        // header row + N rows + spacer + hint
+        4 + self.worktrees.len() as u16
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if self.loading {
             StatusIndicator::new(Status::Loading, LOADING_WORKTREES)

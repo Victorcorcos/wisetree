@@ -51,7 +51,7 @@ pub struct AdaptiveBackend<W: Write> {
 
 impl<W: Write> AdaptiveBackend<W> {
     pub fn new(writer: W) -> Self {
-        Self::with_color_count(writer, available_color_count())
+        Self::with_color_count(writer, detect_color_count())
     }
 
     fn with_color_count(writer: W, color_count: u16) -> Self {
@@ -60,6 +60,21 @@ impl<W: Write> AdaptiveBackend<W> {
             color_count,
         }
     }
+}
+
+/// Crossterm's `available_color_count()` reads `terminfo`'s `colors` capability,
+/// which caps at 256 even on terminals (iTerm2, Terminal.app w/ truecolor
+/// patch, Ghostty, WezTerm, modern xterm) that actually support 24-bit color.
+/// Honor the de facto `COLORTERM` env var so those terminals get true RGB
+/// instead of being forced through the 256-color cube.
+fn detect_color_count() -> u16 {
+    if let Ok(value) = std::env::var("COLORTERM") {
+        let v = value.to_ascii_lowercase();
+        if v == "truecolor" || v == "24bit" {
+            return u16::MAX;
+        }
+    }
+    available_color_count()
 }
 
 impl<W: Write> Write for AdaptiveBackend<W> {
@@ -375,7 +390,7 @@ mod tests {
         let mut cell = Cell::default();
         cell.set_symbol("A");
         cell.set_fg(Color::Rgb(0xd4, 0xea, 0x9a));
-        cell.set_bg(Color::Rgb(0x14, 0x2a, 0x33));
+        cell.set_bg(Color::Rgb(0x12, 0x2c, 0x38));
         cell
     }
 
@@ -389,7 +404,7 @@ mod tests {
 
         let output = writer.contents();
         assert!(output.contains("38;2;212;234;154"));
-        assert!(output.contains("48;2;20;42;51"));
+        assert!(output.contains("48;2;18;44;56"));
     }
 
     #[test]

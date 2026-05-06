@@ -214,35 +214,55 @@ impl App {
                 menu.render(frame, area);
             }
             Screen::List => {
-                let panel = self.render_framed_panel(frame, area);
+                let h = self
+                    .list
+                    .as_ref()
+                    .map_or(8, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
                 if let Some(list) = self.list.as_mut() {
                     list.tick = self.tick;
                     list.render(frame, panel);
                 }
             }
             Screen::Create => {
-                let panel = self.render_framed_panel(frame, area);
+                let h = self
+                    .create
+                    .as_ref()
+                    .map_or(8, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
                 if let Some(create) = self.create.as_mut() {
                     create.tick = self.tick;
                     create.render(frame, panel);
                 }
             }
             Screen::Delete => {
-                let panel = self.render_framed_panel(frame, area);
+                let h = self
+                    .delete
+                    .as_ref()
+                    .map_or(8, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
                 if let Some(delete) = self.delete.as_mut() {
                     delete.tick = self.tick;
                     delete.render(frame, panel);
                 }
             }
             Screen::Settings => {
-                let panel = self.render_framed_panel(frame, area);
+                let h = self
+                    .settings
+                    .as_ref()
+                    .map_or(14, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
                 if let Some(settings) = self.settings.as_mut() {
                     settings.tick = self.tick;
                     settings.render(frame, panel);
                 }
             }
             Screen::Setup => {
-                let panel = self.render_framed_panel(frame, area);
+                let h = self
+                    .setup
+                    .as_ref()
+                    .map_or(8, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
                 if let Some(setup) = self.setup.as_mut() {
                     setup.tick = self.tick;
                     setup.render(frame, panel);
@@ -251,15 +271,15 @@ impl App {
         }
     }
 
-    fn render_framed_panel(&self, frame: &mut Frame, area: Rect) -> Rect {
-        frame.render_widget(
-            Block::default().style(Style::default().bg(colors::APP_BG)),
-            area,
-        );
-
+    fn render_framed_panel(&self, frame: &mut Frame, area: Rect, content_height: u16) -> Rect {
+        let panel_height = content_height.saturating_add(2);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(4), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Length(panel_height),
+                Constraint::Min(0),
+            ])
             .split(area);
 
         let cwd = self.git_root.as_deref().unwrap_or("");
@@ -268,8 +288,8 @@ impl App {
         let panel = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::MUTED))
-            .style(Style::default().bg(colors::APP_BG));
+            .border_style(Style::default().fg(colors::MENU_BORDER).bg(colors::MENU_BG))
+            .style(Style::default().bg(colors::MENU_BG));
         let inner = panel.inner(chunks[1]);
         frame.render_widget(panel, chunks[1]);
         inner

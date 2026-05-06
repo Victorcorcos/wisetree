@@ -319,6 +319,23 @@ impl DeleteScreen {
         }
     }
 
+    /// Inner content height for the framed panel (excludes the rounded
+    /// border).
+    pub fn preferred_content_height(&self) -> u16 {
+        if self.loading || self.error.is_some() {
+            return 4;
+        }
+        if self.worktrees.is_empty() {
+            return 4;
+        }
+        match self.step {
+            DeleteStep::Select => 4 + (self.worktrees.len() as u16).min(10),
+            DeleteStep::Confirm => 10,
+            DeleteStep::Deleting => 3,
+            DeleteStep::Success => 3,
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if self.loading {
             StatusIndicator::new(Status::Loading, LOADING_WORKTREES)

@@ -7,7 +7,7 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::messages::{
@@ -90,17 +90,14 @@ impl MenuScreen {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(
-            Block::default().style(Style::default().bg(colors::APP_BG)),
-            area,
-        );
-
+        let select_height = self.select_panel_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(4),
-                Constraint::Min(1),
+                Constraint::Length(select_height),
                 Constraint::Length(1),
+                Constraint::Min(0),
             ])
             .split(area);
 
@@ -111,6 +108,18 @@ impl MenuScreen {
         self.select.render(frame, chunks[1]);
 
         render_status_bar(frame, chunks[2], cwd);
+    }
+
+    /// Total rows the menu screen wants — header + select panel + status bar.
+    /// Excludes any trailing filler.
+    pub fn preferred_height(&self) -> u16 {
+        4 + self.select_panel_height() + 1
+    }
+
+    /// Inner height of the boxed select panel: borders (2) + title (1) +
+    /// spacer (1) + N option rows + breathing room (1).
+    fn select_panel_height(&self) -> u16 {
+        (self.select.options.len() as u16).saturating_add(5)
     }
 }
 

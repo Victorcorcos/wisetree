@@ -383,6 +383,22 @@ impl CreateScreen {
         }
     }
 
+    /// Inner content height for the framed panel (excludes the rounded
+    /// border).
+    pub fn preferred_content_height(&self) -> u16 {
+        if self.loading || self.error.is_some() {
+            return 4;
+        }
+        match self.step {
+            CreateStep::Directory | CreateStep::CustomRef | CreateStep::NewBranch => 6,
+            CreateStep::SourceBranch => 14,
+            CreateStep::Confirm => 10,
+            CreateStep::Creating => 3,
+            CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
+            CreateStep::Success => 3,
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if self.loading {
             StatusIndicator::new(Status::Loading, LOADING_BRANCHES)

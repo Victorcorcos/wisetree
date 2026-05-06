@@ -511,7 +511,7 @@ impl<T: Clone> SelectPrompt<T> {
                     Style::default().fg(colors::MENU_TEXT).bg(row_bg)
                 };
 
-                let marker = if is_selected { "🪄✨ " } else { "    " };
+                let marker = if is_selected { "➤ " } else { "  " };
                 let mut spans = vec![
                     Span::styled(marker, Style::default().bg(row_bg)),
                     Span::styled(format!("{}. ", original_idx + 1), row_style),
