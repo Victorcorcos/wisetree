@@ -164,17 +164,21 @@ fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
     let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None);
     let buffer = render(80, 20, |f| menu.render(f, f.area()));
 
+    // "Welcome to " stays in the header title color, but "Wisetree" must
+    // wear the brand purple per `design/pallete.md`.
     assert_text_style(
         &buffer,
-        "Welcome to Wisetree",
+        "Welcome to ",
         colors::HEADER_TITLE,
         colors::HEADER_BG,
     );
+    assert_text_style(&buffer, "Wisetree", colors::BRAND, colors::HEADER_BG);
     assert_text_style(&buffer, "/tmp/repo", colors::MENU_TEXT, colors::HEADER_BG);
+    // Titles like "Choose wisely..." use the teal info color.
     assert_text_style(
         &buffer,
         "Choose wisely...",
-        colors::MENU_TEXT,
+        colors::INFO,
         colors::MENU_BG,
     );
     assert_text_style(
@@ -183,12 +187,10 @@ fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
         colors::MENU_SELECTION_FG,
         colors::MENU_SELECTION_BG,
     );
-    assert_text_style(
-        &buffer,
-        "List worktrees",
-        colors::MENU_TEXT,
-        colors::MENU_BG,
-    );
+    // The non-selected "List worktrees" row keeps the menu body color
+    // for the verb but applies the brand purple to the noun.
+    assert_text_style(&buffer, "List ", colors::MENU_TEXT, colors::MENU_BG);
+    assert_text_style(&buffer, "worktrees", colors::BRAND, colors::MENU_BG);
     assert_text_style(&buffer, "Nav", colors::MENU_TEXT, colors::STATUS_BG);
     assert_text_style(
         &buffer,

@@ -140,7 +140,7 @@ impl ConfirmDialog {
             self.confirm_label.clone(),
             if confirm_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(colors::WHITE)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(colors::MUTED)
@@ -150,24 +150,34 @@ impl ConfirmDialog {
             self.cancel_label.clone(),
             if cancel_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(colors::WHITE)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(colors::MUTED)
             },
         ));
 
+        let confirm_border = if confirm_selected {
+            self.variant.color()
+        } else {
+            colors::MUTED
+        };
+        let cancel_border = if cancel_selected {
+            colors::EMPHASIS
+        } else {
+            colors::MUTED
+        };
         let confirm_box = Paragraph::new(confirm_text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(colors::MUTED)),
+                .border_style(Style::default().fg(confirm_border)),
         );
         let cancel_box = Paragraph::new(cancel_text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(colors::MUTED)),
+                .border_style(Style::default().fg(cancel_border)),
         );
         frame.render_widget(confirm_box, button_cols[0]);
         frame.render_widget(cancel_box, button_cols[1]);

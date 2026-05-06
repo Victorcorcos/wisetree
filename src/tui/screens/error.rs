@@ -39,9 +39,13 @@ pub fn draw(frame: &mut Frame, area: Rect, message: &str, show_reset_confirm: bo
         format!("{message}\n\nPress 'r' to reset configuration, any other key to return to menu.")
     };
     let body = Paragraph::new(body_text)
-        .style(Style::default().fg(colors::WARNING))
+        .style(Style::default().fg(colors::EMPHASIS))
         .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::ERROR)),
+        );
     frame.render_widget(body, chunks[1]);
 
     let hint = Paragraph::new(Span::styled(

@@ -52,21 +52,29 @@ impl<'a> WelcomeHeader<'a> {
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(inner);
 
-        let title_text = match self.mode_label() {
-            None => "Welcome to Wisetree".to_string(),
-            Some(label) => format!("Wisetree - {label}"),
-        };
-        let header_line = Line::from(vec![
+        let title_style = Style::default()
+            .fg(colors::HEADER_TITLE)
+            .bg(colors::HEADER_BG)
+            .add_modifier(Modifier::BOLD);
+        let brand_style = Style::default()
+            .fg(colors::BRAND)
+            .bg(colors::HEADER_BG)
+            .add_modifier(Modifier::BOLD);
+        let mut header_spans: Vec<Span> = vec![
             Span::styled("  ", panel_style),
             Span::styled("🧙 ", panel_style),
-            Span::styled(
-                title_text,
-                Style::default()
-                    .fg(colors::HEADER_TITLE)
-                    .bg(colors::HEADER_BG)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
+        ];
+        match self.mode_label() {
+            None => {
+                header_spans.push(Span::styled("Welcome to ", title_style));
+                header_spans.push(Span::styled("Wisetree", brand_style));
+            }
+            Some(label) => {
+                header_spans.push(Span::styled("Wisetree", brand_style));
+                header_spans.push(Span::styled(format!(" - {label}"), title_style));
+            }
+        }
+        let header_line = Line::from(header_spans);
         frame.render_widget(Paragraph::new(header_line).style(panel_style), chunks[0]);
 
         let subtitle = Line::from(vec![

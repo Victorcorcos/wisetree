@@ -12,7 +12,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -612,7 +612,7 @@ Safety features:\n\
         lines.push(Line::from(Span::styled(
             "Press any key to go back.",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM),
         )));
         frame.render_widget(Paragraph::new(lines), area);

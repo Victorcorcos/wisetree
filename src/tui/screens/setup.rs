@@ -260,9 +260,17 @@ impl SetupScreen {
             .constraints([Constraint::Length(2), Constraint::Min(1)])
             .split(area);
         let intro = Line::from(vec![
-            Span::raw("Shell integration wraps the "),
-            Span::styled("wisetree", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" command to enable quick directory switching."),
+            Span::styled("Shell integration wraps the ", Style::default().fg(colors::INFO)),
+            Span::styled(
+                "wisetree",
+                Style::default()
+                    .fg(colors::BRAND)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " command to enable quick directory switching.",
+                Style::default().fg(colors::INFO),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(intro).style(Style::default().fg(colors::INFO)),
@@ -298,7 +306,12 @@ impl SetupScreen {
             ]),
             Line::from(vec![
                 Span::styled("Try it now: ", Style::default().fg(colors::SUCCESS)),
-                Span::styled("wisetree", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "wisetree",
+                    Style::default()
+                        .fg(colors::BRAND)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
         ];
         lines.push(Line::from(Span::styled(

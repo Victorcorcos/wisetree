@@ -84,56 +84,98 @@ pub const UPDATE_UP_TO_DATE: &str = "You're running the latest version";
 pub const UPDATE_FAILED: &str = "Failed to check for updates";
 pub const UPDATE_INSTALL_CMD: &str = "npm install -g wisetree";
 
-/// Color palette ported from the upstream `COLORS` map.
+/// Monokai-inspired palette defined in `design/pallete.md`. Every visible
+/// color in the TUI must resolve to one of these constants — see that file
+/// for the recommended usage of each.
 pub mod colors {
     use ratatui::style::Color;
 
-    /// `#17141d`
-    pub const APP_BG: Color = Color::Rgb(0x17, 0x14, 0x1d);
-    /// `#61dafb`
-    pub const PRIMARY: Color = Color::Rgb(0x61, 0xda, 0xfb);
-    /// `#28a745`
-    pub const SUCCESS: Color = Color::Rgb(0x28, 0xa7, 0x45);
-    /// `#ffc107`
-    pub const WARNING: Color = Color::Rgb(0xff, 0xc1, 0x07);
-    /// `#dc3545`
-    pub const ERROR: Color = Color::Rgb(0xdc, 0x35, 0x45);
-    /// `#17a2b8`
-    pub const INFO: Color = Color::Rgb(0x17, 0xa2, 0xb8);
-    /// `#6c757d`
-    pub const MUTED: Color = Color::Rgb(0x6c, 0x75, 0x7d);
-    /// `#007bff`
-    pub const HIGHLIGHT: Color = Color::Rgb(0x00, 0x7b, 0xff);
+    // ── Brand & font colors ─────────────────────────────────────────────
 
-    // Menu screen theme — values eyedroppered from `images/design.png`.
-    // Truecolor terminals (iTerm2, Ghostty, WezTerm, Kitty, modern xterm with
-    // `COLORTERM=truecolor`) display these literal RGBs. Terminals that only
-    // advertise 256 colors will see them collapse onto the gray ramp under
-    // `AdaptiveBackend`'s downgrade — that's an accepted trade-off; we'd
-    // rather match the design accurately on capable terminals than ship
-    // saturated stand-ins that read wrong everywhere.
-    /// Dark forest backdrop for the welcome header.
-    pub const HEADER_BG: Color = Color::Rgb(0x1c, 0x30, 0x1c);
-    /// Sage border around the welcome header.
-    pub const HEADER_BORDER: Color = Color::Rgb(0x6b, 0x8c, 0x4f);
-    /// Soft sage title text inside the welcome header.
-    pub const HEADER_TITLE: Color = Color::Rgb(0xc8, 0xd9, 0x95);
-    /// Muted parchment text used for the cwd line.
-    pub const HEADER_SUBTITLE: Color = Color::Rgb(0xb0, 0xa8, 0x8c);
-    /// Dark slate-teal backdrop for the menu panel.
-    pub const MENU_BG: Color = Color::Rgb(0x12, 0x2c, 0x38);
-    /// Cyan border around the menu panel.
-    pub const MENU_BORDER: Color = Color::Rgb(0x6c, 0xc6, 0xd6);
-    /// Highlighted background on the currently selected menu row — sits
-    /// distinctly lighter than `MENU_BG`, but stays muted enough to read
-    /// as part of the same teal family rather than a saturated accent.
-    pub const MENU_SELECTION_BG: Color = Color::Rgb(0x1e, 0x55, 0x68);
-    /// Pale-cream foreground used on the highlighted menu row.
-    pub const MENU_SELECTION_FG: Color = Color::Rgb(0xf0, 0xe5, 0xb0);
-    /// Warm parchment body text for menu rows.
-    pub const MENU_TEXT: Color = Color::Rgb(0xdc, 0xd0, 0xa8);
-    /// Dark slate footer backdrop.
-    pub const STATUS_BG: Color = Color::Rgb(0x2b, 0x2d, 0x38);
+    /// Purple `#b47eff` — reserved for the words `wisetree`, `worktree`,
+    /// and `worktrees` to anchor the brand identity.
+    pub const BRAND: Color = Color::Rgb(0xb4, 0x7e, 0xff);
+    /// White `#f8f8f1` — main font color for primary content.
+    pub const WHITE: Color = Color::Rgb(0xf8, 0xf8, 0xf1);
+    /// Gray darker `#90918a` — annotation text such as
+    /// `Version 1.2.0 | Active Repo:`.
+    pub const GRAY_DARK: Color = Color::Rgb(0x90, 0x91, 0x8a);
+    /// Gray lighter `#d9d9d2` — emphasized annotation text such as the
+    /// active repository path.
+    pub const GRAY_LIGHT: Color = Color::Rgb(0xd9, 0xd9, 0xd2);
+    /// Pink `#ff0071` — error messages and destructive states.
+    pub const PINK: Color = Color::Rgb(0xff, 0x00, 0x71);
+    /// Green `#94e400` — success messages and positive states.
+    pub const GREEN: Color = Color::Rgb(0x94, 0xe4, 0x00);
+    /// Teal `#1cdbf2` — informational text and titles like
+    /// `Choose wisely...`.
+    pub const TEAL: Color = Color::Rgb(0x1c, 0xdb, 0xf2);
+    /// Yellow `#eada61` — warnings such as
+    /// `Directory name cannot be empty`.
+    pub const YELLOW: Color = Color::Rgb(0xea, 0xda, 0x61);
+    /// Orange `#ff8f00` — creative accent, used sparingly for highlights
+    /// like progress headers and "running" states.
+    pub const ORANGE: Color = Color::Rgb(0xff, 0x8f, 0x00);
+
+    // ── Background colors ───────────────────────────────────────────────
+
+    /// Brown darker `#282922` — main app background.
+    pub const BG: Color = Color::Rgb(0x28, 0x29, 0x22);
+    /// Brown lighter `#3e3d31` — selected row / status bar background.
+    pub const BG_SELECTED: Color = Color::Rgb(0x3e, 0x3d, 0x31);
+    /// Brown even lighter `#75705b` — focus background for elements that
+    /// need to stand out without leaving the brown family.
+    pub const BG_FOCUS: Color = Color::Rgb(0x75, 0x70, 0x5b);
+
+    // ── Semantic aliases ────────────────────────────────────────────────
+    //
+    // These names describe *intent*, not color. Map them to the palette
+    // above so call sites stay readable. Adjust the alias here if you ever
+    // want to retune a role without touching every screen.
+
+    /// Primary accent (spinners, selected rows, install commands).
+    pub const PRIMARY: Color = TEAL;
+    /// Success state.
+    pub const SUCCESS: Color = GREEN;
+    /// Warning state.
+    pub const WARNING: Color = YELLOW;
+    /// Error state.
+    pub const ERROR: Color = PINK;
+    /// Informational text and headings.
+    pub const INFO: Color = TEAL;
+    /// Muted / secondary annotation text.
+    pub const MUTED: Color = GRAY_DARK;
+    /// Emphasized annotation text (paths, important values).
+    pub const EMPHASIS: Color = GRAY_LIGHT;
+    /// Brand accent for the words `Wisetree` / `worktree`.
+    pub const HIGHLIGHT: Color = BRAND;
+    /// Creative accent for moments worth a splash of color.
+    pub const ACCENT: Color = ORANGE;
+
+    // ── App / panel surfaces ───────────────────────────────────────────
+
+    /// Application background.
+    pub const APP_BG: Color = BG;
+    /// Welcome header backdrop.
+    pub const HEADER_BG: Color = BG;
+    /// Welcome header border (brand purple to frame the wizard mark).
+    pub const HEADER_BORDER: Color = BRAND;
+    /// Welcome header title text.
+    pub const HEADER_TITLE: Color = WHITE;
+    /// Welcome header annotation text (labels like `Current Repository`).
+    pub const HEADER_SUBTITLE: Color = GRAY_DARK;
+    /// Menu panel backdrop.
+    pub const MENU_BG: Color = BG;
+    /// Menu panel border.
+    pub const MENU_BORDER: Color = TEAL;
+    /// Selected menu row background.
+    pub const MENU_SELECTION_BG: Color = BG_SELECTED;
+    /// Selected menu row foreground.
+    pub const MENU_SELECTION_FG: Color = WHITE;
+    /// Menu body text.
+    pub const MENU_TEXT: Color = GRAY_LIGHT;
+    /// Status bar backdrop.
+    pub const STATUS_BG: Color = BG_SELECTED;
     /// Status bar foreground.
-    pub const STATUS_TEXT: Color = Color::Rgb(0xc8, 0xc0, 0xa8);
+    pub const STATUS_TEXT: Color = GRAY_LIGHT;
 }

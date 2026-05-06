@@ -443,7 +443,7 @@ impl<T: Clone> SelectPrompt<T> {
         let title = Paragraph::new(Line::from(Span::styled(
             self.label.clone(),
             Style::default()
-                .fg(colors::MENU_TEXT)
+                .fg(colors::INFO)
                 .bg(colors::MENU_BG)
                 .add_modifier(Modifier::BOLD),
         )))
@@ -526,8 +526,18 @@ impl<T: Clone> SelectPrompt<T> {
                 let mut spans = vec![
                     Span::styled(marker, row_style),
                     Span::styled(format!("{}. ", original_idx + 1), row_style),
-                    Span::styled(option.label.clone(), row_style),
                 ];
+                // The selected row reads as one bold bar — keeping the brand
+                // accent inside it would fight the selection. Only style
+                // unselected, non-disabled, non-color-overridden rows.
+                let allow_brand =
+                    !is_selected && !option.disabled && option.color.is_none();
+                if allow_brand {
+                    let brand_style = Style::default().fg(colors::BRAND).bg(row_bg);
+                    spans.extend(branded_spans(&option.label, row_style, brand_style));
+                } else {
+                    spans.push(Span::styled(option.label.clone(), row_style));
+                }
                 if let Some(desc) = &option.description {
                     spans.push(Span::styled(
                         format!(" ({desc})"),
@@ -553,4 +563,57 @@ impl<T: Clone> SelectPrompt<T> {
             );
         }
     }
+}
+
+/// Split `text` into spans, applying `brand_style` to occurrences of
+/// `worktree`, `worktrees`, and `wisetree` (case-insensitive) and
+/// `base_style` to everything else. Per `design/pallete.md`, those are
+/// the words that wear the brand purple.
+pub fn branded_spans(text: &str, base_style: Style, brand_style: Style) -> Vec<Span<'static>> {
+    const BRAND_WORDS: &[&str] = &["worktrees", "worktree", "wisetree"];
+    let lower = text.to_lowercase();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let mut hit: Option<(usize, usize)> = None;
+        for word in BRAND_WORDS {
+            if let Some(rel) = lower[cursor..].find(word) {
+                let abs = cursor + rel;
+                let end = abs + word.len();
+                let prev_alnum = abs
+                    .checked_sub(1)
+                    .and_then(|i| text.as_bytes().get(i))
+                    .is_some_and(|b| b.is_ascii_alphanumeric());
+                let next_alnum = text
+                    .as_bytes()
+                    .get(end)
+                    .is_some_and(|b| b.is_ascii_alphanumeric());
+                if prev_alnum || next_alnum {
+                    continue;
+                }
+                hit = Some(match hit {
+                    Some((existing, _)) if existing <= abs => Some((existing, hit.unwrap().1)),
+                    _ => Some((abs, end)),
+                }
+                .unwrap());
+            }
+        }
+        match hit {
+            Some((start, end)) => {
+                if start > cursor {
+                    spans.push(Span::styled(text[cursor..start].to_string(), base_style));
+                }
+                spans.push(Span::styled(text[start..end].to_string(), brand_style));
+                cursor = end;
+            }
+            None => {
+                spans.push(Span::styled(text[cursor..].to_string(), base_style));
+                break;
+            }
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base_style));
+    }
+    spans
 }

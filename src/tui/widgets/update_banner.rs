@@ -3,7 +3,7 @@
 //! not actually newer than the running binary.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
@@ -51,7 +51,7 @@ impl<'a> UpdateBanner<'a> {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Yellow));
+            .border_style(Style::default().fg(colors::WARNING));
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
