@@ -213,6 +213,13 @@ fn select_render_shows_more_above_below_when_long() {
     assert!(dumped.contains("more below"));
 }
 
+#[test]
+fn select_render_uses_arrow_cursor_symbol() {
+    let s = SelectPrompt::new("Pick", opts(&["alpha", "beta"]));
+    let dumped = dump(60, 8, |f| s.render(f, f.area()));
+    assert!(dumped.contains("➤"));
+}
+
 // -- ConfirmDialog ------------------------------------------------------------
 
 #[test]

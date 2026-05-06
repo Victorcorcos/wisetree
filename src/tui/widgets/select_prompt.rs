@@ -13,6 +13,10 @@ use ratatui::Frame;
 use crate::messages::colors;
 
 const MAX_VISIBLE: usize = 10;
+pub const SELECT_CURSOR: &str = "➤ ";
+const BLANK_CURSOR: &str = "  ";
+const BOXED_SELECT_CURSOR: &str = " ➤ ";
+const BOXED_BLANK_CURSOR: &str = "   ";
 
 #[derive(Debug, Clone)]
 pub struct SelectOption<T> {
@@ -331,7 +335,11 @@ impl<T: Clone> SelectPrompt<T> {
                 let visible_idx = start + offset;
                 let option = &self.options[original_idx];
                 let is_selected = visible_idx == self.selected;
-                let marker = if is_selected { "> " } else { "  " };
+                let marker = if is_selected {
+                    SELECT_CURSOR
+                } else {
+                    BLANK_CURSOR
+                };
                 let style = if option.disabled {
                     Style::default()
                         .fg(colors::MUTED)
@@ -404,11 +412,6 @@ impl<T: Clone> SelectPrompt<T> {
         let (start, end) = self.visible_window(filtered.len());
         let has_more_above = start > 0;
         let has_more_below = end < filtered.len();
-        let visible_rows = if filtered.is_empty() {
-            1
-        } else {
-            (end - start) as u16
-        };
 
         let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
         if self.searchable {
@@ -418,8 +421,12 @@ impl<T: Clone> SelectPrompt<T> {
         if has_more_above {
             constraints.push(Constraint::Length(1));
         }
-        for _ in 0..visible_rows {
+        if filtered.is_empty() {
             constraints.push(Constraint::Length(1));
+        } else {
+            for _ in &filtered[start..end] {
+                constraints.push(Constraint::Length(1));
+            }
         }
         if has_more_below {
             constraints.push(Constraint::Length(1));
@@ -511,9 +518,13 @@ impl<T: Clone> SelectPrompt<T> {
                     Style::default().fg(colors::MENU_TEXT).bg(row_bg)
                 };
 
-                let marker = if is_selected { "➤ " } else { "  " };
+                let marker = if is_selected {
+                    BOXED_SELECT_CURSOR
+                } else {
+                    BOXED_BLANK_CURSOR
+                };
                 let mut spans = vec![
-                    Span::styled(marker, Style::default().bg(row_bg)),
+                    Span::styled(marker, row_style),
                     Span::styled(format!("{}. ", original_idx + 1), row_style),
                     Span::styled(option.label.clone(), row_style),
                 ];
@@ -526,6 +537,7 @@ impl<T: Clone> SelectPrompt<T> {
                             .add_modifier(Modifier::DIM | Modifier::ITALIC),
                     ));
                 }
+
                 let row = Paragraph::new(Line::from(spans)).style(Style::default().bg(row_bg));
                 frame.render_widget(row, chunks[idx]);
                 idx += 1;

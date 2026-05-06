@@ -19,7 +19,7 @@ pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
 pub use confirm_dialog::{ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant};
 pub use input_prompt::{InputOutcome, InputPrompt};
-pub use select_prompt::{SelectOption, SelectOutcome, SelectPrompt, SelectStyle};
+pub use select_prompt::{SelectOption, SelectOutcome, SelectPrompt, SelectStyle, SELECT_CURSOR};
 pub use spinner::{spinner_frame, Spinner, SPINNER_FRAMES};
 pub use status_indicator::{Status, StatusIndicator};
 pub use update_banner::UpdateBanner;

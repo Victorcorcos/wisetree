@@ -57,6 +57,7 @@ impl<'a> WelcomeHeader<'a> {
             Some(label) => format!("Wisetree - {label}"),
         };
         let header_line = Line::from(vec![
+            Span::styled("  ", panel_style),
             Span::styled("🧙 ", panel_style),
             Span::styled(
                 title_text,
@@ -69,6 +70,7 @@ impl<'a> WelcomeHeader<'a> {
         frame.render_widget(Paragraph::new(header_line).style(panel_style), chunks[0]);
 
         let subtitle = Line::from(vec![
+            Span::styled("  ", panel_style),
             Span::styled(
                 "Current Repository",
                 Style::default()

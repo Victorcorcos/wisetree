@@ -198,6 +198,31 @@ fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
     );
 }
 
+#[test]
+fn menu_render_indents_current_repository_line_inside_header() {
+    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None);
+    let buffer = render(80, 20, |f| menu.render(f, f.area()));
+    let (x, y) =
+        find_text_start(&buffer, "Current Repository").expect("current repository line present");
+
+    assert_eq!(buffer[(x - 1, y)].symbol(), " ");
+    assert_eq!(buffer[(x - 2, y)].symbol(), " ");
+}
+
+#[test]
+fn menu_render_uses_rounded_selected_row_with_arrow_cursor() {
+    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None);
+    let dumped = dump(80, 20, |f| menu.render(f, f.area()));
+
+    assert!(dumped.contains("➤"));
+    assert!(!dumped.contains("◑"));
+    assert!(!dumped.contains("◐"));
+    assert_eq!(dumped.matches('╭').count(), 2);
+    assert_eq!(dumped.matches('╮').count(), 2);
+    assert_eq!(dumped.matches('╰').count(), 2);
+    assert_eq!(dumped.matches('╯').count(), 2);
+}
+
 // -- WelcomeHeader fold_home -------------------------------------------------
 
 #[test]

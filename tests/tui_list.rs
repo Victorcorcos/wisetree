@@ -188,6 +188,7 @@ fn render_shows_table_header_and_hint() {
     let dumped = dump(80, 10, |f| s.render(f, f.area()));
     assert!(dumped.contains("PATH"));
     assert!(dumped.contains("BRANCH"));
+    assert!(dumped.contains("➤"));
     assert!(dumped.contains("Navigate"));
     assert!(dumped.contains("Esc"));
 }

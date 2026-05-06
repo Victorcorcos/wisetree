@@ -1,5 +1,5 @@
 //! List Worktrees screen. Two navigation modes:
-//! - `List`: shows the worktrees in a two-column table with `>` cursor; up/
+//! - `List`: shows the worktrees in a two-column table with `➤` cursor; up/
 //!   down/jk navigate, numeric 1–9 jumps to that row, Enter opens the
 //!   per-row action menu, `e` opens via the configured `terminalCommand`,
 //!   Esc returns to the menu.
@@ -20,7 +20,9 @@ use ratatui::Frame;
 use crate::git::types::GitWorktree;
 use crate::messages::{colors, GIT_ERROR_LIST, LIST_NO_WORKTREES, LOADING_WORKTREES};
 use crate::tui::widgets::welcome_header::fold_home;
-use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
+use crate::tui::widgets::{
+    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator, SELECT_CURSOR,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NavigationMode {
@@ -331,7 +333,7 @@ impl ListScreen {
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(chunks[1 + i]);
             let is_selected = i == self.selected;
-            let marker = if is_selected { "> " } else { "  " };
+            let marker = if is_selected { SELECT_CURSOR } else { "  " };
             let path_style = if is_selected {
                 Style::default().fg(colors::PRIMARY)
             } else {
