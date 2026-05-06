@@ -143,9 +143,11 @@ The wizard appends a marked block to `~/.zshrc`, `~/.bash_profile` for macOS bas
 # (tab completions + a wrapper function)
 wisetree() {
   if [ $# -eq 0 ]; then
-    local dir=$(FORCE_COLOR=3 command wisetree --from-wrapper)
-    if [ -n "$dir" ]; then
-      builtin cd "$dir" && echo "Wisetree: Navigated to $(pwd)"
+    local dir
+    if dir=$(FORCE_COLOR=3 command wisetree --from-wrapper); then
+      if [ -n "$dir" ]; then
+        builtin cd "$dir" && echo "Wisetree: Navigated to $(pwd)"
+      fi
     fi
   else
     command wisetree "$@"

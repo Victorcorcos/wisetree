@@ -280,9 +280,11 @@ pub fn generate_setup_block(shell: Shell, command_name: &str, today: String) -> 
          {completions}\n\
          {command_name}() {{\n\
          \x20\x20if [ $# -eq 0 ]; then\n\
-         \x20\x20\x20\x20local dir=$(FORCE_COLOR=3 command {command_name} --from-wrapper)\n\
-         \x20\x20\x20\x20if [ -n \"$dir\" ]; then\n\
-         \x20\x20\x20\x20\x20\x20builtin cd \"$dir\" && echo \"Wisetree: Navigated to $(pwd)\"\n\
+         \x20\x20\x20\x20local dir\n\
+         \x20\x20\x20\x20if dir=$(FORCE_COLOR=3 command {command_name} --from-wrapper); then\n\
+         \x20\x20\x20\x20\x20\x20if [ -n \"$dir\" ]; then\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20builtin cd \"$dir\" && echo \"Wisetree: Navigated to $(pwd)\"\n\
+         \x20\x20\x20\x20\x20\x20fi\n\
          \x20\x20\x20\x20fi\n\
          \x20\x20else\n\
          \x20\x20\x20\x20command {command_name} \"$@\"\n\

@@ -1,25 +1,35 @@
-//! Terminal lifecycle: alt-screen, raw mode, and panic-safe restoration.
+//! Terminal lifecycle: raw mode, inline viewport, and panic-safe
+//! restoration.
+//!
+//! The TUI renders into an *inline* viewport — a fixed-height window
+//! anchored just below the user's prompt — instead of taking over the full
+//! alternate screen. This matches the design mock-up where the welcome
+//! header, menu panel, and status bar sit tightly stacked, and leaves the
+//! rest of the user's terminal untouched (scrollback stays visible above).
 //!
 //! Two flavors:
 //! - `enter` renders to `stdout` (default).
 //! - `enter_wrapper` renders to the controlling TTY (`/dev/tty` on Unix,
 //!   `CONOUT$` on Windows). Used in `--from-wrapper` mode where real stdout
-//!   is a pipe back to the shell — corrupting it with alt-screen escapes
-//!   would break the `local dir=$(...)` capture.
+//!   is a pipe back to the shell — emitting any TUI bytes there would
+//!   corrupt the `local dir=$(...)` capture.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Stdout, Write};
 
-use crossterm::execute;
 use crossterm::style::available_color_count;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::{Backend as RatatuiBackend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
-use ratatui::layout::{Position, Size};
+use ratatui::layout::{Position, Rect, Size};
 use ratatui::style::Color;
-use ratatui::Terminal as RatTerminal;
+use ratatui::{Terminal as RatTerminal, TerminalOptions, Viewport};
+
+/// Maximum number of rows the TUI reserves below the prompt. Sized to fit
+/// the tallest screen (Setup → Confirm preview); shorter screens leave the
+/// trailing rows blank rather than painting them with a backdrop, so the
+/// user's terminal background shows through.
+pub const INLINE_VIEWPORT_HEIGHT: u16 = 25;
 
 pub type Backend = AdaptiveBackend<Stdout>;
 pub type WrapperBackend = AdaptiveBackend<File>;
@@ -266,40 +276,64 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Set raw mode + alt screen and return a ratatui terminal handle.
+/// Set raw mode and return an inline-viewport ratatui terminal handle.
 pub fn enter() -> io::Result<Terminal> {
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = AdaptiveBackend::new(stdout);
-    RatTerminal::new(backend)
+    let backend = AdaptiveBackend::new(io::stdout());
+    RatTerminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+        },
+    )
 }
 
 /// Wrapper-mode entry: render to `/dev/tty` (Unix) / `CONOUT$` (Windows)
 /// instead of stdout, so the parent shell's `$(...)` capture stays clean.
 pub fn enter_wrapper() -> io::Result<WrapperTerminal> {
     enable_raw_mode()?;
-    let mut tty = OpenOptions::new().read(true).write(true).open(TTY_PATH)?;
-    execute!(tty, EnterAlternateScreen)?;
+    let tty = OpenOptions::new().read(true).write(true).open(TTY_PATH)?;
     let backend = AdaptiveBackend::new(tty);
-    RatTerminal::new(backend)
+    let size = backend.size()?;
+    let viewport = wrapper_viewport(size);
+    RatTerminal::with_options(backend, TerminalOptions { viewport })
 }
 
-/// Best-effort cleanup. Safe to call even if `enter` was never invoked: each
-/// step ignores its own error so partial state is fully unwound.
+fn wrapper_viewport(size: Size) -> Viewport {
+    // Inline viewport initialization queries the cursor position through
+    // Crossterm, which writes the probe to stdout. In `$(wisetree ...)`
+    // wrapper mode stdout is a shell capture pipe, not the controlling TTY,
+    // so the probe never reaches the terminal and times out. Anchor a fixed
+    // viewport to the bottom of the terminal instead.
+    let viewport_height = INLINE_VIEWPORT_HEIGHT.min(size.height);
+    Viewport::Fixed(Rect::new(
+        0,
+        size.height.saturating_sub(viewport_height),
+        size.width,
+        viewport_height,
+    ))
+}
+
+/// Clear the visible terminal and reset the cursor before returning control
+/// to the parent shell. Wrapper mode can't preserve the original inline
+/// cursor position reliably after switching away from Ratatui's inline
+/// viewport, so we prefer a clean prompt at the top-left.
+pub fn clear_wrapper_for_shell(terminal: &mut WrapperTerminal) -> io::Result<()> {
+    let backend = terminal.backend_mut();
+    backend.clear_region(ClearType::All)?;
+    backend.set_cursor_position(Position::ORIGIN)?;
+    RatatuiBackend::flush(backend)
+}
+
+/// Best-effort cleanup. Safe to call even if `enter` was never invoked.
 pub fn restore() -> io::Result<()> {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
     Ok(())
 }
 
-/// Best-effort cleanup for wrapper mode (re-opens the TTY to leave the alt
-/// screen — we no longer hold the original handle by the time we get here).
+/// Best-effort cleanup for wrapper mode.
 pub fn restore_wrapper_tty() -> io::Result<()> {
     let _ = disable_raw_mode();
-    if let Ok(mut tty) = OpenOptions::new().write(true).open(TTY_PATH) {
-        let _ = execute!(tty, LeaveAlternateScreen);
-    }
     Ok(())
 }
 
@@ -369,5 +403,17 @@ mod tests {
         assert!(!output.contains(";2;"));
         assert!(output.contains("38;5;"));
         assert!(output.contains("48;5;"));
+    }
+
+    #[test]
+    fn wrapper_viewport_is_bottom_anchored_and_capped() {
+        assert_eq!(
+            wrapper_viewport(Size::new(80, 40)),
+            Viewport::Fixed(Rect::new(0, 15, 80, 25))
+        );
+        assert_eq!(
+            wrapper_viewport(Size::new(80, 20)),
+            Viewport::Fixed(Rect::new(0, 0, 80, 20))
+        );
     }
 }

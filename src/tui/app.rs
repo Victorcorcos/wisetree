@@ -132,12 +132,17 @@ impl App {
                 )
             })?;
             let result = self.event_loop(&mut terminal).await;
+            // Wrapper mode renders into a fixed bottom viewport on `/dev/tty`.
+            // Clear the screen and reset the cursor so the shell prompt
+            // returns at the top instead of below a block of empty rows.
+            let _ = terminal::clear_wrapper_for_shell(&mut terminal);
             let _ = terminal::restore_wrapper_tty();
             let _ = terminal.show_cursor();
             result?;
         } else {
             let mut terminal = terminal::enter()?;
             let result = self.event_loop(&mut terminal).await;
+            let _ = terminal.clear();
             let _ = terminal::restore();
             let _ = terminal.show_cursor();
             result?;
