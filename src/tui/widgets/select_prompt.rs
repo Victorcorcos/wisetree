@@ -447,7 +447,7 @@ impl<T: Clone> SelectPrompt<T> {
                 .bg(colors::MENU_BG)
                 .add_modifier(Modifier::BOLD),
         )))
-        .alignment(Alignment::Center)
+        .alignment(Alignment::Left)
         .style(panel_style);
         frame.render_widget(title, chunks[idx]);
         idx += 1;

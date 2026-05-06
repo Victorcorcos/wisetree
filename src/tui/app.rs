@@ -292,7 +292,12 @@ impl App {
             .style(Style::default().bg(colors::MENU_BG));
         let inner = panel.inner(chunks[1]);
         frame.render_widget(panel, chunks[1]);
-        inner
+        Rect {
+            x: inner.x.saturating_add(2),
+            y: inner.y,
+            width: inner.width.saturating_sub(4),
+            height: inner.height,
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {

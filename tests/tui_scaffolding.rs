@@ -116,7 +116,7 @@ fn menu_placeholder_renders_welcome_and_prompt() {
         .map(|c| c.symbol())
         .collect::<String>();
     assert!(dump.contains("Wisetree"));
-    assert!(dump.contains("What would you like to do"));
+    assert!(dump.contains("Choose wisely..."));
 }
 
 #[test]

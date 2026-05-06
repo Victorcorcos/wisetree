@@ -173,7 +173,7 @@ fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
     assert_text_style(&buffer, "/tmp/repo", colors::MENU_TEXT, colors::HEADER_BG);
     assert_text_style(
         &buffer,
-        "What would you like to do?",
+        "Choose wisely...",
         colors::MENU_TEXT,
         colors::MENU_BG,
     );
