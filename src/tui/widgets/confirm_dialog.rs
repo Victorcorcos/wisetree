@@ -128,9 +128,20 @@ impl ConfirmDialog {
         frame.render_widget(Paragraph::new(self.message.clone()), chunks[2]);
 
         let buttons_area = chunks[3];
+        let confirm_width = self.confirm_label.chars().count() as u16 + 4;
+        let cancel_width = self.cancel_label.chars().count() as u16 + 4;
+        let gap: u16 = 2;
+        let total_width = confirm_width + cancel_width + gap;
+        let side = buttons_area.width.saturating_sub(total_width) / 2;
         let button_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([
+                Constraint::Length(side),
+                Constraint::Length(confirm_width),
+                Constraint::Length(gap),
+                Constraint::Length(cancel_width),
+                Constraint::Min(0),
+            ])
             .split(buttons_area);
 
         let confirm_selected = self.selected == ConfirmChoice::Confirm;
@@ -181,8 +192,8 @@ impl ConfirmDialog {
                 .border_style(Style::default().fg(cancel_border))
                 .padding(Padding::horizontal(1)),
         );
-        frame.render_widget(confirm_box, button_cols[0]);
-        frame.render_widget(cancel_box, button_cols[1]);
+        frame.render_widget(confirm_box, button_cols[1]);
+        frame.render_widget(cancel_box, button_cols[3]);
 
         let hint = Paragraph::new("Use ←→ or Tab to navigate, Enter to confirm, Esc to cancel")
             .style(
