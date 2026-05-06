@@ -158,16 +158,19 @@ pub mod colors {
     pub const APP_BG: Color = BG;
     /// Welcome header backdrop.
     pub const HEADER_BG: Color = BG;
-    /// Welcome header border (brand purple to frame the wizard mark).
-    pub const HEADER_BORDER: Color = BRAND;
+    /// Welcome header border — uses the focus brown so the panel frame
+    /// reads as scaffolding rather than competing with the brand color
+    /// on the title text inside it.
+    pub const HEADER_BORDER: Color = BG_FOCUS;
     /// Welcome header title text.
     pub const HEADER_TITLE: Color = WHITE;
     /// Welcome header annotation text (labels like `Current Repository`).
     pub const HEADER_SUBTITLE: Color = GRAY_DARK;
     /// Menu panel backdrop.
     pub const MENU_BG: Color = BG;
-    /// Menu panel border.
-    pub const MENU_BORDER: Color = TEAL;
+    /// Menu panel border — uses the focus brown so the frame stays in the
+    /// brown family while the teal accent is reserved for the title text.
+    pub const MENU_BORDER: Color = BG_FOCUS;
     /// Selected menu row background.
     pub const MENU_SELECTION_BG: Color = BG_SELECTED;
     /// Selected menu row foreground.
