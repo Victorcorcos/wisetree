@@ -14,7 +14,6 @@ use crate::messages::colors;
 
 const MAX_VISIBLE: usize = 10;
 pub const SELECT_CURSOR: &str = "➤ ";
-const BLANK_CURSOR: &str = "  ";
 const BOXED_SELECT_CURSOR: &str = " ➤ ";
 const BOXED_BLANK_CURSOR: &str = "   ";
 
@@ -247,155 +246,13 @@ impl<T: Clone> SelectPrompt<T> {
     }
 
     fn render_plain(&self, frame: &mut Frame, area: Rect) {
-        let filtered = self.filtered_indices();
-        let (start, end) = self.visible_window(filtered.len());
-        let has_more_above = start > 0;
-        let has_more_below = end < filtered.len();
-
-        let visible_rows = if filtered.is_empty() {
-            1
-        } else {
-            (end - start) as u16
-        };
-
-        let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
-        if self.searchable {
-            constraints.push(Constraint::Length(1));
-            constraints.push(Constraint::Length(1));
-        }
-        if has_more_above {
-            constraints.push(Constraint::Length(1));
-        }
-        for _ in 0..visible_rows {
-            constraints.push(Constraint::Length(1));
-        }
-        if has_more_below {
-            constraints.push(Constraint::Length(1));
-        }
-        if self.show_hint {
-            constraints.push(Constraint::Length(1));
-        }
-        constraints.push(Constraint::Min(0)); // remainder
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
-
-        let mut idx = 0;
-        frame.render_widget(Paragraph::new(self.label.clone()), chunks[idx]);
-        idx += 1;
-        // blank spacer
-        idx += 1;
-
-        if self.searchable {
-            let line = Line::from(vec![
-                Span::styled("Search: ", Style::default().fg(colors::MUTED)),
-                Span::styled(self.query.clone(), Style::default().fg(colors::PRIMARY)),
-                if self.query.is_empty() {
-                    Span::styled(
-                        "type to filter...",
-                        Style::default()
-                            .fg(colors::MUTED)
-                            .add_modifier(Modifier::DIM),
-                    )
-                } else {
-                    Span::raw("")
-                },
-            ]);
-            frame.render_widget(Paragraph::new(line), chunks[idx]);
-            idx += 1;
-            idx += 1;
-        }
-
-        if has_more_above {
-            frame.render_widget(
-                Paragraph::new(format!("↑ {start} more above")).style(
-                    Style::default()
-                        .fg(colors::MUTED)
-                        .add_modifier(Modifier::DIM),
-                ),
-                chunks[idx],
-            );
-            idx += 1;
-        }
-
-        if filtered.is_empty() {
-            frame.render_widget(
-                Paragraph::new("No matching options").style(
-                    Style::default()
-                        .fg(colors::MUTED)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-                chunks[idx],
-            );
-            idx += 1;
-        } else {
-            for (offset, &original_idx) in filtered[start..end].iter().enumerate() {
-                let visible_idx = start + offset;
-                let option = &self.options[original_idx];
-                let is_selected = visible_idx == self.selected;
-                let marker = if is_selected {
-                    SELECT_CURSOR
-                } else {
-                    BLANK_CURSOR
-                };
-                let style = if option.disabled {
-                    Style::default()
-                        .fg(colors::MUTED)
-                        .add_modifier(Modifier::DIM)
-                } else if let Some(c) = option.color {
-                    Style::default().fg(c)
-                } else if is_selected {
-                    Style::default().fg(colors::PRIMARY)
-                } else {
-                    Style::default()
-                };
-                let mut spans = vec![
-                    Span::styled(marker, style),
-                    Span::styled(option.label.clone(), style),
-                ];
-                if let Some(desc) = &option.description {
-                    spans.push(Span::styled(
-                        format!(" ({desc})"),
-                        Style::default()
-                            .fg(colors::MUTED)
-                            .add_modifier(Modifier::DIM | Modifier::ITALIC),
-                    ));
-                }
-                frame.render_widget(Paragraph::new(Line::from(spans)), chunks[idx]);
-                idx += 1;
-            }
-        }
-
-        if has_more_below {
-            let remaining = filtered.len() - end;
-            frame.render_widget(
-                Paragraph::new(format!("↓ {remaining} more below")).style(
-                    Style::default()
-                        .fg(colors::MUTED)
-                        .add_modifier(Modifier::DIM),
-                ),
-                chunks[idx],
-            );
-            idx += 1;
-        }
-
-        if self.show_hint {
-            let hint = if self.searchable {
-                "Use ↑↓ arrows to navigate, Enter to select, Esc to clear search/cancel"
-            } else {
-                "Use ↑↓ arrows to navigate, Enter to select, Esc to cancel"
-            };
-            frame.render_widget(
-                Paragraph::new(hint).style(
-                    Style::default()
-                        .fg(colors::MUTED)
-                        .add_modifier(Modifier::DIM),
-                ),
-                chunks[idx],
-            );
-        }
+        // Mirror the boxed style's row/title/selection theming so screens
+        // hosted inside the app's outer rounded panel (Settings, Setup,
+        // Delete, List action menu, Create source-branch) read with the
+        // same visual language as the main "Choose wisely..." menu. The
+        // outer border is intentionally omitted — the host screen already
+        // draws one around the entire panel.
+        self.render_themed_body(frame, area, false);
     }
 
     fn render_boxed(&self, frame: &mut Frame, area: Rect) {
@@ -407,7 +264,15 @@ impl<T: Clone> SelectPrompt<T> {
             .style(panel_style);
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.render_themed_body(frame, inner, true);
+    }
 
+    /// Shared row/title/selection rendering used by both `Plain` and `Boxed`.
+    /// `inset` adds a 2-column horizontal margin (matching the boxed style's
+    /// inner padding); `Plain` callers pass `false` because the host screen
+    /// already pre-padded the area inside its outer rounded panel.
+    fn render_themed_body(&self, frame: &mut Frame, area: Rect, inset: bool) {
+        let panel_style = Style::default().bg(colors::MENU_BG);
         let filtered = self.filtered_indices();
         let (start, end) = self.visible_window(filtered.len());
         let has_more_above = start > 0;
@@ -431,13 +296,18 @@ impl<T: Clone> SelectPrompt<T> {
         if has_more_below {
             constraints.push(Constraint::Length(1));
         }
+        if self.show_hint {
+            constraints.push(Constraint::Length(1));
+        }
         constraints.push(Constraint::Min(0));
 
-        let chunks = Layout::default()
+        let mut layout = Layout::default()
             .direction(Direction::Vertical)
-            .horizontal_margin(2)
-            .constraints(constraints)
-            .split(inner);
+            .constraints(constraints);
+        if inset {
+            layout = layout.horizontal_margin(2);
+        }
+        let chunks = layout.split(area);
 
         let mut idx = 0;
         let title = Paragraph::new(Line::from(Span::styled(
@@ -466,6 +336,17 @@ impl<T: Clone> SelectPrompt<T> {
                         .fg(colors::MENU_SELECTION_FG)
                         .bg(colors::MENU_BG),
                 ),
+                if self.query.is_empty() {
+                    Span::styled(
+                        "type to filter...",
+                        Style::default()
+                            .fg(colors::MUTED)
+                            .bg(colors::MENU_BG)
+                            .add_modifier(Modifier::DIM),
+                    )
+                } else {
+                    Span::raw("")
+                },
             ]);
             frame.render_widget(Paragraph::new(line).style(panel_style), chunks[idx]);
             idx += 1;
@@ -559,6 +440,24 @@ impl<T: Clone> SelectPrompt<T> {
             frame.render_widget(
                 Paragraph::new(format!("↓ {remaining} more below"))
                     .style(Style::default().fg(colors::MUTED).bg(colors::MENU_BG)),
+                chunks[idx],
+            );
+            idx += 1;
+        }
+
+        if self.show_hint {
+            let hint = if self.searchable {
+                "Use ↑↓ arrows to navigate, Enter to select, Esc to clear search/cancel"
+            } else {
+                "Use ↑↓ arrows to navigate, Enter to select, Esc to cancel"
+            };
+            frame.render_widget(
+                Paragraph::new(hint).style(
+                    Style::default()
+                        .fg(colors::MUTED)
+                        .bg(colors::MENU_BG)
+                        .add_modifier(Modifier::DIM),
+                ),
                 chunks[idx],
             );
         }
