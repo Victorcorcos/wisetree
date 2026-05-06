@@ -17,7 +17,7 @@ pub const MENU_EXIT: &str = "Exit";
 
 // Create flow
 pub const CREATE_DIRECTORY_PROMPT: &str = "Enter directory name for the new worktree:";
-pub const CREATE_DIRECTORY_PLACEHOLDER: &str = "feature-name";
+pub const CREATE_DIRECTORY_PLACEHOLDER: &str = "worktree-name";
 pub const CREATE_SOURCE_BRANCH_PROMPT: &str = "Select source branch:";
 pub const CREATE_NEW_BRANCH_PROMPT: &str =
     "Enter name for new branch (leave blank to use source branch):";

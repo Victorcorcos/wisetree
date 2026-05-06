@@ -264,7 +264,7 @@ impl SettingsScreen {
             | SettingsStep::PathTemplate
             | SettingsStep::PostCmd
             | SettingsStep::TerminalCmd => 12,
-            SettingsStep::DeleteBranch => 14,
+            SettingsStep::DeleteBranch => 16,
         }
     }
 
@@ -544,11 +544,25 @@ Safety features:\n\
     }
 
     fn render_delete_branch(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(area);
+
         if let Some(dialog) = &self.delete_branch_dialog {
-            dialog.render(frame, area);
+            dialog.render(frame, chunks[0]);
         } else {
-            self.build_delete_branch_dialog().render(frame, area);
+            self.build_delete_branch_dialog().render(frame, chunks[0]);
         }
+
+        let path_line = Line::from(vec![
+            Span::styled("Updating: ", Style::default().fg(colors::MUTED)),
+            Span::styled(
+                self.config_path.clone(),
+                Style::default().fg(colors::EMPHASIS),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(path_line), chunks[1]);
     }
 
     fn render_check_updates(&self, frame: &mut Frame, area: Rect) {

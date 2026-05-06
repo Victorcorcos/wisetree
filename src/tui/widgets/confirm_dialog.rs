@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
@@ -171,13 +171,15 @@ impl ConfirmDialog {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(confirm_border)),
+                .border_style(Style::default().fg(confirm_border))
+                .padding(Padding::horizontal(1)),
         );
         let cancel_box = Paragraph::new(cancel_text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(cancel_border)),
+                .border_style(Style::default().fg(cancel_border))
+                .padding(Padding::horizontal(1)),
         );
         frame.render_widget(confirm_box, button_cols[0]);
         frame.render_widget(cancel_box, button_cols[1]);

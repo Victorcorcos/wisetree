@@ -5,7 +5,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::{colors, UPDATE_AVAILABLE, UPDATE_INSTALL_CMD};
@@ -51,7 +51,8 @@ impl<'a> UpdateBanner<'a> {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::WARNING));
+            .border_style(Style::default().fg(colors::WARNING))
+            .padding(Padding::horizontal(1));
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
