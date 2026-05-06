@@ -1,0 +1,43 @@
+#!/usr/bin/env node
+// Runtime shim: locate the platform binary that postinstall set up and
+// `execvp` into it, forwarding all argv + stdio so the wrapper is fully
+// transparent (no inherited Node process between the user and Wisetree).
+
+const { spawnSync } = require("node:child_process");
+const path = require("node:path");
+
+const targets = {
+  "darwin arm64": { pkg: "wisetree-darwin-arm64", bin: "wisetree" },
+  "darwin x64": { pkg: "wisetree-darwin-x64", bin: "wisetree" },
+  "linux x64": { pkg: "wisetree-linux-x64-gnu", bin: "wisetree" },
+  "linux arm64": { pkg: "wisetree-linux-arm64-gnu", bin: "wisetree" },
+  "win32 x64": { pkg: "wisetree-win32-x64-msvc", bin: "wisetree.exe" },
+};
+
+const key = `${process.platform} ${process.arch}`;
+const target = targets[key];
+if (!target) {
+  console.error(`wisetree: no prebuilt binary for ${key}.`);
+  process.exit(1);
+}
+
+let binaryPath;
+try {
+  const pkgJson = require.resolve(`${target.pkg}/package.json`);
+  binaryPath = path.join(path.dirname(pkgJson), "bin", target.bin);
+} catch (err) {
+  console.error(
+    `wisetree: missing platform package '${target.pkg}'. ` +
+      "Try reinstalling: `npm install -g wisetree`."
+  );
+  process.exit(1);
+}
+
+const result = spawnSync(binaryPath, process.argv.slice(2), {
+  stdio: "inherit",
+});
+if (result.error) {
+  console.error(`wisetree: failed to spawn ${binaryPath}: ${result.error.message}`);
+  process.exit(1);
+}
+process.exit(result.status ?? 0);

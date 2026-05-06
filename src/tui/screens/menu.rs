@@ -1,0 +1,99 @@
+//! Main menu screen. Renders the welcome header above a `SelectPrompt`
+//! whose options mirror upstream's `MainPanel`. The optional
+//! "Setup Shell Integration" entry only appears when the shell-integration
+//! check has run and reports it isn't yet installed.
+
+use crossterm::event::KeyEvent;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::Frame;
+
+use crate::messages::{
+    colors, MENU_CREATE, MENU_DELETE, MENU_EXIT, MENU_LIST, MENU_SETTINGS, MENU_SETUP, MENU_TITLE,
+};
+use crate::tui::router::Screen;
+use crate::tui::widgets::welcome_header::WelcomeHeader;
+use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuChoice {
+    Setup,
+    Create,
+    List,
+    Delete,
+    Settings,
+    Exit,
+}
+
+pub enum MenuOutcome {
+    Selected(MenuChoice, usize),
+    Cancelled,
+    Pending,
+}
+
+pub struct MenuScreen {
+    select: SelectPrompt<MenuChoice>,
+    git_root: Option<String>,
+    has_setup_entry: bool,
+}
+
+impl MenuScreen {
+    /// `shell_installed = None` means "not yet known" (or unsupported shell)
+    /// — the setup entry stays hidden in both cases, matching upstream's
+    /// `shellIntegrationStatus && !isInstalled` guard.
+    pub fn new(
+        default_index: usize,
+        git_root: Option<String>,
+        shell_installed: Option<bool>,
+    ) -> Self {
+        let has_setup_entry = matches!(shell_installed, Some(false));
+        let mut options: Vec<SelectOption<MenuChoice>> = Vec::new();
+        if has_setup_entry {
+            options.push(
+                SelectOption::new(MENU_SETUP, MenuChoice::Setup)
+                    .with_color(colors::WARNING)
+                    .with_description("recommended"),
+            );
+        }
+        options.push(SelectOption::new(MENU_CREATE, MenuChoice::Create));
+        options.push(SelectOption::new(MENU_LIST, MenuChoice::List));
+        options.push(SelectOption::new(MENU_DELETE, MenuChoice::Delete));
+        options.push(SelectOption::new(MENU_SETTINGS, MenuChoice::Settings));
+        options.push(SelectOption::new(MENU_EXIT, MenuChoice::Exit));
+
+        let select = SelectPrompt::new(MENU_TITLE, options).with_default_index(default_index);
+        Self {
+            select,
+            git_root,
+            has_setup_entry,
+        }
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.select.selected
+    }
+
+    pub fn has_setup_entry(&self) -> bool {
+        self.has_setup_entry
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> MenuOutcome {
+        match self.select.handle_key(key) {
+            SelectOutcome::Selected(idx, choice) => MenuOutcome::Selected(choice, idx),
+            SelectOutcome::Cancelled => MenuOutcome::Cancelled,
+            SelectOutcome::Pending => MenuOutcome::Pending,
+        }
+    }
+
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(1)])
+            .split(area);
+
+        let cwd = self.git_root.as_deref().unwrap_or("");
+        let header = WelcomeHeader::new(Screen::Menu, cwd);
+        header.render(frame, chunks[0]);
+
+        self.select.render(frame, chunks[1]);
+    }
+}

@@ -1,0 +1,58 @@
+{
+  "$id": "https://raw.githubusercontent.com/victorcorcos/wisetree/main/schema.json",
+  "$schema": "http://json-schema.org/draft-7/schema#",
+  "additionalProperties": false,
+  "description": "Configuration schema for Wisetree - Git worktree management CLI",
+  "properties": {
+    "deleteBranchWithWorktree": {
+      "default": false,
+      "description": "Also delete the associated git branch when deleting a worktree",
+      "type": "boolean"
+    },
+    "postCreateCmd": {
+      "default": [],
+      "description": "Commands to run after creating a worktree. Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "terminalCommand": {
+      "default": "",
+      "description": "Command to open terminal in new worktree directory (e.g., 'code $WORKTREE_PATH')",
+      "type": "string"
+    },
+    "worktreeCopyIgnores": {
+      "default": [
+        "**/node_modules/**",
+        "**/dist/**",
+        "**/.git/**",
+        "**/Thumbs.db",
+        "**/.DS_Store"
+      ],
+      "description": "File patterns to ignore when copying (glob patterns supported)",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "worktreeCopyPatterns": {
+      "default": [
+        ".env*",
+        ".vscode/**"
+      ],
+      "description": "File patterns to copy to new worktrees (glob patterns supported)",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "worktreePathTemplate": {
+      "default": "$BASE_PATH.worktree",
+      "description": "Template for worktree directory names. Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",
+      "type": "string"
+    }
+  },
+  "title": "Wisetree Configuration",
+  "type": "object"
+}

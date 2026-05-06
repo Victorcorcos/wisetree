@@ -1,0 +1,42 @@
+{
+  "name": "wisetree",
+  "version": "1.2.0",
+  "description": "Interactive CLI for creating and managing Git worktrees",
+  "bin": {
+    "wisetree": "bin/wisetree"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md"
+  ],
+  "keywords": [
+    "git",
+    "worktree",
+    "cli",
+    "tui"
+  ],
+  "author": "Victor Cordeiro Costa",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/victorcorcos/wisetree.git"
+  },
+  "homepage": "https://github.com/victorcorcos/wisetree",
+  "bugs": {
+    "url": "https://github.com/victorcorcos/wisetree/issues"
+  },
+  "optionalDependencies": {
+    "wisetree-darwin-arm64": "1.2.0",
+    "wisetree-darwin-x64": "1.2.0",
+    "wisetree-linux-x64-gnu": "1.2.0",
+    "wisetree-linux-arm64-gnu": "1.2.0",
+    "wisetree-win32-x64-msvc": "1.2.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

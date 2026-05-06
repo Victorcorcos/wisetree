@@ -1,0 +1,109 @@
+use std::fs;
+use std::sync::{Arc, Mutex};
+
+use wisetree::config::WorktreeConfig;
+use wisetree::files::service::{copy_files, execute_post_create_commands, open_terminal};
+use wisetree::utils::path::TemplateVariables;
+
+#[tokio::test]
+async fn copy_files_copies_matched_set_and_skips_ignored() {
+    let src = tempfile::tempdir().expect("src");
+    let dst = tempfile::tempdir().expect("dst");
+
+    fs::write(src.path().join(".env"), "A=1").unwrap();
+    fs::write(src.path().join(".env.local"), "B=2").unwrap();
+    fs::create_dir_all(src.path().join(".vscode")).unwrap();
+    fs::write(src.path().join(".vscode/settings.json"), "{}").unwrap();
+    fs::create_dir_all(src.path().join("node_modules/foo")).unwrap();
+    fs::write(src.path().join("node_modules/foo/index.js"), "x").unwrap();
+    fs::write(src.path().join("README.md"), "hi").unwrap();
+
+    let config = WorktreeConfig::default();
+    let report = copy_files(src.path(), dst.path(), &config).await;
+
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert!(dst.path().join(".env").exists());
+    assert!(dst.path().join(".env.local").exists());
+    assert!(dst.path().join(".vscode/settings.json").exists());
+    assert!(!dst.path().join("node_modules").exists());
+    assert!(!dst.path().join("README.md").exists());
+}
+
+#[tokio::test]
+async fn copy_files_creates_target_dir_if_missing() {
+    let src = tempfile::tempdir().expect("src");
+    let dst_root = tempfile::tempdir().expect("dst root");
+    let dst = dst_root.path().join("nested/target");
+
+    fs::write(src.path().join(".env"), "X").unwrap();
+    let config = WorktreeConfig::default();
+    let report = copy_files(src.path(), &dst, &config).await;
+
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert!(dst.join(".env").exists());
+}
+
+#[tokio::test]
+async fn post_create_runs_commands_and_invokes_progress() {
+    let cwd = tempfile::tempdir().expect("cwd");
+    let progress = Arc::new(Mutex::new(Vec::<(String, usize, usize)>::new()));
+    let progress_clone = progress.clone();
+    let mut cb = move |cmd: &str, idx: usize, total: usize| {
+        progress_clone
+            .lock()
+            .unwrap()
+            .push((cmd.to_string(), idx, total));
+    };
+    let cb_dyn: &mut dyn FnMut(&str, usize, usize) = &mut cb;
+
+    let vars = TemplateVariables {
+        base_path: String::new(),
+        worktree_path: cwd.path().to_string_lossy().into_owned(),
+        branch_name: String::new(),
+        source_branch: String::new(),
+    };
+    let commands = vec!["echo hello > out.txt".to_string(), "false".to_string()];
+    let results = execute_post_create_commands(&commands, &vars, Some(cb_dyn)).await;
+
+    assert_eq!(results.len(), 2);
+    assert!(results[0].success);
+    assert!(!results[1].success);
+    assert!(cwd.path().join("out.txt").exists());
+
+    let snap = progress.lock().unwrap();
+    assert_eq!(snap.len(), 2);
+    assert_eq!(snap[0].2, 2);
+    assert_eq!(snap[0].1, 1);
+    assert_eq!(snap[1].1, 2);
+}
+
+#[tokio::test]
+async fn post_create_skips_blank_command_as_success() {
+    let vars = TemplateVariables::default();
+    let results = execute_post_create_commands(&[String::new(), "   ".into()], &vars, None).await;
+    assert_eq!(results.len(), 2);
+    assert!(results[0].success);
+    assert!(results[1].success);
+}
+
+#[tokio::test]
+async fn post_create_returns_empty_for_empty_input() {
+    let vars = TemplateVariables::default();
+    let results = execute_post_create_commands(&[], &vars, None).await;
+    assert!(results.is_empty());
+}
+
+#[test]
+fn open_terminal_noop_for_empty_command() {
+    let res = open_terminal("", "/tmp");
+    assert!(res.success);
+    assert!(res.command.is_empty());
+}
+
+#[test]
+fn open_terminal_resolves_template_and_spawns() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let res = open_terminal("true", tmp.path().to_str().unwrap());
+    assert!(res.success);
+    assert_eq!(res.command, "true");
+}
