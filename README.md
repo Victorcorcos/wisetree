@@ -105,6 +105,8 @@ wisetree
 
 You land on the main menu, where the available actions are:
 
+<img width="3450" height="526" alt="Screenshot 2026-05-07 at 02 23 33" src="https://github.com/user-attachments/assets/3288edb0-4b42-4428-a77d-d3ab7f18e00d" />
+
 | Menu entry | What it does |
 | --- | --- |
 | **Setup Shell Integration** | One-time installer for the shell wrapper + completions (only shown when integration is not yet installed). |
