@@ -28,6 +28,16 @@ use crate::utils::validation::{validate_branch_name, validate_directory_name};
 
 const CUSTOM_REF_VALUE: &str = "__CUSTOM_REF__";
 
+/// Branches surfaced first on the source-branch picker. New worktrees are
+/// almost always cut from one of these, so listing them above the recency-
+/// sorted remainder saves a search/scroll on every create.
+const PRIORITY_SOURCE_BRANCHES: [&str; 4] = [
+    "upstream/main",
+    "upstream/master",
+    "origin/main",
+    "origin/master",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateStep {
     Directory,
@@ -116,7 +126,7 @@ impl CreateScreen {
     }
 
     pub fn set_branches(&mut self, branches: Vec<GitBranch>) {
-        self.branches = Arc::new(branches);
+        self.branches = Arc::new(prioritize_branches(branches));
         self.loading = false;
     }
 
@@ -200,13 +210,6 @@ impl CreateScreen {
         opts
     }
 
-    fn default_branch_index(&self) -> usize {
-        self.branches
-            .iter()
-            .position(|b| b.is_current || b.is_default)
-            .unwrap_or(0)
-    }
-
     fn validate_new_branch(branches: Arc<Vec<GitBranch>>, name: &str) -> Option<String> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -260,9 +263,7 @@ impl CreateScreen {
 
     fn build_source_select(&self) -> SelectPrompt<String> {
         let opts = self.branch_options();
-        SelectPrompt::new(CREATE_SOURCE_BRANCH_PROMPT, opts)
-            .searchable()
-            .with_default_index(self.default_branch_index())
+        SelectPrompt::new(CREATE_SOURCE_BRANCH_PROMPT, opts).searchable()
     }
 
     fn handle_source_branch(&mut self, key: KeyEvent) -> CreateAction {
@@ -478,6 +479,27 @@ impl Default for CreateScreen {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn prioritize_branches(branches: Vec<GitBranch>) -> Vec<GitBranch> {
+    let mut priority: Vec<GitBranch> = Vec::new();
+    let mut rest: Vec<GitBranch> = Vec::new();
+    for branch in branches {
+        if PRIORITY_SOURCE_BRANCHES.contains(&branch.name.as_str()) {
+            priority.push(branch);
+        } else {
+            rest.push(branch);
+        }
+    }
+    priority.sort_by_key(|b| {
+        PRIORITY_SOURCE_BRANCHES
+            .iter()
+            .position(|p| *p == b.name.as_str())
+            .unwrap_or(usize::MAX)
+    });
+    rest.sort_by(|a, b| a.name.cmp(&b.name));
+    priority.extend(rest);
+    priority
 }
 
 fn directory_input() -> InputPrompt {
