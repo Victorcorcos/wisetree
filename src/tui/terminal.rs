@@ -296,10 +296,7 @@ pub fn enter() -> io::Result<Terminal> {
     let backend = AdaptiveBackend::new(io::stdout());
     let size = backend.size()?;
     let viewport = app_viewport(size);
-    let mut terminal = RatTerminal::with_options(
-        backend,
-        TerminalOptions { viewport },
-    )?;
+    let mut terminal = RatTerminal::with_options(backend, TerminalOptions { viewport })?;
     clear_terminal_for_app(&mut terminal)?;
     Ok(terminal)
 }

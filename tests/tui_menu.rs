@@ -175,12 +175,7 @@ fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
     assert_text_style(&buffer, "Wisetree", colors::BRAND, colors::HEADER_BG);
     assert_text_style(&buffer, "/tmp/repo", colors::MENU_TEXT, colors::HEADER_BG);
     // Titles like "Choose wisely..." use the teal info color.
-    assert_text_style(
-        &buffer,
-        "Choose wisely...",
-        colors::INFO,
-        colors::MENU_BG,
-    );
+    assert_text_style(&buffer, "Choose wisely...", colors::INFO, colors::MENU_BG);
     assert_text_style(
         &buffer,
         "Create new worktree",

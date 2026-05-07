@@ -260,7 +260,10 @@ impl SetupScreen {
             .constraints([Constraint::Length(2), Constraint::Min(1)])
             .split(area);
         let intro = Line::from(vec![
-            Span::styled("Shell integration wraps the ", Style::default().fg(colors::INFO)),
+            Span::styled(
+                "Shell integration wraps the ",
+                Style::default().fg(colors::INFO),
+            ),
             Span::styled(
                 "wisetree",
                 Style::default()

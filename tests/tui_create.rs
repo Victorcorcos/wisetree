@@ -117,8 +117,8 @@ fn select_source_branch_advances_to_new_branch_with_directory_default() {
     let mut s = ready_screen();
     type_str(&mut s, "feat-login");
     s.handle_key(key(KeyCode::Enter)); // → source-branch
-    // Branches sort alphabetically: develop, main, origin/feat/login. The first row
-    // is selected by default, so Enter picks "develop".
+                                       // Branches sort alphabetically: develop, main, origin/feat/login. The first row
+                                       // is selected by default, so Enter picks "develop".
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), CreateStep::NewBranch);
     assert_eq!(s.source_branch, "develop");

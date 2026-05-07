@@ -581,8 +581,7 @@ Safety features:\n\
             let install_style = Style::default()
                 .fg(colors::PRIMARY)
                 .add_modifier(Modifier::BOLD);
-            let mut run_spans =
-                vec![Span::styled("Run: ", Style::default().fg(colors::MUTED))];
+            let mut run_spans = vec![Span::styled("Run: ", Style::default().fg(colors::MUTED))];
             run_spans.extend(branded_line(UPDATE_INSTALL_CMD, install_style));
             lines.push(Line::from(run_spans));
         } else if result.error.is_some() {

@@ -409,8 +409,7 @@ impl<T: Clone> SelectPrompt<T> {
                 // The selected row reads as one bold bar — keeping the brand
                 // accent inside it would fight the selection. Only style
                 // unselected, non-disabled, non-color-overridden rows.
-                let allow_brand =
-                    !is_selected && !option.disabled && option.color.is_none();
+                let allow_brand = !is_selected && !option.disabled && option.color.is_none();
                 if allow_brand {
                     let brand_style = Style::default().fg(colors::BRAND).bg(row_bg);
                     spans.extend(branded_spans(&option.label, row_style, brand_style));
@@ -496,11 +495,13 @@ pub fn branded_spans(text: &str, base_style: Style, brand_style: Style) -> Vec<S
                 if prev_alnum || next_alnum {
                     continue;
                 }
-                hit = Some(match hit {
-                    Some((existing, _)) if existing <= abs => Some((existing, hit.unwrap().1)),
-                    _ => Some((abs, end)),
-                }
-                .unwrap());
+                hit = Some(
+                    match hit {
+                        Some((existing, _)) if existing <= abs => Some((existing, hit.unwrap().1)),
+                        _ => Some((abs, end)),
+                    }
+                    .unwrap(),
+                );
             }
         }
         match hit {

@@ -73,10 +73,7 @@ impl StatusIndicator {
 
     pub fn render(self, frame: &mut Frame, area: Rect) {
         let style = Style::default().fg(self.color());
-        let mut spans: Vec<Span<'static>> = vec![
-            Span::styled(self.icon(), style),
-            Span::raw(" "),
-        ];
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(self.icon(), style), Span::raw(" ")];
         spans.extend(branded_line(&self.message, style));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
