@@ -9,27 +9,27 @@
 class Wisetree < Formula
   desc "Interactive CLI for creating and managing Git worktrees"
   homepage "https://github.com/victorcorcos/wisetree"
-  version "1.2.0"
+  version "1.0.0"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/victorcorcos/wisetree/releases/download/v1.2.0/wisetree-aarch64-apple-darwin.tar.xz"
+      url "https://github.com/victorcorcos/wisetree/releases/download/v1.0.0/wisetree-aarch64-apple-darwin.tar.xz"
       sha256 "REPLACE_WITH_RELEASE_SHA"
     end
     on_intel do
-      url "https://github.com/victorcorcos/wisetree/releases/download/v1.2.0/wisetree-x86_64-apple-darwin.tar.xz"
+      url "https://github.com/victorcorcos/wisetree/releases/download/v1.0.0/wisetree-x86_64-apple-darwin.tar.xz"
       sha256 "REPLACE_WITH_RELEASE_SHA"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/victorcorcos/wisetree/releases/download/v1.2.0/wisetree-aarch64-unknown-linux-gnu.tar.xz"
+      url "https://github.com/victorcorcos/wisetree/releases/download/v1.0.0/wisetree-aarch64-unknown-linux-gnu.tar.xz"
       sha256 "REPLACE_WITH_RELEASE_SHA"
     end
     on_intel do
-      url "https://github.com/victorcorcos/wisetree/releases/download/v1.2.0/wisetree-x86_64-unknown-linux-gnu.tar.xz"
+      url "https://github.com/victorcorcos/wisetree/releases/download/v1.0.0/wisetree-x86_64-unknown-linux-gnu.tar.xz"
       sha256 "REPLACE_WITH_RELEASE_SHA"
     end
   end

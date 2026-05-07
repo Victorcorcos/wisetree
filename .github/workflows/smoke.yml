@@ -15,7 +15,7 @@ on:
       version:
         description: "Wisetree version to smoke-test (without leading v)"
         required: true
-        default: "1.2.0"
+        default: "1.0.0"
 
 jobs:
   smoke:
