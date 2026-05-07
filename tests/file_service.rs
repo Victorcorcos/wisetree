@@ -54,7 +54,7 @@ async fn post_create_runs_commands_and_invokes_progress() {
             .unwrap()
             .push((cmd.to_string(), idx, total));
     };
-    let cb_dyn: &mut dyn FnMut(&str, usize, usize) = &mut cb;
+    let cb_dyn: &mut (dyn FnMut(&str, usize, usize) + Send) = &mut cb;
 
     let vars = TemplateVariables {
         base_path: String::new(),

@@ -136,7 +136,7 @@ async fn create_worktree_runs_post_create_commands_with_progress() {
                     .unwrap()
                     .push((cmd.to_string(), idx, total));
             };
-            let cb_dyn: &mut dyn FnMut(&str, usize, usize) = &mut cb;
+            let cb_dyn: &mut (dyn FnMut(&str, usize, usize) + Send) = &mut cb;
             let outcome = svc
                 .create_worktree(&opts, Some(cb_dyn))
                 .await

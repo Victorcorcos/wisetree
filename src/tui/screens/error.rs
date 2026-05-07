@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::messages::{colors, HINT_CTRL_C_EXIT};
+use crate::tui::widgets::branded_line;
 
 pub fn draw(frame: &mut Frame, area: Rect, message: &str, show_reset_confirm: bool) {
     let chunks = Layout::default()
@@ -39,8 +40,13 @@ pub fn draw(frame: &mut Frame, area: Rect, message: &str, show_reset_confirm: bo
     } else {
         format!("{message}\n\nPress 'r' to reset configuration, any other key to return to menu.")
     };
-    let body = Paragraph::new(body_text)
-        .style(Style::default().fg(colors::EMPHASIS))
+    let body_style = Style::default().fg(colors::EMPHASIS);
+    let body_lines: Vec<Line> = body_text
+        .split('\n')
+        .map(|line| Line::from(branded_line(line, body_style)))
+        .collect();
+    let body = Paragraph::new(body_lines)
+        .style(body_style)
         .wrap(Wrap { trim: false })
         .block(
             Block::default()

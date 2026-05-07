@@ -24,8 +24,8 @@ use crate::messages::{
 };
 use crate::services::UpdateCheckResult;
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmVariant, SelectOption, SelectOutcome, SelectPrompt,
-    Status, StatusIndicator,
+    branded_line, ConfirmChoice, ConfirmDialog, ConfirmVariant, SelectOption, SelectOutcome,
+    SelectPrompt, Status, StatusIndicator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,28 +345,23 @@ impl SettingsScreen {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let lines: Vec<Line> = std::iter::once(Line::from(Span::styled(
-            title.to_string(),
-            Style::default()
-                .fg(colors::INFO)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .chain(std::iter::once(Line::from(Span::styled(
-            hint.to_string(),
-            Style::default().fg(colors::MUTED),
-        ))))
-        .chain(
-            items
-                .into_iter()
-                .map(|s| Line::from(vec![Span::raw("  • "), Span::raw(s.into())])),
-        )
-        .chain(std::iter::once(Line::from(Span::styled(
-            format!("Edit in {}. Press any key to go back.", self.config_path),
-            Style::default()
-                .fg(colors::MUTED)
-                .add_modifier(Modifier::DIM),
-        ))))
-        .collect();
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(colors::MUTED);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+        let lines: Vec<Line> = std::iter::once(Line::from(branded_line(title, title_style)))
+            .chain(std::iter::once(Line::from(branded_line(hint, muted_style))))
+            .chain(items.into_iter().map(|s| {
+                let mut spans = vec![Span::raw("  • ")];
+                spans.extend(branded_line(&s.into(), Style::default()));
+                Line::from(spans)
+            }))
+            .chain(std::iter::once(Line::from(branded_line(
+                &format!("Edit in {}. Press any key to go back.", self.config_path),
+                dim_muted_style,
+            ))))
+            .collect();
         frame.render_widget(Paragraph::new(lines), area);
     }
 
@@ -391,95 +386,85 @@ impl SettingsScreen {
     }
 
     fn render_path_template(&self, frame: &mut Frame, area: Rect) {
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
+        let success_style = Style::default().fg(colors::SUCCESS);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
         let lines = vec![
-            Line::from(Span::styled(
-                "Worktree Path Template",
-                Style::default()
-                    .fg(colors::INFO)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
+            Line::from(branded_line("Worktree Path Template", title_style)),
+            Line::from(branded_line(
                 "Template for worktree directory paths:",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
-                format!("  {}", self.config.worktree_path_template),
-                Style::default().fg(colors::SUCCESS),
+            Line::from(branded_line(
+                &format!("  {}", self.config.worktree_path_template),
+                success_style,
             )),
-            Line::from(Span::styled(
-                "Available variables:",
-                Style::default().fg(colors::INFO),
-            )),
-            Line::from(Span::styled(
+            Line::from(branded_line("Available variables:", info_style)),
+            Line::from(branded_line(
                 "  • $BASE_PATH - Repository name",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
+            Line::from(branded_line(
                 "  • $WORKTREE_PATH - Full worktree path",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
+            Line::from(branded_line(
                 "  • $BRANCH_NAME - New branch name",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
-                format!("Edit in {}. Press any key to go back.", self.config_path),
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
+            Line::from(branded_line(
+                &format!("Edit in {}. Press any key to go back.", self.config_path),
+                dim_muted_style,
             )),
         ];
         frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_post_cmd(&self, frame: &mut Frame, area: Rect) {
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
         let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                "Post-Create Commands",
-                Style::default()
-                    .fg(colors::INFO)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
+            Line::from(branded_line("Post-Create Commands", title_style)),
+            Line::from(branded_line(
                 "Commands executed after creating a worktree (in order):",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
         ];
         if self.config.post_create_cmd.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  (none)",
-                Style::default().fg(colors::MUTED),
-            )));
+            lines.push(Line::from(Span::styled("  (none)", muted_style)));
         } else {
             for (i, cmd) in self.config.post_create_cmd.iter().enumerate() {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {}.", i + 1), Style::default().fg(colors::MUTED)),
+                    Span::styled(format!("  {}.", i + 1), muted_style),
                     Span::raw(format!(" {cmd}")),
                 ]));
             }
         }
         lines.extend([
-            Line::from(Span::styled(
-                "Available variables:",
-                Style::default().fg(colors::INFO),
-            )),
-            Line::from(Span::styled(
+            Line::from(branded_line("Available variables:", info_style)),
+            Line::from(branded_line(
                 "  • $WORKTREE_PATH - Path to new worktree",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
+            Line::from(branded_line(
                 "  • $BRANCH_NAME - New branch name",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
+            Line::from(branded_line(
                 "  • $SOURCE_BRANCH - Source branch name",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
-                format!("Edit in {}. Press any key to go back.", self.config_path),
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
+            Line::from(branded_line(
+                &format!("Edit in {}. Press any key to go back.", self.config_path),
+                dim_muted_style,
             )),
         ]);
         frame.render_widget(Paragraph::new(lines), area);
@@ -491,34 +476,28 @@ impl SettingsScreen {
         } else {
             self.config.terminal_command.clone()
         };
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
+        let success_style = Style::default().fg(colors::SUCCESS);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
         let lines = vec![
-            Line::from(Span::styled(
-                "Terminal Command",
-                Style::default()
-                    .fg(colors::INFO)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
+            Line::from(branded_line("Terminal Command", title_style)),
+            Line::from(branded_line(
                 "Command to open terminal in new worktree:",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
-                format!("  {value}"),
-                Style::default().fg(colors::SUCCESS),
-            )),
-            Line::from(Span::styled(
-                "Available variables:",
-                Style::default().fg(colors::INFO),
-            )),
-            Line::from(Span::styled(
+            Line::from(branded_line(&format!("  {value}"), success_style)),
+            Line::from(branded_line("Available variables:", info_style)),
+            Line::from(branded_line(
                 "  • $WORKTREE_PATH - Path to new worktree",
-                Style::default().fg(colors::MUTED),
+                muted_style,
             )),
-            Line::from(Span::styled(
-                format!("Edit in {}. Press any key to go back.", self.config_path),
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
+            Line::from(branded_line(
+                &format!("Edit in {}. Press any key to go back.", self.config_path),
+                dim_muted_style,
             )),
         ];
         frame.render_widget(Paragraph::new(lines), area);
@@ -599,15 +578,13 @@ Safety features:\n\
                 "Current version: v{}",
                 result.current_version
             )));
-            lines.push(Line::from(vec![
-                Span::styled("Run: ", Style::default().fg(colors::MUTED)),
-                Span::styled(
-                    UPDATE_INSTALL_CMD,
-                    Style::default()
-                        .fg(colors::PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            let install_style = Style::default()
+                .fg(colors::PRIMARY)
+                .add_modifier(Modifier::BOLD);
+            let mut run_spans =
+                vec![Span::styled("Run: ", Style::default().fg(colors::MUTED))];
+            run_spans.extend(branded_line(UPDATE_INSTALL_CMD, install_style));
+            lines.push(Line::from(run_spans));
         } else if result.error.is_some() {
             lines.push(Line::from(Span::styled(
                 UPDATE_FAILED.to_string(),

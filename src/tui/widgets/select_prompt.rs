@@ -310,15 +310,13 @@ impl<T: Clone> SelectPrompt<T> {
         let chunks = layout.split(area);
 
         let mut idx = 0;
-        let title = Paragraph::new(Line::from(Span::styled(
-            self.label.clone(),
-            Style::default()
-                .fg(colors::INFO)
-                .bg(colors::MENU_BG)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Left)
-        .style(panel_style);
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .bg(colors::MENU_BG)
+            .add_modifier(Modifier::BOLD);
+        let title = Paragraph::new(Line::from(branded_line(&self.label, title_style)))
+            .alignment(Alignment::Left)
+            .style(panel_style);
         frame.render_widget(title, chunks[idx]);
         idx += 1;
         // blank spacer
@@ -462,6 +460,14 @@ impl<T: Clone> SelectPrompt<T> {
             );
         }
     }
+}
+
+/// Split `text` into spans, recoloring brand words (`worktree`,
+/// `worktrees`, `wisetree`) with `colors::BRAND` while keeping every
+/// other attribute of `base_style` (background, modifiers) intact.
+pub fn branded_line(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let brand_style = base_style.fg(colors::BRAND);
+    branded_spans(text, base_style, brand_style)
 }
 
 /// Split `text` into spans, applying `brand_style` to occurrences of

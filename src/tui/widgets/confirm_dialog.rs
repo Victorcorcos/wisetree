@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
+use crate::tui::widgets::select_prompt::branded_line;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmChoice {
@@ -117,15 +118,19 @@ impl ConfirmDialog {
             ])
             .split(area);
 
-        let title = Paragraph::new(Span::styled(
-            self.title.clone(),
-            Style::default()
-                .fg(self.variant.color())
-                .add_modifier(Modifier::BOLD),
-        ));
+        let title_style = Style::default()
+            .fg(self.variant.color())
+            .add_modifier(Modifier::BOLD);
+        let title = Paragraph::new(Line::from(branded_line(&self.title, title_style)));
         frame.render_widget(title, chunks[0]);
 
-        frame.render_widget(Paragraph::new(self.message.clone()), chunks[2]);
+        let message_style = Style::default().fg(colors::WHITE);
+        let message_lines: Vec<Line> = self
+            .message
+            .split('\n')
+            .map(|line| Line::from(branded_line(line, message_style)))
+            .collect();
+        frame.render_widget(Paragraph::new(message_lines), chunks[2]);
 
         let buttons_area = chunks[3];
         let confirm_width = self.confirm_label.chars().count() as u16 + 4;

@@ -36,7 +36,7 @@ pub struct TerminalLaunch {
 
 /// Progress callback for `execute_post_create_commands`. Receives the raw
 /// command, its 1-based index, and the total count.
-pub type ProgressCallback<'a> = &'a mut dyn FnMut(&str, usize, usize);
+pub type ProgressCallback<'a> = &'a mut (dyn FnMut(&str, usize, usize) + Send);
 
 /// Copy every file matching `config.worktreeCopyPatterns` from `source_dir`
 /// to `target_dir`, respecting `worktreeCopyIgnores`. Directories listed in

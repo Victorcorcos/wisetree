@@ -27,8 +27,8 @@ use crate::messages::{
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, SelectOption, SelectOutcome,
-    SelectPrompt, Status, StatusIndicator,
+    branded_line, ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, SelectOption,
+    SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,8 +348,9 @@ impl DeleteScreen {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(2)])
                 .split(area);
+            let err_style = Style::default().fg(colors::ERROR);
             frame.render_widget(
-                Paragraph::new(err.clone()).style(Style::default().fg(colors::ERROR)),
+                Paragraph::new(Line::from(branded_line(err, err_style))),
                 chunks[0],
             );
             frame.render_widget(
@@ -364,9 +365,12 @@ impl DeleteScreen {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Length(2)])
                 .split(area);
+            let info_style = Style::default().fg(colors::INFO);
             frame.render_widget(
-                Paragraph::new("No additional worktrees to delete.")
-                    .style(Style::default().fg(colors::INFO)),
+                Paragraph::new(Line::from(branded_line(
+                    "No additional worktrees to delete.",
+                    info_style,
+                ))),
                 chunks[0],
             );
             frame.render_widget(

@@ -20,8 +20,9 @@ use crate::messages::{
     CREATE_SUCCESS, LOADING_BRANCHES,
 };
 use crate::tui::widgets::{
-    CommandListProgress, ConfirmDialog, ConfirmOutcome, ConfirmVariant, InputOutcome, InputPrompt,
-    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+    branded_line, CommandListProgress, ConfirmChoice, ConfirmDialog, ConfirmOutcome,
+    ConfirmVariant, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status,
+    StatusIndicator,
 };
 use crate::utils::validation::{validate_branch_name, validate_directory_name};
 
@@ -360,7 +361,9 @@ impl CreateScreen {
                 self.directory_name, self.new_branch, self.source_branch
             )
         };
-        ConfirmDialog::new(CREATE_CONFIRM_TITLE, message).with_variant(ConfirmVariant::Default)
+        ConfirmDialog::new(CREATE_CONFIRM_TITLE, message)
+            .with_variant(ConfirmVariant::Default)
+            .with_default(ConfirmChoice::Confirm)
     }
 
     fn handle_confirm(&mut self, key: KeyEvent) -> CreateAction {
@@ -411,8 +414,9 @@ impl CreateScreen {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(2)])
                 .split(area);
+            let err_style = Style::default().fg(colors::ERROR);
             frame.render_widget(
-                Paragraph::new(Line::from(msg.clone())).style(Style::default().fg(colors::ERROR)),
+                Paragraph::new(Line::from(branded_line(msg, err_style))),
                 chunks[0],
             );
             frame.render_widget(

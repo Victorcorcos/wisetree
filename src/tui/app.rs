@@ -802,7 +802,7 @@ fn kick_off_create_worktree(
     options: WorktreeCreateOptions,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    tokio::task::spawn_local(async move {
+    tokio::spawn(async move {
         let mut service = WorktreeService::new(git_root.map(PathBuf::from));
         if let Err(err) = service.initialize().await {
             let _ = tx.send(AppEvent::CreateFinished(Err(user_friendly_message(&err))));

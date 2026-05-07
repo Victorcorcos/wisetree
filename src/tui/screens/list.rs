@@ -1,8 +1,10 @@
 //! List Worktrees screen. Two navigation modes:
-//! - `List`: shows the worktrees in a two-column table with `➤` cursor; up/
-//!   down/jk navigate, numeric 1–9 jumps to that row, Enter opens the
-//!   per-row action menu, `e` opens via the configured `terminalCommand`,
-//!   Esc returns to the menu.
+//! - `List`: shows the worktrees through the shared `SelectPrompt` widget,
+//!   so the design matches the main "Choose wisely..." menu and the Settings
+//!   screen (title, full-width selection bar, numbered rows). Up/down/jk
+//!   navigate, numeric 1–9 jumps to that row, Enter opens the per-row action
+//!   menu, `e` opens via the configured `terminalCommand`, Esc returns to the
+//!   menu.
 //! - `ActionMenu`: shows "Navigate to Directory" (only enabled when invoked
 //!   via the wrapper) and, when configured, "Open with Command".
 //!
@@ -10,8 +12,8 @@
 //! `set_worktrees`/`set_error`, and reacts to `ListAction::OpenTerminal`,
 //! `ListAction::NavigateTo`, etc.
 
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -21,7 +23,7 @@ use crate::git::types::GitWorktree;
 use crate::messages::{colors, GIT_ERROR_LIST, LIST_NO_WORKTREES, LOADING_WORKTREES};
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator, SELECT_CURSOR,
+    branded_line, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +48,7 @@ enum ActionChoice {
 
 pub struct ListScreen {
     worktrees: Vec<GitWorktree>,
-    selected: usize,
+    select: Option<SelectPrompt<usize>>,
     mode: NavigationMode,
     is_from_wrapper: bool,
     has_terminal_command: bool,
@@ -60,7 +62,7 @@ impl ListScreen {
     pub fn new(is_from_wrapper: bool, has_terminal_command: bool) -> Self {
         Self {
             worktrees: Vec::new(),
-            selected: 0,
+            select: None,
             mode: NavigationMode::List,
             is_from_wrapper,
             has_terminal_command,
@@ -84,13 +86,17 @@ impl ListScreen {
     }
 
     pub fn selected_index(&self) -> usize {
-        self.selected
+        self.select.as_ref().map(|s| s.selected).unwrap_or(0)
     }
 
     pub fn set_worktrees(&mut self, worktrees: Vec<GitWorktree>) {
         // Match upstream: drop the main worktree from the list view.
         self.worktrees = worktrees.into_iter().filter(|w| !w.is_main).collect();
-        self.selected = 0;
+        self.select = if self.worktrees.is_empty() {
+            None
+        } else {
+            Some(self.build_main_select())
+        };
         self.loading = false;
         self.error = None;
     }
@@ -98,6 +104,18 @@ impl ListScreen {
     pub fn set_error(&mut self, message: String) {
         self.error = Some(message);
         self.loading = false;
+    }
+
+    fn build_main_select(&self) -> SelectPrompt<usize> {
+        let opts: Vec<SelectOption<usize>> = self
+            .worktrees
+            .iter()
+            .enumerate()
+            .map(|(i, wt)| {
+                SelectOption::new(fold_home(&wt.path), i).with_description(wt.branch.clone())
+            })
+            .collect();
+        SelectPrompt::new("Select a worktree:", opts).without_hint()
     }
 
     fn build_action_select(&self, _selected: &GitWorktree) -> SelectPrompt<ActionChoice> {
@@ -136,65 +154,33 @@ impl ListScreen {
             return self.handle_action_menu(key);
         }
 
-        match key.code {
-            KeyCode::Esc => ListAction::Back,
-            KeyCode::Up => {
-                self.selected = if self.selected == 0 {
-                    self.worktrees.len() - 1
-                } else {
-                    self.selected - 1
-                };
-                ListAction::Continue
+        if let KeyCode::Char(c) = key.code {
+            let lower = c.to_ascii_lowercase();
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if plain && lower == 'e' {
+                if self.has_terminal_command {
+                    let idx = self.selected_index();
+                    return ListAction::OpenTerminal(self.worktrees[idx].path.clone());
+                }
+                return ListAction::Continue;
             }
-            KeyCode::Down => {
-                self.selected = if self.selected + 1 >= self.worktrees.len() {
-                    0
-                } else {
-                    self.selected + 1
-                };
-                ListAction::Continue
-            }
-            KeyCode::Enter => {
-                let wt = self.worktrees[self.selected].clone();
+        }
+
+        let select = match self.select.as_mut() {
+            Some(s) => s,
+            None => return ListAction::Continue,
+        };
+        match select.handle_key(key) {
+            SelectOutcome::Selected(idx, _) => {
+                let wt = self.worktrees[idx].clone();
                 self.action_select = Some(self.build_action_select(&wt));
                 self.mode = NavigationMode::ActionMenu;
                 ListAction::Continue
             }
-            KeyCode::Char(c) => match c.to_ascii_lowercase() {
-                'k' => {
-                    self.selected = if self.selected == 0 {
-                        self.worktrees.len() - 1
-                    } else {
-                        self.selected - 1
-                    };
-                    ListAction::Continue
-                }
-                'j' => {
-                    self.selected = if self.selected + 1 >= self.worktrees.len() {
-                        0
-                    } else {
-                        self.selected + 1
-                    };
-                    ListAction::Continue
-                }
-                'e' => {
-                    if self.has_terminal_command {
-                        ListAction::OpenTerminal(self.worktrees[self.selected].path.clone())
-                    } else {
-                        ListAction::Continue
-                    }
-                }
-                d if d.is_ascii_digit() => {
-                    if let Some(n) = d.to_digit(10) {
-                        if n >= 1 && (n as usize) <= self.worktrees.len().min(9) {
-                            self.selected = n as usize - 1;
-                        }
-                    }
-                    ListAction::Continue
-                }
-                _ => ListAction::Continue,
-            },
-            _ => ListAction::Continue,
+            SelectOutcome::Cancelled => ListAction::Back,
+            SelectOutcome::Pending => ListAction::Continue,
         }
     }
 
@@ -208,7 +194,7 @@ impl ListScreen {
         };
         match select.handle_key(key) {
             SelectOutcome::Selected(_, choice) => {
-                let path = self.worktrees[self.selected].path.clone();
+                let path = self.worktrees[self.selected_index()].path.clone();
                 self.action_select = None;
                 self.mode = NavigationMode::List;
                 match choice {
@@ -243,7 +229,8 @@ impl ListScreen {
         if self.worktrees.is_empty() {
             return 4;
         }
-        // header row + N rows + spacer + hint
+        // SelectPrompt body: title (1) + spacer (1) + N rows + custom hint (1)
+        // + a row of breathing room.
         4 + self.worktrees.len() as u16
     }
 
@@ -259,9 +246,10 @@ impl ListScreen {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(2)])
                 .split(area);
+            let err_style = Style::default().fg(colors::ERROR);
+            let err_text = format!("{GIT_ERROR_LIST}: {err}");
             frame.render_widget(
-                Paragraph::new(format!("{GIT_ERROR_LIST}: {err}"))
-                    .style(Style::default().fg(colors::ERROR)),
+                Paragraph::new(Line::from(branded_line(&err_text, err_style))),
                 chunks[0],
             );
             frame.render_widget(
@@ -276,8 +264,9 @@ impl ListScreen {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Length(2)])
                 .split(area);
+            let info_style = Style::default().fg(colors::INFO);
             frame.render_widget(
-                Paragraph::new(LIST_NO_WORKTREES).style(Style::default().fg(colors::INFO)),
+                Paragraph::new(Line::from(branded_line(LIST_NO_WORKTREES, info_style))),
                 chunks[0],
             );
             frame.render_widget(
@@ -293,74 +282,66 @@ impl ListScreen {
             return;
         }
 
-        let mut constraints = vec![Constraint::Length(1)];
-        for _ in &self.worktrees {
-            constraints.push(Constraint::Length(1));
-        }
-        constraints.push(Constraint::Length(1));
-        constraints.push(Constraint::Length(1));
-        constraints.push(Constraint::Min(0));
-
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(area);
 
-        let header_row = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(chunks[0]);
-        frame.render_widget(
-            Paragraph::new("PATH").style(
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            header_row[0],
-        );
-        frame.render_widget(
-            Paragraph::new("BRANCH").alignment(Alignment::Right).style(
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            header_row[1],
-        );
-
-        for (i, wt) in self.worktrees.iter().enumerate() {
-            let row_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .split(chunks[1 + i]);
-            let is_selected = i == self.selected;
-            let marker = if is_selected { SELECT_CURSOR } else { "  " };
-            let path_style = if is_selected {
-                Style::default().fg(colors::PRIMARY)
-            } else {
-                Style::default()
-            };
-            let path_line = Line::from(vec![
-                Span::styled(marker, path_style),
-                Span::styled(fold_home(&wt.path), path_style),
-            ]);
-            frame.render_widget(Paragraph::new(path_line), row_chunks[0]);
-            frame.render_widget(
-                Paragraph::new(wt.branch.clone())
-                    .alignment(Alignment::Right)
-                    .style(Style::default().fg(colors::SUCCESS)),
-                row_chunks[1],
-            );
+        if let Some(select) = &self.select {
+            select.render(frame, chunks[0]);
         }
 
-        let hint = "↑↓/jk Navigate • Enter Action Menu • E Command • Esc Back";
-        frame.render_widget(
-            Paragraph::new(hint).style(
+        let hint = Line::from(vec![
+            Span::styled(
+                "↑↓/jk ",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM),
+            ),
+            Span::styled(
+                "Navigate  ",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),
             ),
-            chunks[1 + self.worktrees.len() + 1],
-        );
+            Span::styled(
+                "↵ ",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM),
+            ),
+            Span::styled(
+                "Action Menu  ",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                "E ",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM),
+            ),
+            Span::styled(
+                "Command  ",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                "⎋ ",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM),
+            ),
+            Span::styled(
+                "Back",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(hint), chunks[1]);
     }
 
     fn render_action_menu(&self, frame: &mut Frame, area: Rect) {
@@ -368,7 +349,7 @@ impl ListScreen {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(1)])
             .split(area);
-        let wt = &self.worktrees[self.selected];
+        let wt = &self.worktrees[self.selected_index()];
         let header = Line::from(vec![
             Span::raw("Selected: "),
             Span::styled(fold_home(&wt.path), Style::default().fg(colors::PRIMARY)),
