@@ -4,20 +4,23 @@
   <img src="https://i.imgur.com/vO0AOis.gif" alt="Wisetree" width="50%" />
 </div>
 
+https://github.com/user-attachments/assets/c65f1144-6a01-49d7-bed3-967da8e3a854
+
 **Wisetree** is an interactive, terminal-first manager for `git worktree`s. It wraps the raw `git worktree` plumbing in a polished TUI (built with Rust + Ratatui) and a scriptable CLI, so creating, listing, navigating, and deleting worktrees becomes a single keystroke instead of a paragraph of commands.
 
-It is purpose-built for developers who run **multiple AI coding agents in parallel** — `Claude Code`, `Codex CLI`, `Gemini CLI`, `Opencode`, `Cursor`, `Aider`, and friends — each on its own branch, each in its own isolated checkout, all stacked on top of the same repository.
+It is purpose-built for developers who run **multiple AI coding agents in parallel**, including `Claude Code`, `Codex CLI`, `Gemini CLI`, `Opencode`, `Cursor`, `Aider`, and friends, each on its own branch, each in its own isolated checkout, all stacked on top of the same repository.
 
 # 🤔 Why?
 
-A `git worktree` lets a single repository have **multiple working directories checked out at the same time**, each pointing to a different branch. No stashing, no `git checkout` dance, no losing your place — just a clean, parallel copy of the codebase.
+A `git worktree` lets a single repository have **multiple working directories checked out at the same time**, each pointing to a different branch. No stashing, no `git checkout` dance, and no losing your place. Just a clean, parallel copy of the codebase.
 
 That capability is great. The raw ergonomics around it are not.
 
-If you have ever tried to spin up three or four agents at once, you have probably hit some — or all — of the following:
+If you have ever tried to spin up three or four agents at once, you have probably hit at least one of the following problems:
 
 - Re-typing long `git worktree add ../repo.feature-x main` invocations every single time.
-- Forgetting to copy untracked but essential files like `.env`, `.env.local`, or `.vscode/settings.json` into the new worktree, and watching the agent fail because it cannot find a database URL or an API key.
+- Having to copy untracked but essential files like `.env`, `.env.local`, or `.vscode/settings.json` into the new worktree, and watching the agent fail because it cannot find a database URL or an API key when you forget to copy.
+- Need to run `git submodule --init --recursive` on new worktrees because the submodules are not initialized by default.
 - Re-running `bundle install`, `npm install`, `pnpm install`, `pip install`, `cargo build`, or `make setup` by hand every single time you spin up a new directory.
 - Manually `cd`-ing into the new path, opening a new editor window, and only *then* starting the agent.
 - Cleaning up dangling worktrees and stale branches one by one when the experiment is over.
@@ -29,7 +32,7 @@ The two features that make it especially powerful for AI-assisted development ar
 | Feature | What it does | Why it matters for AI agents |
 | --- | --- | --- |
 | **Copy Patterns** (`worktreeCopyPatterns` / `worktreeCopyIgnores`) | Glob-based file copying from the source repo into the freshly created worktree, with an explicit ignore list. | Untracked-but-required files (`.env*`, `.vscode/**`, local credentials, editor settings) land in the new worktree automatically, so the agent can run, test, and inspect the code without any manual seeding step. |
-| **Post-Create Commands** (`postCreateCmd`) | An ordered list of shell commands executed inside the new worktree right after it is created, with progress reporting in the TUI. | Bootstraps the environment — `bundle install`, `npm install`, `docker compose up -d`, `rails db:prepare`, `make seed`, anything — so by the time you hand control over to the agent, the project is already runnable. |
+| **Post-Create Commands** (`postCreateCmd`) | An ordered list of shell commands executed inside the new worktree right after it is created, with progress reporting in the TUI. | Bootstraps the environment with commands like `bundle install`, `npm install`, `docker compose up -d`, `rails db:prepare`, and `make seed`, so by the time you hand control over to the agent, the project is already runnable. |
 
 Combined with the optional **`terminalCommand`** (e.g. `code $WORKTREE_PATH`, `cursor $WORKTREE_PATH`, `idea $WORKTREE_PATH`) and the **shell integration** (which `cd`s your current shell into the selected worktree the moment you confirm), the loop becomes:
 
@@ -37,7 +40,7 @@ Combined with the optional **`terminalCommand`** (e.g. `code $WORKTREE_PATH`, `c
 2. Pick a source branch and a name.
 3. The new worktree is created, the relevant files are copied in, the setup commands run, your editor opens on it, and your shell is already inside it.
 4. Launch your AI agent. Code.
-5. Done? Run `wisetree` again, pick `Delete worktree`, and it's gone — branch and all, if you want.
+5. Done? Run `wisetree` again, pick `Delete worktree`, and remove the worktree and, if you want, its branch too.
 
 That is the productivity delta `wisetree` is built to deliver.
 
@@ -86,7 +89,7 @@ wisetree --version
 
 ### Shell integration (highly recommended)
 
-Run `wisetree` once in any git repository and select **`Setup Shell Integration`** from the main menu. This installs a small wrapper into your `~/.zshrc` or `~/.bash_profile` / `~/.bashrc` that lets the bare command `wisetree` (with no args) `cd` your current shell into the selected worktree directly — no `cd $(...)` dance required. Tab-completion for subcommands and flags is installed at the same time.
+Run `wisetree` once in any git repository and select **`Setup Shell Integration`** from the main menu. This installs a small wrapper into your `~/.zshrc` or `~/.bash_profile` / `~/.bashrc` that lets the bare command `wisetree` (with no args) `cd` your current shell into the selected worktree directly, with no `cd $(...)` dance required. Tab-completion for subcommands and flags is installed at the same time.
 
 # 🚀 Usage
 
@@ -117,8 +120,8 @@ Each screen renders the **Monokai-inspired Wisetree palette** (defined in `desig
 
 `wisetree` looks for configuration in this order, falling back to sensible defaults if neither is present:
 
-1. `.wisetree.json` next to the repository root (project-local — commit it, share it across the team).
-2. `~/.wisetree/settings.json` (global — your personal defaults).
+1. `.wisetree.json` next to the repository root (project-local, so you can commit it and share it across the team).
+2. `~/.wisetree/settings.json` (global, for your personal defaults).
 
 A complete configuration example:
 
@@ -181,7 +184,7 @@ wisetree [command] [options]
 | `--help` | `-h` | Show the built-in help screen. |
 | `--version` | `-v` | Print the installed version. |
 | `--mode <mode>` | `-m` | Land directly on a specific screen (`menu`, `create`, `list`, `delete`, `settings`). |
-| `--from-wrapper` | — | Used internally by the shell wrapper so `wisetree` can print the selected path on stdout for the parent shell to `cd` into. |
+| `--from-wrapper` | `None` | Used internally by the shell wrapper so `wisetree` can print the selected path on stdout for the parent shell to `cd` into. |
 
 ### Non-interactive options
 
@@ -192,7 +195,7 @@ wisetree [command] [options]
 | `--branch <branch>` | `-b` | `create` | New branch name; defaults to the directory name. |
 | `--path <path>` | `-p` | `delete` | Worktree path (alternative to `--name`). |
 | `--force` | `-f` | `delete` | Force-delete even when the worktree has uncommitted changes. |
-| `--json` | — | `list` | Emit the worktree list as JSON, suitable for piping into `jq`. |
+| `--json` | `None` | `list` | Emit the worktree list as JSON, suitable for piping into `jq`. |
 
 ### Interactive examples
 
@@ -220,7 +223,7 @@ wisetree delete -p /path/to/worktree -f                # Force-delete by full pa
 
 # 🤝 Contribute
 
-Contributions of every shape are welcome — bug reports, feature requests, design feedback on the palette, documentation polish, and code. The repository follows a few simple conventions:
+Contributions of every shape are welcome, including bug reports, feature requests, design feedback on the palette, documentation polish, and code. The repository follows a few simple conventions:
 
 1. **Fork and branch** off `main`. Use a descriptive branch name (e.g. `feat/json-list-flag`, `fix/shell-wrapper-zsh`).
 2. **Run the test suite** before opening a PR:
