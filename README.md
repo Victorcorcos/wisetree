@@ -1,5 +1,9 @@
 # 🧙 Wisetree
 
+<div align="center">
+  <img src="https://i.imgur.com/vO0AOis.gif" alt="Wisetree" width="50%" />
+</div>
+
 **Wisetree** is an interactive, terminal-first manager for `git worktree`s. It wraps the raw `git worktree` plumbing in a polished TUI (built with Rust + Ratatui) and a scriptable CLI, so creating, listing, navigating, and deleting worktrees becomes a single keystroke instead of a paragraph of commands.
 
 It is purpose-built for developers who run **multiple AI coding agents in parallel** — `Claude Code`, `Codex CLI`, `Gemini CLI`, `Opencode`, `Cursor`, `Aider`, and friends — each on its own branch, each in its own isolated checkout, all stacked on top of the same repository.
