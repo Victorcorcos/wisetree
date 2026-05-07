@@ -1,6 +1,6 @@
 {
   "name": "wisetree-linux-x64-gnu",
-  "version": "1.2.0",
+  "version": "1.0.0",
   "description": "Prebuilt wisetree binary for Linux x64 (gnu)",
   "license": "MIT",
   "repository": {

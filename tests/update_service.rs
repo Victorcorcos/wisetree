@@ -43,7 +43,7 @@ fn should_check_after_ttl_expires() {
 #[test]
 fn cached_status_returns_none_when_unset() {
     let svc = fresh();
-    assert!(get_cached_update_status(&svc, Some("1.2.0")).is_none());
+    assert!(get_cached_update_status(&svc, Some("1.0.0")).is_none());
 }
 
 #[test]

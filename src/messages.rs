@@ -98,7 +98,7 @@ pub mod colors {
     /// White `#f8f8f1` — main font color for primary content.
     pub const WHITE: Color = Color::Rgb(0xf8, 0xf8, 0xf1);
     /// Gray darker `#90918a` — annotation text such as
-    /// `Version 1.2.0 | Active Repo:`.
+    /// `Version 1.0.0 | Active Repo:`.
     pub const GRAY_DARK: Color = Color::Rgb(0x90, 0x91, 0x8a);
     /// Gray lighter `#d9d9d2` — emphasized annotation text such as the
     /// active repository path.
