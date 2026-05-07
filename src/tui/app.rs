@@ -983,34 +983,38 @@ mod tests {
 
     #[test]
     fn menu_create_selection_enters_create_screen() {
-        let mut app = initialized_menu_app();
-        let tx = app_event_tx();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            app.handle_key(key(KeyCode::Enter), &tx);
-            tokio::task::yield_now().await;
-        });
+        with_home(|_| {
+            let mut app = initialized_menu_app();
+            let tx = app_event_tx();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                app.handle_key(key(KeyCode::Enter), &tx);
+                tokio::task::yield_now().await;
+            });
 
-        assert_eq!(app.screen, Screen::Create);
-        assert!(app.create.is_some());
-        assert!(app.menu.is_none());
+            assert_eq!(app.screen, Screen::Create);
+            assert!(app.create.is_some());
+            assert!(app.menu.is_none());
+        });
     }
 
     #[test]
     fn menu_settings_selection_enters_settings_screen() {
-        let mut app = initialized_menu_app();
-        let tx = app_event_tx();
+        with_home(|_| {
+            let mut app = initialized_menu_app();
+            let tx = app_event_tx();
 
-        app.handle_key(key(KeyCode::Down), &tx);
-        app.handle_key(key(KeyCode::Down), &tx);
-        app.handle_key(key(KeyCode::Down), &tx);
-        app.handle_key(key(KeyCode::Enter), &tx);
+            app.handle_key(key(KeyCode::Down), &tx);
+            app.handle_key(key(KeyCode::Down), &tx);
+            app.handle_key(key(KeyCode::Down), &tx);
+            app.handle_key(key(KeyCode::Enter), &tx);
 
-        assert_eq!(app.screen, Screen::Settings);
-        assert!(app.settings.is_some());
+            assert_eq!(app.screen, Screen::Settings);
+            assert!(app.settings.is_some());
+        });
     }
 
     #[test]
