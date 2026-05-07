@@ -11,10 +11,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
+use crate::tui::widgets::select_prompt::branded_line;
 
 pub enum InputOutcome {
     Submitted(String),
@@ -118,18 +119,19 @@ impl InputPrompt {
             ])
             .split(area);
 
-        frame.render_widget(Paragraph::new(self.label.clone()), chunks[0]);
+        let label_style = Style::default().fg(colors::WHITE);
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(&self.label, label_style))),
+            chunks[0],
+        );
 
         let inner_line = if self.value.is_empty() {
-            Line::from(vec![
-                Span::styled(
-                    self.placeholder.clone(),
-                    Style::default()
-                        .fg(colors::MUTED)
-                        .add_modifier(Modifier::DIM),
-                ),
-                Span::raw("|"),
-            ])
+            let placeholder_style = Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM);
+            let mut spans = branded_line(&self.placeholder, placeholder_style);
+            spans.push(Span::raw("|"));
+            Line::from(spans)
         } else {
             Line::from(vec![Span::raw(format!("{}|", self.value))])
         };
@@ -137,7 +139,8 @@ impl InputPrompt {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color)),
+                .border_style(Style::default().fg(border_color))
+                .padding(Padding::horizontal(1)),
         );
         frame.render_widget(field, chunks[1]);
 

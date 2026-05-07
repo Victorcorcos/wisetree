@@ -49,6 +49,7 @@ fn menu_renders_with_config_path() {
     let dumped = dump(80, 12, |f| s.render(f, f.area()));
     assert!(dumped.contains("Configuration file"));
     assert!(dumped.contains("/tmp/.wisetree.json"));
+    assert!(dumped.contains("➤"));
     assert!(dumped.contains("Copy Patterns"));
     assert!(dumped.contains("Check for Updates"));
 }
@@ -78,6 +79,47 @@ fn any_key_in_detail_returns_to_menu() {
     let action = s.handle_key(key(KeyCode::Char('x')));
     assert_eq!(action, SettingsAction::Continue);
     assert_eq!(s.step(), SettingsStep::Menu);
+}
+
+#[test]
+fn delete_branch_setting_renders_yes_no_toggle() {
+    let mut s = ready();
+    for _ in 0..5 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::DeleteBranch);
+
+    let dumped = dump(80, 14, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Delete Branch with Worktree"));
+    assert!(dumped.contains("Yes"));
+    assert!(dumped.contains("No"));
+    assert!(dumped.contains("Never deletes current or default branches"));
+}
+
+#[test]
+fn delete_branch_setting_emits_true_when_yes_selected() {
+    let mut s = ready();
+    for _ in 0..5 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::SetDeleteBranchWithWorktree(true));
+}
+
+#[test]
+fn delete_branch_setting_emits_false_when_no_selected() {
+    let mut s = ready();
+    for _ in 0..5 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('n')));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::SetDeleteBranchWithWorktree(false));
 }
 
 #[test]
@@ -134,14 +176,14 @@ fn check_updates_up_to_date_message() {
     s.handle_key(key(KeyCode::Enter));
     s.set_update_result(UpdateCheckResult {
         has_update: false,
-        current_version: "1.2.0".into(),
-        latest_version: Some("1.2.0".into()),
+        current_version: "1.0.0".into(),
+        latest_version: Some("1.0.0".into()),
         checked_at: 0,
         error: None,
     });
     let dumped = dump(80, 6, |f| s.render(f, f.area()));
     assert!(dumped.contains("latest version"));
-    assert!(dumped.contains("v1.2.0"));
+    assert!(dumped.contains("v1.0.0"));
 }
 
 #[test]
@@ -153,7 +195,7 @@ fn check_updates_error_shows_failure_message() {
     s.handle_key(key(KeyCode::Enter));
     s.set_update_result(UpdateCheckResult {
         has_update: false,
-        current_version: "1.2.0".into(),
+        current_version: "1.0.0".into(),
         latest_version: None,
         checked_at: 0,
         error: Some("network down".into()),

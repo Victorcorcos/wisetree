@@ -41,6 +41,14 @@ fn status(shell: Shell) -> ShellIntegrationStatus {
     }
 }
 
+fn bash_config_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "~/.bash_profile"
+    } else {
+        "~/.bashrc"
+    }
+}
+
 #[test]
 fn select_shell_renders_intro_and_options() {
     let s = SetupScreen::new(Some(&status(Shell::Zsh)));
@@ -138,4 +146,25 @@ fn bash_default_selection_when_detected() {
     // The "detected" tag attached to the bash entry should be visible.
     assert!(dumped.contains("bash"));
     assert!(dumped.contains("detected"));
+    assert!(dumped.contains(bash_config_label()));
+}
+
+#[test]
+fn bash_confirm_uses_platform_config_file() {
+    let mut s = SetupScreen::new(Some(&status(Shell::Bash)));
+    s.handle_key(key(KeyCode::Enter));
+    let dumped = dump(80, 24, |f| s.render(f, f.area()));
+    assert!(dumped.contains(bash_config_label()));
+}
+
+#[test]
+fn bash_success_uses_platform_reload_command() {
+    let mut s = SetupScreen::new(Some(&status(Shell::Bash)));
+    s.handle_key(key(KeyCode::Enter)); // -> confirm
+    s.handle_key(key(KeyCode::Char('y')));
+    s.handle_key(key(KeyCode::Enter)); // confirmed
+    s.start_installing();
+    s.mark_complete();
+    let dumped = dump(80, 8, |f| s.render(f, f.area()));
+    assert!(dumped.contains(&format!("source {}", bash_config_label())));
 }

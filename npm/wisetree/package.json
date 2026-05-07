@@ -1,6 +1,6 @@
 {
   "name": "wisetree",
-  "version": "1.2.0",
+  "version": "1.0.0",
   "description": "Interactive CLI for creating and managing Git worktrees",
   "bin": {
     "wisetree": "bin/wisetree"
@@ -30,11 +30,11 @@
     "url": "https://github.com/victorcorcos/wisetree/issues"
   },
   "optionalDependencies": {
-    "wisetree-darwin-arm64": "1.2.0",
-    "wisetree-darwin-x64": "1.2.0",
-    "wisetree-linux-x64-gnu": "1.2.0",
-    "wisetree-linux-arm64-gnu": "1.2.0",
-    "wisetree-win32-x64-msvc": "1.2.0"
+    "wisetree-darwin-arm64": "1.0.0",
+    "wisetree-darwin-x64": "1.0.0",
+    "wisetree-linux-x64-gnu": "1.0.0",
+    "wisetree-linux-arm64-gnu": "1.0.0",
+    "wisetree-win32-x64-msvc": "1.0.0"
   },
   "engines": {
     "node": ">=14.0.0"

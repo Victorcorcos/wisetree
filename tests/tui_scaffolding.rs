@@ -104,7 +104,7 @@ fn error_screen_with_reset_confirm_shows_yes_no_prompt() {
 
 #[test]
 fn menu_placeholder_renders_welcome_and_prompt() {
-    let backend = TestBackend::new(60, 8);
+    let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| MenuScreen::new(0, None, None).render(f, f.area()))
@@ -116,7 +116,7 @@ fn menu_placeholder_renders_welcome_and_prompt() {
         .map(|c| c.symbol())
         .collect::<String>();
     assert!(dump.contains("Wisetree"));
-    assert!(dump.contains("What would you like to do"));
+    assert!(dump.contains("Choose wisely..."));
 }
 
 #[test]

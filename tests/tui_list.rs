@@ -182,14 +182,21 @@ fn esc_in_action_menu_returns_to_list() {
 }
 
 #[test]
-fn render_shows_table_header_and_hint() {
+fn render_uses_select_prompt_design_with_hint() {
     let mut s = ListScreen::new(true, true);
     s.set_worktrees(worktrees());
     let dumped = dump(80, 10, |f| s.render(f, f.area()));
-    assert!(dumped.contains("PATH"));
-    assert!(dumped.contains("BRANCH"));
+    // Mirrors the "Choose wisely..." page design: a SelectPrompt with a
+    // title, branded "➤" cursor, numbered rows, and the navigation hint.
+    assert!(dumped.contains("Select a worktree:"));
+    assert!(dumped.contains("➤"));
+    assert!(dumped.contains("1. "));
+    assert!(dumped.contains("2. "));
+    assert!(dumped.contains("/tmp/repo-feat"));
+    assert!(dumped.contains("feat"));
     assert!(dumped.contains("Navigate"));
-    assert!(dumped.contains("Esc"));
+    assert!(dumped.contains("Command"));
+    assert!(dumped.contains("Back"));
 }
 
 #[test]

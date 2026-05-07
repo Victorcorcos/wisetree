@@ -1,6 +1,6 @@
-//! Bordered "🌳 Welcome to Wisetree!" / "🌳 Wisetree - <mode>" header with
-//! the current working directory printed beneath. The cwd is folded against
-//! `$HOME` so e.g. `/Users/me/code` renders as `~/code`.
+//! Bordered "🧙 Welcome to Wisetree" header with the current repository
+//! cwd printed beneath. The cwd is folded against `$HOME` so e.g.
+//! `/Users/me/code` renders as `~/code`.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -33,10 +33,16 @@ impl<'a> WelcomeHeader<'a> {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let panel_style = Style::default().bg(colors::HEADER_BG);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::MUTED));
+            .border_style(
+                Style::default()
+                    .fg(colors::HEADER_BORDER)
+                    .bg(colors::HEADER_BG),
+            )
+            .style(panel_style);
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -46,34 +52,55 @@ impl<'a> WelcomeHeader<'a> {
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(inner);
 
-        let header_line = match self.mode_label() {
-            None => Line::from(vec![
-                Span::raw("🌳 Welcome to "),
-                Span::styled(
-                    "Wisetree",
-                    Style::default()
-                        .fg(colors::PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("!"),
-            ]),
-            Some(label) => Line::from(vec![
-                Span::raw("🌳 Wisetree - "),
-                Span::styled(
-                    label,
-                    Style::default()
-                        .fg(colors::PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        };
-        frame.render_widget(Paragraph::new(header_line), chunks[0]);
+        let title_style = Style::default()
+            .fg(colors::HEADER_TITLE)
+            .bg(colors::HEADER_BG)
+            .add_modifier(Modifier::BOLD);
+        let brand_style = Style::default()
+            .fg(colors::BRAND)
+            .bg(colors::HEADER_BG)
+            .add_modifier(Modifier::BOLD);
+        let mut header_spans: Vec<Span> = vec![
+            Span::styled("  ", panel_style),
+            Span::styled("🧙 ", panel_style),
+        ];
+        match self.mode_label() {
+            None => {
+                header_spans.push(Span::styled("Welcome to ", title_style));
+                header_spans.push(Span::styled("Wisetree", brand_style));
+            }
+            Some(label) => {
+                header_spans.push(Span::styled("Wisetree", brand_style));
+                header_spans.push(Span::styled(format!(" - {label}"), title_style));
+            }
+        }
+        let header_line = Line::from(header_spans);
+        frame.render_widget(Paragraph::new(header_line).style(panel_style), chunks[0]);
 
-        let cwd_text = format!("cwd: {}", fold_home(self.cwd));
-        frame.render_widget(
-            Paragraph::new(cwd_text).style(Style::default().fg(colors::MUTED)),
-            chunks[1],
-        );
+        let subtitle = Line::from(vec![
+            Span::styled("  ", panel_style),
+            Span::styled(
+                "Current Repository",
+                Style::default()
+                    .fg(colors::HEADER_SUBTITLE)
+                    .bg(colors::HEADER_BG),
+            ),
+            Span::styled(
+                " | ",
+                Style::default().fg(colors::MUTED).bg(colors::HEADER_BG),
+            ),
+            Span::styled(
+                "cwd: ",
+                Style::default()
+                    .fg(colors::HEADER_SUBTITLE)
+                    .bg(colors::HEADER_BG),
+            ),
+            Span::styled(
+                fold_home(self.cwd),
+                Style::default().fg(colors::MENU_TEXT).bg(colors::HEADER_BG),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(subtitle).style(panel_style), chunks[1]);
     }
 }
 

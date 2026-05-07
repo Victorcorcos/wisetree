@@ -90,6 +90,41 @@ fn falls_back_to_global_when_no_local() {
 }
 
 #[test]
+fn load_global_ignores_local_config() {
+    with_home(|home| {
+        let project = tempfile::tempdir().expect("project tempdir");
+
+        let local = WorktreeConfig {
+            terminal_command: "from-local".into(),
+            ..WorktreeConfig::default()
+        };
+        fs::write(
+            project.path().join(".wisetree.json"),
+            serde_json::to_string_pretty(&local).unwrap(),
+        )
+        .unwrap();
+
+        let global_dir = home.path().join(".wisetree");
+        fs::create_dir_all(&global_dir).unwrap();
+        let global = WorktreeConfig {
+            terminal_command: "from-global".into(),
+            delete_branch_with_worktree: true,
+            ..WorktreeConfig::default()
+        };
+        fs::write(
+            global_dir.join("settings.json"),
+            serde_json::to_string_pretty(&global).unwrap(),
+        )
+        .unwrap();
+
+        let mut svc = ConfigService::new();
+        let loaded = svc.load_global().expect("load global");
+        assert_eq!(loaded.terminal_command, "from-global");
+        assert!(loaded.delete_branch_with_worktree);
+    });
+}
+
+#[test]
 fn ensure_global_config_creates_dir_and_file() {
     with_home(|home| {
         let svc = ConfigService::new();

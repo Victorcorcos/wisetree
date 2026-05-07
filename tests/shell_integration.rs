@@ -23,13 +23,21 @@ fn isolated_home() -> TempDir {
     home
 }
 
+fn bash_config_filename() -> &'static str {
+    if cfg!(target_os = "macos") {
+        ".bash_profile"
+    } else {
+        ".bashrc"
+    }
+}
+
 #[test]
 fn generate_setup_block_for_zsh_includes_signature_and_marker() {
     let block = generate_setup_block(Shell::Zsh, "wisetree", "2026-05-05".into());
     assert!(block.contains("# Wisetree setup: added on 2026-05-05"));
     assert!(block.contains("# End Wisetree setup"));
     assert!(block.contains("compdef _wisetree wisetree"));
-    assert!(block.contains("FORCE_COLOR=3 command wisetree --from-wrapper"));
+    assert!(block.contains("if dir=$(FORCE_COLOR=3 command wisetree --from-wrapper); then"));
     assert!(block.contains("Wisetree: Navigated to"));
 }
 
@@ -51,6 +59,17 @@ fn install_creates_zshrc_when_missing() {
         .map(|h| format!("{h}/.zshrc"))
         .unwrap();
     let content = fs::read_to_string(&zshrc_path).unwrap();
+    assert!(content.contains("# Wisetree setup: added on"));
+    assert!(content.contains("# End Wisetree setup"));
+}
+
+#[test]
+fn install_creates_bash_config_when_missing() {
+    let _g = lock_env();
+    let home = isolated_home();
+    install_shell_integration(Shell::Bash, "wisetree").unwrap();
+    let bash_path = home.path().join(bash_config_filename());
+    let content = fs::read_to_string(&bash_path).unwrap();
     assert!(content.contains("# Wisetree setup: added on"));
     assert!(content.contains("# End Wisetree setup"));
 }
@@ -149,6 +168,53 @@ fn find_end_index_uses_marker_when_present() {
     ];
     let end = find_setup_end_index(&lines, 1);
     assert_eq!(end, 3);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn detect_bash_setup_in_bashrc_requires_reinstall() {
+    let _g = lock_env();
+    let home = isolated_home();
+    fs::write(
+        home.path().join(".bashrc"),
+        "# Wisetree setup: added on 2025-01-01\nbody\n# End Wisetree setup\n",
+    )
+    .unwrap();
+
+    let status = detect_shell_integration_with(Shell::Bash);
+    assert!(!status.is_installed);
+    assert_eq!(status.config_path, Some(home.path().join(".bash_profile")));
+    let reason = status.reason.unwrap();
+    assert!(reason.contains(".bashrc"));
+    assert!(reason.contains(".bash_profile"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn install_bash_moves_existing_block_from_bashrc_to_bash_profile() {
+    let _g = lock_env();
+    let home = isolated_home();
+    fs::write(
+        home.path().join(".bashrc"),
+        "alias x=1\n\
+         \n\
+         # Wisetree setup: added on 2025-01-01\n\
+         body\n\
+         # End Wisetree setup\n\
+         \n\
+         alias y=2\n",
+    )
+    .unwrap();
+
+    install_shell_integration(Shell::Bash, "wisetree").unwrap();
+
+    let bash_profile = fs::read_to_string(home.path().join(".bash_profile")).unwrap();
+    assert!(bash_profile.contains("# Wisetree setup: added on"));
+
+    let bashrc = fs::read_to_string(home.path().join(".bashrc")).unwrap();
+    assert!(!bashrc.contains("# Wisetree setup: added on"));
+    assert!(bashrc.contains("alias x=1"));
+    assert!(bashrc.contains("alias y=2"));
 }
 
 #[test]

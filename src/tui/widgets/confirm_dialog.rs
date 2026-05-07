@@ -7,10 +7,11 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
+use crate::tui::widgets::select_prompt::branded_line;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmChoice {
@@ -117,20 +118,35 @@ impl ConfirmDialog {
             ])
             .split(area);
 
-        let title = Paragraph::new(Span::styled(
-            self.title.clone(),
-            Style::default()
-                .fg(self.variant.color())
-                .add_modifier(Modifier::BOLD),
-        ));
+        let title_style = Style::default()
+            .fg(self.variant.color())
+            .add_modifier(Modifier::BOLD);
+        let title = Paragraph::new(Line::from(branded_line(&self.title, title_style)));
         frame.render_widget(title, chunks[0]);
 
-        frame.render_widget(Paragraph::new(self.message.clone()), chunks[2]);
+        let message_style = Style::default().fg(colors::WHITE);
+        let message_lines: Vec<Line> = self
+            .message
+            .split('\n')
+            .map(|line| Line::from(branded_line(line, message_style)))
+            .collect();
+        frame.render_widget(Paragraph::new(message_lines), chunks[2]);
 
         let buttons_area = chunks[3];
+        let confirm_width = self.confirm_label.chars().count() as u16 + 4;
+        let cancel_width = self.cancel_label.chars().count() as u16 + 4;
+        let gap: u16 = 2;
+        let total_width = confirm_width + cancel_width + gap;
+        let side = buttons_area.width.saturating_sub(total_width) / 2;
         let button_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([
+                Constraint::Length(side),
+                Constraint::Length(confirm_width),
+                Constraint::Length(gap),
+                Constraint::Length(cancel_width),
+                Constraint::Min(0),
+            ])
             .split(buttons_area);
 
         let confirm_selected = self.selected == ConfirmChoice::Confirm;
@@ -140,7 +156,7 @@ impl ConfirmDialog {
             self.confirm_label.clone(),
             if confirm_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(colors::WHITE)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(colors::MUTED)
@@ -150,27 +166,39 @@ impl ConfirmDialog {
             self.cancel_label.clone(),
             if cancel_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(colors::WHITE)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(colors::MUTED)
             },
         ));
 
+        let confirm_border = if confirm_selected {
+            self.variant.color()
+        } else {
+            colors::MUTED
+        };
+        let cancel_border = if cancel_selected {
+            colors::EMPHASIS
+        } else {
+            colors::MUTED
+        };
         let confirm_box = Paragraph::new(confirm_text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(colors::MUTED)),
+                .border_style(Style::default().fg(confirm_border))
+                .padding(Padding::horizontal(1)),
         );
         let cancel_box = Paragraph::new(cancel_text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(colors::MUTED)),
+                .border_style(Style::default().fg(cancel_border))
+                .padding(Padding::horizontal(1)),
         );
-        frame.render_widget(confirm_box, button_cols[0]);
-        frame.render_widget(cancel_box, button_cols[1]);
+        frame.render_widget(confirm_box, button_cols[1]);
+        frame.render_widget(cancel_box, button_cols[3]);
 
         let hint = Paragraph::new("Use ←→ or Tab to navigate, Enter to confirm, Esc to cancel")
             .style(

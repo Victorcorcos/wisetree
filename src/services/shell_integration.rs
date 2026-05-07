@@ -4,7 +4,7 @@
 //! completion bodies (with the `_branchlet`/`_wisetree` function-name swap).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn home_dir() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
@@ -56,11 +56,29 @@ pub fn detect_shell() -> Shell {
 }
 
 pub fn get_config_path(shell: Shell) -> Option<PathBuf> {
+    get_config_paths(shell)?.into_iter().next()
+}
+
+fn get_config_paths(shell: Shell) -> Option<Vec<PathBuf>> {
     let home = home_dir()?;
     match shell {
-        Shell::Zsh => Some(home.join(".zshrc")),
-        Shell::Bash => Some(home.join(".bashrc")),
+        Shell::Zsh => Some(vec![home.join(".zshrc")]),
+        Shell::Bash => {
+            let mut paths = vec![home.join(bash_config_name())];
+            if cfg!(target_os = "macos") {
+                paths.push(home.join(".bashrc"));
+            }
+            Some(paths)
+        }
         Shell::Unknown => None,
+    }
+}
+
+fn bash_config_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        ".bash_profile"
+    } else {
+        ".bashrc"
     }
 }
 
@@ -69,8 +87,8 @@ pub fn detect_shell_integration() -> ShellIntegrationStatus {
 }
 
 pub fn detect_shell_integration_with(shell: Shell) -> ShellIntegrationStatus {
-    let config_path = match get_config_path(shell) {
-        Some(p) => p,
+    let config_paths = match get_config_paths(shell) {
+        Some(paths) => paths,
         None => {
             return ShellIntegrationStatus {
                 is_installed: false,
@@ -80,6 +98,59 @@ pub fn detect_shell_integration_with(shell: Shell) -> ShellIntegrationStatus {
             };
         }
     };
+    let config_path = config_paths[0].clone();
+    let mut first_read_error: Option<(PathBuf, String)> = None;
+    let mut legacy_path_with_setup: Option<PathBuf> = None;
+
+    for (idx, path) in config_paths.iter().enumerate() {
+        if !path.exists() {
+            continue;
+        }
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                if !content.contains(WRAPPER_SIGNATURE) {
+                    continue;
+                }
+                if idx == 0 {
+                    return ShellIntegrationStatus {
+                        is_installed: true,
+                        shell,
+                        config_path: Some(path.clone()),
+                        reason: None,
+                    };
+                }
+                legacy_path_with_setup = Some(path.clone());
+            }
+            Err(e) => {
+                if first_read_error.is_none() {
+                    first_read_error = Some((path.clone(), e.to_string()));
+                }
+            }
+        }
+    }
+
+    if let Some(legacy_path) = legacy_path_with_setup {
+        return ShellIntegrationStatus {
+            is_installed: false,
+            shell,
+            config_path: Some(config_path.clone()),
+            reason: Some(format!(
+                "Legacy shell integration found in {}. Reinstall to move it to {}.",
+                legacy_path.display(),
+                config_path.display()
+            )),
+        };
+    }
+
+    if let Some((path, err)) = first_read_error {
+        return ShellIntegrationStatus {
+            is_installed: false,
+            shell,
+            config_path: Some(path),
+            reason: Some(format!("Failed to read config: {err}")),
+        };
+    }
+
     if !config_path.exists() {
         return ShellIntegrationStatus {
             is_installed: false,
@@ -88,26 +159,11 @@ pub fn detect_shell_integration_with(shell: Shell) -> ShellIntegrationStatus {
             reason: Some("Config file does not exist".into()),
         };
     }
-    match fs::read_to_string(&config_path) {
-        Ok(content) => {
-            let installed = content.contains(WRAPPER_SIGNATURE);
-            ShellIntegrationStatus {
-                is_installed: installed,
-                shell,
-                config_path: Some(config_path),
-                reason: if installed {
-                    None
-                } else {
-                    Some("Shell integration not found in config".into())
-                },
-            }
-        }
-        Err(e) => ShellIntegrationStatus {
-            is_installed: false,
-            shell,
-            config_path: Some(config_path),
-            reason: Some(format!("Failed to read config: {e}")),
-        },
+    ShellIntegrationStatus {
+        is_installed: false,
+        shell,
+        config_path: Some(config_path),
+        reason: Some("Shell integration not found in config".into()),
     }
 }
 
@@ -120,19 +176,17 @@ pub fn install_shell_integration(shell: Shell, command_name: &str) -> std::io::R
             "Could not determine shell config path",
         )
     })?;
+    let config_paths = get_config_paths(shell).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Could not determine shell config paths",
+        )
+    })?;
 
     let block = generate_setup_block(shell, command_name, today_iso());
 
-    if path.exists() {
-        let content = fs::read_to_string(&path)?;
-        if content.contains(WRAPPER_SIGNATURE) {
-            let mut lines: Vec<&str> = content.split('\n').collect();
-            if let Some(start) = lines.iter().position(|l| l.contains(WRAPPER_SIGNATURE)) {
-                let end = find_setup_end_index(&lines, start);
-                lines.drain(start..=end);
-                fs::write(&path, lines.join("\n"))?;
-            }
-        }
+    for config_path in &config_paths {
+        remove_shell_integration_from_path(config_path)?;
     }
 
     let to_append = format!("\n{block}\n");
@@ -150,11 +204,21 @@ pub fn install_shell_integration(shell: Shell, command_name: &str) -> std::io::R
 }
 
 pub fn remove_shell_integration(shell: Shell) -> std::io::Result<()> {
-    let path = match get_config_path(shell) {
-        Some(p) if p.exists() => p,
-        _ => return Ok(()),
+    let config_paths = match get_config_paths(shell) {
+        Some(paths) => paths,
+        None => return Ok(()),
     };
-    let content = fs::read_to_string(&path)?;
+    for path in config_paths {
+        remove_shell_integration_from_path(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_shell_integration_from_path(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(path)?;
     if !content.contains(WRAPPER_SIGNATURE) {
         return Ok(());
     }
@@ -179,7 +243,7 @@ pub fn remove_shell_integration(shell: Shell) -> std::io::Result<()> {
         end
     };
     lines.drain(remove_start..=remove_end);
-    fs::write(&path, lines.join("\n"))
+    fs::write(path, lines.join("\n"))
 }
 
 /// Find the end of a setup block. Looks for the explicit end marker first;
@@ -216,9 +280,11 @@ pub fn generate_setup_block(shell: Shell, command_name: &str, today: String) -> 
          {completions}\n\
          {command_name}() {{\n\
          \x20\x20if [ $# -eq 0 ]; then\n\
-         \x20\x20\x20\x20local dir=$(FORCE_COLOR=3 command {command_name} --from-wrapper)\n\
-         \x20\x20\x20\x20if [ -n \"$dir\" ]; then\n\
-         \x20\x20\x20\x20\x20\x20builtin cd \"$dir\" && echo \"Wisetree: Navigated to $(pwd)\"\n\
+         \x20\x20\x20\x20local dir\n\
+         \x20\x20\x20\x20if dir=$(FORCE_COLOR=3 command {command_name} --from-wrapper); then\n\
+         \x20\x20\x20\x20\x20\x20if [ -n \"$dir\" ]; then\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20builtin cd \"$dir\" && echo \"Wisetree: Navigated to $(pwd)\"\n\
+         \x20\x20\x20\x20\x20\x20fi\n\
          \x20\x20\x20\x20fi\n\
          \x20\x20else\n\
          \x20\x20\x20\x20command {command_name} \"$@\"\n\

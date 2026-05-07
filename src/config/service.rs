@@ -69,25 +69,16 @@ impl ConfigService {
         self.ensure_global_config()?;
 
         if let Some(path) = self.find_config_file(project_path)? {
-            let raw = fs::read_to_string(&path).map_err(|e| {
-                WisetreeError::config(
-                    format!("Failed to load config from {}: {e}", path.display()),
-                    Some(path.clone()),
-                )
-            })?;
-
-            let parsed: WorktreeConfig = serde_json::from_str(&raw).map_err(|e| {
-                WisetreeError::config(
-                    format!("Invalid configuration in {}: {e}", path.display()),
-                    Some(path.clone()),
-                )
-            })?;
-
-            self.config = parsed;
-            self.config_path = Some(path);
+            return self.load_from_path(path);
         }
 
         Ok(self.config.clone())
+    }
+
+    /// Load the global config file directly, ignoring any project-local file.
+    pub fn load_global(&mut self) -> Result<WorktreeConfig> {
+        self.ensure_global_config()?;
+        self.load_from_path(global_config_file())
     }
 
     /// Persist the given config to disk, defaulting to the previously-loaded
@@ -154,6 +145,26 @@ impl ConfigService {
             }
         }
         Ok(None)
+    }
+
+    fn load_from_path(&mut self, path: PathBuf) -> Result<WorktreeConfig> {
+        let raw = fs::read_to_string(&path).map_err(|e| {
+            WisetreeError::config(
+                format!("Failed to load config from {}: {e}", path.display()),
+                Some(path.clone()),
+            )
+        })?;
+
+        let parsed: WorktreeConfig = serde_json::from_str(&raw).map_err(|e| {
+            WisetreeError::config(
+                format!("Invalid configuration in {}: {e}", path.display()),
+                Some(path.clone()),
+            )
+        })?;
+
+        self.config = parsed;
+        self.config_path = Some(path);
+        Ok(self.config.clone())
     }
 }
 

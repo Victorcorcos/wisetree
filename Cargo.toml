@@ -1,6 +1,6 @@
 [package]
 name = "wisetree"
-version = "1.2.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.78"
 description = "Interactive CLI for creating and managing Git worktrees"

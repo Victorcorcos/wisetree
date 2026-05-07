@@ -1,272 +1,257 @@
-# 🌳 Wisetree
+# 🧙 Wisetree
 
-[![npm version](https://badge.fury.io/js/wisetree.svg)](https://www.npmjs.com/package/wisetree)
-[![license](https://img.shields.io/npm/l/wisetree.svg)](https://www.npmjs.com/package/wisetree)
+<div align="center">
+  <img src="https://i.imgur.com/vO0AOis.gif" alt="Wisetree" width="50%" />
+</div>
 
-An interactive CLI for creating and managing Git worktrees, with an easy-to-use terminal interface. Wisetree is distributed as a single static binary.
+https://github.com/user-attachments/assets/c65f1144-6a01-49d7-bed3-967da8e3a854
 
-## Features
+**Wisetree** is an interactive, terminal-first manager for `git worktree`s. It wraps the raw `git worktree` plumbing in a polished TUI (built with Rust + Ratatui) and a scriptable CLI, so creating, listing, navigating, and deleting worktrees becomes a single keystroke instead of a paragraph of commands.
 
-- **Quick Commands**: Jump directly to specific actions via command line
-- **Smart Configuration**: Project-specific and global configuration support
-- **File Management**: Automatically copy configuration files to new worktrees
-- **Post-Create Actions**: Run custom commands after worktree creation
-- **Shell Integration**: Optional zsh/bash wrapper that lets you `cd` into a worktree directly from the picker
-- **Single Static Binary**: No Node runtime required — installable via npm, Homebrew, or a curl shell script
+It is purpose-built for developers who run **multiple AI coding agents in parallel**, including `Claude Code`, `Codex CLI`, `Gemini CLI`, `Opencode`, `Cursor`, `Aider`, and friends, each on its own branch, each in its own isolated checkout, all stacked on top of the same repository.
 
-## Installation
+# 🤔 Why?
 
-### npm (recommended)
+A `git worktree` lets a single repository have **multiple working directories checked out at the same time**, each pointing to a different branch. No stashing, no `git checkout` dance, and no losing your place. Just a clean, parallel copy of the codebase.
 
-```bash
+That capability is great. The raw ergonomics around it are not.
+
+If you have ever tried to spin up three or four agents at once, you have probably hit at least one of the following problems:
+
+- Re-typing long `git worktree add ../repo.feature-x main` invocations every single time.
+- Having to copy untracked but essential files like `.env`, `.env.local`, or `.vscode/settings.json` into the new worktree, and watching the agent fail because it cannot find a database URL or an API key when you forget to copy.
+- Need to run `git submodule --init --recursive` on new worktrees because the submodules are not initialized by default.
+- Re-running `bundle install`, `npm install`, `pnpm install`, `pip install`, `cargo build`, or `make setup` by hand every single time you spin up a new directory.
+- Manually `cd`-ing into the new path, opening a new editor window, and only *then* starting the agent.
+- Cleaning up dangling worktrees and stale branches one by one when the experiment is over.
+
+`wisetree` collapses all of that into a single interactive session. It is opinionated where it helps you, and configurable where you need it.
+
+The two features that make it especially powerful for AI-assisted development are:
+
+| Feature | What it does | Why it matters for AI agents |
+| --- | --- | --- |
+| **Copy Patterns** (`worktreeCopyPatterns` / `worktreeCopyIgnores`) | Glob-based file copying from the source repo into the freshly created worktree, with an explicit ignore list. | Untracked-but-required files (`.env*`, `.vscode/**`, local credentials, editor settings) land in the new worktree automatically, so the agent can run, test, and inspect the code without any manual seeding step. |
+| **Post-Create Commands** (`postCreateCmd`) | An ordered list of shell commands executed inside the new worktree right after it is created, with progress reporting in the TUI. | Bootstraps the environment with commands like `bundle install`, `npm install`, `docker compose up -d`, `rails db:prepare`, and `make seed`, so by the time you hand control over to the agent, the project is already runnable. |
+
+Combined with the optional **`terminalCommand`** (e.g. `code $WORKTREE_PATH`, `cursor $WORKTREE_PATH`, `idea $WORKTREE_PATH`) and the **shell integration** (which `cd`s your current shell into the selected worktree the moment you confirm), the loop becomes:
+
+1. Run `wisetree`.
+2. Pick a source branch and a name.
+3. The new worktree is created, the relevant files are copied in, the setup commands run, your editor opens on it, and your shell is already inside it.
+4. Launch your AI agent. Code.
+5. Done? Run `wisetree` again, pick `Delete worktree`, and remove the worktree and, if you want, its branch too.
+
+That is the productivity delta `wisetree` is built to deliver.
+
+# 🔧 Installation
+
+`wisetree` ships as a single self-contained binary. Pick the channel that matches your environment:
+
+### Homebrew (macOS / Linux)
+
+```rb
+brew install victorcorcos/tap/wisetree
+```
+
+### npm (cross-platform, includes the right native binary for your OS / arch)
+
+```rb
 npm install -g wisetree
 ```
 
-The `wisetree` package is a thin shim that pulls in a precompiled binary for your platform via `optionalDependencies`. Supported platforms: macOS (arm64 + x64), Linux (x64 + arm64 gnu), Windows (x64 msvc).
+### Shell installer (macOS / Linux)
 
-### Homebrew (macOS)
-
-```bash
-brew tap victorcorcos/tap
-brew install wisetree
+```rb
+curl -LsSf https://github.com/victorcorcos/wisetree/releases/latest/download/wisetree-installer.sh | sh
 ```
 
-### Shell installer (Linux / macOS)
+### PowerShell installer (Windows)
 
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/victorcorcos/wisetree/releases/latest/download/wisetree-installer.sh | sh
+```rb
+powershell -c "irm https://github.com/victorcorcos/wisetree/releases/latest/download/wisetree-installer.ps1 | iex"
 ```
 
-### Cargo (build from source)
+### Build from source (Rust 1.78+)
 
-```bash
-cargo install wisetree
+```rb
+git clone https://github.com/victorcorcos/wisetree.git
+cd wisetree
+cargo build --release
+export PATH="$PWD/target/release:$PATH"
 ```
 
-## Quick Start
+After installation, confirm the binary is on your `$PATH`:
 
-Run Wisetree in any Git repository:
+```rb
+wisetree --version
+```
 
-```bash
+### Shell integration (highly recommended)
+
+Run `wisetree` once in any git repository and select **`Setup Shell Integration`** from the main menu. This installs a small wrapper into your `~/.zshrc` or `~/.bash_profile` / `~/.bashrc` that lets the bare command `wisetree` (with no args) `cd` your current shell into the selected worktree directly, with no `cd $(...)` dance required. Tab-completion for subcommands and flags is installed at the same time.
+
+# 🚀 Usage
+
+Two complementary usage modes are supported: an **interactive TUI** for everyday human-driven flows, and a **non-interactive CLI** for scripts, automation, and CI.
+
+### Interactive TUI
+
+From inside any git repository, just run:
+
+```rb
 wisetree
 ```
 
-This opens an interactive menu where you can:
+You land on the main menu, where the available actions are:
 
-- Create new worktrees
-- List existing worktrees
-- Delete worktrees
-- Configure settings
-- Install shell integration
+<img width="3450" height="526" alt="Screenshot 2026-05-07 at 02 23 33" src="https://github.com/user-attachments/assets/3288edb0-4b42-4428-a77d-d3ab7f18e00d" />
 
-## Commands
+| Menu entry | What it does |
+| --- | --- |
+| **Setup Shell Integration** | One-time installer for the shell wrapper + completions (only shown when integration is not yet installed). |
+| **Create new worktree** | Guided flow: pick a source branch, name the directory, optionally name a new branch, confirm. Copy patterns, post-create commands, and terminal launch run automatically afterwards. |
+| **List worktrees** | Live list of every worktree attached to the current repository, with the main checkout and any dirty trees called out. |
+| **Delete worktree** | Pick a worktree, confirm, and it is gone. Optionally deletes the matching branch (`deleteBranchWithWorktree`). Falls back to manual cleanup for corrupted worktrees. |
+| **Settings** | Inspect and edit the active configuration (project-local or global), reset to defaults, and toggle integration. |
+| **Exit** | Close the TUI without changing anything. |
 
-### Interactive Menu (Default)
+Each screen renders the **Monokai-inspired Wisetree palette** (defined in `design/pallete.md`) and supports `↑/↓` to navigate, `Enter` to confirm, and `Esc` / `Ctrl+C` to back out.
 
-```bash
-wisetree
-```
+### Configuration
 
-Opens the main menu with all available options.
+`wisetree` looks for configuration in this order, falling back to sensible defaults if neither is present:
 
-### Direct Commands
+1. `.wisetree.json` next to the repository root (project-local, so you can commit it and share it across the team).
+2. `~/.wisetree/settings.json` (global, for your personal defaults).
 
-```bash
-wisetree create    # Go directly to worktree creation
-wisetree list      # List all worktrees
-wisetree delete    # Go directly to worktree deletion
-wisetree settings  # Open settings menu
-```
+A complete configuration example:
 
-### Options
-
-```bash
-wisetree --help     # Show help information
-wisetree --version  # Show version number
-wisetree -m create  # Set initial mode
-```
-
-### Non-Interactive (Scriptable) CLI
-
-Pass flags to skip the interactive prompts entirely. The three core concepts map directly to flags:
-
-| Flag                    | Description                                     |
-| ----------------------- | ----------------------------------------------- |
-| `-n, --name <name>`     | Worktree directory name                         |
-| `-s, --source <branch>` | Source branch to create from                    |
-| `-b, --branch <branch>` | New branch name (defaults to `-n` when omitted) |
-
-```bash
-# Create a worktree — new branch defaults to the worktree name
-wisetree create -n my-feature -s main
-
-# Create a worktree with an explicit branch name different from the directory
-wisetree create -n ticket-3121-backend -s main -b feature/ticket-3121
-
-# Create multiple sibling worktrees from the same source branch
-# (each gets its own branch, so there's no checkout conflict)
-wisetree create -n digit3121-backend  -s main -b feat/digit3121-backend
-wisetree create -n digit3121-frontend -s main -b feat/digit3121-frontend
-
-# List worktrees as JSON
-wisetree list --json
-
-# Delete a worktree by name
-wisetree delete -n my-feature
-
-# Force-delete a worktree by path
-wisetree delete -p /path/to/worktree -f
-```
-
-Successful `create` output:
-
-```
-/path/to/worktree
-  source: main
-  branch: my-feature
-```
-
-## Shell Integration
-
-Wisetree ships with a tiny shell wrapper that lets you `cd` directly into the worktree you pick from the list view. Without it, the binary can't change your shell's current directory (no process can change its parent's `cwd`); the wrapper bridges that gap by running Wisetree, capturing the chosen path, and `cd`-ing for you.
-
-Install it from the menu (`Setup Shell Integration`) or the wizard:
-
-```bash
-wisetree   # then pick "Setup Shell Integration"
-```
-
-The wizard appends a marked block to `~/.zshrc` or `~/.bashrc`:
-
-```sh
-# Wisetree setup: added on YYYY-MM-DD
-# (tab completions + a wrapper function)
-wisetree() {
-  if [ $# -eq 0 ]; then
-    local dir=$(FORCE_COLOR=3 command wisetree --from-wrapper)
-    if [ -n "$dir" ]; then
-      builtin cd "$dir" && echo "Wisetree: Navigated to $(pwd)"
-    fi
-  else
-    command wisetree "$@"
-  fi
-}
-# End Wisetree setup
-```
-
-Re-running the wizard replaces the existing block in place, so you can safely upgrade.
-
-> **macOS bash users**: bash login shells on macOS read `~/.bash_profile` rather than `~/.bashrc`. If the integration doesn't activate in new terminals, add `[ -f ~/.bashrc ] && source ~/.bashrc` to your `~/.bash_profile`. Wisetree writes to `~/.bashrc` for cross-platform consistency.
-
-## Configuration
-
-Wisetree looks for configuration files in this order:
-
-1. `.wisetree.json` in your repo's root (project-specific)
-2. `~/.wisetree/settings.json` (global configuration)
-
-### Configuration Options
-
-Create a `.wisetree.json` file in your project root or configure global settings:
-
-```json
+```rb
 {
-  "$schema": "https://raw.githubusercontent.com/victorcorcos/wisetree/main/schema.json",
-  "worktreeCopyPatterns": [".env*", ".vscode/**"],
-  "worktreeCopyIgnores": ["**/node_modules/**", "**/dist/**", "**/.git/**"],
-  "worktreePathTemplate": "$BASE_PATH.worktree",
-  "postCreateCmd": ["npm install", "npm run db:generate"],
-  "terminalCommand": "code .",
-  "deleteBranchWithWorktree": true
-}
-```
-
-#### Configuration Fields
-
-- **`worktreeCopyPatterns`**: Files/directories to copy to new worktrees (supports glob patterns)
-  - Default: `[".env*", ".vscode/**"]`
-  - Examples: `["*.json", "config/**", ".env.local"]`
-
-- **`worktreeCopyIgnores`**: Files/directories to exclude when copying (supports glob patterns)
-  - Default: `["**/node_modules/**", "**/dist/**", "**/.git/**", "**/Thumbs.db", "**/.DS_Store"]`
-
-- **`worktreePathTemplate`**: Template for worktree directory names
-  - Default: `"$BASE_PATH.worktree"`
-  - Variables: `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, `$SOURCE_BRANCH`
-  - Examples: `"worktrees/$BRANCH_NAME"`, `"$BASE_PATH-branches/$BRANCH_NAME"`
-
-- **`postCreateCmd`**: Commands to run after creating a worktree. Runs in the new worktree directory.
-  - Default: `[]`
-  - Examples: `["npm install"]`, `["pnpm install", "pnpm build"]`
-  - Variables supported in commands: `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, `$SOURCE_BRANCH`
-
-- **`terminalCommand`**: Command to open terminal/editor in the new worktree. Runs in the new worktree directory.
-  - Default: `""`
-  - Examples: `"code ."`, `"cursor ."`, `"zed ."`
-
-- **`deleteBranchWithWorktree`**: Whether to also delete the associated git branch when deleting a worktree
-  - Default: `false`
-  - When enabled, deleting a worktree will also delete its branch (with safety checks)
-  - Shows warnings for branches with unpushed commits or uncommitted changes
-
-### Template Variables
-
-Available in `worktreePathTemplate`, `postCreateCmd`, and `terminalCommand`:
-
-- `$BASE_PATH`: Base name of your repository
-- `$WORKTREE_PATH`: Full path to the new worktree
-- `$BRANCH_NAME`: Name of the new branch
-- `$SOURCE_BRANCH`: Name of the source branch
-
-## Usage Examples
-
-### Basic Workflow
-
-1. **Navigate to your Git repository**
-
-   ```bash
-   cd my-project
-   ```
-
-2. **Start Wisetree**
-
-   ```bash
-   wisetree
-   ```
-
-3. **Create a worktree**
-   - Select "Create new worktree"
-   - Enter directory name (e.g., `feature-auth`)
-   - Choose source branch (e.g., `main`)
-   - Enter new branch name (e.g., `feature/authentication`)
-   - Confirm creation
-
-### Project-Specific Configuration
-
-Create `.wisetree.json` in your project:
-
-```json
-{
-  "$schema": "https://raw.githubusercontent.com/victorcorcos/wisetree/main/schema.json",
-  "worktreeCopyPatterns": [
-    ".env.local",
-    ".vscode/**",
-    "package.json",
-    "tsconfig.json"
+  "worktreeCopyPatterns": [".env*", ".vscode/**", "config/master.key"],
+  "worktreeCopyIgnores": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/.git/**",
+    "**/Thumbs.db",
+    "**/.DS_Store"
   ],
-  "worktreePathTemplate": "worktrees/$BRANCH_NAME",
-  "postCreateCmd": ["npm install", "npm run db:populate"],
-  "terminalCommand": "code .",
+  "worktreePathTemplate": "$BASE_PATH.worktree",
+  "postCreateCmd": [
+    "bundle install",
+    "yarn install",
+    "bin/rails db:prepare"
+  ],
+  "terminalCommand": "code $WORKTREE_PATH",
   "deleteBranchWithWorktree": true
 }
 ```
 
-## Requirements
+The variables `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, and `$SOURCE_BRANCH` are interpolated in `worktreePathTemplate`, `postCreateCmd`, and `terminalCommand` at runtime.
 
-- Git installed and available in `PATH`
-- Operating system: macOS, Linux, or Windows
-- A terminal that speaks ANSI escapes (most modern terminals)
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `worktreeCopyPatterns` | `string[]` | `[".env*", ".vscode/**"]` | Glob patterns of files to copy from the source repo into a brand-new worktree. |
+| `worktreeCopyIgnores` | `string[]` | `["**/node_modules/**", "**/dist/**", "**/.git/**", "**/Thumbs.db", "**/.DS_Store"]` | Glob patterns to skip during the copy step. |
+| `worktreePathTemplate` | `string` | `"$BASE_PATH.worktree"` | Template that decides where new worktrees live on disk, relative to the repo's parent directory. |
+| `postCreateCmd` | `string[]` | `[]` | Ordered list of shell commands executed inside the new worktree, with live progress in the TUI. |
+| `terminalCommand` | `string` | `""` | Optional command spawned right after creation (e.g. `code $WORKTREE_PATH`) to open an editor or terminal. |
+| `deleteBranchWithWorktree` | `boolean` | `false` | When `true`, deleting a worktree also deletes its associated branch. |
 
-## License
+# 📟 Wisetree CLI
 
-MIT
+The full surface of the binary, suitable for both humans and scripts. Every subcommand has an interactive equivalent, but the flags below let you skip the TUI entirely.
+
+### Top-level invocation
+
+```rb
+wisetree [command] [options]
+```
+
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `(no command)` | Open the interactive main menu. |
+| `create` | Create a new worktree (interactive unless flags are supplied). |
+| `list` | List all worktrees attached to the current repository. |
+| `delete` | Delete an existing worktree (interactive unless flags are supplied). |
+| `settings` | Open the settings screen to inspect and edit configuration. |
+
+### Global / interactive options
+
+| Flag | Alias | Description |
+| --- | --- | --- |
+| `--help` | `-h` | Show the built-in help screen. |
+| `--version` | `-v` | Print the installed version. |
+| `--mode <mode>` | `-m` | Land directly on a specific screen (`menu`, `create`, `list`, `delete`, `settings`). |
+| `--from-wrapper` | `None` | Used internally by the shell wrapper so `wisetree` can print the selected path on stdout for the parent shell to `cd` into. |
+
+### Non-interactive options
+
+| Flag | Alias | Applies to | Description |
+| --- | --- | --- | --- |
+| `--name <name>` | `-n` | `create`, `delete` | Worktree directory name. |
+| `--source <branch>` | `-s` | `create` | Source branch to fork the new worktree from. |
+| `--branch <branch>` | `-b` | `create` | New branch name; defaults to the directory name. |
+| `--path <path>` | `-p` | `delete` | Worktree path (alternative to `--name`). |
+| `--force` | `-f` | `delete` | Force-delete even when the worktree has uncommitted changes. |
+| `--json` | `None` | `list` | Emit the worktree list as JSON, suitable for piping into `jq`. |
+
+### Interactive examples
+
+```rb
+wisetree                # Open the main menu
+wisetree create         # Jump straight into the create flow
+wisetree list           # Browse worktrees interactively
+wisetree delete         # Jump straight into the delete flow
+wisetree settings       # Open the settings screen
+```
+
+### Non-interactive examples
+
+```rb
+wisetree create -n my-feature -s main                  # Create a worktree off main
+wisetree create -n my-feature -s main -b feat/payments # Create with an explicit new branch
+wisetree list --json                                   # Emit JSON for scripting
+wisetree delete -n my-feature                          # Delete by directory name
+wisetree delete -p /path/to/worktree -f                # Force-delete by full path
+```
+
+### Update checks
+
+`wisetree` lazily checks the npm registry at most once every 24 hours and surfaces a banner inside the TUI when a newer version is available. The cache lives at `~/.wisetree/state.json` so the check never gets in your way.
+
+# 🤝 Contribute
+
+Contributions of every shape are welcome, including bug reports, feature requests, design feedback on the palette, documentation polish, and code. The repository follows a few simple conventions:
+
+1. **Fork and branch** off `main`. Use a descriptive branch name (e.g. `feat/json-list-flag`, `fix/shell-wrapper-zsh`).
+2. **Run the test suite** before opening a PR:
+
+```rb
+cargo test --all
+```
+
+3. **Keep the formatter and linter happy:**
+
+```rb
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+```
+
+4. **Open a Pull Request** against `main` using the template in `.github/pull_request_template.md`. Include a short description, a screenshot or screencast for any TUI change, and a checklist of how to test it manually.
+
+The CI pipeline (`.github/workflows/ci.yml`) runs the tests, formatter, and clippy on every push, and the release pipeline (`release.yml`, generated by `cargo-dist`) ships the binaries to GitHub Releases, npm, and the Homebrew tap.
+
+# 🪪 License
+
+`wisetree` is released under the **MIT License**. See [`LICENSE`](./LICENSE) for the full text. In short: do whatever you want with it, just keep the copyright notice intact.
+
+# 👤 Creator
+
+Victor Cordeiro Costa
+
+1. Github: https://github.com/victorcorcos
+2. Linkedin: https://www.linkedin.com/in/victorcorcos/

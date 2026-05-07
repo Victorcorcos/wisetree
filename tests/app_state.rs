@@ -51,7 +51,7 @@ fn save_then_load_round_trip() {
         svc.update(|s| {
             s.last_update_check = Some(1_700_000_000_000);
             s.latest_version = Some("9.9.9".into());
-            s.checked_version = Some("1.2.0".into());
+            s.checked_version = Some("1.0.0".into());
         });
         svc.save();
 
@@ -65,7 +65,7 @@ fn save_then_load_round_trip() {
         let state = svc2.load();
         assert_eq!(state.last_update_check, Some(1_700_000_000_000));
         assert_eq!(state.latest_version.as_deref(), Some("9.9.9"));
-        assert_eq!(state.checked_version.as_deref(), Some("1.2.0"));
+        assert_eq!(state.checked_version.as_deref(), Some("1.0.0"));
     });
 }
 

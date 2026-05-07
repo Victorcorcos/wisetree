@@ -1,7 +1,4 @@
-//! Reusable TUI primitives.
-//!
-//! Each widget mirrors one of the Ink components in branchlet's
-//! `src/components/common`. Stateful widgets (input/select/confirm) own
+//! Reusable TUI primitives. Stateful widgets (input/select/confirm) own
 //! their state and expose a `handle_key` method returning an outcome enum;
 //! purely presentational widgets (spinner / status / command-list) are
 //! drawn directly from the caller's state.
@@ -22,7 +19,10 @@ pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
 pub use confirm_dialog::{ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant};
 pub use input_prompt::{InputOutcome, InputPrompt};
-pub use select_prompt::{SelectOption, SelectOutcome, SelectPrompt};
+pub use select_prompt::{
+    branded_line, branded_spans, SelectOption, SelectOutcome, SelectPrompt, SelectStyle,
+    SELECT_CURSOR,
+};
 pub use spinner::{spinner_frame, Spinner, SPINNER_FRAMES};
 pub use status_indicator::{Status, StatusIndicator};
 pub use update_banner::UpdateBanner;

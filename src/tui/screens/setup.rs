@@ -6,8 +6,7 @@
 //! - `Confirm`     : `ConfirmDialog` showing a preview of the block that
 //!   will be added to the user's rc file.
 //! - `Installing`  : spinner while `App` performs the install.
-//! - `Success`     : success message + reload-shell hint. On macOS bash
-//!   users we also surface a one-line note about `~/.bash_profile`.
+//! - `Success`     : success message + reload-shell hint.
 //! - `Errored`     : error message + "Press any key to go back...".
 //!
 //! Async work is owned by `App`: it triggers the install on `Confirmed`
@@ -104,13 +103,23 @@ impl SetupScreen {
 
     fn build_select(&self) -> SelectPrompt<Shell> {
         let mut zsh_opt = SelectOption::new("zsh (~/.zshrc)", Shell::Zsh);
-        let mut bash_opt = SelectOption::new("bash (~/.bashrc)", Shell::Bash);
+        let bash_label = if self.on_macos {
+            "bash (~/.bash_profile)"
+        } else {
+            "bash (~/.bashrc)"
+        };
+        let mut bash_opt = SelectOption::new(bash_label, Shell::Bash);
         match self.detected {
             Shell::Zsh => {
                 zsh_opt = zsh_opt.with_description("detected");
             }
             Shell::Bash => {
-                bash_opt = bash_opt.with_description("detected");
+                let bash_description = if self.on_macos {
+                    "detected; macOS default"
+                } else {
+                    "detected"
+                };
+                bash_opt = bash_opt.with_description(bash_description);
             }
             Shell::Unknown => {}
         }
@@ -123,18 +132,25 @@ impl SetupScreen {
         SelectPrompt::new("Select your shell:", opts).with_default_index(default_idx)
     }
 
-    fn build_confirm(&self) -> ConfirmDialog {
-        let config_file = match self.selected {
+    fn config_file(&self) -> &'static str {
+        match self.selected {
             Shell::Zsh => "~/.zshrc",
+            Shell::Bash if self.on_macos => "~/.bash_profile",
             _ => "~/.bashrc",
-        };
+        }
+    }
+
+    fn build_confirm(&self) -> ConfirmDialog {
+        let config_file = self.config_file();
         let preview = "# Tab completions for wisetree commands\n# ...\n\n\
              # Shell wrapper for directory switching\n\
              wisetree() {\n\
              \x20\x20if [ $# -eq 0 ]; then\n\
-             \x20\x20\x20\x20local dir=$(FORCE_COLOR=3 command wisetree --from-wrapper)\n\
-             \x20\x20\x20\x20if [ -n \"$dir\" ]; then\n\
-             \x20\x20\x20\x20\x20\x20builtin cd \"$dir\" && echo \"Wisetree: Navigated to $(pwd)\"\n\
+             \x20\x20\x20\x20local dir\n\
+             \x20\x20\x20\x20if dir=$(FORCE_COLOR=3 command wisetree --from-wrapper); then\n\
+             \x20\x20\x20\x20\x20\x20if [ -n \"$dir\" ]; then\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20builtin cd \"$dir\" && echo \"Wisetree: Navigated to $(pwd)\"\n\
+             \x20\x20\x20\x20\x20\x20fi\n\
              \x20\x20\x20\x20fi\n\
              \x20\x20else\n\
              \x20\x20\x20\x20command wisetree \"$@\"\n\
@@ -206,6 +222,20 @@ impl SetupScreen {
         }
     }
 
+    /// Inner content height for the panel (excludes the rounded border).
+    pub fn preferred_content_height(&self) -> u16 {
+        match self.step {
+            // Intro line (2) + select prompt (label + spacer + 2 rows + hint).
+            SetupStep::SelectShell => 8,
+            // Confirm dialog with multi-line install preview.
+            SetupStep::Confirm => 18,
+            SetupStep::Installing => 3,
+            // Title + 3 info lines + footer.
+            SetupStep::Success => 6,
+            SetupStep::Errored => 5,
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         match self.step {
             SetupStep::SelectShell => self.render_select(frame, area),
@@ -230,9 +260,20 @@ impl SetupScreen {
             .constraints([Constraint::Length(2), Constraint::Min(1)])
             .split(area);
         let intro = Line::from(vec![
-            Span::raw("Shell integration wraps the "),
-            Span::styled("wisetree", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" command to enable quick directory switching."),
+            Span::styled(
+                "Shell integration wraps the ",
+                Style::default().fg(colors::INFO),
+            ),
+            Span::styled(
+                "wisetree",
+                Style::default()
+                    .fg(colors::BRAND)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " command to enable quick directory switching.",
+                Style::default().fg(colors::INFO),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(intro).style(Style::default().fg(colors::INFO)),
@@ -244,10 +285,7 @@ impl SetupScreen {
     }
 
     fn render_success(&self, frame: &mut Frame, area: Rect) {
-        let config_file = match self.selected {
-            Shell::Zsh => "~/.zshrc",
-            _ => "~/.bashrc",
-        };
+        let config_file = self.config_file();
         let mut lines: Vec<Line> = vec![
             Line::from(vec![Span::styled(
                 "Shell integration installed successfully!",
@@ -271,18 +309,14 @@ impl SetupScreen {
             ]),
             Line::from(vec![
                 Span::styled("Try it now: ", Style::default().fg(colors::SUCCESS)),
-                Span::styled("wisetree", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "wisetree",
+                    Style::default()
+                        .fg(colors::BRAND)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
         ];
-
-        if matches!(self.selected, Shell::Bash) && self.on_macos {
-            lines.push(Line::from(Span::styled(
-                "On macOS, bash login shells read ~/.bash_profile rather than ~/.bashrc. \
-                 If the integration doesn't activate in new terminals, add \
-                 `[ -f ~/.bashrc ] && source ~/.bashrc` to your ~/.bash_profile.",
-                Style::default().fg(colors::WARNING),
-            )));
-        }
         lines.push(Line::from(Span::styled(
             "Press Enter or Esc to return to menu",
             Style::default()

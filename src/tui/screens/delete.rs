@@ -27,8 +27,8 @@ use crate::messages::{
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, SelectOption, SelectOutcome,
-    SelectPrompt, Status, StatusIndicator,
+    branded_line, ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, SelectOption,
+    SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +319,23 @@ impl DeleteScreen {
         }
     }
 
+    /// Inner content height for the framed panel (excludes the rounded
+    /// border).
+    pub fn preferred_content_height(&self) -> u16 {
+        if self.loading || self.error.is_some() {
+            return 4;
+        }
+        if self.worktrees.is_empty() {
+            return 4;
+        }
+        match self.step {
+            DeleteStep::Select => 4 + (self.worktrees.len() as u16).min(10),
+            DeleteStep::Confirm => 10,
+            DeleteStep::Deleting => 3,
+            DeleteStep::Success => 3,
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if self.loading {
             StatusIndicator::new(Status::Loading, LOADING_WORKTREES)
@@ -331,8 +348,9 @@ impl DeleteScreen {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(2)])
                 .split(area);
+            let err_style = Style::default().fg(colors::ERROR);
             frame.render_widget(
-                Paragraph::new(err.clone()).style(Style::default().fg(colors::ERROR)),
+                Paragraph::new(Line::from(branded_line(err, err_style))),
                 chunks[0],
             );
             frame.render_widget(
@@ -347,9 +365,12 @@ impl DeleteScreen {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Length(2)])
                 .split(area);
+            let info_style = Style::default().fg(colors::INFO);
             frame.render_widget(
-                Paragraph::new("No additional worktrees to delete.")
-                    .style(Style::default().fg(colors::INFO)),
+                Paragraph::new(Line::from(branded_line(
+                    "No additional worktrees to delete.",
+                    info_style,
+                ))),
                 chunks[0],
             );
             frame.render_widget(

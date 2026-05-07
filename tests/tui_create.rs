@@ -117,9 +117,11 @@ fn select_source_branch_advances_to_new_branch_with_directory_default() {
     let mut s = ready_screen();
     type_str(&mut s, "feat-login");
     s.handle_key(key(KeyCode::Enter)); // → source-branch
-    s.handle_key(key(KeyCode::Enter)); // pick first option (main)
+                                       // Branches sort alphabetically: develop, main, origin/feat/login. The first row
+                                       // is selected by default, so Enter picks "develop".
+    s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), CreateStep::NewBranch);
-    assert_eq!(s.source_branch, "main");
+    assert_eq!(s.source_branch, "develop");
 }
 
 #[test]
@@ -127,7 +129,8 @@ fn custom_ref_path_takes_user_to_input() {
     let mut s = ready_screen();
     type_str(&mut s, "feat-login");
     s.handle_key(key(KeyCode::Enter));
-    // Pick __CUSTOM_REF__ — last option (index 3 with 3 branches + custom).
+    // Branches sort alphabetically: develop (default-selected), main, origin/feat/login,
+    // then the custom-ref entry. Three Downs from `develop` reach the custom-ref row.
     for _ in 0..3 {
         s.handle_key(key(KeyCode::Down));
     }
@@ -144,6 +147,7 @@ fn empty_new_branch_falls_back_to_source_for_local() {
     let mut s = ready_screen();
     type_str(&mut s, "myfeat");
     s.handle_key(key(KeyCode::Enter));
+    // First option is "develop" (alphabetical) — picked by default.
     s.handle_key(key(KeyCode::Enter));
     // new-branch step has default="myfeat"; clear it then submit blank
     for _ in 0..6 {
@@ -151,7 +155,7 @@ fn empty_new_branch_falls_back_to_source_for_local() {
     }
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), CreateStep::Confirm);
-    assert_eq!(s.new_branch, "main");
+    assert_eq!(s.new_branch, "develop");
 }
 
 #[test]
@@ -159,7 +163,8 @@ fn empty_new_branch_strips_remote_prefix() {
     let mut s = ready_screen();
     type_str(&mut s, "loginfeat");
     s.handle_key(key(KeyCode::Enter));
-    // navigate to origin/feat/login (3rd entry, index 2)
+    // Branches sort alphabetically: develop (default-selected), main, origin/feat/login.
+    // Two Downs from `develop` land on origin/feat/login.
     s.handle_key(key(KeyCode::Down));
     s.handle_key(key(KeyCode::Down));
     s.handle_key(key(KeyCode::Enter));
@@ -178,6 +183,9 @@ fn new_branch_existing_local_blocks_with_validation() {
     let mut s = ready_screen();
     type_str(&mut s, "feat-x");
     s.handle_key(key(KeyCode::Enter));
+    // First option is "develop" — skip past it to "main" so we can try to reuse the
+    // "develop" name on the new-branch step without auto-matching the source.
+    s.handle_key(key(KeyCode::Down));
     s.handle_key(key(KeyCode::Enter));
     for _ in 0..6 {
         s.handle_key(key(KeyCode::Backspace));
@@ -193,7 +201,7 @@ fn confirm_with_y_then_enter_yields_confirmed_action() {
     let mut s = ready_screen();
     type_str(&mut s, "feat-x");
     s.handle_key(key(KeyCode::Enter));
-    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Enter)); // first option, alphabetical: "develop"
     s.handle_key(key(KeyCode::Enter)); // accept default branch name
     s.handle_key(key(KeyCode::Char('y')));
     let action = s.handle_key(key(KeyCode::Enter));
@@ -204,7 +212,7 @@ fn confirm_with_y_then_enter_yields_confirmed_action() {
             new_branch,
         } => {
             assert_eq!(directory_name, "feat-x");
-            assert_eq!(source_branch, "main");
+            assert_eq!(source_branch, "develop");
             assert_eq!(new_branch, "feat-x");
         }
         other => panic!("expected Confirmed, got {other:?}"),
@@ -236,6 +244,76 @@ fn success_step_done_action_on_enter() {
     s.mark_complete();
     let action = s.handle_key(key(KeyCode::Enter));
     assert_eq!(action, CreateAction::Done);
+}
+
+#[test]
+fn source_branch_options_pin_priority_remotes_to_top() {
+    let mut s = CreateScreen::new();
+    s.set_branches(vec![
+        GitBranch {
+            name: "zeta".into(),
+            commit: "1".into(),
+            last_used: None,
+            is_current: false,
+            is_default: false,
+            is_remote: false,
+        },
+        GitBranch {
+            name: "origin/master".into(),
+            commit: "2".into(),
+            last_used: None,
+            is_current: false,
+            is_default: false,
+            is_remote: true,
+        },
+        GitBranch {
+            name: "alpha".into(),
+            commit: "3".into(),
+            last_used: None,
+            is_current: false,
+            is_default: false,
+            is_remote: false,
+        },
+        GitBranch {
+            name: "origin/main".into(),
+            commit: "4".into(),
+            last_used: None,
+            is_current: false,
+            is_default: false,
+            is_remote: true,
+        },
+        GitBranch {
+            name: "upstream/master".into(),
+            commit: "5".into(),
+            last_used: None,
+            is_current: false,
+            is_default: false,
+            is_remote: true,
+        },
+        GitBranch {
+            name: "upstream/main".into(),
+            commit: "6".into(),
+            last_used: None,
+            is_current: false,
+            is_default: false,
+            is_remote: true,
+        },
+    ]);
+
+    let opts = s.branch_options();
+    let names: Vec<&str> = opts.iter().map(|o| o.value.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "upstream/main",
+            "upstream/master",
+            "origin/main",
+            "origin/master",
+            "alpha",
+            "zeta",
+            "__CUSTOM_REF__",
+        ]
+    );
 }
 
 #[test]

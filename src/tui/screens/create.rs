@@ -20,12 +20,23 @@ use crate::messages::{
     CREATE_SUCCESS, LOADING_BRANCHES,
 };
 use crate::tui::widgets::{
-    CommandListProgress, ConfirmDialog, ConfirmOutcome, ConfirmVariant, InputOutcome, InputPrompt,
-    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+    branded_line, CommandListProgress, ConfirmChoice, ConfirmDialog, ConfirmOutcome,
+    ConfirmVariant, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status,
+    StatusIndicator,
 };
 use crate::utils::validation::{validate_branch_name, validate_directory_name};
 
 const CUSTOM_REF_VALUE: &str = "__CUSTOM_REF__";
+
+/// Branches surfaced first on the source-branch picker. New worktrees are
+/// almost always cut from one of these, so listing them above the recency-
+/// sorted remainder saves a search/scroll on every create.
+const PRIORITY_SOURCE_BRANCHES: [&str; 4] = [
+    "upstream/main",
+    "upstream/master",
+    "origin/main",
+    "origin/master",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateStep {
@@ -115,7 +126,7 @@ impl CreateScreen {
     }
 
     pub fn set_branches(&mut self, branches: Vec<GitBranch>) {
-        self.branches = Arc::new(branches);
+        self.branches = Arc::new(prioritize_branches(branches));
         self.loading = false;
     }
 
@@ -199,13 +210,6 @@ impl CreateScreen {
         opts
     }
 
-    fn default_branch_index(&self) -> usize {
-        self.branches
-            .iter()
-            .position(|b| b.is_current || b.is_default)
-            .unwrap_or(0)
-    }
-
     fn validate_new_branch(branches: Arc<Vec<GitBranch>>, name: &str) -> Option<String> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -259,9 +263,7 @@ impl CreateScreen {
 
     fn build_source_select(&self) -> SelectPrompt<String> {
         let opts = self.branch_options();
-        SelectPrompt::new(CREATE_SOURCE_BRANCH_PROMPT, opts)
-            .searchable()
-            .with_default_index(self.default_branch_index())
+        SelectPrompt::new(CREATE_SOURCE_BRANCH_PROMPT, opts).searchable()
     }
 
     fn handle_source_branch(&mut self, key: KeyEvent) -> CreateAction {
@@ -360,7 +362,9 @@ impl CreateScreen {
                 self.directory_name, self.new_branch, self.source_branch
             )
         };
-        ConfirmDialog::new(CREATE_CONFIRM_TITLE, message).with_variant(ConfirmVariant::Default)
+        ConfirmDialog::new(CREATE_CONFIRM_TITLE, message)
+            .with_variant(ConfirmVariant::Default)
+            .with_default(ConfirmChoice::Confirm)
     }
 
     fn handle_confirm(&mut self, key: KeyEvent) -> CreateAction {
@@ -383,6 +387,22 @@ impl CreateScreen {
         }
     }
 
+    /// Inner content height for the framed panel (excludes the rounded
+    /// border).
+    pub fn preferred_content_height(&self) -> u16 {
+        if self.loading || self.error.is_some() {
+            return 4;
+        }
+        match self.step {
+            CreateStep::Directory | CreateStep::CustomRef | CreateStep::NewBranch => 6,
+            CreateStep::SourceBranch => 14,
+            CreateStep::Confirm => 10,
+            CreateStep::Creating => 3,
+            CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
+            CreateStep::Success => 3,
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if self.loading {
             StatusIndicator::new(Status::Loading, LOADING_BRANCHES)
@@ -395,8 +415,9 @@ impl CreateScreen {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(2)])
                 .split(area);
+            let err_style = Style::default().fg(colors::ERROR);
             frame.render_widget(
-                Paragraph::new(Line::from(msg.clone())).style(Style::default().fg(colors::ERROR)),
+                Paragraph::new(Line::from(branded_line(msg, err_style))),
                 chunks[0],
             );
             frame.render_widget(
@@ -458,6 +479,27 @@ impl Default for CreateScreen {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn prioritize_branches(branches: Vec<GitBranch>) -> Vec<GitBranch> {
+    let mut priority: Vec<GitBranch> = Vec::new();
+    let mut rest: Vec<GitBranch> = Vec::new();
+    for branch in branches {
+        if PRIORITY_SOURCE_BRANCHES.contains(&branch.name.as_str()) {
+            priority.push(branch);
+        } else {
+            rest.push(branch);
+        }
+    }
+    priority.sort_by_key(|b| {
+        PRIORITY_SOURCE_BRANCHES
+            .iter()
+            .position(|p| *p == b.name.as_str())
+            .unwrap_or(usize::MAX)
+    });
+    rest.sort_by(|a, b| a.name.cmp(&b.name));
+    priority.extend(rest);
+    priority
 }
 
 fn directory_input() -> InputPrompt {
