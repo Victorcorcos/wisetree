@@ -22,6 +22,15 @@ fn key(code: KeyCode) -> KeyEvent {
     }
 }
 
+fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
+}
+
 fn dump<F>(width: u16, height: u16, draw: F) -> String
 where
     F: FnOnce(&mut ratatui::Frame),
@@ -63,7 +72,7 @@ fn input_prompt_backspace_erases() {
     );
     assert_eq!(input.value, "h");
     matches!(
-        input.handle_key(key(KeyCode::Delete)),
+        input.handle_key(key(KeyCode::Backspace)),
         InputOutcome::Pending
     );
     assert_eq!(input.value, "");
@@ -95,7 +104,7 @@ fn input_prompt_esc_cancels() {
 #[test]
 fn input_prompt_render_includes_placeholder_and_hint() {
     let input = InputPrompt::new("Branch").with_placeholder("e.g. feat/login");
-    let s = dump(60, 8, |f| input.render(f, f.area()));
+    let s = dump(60, 8, |f| input.render(f, f.area(), 0));
     assert!(s.contains("Branch"));
     assert!(s.contains("e.g. feat/login"));
     assert!(s.contains("Press Enter to confirm"));
@@ -106,7 +115,7 @@ fn input_prompt_render_shows_error_when_pinned() {
     let mut input = InputPrompt::new("Branch")
         .with_validator(|v| (v.is_empty()).then(|| "Required".to_string()));
     matches!(input.handle_key(key(KeyCode::Enter)), InputOutcome::Pending);
-    let s = dump(60, 8, |f| input.render(f, f.area()));
+    let s = dump(60, 8, |f| input.render(f, f.area(), 0));
     assert!(s.contains("Required"));
 }
 
@@ -118,6 +127,210 @@ fn input_prompt_handles_multibyte_unicode() {
     assert_eq!(input.value, "日本");
     input.handle_key(key(KeyCode::Backspace));
     assert_eq!(input.value, "日");
+}
+
+#[test]
+fn input_prompt_with_default_places_cursor_at_end() {
+    let input = InputPrompt::new("Name").with_default("hello");
+    assert_eq!(input.cursor, 5);
+}
+
+#[test]
+fn input_prompt_left_right_arrows_move_cursor() {
+    let mut input = InputPrompt::new("Name").with_default("abc");
+    assert_eq!(input.cursor, 3);
+    input.handle_key(key(KeyCode::Left));
+    assert_eq!(input.cursor, 2);
+    input.handle_key(key(KeyCode::Left));
+    input.handle_key(key(KeyCode::Left));
+    input.handle_key(key(KeyCode::Left));
+    assert_eq!(input.cursor, 0); // clamps at 0
+    input.handle_key(key(KeyCode::Right));
+    assert_eq!(input.cursor, 1);
+}
+
+#[test]
+fn input_prompt_insert_at_cursor() {
+    let mut input = InputPrompt::new("Name").with_default("ac");
+    input.handle_key(key(KeyCode::Left));
+    input.handle_key(key(KeyCode::Char('b')));
+    assert_eq!(input.value, "abc");
+    assert_eq!(input.cursor, 2);
+}
+
+#[test]
+fn input_prompt_backspace_deletes_at_cursor() {
+    let mut input = InputPrompt::new("Name").with_default("abc");
+    input.handle_key(key(KeyCode::Left));
+    input.handle_key(key(KeyCode::Backspace));
+    assert_eq!(input.value, "ac");
+    assert_eq!(input.cursor, 1);
+}
+
+#[test]
+fn input_prompt_delete_removes_char_at_cursor() {
+    let mut input = InputPrompt::new("Name").with_default("abc");
+    input.handle_key(key(KeyCode::Home));
+    input.handle_key(key(KeyCode::Delete));
+    assert_eq!(input.value, "bc");
+    assert_eq!(input.cursor, 0);
+}
+
+#[test]
+fn input_prompt_home_end_keys() {
+    let mut input = InputPrompt::new("Name").with_default("hello");
+    input.handle_key(key(KeyCode::Home));
+    assert_eq!(input.cursor, 0);
+    input.handle_key(key(KeyCode::End));
+    assert_eq!(input.cursor, 5);
+}
+
+#[test]
+fn input_prompt_ctrl_a_and_ctrl_e() {
+    let mut input = InputPrompt::new("Name").with_default("hello");
+    input.handle_key(key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(input.cursor, 0);
+    input.handle_key(key_mod(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    assert_eq!(input.cursor, 5);
+}
+
+#[test]
+fn input_prompt_ctrl_b_and_ctrl_f() {
+    let mut input = InputPrompt::new("Name").with_default("ab");
+    input.handle_key(key_mod(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(input.cursor, 1);
+    input.handle_key(key_mod(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert_eq!(input.cursor, 2);
+}
+
+#[test]
+fn input_prompt_ctrl_h_and_ctrl_d() {
+    let mut input = InputPrompt::new("Name").with_default("abc");
+    input.handle_key(key_mod(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(input.value, "ab"); // Ctrl+H = backspace
+    input.handle_key(key(KeyCode::Home));
+    input.handle_key(key_mod(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(input.value, "b"); // Ctrl+D = delete-right
+}
+
+#[test]
+fn input_prompt_alt_left_jumps_word() {
+    let mut input = InputPrompt::new("Name").with_default("foo bar baz");
+    input.handle_key(key_mod(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(input.cursor, 8); // start of "baz"
+    input.handle_key(key_mod(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(input.cursor, 4); // start of "bar"
+}
+
+#[test]
+fn input_prompt_alt_right_jumps_word() {
+    let mut input = InputPrompt::new("Name").with_default("foo bar baz");
+    input.handle_key(key(KeyCode::Home));
+    input.handle_key(key_mod(KeyCode::Right, KeyModifiers::ALT));
+    assert_eq!(input.cursor, 3); // end of "foo"
+    input.handle_key(key_mod(KeyCode::Right, KeyModifiers::ALT));
+    assert_eq!(input.cursor, 7); // end of "bar"
+}
+
+#[test]
+fn input_prompt_ctrl_left_right_word_jump() {
+    let mut input = InputPrompt::new("Name").with_default("alpha beta");
+    input.handle_key(key_mod(KeyCode::Left, KeyModifiers::CONTROL));
+    assert_eq!(input.cursor, 6); // start of "beta"
+    input.handle_key(key_mod(KeyCode::Right, KeyModifiers::CONTROL));
+    assert_eq!(input.cursor, 10); // end of "beta"
+}
+
+#[test]
+fn input_prompt_word_jump_uses_non_alphanumeric_boundaries() {
+    let mut input = InputPrompt::new("Name").with_default("feat/login-page");
+    input.handle_key(key_mod(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(input.cursor, 11); // start of "page" (after '-')
+    input.handle_key(key_mod(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(input.cursor, 5); // start of "login"
+}
+
+#[test]
+fn input_prompt_ctrl_w_deletes_word_back() {
+    let mut input = InputPrompt::new("Name").with_default("foo bar baz");
+    input.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(input.value, "foo bar ");
+    assert_eq!(input.cursor, 8);
+}
+
+#[test]
+fn input_prompt_alt_backspace_deletes_word_back() {
+    let mut input = InputPrompt::new("Name").with_default("foo bar");
+    input.handle_key(key_mod(KeyCode::Backspace, KeyModifiers::ALT));
+    assert_eq!(input.value, "foo ");
+}
+
+#[test]
+fn input_prompt_ctrl_u_kills_to_start() {
+    let mut input = InputPrompt::new("Name").with_default("hello world");
+    // Move to position 6 (between space and "world").
+    for _ in 0..5 {
+        input.handle_key(key(KeyCode::Left));
+    }
+    assert_eq!(input.cursor, 6);
+    input.handle_key(key_mod(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert_eq!(input.value, "world");
+    assert_eq!(input.cursor, 0);
+}
+
+#[test]
+fn input_prompt_ctrl_k_kills_to_end() {
+    let mut input = InputPrompt::new("Name").with_default("hello world");
+    input.handle_key(key(KeyCode::Home));
+    for _ in 0..5 {
+        input.handle_key(key(KeyCode::Right));
+    }
+    input.handle_key(key_mod(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert_eq!(input.value, "hello");
+    assert_eq!(input.cursor, 5);
+}
+
+#[test]
+fn input_prompt_alt_b_and_alt_f_word_jump() {
+    let mut input = InputPrompt::new("Name").with_default("foo bar");
+    input.handle_key(key_mod(KeyCode::Char('b'), KeyModifiers::ALT));
+    assert_eq!(input.cursor, 4); // start of "bar"
+    input.handle_key(key_mod(KeyCode::Char('f'), KeyModifiers::ALT));
+    assert_eq!(input.cursor, 7); // end of "bar"
+}
+
+#[test]
+fn input_prompt_alt_d_deletes_word_forward() {
+    let mut input = InputPrompt::new("Name").with_default("foo bar");
+    input.handle_key(key(KeyCode::Home));
+    input.handle_key(key_mod(KeyCode::Char('d'), KeyModifiers::ALT));
+    assert_eq!(input.value, " bar");
+    assert_eq!(input.cursor, 0);
+}
+
+#[test]
+fn input_prompt_cursor_handles_multibyte_unicode() {
+    let mut input = InputPrompt::new("Name").with_default("日本語");
+    assert_eq!(input.cursor, 3);
+    input.handle_key(key(KeyCode::Left));
+    assert_eq!(input.cursor, 2);
+    input.handle_key(key(KeyCode::Backspace));
+    assert_eq!(input.value, "日語");
+    assert_eq!(input.cursor, 1);
+    input.handle_key(key(KeyCode::Char('☆')));
+    assert_eq!(input.value, "日☆語");
+    assert_eq!(input.cursor, 2);
+}
+
+#[test]
+fn input_prompt_render_ignores_tick() {
+    // Cursor is always solid — render output should be identical regardless
+    // of `tick` value.
+    let input = InputPrompt::new("Branch").with_default("foo");
+    let s_low = dump(60, 8, |f| input.render(f, f.area(), 0));
+    let s_high = dump(60, 8, |f| input.render(f, f.area(), 7));
+    assert_eq!(s_low, s_high);
+    assert!(s_low.contains("foo"));
 }
 
 // -- SelectPrompt -------------------------------------------------------------
