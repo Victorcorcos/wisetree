@@ -1,10 +1,10 @@
 //! List Worktrees screen. Two navigation modes:
-//! - `List`: shows the worktrees through the shared `SelectPrompt` widget,
-//!   so the design matches the main "Choose wisely..." menu and the Settings
-//!   screen (title, full-width selection bar, numbered rows). Up/down/jk
-//!   navigate, numeric 1–9 jumps to that row, Enter opens the per-row action
-//!   menu, `e` opens via the configured `terminalCommand`, Esc returns to the
-//!   menu.
+//! - `List`: shows the worktrees through the shared `SelectPrompt` widget
+//!   in searchable mode (mirroring the Create → Source-branch screen): a
+//!   "Search:" row filters the worktrees as the user types, Up/Down move
+//!   the cursor inside the filtered view, Enter opens the per-row action
+//!   menu for the highlighted worktree, and Esc clears a non-empty query
+//!   first or otherwise returns to the menu.
 //! - `ActionMenu`: shows "Navigate to Directory" (only enabled when invoked
 //!   via the wrapper) and, when configured, "Open with Command".
 //!
@@ -12,7 +12,7 @@
 //! `set_worktrees`/`set_error`, and reacts to `ListAction::OpenTerminal`,
 //! `ListAction::NavigateTo`, etc.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -55,6 +55,11 @@ pub struct ListScreen {
     loading: bool,
     error: Option<String>,
     action_select: Option<SelectPrompt<ActionChoice>>,
+    // Original-index of the worktree selected when transitioning into the
+    // action menu. Captured at transition time because `select.selected`
+    // is an index into the *filtered* view when the user has typed a
+    // search query, and would otherwise dereference into the wrong row.
+    action_target: Option<usize>,
     pub tick: usize,
 }
 
@@ -69,6 +74,7 @@ impl ListScreen {
             loading: true,
             error: None,
             action_select: None,
+            action_target: None,
             tick: 0,
         }
     }
@@ -115,7 +121,9 @@ impl ListScreen {
                 SelectOption::new(fold_home(&wt.path), i).with_description(wt.branch.clone())
             })
             .collect();
-        SelectPrompt::new("Select a worktree:", opts).without_hint()
+        SelectPrompt::new("Select a worktree:", opts)
+            .searchable()
+            .without_hint()
     }
 
     fn build_action_select(&self, _selected: &GitWorktree) -> SelectPrompt<ActionChoice> {
@@ -154,20 +162,9 @@ impl ListScreen {
             return self.handle_action_menu(key);
         }
 
-        if let KeyCode::Char(c) = key.code {
-            let lower = c.to_ascii_lowercase();
-            let plain = !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-            if plain && lower == 'e' {
-                if self.has_terminal_command {
-                    let idx = self.selected_index();
-                    return ListAction::OpenTerminal(self.worktrees[idx].path.clone());
-                }
-                return ListAction::Continue;
-            }
-        }
-
+        // The select prompt is searchable, so plain alphanumeric keys feed
+        // the filter query (matching the Source-branch screen). Reach the
+        // "Open with Command" action via Enter → Action Menu instead.
         let select = match self.select.as_mut() {
             Some(s) => s,
             None => return ListAction::Continue,
@@ -176,6 +173,7 @@ impl ListScreen {
             SelectOutcome::Selected(idx, _) => {
                 let wt = self.worktrees[idx].clone();
                 self.action_select = Some(self.build_action_select(&wt));
+                self.action_target = Some(idx);
                 self.mode = NavigationMode::ActionMenu;
                 ListAction::Continue
             }
@@ -194,8 +192,10 @@ impl ListScreen {
         };
         match select.handle_key(key) {
             SelectOutcome::Selected(_, choice) => {
-                let path = self.worktrees[self.selected_index()].path.clone();
+                let target = self.action_target.unwrap_or_else(|| self.selected_index());
+                let path = self.worktrees[target].path.clone();
                 self.action_select = None;
+                self.action_target = None;
                 self.mode = NavigationMode::List;
                 match choice {
                     ActionChoice::Cd => {
@@ -210,6 +210,7 @@ impl ListScreen {
             }
             SelectOutcome::Cancelled => {
                 self.action_select = None;
+                self.action_target = None;
                 self.mode = NavigationMode::List;
                 ListAction::Continue
             }
@@ -229,9 +230,12 @@ impl ListScreen {
         if self.worktrees.is_empty() {
             return 4;
         }
-        // SelectPrompt body: title (1) + spacer (1) + N rows + custom hint (1)
-        // + a row of breathing room.
-        4 + self.worktrees.len() as u16
+        // SelectPrompt body: title (1) + spacer (1) + Search row (1) + spacer
+        // (1) + visible rows (capped at 10) + optional "more above/below"
+        // indicators + custom hint (1) + a row of breathing room.
+        let visible = (self.worktrees.len() as u16).min(10);
+        let overflow = if self.worktrees.len() > 10 { 2 } else { 0 };
+        6 + visible + overflow
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -293,7 +297,19 @@ impl ListScreen {
 
         let hint = Line::from(vec![
             Span::styled(
-                "↑↓/jk ",
+                "Type ",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                "to filter  ",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                "↑↓ ",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::BOLD | Modifier::DIM),
@@ -317,25 +333,13 @@ impl ListScreen {
                     .add_modifier(Modifier::DIM),
             ),
             Span::styled(
-                "E ",
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::BOLD | Modifier::DIM),
-            ),
-            Span::styled(
-                "Command  ",
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            ),
-            Span::styled(
                 "⎋ ",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::BOLD | Modifier::DIM),
             ),
             Span::styled(
-                "Back",
+                "Clear / Back",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),
@@ -349,7 +353,8 @@ impl ListScreen {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(1)])
             .split(area);
-        let wt = &self.worktrees[self.selected_index()];
+        let target = self.action_target.unwrap_or_else(|| self.selected_index());
+        let wt = &self.worktrees[target];
         let header = Line::from(vec![
             Span::raw("Selected: "),
             Span::styled(fold_home(&wt.path), Style::default().fg(colors::PRIMARY)),
