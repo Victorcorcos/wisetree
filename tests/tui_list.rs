@@ -89,21 +89,36 @@ fn down_arrow_navigates_with_wrap() {
 }
 
 #[test]
-fn jk_keys_navigate() {
+fn typing_filters_worktrees_and_enter_selects_match() {
+    // The list mirrors the Source-branch screen: typing filters the rows
+    // (so j/k/digits/letters all feed the search query rather than acting
+    // as legacy shortcuts), and Enter opens the action menu for the first
+    // remaining match.
     let mut s = ListScreen::new(true, true);
     s.set_worktrees(worktrees());
-    s.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(s.selected_index(), 1);
-    s.handle_key(key(KeyCode::Char('k')));
-    assert_eq!(s.selected_index(), 0);
+    for ch in "bug".chars() {
+        s.handle_key(key(KeyCode::Char(ch)));
+    }
+    // The action menu opens for the matching worktree's branch.
+    s.handle_key(key(KeyCode::Enter));
+    let action = s.handle_key(key(KeyCode::Enter));
+    match action {
+        ListAction::NavigateTo(path) => assert_eq!(path, "/tmp/repo-bug"),
+        other => panic!("expected NavigateTo, got {other:?}"),
+    }
 }
 
 #[test]
-fn numeric_jump_selects_row() {
+fn esc_clears_search_then_returns_back() {
+    // First Esc clears a non-empty query (matching SelectPrompt's
+    // searchable contract), and a subsequent Esc cancels the screen.
     let mut s = ListScreen::new(true, true);
     s.set_worktrees(worktrees());
-    s.handle_key(key(KeyCode::Char('2')));
-    assert_eq!(s.selected_index(), 1);
+    s.handle_key(key(KeyCode::Char('f')));
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, ListAction::Continue);
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, ListAction::Back);
 }
 
 #[test]
@@ -112,25 +127,6 @@ fn esc_returns_back() {
     s.set_worktrees(worktrees());
     let action = s.handle_key(key(KeyCode::Esc));
     assert_eq!(action, ListAction::Back);
-}
-
-#[test]
-fn e_key_opens_terminal_when_configured() {
-    let mut s = ListScreen::new(true, true);
-    s.set_worktrees(worktrees());
-    let action = s.handle_key(key(KeyCode::Char('e')));
-    match action {
-        ListAction::OpenTerminal(path) => assert_eq!(path, "/tmp/repo-feat"),
-        other => panic!("expected OpenTerminal, got {other:?}"),
-    }
-}
-
-#[test]
-fn e_key_is_noop_when_no_terminal_command() {
-    let mut s = ListScreen::new(true, false);
-    s.set_worktrees(worktrees());
-    let action = s.handle_key(key(KeyCode::Char('e')));
-    assert_eq!(action, ListAction::Continue);
 }
 
 #[test]
@@ -185,17 +181,19 @@ fn esc_in_action_menu_returns_to_list() {
 fn render_uses_select_prompt_design_with_hint() {
     let mut s = ListScreen::new(true, true);
     s.set_worktrees(worktrees());
-    let dumped = dump(80, 10, |f| s.render(f, f.area()));
-    // Mirrors the "Choose wisely..." page design: a SelectPrompt with a
-    // title, branded "➤" cursor, numbered rows, and the navigation hint.
+    let dumped = dump(80, 12, |f| s.render(f, f.area()));
+    // Mirrors the Source-branch page design: SelectPrompt with title,
+    // branded "➤" cursor, numbered rows, "Search:" filter row, and the
+    // navigation hint.
     assert!(dumped.contains("Select a worktree:"));
     assert!(dumped.contains("➤"));
     assert!(dumped.contains("1. "));
     assert!(dumped.contains("2. "));
     assert!(dumped.contains("/tmp/repo-feat"));
     assert!(dumped.contains("feat"));
+    assert!(dumped.contains("Search:"));
+    assert!(dumped.contains("filter"));
     assert!(dumped.contains("Navigate"));
-    assert!(dumped.contains("Command"));
     assert!(dumped.contains("Back"));
 }
 

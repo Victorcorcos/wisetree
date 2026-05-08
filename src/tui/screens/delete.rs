@@ -168,7 +168,7 @@ impl DeleteScreen {
                 o
             })
             .collect();
-        SelectPrompt::new(DELETE_SELECT_PROMPT, opts)
+        SelectPrompt::new(DELETE_SELECT_PROMPT, opts).searchable()
     }
 
     fn build_confirm(&self) -> Option<ConfirmDialog> {
@@ -329,7 +329,11 @@ impl DeleteScreen {
             return 4;
         }
         match self.step {
-            DeleteStep::Select => 4 + (self.worktrees.len() as u16).min(10),
+            DeleteStep::Select => {
+                let visible = (self.worktrees.len() as u16).min(10);
+                let overflow = if self.worktrees.len() > 10 { 2 } else { 0 };
+                6 + visible + overflow
+            }
             DeleteStep::Confirm => 10,
             DeleteStep::Deleting => 3,
             DeleteStep::Success => 3,
