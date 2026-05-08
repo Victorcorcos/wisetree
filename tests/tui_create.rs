@@ -205,6 +205,10 @@ fn confirm_with_y_then_enter_yields_confirmed_action() {
     s.handle_key(key(KeyCode::Enter)); // accept default branch name
     s.handle_key(key(KeyCode::Char('y')));
     let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, CreateAction::Continue);
+    assert_eq!(s.step(), CreateStep::NavigateConfirm);
+    // Default on the navigate page is Yes — Enter accepts and emits Confirmed.
+    let action = s.handle_key(key(KeyCode::Enter));
     match action {
         CreateAction::Confirmed {
             directory_name,
@@ -217,6 +221,36 @@ fn confirm_with_y_then_enter_yields_confirmed_action() {
         }
         other => panic!("expected Confirmed, got {other:?}"),
     }
+    assert!(s.navigate_after_create);
+}
+
+#[test]
+fn navigate_confirm_no_choice_still_proceeds_with_create() {
+    let mut s = ready_screen();
+    type_str(&mut s, "feat-x");
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('y')));
+    s.handle_key(key(KeyCode::Enter)); // → NavigateConfirm
+    assert_eq!(s.step(), CreateStep::NavigateConfirm);
+    s.handle_key(key(KeyCode::Char('n')));
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert!(matches!(action, CreateAction::Confirmed { .. }));
+    assert!(!s.navigate_after_create);
+}
+
+#[test]
+fn navigate_confirm_esc_cancels_entire_flow() {
+    let mut s = ready_screen();
+    type_str(&mut s, "feat-x");
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('y')));
+    s.handle_key(key(KeyCode::Enter)); // → NavigateConfirm
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, CreateAction::Cancelled);
 }
 
 #[test]

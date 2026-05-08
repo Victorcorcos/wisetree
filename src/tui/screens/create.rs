@@ -16,8 +16,8 @@ use ratatui::Frame;
 use crate::git::types::GitBranch;
 use crate::messages::{
     colors, CREATE_CONFIRM_TITLE, CREATE_CREATING, CREATE_DIRECTORY_PLACEHOLDER,
-    CREATE_DIRECTORY_PROMPT, CREATE_NEW_BRANCH_PLACEHOLDER, CREATE_SOURCE_BRANCH_PROMPT,
-    CREATE_SUCCESS, LOADING_BRANCHES,
+    CREATE_DIRECTORY_PROMPT, CREATE_NAVIGATE_PROMPT, CREATE_NAVIGATE_TITLE,
+    CREATE_NEW_BRANCH_PLACEHOLDER, CREATE_SOURCE_BRANCH_PROMPT, CREATE_SUCCESS, LOADING_BRANCHES,
 };
 use crate::tui::widgets::{
     branded_line, CommandListProgress, ConfirmChoice, ConfirmDialog, ConfirmOutcome,
@@ -45,6 +45,9 @@ pub enum CreateStep {
     CustomRef,
     NewBranch,
     Confirm,
+    /// Side question shown right after the create-worktree confirmation:
+    /// once the worktree exists, should we navigate the user into it?
+    NavigateConfirm,
     Creating,
     RunningCommands,
     Success,
@@ -79,6 +82,16 @@ pub struct CreateScreen {
     custom_ref_input: Option<InputPrompt>,
     new_branch_input: Option<InputPrompt>,
     confirm_dialog: Option<ConfirmDialog>,
+    navigate_dialog: Option<ConfirmDialog>,
+
+    /// User's answer to the post-confirmation "navigate into the worktree?"
+    /// question. Defaults to `true` since that's the default option.
+    pub navigate_after_create: bool,
+
+    /// Filled in by the caller once the create succeeds — needed so the
+    /// caller can act on `navigate_after_create` without re-deriving the
+    /// path from the template.
+    created_worktree_path: Option<String>,
 
     // Post-create progress (CommandListProgress is built each render from
     // these slices).
@@ -105,6 +118,9 @@ impl CreateScreen {
             custom_ref_input: None,
             new_branch_input: None,
             confirm_dialog: None,
+            navigate_dialog: None,
+            navigate_after_create: true,
+            created_worktree_path: None,
             post_create_commands: Vec::new(),
             completed_commands: Vec::new(),
             failed_commands: Vec::new(),
@@ -170,6 +186,14 @@ impl CreateScreen {
         // If the running command isn't already in failed/completed, leave it
         // as the running one — the renderer derives status from `current`.
         let _ = command;
+    }
+
+    pub fn set_created_worktree_path(&mut self, path: std::path::PathBuf) {
+        self.created_worktree_path = Some(path.to_string_lossy().into_owned());
+    }
+
+    pub fn created_worktree_path(&self) -> Option<&str> {
+        self.created_worktree_path.as_deref()
     }
 
     pub fn mark_complete(&mut self) {
@@ -241,6 +265,7 @@ impl CreateScreen {
             CreateStep::CustomRef => self.handle_custom_ref(key),
             CreateStep::NewBranch => self.handle_new_branch(key),
             CreateStep::Confirm => self.handle_confirm(key),
+            CreateStep::NavigateConfirm => self.handle_navigate_confirm(key),
             CreateStep::Creating | CreateStep::RunningCommands => CreateAction::Continue,
             CreateStep::Success => CreateAction::Done,
         }
@@ -374,13 +399,41 @@ impl CreateScreen {
         let dialog = self.confirm_dialog.as_mut().expect("set above");
         match dialog.handle_key(key) {
             ConfirmOutcome::Confirmed => {
-                let action = CreateAction::Confirmed {
+                self.confirm_dialog = None;
+                self.navigate_dialog = Some(build_navigate_confirm());
+                self.navigate_after_create = true;
+                self.step = CreateStep::NavigateConfirm;
+                CreateAction::Continue
+            }
+            ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => CreateAction::Cancelled,
+            ConfirmOutcome::Pending => CreateAction::Continue,
+        }
+    }
+
+    fn handle_navigate_confirm(&mut self, key: KeyEvent) -> CreateAction {
+        if self.navigate_dialog.is_none() {
+            self.navigate_dialog = Some(build_navigate_confirm());
+        }
+        let dialog = self.navigate_dialog.as_mut().expect("set above");
+        let outcome = dialog.handle_key(key);
+        match outcome {
+            ConfirmOutcome::Confirmed => {
+                self.navigate_after_create = true;
+                self.navigate_dialog = None;
+                CreateAction::Confirmed {
                     directory_name: self.directory_name.clone(),
                     source_branch: self.source_branch.clone(),
                     new_branch: self.new_branch.clone(),
-                };
-                self.confirm_dialog = None;
-                action
+                }
+            }
+            ConfirmOutcome::Declined => {
+                self.navigate_after_create = false;
+                self.navigate_dialog = None;
+                CreateAction::Confirmed {
+                    directory_name: self.directory_name.clone(),
+                    source_branch: self.source_branch.clone(),
+                    new_branch: self.new_branch.clone(),
+                }
             }
             ConfirmOutcome::Cancelled => CreateAction::Cancelled,
             ConfirmOutcome::Pending => CreateAction::Continue,
@@ -396,7 +449,7 @@ impl CreateScreen {
         match self.step {
             CreateStep::Directory | CreateStep::CustomRef | CreateStep::NewBranch => 6,
             CreateStep::SourceBranch => 14,
-            CreateStep::Confirm => 10,
+            CreateStep::Confirm | CreateStep::NavigateConfirm => 10,
             CreateStep::Creating => 3,
             CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
             CreateStep::Success => 3,
@@ -451,6 +504,11 @@ impl CreateScreen {
             }
             CreateStep::Confirm => {
                 if let Some(d) = &self.confirm_dialog {
+                    d.render(frame, area);
+                }
+            }
+            CreateStep::NavigateConfirm => {
+                if let Some(d) = &self.navigate_dialog {
                     d.render(frame, area);
                 }
             }
@@ -516,4 +574,10 @@ fn custom_ref_input() -> InputPrompt {
                 .is_empty()
                 .then(|| "Please enter a ref".to_string())
         })
+}
+
+fn build_navigate_confirm() -> ConfirmDialog {
+    ConfirmDialog::new(CREATE_NAVIGATE_TITLE, CREATE_NAVIGATE_PROMPT)
+        .with_variant(ConfirmVariant::Default)
+        .with_default(ConfirmChoice::Confirm)
 }

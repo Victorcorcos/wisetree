@@ -38,6 +38,12 @@ impl ConfirmVariant {
 
 pub enum ConfirmOutcome {
     Confirmed,
+    /// User explicitly chose the cancel/No button and pressed Enter. Lets
+    /// callers distinguish "user said no" from "user pressed Esc / left the
+    /// flow", which matters for follow-up screens that ask a side question
+    /// (e.g. *navigate into the created worktree?*) where No should still
+    /// continue the parent flow but Esc should abort it.
+    Declined,
     Cancelled,
     Pending,
 }
@@ -84,7 +90,7 @@ impl ConfirmDialog {
             KeyCode::Esc => ConfirmOutcome::Cancelled,
             KeyCode::Enter => match self.selected {
                 ConfirmChoice::Confirm => ConfirmOutcome::Confirmed,
-                ConfirmChoice::Cancel => ConfirmOutcome::Cancelled,
+                ConfirmChoice::Cancel => ConfirmOutcome::Declined,
             },
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                 self.selected = match self.selected {

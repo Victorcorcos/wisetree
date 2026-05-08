@@ -23,6 +23,9 @@ pub const CREATE_NEW_BRANCH_PROMPT: &str =
     "Enter name for new branch (leave blank to use source branch):";
 pub const CREATE_NEW_BRANCH_PLACEHOLDER: &str = "feat/new-feature or leave blank";
 pub const CREATE_CONFIRM_TITLE: &str = "Create Worktree Confirmation";
+pub const CREATE_NAVIGATE_TITLE: &str = "Navigate to Worktree";
+pub const CREATE_NAVIGATE_PROMPT: &str =
+    "Navigate directly into the created worktree once it is ready?";
 pub const CREATE_SUCCESS: &str = "Worktree created successfully!";
 pub const CREATE_CREATING: &str = "Creating worktree...";
 
