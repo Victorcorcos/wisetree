@@ -310,7 +310,7 @@ impl DeleteScreen {
                 let path = wt.path.clone();
                 DeleteAction::Confirmed { path, force }
             }
-            ConfirmOutcome::Cancelled => {
+            ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => {
                 self.confirm = None;
                 self.step = DeleteStep::Select;
                 DeleteAction::Continue

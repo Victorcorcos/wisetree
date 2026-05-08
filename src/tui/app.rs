@@ -55,7 +55,7 @@ enum AppEvent {
     Initialized(InitOutcome),
     ListLoaded(Result<Vec<GitWorktree>, String>),
     CreateBranchesLoaded(Result<Vec<GitBranch>, String>),
-    CreateFinished(Result<(), String>),
+    CreateFinished(Result<PathBuf, String>),
     DeleteLoaded(Result<Vec<GitWorktree>, String>),
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
     SettingsUpdateChecked(UpdateCheckResult),
@@ -433,6 +433,29 @@ impl App {
                 kick_off_create_worktree(self.git_root.clone(), options, tx.clone());
             }
             CreateAction::Done => {
+                let navigate = self
+                    .create
+                    .as_ref()
+                    .map(|c| c.navigate_after_create)
+                    .unwrap_or(false);
+                let path = self
+                    .create
+                    .as_ref()
+                    .and_then(|c| c.created_worktree_path().map(str::to_string));
+                if navigate {
+                    if let Some(path) = path {
+                        if self.is_from_wrapper {
+                            self.selected_path = Some(path);
+                            self.quit_requested = true;
+                            return;
+                        }
+                        if let Some(config) = self.current_config() {
+                            if !config.terminal_command.trim().is_empty() {
+                                let _ = open_terminal(&config.terminal_command, &path);
+                            }
+                        }
+                    }
+                }
                 self.back_to_menu();
             }
         }
@@ -530,7 +553,10 @@ impl App {
             AppEvent::CreateFinished(result) => {
                 if let Some(create) = self.create.as_mut() {
                     match result {
-                        Ok(()) => create.mark_complete(),
+                        Ok(path) => {
+                            create.set_created_worktree_path(path);
+                            create.mark_complete();
+                        }
                         Err(message) => create.set_error(message),
                     }
                 }
@@ -812,7 +838,7 @@ fn kick_off_create_worktree(
         let result = service
             .create_worktree(&options, None)
             .await
-            .map(|_| ())
+            .map(|outcome| outcome.worktree_path)
             .map_err(|e| user_friendly_message(&e));
         let _ = tx.send(AppEvent::CreateFinished(result));
     });

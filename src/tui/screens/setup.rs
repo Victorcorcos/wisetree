@@ -213,7 +213,7 @@ impl SetupScreen {
             ConfirmOutcome::Confirmed => SetupAction::Confirmed {
                 shell: self.selected,
             },
-            ConfirmOutcome::Cancelled => {
+            ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => {
                 self.confirm = None;
                 self.step = SetupStep::SelectShell;
                 SetupAction::Continue
