@@ -431,7 +431,7 @@ impl CreateScreen {
         match self.step {
             CreateStep::Directory => {
                 if let Some(p) = &self.directory_input {
-                    p.render(frame, area);
+                    p.render(frame, area, self.tick);
                 }
             }
             CreateStep::SourceBranch => {
@@ -441,12 +441,12 @@ impl CreateScreen {
             }
             CreateStep::CustomRef => {
                 if let Some(p) = &self.custom_ref_input {
-                    p.render(frame, area);
+                    p.render(frame, area, self.tick);
                 }
             }
             CreateStep::NewBranch => {
                 if let Some(p) = &self.new_branch_input {
-                    p.render(frame, area);
+                    p.render(frame, area, self.tick);
                 }
             }
             CreateStep::Confirm => {
