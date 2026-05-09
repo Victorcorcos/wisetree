@@ -4,6 +4,7 @@
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::cli::args::{help_text, parse_args, CliArgs, CliCommand, ParsedArgs};
 use crate::cli::commands;
@@ -11,6 +12,8 @@ use crate::git::exec::get_git_root;
 use crate::tui::App;
 use crate::worktree::WorktreeService;
 use crate::VERSION;
+
+const TUI_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub fn run() -> Result<ExitCode, anyhow::Error> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -66,9 +69,7 @@ fn run_tui(parsed: ParsedArgs) -> Result<ExitCode, anyhow::Error> {
         std::env::set_var("FORCE_COLOR", "3");
     }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = build_tui_runtime()?;
 
     let selected_path = runtime.block_on(async move {
         let app = App::new(parsed.mode, parsed.is_from_wrapper);
@@ -87,7 +88,22 @@ fn run_tui(parsed: ParsedArgs) -> Result<ExitCode, anyhow::Error> {
         }
     }
 
+    shutdown_tui_runtime(runtime);
+
     Ok(ExitCode::SUCCESS)
+}
+
+fn build_tui_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+}
+
+fn shutdown_tui_runtime(runtime: tokio::runtime::Runtime) {
+    // The TUI launches background work for git, network, and shell-install
+    // flows. Once the UI has decided to exit, waiting indefinitely for those
+    // tasks can wedge terminal-tab close on the runtime drop path.
+    runtime.shutdown_timeout(TUI_RUNTIME_SHUTDOWN_TIMEOUT);
 }
 
 fn run_cli(args: CliArgs) -> Result<ExitCode, anyhow::Error> {
@@ -113,5 +129,28 @@ fn run_cli(args: CliArgs) -> Result<ExitCode, anyhow::Error> {
             eprintln!("Error: {err}");
             Ok(ExitCode::from(1))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_runtime_shutdown_does_not_wait_for_blocking_tasks() {
+        let runtime = build_tui_runtime().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        runtime.spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = tx.send(());
+        });
+
+        let started = std::time::Instant::now();
+        shutdown_tui_runtime(runtime);
+
+        assert!(started.elapsed() < Duration::from_millis(350));
+        assert!(rx.try_recv().is_err());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
     }
 }
