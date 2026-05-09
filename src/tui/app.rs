@@ -4,6 +4,8 @@
 //! path handoff used by shell integration.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -166,8 +168,9 @@ impl App {
         kick_off_initialize(tx.clone());
 
         let mut events = EventLoop::new(Duration::from_millis(50));
+        let signal_quit = install_termination_listener();
 
-        while !self.quit_requested {
+        while !self.quit_requested && !signal_quit.load(Ordering::Relaxed) {
             while let Ok(event) = rx.try_recv() {
                 self.handle_app_event(event, &tx);
             }
@@ -775,6 +778,34 @@ impl App {
 struct InitOutcome {
     git_root: Option<String>,
     result: Result<WorktreeService, String>,
+}
+
+/// Route SIGHUP (terminal tab closed) and SIGTERM through the normal
+/// shutdown path so `restore()` runs and the tty doesn't get stranded in
+/// raw mode. Without this, closing the tab with Cmd+W kills the process
+/// before cleanup, leaving the parent shell's `dir=$(...)` capture stuck on
+/// a tty with ICANON/ECHO disabled.
+fn install_termination_listener() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        let flag = flag.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut hup) = signal(SignalKind::hangup()) else {
+                return;
+            };
+            let Ok(mut term) = signal(SignalKind::terminate()) else {
+                return;
+            };
+            tokio::select! {
+                _ = hup.recv() => {}
+                _ = term.recv() => {}
+            }
+            flag.store(true, Ordering::Relaxed);
+        });
+    }
+    flag
 }
 
 fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
