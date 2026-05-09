@@ -533,6 +533,13 @@ impl App {
                     }
                 }
             }
+            SettingsAction::SavePathTemplate(template) => {
+                if let Err(err) = self.save_path_template(template) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save path template: {err}"));
+                    }
+                }
+            }
         }
     }
 
@@ -843,6 +850,37 @@ impl App {
 
         if let Some(settings) = self.settings.as_mut() {
             settings.mark_terminal_command_saved(command);
+        }
+        Ok(())
+    }
+
+    fn save_path_template(&mut self, template: String) -> Result<(), String> {
+        let local_path = self
+            .local_config_path()
+            .ok_or_else(|| "No git repository in scope".to_string())?;
+
+        let mut config = if local_path.exists() {
+            let mut svc = ConfigService::new();
+            svc.load(local_path.parent()).map_err(|e| e.to_string())?
+        } else {
+            self.current_config().cloned().unwrap_or_default()
+        };
+        config.worktree_path_template = template.clone();
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&local_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            service
+                .config_service_mut()
+                .load(local_path.parent())
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_path_template_saved(template);
         }
         Ok(())
     }

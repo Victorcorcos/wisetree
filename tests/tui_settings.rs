@@ -10,8 +10,9 @@ use wisetree::config::schema::WorktreeConfig;
 use wisetree::messages::colors;
 use wisetree::services::UpdateCheckResult;
 use wisetree::tui::screens::settings::{
-    CopyDirection, PostCmdRectStatus, PostCmdSelection, SettingsAction, SettingsScreen,
-    SettingsStep, TerminalCmdRectStatus, TerminalCmdSelection,
+    CopyDirection, PathTemplateRectStatus, PathTemplateSelection, PostCmdRectStatus,
+    PostCmdSelection, SettingsAction, SettingsScreen, SettingsStep, TerminalCmdRectStatus,
+    TerminalCmdSelection,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -898,6 +899,172 @@ fn terminal_cmd_selected_rectangle_shows_orange_marker_and_keeps_status_border()
     for (x, y) in [left_border, right_border] {
         assert_eq!(buffer[(x, y)].fg, colors::SUCCESS);
     }
+}
+
+fn enter_path_template(s: &mut SettingsScreen) {
+    // Menu order: Copy(0), Ignore(1), Path(2).
+    for _ in 0..2 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::PathTemplate);
+}
+
+#[test]
+fn path_template_editor_initializes_with_saved_status_when_template_present() {
+    let mut s = ready();
+    enter_path_template(&mut s);
+
+    let editor = s.path_template_editor().expect("editor present");
+    assert_eq!(editor.template, "$BASE_PATH.worktree");
+    assert_eq!(editor.status, PathTemplateRectStatus::Saved);
+    assert_eq!(editor.selection, PathTemplateSelection::Save);
+}
+
+#[test]
+fn path_template_editor_initializes_with_unchanged_status_when_blank() {
+    let cfg = WorktreeConfig {
+        worktree_path_template: String::new(),
+        ..Default::default()
+    };
+    let mut s = SettingsScreen::new(cfg, "/tmp/.wisetree.json".into());
+    enter_path_template(&mut s);
+
+    let editor = s.path_template_editor().expect("editor present");
+    assert_eq!(editor.template, "");
+    assert_eq!(editor.status, PathTemplateRectStatus::Unchanged);
+}
+
+#[test]
+fn path_template_renders_save_button_and_saving_to_line() {
+    let mut s = ready();
+    enter_path_template(&mut s);
+
+    let dumped = dump(80, 18, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Worktree Path Template"));
+    assert!(dumped.contains("Save"));
+    assert!(!dumped.contains("Create"));
+    assert!(dumped.contains("Saving to:"));
+    assert!(dumped.contains("Available variables"));
+    assert!(dumped.contains("$BASE_PATH"));
+}
+
+#[test]
+fn path_template_up_from_save_focuses_rectangle() {
+    let mut s = ready();
+    enter_path_template(&mut s);
+    assert_eq!(
+        s.path_template_editor().unwrap().selection,
+        PathTemplateSelection::Save
+    );
+
+    s.handle_key(key(KeyCode::Up));
+    assert_eq!(
+        s.path_template_editor().unwrap().selection,
+        PathTemplateSelection::Rect
+    );
+
+    s.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        s.path_template_editor().unwrap().selection,
+        PathTemplateSelection::Save
+    );
+}
+
+#[test]
+fn path_template_enter_on_rect_starts_editing_then_modifies() {
+    let mut s = ready();
+    enter_path_template(&mut s);
+
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        s.path_template_editor().unwrap().status,
+        PathTemplateRectStatus::Editing
+    );
+
+    s.handle_key(key(KeyCode::Char('!')));
+    s.handle_key(key(KeyCode::Enter));
+
+    let editor = s.path_template_editor().unwrap();
+    assert_eq!(editor.template, "$BASE_PATH.worktree!");
+    assert_eq!(editor.status, PathTemplateRectStatus::Modified);
+}
+
+#[test]
+fn path_template_escape_during_editing_restores_backup() {
+    let mut s = ready();
+    enter_path_template(&mut s);
+
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('!')));
+    s.handle_key(key(KeyCode::Esc));
+
+    let editor = s.path_template_editor().unwrap();
+    assert_eq!(editor.template, "$BASE_PATH.worktree");
+    assert_eq!(editor.status, PathTemplateRectStatus::Saved);
+}
+
+#[test]
+fn path_template_save_button_emits_save_action() {
+    let mut s = ready();
+    enter_path_template(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::SavePathTemplate("$BASE_PATH.worktree".into())
+    );
+}
+
+#[test]
+fn path_template_save_blank_emits_empty_string() {
+    let cfg = WorktreeConfig {
+        worktree_path_template: "   ".into(),
+        ..Default::default()
+    };
+    let mut s = SettingsScreen::new(cfg, "/tmp/.wisetree.json".into());
+    enter_path_template(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::SavePathTemplate(String::new()));
+}
+
+#[test]
+fn path_template_mark_saved_returns_to_settings_menu() {
+    let mut s = ready();
+    enter_path_template(&mut s);
+
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('!')));
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        s.path_template_editor().unwrap().status,
+        PathTemplateRectStatus::Modified
+    );
+
+    s.mark_path_template_saved("$BASE_PATH.worktree!".into());
+
+    assert_eq!(s.step(), SettingsStep::Menu);
+    assert!(s.path_template_editor().is_none());
+
+    enter_path_template(&mut s);
+    let editor = s.path_template_editor().unwrap();
+    assert_eq!(editor.template, "$BASE_PATH.worktree!");
+    assert_eq!(editor.status, PathTemplateRectStatus::Saved);
+}
+
+#[test]
+fn path_template_esc_outside_editing_returns_to_menu() {
+    let mut s = ready();
+    enter_path_template(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, SettingsAction::Continue);
+    assert_eq!(s.step(), SettingsStep::Menu);
+    assert!(s.path_template_editor().is_none());
 }
 
 #[test]

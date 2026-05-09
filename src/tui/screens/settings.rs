@@ -66,6 +66,10 @@ pub enum SettingsAction {
     /// Persist the supplied terminal command to the project-local
     /// `.wisetree.json`. An empty string clears the configured command.
     SaveTerminalCommand(String),
+    /// Persist the supplied worktree path template to the project-local
+    /// `.wisetree.json`. An empty string falls back to the default template
+    /// on next load via the schema default.
+    SavePathTemplate(String),
     /// Copy the active config from one location to the other.
     CopySettings(CopyDirection),
 }
@@ -278,6 +282,66 @@ impl TerminalCmdEditor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathTemplateRectStatus {
+    Unchanged,
+    Editing,
+    Modified,
+    Saved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathTemplateSelection {
+    Rect,
+    Save,
+}
+
+/// State for the inline worktree path template editor surfaced when the user
+/// drills into the `Path Template` setting from the menu. Mirrors
+/// `TerminalCmdEditor`: a single fixed rectangle plus a Save button.
+pub struct PathTemplateEditor {
+    pub template: String,
+    pub status: PathTemplateRectStatus,
+    pub selection: PathTemplateSelection,
+    edit_backup: Option<(String, PathTemplateRectStatus)>,
+}
+
+impl PathTemplateEditor {
+    pub fn new(template: String) -> Self {
+        let status = if template.is_empty() {
+            PathTemplateRectStatus::Unchanged
+        } else {
+            PathTemplateRectStatus::Saved
+        };
+        Self {
+            template,
+            status,
+            selection: PathTemplateSelection::Save,
+            edit_backup: None,
+        }
+    }
+
+    pub fn editing(&self) -> bool {
+        self.status == PathTemplateRectStatus::Editing
+    }
+
+    fn move_up(&mut self) {
+        if matches!(self.selection, PathTemplateSelection::Save) {
+            self.selection = PathTemplateSelection::Rect;
+        }
+    }
+
+    fn move_down(&mut self) {
+        if matches!(self.selection, PathTemplateSelection::Rect) {
+            self.selection = PathTemplateSelection::Save;
+        }
+    }
+
+    fn template_to_save(&self) -> String {
+        self.template.trim().to_string()
+    }
+}
+
 pub struct SettingsScreen {
     step: SettingsStep,
     config: WorktreeConfig,
@@ -292,6 +356,8 @@ pub struct SettingsScreen {
     post_cmd_input: Option<InputPrompt>,
     terminal_cmd_editor: Option<TerminalCmdEditor>,
     terminal_cmd_input: Option<InputPrompt>,
+    path_template_editor: Option<PathTemplateEditor>,
+    path_template_input: Option<InputPrompt>,
     copy_settings_select: Option<SelectPrompt<CopyDirection>>,
     update_result: Option<UpdateCheckResult>,
     checking_updates: bool,
@@ -312,6 +378,8 @@ impl SettingsScreen {
             post_cmd_input: None,
             terminal_cmd_editor: None,
             terminal_cmd_input: None,
+            path_template_editor: None,
+            path_template_input: None,
             copy_settings_select: None,
             update_result: None,
             checking_updates: false,
@@ -338,6 +406,10 @@ impl SettingsScreen {
 
     pub fn terminal_cmd_editor(&self) -> Option<&TerminalCmdEditor> {
         self.terminal_cmd_editor.as_ref()
+    }
+
+    pub fn path_template_editor(&self) -> Option<&PathTemplateEditor> {
+        self.path_template_editor.as_ref()
     }
 
     pub fn step(&self) -> SettingsStep {
@@ -378,6 +450,8 @@ impl SettingsScreen {
         self.post_cmd_input = None;
         self.terminal_cmd_editor = None;
         self.terminal_cmd_input = None;
+        self.path_template_editor = None;
+        self.path_template_input = None;
         self.copy_settings_select = None;
         self.error = None;
     }
@@ -397,6 +471,15 @@ impl SettingsScreen {
         self.select = Some(self.build_menu());
         self.terminal_cmd_editor = None;
         self.terminal_cmd_input = None;
+        self.step = SettingsStep::Menu;
+    }
+
+    /// Mirror a successful path template save back into the settings menu.
+    pub fn mark_path_template_saved(&mut self, template: String) {
+        self.config.worktree_path_template = template;
+        self.select = Some(self.build_menu());
+        self.path_template_editor = None;
+        self.path_template_input = None;
         self.step = SettingsStep::Menu;
     }
 
@@ -473,6 +556,7 @@ impl SettingsScreen {
             SettingsStep::CheckUpdates => self.handle_check_updates(key),
             SettingsStep::PostCmd => self.handle_post_cmd(key),
             SettingsStep::TerminalCmd => self.handle_terminal_cmd(key),
+            SettingsStep::PathTemplate => self.handle_path_template(key),
             _ => match key.code {
                 KeyCode::Esc => {
                     self.step = SettingsStep::Menu;
@@ -507,6 +591,11 @@ impl SettingsScreen {
                 if matches!(value, SettingsStep::TerminalCmd) {
                     self.terminal_cmd_editor = Some(TerminalCmdEditor::new(
                         self.config.terminal_command.clone(),
+                    ));
+                }
+                if matches!(value, SettingsStep::PathTemplate) {
+                    self.path_template_editor = Some(PathTemplateEditor::new(
+                        self.config.worktree_path_template.clone(),
                     ));
                 }
                 if matches!(value, SettingsStep::CopySettings) {
@@ -813,6 +902,133 @@ impl SettingsScreen {
         }
     }
 
+    fn handle_path_template(&mut self, key: KeyEvent) -> SettingsAction {
+        let is_editing = self
+            .path_template_editor
+            .as_ref()
+            .map(|e| e.editing())
+            .unwrap_or(false);
+        if is_editing {
+            return self.handle_path_template_editing(key);
+        }
+
+        let editor = match self.path_template_editor.as_mut() {
+            Some(e) => e,
+            None => {
+                self.step = SettingsStep::Menu;
+                return SettingsAction::Continue;
+            }
+        };
+
+        let mut start_editing = false;
+        let action = match key.code {
+            KeyCode::Esc => {
+                self.path_template_editor = None;
+                self.path_template_input = None;
+                self.step = SettingsStep::Menu;
+                SettingsAction::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                editor.move_up();
+                SettingsAction::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                editor.move_down();
+                SettingsAction::Continue
+            }
+            KeyCode::Enter => match editor.selection {
+                PathTemplateSelection::Rect => {
+                    start_editing = true;
+                    SettingsAction::Continue
+                }
+                PathTemplateSelection::Save => {
+                    SettingsAction::SavePathTemplate(editor.template_to_save())
+                }
+            },
+            _ => SettingsAction::Continue,
+        };
+
+        if start_editing {
+            self.start_path_template_editing();
+        }
+
+        action
+    }
+
+    fn start_path_template_editing(&mut self) {
+        let editor = match self.path_template_editor.as_mut() {
+            Some(editor) => editor,
+            None => return,
+        };
+        editor.selection = PathTemplateSelection::Rect;
+        editor.edit_backup = Some((editor.template.clone(), editor.status));
+        editor.status = PathTemplateRectStatus::Editing;
+        self.path_template_input = Some(build_path_template_input(&editor.template));
+    }
+
+    fn handle_path_template_editing(&mut self, key: KeyEvent) -> SettingsAction {
+        let (outcome, current_value) = match self.path_template_input.as_mut() {
+            Some(prompt) => {
+                let outcome = prompt.handle_key(key);
+                let current_value = prompt.value.clone();
+                (outcome, current_value)
+            }
+            None => {
+                if let Some(editor) = self.path_template_editor.as_mut() {
+                    editor.status = PathTemplateRectStatus::Unchanged;
+                    editor.edit_backup = None;
+                }
+                return SettingsAction::Continue;
+            }
+        };
+
+        match outcome {
+            InputOutcome::Cancelled => {
+                let editor = match self.path_template_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
+                if let Some((value, prior)) = editor.edit_backup.take() {
+                    editor.template = value;
+                    editor.status = prior;
+                } else {
+                    editor.status = PathTemplateRectStatus::Unchanged;
+                }
+                self.path_template_input = None;
+                SettingsAction::Continue
+            }
+            InputOutcome::Submitted(value) => {
+                let editor = match self.path_template_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
+                let next_status = editor
+                    .edit_backup
+                    .take()
+                    .map(|(original, prior)| {
+                        if value == original {
+                            prior
+                        } else {
+                            PathTemplateRectStatus::Modified
+                        }
+                    })
+                    .unwrap_or(PathTemplateRectStatus::Modified);
+                editor.template = value;
+                editor.status = next_status;
+                self.path_template_input = None;
+                SettingsAction::Continue
+            }
+            InputOutcome::Pending => {
+                let editor = match self.path_template_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
+                editor.template = current_value;
+                SettingsAction::Continue
+            }
+        }
+    }
+
     fn handle_delete_branch(&mut self, key: KeyEvent) -> SettingsAction {
         if self.delete_branch_dialog.is_none() {
             self.delete_branch_dialog = Some(self.build_delete_branch_dialog());
@@ -867,9 +1083,8 @@ impl SettingsScreen {
             SettingsStep::Menu => 14,
             SettingsStep::CheckUpdates => 6,
             // Detail panes: header + value lines + hint.
-            SettingsStep::CopyPatterns
-            | SettingsStep::IgnorePatterns
-            | SettingsStep::PathTemplate => 12,
+            SettingsStep::CopyPatterns | SettingsStep::IgnorePatterns => 12,
+            SettingsStep::PathTemplate => self.path_template_preferred_height(),
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
             SettingsStep::PostCmd => self.post_cmd_preferred_height(),
             SettingsStep::DeleteBranch => 16,
@@ -892,6 +1107,12 @@ impl SettingsScreen {
         // Title + description + 1 rectangle (3 rows) + spacer + Save button
         // (3 rows) + saving-to line + footer hint.
         2 + 3 + 1 + 3 + 2
+    }
+
+    fn path_template_preferred_height(&self) -> u16 {
+        // Title + description + 1 rectangle (3 rows) + 3 variable hints
+        // + spacer + Save button (3 rows) + saving-to line + footer hint.
+        2 + 3 + 3 + 1 + 3 + 2
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -1013,42 +1234,183 @@ impl SettingsScreen {
     }
 
     fn render_path_template(&self, frame: &mut Frame, area: Rect) {
+        let editor = match &self.path_template_editor {
+            Some(e) => e,
+            None => return,
+        };
+
         let title_style = Style::default()
             .fg(colors::INFO)
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
         let info_style = Style::default().fg(colors::INFO);
-        let success_style = Style::default().fg(colors::SUCCESS);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
-        let lines = vec![
-            Line::from(branded_line("Worktree Path Template", title_style)),
-            Line::from(branded_line(
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(
+                "Worktree Path Template",
+                title_style,
+            ))),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(
                 "Template for worktree directory paths:",
                 muted_style,
-            )),
-            Line::from(branded_line(
-                &format!("  {}", self.config.worktree_path_template),
-                success_style,
-            )),
-            Line::from(branded_line("Available variables:", info_style)),
-            Line::from(branded_line(
+            ))),
+            chunks[1],
+        );
+
+        let is_editing = editor.editing();
+        let is_selected = matches!(editor.selection, PathTemplateSelection::Rect);
+        let is_focused = is_selected || is_editing;
+        let border_color = match editor.status {
+            PathTemplateRectStatus::Unchanged => colors::WHITE,
+            PathTemplateRectStatus::Editing => colors::WARNING,
+            PathTemplateRectStatus::Modified => colors::ACCENT,
+            PathTemplateRectStatus::Saved => colors::SUCCESS,
+        };
+        let show_selection_marker = is_selected && !is_editing;
+        let content_style = if is_focused {
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let border_style = Style::default().fg(border_color);
+        let mut inner_line = if is_editing {
+            self.path_template_input
+                .as_ref()
+                .map(|prompt| prompt.inline_line())
+                .unwrap_or_else(|| Line::from(Span::raw(editor.template.clone())))
+        } else if editor.template.is_empty() {
+            let placeholder = Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM);
+            Line::from(Span::styled(
+                "(empty — press Enter to edit)",
+                placeholder,
+            ))
+        } else {
+            Line::from(Span::raw(editor.template.clone()))
+        };
+        if show_selection_marker {
+            inner_line.spans.insert(
+                0,
+                Span::styled(
+                    POST_CMD_SELECTION_MARKER,
+                    Style::default().fg(colors::ACCENT),
+                ),
+            );
+        }
+        inner_line.style = content_style;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(border_style)
+            .padding(Padding::horizontal(1));
+        frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(
+                "Available variables:",
+                info_style,
+            ))),
+            chunks[3],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(
                 "  • $BASE_PATH - Repository name",
                 muted_style,
-            )),
-            Line::from(branded_line(
-                "  • $WORKTREE_PATH - Full worktree path",
-                muted_style,
-            )),
-            Line::from(branded_line(
-                "  • $BRANCH_NAME - New branch name",
-                muted_style,
-            )),
-            Line::from(branded_line(
-                &format!("Edit in {}. Press any key to go back.", self.config_path),
-                dim_muted_style,
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines), area);
+            ))),
+            chunks[4],
+        );
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(branded_line(
+                    "  • $WORKTREE_PATH - Full worktree path",
+                    muted_style,
+                )),
+                Line::from(branded_line(
+                    "  • $BRANCH_NAME - New branch name",
+                    muted_style,
+                )),
+            ]),
+            chunks[5],
+        );
+
+        self.render_path_template_save_button(frame, chunks[7], editor);
+
+        let target = self
+            .local_config_path
+            .clone()
+            .unwrap_or_else(|| ".wisetree.json (project local)".to_string());
+        let saving_line = Line::from(vec![
+            Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
+            Span::styled(target, Style::default().fg(colors::EMPHASIS)),
+        ]);
+        frame.render_widget(Paragraph::new(saving_line), chunks[8]);
+
+        let hint = if is_editing {
+            "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
+        } else {
+            "↑↓ to move • Enter to edit/Save • Esc to go back"
+        };
+        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[9]);
+    }
+
+    fn render_path_template_save_button(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        editor: &PathTemplateEditor,
+    ) {
+        let save_label = "Save";
+        let save_width = save_label.chars().count() as u16 + 4;
+        let side = area.width.saturating_sub(save_width) / 2;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(side),
+                Constraint::Length(save_width),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        let save_selected = editor.selection == PathTemplateSelection::Save;
+        let save_text_style = if save_selected {
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(colors::MUTED)
+        };
+        let save_border = Style::default().fg(colors::SUCCESS);
+
+        let save_box = Paragraph::new(Line::from(Span::styled(save_label, save_text_style))).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(save_border)
+                .padding(Padding::horizontal(1)),
+        );
+        frame.render_widget(save_box, cols[1]);
     }
 
     fn render_copy_settings(&self, frame: &mut Frame, area: Rect) {
@@ -1146,18 +1508,14 @@ impl SettingsScreen {
         let hidden_above = visible_range.start;
         let hidden_below = editor.commands.len().saturating_sub(visible_range.end);
         let is_scrollable = hidden_above > 0 || hidden_below > 0;
-        let visible_constraints = vec![Constraint::Length(3); visible_range.len()];
-        let command_chunks = if visible_constraints.is_empty() {
-            Vec::new()
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(visible_constraints)
-                .split(command_area)
-                .iter()
-                .copied()
-                .collect()
-        };
+        let command_chunks: Vec<Rect> = (0..visible_range.len())
+            .map(|i| Rect {
+                x: command_area.x,
+                y: command_area.y + (i as u16) * 3,
+                width: command_area.width,
+                height: 3,
+            })
+            .collect();
 
         for (chunk, i) in command_chunks.into_iter().zip(visible_range.clone()) {
             let cmd = &editor.commands[i];
@@ -1598,5 +1956,11 @@ fn build_post_cmd_input(value: &str) -> InputPrompt {
 fn build_terminal_cmd_input(value: &str) -> InputPrompt {
     InputPrompt::new("")
         .with_placeholder("Type command (e.g. code $WORKTREE_PATH)")
+        .with_default(value.to_string())
+}
+
+fn build_path_template_input(value: &str) -> InputPrompt {
+    InputPrompt::new("")
+        .with_placeholder("Type template (e.g. $BASE_PATH.worktree)")
         .with_default(value.to_string())
 }
