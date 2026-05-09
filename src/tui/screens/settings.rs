@@ -10,7 +10,7 @@
 //! reset-to-defaults flow and delete-branch toggle persistence are signalled
 //! back to `App`.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,8 +24,8 @@ use crate::messages::{
 };
 use crate::services::UpdateCheckResult;
 use crate::tui::widgets::{
-    branded_line, ConfirmChoice, ConfirmDialog, ConfirmVariant, SelectOption, SelectOutcome,
-    SelectPrompt, Status, StatusIndicator,
+    branded_line, ConfirmChoice, ConfirmDialog, ConfirmVariant, InputOutcome, InputPrompt,
+    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +59,8 @@ pub enum SettingsAction {
     SetDeleteBranchWithWorktree(bool),
     Reset,
     /// Persist the supplied post-create commands to the project-local
-    /// `.wisetree.json`. Empty entries are filtered out by the caller before
-    /// they reach disk.
+    /// `.wisetree.json`. Empty entries and deletion-marked rectangles are
+    /// filtered out by the caller before they reach disk.
     SavePostCreateCommands(Vec<String>),
     /// Copy the active config from one location to the other.
     CopySettings(CopyDirection),
@@ -68,12 +68,14 @@ pub enum SettingsAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostCmdRectStatus {
-    /// Rectangle matches the value the user last loaded — white border.
+    /// New unsaved rectangle — white border.
     Unchanged,
     /// Currently being typed into — yellow border.
     Editing,
     /// Edited and exited but not yet saved — orange border.
     Modified,
+    /// Marked for deletion on the next save — pink/red border.
+    MarkedForDeletion,
     /// Just persisted to disk — green border.
     Saved,
 }
@@ -87,7 +89,6 @@ pub enum PostCmdSelection {
 
 /// State for the inline post-create commands editor surfaced when the user
 /// drills into the `Post-Create Commands` setting from the menu.
-#[derive(Debug, Clone)]
 pub struct PostCmdEditor {
     pub commands: Vec<String>,
     pub statuses: Vec<PostCmdRectStatus>,
@@ -98,16 +99,11 @@ pub struct PostCmdEditor {
 
 impl PostCmdEditor {
     pub fn new(commands: Vec<String>) -> Self {
-        let statuses = vec![PostCmdRectStatus::Unchanged; commands.len()];
-        let selection = if commands.is_empty() {
-            PostCmdSelection::Create
-        } else {
-            PostCmdSelection::Rect(0)
-        };
+        let statuses = vec![PostCmdRectStatus::Saved; commands.len()];
         Self {
             commands,
             statuses,
-            selection,
+            selection: PostCmdSelection::Create,
             edit_backup: None,
         }
     }
@@ -120,10 +116,14 @@ impl PostCmdEditor {
 
     fn move_up(&mut self) {
         self.selection = match self.selection {
-            PostCmdSelection::Rect(0) | PostCmdSelection::Create | PostCmdSelection::Save => {
+            PostCmdSelection::Rect(0) => self.selection,
+            PostCmdSelection::Rect(i) => PostCmdSelection::Rect(i - 1),
+            PostCmdSelection::Create | PostCmdSelection::Save if self.commands.is_empty() => {
                 self.selection
             }
-            PostCmdSelection::Rect(i) => PostCmdSelection::Rect(i - 1),
+            PostCmdSelection::Create | PostCmdSelection::Save => {
+                PostCmdSelection::Rect(self.commands.len() - 1)
+            }
         };
     }
 
@@ -144,6 +144,37 @@ impl PostCmdEditor {
             other => other,
         };
     }
+
+    fn toggle_delete_mark(&mut self) {
+        let PostCmdSelection::Rect(i) = self.selection else {
+            return;
+        };
+
+        self.statuses[i] = match self.statuses[i] {
+            PostCmdRectStatus::MarkedForDeletion => PostCmdRectStatus::Modified,
+            PostCmdRectStatus::Editing => PostCmdRectStatus::Editing,
+            _ => PostCmdRectStatus::MarkedForDeletion,
+        };
+    }
+
+    fn commands_to_save(&self) -> Vec<String> {
+        self.commands
+            .iter()
+            .zip(self.statuses.iter())
+            .filter_map(|(command, status)| {
+                if matches!(status, PostCmdRectStatus::MarkedForDeletion) {
+                    return None;
+                }
+
+                let trimmed = command.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect()
+    }
 }
 
 pub struct SettingsScreen {
@@ -157,6 +188,7 @@ pub struct SettingsScreen {
     select: Option<SelectPrompt<SettingsStep>>,
     delete_branch_dialog: Option<ConfirmDialog>,
     post_cmd_editor: Option<PostCmdEditor>,
+    post_cmd_input: Option<InputPrompt>,
     copy_settings_select: Option<SelectPrompt<CopyDirection>>,
     update_result: Option<UpdateCheckResult>,
     checking_updates: bool,
@@ -174,6 +206,7 @@ impl SettingsScreen {
             select: None,
             delete_branch_dialog: None,
             post_cmd_editor: None,
+            post_cmd_input: None,
             copy_settings_select: None,
             update_result: None,
             checking_updates: false,
@@ -233,30 +266,18 @@ impl SettingsScreen {
         self.select = Some(self.build_menu());
         self.delete_branch_dialog = None;
         self.post_cmd_editor = None;
+        self.post_cmd_input = None;
         self.copy_settings_select = None;
         self.error = None;
     }
 
-    /// Mirror an in-place save back into the editor: updates the menu
-    /// description and recolors every rectangle as `Saved` so the user sees
-    /// the green confirmation while remaining on the editor screen.
+    /// Mirror a successful save back into the settings menu.
     pub fn mark_post_create_commands_saved(&mut self, commands: Vec<String>) {
-        self.config.post_create_cmd = commands.clone();
+        self.config.post_create_cmd = commands;
         self.select = Some(self.build_menu());
-        if let Some(editor) = self.post_cmd_editor.as_mut() {
-            editor.commands = commands;
-            editor.statuses = vec![PostCmdRectStatus::Saved; editor.commands.len()];
-            editor.edit_backup = None;
-            if let PostCmdSelection::Rect(i) = editor.selection {
-                if i >= editor.commands.len() {
-                    editor.selection = if editor.commands.is_empty() {
-                        PostCmdSelection::Create
-                    } else {
-                        PostCmdSelection::Rect(editor.commands.len() - 1)
-                    };
-                }
-            }
-        }
+        self.post_cmd_editor = None;
+        self.post_cmd_input = None;
+        self.step = SettingsStep::Menu;
     }
 
     pub fn start_checking_updates(&mut self) {
@@ -393,6 +414,14 @@ impl SettingsScreen {
     }
 
     fn handle_post_cmd(&mut self, key: KeyEvent) -> SettingsAction {
+        let editing_idx = self
+            .post_cmd_editor
+            .as_ref()
+            .and_then(PostCmdEditor::editing_index);
+        if let Some(idx) = editing_idx {
+            return self.handle_post_cmd_editing(idx, key);
+        }
+
         let editor = match self.post_cmd_editor.as_mut() {
             Some(e) => e,
             None => {
@@ -401,13 +430,11 @@ impl SettingsScreen {
             }
         };
 
-        if let Some(idx) = editor.editing_index() {
-            return Self::handle_post_cmd_editing(editor, idx, key);
-        }
-
-        match key.code {
+        let mut start_editing = None;
+        let action = match key.code {
             KeyCode::Esc => {
                 self.post_cmd_editor = None;
+                self.post_cmd_input = None;
                 self.step = SettingsStep::Menu;
                 SettingsAction::Continue
             }
@@ -425,79 +452,111 @@ impl SettingsScreen {
             }
             KeyCode::Enter => match editor.selection {
                 PostCmdSelection::Rect(i) => {
-                    let prior = editor.statuses[i];
-                    editor.edit_backup = Some((editor.commands[i].clone(), prior));
-                    editor.statuses[i] = PostCmdRectStatus::Editing;
+                    start_editing = Some(i);
                     SettingsAction::Continue
                 }
                 PostCmdSelection::Create => {
                     editor.commands.push(String::new());
                     editor.statuses.push(PostCmdRectStatus::Unchanged);
-                    editor.selection = PostCmdSelection::Rect(editor.commands.len() - 1);
+                    let idx = editor.commands.len() - 1;
+                    editor.selection = PostCmdSelection::Rect(idx);
+                    start_editing = Some(idx);
                     SettingsAction::Continue
                 }
                 PostCmdSelection::Save => {
-                    let to_save: Vec<String> = editor
-                        .commands
-                        .iter()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
+                    let to_save = editor.commands_to_save();
                     SettingsAction::SavePostCreateCommands(to_save)
                 }
             },
-            KeyCode::Delete => {
-                if let PostCmdSelection::Rect(i) = editor.selection {
-                    editor.commands.remove(i);
-                    editor.statuses.remove(i);
-                    editor.edit_backup = None;
-                    editor.selection = if editor.commands.is_empty() {
-                        PostCmdSelection::Create
-                    } else if i >= editor.commands.len() {
-                        PostCmdSelection::Rect(editor.commands.len() - 1)
-                    } else {
-                        PostCmdSelection::Rect(i)
-                    };
-                }
+            KeyCode::Backspace | KeyCode::Delete => {
+                editor.toggle_delete_mark();
                 SettingsAction::Continue
             }
             _ => SettingsAction::Continue,
+        };
+
+        if let Some(idx) = start_editing {
+            self.start_post_cmd_editing(idx);
         }
+
+        action
     }
 
-    fn handle_post_cmd_editing(
-        editor: &mut PostCmdEditor,
-        idx: usize,
-        key: KeyEvent,
-    ) -> SettingsAction {
-        match key.code {
-            KeyCode::Esc => {
+    fn start_post_cmd_editing(&mut self, idx: usize) {
+        let editor = match self.post_cmd_editor.as_mut() {
+            Some(editor) => editor,
+            None => return,
+        };
+        let prior = match editor.statuses[idx] {
+            PostCmdRectStatus::MarkedForDeletion => PostCmdRectStatus::Modified,
+            other => other,
+        };
+        editor.selection = PostCmdSelection::Rect(idx);
+        editor.edit_backup = Some((editor.commands[idx].clone(), prior));
+        editor.statuses[idx] = PostCmdRectStatus::Editing;
+        self.post_cmd_input = Some(build_post_cmd_input(&editor.commands[idx]));
+    }
+
+    fn handle_post_cmd_editing(&mut self, idx: usize, key: KeyEvent) -> SettingsAction {
+        let (outcome, current_value) = match self.post_cmd_input.as_mut() {
+            Some(prompt) => {
+                let outcome = prompt.handle_key(key);
+                let current_value = prompt.value.clone();
+                (outcome, current_value)
+            }
+            None => {
+                if let Some(editor) = self.post_cmd_editor.as_mut() {
+                    editor.statuses[idx] = PostCmdRectStatus::Unchanged;
+                    editor.edit_backup = None;
+                }
+                return SettingsAction::Continue;
+            }
+        };
+
+        match outcome {
+            InputOutcome::Cancelled => {
+                let editor = match self.post_cmd_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
                 if let Some((value, prior)) = editor.edit_backup.take() {
                     editor.commands[idx] = value;
                     editor.statuses[idx] = prior;
                 } else {
                     editor.statuses[idx] = PostCmdRectStatus::Unchanged;
                 }
+                self.post_cmd_input = None;
                 SettingsAction::Continue
             }
-            KeyCode::Enter => {
-                editor.edit_backup = None;
-                editor.statuses[idx] = PostCmdRectStatus::Modified;
+            InputOutcome::Submitted(value) => {
+                let editor = match self.post_cmd_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
+                let next_status = editor
+                    .edit_backup
+                    .take()
+                    .map(|(original, prior)| {
+                        if value == original {
+                            prior
+                        } else {
+                            PostCmdRectStatus::Modified
+                        }
+                    })
+                    .unwrap_or(PostCmdRectStatus::Modified);
+                editor.commands[idx] = value;
+                editor.statuses[idx] = next_status;
+                self.post_cmd_input = None;
                 SettingsAction::Continue
             }
-            KeyCode::Backspace => {
-                editor.commands[idx].pop();
+            InputOutcome::Pending => {
+                let editor = match self.post_cmd_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
+                editor.commands[idx] = current_value;
                 SettingsAction::Continue
             }
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                editor.commands[idx].push(c);
-                SettingsAction::Continue
-            }
-            _ => SettingsAction::Continue,
         }
     }
 
@@ -833,20 +892,33 @@ impl SettingsScreen {
         let editing_idx = editor.editing_index();
         for (i, cmd) in editor.commands.iter().enumerate() {
             let status = editor.statuses[i];
-            let is_focused = matches!(editor.selection, PostCmdSelection::Rect(j) if j == i)
-                || editing_idx == Some(i);
-            let border_color = match status {
-                PostCmdRectStatus::Unchanged => colors::WHITE,
-                PostCmdRectStatus::Editing => colors::WARNING,
-                PostCmdRectStatus::Modified => colors::ACCENT,
-                PostCmdRectStatus::Saved => colors::SUCCESS,
+            let is_selected = matches!(editor.selection, PostCmdSelection::Rect(j) if j == i);
+            let is_editing = editing_idx == Some(i);
+            let is_focused = is_selected || is_editing;
+            let border_color = if is_selected {
+                colors::INFO
+            } else {
+                match status {
+                    PostCmdRectStatus::Unchanged => colors::WHITE,
+                    PostCmdRectStatus::Editing => colors::WARNING,
+                    PostCmdRectStatus::Modified => colors::ACCENT,
+                    PostCmdRectStatus::MarkedForDeletion => colors::ERROR,
+                    PostCmdRectStatus::Saved => colors::SUCCESS,
+                }
             };
-            let mut border_style = Style::default().fg(border_color);
-            if is_focused {
-                border_style = border_style.add_modifier(Modifier::BOLD);
-            }
-            let inner_line = if editing_idx == Some(i) {
-                Line::from(vec![Span::raw(format!("{cmd}|"))])
+            let border_style = Style::default().fg(border_color);
+            let content_style = if is_focused {
+                Style::default()
+                    .fg(colors::WHITE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let mut inner_line = if is_editing {
+                self.post_cmd_input
+                    .as_ref()
+                    .map(|prompt| prompt.inline_line())
+                    .unwrap_or_else(|| Line::from(Span::raw(cmd.clone())))
             } else if cmd.is_empty() {
                 let placeholder = Style::default()
                     .fg(colors::MUTED)
@@ -855,6 +927,7 @@ impl SettingsScreen {
             } else {
                 Line::from(Span::raw(cmd.clone()))
             };
+            inner_line.style = content_style;
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
@@ -883,9 +956,9 @@ impl SettingsScreen {
         idx += 1;
 
         let hint = if editing_idx.is_some() {
-            "Type to edit, Enter to confirm, Esc to cancel"
+            "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else {
-            "↑↓ to move • Enter to edit/Create/Save • ←→ between buttons • Del to remove • Esc to go back"
+            "↑↓ to move • Enter to edit/Create/Save • Backspace toggles delete mark • ←→ between buttons • Esc to go back"
         };
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[idx]);
     }
@@ -927,7 +1000,7 @@ impl SettingsScreen {
             Style::default().fg(colors::MUTED)
         };
 
-        let create_border = Style::default().fg(colors::INFO);
+        let create_border = Style::default().fg(colors::WHITE);
         let save_border = Style::default().fg(colors::SUCCESS);
 
         let create_box = Paragraph::new(Line::from(Span::styled(create_label, create_text_style)))
@@ -1086,4 +1159,10 @@ Safety features:\n\
         )));
         frame.render_widget(Paragraph::new(lines), area);
     }
+}
+
+fn build_post_cmd_input(value: &str) -> InputPrompt {
+    InputPrompt::new("")
+        .with_placeholder("Type command")
+        .with_default(value.to_string())
 }

@@ -320,8 +320,7 @@ impl InputPrompt {
         );
 
         let _ = tick;
-        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
-        let inner_line = self.build_input_line(cursor_style);
+        let inner_line = self.inline_line();
         let field = Paragraph::new(inner_line).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -344,6 +343,14 @@ impl InputPrompt {
                 .add_modifier(Modifier::DIM),
         );
         frame.render_widget(hint, chunks[3]);
+    }
+
+    /// Renderable single-line content with the same solid block cursor used by
+    /// the full prompt widget. Useful for inline editors that still want the
+    /// same editing affordances and cursor visuals.
+    pub fn inline_line(&self) -> Line<'_> {
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+        self.build_input_line(cursor_style)
     }
 
     fn build_input_line(&self, cursor_style: Style) -> Line<'_> {
