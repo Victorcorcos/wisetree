@@ -1100,9 +1100,10 @@ mod tests {
     fn list_navigate_to_in_wrapper_mode_sets_selected_path_and_quits() {
         let mut app = ready_app(true);
         let tx = app_event_tx();
+        // The main worktree is the first row, so two Enters navigate to it.
         app.handle_key(key(KeyCode::Enter), &tx);
         app.handle_key(key(KeyCode::Enter), &tx);
-        assert_eq!(app.selected_path(), Some("/tmp/repo-feat"));
+        assert_eq!(app.selected_path(), Some("/tmp/repo"));
         assert!(app.quit_requested);
     }
 

@@ -59,18 +59,31 @@ fn loading_render_shows_loading_message() {
 }
 
 #[test]
-fn set_worktrees_filters_main_and_clears_loading() {
+fn set_worktrees_keeps_main_first_and_clears_loading() {
     let mut s = ListScreen::new(true, true);
     s.set_worktrees(worktrees());
     assert!(!s.loading());
-    assert_eq!(s.worktrees().len(), 2);
-    assert!(s.worktrees().iter().all(|w| !w.is_main));
+    assert_eq!(s.worktrees().len(), 3);
+    assert!(s.worktrees()[0].is_main);
+    assert_eq!(s.worktrees()[0].path, "/tmp/repo");
+}
+
+#[test]
+fn set_worktrees_promotes_main_to_first_row() {
+    let mut s = ListScreen::new(true, true);
+    s.set_worktrees(vec![
+        wt("/tmp/repo-feat", "feat", false),
+        wt("/tmp/repo", "main", true),
+        wt("/tmp/repo-bug", "bug", false),
+    ]);
+    assert!(s.worktrees()[0].is_main);
+    assert_eq!(s.worktrees()[0].path, "/tmp/repo");
 }
 
 #[test]
 fn empty_list_shows_no_worktrees_and_back_on_keypress() {
     let mut s = ListScreen::new(true, true);
-    s.set_worktrees(vec![wt("/tmp/repo", "main", true)]);
+    s.set_worktrees(vec![]);
     let dumped = dump(60, 4, |f| s.render(f, f.area()));
     assert!(dumped.contains("No additional worktrees"));
     let action = s.handle_key(key(KeyCode::Char('x')));
@@ -84,6 +97,8 @@ fn down_arrow_navigates_with_wrap() {
     assert_eq!(s.selected_index(), 0);
     s.handle_key(key(KeyCode::Down));
     assert_eq!(s.selected_index(), 1);
+    s.handle_key(key(KeyCode::Down));
+    assert_eq!(s.selected_index(), 2);
     s.handle_key(key(KeyCode::Down));
     assert_eq!(s.selected_index(), 0);
 }
@@ -135,9 +150,10 @@ fn enter_opens_action_menu_and_navigate_to_emits_path_when_from_wrapper() {
     s.set_worktrees(worktrees());
     s.handle_key(key(KeyCode::Enter));
     // Now in action menu; first option is "Navigate to Directory" (enabled).
+    // The first row is the main worktree so the emitted path is the main checkout.
     let action = s.handle_key(key(KeyCode::Enter));
     match action {
-        ListAction::NavigateTo(path) => assert_eq!(path, "/tmp/repo-feat"),
+        ListAction::NavigateTo(path) => assert_eq!(path, "/tmp/repo"),
         other => panic!("expected NavigateTo, got {other:?}"),
     }
 }
@@ -160,7 +176,7 @@ fn open_with_command_in_action_menu_emits_open_terminal() {
     s.handle_key(key(KeyCode::Down)); // move to "Open with Command"
     let action = s.handle_key(key(KeyCode::Enter));
     match action {
-        ListAction::OpenTerminal(path) => assert_eq!(path, "/tmp/repo-feat"),
+        ListAction::OpenTerminal(path) => assert_eq!(path, "/tmp/repo"),
         other => panic!("expected OpenTerminal, got {other:?}"),
     }
 }
@@ -204,7 +220,16 @@ fn render_action_menu_shows_selected_header() {
     s.handle_key(key(KeyCode::Enter));
     let dumped = dump(80, 10, |f| s.render(f, f.area()));
     assert!(dumped.contains("Selected"));
-    assert!(dumped.contains("feat"));
+    assert!(dumped.contains("main"));
+}
+
+#[test]
+fn render_marks_main_row_with_main_indicator() {
+    let mut s = ListScreen::new(true, true);
+    s.set_worktrees(worktrees());
+    let dumped = dump(80, 12, |f| s.render(f, f.area()));
+    assert!(dumped.contains("/tmp/repo"));
+    assert!(dumped.contains("(main)"));
 }
 
 #[test]

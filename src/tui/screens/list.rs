@@ -20,7 +20,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::git::types::GitWorktree;
-use crate::messages::{colors, GIT_ERROR_LIST, LIST_NO_WORKTREES, LOADING_WORKTREES};
+use crate::messages::{
+    colors, GIT_ERROR_LIST, LIST_MAIN_INDICATOR, LIST_NO_WORKTREES, LOADING_WORKTREES,
+};
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
     branded_line, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
@@ -96,8 +98,10 @@ impl ListScreen {
     }
 
     pub fn set_worktrees(&mut self, worktrees: Vec<GitWorktree>) {
-        // Match upstream: drop the main worktree from the list view.
-        self.worktrees = worktrees.into_iter().filter(|w| !w.is_main).collect();
+        // Keep the main worktree as the first row so the user can always
+        // navigate back to the main checkout from any other worktree.
+        let (main, others): (Vec<_>, Vec<_>) = worktrees.into_iter().partition(|w| w.is_main);
+        self.worktrees = main.into_iter().chain(others).collect();
         self.select = if self.worktrees.is_empty() {
             None
         } else {
@@ -118,7 +122,12 @@ impl ListScreen {
             .iter()
             .enumerate()
             .map(|(i, wt)| {
-                SelectOption::new(fold_home(&wt.path), i).with_description(wt.branch.clone())
+                let description = if wt.is_main {
+                    format!("{} {LIST_MAIN_INDICATOR}", wt.branch)
+                } else {
+                    wt.branch.clone()
+                };
+                SelectOption::new(fold_home(&wt.path), i).with_description(description)
             })
             .collect();
         SelectPrompt::new("Select a worktree:", opts)
