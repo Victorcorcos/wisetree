@@ -677,8 +677,9 @@ impl App {
                 let local_path = self.local_config_path_str();
                 let active_post_create =
                     self.current_config().map(|cfg| cfg.post_create_cmd.clone());
-                let active_terminal_command =
-                    self.current_config().map(|cfg| cfg.terminal_command.clone());
+                let active_terminal_command = self
+                    .current_config()
+                    .map(|cfg| cfg.terminal_command.clone());
                 let active_path_template = self
                     .current_config()
                     .map(|cfg| cfg.worktree_path_template.clone());
@@ -1533,10 +1534,7 @@ mod tests {
 
             // "Open with Command" reads from current_config() — confirm it sees
             // the just-saved local value.
-            assert_eq!(
-                app.current_config().unwrap().terminal_command,
-                "new-local"
-            );
+            assert_eq!(app.current_config().unwrap().terminal_command, "new-local");
         });
     }
 
@@ -1572,10 +1570,7 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
             assert_eq!(saved_global.terminal_command, "new-global");
 
-            assert_eq!(
-                app.current_config().unwrap().terminal_command,
-                "new-global"
-            );
+            assert_eq!(app.current_config().unwrap().terminal_command, "new-global");
         });
     }
 

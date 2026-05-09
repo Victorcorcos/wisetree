@@ -589,9 +589,8 @@ impl SettingsScreen {
                         Some(PostCmdEditor::new(self.config.post_create_cmd.clone()));
                 }
                 if matches!(value, SettingsStep::TerminalCmd) {
-                    self.terminal_cmd_editor = Some(TerminalCmdEditor::new(
-                        self.config.terminal_command.clone(),
-                    ));
+                    self.terminal_cmd_editor =
+                        Some(TerminalCmdEditor::new(self.config.terminal_command.clone()));
                 }
                 if matches!(value, SettingsStep::PathTemplate) {
                     self.path_template_editor = Some(PathTemplateEditor::new(
@@ -1303,10 +1302,7 @@ impl SettingsScreen {
             let placeholder = Style::default()
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM);
-            Line::from(Span::styled(
-                "(empty — press Enter to edit)",
-                placeholder,
-            ))
+            Line::from(Span::styled("(empty — press Enter to edit)", placeholder))
         } else {
             Line::from(Span::raw(editor.template.clone()))
         };
@@ -1328,10 +1324,7 @@ impl SettingsScreen {
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
 
         frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "Available variables:",
-                info_style,
-            ))),
+            Paragraph::new(Line::from(branded_line("Available variables:", info_style))),
             chunks[3],
         );
         frame.render_widget(
