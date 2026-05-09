@@ -120,10 +120,12 @@ Each screen renders the **Monokai-inspired Wisetree palette** (defined in `desig
 
 ### Configuration
 
-`wisetree` looks for configuration in this order, falling back to sensible defaults if neither is present:
+`wisetree` loads the **first** of these it finds; the two files are never merged:
 
-1. `.wisetree.json` next to the repository root (project-local, so you can commit it and share it across the team).
-2. `~/.wisetree/settings.json` (global, for your personal defaults).
+1. `.wisetree.json` at the repo root (project-local, commit it to share with the team).
+2. `~/.wisetree/settings.json` (global, your personal defaults — auto-created on first run).
+
+Any field you omit falls back to the built-in default below, not to the global file.
 
 A complete configuration example:
 
