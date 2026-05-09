@@ -679,6 +679,9 @@ impl App {
                     self.current_config().map(|cfg| cfg.post_create_cmd.clone());
                 let active_terminal_command =
                     self.current_config().map(|cfg| cfg.terminal_command.clone());
+                let active_path_template = self
+                    .current_config()
+                    .map(|cfg| cfg.worktree_path_template.clone());
                 let settings = match self.global_settings_snapshot() {
                     Ok((mut config, config_path)) => {
                         if let Some(commands) = active_post_create {
@@ -686,6 +689,9 @@ impl App {
                         }
                         if let Some(command) = active_terminal_command {
                             config.terminal_command = command;
+                        }
+                        if let Some(template) = active_path_template {
+                            config.worktree_path_template = template;
                         }
                         SettingsScreen::new(config, config_path).with_local_config_path(local_path)
                     }
@@ -865,27 +871,32 @@ impl App {
     }
 
     fn save_path_template(&mut self, template: String) -> Result<(), String> {
-        let local_path = self
-            .local_config_path()
-            .ok_or_else(|| "No git repository in scope".to_string())?;
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
 
-        let mut config = if local_path.exists() {
-            let mut svc = ConfigService::new();
-            svc.load(local_path.parent()).map_err(|e| e.to_string())?
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
         } else {
-            self.current_config().cloned().unwrap_or_default()
+            WorktreeConfig::default()
         };
         config.worktree_path_template = template.clone();
 
         let mut writer = ConfigService::new();
         writer
-            .save(&config, Some(&local_path))
+            .save(&config, Some(&target_path))
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
             service
                 .config_service_mut()
-                .load(local_path.parent())
+                .load(project_path)
                 .map_err(|e| e.to_string())?;
         }
 
@@ -1564,6 +1575,91 @@ mod tests {
             assert_eq!(
                 app.current_config().unwrap().terminal_command,
                 "new-global"
+            );
+        });
+    }
+
+    #[test]
+    fn save_path_template_writes_to_local_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_path_template: "$BASE_PATH-global".into(),
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                worktree_path_template: "$BASE_PATH-old".into(),
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_path_template("$BASE_PATH-new".into()).unwrap();
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert_eq!(saved_local.worktree_path_template, "$BASE_PATH-new");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.worktree_path_template, "$BASE_PATH-global");
+
+            assert_eq!(
+                app.current_config().unwrap().worktree_path_template,
+                "$BASE_PATH-new"
+            );
+        });
+    }
+
+    #[test]
+    fn save_path_template_writes_to_global_when_local_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_path_template: "$BASE_PATH-old".into(),
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_path_template("$BASE_PATH-new".into()).unwrap();
+
+            assert!(!local_path.exists(), "local config must not be created");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.worktree_path_template, "$BASE_PATH-new");
+
+            assert_eq!(
+                app.current_config().unwrap().worktree_path_template,
+                "$BASE_PATH-new"
             );
         });
     }
