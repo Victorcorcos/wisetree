@@ -6,7 +6,10 @@ use ratatui::Terminal;
 
 use wisetree::config::schema::WorktreeConfig;
 use wisetree::services::UpdateCheckResult;
-use wisetree::tui::screens::settings::{SettingsAction, SettingsScreen, SettingsStep};
+use wisetree::tui::screens::settings::{
+    CopyDirection, PostCmdRectStatus, PostCmdSelection, SettingsAction, SettingsScreen,
+    SettingsStep,
+};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -51,6 +54,7 @@ fn menu_renders_with_config_path() {
     assert!(dumped.contains("/tmp/.wisetree.json"));
     assert!(dumped.contains("➤"));
     assert!(dumped.contains("Copy Patterns"));
+    assert!(dumped.contains("Copy Settings"));
     assert!(dumped.contains("Check for Updates"));
 }
 
@@ -125,8 +129,8 @@ fn delete_branch_setting_emits_false_when_no_selected() {
 #[test]
 fn select_check_updates_emits_action() {
     let mut s = ready();
-    // Navigate to last entry "Check for Updates" — 6 downs from the first.
-    for _ in 0..6 {
+    // Navigate to last entry "Check for Updates" — 7 downs from the first.
+    for _ in 0..7 {
         s.handle_key(key(KeyCode::Down));
     }
     let action = s.handle_key(key(KeyCode::Enter));
@@ -135,9 +139,55 @@ fn select_check_updates_emits_action() {
 }
 
 #[test]
-fn check_updates_loading_renders_spinner_message() {
+fn selecting_copy_settings_shows_copy_directions() {
     let mut s = ready();
     for _ in 0..6 {
+        s.handle_key(key(KeyCode::Down));
+    }
+
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::CopySettings);
+
+    let dumped = dump(90, 12, |f| s.render(f, f.area()));
+    assert!(dumped.contains("global → local"));
+    assert!(dumped.contains("local → global"));
+}
+
+#[test]
+fn copy_settings_default_selection_emits_global_to_local() {
+    let mut s = ready();
+    for _ in 0..6 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::CopySettings(CopyDirection::GlobalToLocal)
+    );
+}
+
+#[test]
+fn copy_settings_second_selection_emits_local_to_global() {
+    let mut s = ready();
+    for _ in 0..6 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Down));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::CopySettings(CopyDirection::LocalToGlobal)
+    );
+}
+
+#[test]
+fn check_updates_loading_renders_spinner_message() {
+    let mut s = ready();
+    for _ in 0..7 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -149,7 +199,7 @@ fn check_updates_loading_renders_spinner_message() {
 #[test]
 fn check_updates_with_new_version_shows_install_command() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..7 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -170,7 +220,7 @@ fn check_updates_with_new_version_shows_install_command() {
 #[test]
 fn check_updates_up_to_date_message() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..7 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -189,7 +239,7 @@ fn check_updates_up_to_date_message() {
 #[test]
 fn check_updates_error_shows_failure_message() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..7 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -202,6 +252,120 @@ fn check_updates_error_shows_failure_message() {
     });
     let dumped = dump(80, 6, |f| s.render(f, f.area()));
     assert!(dumped.contains("Failed to check for updates"));
+}
+
+fn enter_post_cmd(s: &mut SettingsScreen) {
+    // Menu order: Copy(0), Ignore(1), Path(2), PostCmd(3).
+    for _ in 0..3 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::PostCmd);
+}
+
+#[test]
+fn post_cmd_editor_initializes_with_existing_commands() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+
+    let editor = s.post_cmd_editor().expect("editor present");
+    assert_eq!(editor.commands, vec!["bun install".to_string()]);
+    assert_eq!(editor.statuses, vec![PostCmdRectStatus::Unchanged]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(0));
+}
+
+#[test]
+fn post_cmd_create_button_appends_blank_rectangle() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+
+    // Move down: Rect(0) -> Create.
+    s.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        s.post_cmd_editor().unwrap().selection,
+        PostCmdSelection::Create
+    );
+
+    s.handle_key(key(KeyCode::Enter));
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands.len(), 2);
+    assert_eq!(editor.commands[1], "");
+    assert_eq!(editor.selection, PostCmdSelection::Rect(1));
+}
+
+#[test]
+fn post_cmd_enter_starts_editing_then_modifies() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        s.post_cmd_editor().unwrap().statuses[0],
+        PostCmdRectStatus::Editing
+    );
+
+    // Append a character, then commit with Enter.
+    s.handle_key(key(KeyCode::Char('!')));
+    s.handle_key(key(KeyCode::Enter));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands[0], "bun install!");
+    assert_eq!(editor.statuses[0], PostCmdRectStatus::Modified);
+}
+
+#[test]
+fn post_cmd_save_button_emits_filtered_commands() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+
+    // Add a blank one and then leave it empty. Selection lands on Rect(1)
+    // after Create; move down to Create, right to Save.
+    s.handle_key(key(KeyCode::Down));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Down));
+    s.handle_key(key(KeyCode::Right));
+    assert_eq!(
+        s.post_cmd_editor().unwrap().selection,
+        PostCmdSelection::Save
+    );
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::SavePostCreateCommands(vec!["bun install".into()])
+    );
+}
+
+#[test]
+fn post_cmd_mark_saved_paints_all_rectangles_green() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+
+    // Edit then mark saved.
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('x')));
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        s.post_cmd_editor().unwrap().statuses[0],
+        PostCmdRectStatus::Modified
+    );
+
+    s.mark_post_create_commands_saved(vec!["bun installx".into()]);
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.statuses, vec![PostCmdRectStatus::Saved]);
+    assert_eq!(editor.commands, vec!["bun installx".to_string()]);
+}
+
+#[test]
+fn post_cmd_delete_key_removes_rectangle() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+
+    s.handle_key(key(KeyCode::Delete));
+    let editor = s.post_cmd_editor().unwrap();
+    assert!(editor.commands.is_empty());
+    assert_eq!(editor.selection, PostCmdSelection::Create);
 }
 
 #[test]

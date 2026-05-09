@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::cli::AppMode;
 use crate::config::schema::WorktreeConfig;
 use crate::config::service::ConfigService;
-use crate::constants::global_config_file;
+use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
 use crate::files::service::open_terminal;
 use crate::git::exec::get_git_root;
@@ -38,7 +38,7 @@ use crate::tui::screens::delete::{
 };
 use crate::tui::screens::list::{ListAction, ListScreen};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
-use crate::tui::screens::settings::{SettingsAction, SettingsScreen};
+use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
 use crate::tui::terminal;
 use crate::tui::widgets::WelcomeHeader;
@@ -512,6 +512,20 @@ impl App {
                     }
                 }
             }
+            SettingsAction::CopySettings(direction) => {
+                if let Err(err) = self.copy_settings(direction) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to copy settings: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SavePostCreateCommands(commands) => {
+                if let Err(err) = self.save_post_create_commands(commands) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save post-create commands: {err}"));
+                    }
+                }
+            }
         }
     }
 
@@ -646,13 +660,22 @@ impl App {
                 kick_off_delete_load(self.git_root.clone(), tx.clone());
             }
             Screen::Settings => {
+                let local_path = self.local_config_path_str();
+                let active_post_create =
+                    self.current_config().map(|cfg| cfg.post_create_cmd.clone());
                 let settings = match self.global_settings_snapshot() {
-                    Ok((config, config_path)) => SettingsScreen::new(config, config_path),
+                    Ok((mut config, config_path)) => {
+                        if let Some(commands) = active_post_create {
+                            config.post_create_cmd = commands;
+                        }
+                        SettingsScreen::new(config, config_path).with_local_config_path(local_path)
+                    }
                     Err(err) => {
                         let mut settings = SettingsScreen::new(
                             WorktreeConfig::default(),
                             global_config_file().display().to_string(),
-                        );
+                        )
+                        .with_local_config_path(local_path);
                         settings.set_error(err);
                         settings
                     }
@@ -738,6 +761,105 @@ impl App {
             .config_path()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| global_config_file().display().to_string());
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.set_config(config, path);
+        }
+        Ok(())
+    }
+
+    fn local_config_path(&self) -> Option<PathBuf> {
+        self.git_root
+            .as_ref()
+            .map(|root| PathBuf::from(root).join(LOCAL_CONFIG_FILE_NAME))
+    }
+
+    fn local_config_path_str(&self) -> Option<String> {
+        self.local_config_path().map(|p| p.display().to_string())
+    }
+
+    fn save_post_create_commands(&mut self, commands: Vec<String>) -> Result<(), String> {
+        let local_path = self
+            .local_config_path()
+            .ok_or_else(|| "No git repository in scope".to_string())?;
+
+        let mut config = if local_path.exists() {
+            let mut svc = ConfigService::new();
+            svc.load(local_path.parent()).map_err(|e| e.to_string())?
+        } else {
+            self.current_config().cloned().unwrap_or_default()
+        };
+        config.post_create_cmd = commands.clone();
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&local_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            service
+                .config_service_mut()
+                .load(local_path.parent())
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_post_create_commands_saved(commands);
+        }
+        Ok(())
+    }
+
+    fn copy_settings(&mut self, direction: CopyDirection) -> Result<(), String> {
+        let local_path = self
+            .local_config_path()
+            .ok_or_else(|| "No git repository in scope".to_string())?;
+        let global_path = global_config_file();
+
+        let config = match direction {
+            CopyDirection::GlobalToLocal => {
+                let mut reader = ConfigService::new();
+                reader.load_global().map_err(|e| e.to_string())?
+            }
+            CopyDirection::LocalToGlobal => {
+                if !local_path.exists() {
+                    return Err(format!(
+                        "No project-local config found at {}",
+                        local_path.display()
+                    ));
+                }
+                let mut reader = ConfigService::new();
+                reader
+                    .load(local_path.parent())
+                    .map_err(|e| e.to_string())?
+            }
+        };
+
+        let target_path = match direction {
+            CopyDirection::GlobalToLocal => local_path.clone(),
+            CopyDirection::LocalToGlobal => global_path.clone(),
+        };
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(target_path.as_path()))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            service
+                .config_service_mut()
+                .load(local_path.parent())
+                .map_err(|e| e.to_string())?;
+        }
+
+        self.refresh_settings_screen()
+    }
+
+    fn refresh_settings_screen(&mut self) -> Result<(), String> {
+        let active_post_create = self.current_config().map(|cfg| cfg.post_create_cmd.clone());
+        let (mut config, path) = self.global_settings_snapshot()?;
+        if let Some(commands) = active_post_create {
+            config.post_create_cmd = commands;
+        }
 
         if let Some(settings) = self.settings.as_mut() {
             settings.set_config(config, path);
@@ -1123,6 +1245,121 @@ mod tests {
                     .config_service()
                     .config()
                     .delete_branch_with_worktree
+            );
+        });
+    }
+
+    #[test]
+    fn settings_copy_global_to_local_creates_local_config_file() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global = WorktreeConfig {
+                terminal_command: "global $WORKTREE_PATH".into(),
+                delete_branch_with_worktree: true,
+                post_create_cmd: vec!["bun install".into()],
+                ..WorktreeConfig::default()
+            };
+
+            let mut config_service = ConfigService::new();
+            config_service.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load_global().unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.screen = Screen::Settings;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let tx = app_event_tx();
+            app.enter_screen(Screen::Settings, &tx);
+
+            for _ in 0..6 {
+                app.handle_key(key(KeyCode::Down), &tx);
+            }
+            app.handle_key(key(KeyCode::Enter), &tx);
+            app.handle_key(key(KeyCode::Enter), &tx);
+
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let saved: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+
+            assert_eq!(saved, global);
+            assert_eq!(
+                app.worktree_service
+                    .as_ref()
+                    .unwrap()
+                    .config_service()
+                    .config_path(),
+                Some(local_path.as_path())
+            );
+        });
+    }
+
+    #[test]
+    fn settings_copy_local_to_global_overwrites_global_config_file() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                terminal_command: "global".into(),
+                delete_branch_with_worktree: false,
+                post_create_cmd: vec!["npm install".into()],
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                terminal_command: "local".into(),
+                delete_branch_with_worktree: true,
+                post_create_cmd: vec!["bun install".into(), "bun test".into()],
+                ..WorktreeConfig::default()
+            };
+
+            let mut config_service = ConfigService::new();
+            config_service.save(&global, Some(&global_path)).unwrap();
+            config_service.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.screen = Screen::Settings;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let tx = app_event_tx();
+            app.enter_screen(Screen::Settings, &tx);
+
+            for _ in 0..6 {
+                app.handle_key(key(KeyCode::Down), &tx);
+            }
+            app.handle_key(key(KeyCode::Enter), &tx);
+            app.handle_key(key(KeyCode::Down), &tx);
+            app.handle_key(key(KeyCode::Enter), &tx);
+
+            let saved: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+
+            assert_eq!(saved, local);
+            assert_eq!(
+                app.settings.as_ref().unwrap().config().terminal_command,
+                local.terminal_command
+            );
+            assert_eq!(
+                app.worktree_service
+                    .as_ref()
+                    .unwrap()
+                    .config_service()
+                    .config(),
+                &local
             );
         });
     }
