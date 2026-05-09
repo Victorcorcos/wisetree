@@ -250,3 +250,11 @@ Update `schema.json` via the existing generator binary (`src/bin/generate_schema
 - **Test on a real network filesystem if possible.** Symlinks across NFS/SMB are flaky; document "local filesystems only" if you can't make it robust.
 - **`metadata.json` writes must be atomic.** Use `tempfile::NamedTempFile::persist` or write-then-rename. A half-written metadata file breaks every subsequent operation.
 - **Keep `LinkReport` separate from `CopyReport`.** They look similar; they are not the same. Conflating them in the TUI surfaces is a refactor trap — accept the duplication.
+
+---
+
+## 12. Design guidance
+
+In case something need to be done in TUI, always remember to follow the design and color pallete we already have, documented in:
+
+* design/pallete.md

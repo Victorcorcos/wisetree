@@ -252,3 +252,11 @@ Run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo t
 - **Cache `gh --version` result.** Probing per tick is wasteful; once at service construction is enough.
 - **Respect `is_from_wrapper`.** The `Navigate to Directory` action only makes sense when the shell wrapper is in use, exactly like `ListScreen` already enforces.
 - **Keep the wire format stable.** `--json` output should be a strict superset of `wisetree list --json`'s array element shape — extend, do not rename.
+
+---
+
+## 10. Design guidance
+
+In case something need to be done in TUI, always remember to follow the design and color pallete we already have, documented in:
+
+* design/pallete.md

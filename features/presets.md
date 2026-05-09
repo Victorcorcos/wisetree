@@ -246,3 +246,11 @@ Re-run the schema generator (`cargo run --bin generate-schema`) so `schema.json`
 - **Don't introduce a separate file format.** Presets live inside the existing `.wisetree.json`. A `~/.wisetree/presets/` directory is tempting but doubles the discovery rules and breaks team-shared configs.
 - **`Option<Vec<T>>` is awkward to serialize prettily.** That's fine — `skip_serializing_if = "Option::is_none"` keeps the on-disk shape clean. Don't substitute a custom enum for clever empty/unset distinctions; the option is the simplest correct thing.
 - **Preset names are user-facing identifiers.** Treat them as data, not code. Don't lowercase/uppercase them, don't strip whitespace, don't auto-rename. Round-trip them verbatim.
+
+---
+
+## 12. Design guidance
+
+In case something need to be done in TUI, always remember to follow the design and color pallete we already have, documented in:
+
+* design/pallete.md

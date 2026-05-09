@@ -320,3 +320,11 @@ No `schema.json` change required — `CleanupRule` lives in code, not in the per
 - **Confirmation is non-negotiable.** No code path may delete a worktree without either an interactive confirmation or an explicit `--yes`. Even `--dry-run` must not delete. Add a test that calling `execute` without going through the TUI's Confirm step or the CLI's `--yes` is impossible by construction (e.g. require a `Confirmed` token type that only the confirmation surfaces produce).
 - **Report partial failures plainly.** A user running `cleanup` against 30 worktrees needs to know exactly which 28 succeeded and which 2 didn't. Don't compress the failed list into a count; print every path with its error message.
 - **Don't reach into `.git/worktrees/` directly.** Always go through `git worktree remove` (via `WorktreeService::delete_worktree`). The plumbing under `.git/worktrees/` is private to git and changes between versions.
+
+---
+
+## 11. Design guidance
+
+In case something need to be done in TUI, always remember to follow the design and color pallete we already have, documented in:
+
+* design/pallete.md
