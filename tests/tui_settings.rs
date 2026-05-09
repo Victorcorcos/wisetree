@@ -11,7 +11,7 @@ use wisetree::messages::colors;
 use wisetree::services::UpdateCheckResult;
 use wisetree::tui::screens::settings::{
     CopyDirection, PostCmdRectStatus, PostCmdSelection, SettingsAction, SettingsScreen,
-    SettingsStep,
+    SettingsStep, TerminalCmdRectStatus, TerminalCmdSelection,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -100,18 +100,25 @@ fn surrounding_border_cells(buffer: &Buffer, text: &str) -> ((u16, u16), (u16, u
 
     let left_x = (0..x)
         .rev()
-        .find(|&candidate| buffer[(candidate, y)].symbol() != " ")
+        .find(|&candidate| buffer[(candidate, y)].symbol() == "│")
         .unwrap_or_else(|| panic!("left border for {text:?} not found"));
     let right_x = ((x + text.chars().count() as u16)..buffer.area.width)
-        .find(|&candidate| buffer[(candidate, y)].symbol() != " ")
+        .find(|&candidate| buffer[(candidate, y)].symbol() == "│")
         .unwrap_or_else(|| panic!("right border for {text:?} not found"));
 
     ((left_x, y), (right_x, y))
 }
 
 fn ready() -> SettingsScreen {
+    ready_with_commands(&["bun install"])
+}
+
+fn ready_with_commands(commands: &[&str]) -> SettingsScreen {
     let cfg = WorktreeConfig {
-        post_create_cmd: vec!["bun install".into()],
+        post_create_cmd: commands
+            .iter()
+            .map(|command| (*command).to_string())
+            .collect(),
         terminal_command: "code $WORKTREE_PATH".into(),
         delete_branch_with_worktree: true,
         ..Default::default()
@@ -348,24 +355,102 @@ fn post_cmd_editor_initializes_existing_commands_as_saved() {
 }
 
 #[test]
-fn post_cmd_selected_rectangle_uses_teal_border_and_plain_border_cells() {
+fn post_cmd_selected_rectangle_keeps_status_border_and_shows_orange_marker() {
     let mut s = ready();
     enter_post_cmd(&mut s);
     s.handle_key(key(KeyCode::Up));
 
     let buffer = render(80, 14, |f| s.render(f, f.area()));
+    assert_text_fg(&buffer, "✎", colors::ACCENT);
     assert_text_fg(&buffer, "bun install", colors::WHITE);
     assert_text_modifier(&buffer, "bun install", Modifier::BOLD);
 
     let (left_border, right_border) = surrounding_border_cells(&buffer, "bun install");
     for (x, y) in [left_border, right_border] {
         let cell = &buffer[(x, y)];
-        assert_eq!(cell.fg, colors::INFO);
+        assert_eq!(cell.fg, colors::SUCCESS);
         assert!(
             !cell.modifier.contains(Modifier::BOLD),
             "border cell at ({x}, {y}) should not be bold"
         );
     }
+}
+
+#[test]
+fn post_cmd_selected_delete_mark_keeps_red_border() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Backspace));
+
+    let buffer = render(80, 14, |f| s.render(f, f.area()));
+    assert_text_fg(&buffer, "✎", colors::ACCENT);
+
+    let (left_border, right_border) = surrounding_border_cells(&buffer, "bun install");
+    for (x, y) in [left_border, right_border] {
+        assert_eq!(buffer[(x, y)].fg, colors::ERROR);
+    }
+}
+
+#[test]
+fn post_cmd_selection_marker_disappears_while_editing() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+    s.handle_key(key(KeyCode::Up));
+
+    let selected = dump(80, 14, |f| s.render(f, f.area()));
+    assert!(selected.contains("✎𓂃"));
+
+    s.handle_key(key(KeyCode::Enter));
+
+    let editing = dump(80, 14, |f| s.render(f, f.area()));
+    assert!(!editing.contains("✎𓂃"));
+}
+
+#[test]
+fn post_cmd_overflow_keeps_button_labels_visible() {
+    let mut s = ready_with_commands(&[
+        "mkdir eu_abri1",
+        "mkdir eu_abri2",
+        "mkdir eu_abri3",
+        "mkdir eu_abri4",
+    ]);
+    enter_post_cmd(&mut s);
+
+    let dumped = dump(80, 18, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Create"));
+    assert!(dumped.contains("Save"));
+    assert!(dumped.contains("▲/▼ to scroll"));
+    assert!(dumped.contains("▼ 1 below"));
+}
+
+#[test]
+fn post_cmd_overflow_keeps_last_selected_rectangle_in_view() {
+    let mut s = ready_with_commands(&[
+        "mkdir eu_abri1",
+        "mkdir eu_abri2",
+        "mkdir eu_abri3",
+        "mkdir eu_abri4",
+    ]);
+    enter_post_cmd(&mut s);
+
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Down));
+
+    let dumped = dump(80, 18, |f| s.render(f, f.area()));
+    assert!(dumped.contains("mkdir eu_abri4"));
+    assert!(dumped.contains("Create"));
+    assert!(dumped.contains("▲ 1 above"));
+    assert!(dumped.contains("▼ bottom"));
+}
+
+#[test]
+fn post_cmd_non_overflow_hides_scroll_indicator() {
+    let mut s = ready();
+    enter_post_cmd(&mut s);
+
+    let dumped = dump(80, 14, |f| s.render(f, f.area()));
+    assert!(!dumped.contains("▲/▼ to scroll"));
 }
 
 #[test]
@@ -618,6 +703,201 @@ fn post_cmd_backspace_toggles_delete_mark() {
     s.handle_key(key(KeyCode::Backspace));
     let editor = s.post_cmd_editor().unwrap();
     assert_eq!(editor.statuses, vec![PostCmdRectStatus::MarkedForDeletion]);
+}
+
+fn enter_terminal_cmd(s: &mut SettingsScreen) {
+    // Menu order: Copy(0), Ignore(1), Path(2), PostCmd(3), TerminalCmd(4).
+    for _ in 0..4 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::TerminalCmd);
+}
+
+#[test]
+fn terminal_cmd_editor_initializes_with_saved_status_when_command_present() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+
+    let editor = s.terminal_cmd_editor().expect("editor present");
+    assert_eq!(editor.command, "code $WORKTREE_PATH");
+    assert_eq!(editor.status, TerminalCmdRectStatus::Saved);
+    assert_eq!(editor.selection, TerminalCmdSelection::Save);
+}
+
+#[test]
+fn terminal_cmd_editor_initializes_with_unchanged_status_when_blank() {
+    let cfg = WorktreeConfig {
+        terminal_command: String::new(),
+        ..Default::default()
+    };
+    let mut s = SettingsScreen::new(cfg, "/tmp/.wisetree.json".into());
+    enter_terminal_cmd(&mut s);
+
+    let editor = s.terminal_cmd_editor().expect("editor present");
+    assert_eq!(editor.command, "");
+    assert_eq!(editor.status, TerminalCmdRectStatus::Unchanged);
+}
+
+#[test]
+fn terminal_cmd_blank_renders_none_placeholder_in_muted() {
+    let cfg = WorktreeConfig {
+        terminal_command: String::new(),
+        ..Default::default()
+    };
+    let mut s = SettingsScreen::new(cfg, "/tmp/.wisetree.json".into());
+    enter_terminal_cmd(&mut s);
+
+    let buffer = render(80, 14, |f| s.render(f, f.area()));
+    assert_text_fg(&buffer, "(none)", colors::MUTED);
+}
+
+#[test]
+fn terminal_cmd_renders_save_button_and_saving_to_line() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+
+    let dumped = dump(80, 14, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Terminal Command"));
+    assert!(dumped.contains("Save"));
+    assert!(!dumped.contains("Create"));
+    assert!(dumped.contains("Saving to:"));
+    assert!(dumped.contains(".wisetree.json"));
+}
+
+#[test]
+fn terminal_cmd_up_from_save_focuses_rectangle() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+    assert_eq!(
+        s.terminal_cmd_editor().unwrap().selection,
+        TerminalCmdSelection::Save
+    );
+
+    s.handle_key(key(KeyCode::Up));
+    assert_eq!(
+        s.terminal_cmd_editor().unwrap().selection,
+        TerminalCmdSelection::Rect
+    );
+
+    s.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        s.terminal_cmd_editor().unwrap().selection,
+        TerminalCmdSelection::Save
+    );
+}
+
+#[test]
+fn terminal_cmd_enter_on_rect_starts_editing_then_modifies() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        s.terminal_cmd_editor().unwrap().status,
+        TerminalCmdRectStatus::Editing
+    );
+
+    s.handle_key(key(KeyCode::Char('!')));
+    s.handle_key(key(KeyCode::Enter));
+
+    let editor = s.terminal_cmd_editor().unwrap();
+    assert_eq!(editor.command, "code $WORKTREE_PATH!");
+    assert_eq!(editor.status, TerminalCmdRectStatus::Modified);
+}
+
+#[test]
+fn terminal_cmd_escape_during_editing_restores_backup() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('!')));
+    s.handle_key(key(KeyCode::Esc));
+
+    let editor = s.terminal_cmd_editor().unwrap();
+    assert_eq!(editor.command, "code $WORKTREE_PATH");
+    assert_eq!(editor.status, TerminalCmdRectStatus::Saved);
+}
+
+#[test]
+fn terminal_cmd_save_button_emits_save_action() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::SaveTerminalCommand("code $WORKTREE_PATH".into())
+    );
+}
+
+#[test]
+fn terminal_cmd_save_blank_emits_empty_string() {
+    let cfg = WorktreeConfig {
+        terminal_command: "   ".into(),
+        ..Default::default()
+    };
+    let mut s = SettingsScreen::new(cfg, "/tmp/.wisetree.json".into());
+    enter_terminal_cmd(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::SaveTerminalCommand(String::new()));
+}
+
+#[test]
+fn terminal_cmd_mark_saved_returns_to_settings_menu() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Char('!')));
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        s.terminal_cmd_editor().unwrap().status,
+        TerminalCmdRectStatus::Modified
+    );
+
+    s.mark_terminal_command_saved("code $WORKTREE_PATH!".into());
+
+    assert_eq!(s.step(), SettingsStep::Menu);
+    assert!(s.terminal_cmd_editor().is_none());
+
+    enter_terminal_cmd(&mut s);
+    let editor = s.terminal_cmd_editor().unwrap();
+    assert_eq!(editor.command, "code $WORKTREE_PATH!");
+    assert_eq!(editor.status, TerminalCmdRectStatus::Saved);
+}
+
+#[test]
+fn terminal_cmd_esc_outside_editing_returns_to_menu() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, SettingsAction::Continue);
+    assert_eq!(s.step(), SettingsStep::Menu);
+    assert!(s.terminal_cmd_editor().is_none());
+}
+
+#[test]
+fn terminal_cmd_selected_rectangle_shows_orange_marker_and_keeps_status_border() {
+    let mut s = ready();
+    enter_terminal_cmd(&mut s);
+    s.handle_key(key(KeyCode::Up));
+
+    let buffer = render(80, 14, |f| s.render(f, f.area()));
+    assert_text_fg(&buffer, "✎", colors::ACCENT);
+    assert_text_fg(&buffer, "code $WORKTREE_PATH", colors::WHITE);
+    assert_text_modifier(&buffer, "code $WORKTREE_PATH", Modifier::BOLD);
+
+    let (left_border, right_border) = surrounding_border_cells(&buffer, "code $WORKTREE_PATH");
+    for (x, y) in [left_border, right_border] {
+        assert_eq!(buffer[(x, y)].fg, colors::SUCCESS);
+    }
 }
 
 #[test]
