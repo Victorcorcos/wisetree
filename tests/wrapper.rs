@@ -11,7 +11,7 @@ use wisetree::tui::App;
 
 #[test]
 fn wrapper_flag_propagates_to_app() {
-    let app = App::new(AppMode::List, true);
+    let app = App::new(AppMode::Dashboard, true);
     assert!(app.is_from_wrapper);
     assert!(app.selected_path().is_none());
 }

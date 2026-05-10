@@ -49,7 +49,6 @@ enum DashboardColumn {
     Status,
     AheadBehind,
     LastCommit,
-    Agent,
     PullRequest,
 }
 
@@ -154,8 +153,8 @@ impl DashboardScreen {
             0
         };
         let table_rows = visible.max(1);
-        // Search bar is always visible (1 line).
-        5 + 1 + table_rows + overflow + 3
+        // Search bar (1 line) plus a blank spacer above and below it (2 lines).
+        5 + 3 + table_rows + overflow + 4
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -256,33 +255,23 @@ impl DashboardScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(4),
-                Constraint::Length(3),
+                Constraint::Length(1), // status banner
+                Constraint::Length(1), // spacer above search
+                Constraint::Length(1), // search line
+                Constraint::Length(1), // spacer below search
+                Constraint::Min(4),    // table
+                Constraint::Length(4), // footer
             ])
             .split(area);
 
         frame.render_widget(Paragraph::new(self.status_banner()), chunks[0]);
-        frame.render_widget(Paragraph::new(self.search_line()), chunks[1]);
-        let layout = self.table_layout(chunks[2].width);
-        self.render_table(frame, chunks[2], &layout);
+        frame.render_widget(Paragraph::new(self.search_line()), chunks[2]);
+        let layout = self.table_layout(chunks[4].width);
+        self.render_table(frame, chunks[4], &layout);
         frame.render_widget(
-            Paragraph::new(self.footer_lines(chunks[2].width, &layout)),
-            chunks[3],
+            Paragraph::new(self.footer_lines(chunks[4].width, &layout)),
+            chunks[5],
         );
-    }
-
-    fn handle_search_noop(&mut self, _key: KeyEvent) -> DashboardAction {
-        // Placeholder retained so the type compiles cleanly; the search
-        // mode no longer exists, so this branch is unreachable.
-        unreachable!("search mode removed");
-        #[allow(unreachable_code)]
-        {
-            #[allow(clippy::needless_return)]
-            return DashboardAction::Continue;
-        }
-        DashboardAction::Continue
     }
 
     fn build_action_select(&self, row: &DashboardRow) -> SelectPrompt<ActionChoice> {
@@ -389,15 +378,33 @@ impl DashboardScreen {
     fn row_matches_query(&self, row: &DashboardRow, query: &str) -> bool {
         let mut haystacks = vec![
             row.worktree.path.to_ascii_lowercase(),
+            fold_home(&row.worktree.path).to_ascii_lowercase(),
             row.worktree.branch.to_ascii_lowercase(),
             row.worktree.commit.to_ascii_lowercase(),
+            // Status column text — so users can filter by `clean`/`dirty`.
+            if row.worktree.is_clean { "clean" } else { "dirty" }.to_string(),
         ];
+        // Ahead/Behind column text — match the rendered "+N -N" / "=0" form
+        // and also raw "ahead N", "behind N" so either spelling filters.
+        if let Some(branch_status) = &row.worktree.branch_status {
+            if branch_status.ahead == 0 && branch_status.behind == 0 {
+                haystacks.push("=0".into());
+            } else {
+                haystacks.push(format!(
+                    "+{} -{}",
+                    branch_status.ahead, branch_status.behind
+                ));
+                haystacks.push(format!(
+                    "ahead {} behind {}",
+                    branch_status.ahead, branch_status.behind
+                ));
+            }
+        }
         if let Some(commit) = &row.last_commit {
+            haystacks.push(commit.sha.to_ascii_lowercase());
             haystacks.push(commit.summary.to_ascii_lowercase());
             haystacks.push(commit.author.to_ascii_lowercase());
-        }
-        if let Some(agent) = &row.agent {
-            haystacks.push(agent.name.to_ascii_lowercase());
+            haystacks.push(commit.relative_time.to_ascii_lowercase());
         }
         if let Some(pr) = &row.pull_request {
             haystacks.push(pr.title.to_ascii_lowercase());
@@ -457,17 +464,18 @@ impl DashboardScreen {
                 .fg(colors::INFO)
                 .add_modifier(Modifier::BOLD),
         )];
-        if let Some(prompt) = &self.search_input {
-            spans.extend(prompt.inline_line().spans);
-        } else if self.query.is_empty() {
+        if self.query.is_empty() {
             spans.push(Span::styled(
-                "/ to filter",
+                "type to filter...",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),
             ));
         } else {
-            spans.push(Span::raw(self.query.clone()));
+            spans.push(Span::styled(
+                self.query.clone(),
+                Style::default().fg(colors::EMPHASIS),
+            ));
         }
         Line::from(spans)
     }
@@ -613,14 +621,14 @@ impl DashboardScreen {
 
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
-                "↑↓ Navigate  ↵ Actions  / Search  r Refresh  Esc Clear / Back",
+                "↑↓ Navigate  ↵ Actions  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),
             )));
         } else {
             lines.push(Line::from(Span::styled(
-                "↑↓ Navigate  ↵ Actions  / Search  r Refresh  Esc Clear / Back",
+                "↑↓ Navigate  ↵ Actions  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),
@@ -633,6 +641,13 @@ impl DashboardScreen {
             Span::styled(" = no uncommitted changes  ", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
             Span::styled("Dirty", Style::default().fg(colors::WARNING)),
             Span::styled(" = has uncommitted changes", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Ahead/Behind: ", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
+            Span::styled("+N", Style::default().fg(colors::SUCCESS)),
+            Span::styled(" lines added  ", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
+            Span::styled("-N", Style::default().fg(colors::ERROR)),
+            Span::styled(" lines removed vs upstream/main (falls back to upstream/master, origin/main, origin/master)", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
         ]));
         lines
     }
@@ -760,15 +775,6 @@ impl DashboardScreen {
                         ));
                     }
                 }
-                DashboardColumn::Agent => {
-                    if let Some(agent) = &row.agent {
-                        if !spans.is_empty() {
-                            spans.push(Span::styled("  •  ", muted));
-                        }
-                        spans.push(Span::styled("Agent ", muted));
-                        spans.push(Span::styled(agent.name.clone(), emphasis));
-                    }
-                }
                 DashboardColumn::PullRequest => {}
                 DashboardColumn::Branch
                 | DashboardColumn::Status
@@ -837,7 +843,6 @@ impl DashboardColumn {
             "status" => Some(Self::Status),
             "ahead_behind" => Some(Self::AheadBehind),
             "last_commit" => Some(Self::LastCommit),
-            "agent" => Some(Self::Agent),
             "pull_request" => Some(Self::PullRequest),
             _ => None,
         }
@@ -861,7 +866,6 @@ impl DashboardColumn {
                     "Last Commit"
                 }
             }
-            Self::Agent => "Agent",
             Self::PullRequest => "PR",
         }
     }
@@ -896,13 +900,6 @@ impl DashboardColumn {
                     22
                 }
             }
-            Self::Agent => {
-                if compact {
-                    10
-                } else {
-                    14
-                }
-            }
             Self::PullRequest => {
                 if compact {
                     12
@@ -932,30 +929,29 @@ impl DashboardColumn {
                 };
                 Cell::from(Line::from(Span::styled(text, style)))
             }
-            Self::AheadBehind => {
-                let status = row
-                    .worktree
-                    .branch_status
-                    .as_ref()
-                    .map(|branch_status| {
-                        if branch_status.ahead == 0 && branch_status.behind == 0 {
-                            "=0".to_string()
-                        } else {
-                            format!("+{} -{}", branch_status.ahead, branch_status.behind)
-                        }
-                    })
-                    .unwrap_or_else(|| "-".to_string());
-                let style = match row.worktree.branch_status.as_ref() {
-                    Some(branch_status) if branch_status.behind > 0 => {
-                        Style::default().fg(colors::HIGHLIGHT)
-                    }
-                    Some(branch_status) if branch_status.ahead > 0 => {
-                        Style::default().fg(colors::INFO)
-                    }
-                    _ => Style::default().fg(colors::MUTED),
-                };
-                Cell::from(Line::from(Span::styled(status, style)))
-            }
+            Self::AheadBehind => match row.worktree.branch_status.as_ref() {
+                Some(branch_status) if branch_status.ahead == 0 && branch_status.behind == 0 => {
+                    Cell::from(Line::from(Span::styled(
+                        "=0",
+                        Style::default().fg(colors::MUTED),
+                    )))
+                }
+                Some(branch_status) => Cell::from(Line::from(vec![
+                    Span::styled(
+                        format!("+{}", branch_status.ahead),
+                        Style::default().fg(colors::SUCCESS),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("-{}", branch_status.behind),
+                        Style::default().fg(colors::ERROR),
+                    ),
+                ])),
+                None => Cell::from(Line::from(Span::styled(
+                    "-",
+                    Style::default().fg(colors::MUTED),
+                ))),
+            },
             Self::LastCommit => {
                 let text = row
                     .last_commit
@@ -970,14 +966,6 @@ impl DashboardColumn {
                             )
                         )
                     })
-                    .unwrap_or_else(|| "-".to_string());
-                Cell::from(text)
-            }
-            Self::Agent => {
-                let text = row
-                    .agent
-                    .as_ref()
-                    .map(|agent| agent.name.clone())
                     .unwrap_or_else(|| "-".to_string());
                 Cell::from(text)
             }

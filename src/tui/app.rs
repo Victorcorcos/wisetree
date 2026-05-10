@@ -27,9 +27,9 @@ use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::colors;
 use crate::services::{
-    check_for_updates, default_dashboard_warning, detect_agent_columns, detect_shell_integration,
-    install_shell_integration, AppStateService, DashboardService, DashboardWatch, Shell,
-    ShellIntegrationStatus, UpdateCheckResult,
+    check_for_updates, default_dashboard_warning, detect_shell_integration,
+    install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
+    DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -39,7 +39,6 @@ use crate::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
 };
-use crate::tui::screens::list::{ListAction, ListScreen};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
@@ -58,7 +57,6 @@ enum InitPhase {
 
 enum AppEvent {
     Initialized(Box<InitOutcome>),
-    ListLoaded(Result<Vec<GitWorktree>, String>),
     CreateBranchesLoaded(Result<Vec<GitBranch>, String>),
     CreateFinished(Result<PathBuf, String>),
     DeleteLoaded(Result<Vec<GitWorktree>, String>),
@@ -80,7 +78,6 @@ pub struct App {
     git_root: Option<String>,
     quit_requested: bool,
     menu: Option<MenuScreen>,
-    list: Option<ListScreen>,
     dashboard: Option<DashboardScreen>,
     dashboard_watch: Option<DashboardWatch>,
     create: Option<CreateScreen>,
@@ -108,7 +105,6 @@ impl App {
             git_root: None,
             quit_requested: false,
             menu: None,
-            list: None,
             dashboard: None,
             dashboard_watch: None,
             create: None,
@@ -225,17 +221,6 @@ impl App {
                 }
                 let menu = self.menu.as_mut().expect("menu set above");
                 menu.render(frame, area);
-            }
-            Screen::List => {
-                let h = self
-                    .list
-                    .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
-                if let Some(list) = self.list.as_mut() {
-                    list.tick = self.tick;
-                    list.render(frame, panel);
-                }
             }
             Screen::Dashboard => {
                 let h = self
@@ -378,7 +363,6 @@ impl App {
     fn handle_screen_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match self.screen {
             Screen::Menu => self.handle_menu_key(key, tx),
-            Screen::List => self.handle_list_key(key),
             Screen::Dashboard => self.handle_dashboard_key(key, tx),
             Screen::Create => self.handle_create_key(key, tx),
             Screen::Delete => self.handle_delete_key(key, tx),
@@ -399,7 +383,6 @@ impl App {
                     MenuChoice::Exit => self.quit_requested = true,
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
-                    MenuChoice::List => self.enter_screen(Screen::List, tx),
                     MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
                     MenuChoice::Delete => self.enter_screen(Screen::Delete, tx),
                     MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
@@ -407,28 +390,6 @@ impl App {
             }
             MenuOutcome::Cancelled => self.quit_requested = true,
             MenuOutcome::Pending => {}
-        }
-    }
-
-    fn handle_list_key(&mut self, key: KeyEvent) {
-        let Some(list) = self.list.as_mut() else {
-            return;
-        };
-        match list.handle_key(key) {
-            ListAction::Continue => {}
-            ListAction::Back => self.back_to_menu(),
-            ListAction::NavigateTo(path) => {
-                if self.is_from_wrapper {
-                    self.selected_path = Some(path);
-                }
-                self.quit_requested = true;
-            }
-            ListAction::OpenTerminal(path) => {
-                if let Some(config) = self.current_config() {
-                    let _ = open_terminal(&config.terminal_command, &path);
-                }
-                self.back_to_menu();
-            }
         }
     }
 
@@ -631,14 +592,6 @@ impl App {
     fn handle_app_event(&mut self, event: AppEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match event {
             AppEvent::Initialized(outcome) => self.apply_init_outcome(*outcome, tx),
-            AppEvent::ListLoaded(result) => {
-                if let Some(list) = self.list.as_mut() {
-                    match result {
-                        Ok(worktrees) => list.set_worktrees(worktrees),
-                        Err(message) => list.set_error(message),
-                    }
-                }
-            }
             AppEvent::CreateBranchesLoaded(result) => {
                 if let Some(create) = self.create.as_mut() {
                     match result {
@@ -724,14 +677,6 @@ impl App {
             Screen::Menu => {
                 self.menu = Some(self.build_menu_screen());
             }
-            Screen::List => {
-                let has_terminal_command = self
-                    .current_config()
-                    .map(|cfg| !cfg.terminal_command.trim().is_empty())
-                    .unwrap_or(false);
-                self.list = Some(ListScreen::new(self.is_from_wrapper, has_terminal_command));
-                kick_off_list_load(self.git_root.clone(), tx.clone());
-            }
             Screen::Dashboard => {
                 let Some(git_root) = self.git_root.as_ref().map(PathBuf::from) else {
                     return;
@@ -748,7 +693,7 @@ impl App {
                 let service = DashboardService::new(git_root, config.clone());
                 let gh_warning = default_dashboard_warning(&config, service.gh_available());
                 let (columns, runtime_warnings) =
-                    detect_agent_columns(&config.columns, service.gh_available());
+                    resolve_dashboard_columns(&config.columns, service.gh_available());
                 warnings.extend(runtime_warnings);
                 if let Some(warning) = gh_warning {
                     warnings.push(warning);
@@ -825,7 +770,6 @@ impl App {
 
     fn clear_screen_state(&mut self) {
         self.menu = None;
-        self.list = None;
         self.dashboard = None;
         self.dashboard_watch = None;
         self.create = None;
@@ -1198,17 +1142,6 @@ fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
     });
 }
 
-fn kick_off_list_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEvent>) {
-    tokio::spawn(async move {
-        let service = GitService::new(git_root.map(PathBuf::from));
-        let result = service
-            .list_worktrees()
-            .await
-            .map_err(|e| user_friendly_message(&e));
-        let _ = tx.send(AppEvent::ListLoaded(result));
-    });
-}
-
 fn kick_off_create_branch_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let service = GitService::new(git_root.map(PathBuf::from));
@@ -1448,7 +1381,6 @@ mod tests {
     use super::*;
     use crate::config::schema::WorktreeConfig;
     use crate::config::service::ConfigService;
-    use crate::git::types::GitWorktree;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
     use std::fs;
@@ -1484,33 +1416,6 @@ mod tests {
         }
     }
 
-    fn ready_app(is_from_wrapper: bool) -> App {
-        let mut app = App::new(AppMode::List, is_from_wrapper);
-        app.phase = InitPhase::Ready;
-        app.screen = Screen::List;
-        let mut list = ListScreen::new(is_from_wrapper, false);
-        list.set_worktrees(vec![
-            GitWorktree {
-                path: "/tmp/repo".into(),
-                branch: "main".into(),
-                commit: "deadbeef".into(),
-                is_main: true,
-                is_clean: true,
-                branch_status: None,
-            },
-            GitWorktree {
-                path: "/tmp/repo-feat".into(),
-                branch: "feat".into(),
-                commit: "cafebabe".into(),
-                is_main: false,
-                is_clean: true,
-                branch_status: None,
-            },
-        ]);
-        app.list = Some(list);
-        app
-    }
-
     fn initialized_menu_app() -> App {
         let mut config_service = ConfigService::new();
         let _ = config_service.create_global_config();
@@ -1541,7 +1446,7 @@ mod tests {
 
     #[test]
     fn new_app_remembers_from_wrapper_flag() {
-        let app = App::new(AppMode::List, true);
+        let app = App::new(AppMode::Dashboard, true);
         assert!(app.is_from_wrapper);
         assert!(app.selected_path().is_none());
     }
@@ -1572,7 +1477,6 @@ mod tests {
             let mut app = initialized_menu_app();
             let tx = app_event_tx();
 
-            app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
@@ -1752,37 +1656,6 @@ mod tests {
     }
 
     #[test]
-    fn list_navigate_to_in_wrapper_mode_sets_selected_path_and_quits() {
-        let mut app = ready_app(true);
-        let tx = app_event_tx();
-        // The main worktree is the first row, so two Enters navigate to it.
-        app.handle_key(key(KeyCode::Enter), &tx);
-        app.handle_key(key(KeyCode::Enter), &tx);
-        assert_eq!(app.selected_path(), Some("/tmp/repo"));
-        assert!(app.quit_requested);
-    }
-
-    #[test]
-    fn list_navigate_to_outside_wrapper_does_not_emit_path() {
-        let mut app = ready_app(false);
-        let tx = app_event_tx();
-        app.handle_key(key(KeyCode::Enter), &tx);
-        app.handle_key(key(KeyCode::Enter), &tx);
-        assert!(app.selected_path().is_none());
-        assert!(!app.quit_requested);
-    }
-
-    #[test]
-    fn list_esc_returns_to_menu_with_no_selected_path() {
-        let mut app = ready_app(true);
-        let tx = app_event_tx();
-        app.handle_key(key(KeyCode::Esc), &tx);
-        assert!(app.selected_path().is_none());
-        assert_eq!(app.screen, Screen::Menu);
-        assert!(!app.quit_requested);
-    }
-
-    #[test]
     fn save_terminal_command_writes_to_local_when_local_exists() {
         with_home(|home| {
             let repo_root = home.path().join("repo");
@@ -1950,7 +1823,8 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits_without_emitting_path() {
-        let mut app = ready_app(true);
+        let mut app = App::new(AppMode::Dashboard, true);
+        app.phase = InitPhase::Ready;
         let tx = app_event_tx();
         let ctrl_c = KeyEvent {
             code: KeyCode::Char('c'),

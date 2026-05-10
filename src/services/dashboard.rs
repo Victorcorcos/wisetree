@@ -43,13 +43,6 @@ pub struct PullRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DetectedAgent {
-    pub name: String,
-    #[serde(rename = "matchedFile")]
-    pub matched_file: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashboardRow {
     #[serde(flatten)]
     pub worktree: GitWorktree,
@@ -57,8 +50,6 @@ pub struct DashboardRow {
     pub last_commit: Option<CommitSummary>,
     #[serde(rename = "pullRequest", skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<DetectedAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -278,13 +269,10 @@ impl DashboardService {
             }
         };
 
-        let agent = self.detect_agent(Path::new(&worktree.path)).await;
-
         DashboardRow {
             worktree,
             last_commit,
             pull_request,
-            agent,
             error: (!errors.is_empty()).then(|| errors.join("; ")),
         }
     }
@@ -297,7 +285,7 @@ impl DashboardService {
             COMMAND_TIMEOUT,
             run_command(
                 &self.git_binary,
-                &["status", "--porcelain=v2", "--branch"],
+                &["status", "--porcelain=v2"],
                 Some(cwd),
             ),
         )
@@ -305,42 +293,48 @@ impl DashboardService {
         .map_err(|_| "timed out after 1s".to_string())??;
 
         let mut dirty = false;
-        let mut ahead = 0;
-        let mut behind = 0;
-        let mut upstream_branch = None;
-
         for line in output.lines() {
-            if let Some(upstream) = line.strip_prefix("# branch.upstream ") {
-                upstream_branch = Some(upstream.to_string());
-                continue;
-            }
-            if let Some(ab) = line.strip_prefix("# branch.ab ") {
-                let parts: Vec<&str> = ab.split_whitespace().collect();
-                for part in parts {
-                    if let Some(value) = part.strip_prefix('+') {
-                        ahead = value.parse::<u64>().unwrap_or(0);
-                    } else if let Some(value) = part.strip_prefix('-') {
-                        behind = value.parse::<u64>().unwrap_or(0);
-                    }
-                }
-                continue;
-            }
             if !line.trim().is_empty() && !line.starts_with('#') {
                 dirty = true;
+                break;
             }
         }
 
-        let branch_status = if upstream_branch.is_some() || ahead > 0 || behind > 0 {
-            Some(BranchStatus {
-                ahead,
-                behind,
-                upstream_branch,
-            })
-        } else {
-            None
-        };
-
+        let branch_status = self.fetch_upstream_diff(cwd).await;
         Ok((!dirty, branch_status))
+    }
+
+    /// Compute the line-level diff (insertions/deletions) of HEAD relative to
+    /// the first reachable ref in `upstream/main`, `upstream/master`,
+    /// `origin/main`, `origin/master`. Insertions are stored in `ahead` and
+    /// deletions in `behind` so the renderer can show `+<ins> -<del>`.
+    /// Returns `None` when none of those remote refs are reachable.
+    async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
+        for upstream in [
+            "upstream/main",
+            "upstream/master",
+            "origin/main",
+            "origin/master",
+        ] {
+            let result = time::timeout(
+                COMMAND_TIMEOUT,
+                run_command(
+                    &self.git_binary,
+                    &["diff", "--shortstat", upstream],
+                    Some(cwd),
+                ),
+            )
+            .await
+            .ok()?;
+            let Ok(output) = result else { continue };
+            let (insertions, deletions) = parse_shortstat(&output);
+            return Some(BranchStatus {
+                ahead: insertions,
+                behind: deletions,
+                upstream_branch: Some(upstream.to_string()),
+            });
+        }
+        None
     }
 
     async fn fetch_last_commit(
@@ -440,18 +434,6 @@ impl DashboardService {
         }))
     }
 
-    async fn detect_agent(&self, cwd: &Path) -> Option<DetectedAgent> {
-        for detector in &self.config.agent_detectors {
-            let path = cwd.join(&detector.file);
-            if tokio::fs::metadata(&path).await.is_ok() {
-                return Some(DetectedAgent {
-                    name: detector.name.clone(),
-                    matched_file: path,
-                });
-            }
-        }
-        None
-    }
 }
 
 fn binary_available(binary: &Path) -> bool {
@@ -462,6 +444,29 @@ fn binary_available(binary: &Path) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+/// Parse `git diff --shortstat` output and return `(insertions, deletions)`.
+/// Sample inputs:
+///   ` 28 files changed, 2815 insertions(+), 42 deletions(-)`
+///   ` 1 file changed, 5 insertions(+)`
+///   `` (no diff → both zero)
+fn parse_shortstat(output: &str) -> (u64, u64) {
+    let mut insertions = 0u64;
+    let mut deletions = 0u64;
+    let tokens: Vec<&str> = output.split_whitespace().collect();
+    for window in tokens.windows(2) {
+        let Ok(num) = window[0].parse::<u64>() else {
+            continue;
+        };
+        let label = window[1].trim_end_matches(',');
+        if label.starts_with("insertion") {
+            insertions = num;
+        } else if label.starts_with("deletion") {
+            deletions = num;
+        }
+    }
+    (insertions, deletions)
 }
 
 async fn run_command(
@@ -491,7 +496,10 @@ pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -
     }
 }
 
-pub fn detect_agent_columns(columns: &[String], gh_available: bool) -> (Vec<String>, Vec<String>) {
+pub fn resolve_dashboard_columns(
+    columns: &[String],
+    gh_available: bool,
+) -> (Vec<String>, Vec<String>) {
     let (normalized, warnings) = normalize_dashboard_columns(columns);
     let mut resolved = Vec::new();
 
@@ -508,7 +516,6 @@ pub fn detect_agent_columns(columns: &[String], gh_available: bool) -> (Vec<Stri
             "status".to_string(),
             "ahead_behind".to_string(),
             "last_commit".to_string(),
-            "agent".to_string(),
         ];
     }
 

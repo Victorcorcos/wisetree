@@ -49,8 +49,8 @@ fn from_wrapper_flag_detected() {
 fn mode_flag_sets_mode() {
     let p = parse_args::<Vec<String>>(vec!["--mode".into(), "create".into()]).unwrap();
     assert_eq!(p.mode, AppMode::Create);
-    let p = parse_args::<Vec<String>>(vec!["-m".into(), "list".into()]).unwrap();
-    assert_eq!(p.mode, AppMode::List);
+    let p = parse_args::<Vec<String>>(vec!["-m".into(), "delete".into()]).unwrap();
+    assert_eq!(p.mode, AppMode::Delete);
 }
 
 #[test]
@@ -90,14 +90,6 @@ fn create_with_required_flags_is_non_interactive() {
     assert_eq!(args.command, CliCommand::Create);
     assert_eq!(args.name.as_deref(), Some("feat"));
     assert_eq!(args.source.as_deref(), Some("main"));
-}
-
-#[test]
-fn list_json_flag_triggers_non_interactive() {
-    let p = parse_args::<Vec<String>>(vec!["list".into(), "--json".into()]).unwrap();
-    let args = p.cli_args.expect("must be cli");
-    assert_eq!(args.command, CliCommand::List);
-    assert!(args.json);
 }
 
 #[test]

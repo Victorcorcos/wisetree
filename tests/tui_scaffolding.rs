@@ -13,7 +13,7 @@ use wisetree::tui::screens::{error as error_screen, loading as loading_screen};
 fn screen_from_mode_maps_every_variant() {
     assert_eq!(Screen::from_mode(AppMode::Menu), Screen::Menu);
     assert_eq!(Screen::from_mode(AppMode::Create), Screen::Create);
-    assert_eq!(Screen::from_mode(AppMode::List), Screen::List);
+    assert_eq!(Screen::from_mode(AppMode::Dashboard), Screen::Dashboard);
     assert_eq!(Screen::from_mode(AppMode::Delete), Screen::Delete);
     assert_eq!(Screen::from_mode(AppMode::Settings), Screen::Settings);
 }
@@ -23,7 +23,7 @@ fn screen_as_str_round_trip_for_known_modes() {
     for s in [
         Screen::Menu,
         Screen::Create,
-        Screen::List,
+        Screen::Dashboard,
         Screen::Delete,
         Screen::Settings,
     ] {

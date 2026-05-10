@@ -1,11 +1,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
-use std::path::PathBuf;
 
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::messages::colors;
-use wisetree::services::{CommitSummary, DashboardRow, DetectedAgent, PrState, PullRequest};
+use wisetree::services::{CommitSummary, DashboardRow, PrState, PullRequest};
 use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -74,7 +73,6 @@ fn row(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
             author: "Test".into(),
         }),
         pull_request: None,
-        agent: None,
         error: None,
     }
 }
@@ -85,11 +83,7 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
         number: 42,
         state: PrState::Open,
         url: "https://github.com/example/repo/pull/42".into(),
-        title: "Improve dashboard footer details for live agent workflows".into(),
-    });
-    row.agent = Some(DetectedAgent {
-        name: "Claude Code".into(),
-        matched_file: PathBuf::from("/tmp/repo-bug/.claude"),
+        title: "Improve dashboard footer details for live workflows".into(),
     });
     row
 }
@@ -144,11 +138,10 @@ fn table_renders_configured_columns_in_order() {
 #[test]
 fn search_filter_narrows_then_escape_clears_before_back() {
     let mut screen = ready_screen(true);
-    screen.handle_key(key(KeyCode::Char('/')));
+    // Always-on search: typing characters directly filters the list.
     screen.handle_key(key(KeyCode::Char('b')));
     screen.handle_key(key(KeyCode::Char('u')));
     screen.handle_key(key(KeyCode::Char('g')));
-    screen.handle_key(key(KeyCode::Enter));
 
     let filtered = dump(120, 12, |f| screen.render(f, f.area()));
     assert!(filtered.contains("repo-bug"));
@@ -161,6 +154,66 @@ fn search_filter_narrows_then_escape_clears_before_back() {
     let cleared = dump(120, 12, |f| screen.render(f, f.area()));
     assert!(cleared.contains("repo-feat"));
     assert_eq!(screen.handle_key(key(KeyCode::Esc)), DashboardAction::Back);
+}
+
+#[test]
+fn search_matches_status_text() {
+    let mut screen = ready_screen(true);
+    for c in "dirty".chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+    let filtered = dump(120, 12, |f| screen.render(f, f.area()));
+    // Only repo-bug is dirty in ready_screen.
+    assert!(filtered.contains("repo-bug"));
+    assert!(!filtered.contains("repo-feat"));
+}
+
+#[test]
+fn search_matches_ahead_behind_text() {
+    let mut screen = ready_screen(true);
+    // Only the "bug" branch is +1 ahead per the row() helper.
+    for c in "+1".chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+    let filtered = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(filtered.contains("repo-bug"));
+    assert!(!filtered.contains("repo-feat"));
+}
+
+#[test]
+fn backspace_removes_last_character_from_query() {
+    let mut screen = ready_screen(true);
+    // Type "bugxyz" — matches nothing.
+    for c in "bugxyz".chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+    let empty = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(empty.contains("No worktrees match"));
+
+    // Backspace 3 times → query becomes "bug" → narrows to repo-bug only.
+    screen.handle_key(key(KeyCode::Backspace));
+    screen.handle_key(key(KeyCode::Backspace));
+    screen.handle_key(key(KeyCode::Backspace));
+    let narrowed = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(narrowed.contains("repo-bug"));
+    assert!(!narrowed.contains("repo-feat"));
+}
+
+#[test]
+fn ctrl_r_emits_refresh_action() {
+    let mut screen = ready_screen(true);
+    let ctrl_r = KeyEvent {
+        code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::CONTROL,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    };
+    assert_eq!(screen.handle_key(ctrl_r), DashboardAction::Refresh);
+    // Plain 'r' should now be added to the search query, not refresh.
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Char('r'))),
+        DashboardAction::Continue
+    );
 }
 
 #[test]
@@ -237,7 +290,7 @@ fn overflow_rows_show_more_above_and_below_indicators() {
         screen.handle_key(key(KeyCode::Down));
     }
 
-    let dumped = dump(120, 18, |f| screen.render(f, f.area()));
+    let dumped = dump(120, 20, |f| screen.render(f, f.area()));
     assert!(dumped.contains("more above"));
     assert!(dumped.contains("more below") || dumped.contains("bottom"));
 }
@@ -299,7 +352,6 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
             "status".into(),
             "ahead_behind".into(),
             "last_commit".into(),
-            "agent".into(),
             "pull_request".into(),
         ],
         Vec::new(),

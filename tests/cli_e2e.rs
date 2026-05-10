@@ -126,24 +126,6 @@ fn create_unknown_source_branch_errors() {
 }
 
 #[test]
-fn list_json_outputs_array() {
-    let fx = repo_with_commit();
-    let home = isolated_home();
-    let output = Command::cargo_bin("wisetree")
-        .unwrap()
-        .args(["list", "--json"])
-        .current_dir(&fx.repo)
-        .env("HOME", home.path())
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let parsed: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
-    assert!(parsed.is_array(), "expected JSON array, got {parsed:?}");
-}
-
-#[test]
 fn dashboard_json_outputs_array_with_expected_length() {
     let fx = repo_with_commit();
     let home = isolated_home();

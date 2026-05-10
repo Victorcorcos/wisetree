@@ -207,10 +207,6 @@ fn dashboard_config_round_trips_json() {
             refresh_interval_ms: 5_000,
             show_pull_requests: true,
             columns: vec!["status".into(), "branch".into(), "pull_request".into()],
-            agent_detectors: vec![wisetree::config::schema::AgentDetector {
-                name: "Claude Code".into(),
-                file: ".claude".into(),
-            }],
         },
         ..WorktreeConfig::default()
     };

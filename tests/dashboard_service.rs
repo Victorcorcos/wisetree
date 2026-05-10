@@ -18,7 +18,6 @@ fn git(cwd: &Path, args: &[&str]) {
 struct Fixture {
     _parent: TempDir,
     repo: PathBuf,
-    worktree: PathBuf,
 }
 
 fn repo_with_worktree() -> Fixture {
@@ -46,7 +45,6 @@ fn repo_with_worktree() -> Fixture {
     Fixture {
         _parent: parent,
         repo,
-        worktree,
     }
 }
 
@@ -72,22 +70,6 @@ async fn snapshot_returns_one_row_per_worktree() {
     assert!(rows
         .iter()
         .any(|row| row.worktree.branch == "feat-dashboard"));
-}
-
-#[tokio::test]
-async fn snapshot_detects_agent_files() {
-    let fixture = repo_with_worktree();
-    fs::create_dir_all(fixture.worktree.join(".claude")).unwrap();
-
-    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default());
-    let rows = service.snapshot().await.expect("snapshot");
-
-    let feature_row = rows
-        .iter()
-        .find(|row| row.worktree.branch == "feat-dashboard")
-        .expect("feature row");
-    let agent = feature_row.agent.as_ref().expect("detected agent");
-    assert_eq!(agent.name, "Claude Code");
 }
 
 #[tokio::test]

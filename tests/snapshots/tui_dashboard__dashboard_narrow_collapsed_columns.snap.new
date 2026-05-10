@@ -15,7 +15,7 @@ Worktree             Branch        Status   A/B         Commit
 
 
 
-
 Narrow view: 1 hidden  •  PR #42 Open: Improve dashboard...
 ↑↓ Navigate  ↵ Actions  Type to Search  Ctrl+R Refresh  Esc Clear / Back
 Status: Clean = no uncommitted changes  Dirty = has uncommitted changes
+Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls b

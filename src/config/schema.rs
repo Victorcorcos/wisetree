@@ -38,28 +38,6 @@ pub fn default_columns() -> Vec<String> {
         "status".to_string(),
         "ahead_behind".to_string(),
         "last_commit".to_string(),
-        "agent".to_string(),
-    ]
-}
-
-pub fn default_agent_detectors() -> Vec<AgentDetector> {
-    vec![
-        AgentDetector {
-            name: "Claude Code".to_string(),
-            file: ".claude".to_string(),
-        },
-        AgentDetector {
-            name: "Codex".to_string(),
-            file: ".codex".to_string(),
-        },
-        AgentDetector {
-            name: "Aider".to_string(),
-            file: ".aider.conf.yml".to_string(),
-        },
-        AgentDetector {
-            name: "Cursor".to_string(),
-            file: ".cursor".to_string(),
-        },
     ]
 }
 
@@ -75,7 +53,7 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
         let normalized = column.trim().to_ascii_lowercase();
         let known = matches!(
             normalized.as_str(),
-            "branch" | "status" | "ahead_behind" | "last_commit" | "agent" | "pull_request"
+            "branch" | "status" | "ahead_behind" | "last_commit" | "pull_request"
         );
 
         if !known {
@@ -96,13 +74,6 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct AgentDetector {
-    pub name: String,
-    pub file: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct DashboardConfig {
     #[serde(rename = "refreshIntervalMs", default = "default_refresh_ms")]
     pub refresh_interval_ms: u64,
@@ -112,9 +83,6 @@ pub struct DashboardConfig {
 
     #[serde(rename = "columns", default = "default_columns")]
     pub columns: Vec<String>,
-
-    #[serde(rename = "agentDetectors", default = "default_agent_detectors")]
-    pub agent_detectors: Vec<AgentDetector>,
 }
 
 impl Default for DashboardConfig {
@@ -123,7 +91,6 @@ impl Default for DashboardConfig {
             refresh_interval_ms: default_refresh_ms(),
             show_pull_requests: false,
             columns: default_columns(),
-            agent_detectors: default_agent_detectors(),
         }
     }
 }

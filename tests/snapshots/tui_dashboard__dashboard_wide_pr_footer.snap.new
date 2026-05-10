@@ -13,7 +13,7 @@ Worktree              Branch              Status      Ahead/Behind  Last Commit 
 
 
 
-
 PR #42 Open: Improve dashboard footer details for live workflows
 ↑↓ Navigate  ↵ Actions  Type to Search  Ctrl+R Refresh  Esc Clear / Back
 Status: Clean = no uncommitted changes  Dirty = has uncommitted changes
+Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls back to upstream/master, origin/main, o

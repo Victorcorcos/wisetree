@@ -1243,7 +1243,7 @@ impl SettingsScreen {
     }
 
     fn render_dashboard(&self, frame: &mut Frame, area: Rect) {
-        let mut items = vec![
+        let items = vec![
             format!(
                 "refreshIntervalMs: {}",
                 self.config.dashboard.refresh_interval_ms
@@ -1254,13 +1254,6 @@ impl SettingsScreen {
             ),
             format!("columns: {}", self.config.dashboard.columns.join(", ")),
         ];
-        items.extend(
-            self.config
-                .dashboard
-                .agent_detectors
-                .iter()
-                .map(|detector| format!("agent detector: {} => {}", detector.name, detector.file)),
-        );
 
         self.render_field(
             frame,
