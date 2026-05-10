@@ -144,6 +144,38 @@ fn list_json_outputs_array() {
 }
 
 #[test]
+fn dashboard_json_outputs_array_with_expected_length() {
+    let fx = repo_with_commit();
+    let home = isolated_home();
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat-dashboard",
+            "../repo-dashboard",
+            "main",
+        ],
+    );
+
+    let output = Command::cargo_bin("wisetree")
+        .unwrap()
+        .args(["dashboard", "--json"])
+        .current_dir(&fx.repo)
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
+    let rows = parsed.as_array().expect("dashboard array");
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
 fn delete_missing_args_errors() {
     let fx = repo_with_commit();
     let home = isolated_home();

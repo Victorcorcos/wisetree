@@ -1,0 +1,18 @@
+---
+source: tests/tui_dashboard.rs
+expression: "dump_lines(110, 14, |f| screen.render(f, f.area()))"
+---
+Refreshed just now - 2 worktrees, 1 dirty, 1 PR open
+Worktree              Branch              Status      Ahead/Behind  Last Commit             PR
+/tmp/repo             main                Clean       =0            deadbee work on main    -
+/tmp/repo-bug         bug                 Dirty       +1 -0         deadbee work on bug     #42 Open
+
+
+
+
+
+
+
+
+PR #42 Open: Improve dashboard footer details for live agent wor...
+↑↓ Navigate  ↵ Actions  / Search  r Refresh  Esc Clear / Back

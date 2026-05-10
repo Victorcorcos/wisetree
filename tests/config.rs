@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use tempfile::TempDir;
 use wisetree::config::schema::{
-    default_copy_ignores, default_copy_patterns, default_path_template,
+    clamp_dashboard_refresh_interval, default_copy_ignores, default_copy_patterns,
+    default_path_template,
 };
 use wisetree::config::{ConfigService, WorktreeConfig};
 
@@ -197,4 +198,77 @@ fn unknown_field_rejected() {
     let raw = r#"{"unknownField": 1}"#;
     let parsed: Result<WorktreeConfig, _> = serde_json::from_str(raw);
     assert!(parsed.is_err(), "deny_unknown_fields should reject");
+}
+
+#[test]
+fn dashboard_config_round_trips_json() {
+    let cfg = WorktreeConfig {
+        dashboard: wisetree::config::schema::DashboardConfig {
+            refresh_interval_ms: 5_000,
+            show_pull_requests: true,
+            columns: vec!["status".into(), "branch".into(), "pull_request".into()],
+            agent_detectors: vec![wisetree::config::schema::AgentDetector {
+                name: "Claude Code".into(),
+                file: ".claude".into(),
+            }],
+        },
+        ..WorktreeConfig::default()
+    };
+
+    let raw = serde_json::to_string(&cfg).unwrap();
+    let parsed: WorktreeConfig = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed.dashboard, cfg.dashboard);
+}
+
+#[test]
+fn dashboard_refresh_interval_is_clamped_on_load() {
+    with_home(|home| {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let raw = r#"{
+  "dashboard": {
+    "refreshIntervalMs": 10
+  }
+}"#;
+        fs::write(project.path().join(".wisetree.json"), raw).unwrap();
+
+        let mut svc = ConfigService::new();
+        let loaded = svc.load(Some(project.path())).expect("load");
+        assert_eq!(loaded.dashboard.refresh_interval_ms, 500);
+
+        let global_dir = home.path().join(".wisetree");
+        fs::create_dir_all(&global_dir).unwrap();
+    });
+    assert_eq!(clamp_dashboard_refresh_interval(100_000), 60_000);
+}
+
+#[test]
+fn dashboard_unknown_field_is_rejected() {
+    let raw = r#"{
+  "dashboard": {
+    "bogus": true
+  }
+}"#;
+    let parsed: Result<WorktreeConfig, _> = serde_json::from_str(raw);
+    assert!(parsed.is_err(), "unknown dashboard key should be rejected");
+}
+
+#[test]
+fn invalid_dashboard_columns_are_dropped_at_load_with_warning() {
+    with_home(|_home| {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let raw = r#"{
+  "dashboard": {
+    "columns": ["branch", "bogus", "status"]
+  }
+}"#;
+        fs::write(project.path().join(".wisetree.json"), raw).unwrap();
+
+        let mut svc = ConfigService::new();
+        let loaded = svc.load(Some(project.path())).expect("load");
+        assert_eq!(loaded.dashboard.columns, vec!["branch", "status"]);
+        assert!(svc
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("Unknown dashboard column 'bogus'")));
+    });
 }

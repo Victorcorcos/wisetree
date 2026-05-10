@@ -6,7 +6,7 @@
 
 <img width="1080" height="273" alt="wisetree" src="https://github.com/user-attachments/assets/26deda30-73c5-4a2f-b713-324f1663471a" />
 
-**Wisetree** is an interactive, terminal-first manager for `git worktree`s. It wraps the raw `git worktree` plumbing in a polished TUI (built with Rust + Ratatui) and a scriptable CLI, so creating, listing, navigating, and deleting worktrees becomes a single keystroke instead of a paragraph of commands.
+**Wisetree** is an interactive, terminal-first manager for `git worktree`s. It wraps the raw `git worktree` plumbing in a polished TUI (built with Rust + Ratatui) and a scriptable CLI, so creating, surveying, navigating, and deleting worktrees becomes a single keystroke instead of a paragraph of commands.
 
 It is purpose-built for developers who run **multiple AI coding agents in parallel**, including `Claude Code`, `Codex CLI`, `Gemini CLI`, `Opencode`, `Cursor`, `Aider`, and friends, each on its own branch, each in its own isolated checkout, all stacked on top of the same repository.
 
@@ -151,6 +151,7 @@ You land on the main menu, where the available actions are:
 | **Setup Shell Integration** | One-time installer for the shell wrapper + completions (only shown when integration is not yet installed). |
 | **Create new worktree** | Guided flow: pick a source branch, name the directory, optionally name a new branch, confirm. Copy patterns, post-create commands, and terminal launch run automatically afterwards. |
 | **List worktrees** | Live list of every worktree attached to the current repository, with the main checkout and any dirty trees called out. |
+| **Dashboard** | Live table of all worktrees with refreshable dirty/clean state, ahead/behind, last commit, optional PR state, agent detection, and row actions like copy path, open editor, and jump to delete. |
 | **Delete worktree** | Pick a worktree, confirm, and it is gone. Optionally deletes the matching branch (`deleteBranchWithWorktree`). Falls back to manual cleanup for corrupted worktrees. |
 | **Settings** | Inspect and edit the active configuration (project-local or global), reset to defaults, and toggle integration. |
 | **Exit** | Close the TUI without changing anything. |
@@ -185,7 +186,18 @@ A complete configuration example:
     "bin/rails db:prepare"
   ],
   "terminalCommand": "code $WORKTREE_PATH",
-  "deleteBranchWithWorktree": true
+  "deleteBranchWithWorktree": true,
+  "dashboard": {
+    "refreshIntervalMs": 3000,
+    "showPullRequests": false,
+    "columns": ["branch", "status", "ahead_behind", "last_commit", "agent"],
+    "agentDetectors": [
+      { "name": "Claude Code", "file": ".claude" },
+      { "name": "Codex", "file": ".codex" },
+      { "name": "Aider", "file": ".aider.conf.yml" },
+      { "name": "Cursor", "file": ".cursor" }
+    ]
+  }
 }
 ```
 
@@ -199,6 +211,16 @@ The variables `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, and `$SOURCE_BRANC
 | `postCreateCmd` | `string[]` | `[]` | Ordered list of shell commands executed inside the new worktree, with live progress in the TUI. |
 | `terminalCommand` | `string` | `""` | Optional command spawned right after creation (e.g. `code $WORKTREE_PATH`) to open an editor or terminal. |
 | `deleteBranchWithWorktree` | `boolean` | `false` | When `true`, deleting a worktree also deletes its associated branch. |
+| `dashboard` | `object` | see below | Live dashboard polling, visible columns, PR enrichment, and agent detection settings. |
+
+Dashboard sub-fields:
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `dashboard.refreshIntervalMs` | `number` | `3000` | Poll interval in milliseconds, clamped to `500..60000` when loaded. |
+| `dashboard.showPullRequests` | `boolean` | `false` | Enables `gh pr list` enrichment when the GitHub CLI is installed. |
+| `dashboard.columns` | `string[]` | `["branch", "status", "ahead_behind", "last_commit", "agent"]` | Column order for the live dashboard table. |
+| `dashboard.agentDetectors` | `{ name: string, file: string }[]` | Claude Code / Codex / Aider / Cursor defaults | Tags rows when the configured marker file or directory exists inside a worktree. |
 
 # 📟 Wisetree CLI
 
@@ -217,6 +239,7 @@ wisetree [command] [options]
 | `(no command)` | Open the interactive main menu. |
 | `create` | Create a new worktree (interactive unless flags are supplied). |
 | `list` | List all worktrees attached to the current repository. |
+| `dashboard` | Open the live dashboard, print one JSON snapshot, or stream JSON Lines. |
 | `delete` | Delete an existing worktree (interactive unless flags are supplied). |
 | `settings` | Open the settings screen to inspect and edit configuration. |
 
@@ -226,7 +249,7 @@ wisetree [command] [options]
 | --- | --- | --- |
 | `--help` | `-h` | Show the built-in help screen. |
 | `--version` | `-v` | Print the installed version. |
-| `--mode <mode>` | `-m` | Land directly on a specific screen (`menu`, `create`, `list`, `delete`, `settings`). |
+| `--mode <mode>` | `-m` | Land directly on a specific screen (`menu`, `create`, `list`, `dashboard`, `delete`, `settings`). |
 | `--from-wrapper` | `None` | Used internally by the shell wrapper so `wisetree` can print the selected path on stdout for the parent shell to `cd` into. |
 
 ### Non-interactive options
@@ -238,7 +261,8 @@ wisetree [command] [options]
 | `--branch <branch>` | `-b` | `create` | New branch name; defaults to the directory name. |
 | `--path <path>` | `-p` | `delete` | Worktree path (alternative to `--name`). |
 | `--force` | `-f` | `delete` | Force-delete even when the worktree has uncommitted changes. |
-| `--json` | `None` | `list` | Emit the worktree list as JSON, suitable for piping into `jq`. |
+| `--json` | `None` | `list`, `dashboard` | Emit JSON suitable for piping into `jq`. |
+| `--watch` | `-w` | `dashboard` | Stream dashboard snapshots as JSON Lines until `Ctrl+C`. |
 
 ### Interactive examples
 
@@ -246,6 +270,7 @@ wisetree [command] [options]
 wisetree                # Open the main menu
 wisetree create         # Jump straight into the create flow
 wisetree list           # Browse worktrees interactively
+wisetree dashboard      # Open the live dashboard
 wisetree delete         # Jump straight into the delete flow
 wisetree settings       # Open the settings screen
 ```
@@ -256,6 +281,8 @@ wisetree settings       # Open the settings screen
 wisetree create -n my-feature -s main                  # Create a worktree off main
 wisetree create -n my-feature -s main -b feat/payments # Create with an explicit new branch
 wisetree list --json                                   # Emit JSON for scripting
+wisetree dashboard --json                              # Print one dashboard snapshot as JSON
+wisetree dashboard --watch                             # Stream dashboard snapshots as JSON Lines
 wisetree delete -n my-feature                          # Delete by directory name
 wisetree delete -p /path/to/worktree -f                # Force-delete by full path
 ```

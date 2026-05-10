@@ -1,0 +1,318 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+use std::path::PathBuf;
+
+use wisetree::git::types::{BranchStatus, GitWorktree};
+use wisetree::messages::colors;
+use wisetree::services::{CommitSummary, DashboardRow, DetectedAgent, PrState, PullRequest};
+use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
+}
+
+fn dump<F>(width: u16, height: u16, draw: F) -> String
+where
+    F: FnOnce(&mut ratatui::Frame),
+{
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(draw).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect()
+}
+
+fn dump_lines<F>(width: u16, height: u16, draw: F) -> String
+where
+    F: FnOnce(&mut ratatui::Frame),
+{
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(draw).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end_matches(' ')
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn row(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
+    DashboardRow {
+        worktree: GitWorktree {
+            path: path.into(),
+            branch: branch.into(),
+            commit: "deadbeef".into(),
+            is_main: branch == "main",
+            is_clean,
+            branch_status: Some(BranchStatus {
+                ahead: if branch == "bug" { 1 } else { 0 },
+                behind: 0,
+                upstream_branch: Some("origin/main".into()),
+            }),
+        },
+        last_commit: Some(CommitSummary {
+            sha: "deadbee".into(),
+            summary: format!("work on {branch}"),
+            relative_time: "2 minutes ago".into(),
+            author: "Test".into(),
+        }),
+        pull_request: None,
+        agent: None,
+        error: None,
+    }
+}
+
+fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
+    let mut row = row(path, branch, is_clean);
+    row.pull_request = Some(PullRequest {
+        number: 42,
+        state: PrState::Open,
+        url: "https://github.com/example/repo/pull/42".into(),
+        title: "Improve dashboard footer details for live agent workflows".into(),
+    });
+    row.agent = Some(DetectedAgent {
+        name: "Claude Code".into(),
+        matched_file: PathBuf::from("/tmp/repo-bug/.claude"),
+    });
+    row
+}
+
+fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
+    let mut screen = DashboardScreen::new(
+        is_from_wrapper,
+        true,
+        true,
+        vec![
+            "branch".into(),
+            "status".into(),
+            "ahead_behind".into(),
+            "last_commit".into(),
+        ],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", false),
+        row("/tmp/repo-feat", "feat", true),
+    ]);
+    screen
+}
+
+#[test]
+fn loading_render_shows_loading_message() {
+    let screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new());
+    let dumped = dump(80, 8, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Loading dashboard"));
+}
+
+#[test]
+fn empty_state_renders_no_worktrees_found() {
+    let mut screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new());
+    screen.set_rows(vec![]);
+    let dumped = dump(80, 8, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("No worktrees found"));
+}
+
+#[test]
+fn table_renders_configured_columns_in_order() {
+    let screen = ready_screen(true);
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    let branch = dumped.find("Branch").unwrap();
+    let status = dumped.find("Status").unwrap();
+    let ahead = dumped.find("Ahead/Behind").unwrap();
+    let last_commit = dumped.find("Last Commit").unwrap();
+    assert!(branch < status && status < ahead && ahead < last_commit);
+}
+
+#[test]
+fn search_filter_narrows_then_escape_clears_before_back() {
+    let mut screen = ready_screen(true);
+    screen.handle_key(key(KeyCode::Char('/')));
+    screen.handle_key(key(KeyCode::Char('b')));
+    screen.handle_key(key(KeyCode::Char('u')));
+    screen.handle_key(key(KeyCode::Char('g')));
+    screen.handle_key(key(KeyCode::Enter));
+
+    let filtered = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(filtered.contains("repo-bug"));
+    assert!(!filtered.contains("repo-feat"));
+
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Esc)),
+        DashboardAction::Continue
+    );
+    let cleared = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(cleared.contains("repo-feat"));
+    assert_eq!(screen.handle_key(key(KeyCode::Esc)), DashboardAction::Back);
+}
+
+#[test]
+fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
+    let mut wrapper = ready_screen(true);
+    wrapper.handle_key(key(KeyCode::Enter));
+    let dumped = dump(100, 12, |f| wrapper.render(f, f.area()));
+    assert!(dumped.contains("Navigate to Directory"));
+    assert!(dumped.contains("Copy path to clipboard"));
+
+    let mut plain = DashboardScreen::new(
+        false,
+        true,
+        false,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    plain.set_rows(vec![row("/tmp/repo", "main", true)]);
+    plain.handle_key(key(KeyCode::Enter));
+    let dumped = dump(100, 12, |f| plain.render(f, f.area()));
+    assert!(!dumped.contains("Navigate to Directory"));
+    assert!(!dumped.contains("Copy path to clipboard"));
+}
+
+#[test]
+fn jump_to_delete_action_is_emitted_for_selected_row() {
+    let mut screen = ready_screen(false);
+    screen.handle_key(key(KeyCode::Enter));
+    screen.handle_key(key(KeyCode::Down));
+    let action = screen.handle_key(key(KeyCode::Down));
+    assert_eq!(action, DashboardAction::Continue);
+    match screen.handle_key(key(KeyCode::Enter)) {
+        DashboardAction::JumpToDelete(path) => assert_eq!(path, "/tmp/repo"),
+        other => panic!("expected JumpToDelete, got {other:?}"),
+    }
+}
+
+#[test]
+fn dirty_row_uses_warning_palette() {
+    let screen = ready_screen(true);
+    let backend = TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let dirty_cell = buffer
+        .content
+        .iter()
+        .find(|cell| cell.symbol() == "D" && cell.fg == colors::WARNING)
+        .expect("dirty cell with warning color");
+    assert_eq!(dirty_cell.fg, colors::WARNING);
+}
+
+#[test]
+fn overflow_rows_show_more_above_and_below_indicators() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    let rows: Vec<DashboardRow> = (0..12)
+        .map(|index| {
+            row(
+                &format!("/tmp/repo-{index}"),
+                &format!("feat-{index}"),
+                true,
+            )
+        })
+        .collect();
+    screen.set_rows(rows);
+    for _ in 0..11 {
+        screen.handle_key(key(KeyCode::Down));
+    }
+
+    let dumped = dump(120, 18, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("more above"));
+    assert!(dumped.contains("more below") || dumped.contains("bottom"));
+}
+
+#[test]
+fn selected_row_warning_is_rendered_in_footer() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    let mut broken = row("/tmp/repo-bug", "bug", false);
+    broken.error = Some("status timed out".into());
+    screen.set_rows(vec![row("/tmp/repo", "main", true), broken]);
+    screen.handle_key(key(KeyCode::Down));
+
+    let dumped = dump(120, 14, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Selected row warning"));
+    assert!(dumped.contains("status timed out"));
+}
+
+#[test]
+fn wide_render_snapshot_includes_pr_footer_detail() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec![
+            "branch".into(),
+            "status".into(),
+            "ahead_behind".into(),
+            "last_commit".into(),
+            "pull_request".into(),
+        ],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr("/tmp/repo-bug", "bug", false),
+    ]);
+    screen.handle_key(key(KeyCode::Down));
+
+    insta::assert_snapshot!(
+        "dashboard_wide_pr_footer",
+        dump_lines(110, 14, |f| screen.render(f, f.area()))
+    );
+}
+
+#[test]
+fn narrow_render_snapshot_collapses_trailing_columns() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec![
+            "branch".into(),
+            "status".into(),
+            "ahead_behind".into(),
+            "last_commit".into(),
+            "agent".into(),
+            "pull_request".into(),
+        ],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr("/tmp/repo-bug", "bug", false),
+        row("/tmp/repo-feat", "feat", true),
+    ]);
+    screen.handle_key(key(KeyCode::Down));
+
+    insta::assert_snapshot!(
+        "dashboard_narrow_collapsed_columns",
+        dump_lines(72, 16, |f| screen.render(f, f.area()))
+    );
+}

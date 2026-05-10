@@ -11,6 +11,7 @@ pub const MENU_TITLE: &str = "Choose wisely...";
 pub const MENU_SETUP: &str = "Setup Shell Integration";
 pub const MENU_CREATE: &str = "Create new worktree";
 pub const MENU_LIST: &str = "List worktrees";
+pub const MENU_DASHBOARD: &str = "Dashboard";
 pub const MENU_DELETE: &str = "Delete worktree";
 pub const MENU_SETTINGS: &str = "Settings";
 pub const MENU_EXIT: &str = "Exit";

@@ -115,6 +115,19 @@ impl DeleteScreen {
         self.select = Some(self.build_select());
     }
 
+    pub fn preselect_path(&mut self, path: &str) {
+        let Some(select) = self.select.as_mut() else {
+            return;
+        };
+        if let Some(index) = self
+            .worktrees
+            .iter()
+            .position(|worktree| worktree.path == path)
+        {
+            select.selected = index;
+        }
+    }
+
     pub fn set_error(&mut self, message: String) {
         self.error = Some(message);
         self.loading = false;

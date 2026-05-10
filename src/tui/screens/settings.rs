@@ -35,6 +35,7 @@ pub enum SettingsStep {
     CopyPatterns,
     IgnorePatterns,
     PathTemplate,
+    Dashboard,
     PostCmd,
     TerminalCmd,
     DeleteBranch,
@@ -522,6 +523,11 @@ impl SettingsScreen {
                 .with_description("Sync global and local config"),
             SelectOption::new(UPDATE_CHECK_MENU, SettingsStep::CheckUpdates)
                 .with_description("Check npm for latest version"),
+            SelectOption::new("Dashboard", SettingsStep::Dashboard).with_description(format!(
+                "{}ms refresh, {} columns",
+                self.config.dashboard.refresh_interval_ms,
+                self.config.dashboard.columns.len()
+            )),
         ];
         SelectPrompt::new("Select setting to view:", opts)
     }
@@ -1078,11 +1084,14 @@ impl SettingsScreen {
             return 6;
         }
         match self.step {
-            // Settings menu select prompt: ~7 entries + label + spacer + hint.
-            SettingsStep::Menu => 14,
+            // Settings menu select prompt: config path line + title/search body
+            // + all visible entries + hint.
+            SettingsStep::Menu => 16,
             SettingsStep::CheckUpdates => 6,
             // Detail panes: header + value lines + hint.
-            SettingsStep::CopyPatterns | SettingsStep::IgnorePatterns => 12,
+            SettingsStep::CopyPatterns | SettingsStep::IgnorePatterns | SettingsStep::Dashboard => {
+                12
+            }
             SettingsStep::PathTemplate => self.path_template_preferred_height(),
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
             SettingsStep::PostCmd => self.post_cmd_preferred_height(),
@@ -1124,6 +1133,7 @@ impl SettingsScreen {
             SettingsStep::CopyPatterns => self.render_copy_patterns(frame, area),
             SettingsStep::IgnorePatterns => self.render_ignore_patterns(frame, area),
             SettingsStep::PathTemplate => self.render_path_template(frame, area),
+            SettingsStep::Dashboard => self.render_dashboard(frame, area),
             SettingsStep::PostCmd => self.render_post_cmd(frame, area),
             SettingsStep::TerminalCmd => self.render_terminal_cmd(frame, area),
             SettingsStep::DeleteBranch => self.render_delete_branch(frame, area),
@@ -1229,6 +1239,35 @@ impl SettingsScreen {
             "Ignore Patterns",
             "Files/patterns excluded from copying:",
             self.config.worktree_copy_ignores.clone(),
+        );
+    }
+
+    fn render_dashboard(&self, frame: &mut Frame, area: Rect) {
+        let mut items = vec![
+            format!(
+                "refreshIntervalMs: {}",
+                self.config.dashboard.refresh_interval_ms
+            ),
+            format!(
+                "showPullRequests: {}",
+                self.config.dashboard.show_pull_requests
+            ),
+            format!("columns: {}", self.config.dashboard.columns.join(", ")),
+        ];
+        items.extend(
+            self.config
+                .dashboard
+                .agent_detectors
+                .iter()
+                .map(|detector| format!("agent detector: {} => {}", detector.name, detector.file)),
+        );
+
+        self.render_field(
+            frame,
+            area,
+            "Dashboard",
+            "Live dashboard settings resolved from the active config:",
+            items,
         );
     }
 

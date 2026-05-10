@@ -28,6 +28,118 @@ pub fn default_path_template() -> String {
     "$BASE_PATH.worktree".to_string()
 }
 
+pub fn default_refresh_ms() -> u64 {
+    3_000
+}
+
+pub fn default_columns() -> Vec<String> {
+    vec![
+        "branch".to_string(),
+        "status".to_string(),
+        "ahead_behind".to_string(),
+        "last_commit".to_string(),
+        "agent".to_string(),
+    ]
+}
+
+pub fn default_agent_detectors() -> Vec<AgentDetector> {
+    vec![
+        AgentDetector {
+            name: "Claude Code".to_string(),
+            file: ".claude".to_string(),
+        },
+        AgentDetector {
+            name: "Codex".to_string(),
+            file: ".codex".to_string(),
+        },
+        AgentDetector {
+            name: "Aider".to_string(),
+            file: ".aider.conf.yml".to_string(),
+        },
+        AgentDetector {
+            name: "Cursor".to_string(),
+            file: ".cursor".to_string(),
+        },
+    ]
+}
+
+pub fn clamp_dashboard_refresh_interval(value: u64) -> u64 {
+    value.clamp(500, 60_000)
+}
+
+pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut warnings = Vec::new();
+
+    for column in columns {
+        let normalized = column.trim().to_ascii_lowercase();
+        let known = matches!(
+            normalized.as_str(),
+            "branch" | "status" | "ahead_behind" | "last_commit" | "agent" | "pull_request"
+        );
+
+        if !known {
+            warnings.push(format!("Unknown dashboard column '{column}' ignored."));
+            continue;
+        }
+
+        resolved.push(normalized);
+    }
+
+    if resolved.is_empty() {
+        warnings.push("No valid dashboard columns configured; using defaults.".to_string());
+        resolved = default_columns();
+    }
+
+    (resolved, warnings)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDetector {
+    pub name: String,
+    pub file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardConfig {
+    #[serde(rename = "refreshIntervalMs", default = "default_refresh_ms")]
+    pub refresh_interval_ms: u64,
+
+    #[serde(rename = "showPullRequests", default)]
+    pub show_pull_requests: bool,
+
+    #[serde(rename = "columns", default = "default_columns")]
+    pub columns: Vec<String>,
+
+    #[serde(rename = "agentDetectors", default = "default_agent_detectors")]
+    pub agent_detectors: Vec<AgentDetector>,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_ms: default_refresh_ms(),
+            show_pull_requests: false,
+            columns: default_columns(),
+            agent_detectors: default_agent_detectors(),
+        }
+    }
+}
+
+impl DashboardConfig {
+    pub fn clamp(&mut self) {
+        self.refresh_interval_ms = clamp_dashboard_refresh_interval(self.refresh_interval_ms);
+    }
+
+    pub fn normalize_columns(&mut self) -> Vec<String> {
+        let (columns, warnings) = normalize_dashboard_columns(&self.columns);
+        self.columns = columns;
+        warnings
+    }
+}
+
 /// Configuration for the worktree manager.
 ///
 /// Mirrors `WorktreeConfigSchema` from the upstream TS implementation. Field
@@ -60,6 +172,10 @@ pub struct WorktreeConfig {
     /// Also delete the associated git branch when deleting a worktree.
     #[serde(rename = "deleteBranchWithWorktree", default)]
     pub delete_branch_with_worktree: bool,
+
+    /// Live dashboard preferences.
+    #[serde(rename = "dashboard", default)]
+    pub dashboard: DashboardConfig,
 }
 
 impl Default for WorktreeConfig {
@@ -71,6 +187,7 @@ impl Default for WorktreeConfig {
             post_create_cmd: Vec::new(),
             terminal_command: String::new(),
             delete_branch_with_worktree: false,
+            dashboard: DashboardConfig::default(),
         }
     }
 }

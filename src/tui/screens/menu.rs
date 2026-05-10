@@ -11,7 +11,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::messages::{
-    colors, MENU_CREATE, MENU_DELETE, MENU_EXIT, MENU_LIST, MENU_SETTINGS, MENU_SETUP, MENU_TITLE,
+    colors, MENU_CREATE, MENU_DASHBOARD, MENU_DELETE, MENU_EXIT, MENU_LIST, MENU_SETTINGS,
+    MENU_SETUP, MENU_TITLE,
 };
 use crate::tui::router::Screen;
 use crate::tui::widgets::welcome_header::{fold_home, WelcomeHeader};
@@ -22,6 +23,7 @@ pub enum MenuChoice {
     Setup,
     Create,
     List,
+    Dashboard,
     Delete,
     Settings,
     Exit,
@@ -58,6 +60,7 @@ impl MenuScreen {
         }
         options.push(SelectOption::new(MENU_CREATE, MenuChoice::Create));
         options.push(SelectOption::new(MENU_LIST, MenuChoice::List));
+        options.push(SelectOption::new(MENU_DASHBOARD, MenuChoice::Dashboard));
         options.push(SelectOption::new(MENU_DELETE, MenuChoice::Delete));
         options.push(SelectOption::new(MENU_SETTINGS, MenuChoice::Settings));
         options.push(SelectOption::new(MENU_EXIT, MenuChoice::Exit));

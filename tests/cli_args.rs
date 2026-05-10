@@ -101,6 +101,29 @@ fn list_json_flag_triggers_non_interactive() {
 }
 
 #[test]
+fn dashboard_json_flag_triggers_non_interactive() {
+    let p = parse_args::<Vec<String>>(vec!["dashboard".into(), "--json".into()]).unwrap();
+    let args = p.cli_args.expect("must be cli");
+    assert_eq!(p.mode, AppMode::Dashboard);
+    assert_eq!(args.command, CliCommand::Dashboard);
+    assert!(args.json);
+}
+
+#[test]
+fn dashboard_watch_flag_is_supported() {
+    let p = parse_args::<Vec<String>>(vec!["dashboard".into(), "--watch".into()]).unwrap();
+    let args = p.cli_args.expect("must be cli");
+    assert_eq!(args.command, CliCommand::Dashboard);
+    assert!(args.watch);
+}
+
+#[test]
+fn mode_dashboard_is_supported() {
+    let p = parse_args::<Vec<String>>(vec!["--mode".into(), "dashboard".into()]).unwrap();
+    assert_eq!(p.mode, AppMode::Dashboard);
+}
+
+#[test]
 fn delete_with_path_and_force() {
     let p = parse_args::<Vec<String>>(vec![
         "delete".into(),

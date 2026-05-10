@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{env, ffi::OsString};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -26,13 +27,15 @@ use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::colors;
 use crate::services::{
-    check_for_updates, detect_shell_integration, install_shell_integration, AppStateService, Shell,
+    check_for_updates, default_dashboard_warning, detect_agent_columns, detect_shell_integration,
+    install_shell_integration, AppStateService, DashboardService, DashboardWatch, Shell,
     ShellIntegrationStatus, UpdateCheckResult,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::create::{CreateAction, CreateScreen};
+use crate::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
 };
@@ -54,7 +57,7 @@ enum InitPhase {
 }
 
 enum AppEvent {
-    Initialized(InitOutcome),
+    Initialized(Box<InitOutcome>),
     ListLoaded(Result<Vec<GitWorktree>, String>),
     CreateBranchesLoaded(Result<Vec<GitBranch>, String>),
     CreateFinished(Result<PathBuf, String>),
@@ -78,6 +81,8 @@ pub struct App {
     quit_requested: bool,
     menu: Option<MenuScreen>,
     list: Option<ListScreen>,
+    dashboard: Option<DashboardScreen>,
+    dashboard_watch: Option<DashboardWatch>,
     create: Option<CreateScreen>,
     delete: Option<DeleteScreen>,
     settings: Option<SettingsScreen>,
@@ -86,6 +91,7 @@ pub struct App {
     /// Wrapper-mode side channel: the path that should be emitted on real
     /// stdout once the TUI tears down. Only set in `is_from_wrapper` mode.
     selected_path: Option<String>,
+    pending_delete_path: Option<String>,
 }
 
 impl App {
@@ -103,12 +109,15 @@ impl App {
             quit_requested: false,
             menu: None,
             list: None,
+            dashboard: None,
+            dashboard_watch: None,
             create: None,
             delete: None,
             settings: None,
             setup: None,
             shell_integration_status: None,
             selected_path: None,
+            pending_delete_path: None,
         }
     }
 
@@ -174,6 +183,7 @@ impl App {
             while let Ok(event) = rx.try_recv() {
                 self.handle_app_event(event, &tx);
             }
+            self.poll_dashboard_updates();
 
             terminal.draw(|frame| self.draw(frame))?;
 
@@ -225,6 +235,17 @@ impl App {
                 if let Some(list) = self.list.as_mut() {
                     list.tick = self.tick;
                     list.render(frame, panel);
+                }
+            }
+            Screen::Dashboard => {
+                let h = self
+                    .dashboard
+                    .as_ref()
+                    .map_or(12, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
+                if let Some(dashboard) = self.dashboard.as_mut() {
+                    dashboard.tick = self.tick;
+                    dashboard.render(frame, panel);
                 }
             }
             Screen::Create => {
@@ -358,6 +379,7 @@ impl App {
         match self.screen {
             Screen::Menu => self.handle_menu_key(key, tx),
             Screen::List => self.handle_list_key(key),
+            Screen::Dashboard => self.handle_dashboard_key(key, tx),
             Screen::Create => self.handle_create_key(key, tx),
             Screen::Delete => self.handle_delete_key(key, tx),
             Screen::Settings => self.handle_settings_key(key, tx),
@@ -378,6 +400,7 @@ impl App {
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                     MenuChoice::List => self.enter_screen(Screen::List, tx),
+                    MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
                     MenuChoice::Delete => self.enter_screen(Screen::Delete, tx),
                     MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
                 }
@@ -405,6 +428,49 @@ impl App {
                     let _ = open_terminal(&config.terminal_command, &path);
                 }
                 self.back_to_menu();
+            }
+        }
+    }
+
+    fn handle_dashboard_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(dashboard) = self.dashboard.as_mut() else {
+            return;
+        };
+        match dashboard.handle_key(key) {
+            DashboardAction::Continue => {}
+            DashboardAction::Back => self.back_to_menu(),
+            DashboardAction::Refresh => {
+                if let Some(watch) = self.dashboard_watch.as_ref() {
+                    watch.refresh();
+                }
+            }
+            DashboardAction::NavigateTo(path) => {
+                if self.is_from_wrapper {
+                    self.selected_path = Some(path);
+                    self.quit_requested = true;
+                }
+            }
+            DashboardAction::OpenTerminal(path) => {
+                if let Some(config) = self.current_config() {
+                    let _ = open_terminal(&config.terminal_command, &path);
+                }
+                if let Some(dashboard) = self.dashboard.as_mut() {
+                    dashboard
+                        .set_notice(format!("Opened terminal command for {}", fold_path(&path)));
+                }
+            }
+            DashboardAction::JumpToDelete(path) => {
+                self.pending_delete_path = Some(path);
+                self.enter_screen(Screen::Delete, tx);
+            }
+            DashboardAction::CopyPath(path) => {
+                let notice = match copy_to_clipboard(&path) {
+                    Ok(()) => format!("Copied {} to clipboard.", fold_path(&path)),
+                    Err(err) => format!("Clipboard copy failed: {err}"),
+                };
+                if let Some(dashboard) = self.dashboard.as_mut() {
+                    dashboard.set_notice(notice);
+                }
             }
         }
     }
@@ -564,7 +630,7 @@ impl App {
 
     fn handle_app_event(&mut self, event: AppEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match event {
-            AppEvent::Initialized(outcome) => self.apply_init_outcome(outcome, tx),
+            AppEvent::Initialized(outcome) => self.apply_init_outcome(*outcome, tx),
             AppEvent::ListLoaded(result) => {
                 if let Some(list) = self.list.as_mut() {
                     match result {
@@ -595,7 +661,12 @@ impl App {
             AppEvent::DeleteLoaded(result) => {
                 if let Some(delete) = self.delete.as_mut() {
                     match result {
-                        Ok(worktrees) => delete.set_worktrees(worktrees),
+                        Ok(worktrees) => {
+                            delete.set_worktrees(worktrees);
+                            if let Some(path) = self.pending_delete_path.as_deref() {
+                                delete.preselect_path(path);
+                            }
+                        }
                         Err(message) => delete.set_error(message),
                     }
                 }
@@ -661,6 +732,36 @@ impl App {
                 self.list = Some(ListScreen::new(self.is_from_wrapper, has_terminal_command));
                 kick_off_list_load(self.git_root.clone(), tx.clone());
             }
+            Screen::Dashboard => {
+                let Some(git_root) = self.git_root.as_ref().map(PathBuf::from) else {
+                    return;
+                };
+                let config = self
+                    .current_config()
+                    .map(|cfg| cfg.dashboard.clone())
+                    .unwrap_or_default();
+                let mut warnings = self.current_config_warnings();
+                let has_terminal_command = self
+                    .current_config()
+                    .map(|cfg| !cfg.terminal_command.trim().is_empty())
+                    .unwrap_or(false);
+                let service = DashboardService::new(git_root, config.clone());
+                let gh_warning = default_dashboard_warning(&config, service.gh_available());
+                let (columns, runtime_warnings) =
+                    detect_agent_columns(&config.columns, service.gh_available());
+                warnings.extend(runtime_warnings);
+                if let Some(warning) = gh_warning {
+                    warnings.push(warning);
+                }
+                self.dashboard = Some(DashboardScreen::new(
+                    self.is_from_wrapper,
+                    has_terminal_command,
+                    clipboard_available(),
+                    columns,
+                    warnings,
+                ));
+                self.dashboard_watch = Some(service.watch());
+            }
             Screen::Create => {
                 self.create = Some(CreateScreen::new());
                 kick_off_create_branch_load(self.git_root.clone(), tx.clone());
@@ -683,6 +784,7 @@ impl App {
                 let active_path_template = self
                     .current_config()
                     .map(|cfg| cfg.worktree_path_template.clone());
+                let active_dashboard = self.current_config().map(|cfg| cfg.dashboard.clone());
                 let settings = match self.global_settings_snapshot() {
                     Ok((mut config, config_path)) => {
                         if let Some(commands) = active_post_create {
@@ -693,6 +795,9 @@ impl App {
                         }
                         if let Some(template) = active_path_template {
                             config.worktree_path_template = template;
+                        }
+                        if let Some(dashboard) = active_dashboard {
+                            config.dashboard = dashboard;
                         }
                         SettingsScreen::new(config, config_path).with_local_config_path(local_path)
                     }
@@ -712,11 +817,17 @@ impl App {
                 self.setup = Some(SetupScreen::new(self.shell_integration_status.as_ref()));
             }
         }
+
+        if !matches!(screen, Screen::Delete) {
+            self.pending_delete_path = None;
+        }
     }
 
     fn clear_screen_state(&mut self) {
         self.menu = None;
         self.list = None;
+        self.dashboard = None;
+        self.dashboard_watch = None;
         self.create = None;
         self.delete = None;
         self.settings = None;
@@ -726,7 +837,27 @@ impl App {
     fn back_to_menu(&mut self) {
         self.clear_screen_state();
         self.screen = Screen::Menu;
+        self.pending_delete_path = None;
         self.menu = Some(self.build_menu_screen());
+    }
+
+    fn poll_dashboard_updates(&mut self) {
+        let Some(watch) = self.dashboard_watch.as_mut() else {
+            return;
+        };
+        let Some(screen) = self.dashboard.as_mut() else {
+            return;
+        };
+        while let Ok(rows) = watch.rx.try_recv() {
+            screen.set_rows(rows);
+        }
+        while let Ok(notice) = watch.notice_rx.try_recv() {
+            if screen.has_rows() {
+                screen.set_notice(notice);
+            } else {
+                screen.set_error(notice);
+            }
+        }
     }
 
     fn build_menu_screen(&self) -> MenuScreen {
@@ -743,6 +874,13 @@ impl App {
         self.worktree_service
             .as_ref()
             .map(|service| service.config_service().config())
+    }
+
+    fn current_config_warnings(&self) -> Vec<String> {
+        self.worktree_service
+            .as_ref()
+            .map(|service| service.config_service().warnings().to_vec())
+            .unwrap_or_default()
     }
 
     fn global_settings_snapshot(&self) -> Result<(WorktreeConfig, String), String> {
@@ -954,9 +1092,25 @@ impl App {
 
     fn refresh_settings_screen(&mut self) -> Result<(), String> {
         let active_post_create = self.current_config().map(|cfg| cfg.post_create_cmd.clone());
+        let active_terminal_command = self
+            .current_config()
+            .map(|cfg| cfg.terminal_command.clone());
+        let active_path_template = self
+            .current_config()
+            .map(|cfg| cfg.worktree_path_template.clone());
+        let active_dashboard = self.current_config().map(|cfg| cfg.dashboard.clone());
         let (mut config, path) = self.global_settings_snapshot()?;
         if let Some(commands) = active_post_create {
             config.post_create_cmd = commands;
+        }
+        if let Some(command) = active_terminal_command {
+            config.terminal_command = command;
+        }
+        if let Some(template) = active_path_template {
+            config.worktree_path_template = template;
+        }
+        if let Some(dashboard) = active_dashboard {
+            config.dashboard = dashboard;
         }
 
         if let Some(settings) = self.settings.as_mut() {
@@ -1037,7 +1191,10 @@ fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
             Ok(()) => Ok(service),
             Err(e) => Err(user_friendly_message(&e)),
         };
-        let _ = tx.send(AppEvent::Initialized(InitOutcome { git_root, result }));
+        let _ = tx.send(AppEvent::Initialized(Box::new(InitOutcome {
+            git_root,
+            result,
+        })));
     });
 }
 
@@ -1146,6 +1303,137 @@ fn screen_delete_outcome(outcome: ServiceDeleteOutcome) -> ScreenDeleteOutcome {
         branch_deleted: outcome.branch_deleted,
         branch_name: outcome.branch_name,
     }
+}
+
+fn copy_to_clipboard(value: &str) -> std::result::Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| err.to_string())?;
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err("clipboard stdin unavailable".to_string());
+        };
+        stdin
+            .write_all(value.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let status = child.wait().map_err(|err| err.to_string())?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err("pbcopy exited unsuccessfully".to_string())
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+
+        for program in ["wl-copy", "xclip"] {
+            let mut command = std::process::Command::new(program);
+            if program == "xclip" {
+                command.args(["-selection", "clipboard"]);
+            }
+            match command.stdin(std::process::Stdio::piped()).spawn() {
+                Ok(mut child) => {
+                    let Some(mut stdin) = child.stdin.take() else {
+                        continue;
+                    };
+                    let _ = stdin.write_all(value.as_bytes());
+                    if child.wait().map(|status| status.success()).unwrap_or(false) {
+                        return Ok(());
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        Err("no supported clipboard tool found".to_string())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Write;
+
+        let mut child = std::process::Command::new("clip")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| err.to_string())?;
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err("clipboard stdin unavailable".to_string());
+        };
+        stdin
+            .write_all(value.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let status = child.wait().map_err(|err| err.to_string())?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err("clip exited unsuccessfully".to_string())
+        };
+    }
+
+    #[allow(unreachable_code)]
+    Err("clipboard is unavailable on this platform".to_string())
+}
+
+fn fold_path(path: &str) -> String {
+    crate::tui::widgets::welcome_header::fold_home(path)
+}
+
+fn clipboard_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return command_in_path("pbcopy");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return command_in_path("wl-copy") || command_in_path("xclip");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return command_in_path("clip") || command_in_path("clip.exe");
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+fn command_in_path(program: &str) -> bool {
+    let Some(path_var) = env::var_os("PATH") else {
+        return false;
+    };
+    let candidates = candidate_program_names(program);
+
+    env::split_paths(&path_var).any(|directory| {
+        candidates
+            .iter()
+            .map(|name| directory.join(name))
+            .any(|candidate| candidate.is_file())
+    })
+}
+
+fn candidate_program_names(program: &str) -> Vec<OsString> {
+    #[cfg(not(target_os = "windows"))]
+    let candidates = vec![OsString::from(program)];
+
+    #[cfg(target_os = "windows")]
+    let mut candidates = vec![OsString::from(program)];
+
+    #[cfg(target_os = "windows")]
+    {
+        if !program.contains('.') {
+            candidates.push(OsString::from(format!("{program}.exe")));
+            candidates.push(OsString::from(format!("{program}.cmd")));
+            candidates.push(OsString::from(format!("{program}.bat")));
+        }
+    }
+
+    candidates
 }
 
 fn reset_global_config() -> Result<(), String> {
@@ -1284,6 +1572,7 @@ mod tests {
             let mut app = initialized_menu_app();
             let tx = app_event_tx();
 
+            app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
