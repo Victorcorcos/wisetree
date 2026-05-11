@@ -1,8 +1,10 @@
 //! Live dashboard polling service.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -11,11 +13,21 @@ use tokio::task::JoinSet;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::schema::{normalize_dashboard_columns, DashboardConfig};
+use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
 use crate::git::exec::execute_git_command;
 use crate::git::types::{BranchStatus, GitWorktree};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+/// `gh api graphql` may include the network round-trip — give it more headroom
+/// than local git calls.
+const GH_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long a cached PR record stays fresh when the branch HEAD hasn't moved.
+/// Catches remote-only changes (merge, close, title edit) without hammering
+/// the API.
+const PR_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+/// How long to suspend PR fetches after a rate-limit error.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitSummary {
@@ -76,6 +88,28 @@ impl Drop for DashboardWatch {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrCacheEntry {
+    sha: String,
+    #[serde(rename = "fetchedAtMs")]
+    fetched_at_ms: u64,
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<PullRequest>,
+}
+
+/// On-disk schema: `repo_root` → `branch` → entry.
+type DiskCache = HashMap<String, HashMap<String, PrCacheEntry>>;
+
+#[derive(Debug, Default)]
+struct PrCacheState {
+    entries: HashMap<String, PrCacheEntry>,
+    repo_slug: Option<(String, String)>,
+    rate_limited_until: Option<Instant>,
+    rate_limit_notice_sent: bool,
+    loaded_from_disk: bool,
+    notice_tx: Option<mpsc::Sender<String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DashboardService {
     git_root: PathBuf,
@@ -83,6 +117,8 @@ pub struct DashboardService {
     gh_available: bool,
     git_binary: PathBuf,
     gh_binary: PathBuf,
+    cache_path: Option<PathBuf>,
+    pr_state: Arc<Mutex<PrCacheState>>,
 }
 
 impl DashboardService {
@@ -97,6 +133,8 @@ impl DashboardService {
             gh_available,
             git_binary,
             gh_binary,
+            cache_path: Some(dashboard_pr_cache_file()),
+            pr_state: Arc::new(Mutex::new(PrCacheState::default())),
         }
     }
 
@@ -111,6 +149,13 @@ impl DashboardService {
         self
     }
 
+    /// Override the disk cache location. Pass `None` to disable disk
+    /// persistence entirely (used by tests that must not touch `$HOME`).
+    pub fn with_cache_path(mut self, path: Option<PathBuf>) -> Self {
+        self.cache_path = path;
+        self
+    }
+
     pub fn gh_available(&self) -> bool {
         self.gh_available
     }
@@ -121,6 +166,9 @@ impl DashboardService {
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let service = self.clone();
+        if let Ok(mut state) = service.pr_state.lock() {
+            state.notice_tx = Some(notice_tx.clone());
+        }
 
         tokio::spawn(async move {
             let interval_ms = service.config.refresh_interval_ms;
@@ -167,7 +215,7 @@ impl DashboardService {
 
         for worktree in worktrees {
             let service = self.clone();
-            tasks.spawn(async move { service.enrich_worktree(worktree).await });
+            tasks.spawn(async move { service.enrich_worktree_git(worktree).await });
         }
 
         let mut rows = Vec::new();
@@ -181,6 +229,18 @@ impl DashboardService {
                 }
             }
         }
+
+        self.ensure_cache_loaded();
+
+        let live_branches: HashSet<String> = rows
+            .iter()
+            .map(|row| row.worktree.branch.clone())
+            .collect();
+        self.prune_cache(&live_branches);
+
+        self.refresh_pull_requests(&rows).await;
+        self.apply_cached_prs(&mut rows);
+        self.save_cache();
 
         rows.sort_by_key(|row| (!row.worktree.is_main, row.worktree.path.clone()));
         Ok(rows)
@@ -239,7 +299,7 @@ impl DashboardService {
         Ok(worktrees)
     }
 
-    async fn enrich_worktree(&self, mut worktree: GitWorktree) -> DashboardRow {
+    async fn enrich_worktree_git(&self, mut worktree: GitWorktree) -> DashboardRow {
         let mut errors = Vec::new();
 
         match self.fetch_status(Path::new(&worktree.path)).await {
@@ -258,21 +318,10 @@ impl DashboardService {
             }
         };
 
-        let pull_request = match self
-            .fetch_pull_request(Path::new(&worktree.path), &worktree.branch)
-            .await
-        {
-            Ok(pr) => pr,
-            Err(err) => {
-                errors.push(format!("pull request: {err}"));
-                None
-            }
-        };
-
         DashboardRow {
             worktree,
             last_commit,
-            pull_request,
+            pull_request: None,
             error: (!errors.is_empty()).then(|| errors.join("; ")),
         }
     }
@@ -365,69 +414,226 @@ impl DashboardService {
         }))
     }
 
-    async fn fetch_pull_request(
-        &self,
-        cwd: &Path,
-        branch: &str,
-    ) -> std::result::Result<Option<PullRequest>, String> {
-        if !self.gh_available || branch == "detached" || branch.is_empty() {
-            return Ok(None);
+    /// Decide which branches need a PR refresh, then (if any) issue a single
+    /// batched GraphQL request and update the cache.
+    async fn refresh_pull_requests(&self, rows: &[DashboardRow]) {
+        if !self.gh_available {
+            return;
+        }
+        if self.is_rate_limited() {
+            return;
         }
 
-        let output = time::timeout(
+        let now = now_ms();
+        let to_fetch: Vec<(String, String)> = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            rows.iter()
+                .filter_map(|row| {
+                    let branch = row.worktree.branch.clone();
+                    let sha = row.worktree.commit.clone();
+                    if branch.is_empty() || branch == "detached" || sha.is_empty() {
+                        return None;
+                    }
+                    let needs = match state.entries.get(&branch) {
+                        Some(entry) => {
+                            entry.sha != sha
+                                || now.saturating_sub(entry.fetched_at_ms) > PR_CACHE_TTL_MS
+                        }
+                        None => true,
+                    };
+                    needs.then_some((branch, sha))
+                })
+                .collect()
+        };
+
+        if to_fetch.is_empty() {
+            return;
+        }
+
+        let Some((owner, repo)) = self.resolve_repo_slug().await else {
+            return;
+        };
+
+        let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
+        match self.fetch_prs_batched(&owner, &repo, &branches).await {
+            Ok(results) => {
+                let mut state = self.pr_state.lock().expect("pr_state poisoned");
+                let now = now_ms();
+                for (branch, sha) in &to_fetch {
+                    let pr = results.get(branch).cloned().flatten();
+                    state.entries.insert(
+                        branch.clone(),
+                        PrCacheEntry {
+                            sha: sha.clone(),
+                            fetched_at_ms: now,
+                            pull_request: pr,
+                        },
+                    );
+                }
+                // Successful round-trip — clear any prior rate-limit state.
+                state.rate_limited_until = None;
+                state.rate_limit_notice_sent = false;
+            }
+            Err(err) => {
+                if is_rate_limit_error(&err) {
+                    self.mark_rate_limited();
+                }
+                // Non-rate-limit failures are silently ignored: rows fall back
+                // to cached or empty PR data. Surfacing per-row errors here
+                // would be misleading because the call covers all branches.
+            }
+        }
+    }
+
+    fn apply_cached_prs(&self, rows: &mut [DashboardRow]) {
+        let state = self.pr_state.lock().expect("pr_state poisoned");
+        for row in rows {
+            if let Some(entry) = state.entries.get(&row.worktree.branch) {
+                row.pull_request = entry.pull_request.clone();
+            }
+        }
+    }
+
+    fn is_rate_limited(&self) -> bool {
+        let mut state = self.pr_state.lock().expect("pr_state poisoned");
+        match state.rate_limited_until {
+            Some(deadline) if Instant::now() < deadline => true,
+            Some(_) => {
+                state.rate_limited_until = None;
+                state.rate_limit_notice_sent = false;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn mark_rate_limited(&self) {
+        let notice = {
+            let mut state = self.pr_state.lock().expect("pr_state poisoned");
+            state.rate_limited_until = Some(Instant::now() + RATE_LIMIT_BACKOFF);
+            if state.rate_limit_notice_sent {
+                None
+            } else {
+                state.rate_limit_notice_sent = true;
+                state.notice_tx.clone()
+            }
+        };
+        if let Some(tx) = notice {
+            let _ = tx.try_send(
+                "GitHub API rate-limited — pausing PR refresh for 5 min; showing cached data."
+                    .to_string(),
+            );
+        }
+    }
+
+    async fn resolve_repo_slug(&self) -> Option<(String, String)> {
+        if let Ok(state) = self.pr_state.lock() {
+            if let Some(slug) = &state.repo_slug {
+                return Some(slug.clone());
+            }
+        }
+
+        let url = time::timeout(
             COMMAND_TIMEOUT,
             run_command(
-                &self.gh_binary,
-                &[
-                    "pr",
-                    "list",
-                    "--head",
-                    branch,
-                    "--state",
-                    "all",
-                    "--limit",
-                    "1",
-                    "--json",
-                    "number,state,url,title,isDraft",
-                ],
-                Some(cwd),
+                &self.git_binary,
+                &["remote", "get-url", "origin"],
+                Some(&self.git_root),
             ),
         )
         .await
-        .map_err(|_| "timed out after 1s".to_string())??;
+        .ok()?
+        .ok()?;
 
-        #[derive(Deserialize)]
-        struct GhPr {
-            number: u64,
-            state: String,
-            url: String,
-            title: String,
-            #[serde(rename = "isDraft")]
-            is_draft: bool,
+        let slug = parse_github_slug(&url)?;
+        if let Ok(mut state) = self.pr_state.lock() {
+            state.repo_slug = Some(slug.clone());
+        }
+        Some(slug)
+    }
+
+    async fn fetch_prs_batched(
+        &self,
+        owner: &str,
+        repo: &str,
+        branches: &[&str],
+    ) -> std::result::Result<HashMap<String, Option<PullRequest>>, String> {
+        let query = build_graphql_query(owner, repo, branches);
+        let arg = format!("query={query}");
+        let output = time::timeout(
+            GH_GRAPHQL_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &["api", "graphql", "-f", &arg],
+                Some(&self.git_root),
+            ),
+        )
+        .await
+        .map_err(|_| "timed out after 8s".to_string())??;
+
+        parse_graphql_response(&output, branches)
+    }
+
+    fn ensure_cache_loaded(&self) {
+        let needs_load = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            !state.loaded_from_disk
+        };
+        if !needs_load {
+            return;
         }
 
-        let prs: Vec<GhPr> = serde_json::from_str(&output).map_err(|err| err.to_string())?;
-        let Some(pr) = prs.into_iter().next() else {
-            return Ok(None);
-        };
-
-        let state = if pr.is_draft {
-            PrState::Draft
-        } else {
-            match pr.state.as_str() {
-                "OPEN" => PrState::Open,
-                "MERGED" => PrState::Merged,
-                "CLOSED" => PrState::Closed,
-                _ => PrState::Closed,
+        let key = self.git_root.to_string_lossy().to_string();
+        let mut loaded = HashMap::new();
+        if let Some(path) = &self.cache_path {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(parsed) = serde_json::from_str::<DiskCache>(&content) {
+                    if let Some(entries) = parsed.get(&key) {
+                        loaded = entries.clone();
+                    }
+                }
             }
+        }
+
+        let mut state = self.pr_state.lock().expect("pr_state poisoned");
+        state.entries = loaded;
+        state.loaded_from_disk = true;
+    }
+
+    fn prune_cache(&self, live_branches: &HashSet<String>) {
+        let mut state = self.pr_state.lock().expect("pr_state poisoned");
+        state
+            .entries
+            .retain(|branch, _| live_branches.contains(branch));
+    }
+
+    fn save_cache(&self) {
+        let Some(path) = self.cache_path.clone() else {
+            return;
+        };
+        let key = self.git_root.to_string_lossy().to_string();
+        let entries = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state.entries.clone()
         };
 
-        Ok(Some(PullRequest {
-            number: pr.number,
-            state,
-            url: pr.url,
-            title: pr.title,
-        }))
+        // Merge with what's already on disk so other repos' entries survive.
+        let mut disk: DiskCache = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .unwrap_or_default();
+        if entries.is_empty() {
+            disk.remove(&key);
+        } else {
+            disk.insert(key, entries);
+        }
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&disk) {
+            let _ = std::fs::write(&path, json);
+        }
     }
 }
 
@@ -439,6 +645,146 @@ fn binary_available(binary: &Path) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn is_rate_limit_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("rate limit") || lower.contains("rate-limit")
+}
+
+/// Extract `(owner, repo)` from a GitHub remote URL. Handles the common SSH,
+/// HTTPS, and `git@` SCP-style forms.
+fn parse_github_slug(remote: &str) -> Option<(String, String)> {
+    let trimmed = remote.trim();
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let trimmed = trimmed.trim_end_matches('/');
+    let (_, after_host) = trimmed.rsplit_once("github.com")?;
+    let path = after_host.trim_start_matches([':', '/']);
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
+    let mut q = String::new();
+    q.push_str("query { repository(owner: \"");
+    q.push_str(&escape_graphql_string(owner));
+    q.push_str("\", name: \"");
+    q.push_str(&escape_graphql_string(repo));
+    q.push_str("\") { ");
+    for (i, branch) in branches.iter().enumerate() {
+        q.push_str(&format!(
+            "b{i}: pullRequests(headRefName: \"{}\", first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft }} }} ",
+            escape_graphql_string(branch)
+        ));
+    }
+    q.push_str("} }");
+    q
+}
+
+fn escape_graphql_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn parse_graphql_response(
+    body: &str,
+    branches: &[&str],
+) -> std::result::Result<HashMap<String, Option<PullRequest>>, String> {
+    #[derive(Deserialize)]
+    struct GhNode {
+        number: u64,
+        state: String,
+        url: String,
+        title: String,
+        #[serde(rename = "isDraft")]
+        is_draft: bool,
+    }
+    #[derive(Deserialize)]
+    struct GhConnection {
+        nodes: Vec<GhNode>,
+    }
+    #[derive(Deserialize)]
+    struct GhError {
+        message: String,
+    }
+    #[derive(Deserialize)]
+    struct GhEnvelope {
+        #[serde(default)]
+        data: Option<serde_json::Value>,
+        #[serde(default)]
+        errors: Option<Vec<GhError>>,
+    }
+
+    let envelope: GhEnvelope =
+        serde_json::from_str(body).map_err(|err| format!("invalid gh response: {err}"))?;
+
+    if let Some(errors) = envelope.errors {
+        let joined = errors
+            .into_iter()
+            .map(|e| e.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !joined.is_empty() {
+            return Err(joined);
+        }
+    }
+
+    let data = envelope.data.ok_or_else(|| "missing data".to_string())?;
+    let repo = data
+        .get("repository")
+        .ok_or_else(|| "missing repository in response".to_string())?;
+
+    let mut out: HashMap<String, Option<PullRequest>> = HashMap::new();
+    for (i, branch) in branches.iter().enumerate() {
+        let key = format!("b{i}");
+        let pr = repo
+            .get(&key)
+            .and_then(|v| serde_json::from_value::<GhConnection>(v.clone()).ok())
+            .and_then(|conn| conn.nodes.into_iter().next())
+            .map(|node| {
+                let state = if node.is_draft {
+                    PrState::Draft
+                } else {
+                    match node.state.as_str() {
+                        "OPEN" => PrState::Open,
+                        "MERGED" => PrState::Merged,
+                        "CLOSED" => PrState::Closed,
+                        _ => PrState::Closed,
+                    }
+                };
+                PullRequest {
+                    number: node.number,
+                    state,
+                    url: node.url,
+                    title: node.title,
+                }
+            });
+        out.insert((*branch).to_string(), pr);
+    }
+    Ok(out)
 }
 
 /// Parse `git diff --shortstat` output and return `(insertions, deletions)`.
@@ -515,4 +861,85 @@ pub fn resolve_dashboard_columns(
     }
 
     (resolved, warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_github_ssh_scp_form() {
+        assert_eq!(
+            parse_github_slug("git@github.com:victorcorcos/wisetree.git"),
+            Some(("victorcorcos".into(), "wisetree".into()))
+        );
+    }
+
+    #[test]
+    fn parses_github_https_form() {
+        assert_eq!(
+            parse_github_slug("https://github.com/victorcorcos/wisetree.git"),
+            Some(("victorcorcos".into(), "wisetree".into()))
+        );
+    }
+
+    #[test]
+    fn parses_github_https_no_suffix() {
+        assert_eq!(
+            parse_github_slug("https://github.com/victorcorcos/wisetree"),
+            Some(("victorcorcos".into(), "wisetree".into()))
+        );
+    }
+
+    #[test]
+    fn parses_github_ssh_url_form() {
+        assert_eq!(
+            parse_github_slug("ssh://git@github.com/foo/bar.git"),
+            Some(("foo".into(), "bar".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_non_github_remote() {
+        assert_eq!(parse_github_slug("git@gitlab.com:foo/bar.git"), None);
+    }
+
+    #[test]
+    fn detects_rate_limit_message() {
+        assert!(is_rate_limit_error(
+            "GraphQL: API rate limit exceeded for user ID 7637806."
+        ));
+        assert!(is_rate_limit_error("Secondary rate-limit triggered"));
+        assert!(!is_rate_limit_error("network is unreachable"));
+    }
+
+    #[test]
+    fn builds_graphql_query_with_aliases_per_branch() {
+        let q = build_graphql_query("owner", "repo", &["feat/a", "fix-b"]);
+        assert!(q.contains("b0: pullRequests(headRefName: \"feat/a\""));
+        assert!(q.contains("b1: pullRequests(headRefName: \"fix-b\""));
+        assert!(q.contains("repository(owner: \"owner\", name: \"repo\")"));
+    }
+
+    #[test]
+    fn parses_graphql_response_into_branch_map() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{"number": 7, "state": "OPEN", "url": "u", "title": "t", "isDraft": false}]},
+              "b1": {"nodes": []}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat", "fix"]).unwrap();
+        assert_eq!(out.get("feat").unwrap().as_ref().unwrap().number, 7);
+        assert!(out.get("fix").unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_graphql_errors_envelope() {
+        let body = r#"{"errors":[{"message":"API rate limit exceeded"}]}"#;
+        let err = parse_graphql_response(body, &["feat"]).unwrap_err();
+        assert!(is_rate_limit_error(&err));
+    }
 }

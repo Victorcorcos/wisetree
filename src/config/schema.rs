@@ -29,7 +29,7 @@ pub fn default_path_template() -> String {
 }
 
 pub fn default_refresh_ms() -> u64 {
-    3_000
+    5_000
 }
 
 pub fn default_columns() -> Vec<String> {
@@ -42,7 +42,7 @@ pub fn default_columns() -> Vec<String> {
 }
 
 pub fn clamp_dashboard_refresh_interval(value: u64) -> u64 {
-    value.clamp(500, 60_000)
+    value.clamp(5_000, 60_000)
 }
 
 pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<String>) {

@@ -14,6 +14,9 @@ pub const GLOBAL_CONFIG_FILE_NAME: &str = "settings.json";
 /// Filename of the app state cache.
 pub const APP_STATE_FILE_NAME: &str = "state.json";
 
+/// Filename of the dashboard pull-request cache.
+pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
+
 /// Resolve the global config directory (`~/.wisetree/`).
 ///
 /// Mirrors the upstream behaviour of synthesising the path from `$HOME`. We
@@ -38,4 +41,9 @@ pub fn global_config_file() -> PathBuf {
 /// Path to the app state cache (`~/.wisetree/state.json`).
 pub fn app_state_file() -> PathBuf {
     global_config_dir().join(APP_STATE_FILE_NAME)
+}
+
+/// Path to the dashboard PR cache (`~/.wisetree/dashboard_pr_cache.json`).
+pub fn dashboard_pr_cache_file() -> PathBuf {
+    global_config_dir().join(DASHBOARD_PR_CACHE_FILE_NAME)
 }

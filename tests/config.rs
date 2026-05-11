@@ -229,7 +229,7 @@ fn dashboard_refresh_interval_is_clamped_on_load() {
 
         let mut svc = ConfigService::new();
         let loaded = svc.load(Some(project.path())).expect("load");
-        assert_eq!(loaded.dashboard.refresh_interval_ms, 500);
+        assert_eq!(loaded.dashboard.refresh_interval_ms, 5_000);
 
         let global_dir = home.path().join(".wisetree");
         fs::create_dir_all(&global_dir).unwrap();
