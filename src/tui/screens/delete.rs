@@ -367,11 +367,7 @@ impl DeleteScreen {
             return 4;
         }
         match self.step {
-            DeleteStep::Select => {
-                let visible = (self.worktrees.len() as u16).min(10);
-                let overflow = if self.worktrees.len() > 10 { 2 } else { 0 };
-                6 + visible + overflow
-            }
+            DeleteStep::Select => 6 + self.worktrees.len().max(1) as u16,
             DeleteStep::Confirm => 10,
             DeleteStep::Deleting => 3,
             DeleteStep::Success => 3,

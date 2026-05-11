@@ -242,3 +242,42 @@ fn error_overlay_clears_and_returns_to_select() {
     assert!(s.error().is_none());
     assert_eq!(s.step(), DeleteStep::Select);
 }
+
+#[test]
+fn select_step_preferred_height_grows_to_fit_all_worktrees() {
+    let mut s = DeleteScreen::new(false);
+    let rows: Vec<GitWorktree> = std::iter::once(wt("/tmp/repo", "main", true, true))
+        .chain((0..12).map(|index| {
+            wt(
+                &format!("/tmp/repo-{index}"),
+                &format!("feat-{index}"),
+                false,
+                true,
+            )
+        }))
+        .collect();
+    s.set_worktrees(rows);
+
+    assert_eq!(s.preferred_content_height(), 18);
+}
+
+#[test]
+fn select_step_uses_available_height_before_scrolling() {
+    let mut s = DeleteScreen::new(false);
+    let rows: Vec<GitWorktree> = std::iter::once(wt("/tmp/repo", "main", true, true))
+        .chain((0..12).map(|index| {
+            wt(
+                &format!("/tmp/repo-{index}"),
+                &format!("feat-{index}"),
+                false,
+                true,
+            )
+        }))
+        .collect();
+    s.set_worktrees(rows);
+
+    let dumped = dump(100, 18, |f| s.render(f, f.area()));
+    assert!(dumped.contains("repo-11"));
+    assert!(!dumped.contains("more below"));
+    assert!(!dumped.contains("more above"));
+}
