@@ -288,12 +288,9 @@ impl DashboardScreen {
                     .with_description("Open using configured terminal command"),
             );
         }
-        if self.has_clipboard {
-            options.push(SelectOption::new(
-                "Copy path to clipboard",
-                ActionChoice::CopyPath,
-            ));
-        }
+        // Delete is intentionally placed above Copy path: from the dashboard
+        // the user is more likely to want to delete the selected worktree than
+        // to copy its path.
         options.push(
             SelectOption::new("Delete this worktree", ActionChoice::Delete).with_description(
                 format!(
@@ -303,6 +300,12 @@ impl DashboardScreen {
                 ),
             ),
         );
+        if self.has_clipboard {
+            options.push(SelectOption::new(
+                "Copy path to clipboard",
+                ActionChoice::CopyPath,
+            ));
+        }
         SelectPrompt::new("Choose action:", options).without_hint()
     }
 
@@ -381,8 +384,9 @@ impl DashboardScreen {
             fold_home(&row.worktree.path).to_ascii_lowercase(),
             row.worktree.branch.to_ascii_lowercase(),
             row.worktree.commit.to_ascii_lowercase(),
-            // Status column text — so users can filter by `clean`/`dirty`.
-            if row.worktree.is_clean { "clean" } else { "dirty" }.to_string(),
+            // Status column text — so users can filter by the rendered label
+            // (`clean`/`dirty`/`opened`/`merged`).
+            status_label_and_style(row).0.to_ascii_lowercase(),
         ];
         // Ahead/Behind column text — match the rendered "+N -N" / "=0" form
         // and also raw "ahead N", "behind N" so either spelling filters.
@@ -635,12 +639,17 @@ impl DashboardScreen {
             )));
         }
 
+        let muted_dim = Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM);
         lines.push(Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
-            Span::styled("Clean", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" = no uncommitted changes  ", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
-            Span::styled("Dirty", Style::default().fg(colors::WARNING)),
-            Span::styled(" = has uncommitted changes", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
+            Span::styled("Status: ", muted_dim),
+            Span::styled("Clean", Style::default().fg(colors::ACCENT)),
+            Span::styled(" = no uncommitted changes  ", muted_dim),
+            Span::styled("Dirty", Style::default().fg(colors::ERROR)),
+            Span::styled(" = has uncommitted changes  ", muted_dim),
+            Span::styled("Opened", Style::default().fg(colors::WARNING)),
+            Span::styled(" = PR open  ", muted_dim),
+            Span::styled("Merged", Style::default().fg(colors::INFO)),
+            Span::styled(" = PR merged", muted_dim),
         ]));
         lines.push(Line::from(vec![
             Span::styled("Ahead/Behind: ", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
@@ -917,16 +926,7 @@ impl DashboardColumn {
                 self.width(compact) as usize,
             )))),
             Self::Status => {
-                let text = if row.worktree.is_clean {
-                    "Clean"
-                } else {
-                    "Dirty"
-                };
-                let style = if row.worktree.is_clean {
-                    Style::default().fg(colors::SUCCESS)
-                } else {
-                    Style::default().fg(colors::WARNING)
-                };
+                let (text, style) = status_label_and_style(row);
                 Cell::from(Line::from(Span::styled(text, style)))
             }
             Self::AheadBehind => match row.worktree.branch_status.as_ref() {
@@ -1020,6 +1020,15 @@ impl PrState {
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM),
         }
+    }
+}
+
+fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
+    match row.pull_request.as_ref().map(|pr| pr.state) {
+        Some(PrState::Merged) => ("Merged", Style::default().fg(colors::INFO)),
+        Some(PrState::Open) => ("Opened", Style::default().fg(colors::WARNING)),
+        _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
+        _ => ("Dirty", Style::default().fg(colors::ERROR)),
     }
 }
 

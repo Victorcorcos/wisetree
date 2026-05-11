@@ -63,6 +63,7 @@ enum AppEvent {
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
     SettingsUpdateChecked(UpdateCheckResult),
     SetupInstalled(Result<ShellIntegrationStatus, String>),
+    DashboardCopyFinished { path: String, error: Option<String> },
 }
 
 /// State the TUI carries across frames.
@@ -425,13 +426,10 @@ impl App {
                 self.enter_screen(Screen::Delete, tx);
             }
             DashboardAction::CopyPath(path) => {
-                let notice = match copy_to_clipboard(&path) {
-                    Ok(()) => format!("Copied {} to clipboard.", fold_path(&path)),
-                    Err(err) => format!("Clipboard copy failed: {err}"),
-                };
                 if let Some(dashboard) = self.dashboard.as_mut() {
-                    dashboard.set_notice(notice);
+                    dashboard.set_notice(format!("Copying {} to clipboard…", fold_path(&path)));
                 }
+                kick_off_clipboard_copy(path, tx.clone());
             }
         }
     }
@@ -647,6 +645,15 @@ impl App {
                         }
                         Err(message) => setup.set_error(message),
                     }
+                }
+            }
+            AppEvent::DashboardCopyFinished { path, error } => {
+                if let Some(dashboard) = self.dashboard.as_mut() {
+                    let notice = match error {
+                        None => format!("Copied {} to clipboard.", fold_path(&path)),
+                        Some(err) => format!("Clipboard copy failed: {err}"),
+                    };
+                    dashboard.set_notice(notice);
                 }
             }
         }
@@ -1212,6 +1219,20 @@ fn kick_off_update_check(tx: mpsc::UnboundedSender<AppEvent>) {
         state.load();
         let result = check_for_updates(VERSION, &mut state, true).await;
         let _ = tx.send(AppEvent::SettingsUpdateChecked(result));
+    });
+}
+
+fn kick_off_clipboard_copy(path: String, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let value = path.clone();
+        let result = tokio::task::spawn_blocking(move || copy_to_clipboard(&value))
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|inner| inner);
+        let _ = tx.send(AppEvent::DashboardCopyFinished {
+            path,
+            error: result.err(),
+        });
     });
 }
 

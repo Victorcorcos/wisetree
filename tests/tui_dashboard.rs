@@ -88,6 +88,19 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
     row
 }
 
+fn row_with_pr_state(
+    path: &str,
+    branch: &str,
+    is_clean: bool,
+    state: PrState,
+) -> DashboardRow {
+    let mut row = row_with_pr(path, branch, is_clean);
+    if let Some(pr) = row.pull_request.as_mut() {
+        pr.state = state;
+    }
+    row
+}
+
 fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
     let mut screen = DashboardScreen::new(
         is_from_wrapper,
@@ -240,9 +253,10 @@ fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
 
 #[test]
 fn jump_to_delete_action_is_emitted_for_selected_row() {
+    // Without wrapper-mode the menu is Open / Delete / Copy, so a single
+    // Down lands on Delete (Copy is intentionally below Delete now).
     let mut screen = ready_screen(false);
     screen.handle_key(key(KeyCode::Enter));
-    screen.handle_key(key(KeyCode::Down));
     let action = screen.handle_key(key(KeyCode::Down));
     assert_eq!(action, DashboardAction::Continue);
     match screen.handle_key(key(KeyCode::Enter)) {
@@ -252,7 +266,7 @@ fn jump_to_delete_action_is_emitted_for_selected_row() {
 }
 
 #[test]
-fn dirty_row_uses_warning_palette() {
+fn dirty_row_uses_error_palette() {
     let screen = ready_screen(true);
     let backend = TestBackend::new(120, 12);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -262,9 +276,110 @@ fn dirty_row_uses_warning_palette() {
     let dirty_cell = buffer
         .content
         .iter()
-        .find(|cell| cell.symbol() == "D" && cell.fg == colors::WARNING)
-        .expect("dirty cell with warning color");
-    assert_eq!(dirty_cell.fg, colors::WARNING);
+        .find(|cell| cell.symbol() == "D" && cell.fg == colors::ERROR)
+        .expect("dirty cell with error color");
+    assert_eq!(dirty_cell.fg, colors::ERROR);
+}
+
+#[test]
+fn clean_row_uses_accent_palette() {
+    let screen = ready_screen(true);
+    let backend = TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let clean_cell = buffer
+        .content
+        .iter()
+        .find(|cell| cell.symbol() == "C" && cell.fg == colors::ACCENT)
+        .expect("clean cell with accent color");
+    assert_eq!(clean_cell.fg, colors::ACCENT);
+}
+
+#[test]
+fn opened_pr_row_renders_opened_status_in_warning_palette() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    screen.set_rows(vec![row_with_pr_state(
+        "/tmp/repo-bug",
+        "bug",
+        false,
+        PrState::Open,
+    )]);
+
+    let backend = TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let opened_cell = buffer
+        .content
+        .iter()
+        .find(|cell| cell.symbol() == "O" && cell.fg == colors::WARNING)
+        .expect("opened cell with warning color");
+    assert_eq!(opened_cell.fg, colors::WARNING);
+
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Opened"));
+}
+
+#[test]
+fn merged_pr_row_renders_merged_status_in_info_palette() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    screen.set_rows(vec![row_with_pr_state(
+        "/tmp/repo-bug",
+        "bug",
+        true,
+        PrState::Merged,
+    )]);
+
+    let backend = TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let merged_cell = buffer
+        .content
+        .iter()
+        .find(|cell| cell.symbol() == "M" && cell.fg == colors::INFO)
+        .expect("merged cell with info color");
+    assert_eq!(merged_cell.fg, colors::INFO);
+
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Merged"));
+}
+
+#[test]
+fn search_matches_opened_status_text() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open),
+    ]);
+    for c in "opened".chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+    let filtered = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(filtered.contains("repo-bug"));
+    assert!(!filtered.contains("/tmp/repo "));
 }
 
 #[test]
