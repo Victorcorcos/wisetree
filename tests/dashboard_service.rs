@@ -73,7 +73,7 @@ async fn snapshot_returns_one_row_per_worktree() {
 }
 
 #[tokio::test]
-async fn gh_is_only_called_when_enabled() {
+async fn gh_is_called_whenever_available() {
     let fixture = repo_with_worktree();
     let log_path = fixture.repo.parent().unwrap().join("gh.log");
     let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
@@ -89,17 +89,12 @@ async fn gh_is_only_called_when_enabled() {
 
     let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
         .with_gh_binary(gh_path.clone());
-    service.snapshot().await.expect("snapshot without gh");
-    assert!(!log_path.exists(), "gh should not be called when disabled");
-
-    let enabled = DashboardConfig {
-        show_pull_requests: true,
-        ..DashboardConfig::default()
-    };
-    let service = DashboardService::new(fixture.repo.clone(), enabled).with_gh_binary(gh_path);
-    service.snapshot().await.expect("snapshot with gh");
-    let log = fs::read_to_string(log_path).unwrap();
-    assert!(log.contains("pr list"));
+    service.snapshot().await.expect("snapshot");
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("pr list"),
+        "gh pr list should be called so the status column can show Opened/Merged"
+    );
 }
 
 #[tokio::test]

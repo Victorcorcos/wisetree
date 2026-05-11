@@ -425,7 +425,7 @@ impl DashboardScreen {
         let dirty = self
             .rows
             .iter()
-            .filter(|row| !row.worktree.is_clean)
+            .filter(|row| status_label_and_style(row).0 == "Dirty")
             .count();
         let open_prs = self
             .rows

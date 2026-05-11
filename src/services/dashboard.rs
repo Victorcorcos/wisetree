@@ -90,7 +90,7 @@ impl DashboardService {
         config.clamp();
         let git_binary = PathBuf::from("git");
         let gh_binary = PathBuf::from("gh");
-        let gh_available = config.show_pull_requests && binary_available(&gh_binary);
+        let gh_available = binary_available(&gh_binary);
         Self {
             git_root,
             config,
@@ -107,7 +107,7 @@ impl DashboardService {
 
     pub fn with_gh_binary(mut self, gh_binary: PathBuf) -> Self {
         self.gh_binary = gh_binary;
-        self.gh_available = self.config.show_pull_requests && binary_available(&self.gh_binary);
+        self.gh_available = binary_available(&self.gh_binary);
         self
     }
 
