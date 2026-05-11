@@ -359,8 +359,8 @@ impl DashboardScreen {
                 Constraint::Length(1), // spacer above search
                 Constraint::Length(1), // search line
                 Constraint::Length(1), // spacer below search
-                Constraint::Min(4),     // table
-                Constraint::Length(7),  // footer
+                Constraint::Min(4),    // table
+                Constraint::Length(7), // footer
             ])
             .split(area);
 
@@ -881,7 +881,8 @@ impl DashboardScreen {
         // half-char of leftover space on one side.
         let gap: u16 = 2;
 
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(BulkDeleteStatus::ALL.len() * 2 + 2);
+        let mut constraints: Vec<Constraint> =
+            Vec::with_capacity(BulkDeleteStatus::ALL.len() * 2 + 2);
         constraints.push(Constraint::Length(prefix_width));
         for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
             if index > 0 {
@@ -1360,10 +1361,7 @@ fn row_matches_bulk_status(row: &DashboardRow, status: BulkDeleteStatus) -> bool
 
 /// Returns the next focused bulk-delete button, or `None` to land back
 /// on the table. `forward` controls direction (`Tab` vs `BackTab`).
-fn next_bulk_focus(
-    current: Option<BulkDeleteStatus>,
-    forward: bool,
-) -> Option<BulkDeleteStatus> {
+fn next_bulk_focus(current: Option<BulkDeleteStatus>, forward: bool) -> Option<BulkDeleteStatus> {
     let all = BulkDeleteStatus::ALL;
     let index = match current {
         None => {

@@ -634,10 +634,7 @@ impl App {
             // success toast (plus any per-item warnings) and drop the
             // user back on the Dashboard rather than rendering a
             // dedicated success page.
-            let summary = self
-                .delete
-                .as_mut()
-                .and_then(|d| d.take_bulk_summary());
+            let summary = self.delete.as_mut().and_then(|d| d.take_bulk_summary());
             if let Some((message, warnings)) = summary {
                 self.show_toast(ToastVariant::Success, message);
                 for warning in warnings {
@@ -667,11 +664,7 @@ impl App {
     /// lands where they started.
     fn leave_delete_screen(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let from_dashboard_single = self.pending_delete_path.take().is_some();
-        let from_dashboard_bulk = self
-            .delete
-            .as_ref()
-            .map(|d| d.is_bulk())
-            .unwrap_or(false)
+        let from_dashboard_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false)
             || !self.pending_bulk_delete_paths.is_empty();
         if (from_dashboard_single || from_dashboard_bulk) && self.git_root.is_some() {
             self.enter_screen(Screen::Dashboard, tx);
@@ -787,8 +780,7 @@ impl App {
                         Ok(worktrees) => {
                             delete.set_worktrees(worktrees);
                             if !self.pending_bulk_delete_paths.is_empty() {
-                                let paths =
-                                    std::mem::take(&mut self.pending_bulk_delete_paths);
+                                let paths = std::mem::take(&mut self.pending_bulk_delete_paths);
                                 delete.jump_to_bulk_confirm(paths);
                             } else if let Some(path) = self.pending_delete_path.as_deref() {
                                 delete.jump_to_confirm_path(path);
@@ -799,11 +791,7 @@ impl App {
                 }
             }
             AppEvent::DeleteFinished(result) => {
-                let in_bulk = self
-                    .delete
-                    .as_ref()
-                    .map(|d| d.is_bulk())
-                    .unwrap_or(false);
+                let in_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false);
                 match result {
                     Ok(outcome) => {
                         if in_bulk {

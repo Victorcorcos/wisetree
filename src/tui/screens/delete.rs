@@ -659,10 +659,7 @@ impl DeleteScreen {
             } else {
                 "worktrees"
             };
-            return format!(
-                "{} {label} deleted successfully",
-                self.bulk_completed
-            );
+            return format!("{} {label} deleted successfully", self.bulk_completed);
         }
         match &self.outcome {
             Some(o) => {
