@@ -16,6 +16,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Stdout, Write};
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::style::available_color_count;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::{Backend as RatatuiBackend, ClearType, CrosstermBackend, WindowSize};
@@ -293,7 +294,8 @@ pub fn install_panic_hook() {
 /// Set raw mode and return a top-anchored ratatui terminal handle.
 pub fn enter() -> io::Result<Terminal> {
     enable_raw_mode()?;
-    let backend = AdaptiveBackend::new(io::stdout());
+    let mut backend = AdaptiveBackend::new(io::stdout());
+    crossterm::execute!(&mut backend, EnableMouseCapture)?;
     let size = backend.size()?;
     let viewport = app_viewport(size);
     let mut terminal = RatTerminal::with_options(backend, TerminalOptions { viewport })?;
@@ -306,7 +308,8 @@ pub fn enter() -> io::Result<Terminal> {
 pub fn enter_wrapper() -> io::Result<WrapperTerminal> {
     enable_raw_mode()?;
     let tty = OpenOptions::new().read(true).write(true).open(TTY_PATH)?;
-    let backend = AdaptiveBackend::new(tty);
+    let mut backend = AdaptiveBackend::new(tty);
+    crossterm::execute!(&mut backend, EnableMouseCapture)?;
     let size = backend.size()?;
     let viewport = app_viewport(size);
     let mut terminal = RatTerminal::with_options(backend, TerminalOptions { viewport })?;
@@ -337,6 +340,8 @@ pub fn clear_wrapper_for_shell(terminal: &mut WrapperTerminal) -> io::Result<()>
 /// Best-effort cleanup. Safe to call even if `enter` was never invoked.
 pub fn restore() -> io::Result<()> {
     let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = crossterm::execute!(&mut stdout, DisableMouseCapture);
     let mut backend = AdaptiveBackend::new(io::stdout());
     let _ = backend.clear_region(ClearType::All);
     let _ = backend.set_cursor_position(Position::ORIGIN);
@@ -347,6 +352,9 @@ pub fn restore() -> io::Result<()> {
 /// Best-effort cleanup for wrapper mode.
 pub fn restore_wrapper_tty() -> io::Result<()> {
     let _ = disable_raw_mode();
+    if let Ok(mut tty) = OpenOptions::new().write(true).open(TTY_PATH) {
+        let _ = crossterm::execute!(&mut tty, DisableMouseCapture);
+    }
     Ok(())
 }
 

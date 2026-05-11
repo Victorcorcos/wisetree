@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, ffi::OsString};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
@@ -42,6 +43,9 @@ use crate::tui::screens::delete::{
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
+use crate::tui::selection::{
+    clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
+};
 use crate::tui::terminal;
 use crate::tui::widgets::{render_toast, ToastState, ToastVariant, WelcomeHeader};
 use crate::worktree::service::DeleteOutcome as ServiceDeleteOutcome;
@@ -63,7 +67,10 @@ enum AppEvent {
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
     SettingsUpdateChecked(UpdateCheckResult),
     SetupInstalled(Result<ShellIntegrationStatus, String>),
-    DashboardCopyFinished { path: String, error: Option<String> },
+    ClipboardCopyFinished {
+        success_message: String,
+        error: Option<String>,
+    },
 }
 
 /// State the TUI carries across frames.
@@ -87,6 +94,8 @@ pub struct App {
     setup: Option<SetupScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
+    last_rendered_buffer: Option<Buffer>,
+    mouse_selection: Option<MouseSelection>,
     /// Wrapper-mode side channel: the path that should be emitted on real
     /// stdout once the TUI tears down. Only set in `is_from_wrapper` mode.
     selected_path: Option<String>,
@@ -115,6 +124,8 @@ impl App {
             setup: None,
             shell_integration_status: None,
             toast: ToastState::default(),
+            last_rendered_buffer: None,
+            mouse_selection: None,
             selected_path: None,
             pending_delete_path: None,
         }
@@ -184,12 +195,14 @@ impl App {
             }
             self.poll_dashboard_updates();
 
-            terminal.draw(|frame| self.draw(frame))?;
+            let completed = terminal.draw(|frame| self.draw(frame))?;
+            self.last_rendered_buffer = Some(completed.buffer.clone());
 
             match events.next_event()? {
                 Event::Key(key) => self.handle_key(key, &tx),
+                Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
                 Event::Tick => self.tick = self.tick.wrapping_add(1),
-                Event::Resize(_, _) | Event::Mouse(_) => {}
+                Event::Resize(_, _) => {}
             }
         }
         Ok(())
@@ -214,6 +227,13 @@ impl App {
                 screens::error::draw(frame, area, msg, self.show_reset_confirm);
             }
             InitPhase::Ready => self.draw_ready(frame, area),
+        }
+
+        if let (Some(snapshot), Some(selection)) = (
+            self.last_rendered_buffer.as_ref(),
+            self.mouse_selection.as_ref(),
+        ) {
+            frame.render_widget(SelectionOverlay::new(snapshot, selection), area);
         }
 
         if let Some(toast) = self.toast.current() {
@@ -325,10 +345,50 @@ impl App {
             return;
         }
 
+        self.mouse_selection = None;
+
         match self.phase {
             InitPhase::Errored => self.handle_error_key(key, tx),
             InitPhase::Ready => self.handle_screen_key(key, tx),
             InitPhase::Loading => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(snapshot) = self.last_rendered_buffer.as_ref() else {
+            return;
+        };
+
+        let raw_position = ratatui::layout::Position {
+            x: mouse.column,
+            y: mouse.row,
+        };
+        let clamped = clamp_position(raw_position, snapshot.area);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_selection = contains_position(snapshot.area, raw_position)
+                    .then(|| MouseSelection::start(raw_position));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let (Some(selection), Some(position)) = (self.mouse_selection.as_mut(), clamped)
+                {
+                    selection.update(position);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(mut selection) = self.mouse_selection.take() else {
+                    return;
+                };
+                if let Some(position) = clamped {
+                    selection.update(position);
+                }
+
+                if let Some(text) = extract_text(snapshot, &selection) {
+                    kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -442,7 +502,8 @@ impl App {
                 self.enter_screen(Screen::Delete, tx);
             }
             DashboardAction::CopyPath(path) => {
-                kick_off_clipboard_copy(path, tx.clone());
+                let success_message = format!("Copied {} to clipboard.", fold_path(&path));
+                kick_off_clipboard_copy(path, success_message, tx.clone());
             }
         }
     }
@@ -679,11 +740,11 @@ impl App {
                     }
                 }
             }
-            AppEvent::DashboardCopyFinished { path, error } => match error {
-                None => self.show_toast(
-                    ToastVariant::Info,
-                    format!("Copied {} to clipboard.", fold_path(&path)),
-                ),
+            AppEvent::ClipboardCopyFinished {
+                success_message,
+                error,
+            } => match error {
+                None => self.show_toast(ToastVariant::Info, success_message),
                 Some(err) => {
                     self.show_toast(ToastVariant::Error, format!("Clipboard copy failed: {err}"))
                 }
@@ -796,6 +857,7 @@ impl App {
         self.delete = None;
         self.settings = None;
         self.setup = None;
+        self.mouse_selection = None;
     }
 
     fn back_to_menu(&mut self) {
@@ -1246,15 +1308,18 @@ fn kick_off_update_check(tx: mpsc::UnboundedSender<AppEvent>) {
     });
 }
 
-fn kick_off_clipboard_copy(path: String, tx: mpsc::UnboundedSender<AppEvent>) {
+fn kick_off_clipboard_copy(
+    value: String,
+    success_message: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
     tokio::spawn(async move {
-        let value = path.clone();
         let result = tokio::task::spawn_blocking(move || copy_to_clipboard(&value))
             .await
             .map_err(|err| err.to_string())
             .and_then(|inner| inner);
-        let _ = tx.send(AppEvent::DashboardCopyFinished {
-            path,
+        let _ = tx.send(AppEvent::ClipboardCopyFinished {
+            success_message,
             error: result.err(),
         });
     });
@@ -1469,11 +1534,7 @@ mod tests {
     }
 
     fn initialized_menu_app() -> App {
-        let mut config_service = ConfigService::new();
-        let _ = config_service.create_global_config();
-
-        let mut service = WorktreeService::new(None);
-        let _ = service.config_service_mut().create_global_config();
+        let service = WorktreeService::new(None);
 
         let mut app = App::new(AppMode::Menu, false);
         app.phase = InitPhase::Ready;
