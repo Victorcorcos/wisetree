@@ -127,16 +127,35 @@ fn ready_with_commands(commands: &[&str]) -> SettingsScreen {
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
+fn ready_with_patterns(copy_patterns: &[&str], ignore_patterns: &[&str]) -> SettingsScreen {
+    let cfg = WorktreeConfig {
+        worktree_copy_patterns: copy_patterns
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+        worktree_copy_ignores: ignore_patterns
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+        post_create_cmd: vec!["bun install".into()],
+        terminal_command: "code $WORKTREE_PATH".into(),
+        delete_branch_with_worktree: true,
+        ..Default::default()
+    };
+    SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
+}
+
 #[test]
 fn menu_renders_with_config_path() {
     let s = ready();
-    let dumped = dump(80, 13, |f| s.render(f, f.area()));
+    let dumped = dump(80, 14, |f| s.render(f, f.area()));
     assert!(dumped.contains("Configuration file"));
     assert!(dumped.contains("/tmp/.wisetree.json"));
     assert!(dumped.contains("➤"));
     assert!(dumped.contains("Copy Patterns"));
     assert!(dumped.contains("Copy Settings"));
     assert!(dumped.contains("Check for Updates"));
+    assert!(dumped.contains("Dashboard"));
 }
 
 #[test]
@@ -154,6 +173,96 @@ fn selecting_copy_patterns_shows_detail_view() {
     let dumped = dump(80, 12, |f| s.render(f, f.area()));
     assert!(dumped.contains("Copy Patterns"));
     assert!(dumped.contains(".env*"));
+}
+
+#[test]
+fn copy_patterns_view_grows_to_show_every_pattern() {
+    let mut s = ready_with_patterns(
+        &[
+            ".env",
+            "**/.env*",
+            "**/config.yml",
+            "**/config/application.yml",
+            "**/config/credentials.yml.enc",
+            "**/config/credentials/*.key",
+            "**/config/secrets.yml",
+            "**/config/master.key",
+            "android/local.properties",
+            "docker/pms-env.conf",
+            "docker/.env-backuper",
+            ".vscode/**",
+        ],
+        &["**/node_modules/**"],
+    );
+
+    s.handle_key(key(KeyCode::Enter));
+
+    let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
+    assert!(dumped.contains("docker/.env-backuper"));
+    assert!(dumped.contains(".vscode/**"));
+}
+
+#[test]
+fn copy_patterns_footer_renders_after_blank_line() {
+    let mut s = ready_with_patterns(&["docker/.env-backuper"], &["**/node_modules/**"]);
+
+    s.handle_key(key(KeyCode::Enter));
+
+    let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
+    let (_, item_y) = find_text_start(&buffer, "docker/.env-backuper").unwrap();
+    let (_, footer_y) = find_text_start(
+        &buffer,
+        "Edit in /tmp/.wisetree.json. Press any key to go back.",
+    )
+    .unwrap();
+
+    assert_eq!(footer_y, item_y + 2);
+}
+
+#[test]
+fn ignore_patterns_view_grows_to_show_every_pattern() {
+    let mut s = ready_with_patterns(
+        &[".env*"],
+        &[
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/.git/**",
+            "**/Thumbs.db",
+            "**/.DS_Store",
+            "coverage/**",
+            "tmp/**",
+            ".idea/**",
+            ".cache/**",
+            "vendor/bundle/**",
+            "log/**",
+            "storage/**",
+        ],
+    );
+
+    s.handle_key(key(KeyCode::Down));
+    s.handle_key(key(KeyCode::Enter));
+
+    let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
+    assert!(dumped.contains("vendor/bundle/**"));
+    assert!(dumped.contains("storage/**"));
+}
+
+#[test]
+fn ignore_patterns_footer_renders_after_blank_line() {
+    let mut s = ready_with_patterns(&[".env*"], &["storage/**"]);
+
+    s.handle_key(key(KeyCode::Down));
+    s.handle_key(key(KeyCode::Enter));
+
+    let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
+    let (_, item_y) = find_text_start(&buffer, "storage/**").unwrap();
+    let (_, footer_y) = find_text_start(
+        &buffer,
+        "Edit in /tmp/.wisetree.json. Press any key to go back.",
+    )
+    .unwrap();
+
+    assert_eq!(footer_y, item_y + 2);
 }
 
 #[test]

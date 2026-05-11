@@ -51,6 +51,11 @@ pub enum ConfirmOutcome {
 pub struct ConfirmDialog {
     pub title: String,
     pub message: String,
+    /// When set, overrides the plain-text `message` rendering with these
+    /// pre-styled lines. Used by callers that need per-line colors (e.g.
+    /// the bulk-delete dialog highlights its warning line in red/yellow
+    /// while keeping the rest white).
+    pub message_lines: Option<Vec<Line<'static>>>,
     pub confirm_label: String,
     pub cancel_label: String,
     pub variant: ConfirmVariant,
@@ -62,6 +67,7 @@ impl ConfirmDialog {
         Self {
             title: title.into(),
             message: message.into(),
+            message_lines: None,
             confirm_label: "Yes".into(),
             cancel_label: "No".into(),
             variant: ConfirmVariant::Default,
@@ -82,6 +88,11 @@ impl ConfirmDialog {
 
     pub fn with_default(mut self, choice: ConfirmChoice) -> Self {
         self.selected = choice;
+        self
+    }
+
+    pub fn with_message_lines(mut self, lines: Vec<Line<'static>>) -> Self {
+        self.message_lines = Some(lines);
         self
     }
 
@@ -131,11 +142,14 @@ impl ConfirmDialog {
         frame.render_widget(title, chunks[0]);
 
         let message_style = Style::default().fg(colors::WHITE);
-        let message_lines: Vec<Line> = self
-            .message
-            .split('\n')
-            .map(|line| Line::from(branded_line(line, message_style)))
-            .collect();
+        let message_lines: Vec<Line> = if let Some(lines) = self.message_lines.as_ref() {
+            lines.clone()
+        } else {
+            self.message
+                .split('\n')
+                .map(|line| Line::from(branded_line(line, message_style)))
+                .collect()
+        };
         frame.render_widget(Paragraph::new(message_lines), chunks[2]);
 
         let buttons_area = chunks[3];

@@ -7,8 +7,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{env, ffi::OsString};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
@@ -24,24 +26,28 @@ use crate::files::service::open_terminal;
 use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
-use crate::messages::colors;
+use crate::messages::{colors, CREATE_SUCCESS};
 use crate::services::{
-    check_for_updates, detect_shell_integration, install_shell_integration, AppStateService, Shell,
-    ShellIntegrationStatus, UpdateCheckResult,
+    check_for_updates, default_dashboard_warning, detect_shell_integration,
+    install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
+    DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::create::{CreateAction, CreateScreen};
+use crate::tui::screens::dashboard::{BulkDeleteStatus, DashboardAction, DashboardScreen};
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
 };
-use crate::tui::screens::list::{ListAction, ListScreen};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
+use crate::tui::selection::{
+    clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
+};
 use crate::tui::terminal;
-use crate::tui::widgets::WelcomeHeader;
+use crate::tui::widgets::{render_toast, ToastState, ToastVariant, WelcomeHeader};
 use crate::worktree::service::DeleteOutcome as ServiceDeleteOutcome;
 use crate::worktree::WorktreeService;
 use crate::VERSION;
@@ -54,14 +60,17 @@ enum InitPhase {
 }
 
 enum AppEvent {
-    Initialized(InitOutcome),
-    ListLoaded(Result<Vec<GitWorktree>, String>),
+    Initialized(Box<InitOutcome>),
     CreateBranchesLoaded(Result<Vec<GitBranch>, String>),
     CreateFinished(Result<PathBuf, String>),
     DeleteLoaded(Result<Vec<GitWorktree>, String>),
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
     SettingsUpdateChecked(UpdateCheckResult),
     SetupInstalled(Result<ShellIntegrationStatus, String>),
+    ClipboardCopyFinished {
+        success_message: String,
+        error: Option<String>,
+    },
 }
 
 /// State the TUI carries across frames.
@@ -77,15 +86,26 @@ pub struct App {
     git_root: Option<String>,
     quit_requested: bool,
     menu: Option<MenuScreen>,
-    list: Option<ListScreen>,
+    dashboard: Option<DashboardScreen>,
+    dashboard_watch: Option<DashboardWatch>,
     create: Option<CreateScreen>,
     delete: Option<DeleteScreen>,
     settings: Option<SettingsScreen>,
     setup: Option<SetupScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
+    toast: ToastState,
+    last_rendered_buffer: Option<Buffer>,
+    mouse_selection: Option<MouseSelection>,
     /// Wrapper-mode side channel: the path that should be emitted on real
     /// stdout once the TUI tears down. Only set in `is_from_wrapper` mode.
     selected_path: Option<String>,
+    pending_delete_path: Option<String>,
+    /// Worktree paths queued by a dashboard bulk-delete button; consumed
+    /// once the Delete screen finishes loading.
+    pending_bulk_delete_paths: Vec<String>,
+    /// Remaining `(path, force)` items still to delete in the current
+    /// bulk run, processed one at a time via `kick_off_delete_worktree`.
+    bulk_delete_queue: Vec<(String, bool)>,
 }
 
 impl App {
@@ -102,13 +122,20 @@ impl App {
             git_root: None,
             quit_requested: false,
             menu: None,
-            list: None,
+            dashboard: None,
+            dashboard_watch: None,
             create: None,
             delete: None,
             settings: None,
             setup: None,
             shell_integration_status: None,
+            toast: ToastState::default(),
+            last_rendered_buffer: None,
+            mouse_selection: None,
             selected_path: None,
+            pending_delete_path: None,
+            pending_bulk_delete_paths: Vec::new(),
+            bulk_delete_queue: Vec::new(),
         }
     }
 
@@ -174,19 +201,23 @@ impl App {
             while let Ok(event) = rx.try_recv() {
                 self.handle_app_event(event, &tx);
             }
+            self.poll_dashboard_updates();
 
-            terminal.draw(|frame| self.draw(frame))?;
+            let completed = terminal.draw(|frame| self.draw(frame))?;
+            self.last_rendered_buffer = Some(completed.buffer.clone());
 
             match events.next_event()? {
                 Event::Key(key) => self.handle_key(key, &tx),
+                Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
                 Event::Tick => self.tick = self.tick.wrapping_add(1),
-                Event::Resize(_, _) | Event::Mouse(_) => {}
+                Event::Resize(_, _) => {}
             }
         }
         Ok(())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        self.toast.dismiss_expired();
         let area = frame.area();
 
         if area.width < 20 || area.height < 5 {
@@ -205,6 +236,17 @@ impl App {
             }
             InitPhase::Ready => self.draw_ready(frame, area),
         }
+
+        if let (Some(snapshot), Some(selection)) = (
+            self.last_rendered_buffer.as_ref(),
+            self.mouse_selection.as_ref(),
+        ) {
+            frame.render_widget(SelectionOverlay::new(snapshot, selection), area);
+        }
+
+        if let Some(toast) = self.toast.current() {
+            render_toast(frame, area, &toast);
+        }
     }
 
     fn draw_ready(&mut self, frame: &mut Frame, area: Rect) {
@@ -216,15 +258,11 @@ impl App {
                 let menu = self.menu.as_mut().expect("menu set above");
                 menu.render(frame, area);
             }
-            Screen::List => {
-                let h = self
-                    .list
-                    .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
-                if let Some(list) = self.list.as_mut() {
-                    list.tick = self.tick;
-                    list.render(frame, panel);
+            Screen::Dashboard => {
+                let panel = self.render_framed_panel_fill(frame, area);
+                if let Some(dashboard) = self.dashboard.as_mut() {
+                    dashboard.tick = self.tick;
+                    dashboard.render(frame, panel);
                 }
             }
             Screen::Create => {
@@ -288,13 +326,29 @@ impl App {
         let cwd = self.git_root.as_deref().unwrap_or("");
         WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
 
+        self.render_panel_block(frame, chunks[1])
+    }
+
+    fn render_framed_panel_fill(&self, frame: &mut Frame, area: Rect) -> Rect {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(0)])
+            .split(area);
+
+        let cwd = self.git_root.as_deref().unwrap_or("");
+        WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+
+        self.render_panel_block(frame, chunks[1])
+    }
+
+    fn render_panel_block(&self, frame: &mut Frame, area: Rect) -> Rect {
         let panel = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(colors::MENU_BORDER).bg(colors::MENU_BG))
             .style(Style::default().bg(colors::MENU_BG));
-        let inner = panel.inner(chunks[1]);
-        frame.render_widget(panel, chunks[1]);
+        let inner = panel.inner(area);
+        frame.render_widget(panel, area);
         Rect {
             x: inner.x.saturating_add(2),
             y: inner.y,
@@ -311,10 +365,62 @@ impl App {
             return;
         }
 
+        self.mouse_selection = None;
+
         match self.phase {
             InitPhase::Errored => self.handle_error_key(key, tx),
             InitPhase::Ready => self.handle_screen_key(key, tx),
             InitPhase::Loading => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(snapshot) = self.last_rendered_buffer.as_ref() else {
+            return;
+        };
+
+        let raw_position = ratatui::layout::Position {
+            x: mouse.column,
+            y: mouse.row,
+        };
+        let clamped = clamp_position(raw_position, snapshot.area);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_selection = contains_position(snapshot.area, raw_position)
+                    .then(|| MouseSelection::start(raw_position));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let (Some(selection), Some(position)) = (self.mouse_selection.as_mut(), clamped)
+                {
+                    selection.update(position);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(mut selection) = self.mouse_selection.take() else {
+                    return;
+                };
+                if let Some(position) = clamped {
+                    selection.update(position);
+                }
+
+                // A click without drag is a button activation, not a text
+                // selection. Try the dashboard's bulk-delete buttons first;
+                // fall back to clipboard copy when the click missed.
+                if let Some(text) = extract_text(snapshot, &selection) {
+                    kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
+                    return;
+                }
+                if matches!(self.screen, Screen::Dashboard) {
+                    let action = self
+                        .dashboard
+                        .as_mut()
+                        .map(|dashboard| dashboard.handle_mouse_click(raw_position))
+                        .unwrap_or(DashboardAction::Continue);
+                    self.apply_dashboard_action(action, tx);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -357,7 +463,7 @@ impl App {
     fn handle_screen_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match self.screen {
             Screen::Menu => self.handle_menu_key(key, tx),
-            Screen::List => self.handle_list_key(key),
+            Screen::Dashboard => self.handle_dashboard_key(key, tx),
             Screen::Create => self.handle_create_key(key, tx),
             Screen::Delete => self.handle_delete_key(key, tx),
             Screen::Settings => self.handle_settings_key(key, tx),
@@ -377,7 +483,7 @@ impl App {
                     MenuChoice::Exit => self.quit_requested = true,
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
-                    MenuChoice::List => self.enter_screen(Screen::List, tx),
+                    MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
                     MenuChoice::Delete => self.enter_screen(Screen::Delete, tx),
                     MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
                 }
@@ -387,26 +493,78 @@ impl App {
         }
     }
 
-    fn handle_list_key(&mut self, key: KeyEvent) {
-        let Some(list) = self.list.as_mut() else {
-            return;
+    fn handle_dashboard_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.dashboard.as_mut() {
+            Some(dashboard) => dashboard.handle_key(key),
+            None => return,
         };
-        match list.handle_key(key) {
-            ListAction::Continue => {}
-            ListAction::Back => self.back_to_menu(),
-            ListAction::NavigateTo(path) => {
+        self.apply_dashboard_action(action, tx);
+    }
+
+    fn apply_dashboard_action(
+        &mut self,
+        action: DashboardAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match action {
+            DashboardAction::Continue => {}
+            DashboardAction::Back => self.back_to_menu(),
+            DashboardAction::Refresh => {
+                if let Some(watch) = self.dashboard_watch.as_ref() {
+                    watch.refresh();
+                }
+            }
+            DashboardAction::NavigateTo(path) => {
                 if self.is_from_wrapper {
                     self.selected_path = Some(path);
+                    self.quit_requested = true;
                 }
-                self.quit_requested = true;
             }
-            ListAction::OpenTerminal(path) => {
+            DashboardAction::OpenTerminal(path) => {
                 if let Some(config) = self.current_config() {
-                    let _ = open_terminal(&config.terminal_command, &path);
+                    let launch = open_terminal(&config.terminal_command, &path);
+                    if launch.success {
+                        self.show_toast(
+                            ToastVariant::Info,
+                            format!("Opened terminal command for {}", fold_path(&path)),
+                        );
+                    } else if let Some(error) = launch.error {
+                        self.show_toast(
+                            ToastVariant::Error,
+                            format!("Failed to open terminal for {}: {error}", fold_path(&path)),
+                        );
+                    }
                 }
-                self.back_to_menu();
+            }
+            DashboardAction::JumpToDelete(path) => {
+                self.pending_delete_path = Some(path);
+                self.enter_screen(Screen::Delete, tx);
+            }
+            DashboardAction::BulkDelete(status, paths) => {
+                self.start_bulk_delete_flow(status, paths, tx);
+            }
+            DashboardAction::CopyPath(path) => {
+                let success_message = format!("Copied {} to clipboard.", fold_path(&path));
+                kick_off_clipboard_copy(path, success_message, tx.clone());
             }
         }
+    }
+
+    fn start_bulk_delete_flow(
+        &mut self,
+        status: BulkDeleteStatus,
+        paths: Vec<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if paths.is_empty() {
+            self.show_toast(
+                ToastVariant::Info,
+                format!("No worktrees with status '{}' to delete.", status.label()),
+            );
+            return;
+        }
+        self.pending_bulk_delete_paths = paths;
+        self.enter_screen(Screen::Delete, tx);
     }
 
     fn handle_create_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -436,30 +594,7 @@ impl App {
                 kick_off_create_worktree(self.git_root.clone(), options, tx.clone());
             }
             CreateAction::Done => {
-                let navigate = self
-                    .create
-                    .as_ref()
-                    .map(|c| c.navigate_after_create)
-                    .unwrap_or(false);
-                let path = self
-                    .create
-                    .as_ref()
-                    .and_then(|c| c.created_worktree_path().map(str::to_string));
-                if navigate {
-                    if let Some(path) = path {
-                        if self.is_from_wrapper {
-                            self.selected_path = Some(path);
-                            self.quit_requested = true;
-                            return;
-                        }
-                        if let Some(config) = self.current_config() {
-                            if !config.terminal_command.trim().is_empty() {
-                                let _ = open_terminal(&config.terminal_command, &path);
-                            }
-                        }
-                    }
-                }
-                self.back_to_menu();
+                self.finish_create_success();
             }
         }
     }
@@ -472,14 +607,69 @@ impl App {
 
         match action {
             DeleteAction::Continue => {}
-            DeleteAction::Cancelled => self.back_to_menu(),
+            DeleteAction::Cancelled => {
+                self.bulk_delete_queue.clear();
+                self.leave_delete_screen(tx);
+            }
             DeleteAction::Confirmed { path, force } => {
                 if let Some(delete) = self.delete.as_mut() {
                     delete.start_deleting();
                 }
                 kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
             }
-            DeleteAction::Done => self.back_to_menu(),
+            DeleteAction::BulkConfirmed { items } => {
+                self.bulk_delete_queue = items;
+                if let Some(delete) = self.delete.as_mut() {
+                    delete.start_deleting();
+                }
+                self.dispatch_next_bulk_delete(tx);
+            }
+            DeleteAction::Done => self.leave_delete_screen(tx),
+        }
+    }
+
+    fn dispatch_next_bulk_delete(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if self.bulk_delete_queue.is_empty() {
+            // Bulk run finished. Mirror the post-Create flow: surface a
+            // success toast (plus any per-item warnings) and drop the
+            // user back on the Dashboard rather than rendering a
+            // dedicated success page.
+            let summary = self.delete.as_mut().and_then(|d| d.take_bulk_summary());
+            if let Some((message, warnings)) = summary {
+                self.show_toast(ToastVariant::Success, message);
+                for warning in warnings {
+                    self.show_toast(ToastVariant::Warning, warning);
+                }
+            }
+            // Bulk delete always originates from the Dashboard, so go
+            // straight there. We can't rely on `leave_delete_screen`
+            // here because `take_bulk_summary` already cleared the
+            // bulk markers that `leave_delete_screen` inspects.
+            self.pending_delete_path = None;
+            self.pending_bulk_delete_paths.clear();
+            if self.git_root.is_some() {
+                self.enter_screen(Screen::Dashboard, tx);
+            } else {
+                self.back_to_menu();
+            }
+            return;
+        }
+        let (path, force) = self.bulk_delete_queue.remove(0);
+        kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
+    }
+
+    /// Exit the Delete screen back to wherever we came from. When the
+    /// dashboard jumped us straight to a single-target or bulk confirm,
+    /// return to the Dashboard rather than the main menu so the user
+    /// lands where they started.
+    fn leave_delete_screen(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let from_dashboard_single = self.pending_delete_path.take().is_some();
+        let from_dashboard_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false)
+            || !self.pending_bulk_delete_paths.is_empty();
+        if (from_dashboard_single || from_dashboard_bulk) && self.git_root.is_some() {
+            self.enter_screen(Screen::Dashboard, tx);
+        } else {
+            self.back_to_menu();
         }
     }
 
@@ -564,15 +754,7 @@ impl App {
 
     fn handle_app_event(&mut self, event: AppEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match event {
-            AppEvent::Initialized(outcome) => self.apply_init_outcome(outcome, tx),
-            AppEvent::ListLoaded(result) => {
-                if let Some(list) = self.list.as_mut() {
-                    match result {
-                        Ok(worktrees) => list.set_worktrees(worktrees),
-                        Err(message) => list.set_error(message),
-                    }
-                }
-            }
+            AppEvent::Initialized(outcome) => self.apply_init_outcome(*outcome, tx),
             AppEvent::CreateBranchesLoaded(result) => {
                 if let Some(create) = self.create.as_mut() {
                     match result {
@@ -586,7 +768,7 @@ impl App {
                     match result {
                         Ok(path) => {
                             create.set_created_worktree_path(path);
-                            create.mark_complete();
+                            self.finish_create_success();
                         }
                         Err(message) => create.set_error(message),
                     }
@@ -595,16 +777,49 @@ impl App {
             AppEvent::DeleteLoaded(result) => {
                 if let Some(delete) = self.delete.as_mut() {
                     match result {
-                        Ok(worktrees) => delete.set_worktrees(worktrees),
+                        Ok(worktrees) => {
+                            delete.set_worktrees(worktrees);
+                            if !self.pending_bulk_delete_paths.is_empty() {
+                                let paths = std::mem::take(&mut self.pending_bulk_delete_paths);
+                                delete.jump_to_bulk_confirm(paths);
+                            } else if let Some(path) = self.pending_delete_path.as_deref() {
+                                delete.jump_to_confirm_path(path);
+                            }
+                        }
                         Err(message) => delete.set_error(message),
                     }
                 }
             }
             AppEvent::DeleteFinished(result) => {
-                if let Some(delete) = self.delete.as_mut() {
-                    match result {
-                        Ok(outcome) => delete.mark_complete(screen_delete_outcome(outcome)),
-                        Err(message) => delete.set_error(message),
+                let in_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false);
+                match result {
+                    Ok(outcome) => {
+                        if in_bulk {
+                            // Defer per-item branch warnings to the end of
+                            // the bulk run so they're surfaced together
+                            // with the summary toast (otherwise a long run
+                            // would flash many 5-second warning toasts
+                            // back-to-back, hiding earlier ones).
+                            if let Some(delete) = self.delete.as_mut() {
+                                delete.bulk_record_progress(outcome.branch_delete_error.clone());
+                            }
+                            self.dispatch_next_bulk_delete(tx);
+                        } else {
+                            if let Some(message) = outcome.branch_delete_error.clone() {
+                                self.show_toast(ToastVariant::Warning, message);
+                            }
+                            if let Some(delete) = self.delete.as_mut() {
+                                delete.mark_complete(screen_delete_outcome(outcome));
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        // Abort the remaining bulk run on the first failure
+                        // and surface the error.
+                        self.bulk_delete_queue.clear();
+                        if let Some(delete) = self.delete.as_mut() {
+                            delete.set_error(message);
+                        }
                     }
                 }
             }
@@ -625,6 +840,15 @@ impl App {
                     }
                 }
             }
+            AppEvent::ClipboardCopyFinished {
+                success_message,
+                error,
+            } => match error {
+                None => self.show_toast(ToastVariant::Info, success_message),
+                Some(err) => {
+                    self.show_toast(ToastVariant::Error, format!("Clipboard copy failed: {err}"))
+                }
+            },
         }
     }
 
@@ -653,13 +877,35 @@ impl App {
             Screen::Menu => {
                 self.menu = Some(self.build_menu_screen());
             }
-            Screen::List => {
+            Screen::Dashboard => {
+                let Some(git_root) = self.git_root.as_ref().map(PathBuf::from) else {
+                    return;
+                };
+                let config = self
+                    .current_config()
+                    .map(|cfg| cfg.dashboard.clone())
+                    .unwrap_or_default();
+                let mut warnings = self.current_config_warnings();
                 let has_terminal_command = self
                     .current_config()
                     .map(|cfg| !cfg.terminal_command.trim().is_empty())
                     .unwrap_or(false);
-                self.list = Some(ListScreen::new(self.is_from_wrapper, has_terminal_command));
-                kick_off_list_load(self.git_root.clone(), tx.clone());
+                let service = DashboardService::new(git_root, config.clone());
+                let gh_warning = default_dashboard_warning(&config, service.gh_available());
+                let (columns, runtime_warnings) =
+                    resolve_dashboard_columns(&config.columns, service.gh_available());
+                warnings.extend(runtime_warnings);
+                if let Some(warning) = gh_warning {
+                    warnings.push(warning);
+                }
+                self.dashboard = Some(DashboardScreen::new(
+                    self.is_from_wrapper,
+                    has_terminal_command,
+                    clipboard_available(),
+                    columns,
+                    warnings,
+                ));
+                self.dashboard_watch = Some(service.watch());
             }
             Screen::Create => {
                 self.create = Some(CreateScreen::new());
@@ -675,32 +921,17 @@ impl App {
             }
             Screen::Settings => {
                 let local_path = self.local_config_path_str();
-                let active_post_create =
-                    self.current_config().map(|cfg| cfg.post_create_cmd.clone());
-                let active_terminal_command = self
-                    .current_config()
-                    .map(|cfg| cfg.terminal_command.clone());
-                let active_path_template = self
-                    .current_config()
-                    .map(|cfg| cfg.worktree_path_template.clone());
-                let settings = match self.global_settings_snapshot() {
-                    Ok((mut config, config_path)) => {
-                        if let Some(commands) = active_post_create {
-                            config.post_create_cmd = commands;
-                        }
-                        if let Some(command) = active_terminal_command {
-                            config.terminal_command = command;
-                        }
-                        if let Some(template) = active_path_template {
-                            config.worktree_path_template = template;
-                        }
-                        SettingsScreen::new(config, config_path).with_local_config_path(local_path)
-                    }
+                let global_path = global_config_file().display().to_string();
+                let settings = match self.settings_snapshot() {
+                    Ok((config, config_path)) => SettingsScreen::new(config, config_path)
+                        .with_global_config_path(global_path)
+                        .with_local_config_path(local_path),
                     Err(err) => {
                         let mut settings = SettingsScreen::new(
                             WorktreeConfig::default(),
                             global_config_file().display().to_string(),
                         )
+                        .with_global_config_path(global_config_file().display().to_string())
                         .with_local_config_path(local_path);
                         settings.set_error(err);
                         settings
@@ -712,21 +943,98 @@ impl App {
                 self.setup = Some(SetupScreen::new(self.shell_integration_status.as_ref()));
             }
         }
+
+        if !matches!(screen, Screen::Delete) {
+            self.pending_delete_path = None;
+            self.pending_bulk_delete_paths.clear();
+            self.bulk_delete_queue.clear();
+        }
     }
 
     fn clear_screen_state(&mut self) {
         self.menu = None;
-        self.list = None;
+        self.dashboard = None;
+        self.dashboard_watch = None;
         self.create = None;
         self.delete = None;
         self.settings = None;
         self.setup = None;
+        self.mouse_selection = None;
     }
 
     fn back_to_menu(&mut self) {
         self.clear_screen_state();
         self.screen = Screen::Menu;
+        self.pending_delete_path = None;
+        self.pending_bulk_delete_paths.clear();
+        self.bulk_delete_queue.clear();
         self.menu = Some(self.build_menu_screen());
+    }
+
+    fn finish_create_success(&mut self) {
+        let navigate = self
+            .create
+            .as_ref()
+            .map(|c| c.navigate_after_create)
+            .unwrap_or(false);
+        let path = self
+            .create
+            .as_ref()
+            .and_then(|c| c.created_worktree_path().map(str::to_string));
+
+        self.show_toast(ToastVariant::Success, CREATE_SUCCESS);
+
+        if navigate {
+            if let Some(path) = path {
+                if self.is_from_wrapper {
+                    self.selected_path = Some(path);
+                    self.quit_requested = true;
+                    return;
+                }
+                if let Some(config) = self.current_config() {
+                    if !config.terminal_command.trim().is_empty() {
+                        let _ = open_terminal(&config.terminal_command, &path);
+                    }
+                }
+            }
+        }
+
+        self.back_to_menu();
+    }
+
+    fn poll_dashboard_updates(&mut self) {
+        let Some(watch) = self.dashboard_watch.as_mut() else {
+            return;
+        };
+        let mut rows_batch = Vec::new();
+        let mut notices = Vec::new();
+        while let Ok(rows) = watch.rx.try_recv() {
+            rows_batch.push(rows);
+        }
+        while let Ok(notice) = watch.notice_rx.try_recv() {
+            notices.push(notice);
+        }
+
+        if let Some(screen) = self.dashboard.as_mut() {
+            for rows in rows_batch {
+                screen.set_rows(rows);
+            }
+        }
+        let has_rows = self
+            .dashboard
+            .as_ref()
+            .is_some_and(DashboardScreen::has_rows);
+        for notice in notices {
+            if has_rows {
+                self.show_toast(ToastVariant::Error, notice);
+            } else if let Some(screen) = self.dashboard.as_mut() {
+                screen.set_error(notice);
+            }
+        }
+    }
+
+    fn show_toast(&mut self, variant: ToastVariant, message: impl Into<String>) {
+        self.toast.show(message, variant);
     }
 
     fn build_menu_screen(&self) -> MenuScreen {
@@ -745,7 +1053,21 @@ impl App {
             .map(|service| service.config_service().config())
     }
 
-    fn global_settings_snapshot(&self) -> Result<(WorktreeConfig, String), String> {
+    fn current_config_warnings(&self) -> Vec<String> {
+        self.worktree_service
+            .as_ref()
+            .map(|service| service.config_service().warnings().to_vec())
+            .unwrap_or_default()
+    }
+
+    fn settings_snapshot(&self) -> Result<(WorktreeConfig, String), String> {
+        if let Some(service) = self.worktree_service.as_ref() {
+            let config_service = service.config_service();
+            if let Some(path) = config_service.config_path() {
+                return Ok((config_service.config().clone(), path.display().to_string()));
+            }
+        }
+
         let mut config_service = ConfigService::new();
         let config = config_service.load_global().map_err(|e| e.to_string())?;
         let path = config_service
@@ -765,28 +1087,36 @@ impl App {
     }
 
     fn save_delete_branch_with_worktree(&mut self, enabled: bool) -> Result<(), String> {
-        let mut config_service = ConfigService::new();
-        let mut config = config_service.load_global().map_err(|e| e.to_string())?;
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
         config.delete_branch_with_worktree = enabled;
-        config_service
-            .save(&config, None)
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
             .map_err(|e| e.to_string())?;
 
-        if self.active_config_uses_global() {
-            let service = self
-                .worktree_service
-                .as_mut()
-                .ok_or_else(|| "Worktree service not initialized".to_string())?;
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
             service
                 .config_service_mut()
-                .load_global()
+                .load(project_path)
                 .map_err(|e| e.to_string())?;
         }
 
-        let path = config_service
-            .config_path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| global_config_file().display().to_string());
+        let path = target_path.display().to_string();
 
         if let Some(settings) = self.settings.as_mut() {
             settings.set_config(config, path);
@@ -953,11 +1283,7 @@ impl App {
     }
 
     fn refresh_settings_screen(&mut self) -> Result<(), String> {
-        let active_post_create = self.current_config().map(|cfg| cfg.post_create_cmd.clone());
-        let (mut config, path) = self.global_settings_snapshot()?;
-        if let Some(commands) = active_post_create {
-            config.post_create_cmd = commands;
-        }
+        let (config, path) = self.settings_snapshot()?;
 
         if let Some(settings) = self.settings.as_mut() {
             settings.set_config(config, path);
@@ -1037,18 +1363,10 @@ fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
             Ok(()) => Ok(service),
             Err(e) => Err(user_friendly_message(&e)),
         };
-        let _ = tx.send(AppEvent::Initialized(InitOutcome { git_root, result }));
-    });
-}
-
-fn kick_off_list_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEvent>) {
-    tokio::spawn(async move {
-        let service = GitService::new(git_root.map(PathBuf::from));
-        let result = service
-            .list_worktrees()
-            .await
-            .map_err(|e| user_friendly_message(&e));
-        let _ = tx.send(AppEvent::ListLoaded(result));
+        let _ = tx.send(AppEvent::Initialized(Box::new(InitOutcome {
+            git_root,
+            result,
+        })));
     });
 }
 
@@ -1125,6 +1443,23 @@ fn kick_off_update_check(tx: mpsc::UnboundedSender<AppEvent>) {
     });
 }
 
+fn kick_off_clipboard_copy(
+    value: String,
+    success_message: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || copy_to_clipboard(&value))
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|inner| inner);
+        let _ = tx.send(AppEvent::ClipboardCopyFinished {
+            success_message,
+            error: result.err(),
+        });
+    });
+}
+
 fn kick_off_setup_install(shell: Shell, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
@@ -1148,6 +1483,142 @@ fn screen_delete_outcome(outcome: ServiceDeleteOutcome) -> ScreenDeleteOutcome {
     }
 }
 
+fn copy_to_clipboard(value: &str) -> std::result::Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| err.to_string())?;
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err("clipboard stdin unavailable".to_string());
+        };
+        stdin
+            .write_all(value.as_bytes())
+            .map_err(|err| err.to_string())?;
+        // Drop stdin to signal EOF — pbcopy reads until the pipe closes and
+        // child.wait() would otherwise deadlock the UI thread.
+        drop(stdin);
+        let status = child.wait().map_err(|err| err.to_string())?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err("pbcopy exited unsuccessfully".to_string())
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+
+        for program in ["wl-copy", "xclip"] {
+            let mut command = std::process::Command::new(program);
+            if program == "xclip" {
+                command.args(["-selection", "clipboard"]);
+            }
+            match command.stdin(std::process::Stdio::piped()).spawn() {
+                Ok(mut child) => {
+                    let Some(mut stdin) = child.stdin.take() else {
+                        continue;
+                    };
+                    let _ = stdin.write_all(value.as_bytes());
+                    drop(stdin);
+                    if child.wait().map(|status| status.success()).unwrap_or(false) {
+                        return Ok(());
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        return Err("no supported clipboard tool found".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Write;
+
+        let mut child = std::process::Command::new("clip")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| err.to_string())?;
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err("clipboard stdin unavailable".to_string());
+        };
+        stdin
+            .write_all(value.as_bytes())
+            .map_err(|err| err.to_string())?;
+        drop(stdin);
+        let status = child.wait().map_err(|err| err.to_string())?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err("clip exited unsuccessfully".to_string())
+        };
+    }
+
+    #[allow(unreachable_code)]
+    Err("clipboard is unavailable on this platform".to_string())
+}
+
+fn fold_path(path: &str) -> String {
+    crate::tui::widgets::welcome_header::fold_home(path)
+}
+
+fn clipboard_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return command_in_path("pbcopy");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return command_in_path("wl-copy") || command_in_path("xclip");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return command_in_path("clip") || command_in_path("clip.exe");
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+fn command_in_path(program: &str) -> bool {
+    let Some(path_var) = env::var_os("PATH") else {
+        return false;
+    };
+    let candidates = candidate_program_names(program);
+
+    env::split_paths(&path_var).any(|directory| {
+        candidates
+            .iter()
+            .map(|name| directory.join(name))
+            .any(|candidate| candidate.is_file())
+    })
+}
+
+fn candidate_program_names(program: &str) -> Vec<OsString> {
+    #[cfg(not(target_os = "windows"))]
+    let candidates = vec![OsString::from(program)];
+
+    #[cfg(target_os = "windows")]
+    let mut candidates = vec![OsString::from(program)];
+
+    #[cfg(target_os = "windows")]
+    {
+        if !program.contains('.') {
+            candidates.push(OsString::from(format!("{program}.exe")));
+            candidates.push(OsString::from(format!("{program}.cmd")));
+            candidates.push(OsString::from(format!("{program}.bat")));
+        }
+    }
+
+    candidates
+}
+
 fn reset_global_config() -> Result<(), String> {
     let mut svc = ConfigService::new();
     svc.create_global_config()
@@ -1160,9 +1631,10 @@ mod tests {
     use super::*;
     use crate::config::schema::WorktreeConfig;
     use crate::config::service::ConfigService;
-    use crate::git::types::GitWorktree;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::fs;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -1196,39 +1668,8 @@ mod tests {
         }
     }
 
-    fn ready_app(is_from_wrapper: bool) -> App {
-        let mut app = App::new(AppMode::List, is_from_wrapper);
-        app.phase = InitPhase::Ready;
-        app.screen = Screen::List;
-        let mut list = ListScreen::new(is_from_wrapper, false);
-        list.set_worktrees(vec![
-            GitWorktree {
-                path: "/tmp/repo".into(),
-                branch: "main".into(),
-                commit: "deadbeef".into(),
-                is_main: true,
-                is_clean: true,
-                branch_status: None,
-            },
-            GitWorktree {
-                path: "/tmp/repo-feat".into(),
-                branch: "feat".into(),
-                commit: "cafebabe".into(),
-                is_main: false,
-                is_clean: true,
-                branch_status: None,
-            },
-        ]);
-        app.list = Some(list);
-        app
-    }
-
     fn initialized_menu_app() -> App {
-        let mut config_service = ConfigService::new();
-        let _ = config_service.create_global_config();
-
-        let mut service = WorktreeService::new(None);
-        let _ = service.config_service_mut().create_global_config();
+        let service = WorktreeService::new(None);
 
         let mut app = App::new(AppMode::Menu, false);
         app.phase = InitPhase::Ready;
@@ -1253,7 +1694,7 @@ mod tests {
 
     #[test]
     fn new_app_remembers_from_wrapper_flag() {
-        let app = App::new(AppMode::List, true);
+        let app = App::new(AppMode::Dashboard, true);
         assert!(app.is_from_wrapper);
         assert!(app.selected_path().is_none());
     }
@@ -1295,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_delete_branch_toggle_updates_global_config_file() {
+    fn settings_delete_branch_toggle_updates_global_config_file_when_local_missing() {
         with_home(|home| {
             let mut config_service = ConfigService::new();
             let global_path = home.path().join(".wisetree").join("settings.json");
@@ -1329,6 +1770,10 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
             assert!(saved.delete_branch_with_worktree);
             assert_eq!(saved.terminal_command, "code $WORKTREE_PATH");
+            assert_eq!(
+                app.settings.as_ref().unwrap().config_path(),
+                global_path.display().to_string()
+            );
             assert!(
                 app.settings
                     .as_ref()
@@ -1341,6 +1786,147 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .config_service()
+                    .config()
+                    .delete_branch_with_worktree
+            );
+        });
+    }
+
+    #[test]
+    fn settings_delete_branch_toggle_updates_local_config_file_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                terminal_command: "global $WORKTREE_PATH".into(),
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                terminal_command: "local $WORKTREE_PATH".into(),
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.screen = Screen::Settings;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let tx = app_event_tx();
+            app.enter_screen(Screen::Settings, &tx);
+
+            for _ in 0..5 {
+                app.handle_key(key(KeyCode::Down), &tx);
+            }
+            app.handle_key(key(KeyCode::Enter), &tx);
+            app.handle_key(key(KeyCode::Char('y')), &tx);
+            app.handle_key(key(KeyCode::Enter), &tx);
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert!(saved_local.delete_branch_with_worktree);
+            assert_eq!(saved_local.terminal_command, "local $WORKTREE_PATH");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert!(!saved_global.delete_branch_with_worktree);
+            assert_eq!(saved_global.terminal_command, "global $WORKTREE_PATH");
+
+            assert_eq!(
+                app.settings.as_ref().unwrap().config_path(),
+                local_path.display().to_string()
+            );
+            assert!(
+                app.settings
+                    .as_ref()
+                    .unwrap()
+                    .config()
+                    .delete_branch_with_worktree
+            );
+            assert!(
+                app.worktree_service
+                    .as_ref()
+                    .unwrap()
+                    .config_service()
+                    .config()
+                    .delete_branch_with_worktree
+            );
+            assert_eq!(
+                app.worktree_service
+                    .as_ref()
+                    .unwrap()
+                    .config_service()
+                    .config_path(),
+                Some(local_path.as_path())
+            );
+        });
+    }
+
+    #[test]
+    fn settings_reenter_uses_local_delete_branch_value_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.screen = Screen::Settings;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let tx = app_event_tx();
+            app.enter_screen(Screen::Settings, &tx);
+
+            for _ in 0..5 {
+                app.handle_key(key(KeyCode::Down), &tx);
+            }
+            app.handle_key(key(KeyCode::Enter), &tx);
+            app.handle_key(key(KeyCode::Char('y')), &tx);
+            app.handle_key(key(KeyCode::Enter), &tx);
+
+            app.back_to_menu();
+            app.enter_screen(Screen::Settings, &tx);
+
+            assert_eq!(
+                app.settings.as_ref().unwrap().config_path(),
+                local_path.display().to_string()
+            );
+            assert!(
+                app.settings
+                    .as_ref()
+                    .unwrap()
                     .config()
                     .delete_branch_with_worktree
             );
@@ -1460,37 +2046,6 @@ mod tests {
                 &local
             );
         });
-    }
-
-    #[test]
-    fn list_navigate_to_in_wrapper_mode_sets_selected_path_and_quits() {
-        let mut app = ready_app(true);
-        let tx = app_event_tx();
-        // The main worktree is the first row, so two Enters navigate to it.
-        app.handle_key(key(KeyCode::Enter), &tx);
-        app.handle_key(key(KeyCode::Enter), &tx);
-        assert_eq!(app.selected_path(), Some("/tmp/repo"));
-        assert!(app.quit_requested);
-    }
-
-    #[test]
-    fn list_navigate_to_outside_wrapper_does_not_emit_path() {
-        let mut app = ready_app(false);
-        let tx = app_event_tx();
-        app.handle_key(key(KeyCode::Enter), &tx);
-        app.handle_key(key(KeyCode::Enter), &tx);
-        assert!(app.selected_path().is_none());
-        assert!(!app.quit_requested);
-    }
-
-    #[test]
-    fn list_esc_returns_to_menu_with_no_selected_path() {
-        let mut app = ready_app(true);
-        let tx = app_event_tx();
-        app.handle_key(key(KeyCode::Esc), &tx);
-        assert!(app.selected_path().is_none());
-        assert_eq!(app.screen, Screen::Menu);
-        assert!(!app.quit_requested);
     }
 
     #[test]
@@ -1661,7 +2216,8 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits_without_emitting_path() {
-        let mut app = ready_app(true);
+        let mut app = App::new(AppMode::Dashboard, true);
+        app.phase = InitPhase::Ready;
         let tx = app_event_tx();
         let ctrl_c = KeyEvent {
             code: KeyCode::Char('c'),
@@ -1672,5 +2228,110 @@ mod tests {
         app.handle_key(ctrl_c, &tx);
         assert!(app.quit_requested);
         assert!(app.selected_path().is_none());
+    }
+
+    #[test]
+    fn create_finished_returns_to_menu_with_success_toast() {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::Create;
+        app.menu = None;
+        app.create = Some(CreateScreen::new());
+        if let Some(create) = app.create.as_mut() {
+            create.navigate_after_create = false;
+        }
+
+        app.handle_app_event(
+            AppEvent::CreateFinished(Ok(PathBuf::from("/tmp/repo/feat-x"))),
+            &app_event_tx(),
+        );
+
+        assert_eq!(app.screen, Screen::Menu);
+        assert!(app.create.is_none());
+
+        let toast = app.toast.current().expect("toast should be shown");
+        assert_eq!(toast.variant, ToastVariant::Success);
+        assert_eq!(toast.message, CREATE_SUCCESS);
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let dumped = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(dumped.contains("Choose wisely"));
+        assert!(dumped.contains(CREATE_SUCCESS));
+    }
+
+    #[test]
+    fn create_finished_in_wrapper_mode_selects_path_and_quits() {
+        let service = WorktreeService::new(None);
+        let mut app = App::new(AppMode::Create, true);
+        app.phase = InitPhase::Ready;
+        app.screen = Screen::Create;
+        app.worktree_service = Some(service);
+        app.git_root = Some("/tmp/repo".into());
+        app.create = Some(CreateScreen::new());
+
+        app.handle_app_event(
+            AppEvent::CreateFinished(Ok(PathBuf::from("/tmp/repo/feat-x"))),
+            &app_event_tx(),
+        );
+
+        assert!(app.quit_requested);
+        assert_eq!(app.selected_path(), Some("/tmp/repo/feat-x"));
+    }
+
+    #[test]
+    fn delete_finished_with_branch_warning_shows_toast() {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::Delete;
+        app.delete = Some(DeleteScreen::new(true));
+
+        app.handle_app_event(
+            AppEvent::DeleteFinished(Ok(ServiceDeleteOutcome {
+                worktree_deleted: true,
+                branch_deleted: false,
+                branch_name: Some("ignore-local".into()),
+                branch_delete_error: Some(
+                    "Branch 'ignore-local' was kept.\nerror: the branch 'ignore-local' is not fully merged"
+                        .into(),
+                ),
+            })),
+            &app_event_tx(),
+        );
+
+        let toast = app.toast.current().expect("toast should be shown");
+        assert_eq!(toast.variant, ToastVariant::Warning);
+        assert!(toast.message.contains("ignore-local"));
+        assert!(toast.message.contains("not fully merged"));
+        assert_eq!(
+            app.delete.as_ref().unwrap().step(),
+            screens::delete::DeleteStep::Success
+        );
+    }
+
+    #[test]
+    fn draw_renders_active_toast_overlay() {
+        let mut app = initialized_menu_app();
+        app.show_toast(ToastVariant::Info, "Copied to clipboard");
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let dumped = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(dumped.contains("Choose wisely"));
+        assert!(dumped.contains("Copied to clipboard"));
     }
 }

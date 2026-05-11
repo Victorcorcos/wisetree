@@ -31,6 +31,9 @@ use crate::tui::widgets::{
     SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
+const BULK_DELETE_CONFIRM_PROMPT: &str = "Are you sure you want to delete all these worktrees?";
+const BULK_DELETE_BRANCH_WARNING: &str = "This will also delete their branches!";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteStep {
     Select,
@@ -50,7 +53,16 @@ pub struct DeleteOutcome {
 pub enum DeleteAction {
     Continue,
     Cancelled,
-    Confirmed { path: String, force: bool },
+    Confirmed {
+        path: String,
+        force: bool,
+    },
+    /// User confirmed a bulk delete from the dashboard's status buttons.
+    /// Items are pre-resolved to `(path, force)` so the caller can pipe
+    /// them one-at-a-time through `kick_off_delete_worktree`.
+    BulkConfirmed {
+        items: Vec<(String, bool)>,
+    },
     Done,
 }
 
@@ -64,6 +76,21 @@ pub struct DeleteScreen {
     select: Option<SelectPrompt<String>>,
     confirm: Option<ConfirmDialog>,
     outcome: Option<DeleteOutcome>,
+    /// True when we bypassed the Select step (dashboard's Backspace
+    /// shortcut). Esc on Confirm should then cancel the whole screen
+    /// instead of falling back to Select.
+    entered_via_jump: bool,
+    /// Paths queued for a bulk delete from the dashboard. Empty for
+    /// single-target deletions.
+    bulk_paths: Vec<String>,
+    /// Total worktrees in the active bulk run — used to render
+    /// "Deleting (i of N)" progress.
+    bulk_total: usize,
+    /// Number of bulk items already deleted in the active run.
+    bulk_completed: usize,
+    /// Bulk-delete sub-failures (e.g. "branch X could not be removed")
+    /// that should be surfaced after the run completes.
+    bulk_warnings: Vec<String>,
     pub tick: usize,
 }
 
@@ -79,8 +106,43 @@ impl DeleteScreen {
             select: None,
             confirm: None,
             outcome: None,
+            entered_via_jump: false,
+            bulk_paths: Vec::new(),
+            bulk_total: 0,
+            bulk_completed: 0,
+            bulk_warnings: Vec::new(),
             tick: 0,
         }
+    }
+
+    pub fn is_bulk(&self) -> bool {
+        !self.bulk_paths.is_empty() || self.bulk_total > 0
+    }
+
+    pub fn bulk_progress(&self) -> Option<(usize, usize)> {
+        if self.bulk_total == 0 {
+            None
+        } else {
+            Some((self.bulk_completed, self.bulk_total))
+        }
+    }
+
+    /// Returns the toast-ready summary for a finished bulk run plus any
+    /// per-item warnings collected during the run (e.g. branches that
+    /// could not be removed). Returns `None` when the screen was not
+    /// running a bulk delete.
+    pub fn take_bulk_summary(&mut self) -> Option<(String, Vec<String>)> {
+        if self.bulk_total == 0 {
+            return None;
+        }
+        let count = self.bulk_completed;
+        let label = if count == 1 { "worktree" } else { "worktrees" };
+        let message = format!("{count} {label} deleted successfully");
+        let warnings = std::mem::take(&mut self.bulk_warnings);
+        self.bulk_paths.clear();
+        self.bulk_total = 0;
+        self.bulk_completed = 0;
+        Some((message, warnings))
     }
 
     pub fn step(&self) -> DeleteStep {
@@ -115,6 +177,58 @@ impl DeleteScreen {
         self.select = Some(self.build_select());
     }
 
+    pub fn preselect_path(&mut self, path: &str) {
+        let Some(select) = self.select.as_mut() else {
+            return;
+        };
+        if let Some(index) = self
+            .worktrees
+            .iter()
+            .position(|worktree| worktree.path == path)
+        {
+            select.selected = index;
+        }
+    }
+
+    /// Like `preselect_path`, but also bypasses the worktree picker and
+    /// advances straight to the per-worktree confirmation dialog. Used by
+    /// the dashboard's Backspace shortcut to make deletion a one-key action.
+    pub fn jump_to_confirm_path(&mut self, path: &str) {
+        if !self.worktrees.iter().any(|worktree| worktree.path == path) {
+            return;
+        }
+        self.preselect_path(path);
+        self.selected_path = Some(path.to_string());
+        self.confirm = self.build_confirm();
+        if self.confirm.is_some() {
+            self.step = DeleteStep::Confirm;
+            self.entered_via_jump = true;
+        }
+    }
+
+    /// Bypasses the worktree picker and opens a multi-target confirmation
+    /// dialog for the given paths. Used by the dashboard's bulk-delete
+    /// buttons. Paths not present in the loaded worktree list (or the
+    /// non-deletable main worktree) are dropped silently.
+    pub fn jump_to_bulk_confirm(&mut self, paths: Vec<String>) {
+        let filtered: Vec<String> = paths
+            .into_iter()
+            .filter(|p| self.worktrees.iter().any(|w| &w.path == p))
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        self.bulk_paths = filtered;
+        self.bulk_total = self.bulk_paths.len();
+        self.bulk_completed = 0;
+        self.bulk_warnings.clear();
+        if let Some(dialog) = self.build_bulk_confirm() {
+            self.confirm = Some(dialog);
+            self.step = DeleteStep::Confirm;
+            self.entered_via_jump = true;
+        }
+    }
+
     pub fn set_error(&mut self, message: String) {
         self.error = Some(message);
         self.loading = false;
@@ -130,6 +244,27 @@ impl DeleteScreen {
         self.outcome = Some(outcome);
         self.step = DeleteStep::Success;
         self.loading = false;
+    }
+
+    /// Records one finished sub-deletion in an active bulk run. The
+    /// optional `warning` is surfaced after the run finishes (e.g. when
+    /// the worktree was removed but its branch could not be deleted).
+    pub fn bulk_record_progress(&mut self, warning: Option<String>) {
+        if self.bulk_total == 0 {
+            return;
+        }
+        self.bulk_completed = self.bulk_completed.saturating_add(1);
+        if let Some(message) = warning {
+            self.bulk_warnings.push(message);
+        }
+    }
+
+    /// Marks the bulk run as finished. Transitions to `Success` and
+    /// rolls the accumulated counts into the displayed message.
+    pub fn mark_bulk_complete(&mut self) {
+        self.step = DeleteStep::Success;
+        self.loading = false;
+        self.outcome = Some(DeleteOutcome::default());
     }
 
     fn selected(&self) -> Option<&GitWorktree> {
@@ -239,6 +374,54 @@ impl DeleteScreen {
         )
     }
 
+    fn build_bulk_confirm(&self) -> Option<ConfirmDialog> {
+        if self.bulk_paths.is_empty() {
+            return None;
+        }
+
+        let white = Style::default().fg(colors::WHITE);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(BULK_DELETE_CONFIRM_PROMPT, white)));
+        lines.push(Line::from(""));
+
+        for (index, path) in self.bulk_paths.iter().enumerate() {
+            let label = self
+                .worktrees
+                .iter()
+                .find(|w| &w.path == path)
+                .map(|w| format!("{}. {} [{}]", index + 1, fold_home(&w.path), w.branch))
+                .unwrap_or_else(|| format!("{}. {}", index + 1, fold_home(path)));
+            lines.push(Line::from(Span::styled(label, white)));
+        }
+        lines.push(Line::from(""));
+
+        let (warning_text, warning_color) = if self.delete_branch_with_worktree {
+            (BULK_DELETE_BRANCH_WARNING, colors::ERROR)
+        } else {
+            (DELETE_WARNING, colors::WARNING)
+        };
+        lines.push(Line::from(Span::styled(
+            warning_text,
+            Style::default()
+                .fg(warning_color)
+                .add_modifier(Modifier::BOLD),
+        )));
+
+        let variant = if self.delete_branch_with_worktree {
+            ConfirmVariant::Danger
+        } else {
+            ConfirmVariant::Warning
+        };
+
+        Some(
+            ConfirmDialog::new(DELETE_CONFIRM_TITLE.to_string(), String::new())
+                .with_message_lines(lines)
+                .with_labels("Yes", "No")
+                .with_variant(variant)
+                .with_default(ConfirmChoice::Cancel),
+        )
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DeleteAction {
         // The success step is terminal — handle it before any loading/empty
         // gates so the caller can dismiss it even when nothing else is set.
@@ -301,6 +484,22 @@ impl DeleteScreen {
         };
         match outcome {
             ConfirmOutcome::Confirmed => {
+                if !self.bulk_paths.is_empty() {
+                    let items: Vec<(String, bool)> = self
+                        .bulk_paths
+                        .iter()
+                        .filter_map(|p| {
+                            self.worktrees
+                                .iter()
+                                .find(|w| &w.path == p)
+                                .map(|w| (w.path.clone(), !w.is_clean))
+                        })
+                        .collect();
+                    if items.is_empty() {
+                        return DeleteAction::Cancelled;
+                    }
+                    return DeleteAction::BulkConfirmed { items };
+                }
                 let wt = match self.selected() {
                     Some(w) => w,
                     None => {
@@ -314,8 +513,12 @@ impl DeleteScreen {
             }
             ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => {
                 self.confirm = None;
-                self.step = DeleteStep::Select;
-                DeleteAction::Continue
+                if self.entered_via_jump {
+                    DeleteAction::Cancelled
+                } else {
+                    self.step = DeleteStep::Select;
+                    DeleteAction::Continue
+                }
             }
             ConfirmOutcome::Pending => DeleteAction::Continue,
         }
@@ -334,9 +537,21 @@ impl DeleteScreen {
             DeleteStep::Select => {
                 let visible = (self.worktrees.len() as u16).min(10);
                 let overflow = if self.worktrees.len() > 10 { 2 } else { 0 };
-                7 + visible + overflow
+                6 + visible + overflow
             }
-            DeleteStep::Confirm => 10,
+            DeleteStep::Confirm => {
+                // Bulk confirm renders prompt + blank + N path lines +
+                // blank + warning inside the dialog message area, plus
+                // title + spacer + 3-line buttons + 2-line hint. Allow
+                // the panel to grow with the number of items so paths
+                // aren't clipped to a single visible row.
+                if self.bulk_total > 0 {
+                    let item_count = self.bulk_paths.len().max(self.bulk_total) as u16;
+                    11u16.saturating_add(item_count)
+                } else {
+                    10
+                }
+            }
             DeleteStep::Deleting => 3,
             DeleteStep::Success => 3,
         }
@@ -399,11 +614,26 @@ impl DeleteScreen {
                 }
             }
             DeleteStep::Deleting => {
-                let branch = self
-                    .selected()
-                    .map(|w| w.branch.clone())
-                    .unwrap_or_default();
-                let msg = format!("{DELETE_DELETING} ({branch})");
+                let msg = if let Some((completed, total)) = self.bulk_progress() {
+                    let current_index = completed.saturating_add(1).min(total);
+                    let branch = self
+                        .bulk_paths
+                        .get(completed)
+                        .and_then(|p| self.worktrees.iter().find(|w| &w.path == p))
+                        .map(|w| w.branch.clone())
+                        .unwrap_or_default();
+                    if branch.is_empty() {
+                        format!("{DELETE_DELETING} ({current_index} of {total})")
+                    } else {
+                        format!("{DELETE_DELETING} ({current_index} of {total}: {branch})")
+                    }
+                } else {
+                    let branch = self
+                        .selected()
+                        .map(|w| w.branch.clone())
+                        .unwrap_or_default();
+                    format!("{DELETE_DELETING} ({branch})")
+                };
                 StatusIndicator::new(Status::Loading, msg)
                     .with_tick(self.tick)
                     .render(frame, area);
@@ -429,6 +659,14 @@ impl DeleteScreen {
     }
 
     fn success_message(&self) -> String {
+        if self.bulk_total > 0 {
+            let label = if self.bulk_completed == 1 {
+                "worktree"
+            } else {
+                "worktrees"
+            };
+            return format!("{} {label} deleted successfully", self.bulk_completed);
+        }
         match &self.outcome {
             Some(o) => {
                 if o.branch_deleted {

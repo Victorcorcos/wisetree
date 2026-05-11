@@ -49,8 +49,8 @@ fn from_wrapper_flag_detected() {
 fn mode_flag_sets_mode() {
     let p = parse_args::<Vec<String>>(vec!["--mode".into(), "create".into()]).unwrap();
     assert_eq!(p.mode, AppMode::Create);
-    let p = parse_args::<Vec<String>>(vec!["-m".into(), "list".into()]).unwrap();
-    assert_eq!(p.mode, AppMode::List);
+    let p = parse_args::<Vec<String>>(vec!["-m".into(), "delete".into()]).unwrap();
+    assert_eq!(p.mode, AppMode::Delete);
 }
 
 #[test]
@@ -93,11 +93,26 @@ fn create_with_required_flags_is_non_interactive() {
 }
 
 #[test]
-fn list_json_flag_triggers_non_interactive() {
-    let p = parse_args::<Vec<String>>(vec!["list".into(), "--json".into()]).unwrap();
+fn dashboard_json_flag_triggers_non_interactive() {
+    let p = parse_args::<Vec<String>>(vec!["dashboard".into(), "--json".into()]).unwrap();
     let args = p.cli_args.expect("must be cli");
-    assert_eq!(args.command, CliCommand::List);
+    assert_eq!(p.mode, AppMode::Dashboard);
+    assert_eq!(args.command, CliCommand::Dashboard);
     assert!(args.json);
+}
+
+#[test]
+fn dashboard_watch_flag_is_supported() {
+    let p = parse_args::<Vec<String>>(vec!["dashboard".into(), "--watch".into()]).unwrap();
+    let args = p.cli_args.expect("must be cli");
+    assert_eq!(args.command, CliCommand::Dashboard);
+    assert!(args.watch);
+}
+
+#[test]
+fn mode_dashboard_is_supported() {
+    let p = parse_args::<Vec<String>>(vec!["--mode".into(), "dashboard".into()]).unwrap();
+    assert_eq!(p.mode, AppMode::Dashboard);
 }
 
 #[test]

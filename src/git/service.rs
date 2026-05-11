@@ -104,14 +104,44 @@ impl GitService {
             first.is_main = true;
         }
 
-        for wt in worktrees.iter_mut() {
+        // `default_branch`/`current_branch` query the main repo, not each
+        // worktree — hoist them out so we pay for them once instead of once
+        // per worktree.
+        let (default_branch, current_branch) =
+            tokio::join!(self.default_branch(), self.current_branch());
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, wt) in worktrees.iter().enumerate() {
             let path = PathBuf::from(&wt.path);
-            wt.is_clean = self.is_worktree_clean(&path).await;
-            if wt.branch.is_empty() {
-                wt.branch = "detached".to_string();
-            } else {
-                wt.branch_status = self.branch_status(&wt.branch).await;
-            }
+            let branch = wt.branch.clone();
+            let git_root = self.git_root.clone();
+            let default_branch = default_branch.clone();
+            let current_branch = current_branch.clone();
+            tasks.spawn(async move {
+                let is_clean = is_worktree_clean_at(&path).await;
+                let (resolved_branch, branch_status) = if branch.is_empty() {
+                    ("detached".to_string(), None)
+                } else {
+                    let status = compute_branch_status(
+                        &git_root,
+                        &default_branch,
+                        current_branch.as_deref(),
+                        &branch,
+                    )
+                    .await;
+                    (branch, status)
+                };
+                (index, is_clean, resolved_branch, branch_status)
+            });
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            let (index, is_clean, branch, branch_status) = joined
+                .map_err(|err| WisetreeError::other(format!("list worktrees task: {err}")))?;
+            let wt = &mut worktrees[index];
+            wt.is_clean = is_clean;
+            wt.branch = branch;
+            wt.branch_status = branch_status;
         }
 
         Ok(worktrees)
@@ -405,4 +435,44 @@ fn parse_checkout_target(line: &str) -> Option<&str> {
 
 fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn is_worktree_clean_at(worktree_path: &Path) -> bool {
+    let result = execute_git_command(&["status", "--porcelain"], Some(worktree_path)).await;
+    result.success && result.stdout.trim().is_empty()
+}
+
+async fn compute_branch_status(
+    git_root: &Path,
+    default_branch: &str,
+    current_branch: Option<&str>,
+    branch_name: &str,
+) -> Option<BranchStatus> {
+    let candidates: [Option<&str>; 2] = [Some(default_branch), current_branch];
+    for compare in candidates.into_iter().flatten() {
+        if compare.is_empty() || compare == branch_name {
+            continue;
+        }
+        let result = execute_git_command(
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{compare}...{branch_name}"),
+            ],
+            Some(git_root),
+        )
+        .await;
+        if result.success {
+            let mut parts = result.stdout.split('\t');
+            let behind = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let ahead = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            return Some(BranchStatus {
+                ahead,
+                behind,
+                upstream_branch: Some(compare.to_string()),
+            });
+        }
+    }
+    None
 }

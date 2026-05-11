@@ -76,9 +76,12 @@ fn menu_default_shows_five_entries_when_shell_status_unknown() {
     let menu = MenuScreen::new(0, None, None);
     assert!(!menu.has_setup_entry());
     let dumped = dump(80, 18, |f| menu.render(f, f.area()));
-    assert!(dumped.contains("Create new worktree"));
-    assert!(dumped.contains("List worktrees"));
-    assert!(dumped.contains("Delete worktree"));
+    assert!(dumped.contains("Create"));
+    assert!(!dumped.contains("Create new worktree"));
+    assert!(!dumped.contains("List worktrees"));
+    assert!(dumped.contains("Dashboard"));
+    assert!(dumped.contains("Delete"));
+    assert!(!dumped.contains("Delete worktree"));
     assert!(dumped.contains("Settings"));
     assert!(dumped.contains("Exit"));
     assert!(!dumped.contains("Setup Shell Integration"));
@@ -178,14 +181,11 @@ fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
     assert_text_style(&buffer, "Choose wisely...", colors::INFO, colors::MENU_BG);
     assert_text_style(
         &buffer,
-        "Create new worktree",
+        "Create",
         colors::MENU_SELECTION_FG,
         colors::MENU_SELECTION_BG,
     );
-    // The non-selected "List worktrees" row keeps the menu body color
-    // for the verb but applies the brand purple to the noun.
-    assert_text_style(&buffer, "List ", colors::MENU_TEXT, colors::MENU_BG);
-    assert_text_style(&buffer, "worktrees", colors::BRAND, colors::MENU_BG);
+    assert_text_style(&buffer, "Dashboard", colors::MENU_TEXT, colors::MENU_BG);
     assert_text_style(&buffer, "Nav", colors::MENU_TEXT, colors::STATUS_BG);
     assert_text_style(
         &buffer,

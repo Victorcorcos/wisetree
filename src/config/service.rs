@@ -24,6 +24,7 @@ pub struct ResolvedConfig {
 pub struct ConfigService {
     config: WorktreeConfig,
     config_path: Option<PathBuf>,
+    warnings: Vec<String>,
 }
 
 impl Default for ConfigService {
@@ -37,6 +38,7 @@ impl ConfigService {
         Self {
             config: WorktreeConfig::default(),
             config_path: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -50,6 +52,10 @@ impl ConfigService {
         self.config_path.as_deref()
     }
 
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     /// Apply a partial update in-memory.
     pub fn update(&mut self, mut f: impl FnMut(&mut WorktreeConfig)) -> WorktreeConfig {
         f(&mut self.config);
@@ -59,6 +65,7 @@ impl ConfigService {
     /// Reset the in-memory config to defaults (does not touch disk).
     pub fn reset(&mut self) -> WorktreeConfig {
         self.config = WorktreeConfig::default();
+        self.warnings.clear();
         self.config.clone()
     }
 
@@ -72,6 +79,7 @@ impl ConfigService {
             return self.load_from_path(path);
         }
 
+        self.warnings.clear();
         Ok(self.config.clone())
     }
 
@@ -98,6 +106,7 @@ impl ConfigService {
 
         self.config = config.clone();
         self.config_path = Some(target);
+        self.warnings.clear();
         Ok(())
     }
 
@@ -111,6 +120,7 @@ impl ConfigService {
         fs::write(&path, json)?;
         self.config = defaults;
         self.config_path = Some(path.clone());
+        self.warnings.clear();
         Ok(path)
     }
 
@@ -155,12 +165,15 @@ impl ConfigService {
             )
         })?;
 
-        let parsed: WorktreeConfig = serde_json::from_str(&raw).map_err(|e| {
+        let mut parsed: WorktreeConfig = serde_json::from_str(&raw).map_err(|e| {
             WisetreeError::config(
                 format!("Invalid configuration in {}: {e}", path.display()),
                 Some(path.clone()),
             )
         })?;
+
+        parsed.dashboard.clamp();
+        self.warnings = parsed.dashboard.normalize_columns();
 
         self.config = parsed;
         self.config_path = Some(path);

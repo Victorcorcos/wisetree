@@ -2,9 +2,9 @@
 //! eventually, a small piece of state owned by `App`.
 
 pub mod create;
+pub mod dashboard;
 pub mod delete;
 pub mod error;
-pub mod list;
 pub mod loading;
 pub mod menu;
 pub mod settings;

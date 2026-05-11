@@ -413,7 +413,7 @@ fn select_empty_after_filter_renders_no_matching_options() {
 }
 
 #[test]
-fn select_render_shows_more_above_below_when_long() {
+fn select_render_uses_available_height_before_scrolling() {
     let labels: Vec<String> = (0..20).map(|i| format!("opt{i}")).collect();
     let opts: Vec<SelectOption<String>> = labels
         .iter()
@@ -422,6 +422,21 @@ fn select_render_shows_more_above_below_when_long() {
     let mut s = SelectPrompt::new("Pick", opts);
     s.selected = 10;
     let dumped = dump(60, 24, |f| s.render(f, f.area()));
+    assert!(dumped.contains("opt19"));
+    assert!(!dumped.contains("more above"));
+    assert!(!dumped.contains("more below"));
+}
+
+#[test]
+fn select_render_shows_more_above_below_when_long() {
+    let labels: Vec<String> = (0..20).map(|i| format!("opt{i}")).collect();
+    let opts: Vec<SelectOption<String>> = labels
+        .iter()
+        .map(|l| SelectOption::new(l.clone(), l.clone()))
+        .collect();
+    let mut s = SelectPrompt::new("Pick", opts);
+    s.selected = 10;
+    let dumped = dump(60, 14, |f| s.render(f, f.area()));
     assert!(dumped.contains("more above"));
     assert!(dumped.contains("more below"));
 }

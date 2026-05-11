@@ -14,7 +14,7 @@ use crate::messages::WELCOME;
 pub enum AppMode {
     Menu,
     Create,
-    List,
+    Dashboard,
     Delete,
     Settings,
 }
@@ -24,7 +24,7 @@ impl AppMode {
         match self {
             Self::Menu => "menu",
             Self::Create => "create",
-            Self::List => "list",
+            Self::Dashboard => "dashboard",
             Self::Delete => "delete",
             Self::Settings => "settings",
         }
@@ -34,7 +34,7 @@ impl AppMode {
         match s {
             "menu" => Some(Self::Menu),
             "create" => Some(Self::Create),
-            "list" => Some(Self::List),
+            "dashboard" => Some(Self::Dashboard),
             "delete" => Some(Self::Delete),
             "settings" => Some(Self::Settings),
             _ => None,
@@ -47,7 +47,7 @@ impl AppMode {
 pub enum CliCommand {
     Create,
     #[default]
-    List,
+    Dashboard,
     Delete,
 }
 
@@ -60,6 +60,7 @@ pub struct CliArgs {
     pub branch: Option<String>,
     pub path: Option<String>,
     pub json: bool,
+    pub watch: bool,
     pub force: bool,
 }
 
@@ -103,6 +104,7 @@ where
     let mut branch: Option<String> = None;
     let mut path: Option<String> = None;
     let mut json = false;
+    let mut watch = false;
     let mut force = false;
     let mut positional: Vec<String> = Vec::new();
 
@@ -114,6 +116,7 @@ where
             "-v" | "--version" => version = true,
             "--from-wrapper" => from_wrapper = true,
             "--json" => json = true,
+            "-w" | "--watch" => watch = true,
             "-f" | "--force" => force = true,
             "-m" | "--mode" => {
                 mode_arg = Some(take_value(&raw, &mut i, token)?);
@@ -187,12 +190,17 @@ where
     // Detect non-interactive CLI subcommand.
     let cli_command = match mode {
         AppMode::Create => Some(CliCommand::Create),
-        AppMode::List => Some(CliCommand::List),
+        AppMode::Dashboard => Some(CliCommand::Dashboard),
         AppMode::Delete => Some(CliCommand::Delete),
         _ => None,
     };
-    let has_cli_flags =
-        name.is_some() || source.is_some() || branch.is_some() || path.is_some() || force || json;
+    let has_cli_flags = name.is_some()
+        || source.is_some()
+        || branch.is_some()
+        || path.is_some()
+        || force
+        || json
+        || watch;
 
     let cli_args = match (cli_command, has_cli_flags) {
         (Some(cmd), true) => Some(CliArgs {
@@ -202,6 +210,7 @@ where
             branch,
             path,
             json,
+            watch,
             force,
         }),
         _ => None,
@@ -233,7 +242,7 @@ pub fn help_text() -> String {
 Usage:\n  wisetree [command] [options]\n\n\
 Commands:\n  \
 create     Create a new worktree\n  \
-list       List all worktrees\n  \
+dashboard  Live worktree dashboard\n  \
 delete     Delete a worktree\n  \
 settings   Manage configuration\n  \
 (no command) Start interactive menu\n\n\
@@ -248,18 +257,20 @@ Non-Interactive Options:\n  \
 -b, --branch <branch>  New branch name; defaults to source (create)\n  \
 -p, --path <path>      Worktree path (delete)\n  \
 -f, --force            Force delete even with uncommitted changes (delete)\n  \
---json                 Output as JSON (list)\n\n\
+--json                 Output as JSON (dashboard)\n  \
+-w, --watch            Stream JSON Lines (dashboard)\n\n\
 Interactive Examples:\n  \
 wisetree                # Start interactive menu\n  \
 wisetree create         # Go directly to create worktree flow\n  \
-wisetree list           # List all worktrees interactively\n  \
+wisetree dashboard      # Open the live dashboard\n  \
 wisetree --from-wrapper # Used by shell wrapper to enable directory switching\n  \
 wisetree delete         # Go directly to delete worktree flow\n  \
 wisetree settings       # Open settings menu\n\n\
 Non-Interactive Examples:\n  \
 wisetree create -n my-feature -s main              # Create worktree from main\n  \
 wisetree create -n my-feature -s main -b feat/foo  # Create with new branch\n  \
-wisetree list --json                               # List worktrees as JSON\n  \
+wisetree dashboard --json                          # Snapshot dashboard as JSON\n  \
+wisetree dashboard --watch                         # Stream dashboard snapshots\n  \
 wisetree delete -n my-feature                      # Delete worktree by name\n  \
 wisetree delete -p /path/to/worktree -f            # Force delete by path\n\n\
 Shell Integration:\n  \

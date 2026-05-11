@@ -126,12 +126,24 @@ fn create_unknown_source_branch_errors() {
 }
 
 #[test]
-fn list_json_outputs_array() {
+fn dashboard_json_outputs_array_with_expected_length() {
     let fx = repo_with_commit();
     let home = isolated_home();
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat-dashboard",
+            "../repo-dashboard",
+            "main",
+        ],
+    );
+
     let output = Command::cargo_bin("wisetree")
         .unwrap()
-        .args(["list", "--json"])
+        .args(["dashboard", "--json"])
         .current_dir(&fx.repo)
         .env("HOME", home.path())
         .assert()
@@ -139,8 +151,10 @@ fn list_json_outputs_array() {
         .get_output()
         .stdout
         .clone();
+
     let parsed: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
-    assert!(parsed.is_array(), "expected JSON array, got {parsed:?}");
+    let rows = parsed.as_array().expect("dashboard array");
+    assert_eq!(rows.len(), 2);
 }
 
 #[test]

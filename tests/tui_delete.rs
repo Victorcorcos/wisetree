@@ -105,6 +105,16 @@ fn esc_in_confirm_returns_to_select() {
 }
 
 #[test]
+fn esc_in_confirm_after_jump_cancels_screen() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(worktrees());
+    s.jump_to_confirm_path("/tmp/repo-feat");
+    assert_eq!(s.step(), DeleteStep::Confirm);
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, DeleteAction::Cancelled);
+}
+
+#[test]
 fn confirm_yes_emits_confirmed_with_force_false_for_clean() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
@@ -231,4 +241,43 @@ fn error_overlay_clears_and_returns_to_select() {
     s.handle_key(key(KeyCode::Char('x')));
     assert!(s.error().is_none());
     assert_eq!(s.step(), DeleteStep::Select);
+}
+
+#[test]
+fn select_step_preferred_height_grows_to_fit_all_worktrees() {
+    let mut s = DeleteScreen::new(false);
+    let rows: Vec<GitWorktree> = std::iter::once(wt("/tmp/repo", "main", true, true))
+        .chain((0..12).map(|index| {
+            wt(
+                &format!("/tmp/repo-{index}"),
+                &format!("feat-{index}"),
+                false,
+                true,
+            )
+        }))
+        .collect();
+    s.set_worktrees(rows);
+
+    assert_eq!(s.preferred_content_height(), 18);
+}
+
+#[test]
+fn select_step_uses_available_height_before_scrolling() {
+    let mut s = DeleteScreen::new(false);
+    let rows: Vec<GitWorktree> = std::iter::once(wt("/tmp/repo", "main", true, true))
+        .chain((0..12).map(|index| {
+            wt(
+                &format!("/tmp/repo-{index}"),
+                &format!("feat-{index}"),
+                false,
+                true,
+            )
+        }))
+        .collect();
+    s.set_worktrees(rows);
+
+    let dumped = dump(100, 18, |f| s.render(f, f.area()));
+    assert!(dumped.contains("repo-11"));
+    assert!(!dumped.contains("more below"));
+    assert!(!dumped.contains("more above"));
 }

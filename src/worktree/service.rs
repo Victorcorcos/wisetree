@@ -34,6 +34,7 @@ pub struct DeleteOutcome {
     pub worktree_deleted: bool,
     pub branch_deleted: bool,
     pub branch_name: Option<String>,
+    pub branch_delete_error: Option<String>,
 }
 
 pub struct WorktreeService {
@@ -200,7 +201,6 @@ impl WorktreeService {
             Ok(()) => {}
             Err(err) => {
                 if err.code() == Some(GitErrorCode::CorruptedWorktree) {
-                    eprintln!("Attempting manual cleanup for corrupted worktree: {worktree_path}");
                     self.manual_worktree_cleanup(worktree_path).await?;
                 } else {
                     return Err(err);
@@ -209,11 +209,12 @@ impl WorktreeService {
         }
 
         let mut branch_deleted = false;
+        let mut branch_delete_error = None;
         if let Some(name) = &branch_name {
             match self.git_service.delete_branch(name, force).await {
                 Ok(()) => branch_deleted = true,
                 Err(e) => {
-                    eprintln!("Failed to delete branch '{name}': {e}");
+                    branch_delete_error = Some(format!("Branch '{name}' was kept.\n{e}"));
                 }
             }
         }
@@ -222,6 +223,7 @@ impl WorktreeService {
             worktree_deleted: true,
             branch_deleted,
             branch_name,
+            branch_delete_error,
         })
     }
 
@@ -246,8 +248,6 @@ impl WorktreeService {
                 result.stderr
             )));
         }
-
-        eprintln!("Successfully cleaned up corrupted worktree: {worktree_path}");
         Ok(())
     }
 

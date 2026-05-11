@@ -451,7 +451,7 @@ impl CreateScreen {
         match self.step {
             CreateStep::Directory => 7,
             CreateStep::CustomRef | CreateStep::NewBranch => 6,
-            CreateStep::SourceBranch => 15,
+            CreateStep::SourceBranch => (6 + (self.branches.len() + 1).max(1) as u16).min(15),
             CreateStep::Confirm | CreateStep::NavigateConfirm => 10,
             CreateStep::Creating => 3,
             CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
