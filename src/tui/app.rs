@@ -1417,7 +1417,7 @@ fn copy_to_clipboard(value: &str) -> std::result::Result<(), String> {
                 Err(_) => continue,
             }
         }
-        Err("no supported clipboard tool found".to_string())
+        return Err("no supported clipboard tool found".to_string());
     }
 
     #[cfg(target_os = "windows")]
