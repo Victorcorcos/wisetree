@@ -8,9 +8,9 @@ Refreshed just now - 3 worktrees, 0 dirty, 1 PR open
 Search: type to filter...
 
 Worktree             Branch        Status   A/B         Commit
-/tmp/repo            main          Clean    =0          deadbee work o..
-/tmp/repo-bug        bug           Opened   +1 -0       deadbee work o..
-/tmp/repo-feat       feat          Clean    =0          deadbee work o..
+   /tmp/repo         main          Clean    =0          deadbee work o..
+ ➤ /tmp/repo-bug     bug           Opened   +1 -0       deadbee work o..
+   /tmp/repo-feat    feat          Clean    =0          deadbee work o..
 
 
 

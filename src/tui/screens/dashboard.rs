@@ -12,9 +12,13 @@ use ratatui::Frame;
 use crate::messages::colors;
 use crate::services::{DashboardRow, PrState};
 use crate::tui::widgets::welcome_header::fold_home;
-use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
+use crate::tui::widgets::{
+    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+};
 
 const MAX_VISIBLE_ROWS: usize = 10;
+const SELECT_MARKER: &str = " ➤ ";
+const BLANK_SELECT_MARKER: &str = "   ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardMode {
@@ -522,7 +526,7 @@ impl DashboardScreen {
             } else {
                 Style::default()
             };
-            Row::new(self.row_cells(row, layout)).style(style)
+            Row::new(self.row_cells(row, layout, is_selected)).style(style)
         }));
 
         if filtered.len() > MAX_VISIBLE_ROWS {
@@ -556,12 +560,25 @@ impl DashboardScreen {
         cells
     }
 
-    fn row_cells(&self, row: &DashboardRow, layout: &DashboardTableLayout) -> Vec<Cell<'static>> {
+    fn row_cells(
+        &self,
+        row: &DashboardRow,
+        layout: &DashboardTableLayout,
+        is_selected: bool,
+    ) -> Vec<Cell<'static>> {
+        let marker = if is_selected {
+            SELECT_MARKER
+        } else {
+            BLANK_SELECT_MARKER
+        };
         let mut cells = vec![Cell::from(Line::from(vec![
+            Span::raw(marker),
             Span::styled(
                 truncate(
                     &fold_home(&row.worktree.path),
-                    layout.worktree_width as usize,
+                    layout
+                        .worktree_width
+                        .saturating_sub(marker.chars().count() as u16) as usize,
                 ),
                 Style::default().fg(colors::EMPHASIS),
             ),
