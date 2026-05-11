@@ -185,7 +185,19 @@ A status banner at the top of the screen shows the last refresh time, the total 
 | `Esc` | Clear the active search if there is one, otherwise return to the previous screen. |
 | `↵` (Enter) | Open the **row actions** menu for the selected worktree: `Navigate to Directory` (your shell `cd`s into it via the wrapper), `Open with Command` (runs your configured `terminalCommand`, e.g. `code $WORKTREE_PATH`), and `Copy path to clipboard`. |
 | `⌫` (Backspace, when the search is empty) | Jump straight into the **delete** confirmation for the highlighted worktree, skipping the picker. While you are typing into the search, Backspace edits the query instead — the binding only fires on an empty search. |
+| `Tab` / `Shift+Tab` | Move focus into and through the **bulk-delete buttons** row in the footer (see below). `↑` at the first table row and `↓` at the last table row also land on the buttons; `↑` / `↓` from the buttons return focus to the worktree list. |
 | `Ctrl+R` | Force an immediate refresh, on top of the configured polling interval. |
+
+#### Bulk delete by status
+
+Above the footer the dashboard renders four colour-coded buttons — **`Merged`**, **`Opened`**, **`Clean`**, **`Dirty`** — that mirror the values of the `Status` column. Activating a button (with `Enter` on the focused button, or by clicking it) opens a single multi-target confirmation dialog that lists every worktree currently matching that status and, on `Yes`, deletes them sequentially with live `(i of N)` progress in the same screen. The main repository checkout is never offered for deletion.
+
+The confirmation has two variants driven by `deleteBranchWithWorktree`:
+
+- **`false`** — yellow warning variant. Worktrees are removed; their branches are kept.
+- **`true`** — red danger variant with an explicit "This will also delete their branches!" line. Worktree + branch are removed together.
+
+Both variants default to **`No`** so an accidental `Enter` is a no-op. When the run finishes, the dashboard pops back into focus with a single success toast (e.g. *"22 worktrees deleted successfully"*), and any per-item warnings (e.g. a branch that could not be deleted because it was not fully merged) are surfaced together as follow-up toasts. Clicking a button whose status has no matching worktrees shows a `No worktrees with status 'X' to delete.` toast instead of opening the dialog.
 
 #### Adapts to your terminal
 

@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table};
@@ -680,9 +680,13 @@ impl DashboardScreen {
             rows.push(self.overflow_row(format!("↑ {hidden_above} more above"), true));
         }
 
+        // When focus is on the bulk-delete buttons row, hide the
+        // worktree selection (no highlight, no ➤ marker) so the user
+        // sees a single active focus indicator at a time.
+        let show_selection = self.bulk_focus.is_none();
         rows.extend(visible.iter().enumerate().map(|(offset, index)| {
             let row = &self.rows[*index];
-            let is_selected = viewport.start + offset == self.selected;
+            let is_selected = show_selection && viewport.start + offset == self.selected;
             let style = if is_selected {
                 Style::default()
                     .bg(colors::MENU_SELECTION_BG)
@@ -937,6 +941,7 @@ impl DashboardScreen {
             let border_style = Style::default().fg(status.color());
 
             let button = Paragraph::new(Line::from(Span::styled(status.label(), text_style)))
+                .alignment(Alignment::Center)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
