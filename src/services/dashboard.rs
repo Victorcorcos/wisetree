@@ -531,19 +531,31 @@ impl DashboardService {
             }
         }
 
-        let url = time::timeout(
-            COMMAND_TIMEOUT,
-            run_command(
-                &self.git_binary,
-                &["remote", "get-url", "origin"],
-                Some(&self.git_root),
-            ),
-        )
-        .await
-        .ok()?
-        .ok()?;
+        // Prefer `upstream` over `origin` so fork-based workflows resolve to
+        // the repository that actually hosts the PRs. Matches the precedence
+        // used by `fetch_upstream_diff`.
+        let mut slug = None;
+        for remote in ["upstream", "origin"] {
+            let Ok(result) = time::timeout(
+                COMMAND_TIMEOUT,
+                run_command(
+                    &self.git_binary,
+                    &["remote", "get-url", remote],
+                    Some(&self.git_root),
+                ),
+            )
+            .await
+            else {
+                continue;
+            };
+            let Ok(url) = result else { continue };
+            if let Some(parsed) = parse_github_slug(&url) {
+                slug = Some(parsed);
+                break;
+            }
+        }
 
-        let slug = parse_github_slug(&url)?;
+        let slug = slug?;
         if let Ok(mut state) = self.pr_state.lock() {
             state.repo_slug = Some(slug.clone());
         }

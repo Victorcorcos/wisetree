@@ -99,6 +99,42 @@ fn fake_gh_script(log_path: &Path) -> String {
 }
 
 #[tokio::test]
+async fn resolves_pr_repo_via_upstream_when_origin_is_a_fork() {
+    // Fork workflow: `origin` is the user's fork, `upstream` is the
+    // canonical repo where PRs live. The dashboard must query `upstream`
+    // so PR state shows up for the worktree branches.
+    let fixture = repo_with_worktree();
+    Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:canonical/repo.git",
+        ])
+        .current_dir(&fixture.repo)
+        .status()
+        .expect("add upstream remote");
+
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_script(&log_path)).unwrap();
+    make_executable(&gh_path);
+
+    let service = service_with_isolated_cache(&fixture).with_gh_binary(gh_path.clone());
+    service.snapshot().await.expect("snapshot");
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("canonical") && log.contains("repo"),
+        "graphql call should target upstream `canonical/repo`, got log {log:?}"
+    );
+    assert!(
+        !log.contains("example"),
+        "graphql call should NOT target origin `example/repo` when upstream exists, got log {log:?}"
+    );
+}
+
+#[tokio::test]
 async fn gh_is_called_whenever_available() {
     let fixture = repo_with_worktree();
     let log_path = fixture.repo.parent().unwrap().join("gh.log");
