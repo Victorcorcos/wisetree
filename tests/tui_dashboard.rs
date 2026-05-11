@@ -290,7 +290,9 @@ fn overflow_rows_show_more_above_and_below_indicators() {
         screen.handle_key(key(KeyCode::Down));
     }
 
-    let dumped = dump(120, 20, |f| screen.render(f, f.area()));
+    // Height must fit: 4 (banner/search) + 13 (header + 2 overflow + 10 rows)
+    // + 4 (4-line footer with Status / Ahead-Behind legends).
+    let dumped = dump(120, 21, |f| screen.render(f, f.area()));
     assert!(dumped.contains("more above"));
     assert!(dumped.contains("more below") || dumped.contains("bottom"));
 }

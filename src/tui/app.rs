@@ -1253,6 +1253,9 @@ fn copy_to_clipboard(value: &str) -> std::result::Result<(), String> {
         stdin
             .write_all(value.as_bytes())
             .map_err(|err| err.to_string())?;
+        // Drop stdin to signal EOF — pbcopy reads until the pipe closes and
+        // child.wait() would otherwise deadlock the UI thread.
+        drop(stdin);
         let status = child.wait().map_err(|err| err.to_string())?;
         return if status.success() {
             Ok(())
@@ -1276,6 +1279,7 @@ fn copy_to_clipboard(value: &str) -> std::result::Result<(), String> {
                         continue;
                     };
                     let _ = stdin.write_all(value.as_bytes());
+                    drop(stdin);
                     if child.wait().map(|status| status.success()).unwrap_or(false) {
                         return Ok(());
                     }
@@ -1300,6 +1304,7 @@ fn copy_to_clipboard(value: &str) -> std::result::Result<(), String> {
         stdin
             .write_all(value.as_bytes())
             .map_err(|err| err.to_string())?;
+        drop(stdin);
         let status = child.wait().map_err(|err| err.to_string())?;
         return if status.success() {
             Ok(())
