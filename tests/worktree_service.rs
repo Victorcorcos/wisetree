@@ -234,6 +234,7 @@ async fn delete_worktree_removes_path_and_skips_branch_when_disabled() {
             assert!(result.worktree_deleted);
             assert!(!result.branch_deleted);
             assert!(result.branch_name.is_none());
+            assert!(result.branch_delete_error.is_none());
             assert!(svc.git_service().branch_exists("feat-d").await);
         };
         tokio::runtime::Runtime::new().unwrap().block_on(body);
@@ -271,7 +272,56 @@ async fn delete_worktree_with_branch_deletion_when_enabled() {
             assert!(result.worktree_deleted);
             assert!(result.branch_deleted);
             assert_eq!(result.branch_name.as_deref(), Some("feat-e"));
+            assert!(result.branch_delete_error.is_none());
             assert!(!svc.git_service().branch_exists("feat-e").await);
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(body);
+    });
+}
+
+#[tokio::test]
+async fn delete_worktree_keeps_unmerged_branch_and_returns_warning() {
+    with_isolated_home(|| {
+        let body = async {
+            let fx = build_fixture();
+            let mut svc = WorktreeService::new(Some(fx.repo.clone()));
+            svc.initialize().await.expect("init");
+            svc.config_service_mut().update(|c| {
+                *c = WorktreeConfig {
+                    worktree_copy_patterns: Vec::new(),
+                    delete_branch_with_worktree: true,
+                    ..WorktreeConfig::default()
+                };
+            });
+
+            let opts = WorktreeCreateOptions {
+                name: "feat-unmerged".into(),
+                source_branch: "main".into(),
+                new_branch: "feat-unmerged".into(),
+                base_path: String::new(),
+            };
+            let outcome = svc.create_worktree(&opts, None).await.expect("create");
+            fs::write(outcome.worktree_path.join("feature.txt"), "hello").unwrap();
+            git(&outcome.worktree_path, &["add", "feature.txt"]);
+            git(
+                &outcome.worktree_path,
+                &["commit", "-q", "-m", "feature work"],
+            );
+
+            let path = outcome.worktree_path.to_string_lossy().into_owned();
+            let result = svc
+                .delete_worktree(&path, false)
+                .await
+                .expect("delete worktree");
+
+            assert!(result.worktree_deleted);
+            assert!(!result.branch_deleted);
+            assert_eq!(result.branch_name.as_deref(), Some("feat-unmerged"));
+            assert!(result
+                .branch_delete_error
+                .as_deref()
+                .is_some_and(|message| message.contains("not fully merged")));
+            assert!(svc.git_service().branch_exists("feat-unmerged").await);
         };
         tokio::runtime::Runtime::new().unwrap().block_on(body);
     });

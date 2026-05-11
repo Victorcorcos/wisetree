@@ -105,6 +105,16 @@ fn esc_in_confirm_returns_to_select() {
 }
 
 #[test]
+fn esc_in_confirm_after_jump_cancels_screen() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(worktrees());
+    s.jump_to_confirm_path("/tmp/repo-feat");
+    assert_eq!(s.step(), DeleteStep::Confirm);
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, DeleteAction::Cancelled);
+}
+
+#[test]
 fn confirm_yes_emits_confirmed_with_force_false_for_clean() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());

@@ -43,7 +43,7 @@ use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
 use crate::tui::terminal;
-use crate::tui::widgets::WelcomeHeader;
+use crate::tui::widgets::{render_toast, ToastState, ToastVariant, WelcomeHeader};
 use crate::worktree::service::DeleteOutcome as ServiceDeleteOutcome;
 use crate::worktree::WorktreeService;
 use crate::VERSION;
@@ -86,6 +86,7 @@ pub struct App {
     settings: Option<SettingsScreen>,
     setup: Option<SetupScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
+    toast: ToastState,
     /// Wrapper-mode side channel: the path that should be emitted on real
     /// stdout once the TUI tears down. Only set in `is_from_wrapper` mode.
     selected_path: Option<String>,
@@ -113,6 +114,7 @@ impl App {
             settings: None,
             setup: None,
             shell_integration_status: None,
+            toast: ToastState::default(),
             selected_path: None,
             pending_delete_path: None,
         }
@@ -194,6 +196,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        self.toast.dismiss_expired();
         let area = frame.area();
 
         if area.width < 20 || area.height < 5 {
@@ -211,6 +214,10 @@ impl App {
                 screens::error::draw(frame, area, msg, self.show_reset_confirm);
             }
             InitPhase::Ready => self.draw_ready(frame, area),
+        }
+
+        if let Some(toast) = self.toast.current() {
+            render_toast(frame, area, &toast);
         }
     }
 
@@ -395,10 +402,12 @@ impl App {
     }
 
     fn handle_dashboard_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
-        let Some(dashboard) = self.dashboard.as_mut() else {
-            return;
+        let action = match self.dashboard.as_mut() {
+            Some(dashboard) => dashboard.handle_key(key),
+            None => return,
         };
-        match dashboard.handle_key(key) {
+
+        match action {
             DashboardAction::Continue => {}
             DashboardAction::Back => self.back_to_menu(),
             DashboardAction::Refresh => {
@@ -414,11 +423,18 @@ impl App {
             }
             DashboardAction::OpenTerminal(path) => {
                 if let Some(config) = self.current_config() {
-                    let _ = open_terminal(&config.terminal_command, &path);
-                }
-                if let Some(dashboard) = self.dashboard.as_mut() {
-                    dashboard
-                        .set_notice(format!("Opened terminal command for {}", fold_path(&path)));
+                    let launch = open_terminal(&config.terminal_command, &path);
+                    if launch.success {
+                        self.show_toast(
+                            ToastVariant::Info,
+                            format!("Opened terminal command for {}", fold_path(&path)),
+                        );
+                    } else if let Some(error) = launch.error {
+                        self.show_toast(
+                            ToastVariant::Error,
+                            format!("Failed to open terminal for {}: {error}", fold_path(&path)),
+                        );
+                    }
                 }
             }
             DashboardAction::JumpToDelete(path) => {
@@ -426,9 +442,6 @@ impl App {
                 self.enter_screen(Screen::Delete, tx);
             }
             DashboardAction::CopyPath(path) => {
-                if let Some(dashboard) = self.dashboard.as_mut() {
-                    dashboard.set_notice(format!("Copying {} to clipboard…", fold_path(&path)));
-                }
                 kick_off_clipboard_copy(path, tx.clone());
             }
         }
@@ -497,14 +510,26 @@ impl App {
 
         match action {
             DeleteAction::Continue => {}
-            DeleteAction::Cancelled => self.back_to_menu(),
+            DeleteAction::Cancelled => self.leave_delete_screen(tx),
             DeleteAction::Confirmed { path, force } => {
                 if let Some(delete) = self.delete.as_mut() {
                     delete.start_deleting();
                 }
                 kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
             }
-            DeleteAction::Done => self.back_to_menu(),
+            DeleteAction::Done => self.leave_delete_screen(tx),
+        }
+    }
+
+    /// Exit the Delete screen back to wherever we came from. When the
+    /// dashboard's Backspace shortcut jumped us straight to confirm,
+    /// `pending_delete_path` is set — return to the Dashboard rather than
+    /// the main menu so the user lands where they started.
+    fn leave_delete_screen(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if self.pending_delete_path.take().is_some() && self.git_root.is_some() {
+            self.enter_screen(Screen::Dashboard, tx);
+        } else {
+            self.back_to_menu();
         }
     }
 
@@ -622,14 +647,21 @@ impl App {
                     }
                 }
             }
-            AppEvent::DeleteFinished(result) => {
-                if let Some(delete) = self.delete.as_mut() {
-                    match result {
-                        Ok(outcome) => delete.mark_complete(screen_delete_outcome(outcome)),
-                        Err(message) => delete.set_error(message),
+            AppEvent::DeleteFinished(result) => match result {
+                Ok(outcome) => {
+                    if let Some(message) = outcome.branch_delete_error.clone() {
+                        self.show_toast(ToastVariant::Warning, message);
+                    }
+                    if let Some(delete) = self.delete.as_mut() {
+                        delete.mark_complete(screen_delete_outcome(outcome));
                     }
                 }
-            }
+                Err(message) => {
+                    if let Some(delete) = self.delete.as_mut() {
+                        delete.set_error(message);
+                    }
+                }
+            },
             AppEvent::SettingsUpdateChecked(result) => {
                 if let Some(settings) = self.settings.as_mut() {
                     settings.set_update_result(result);
@@ -647,15 +679,15 @@ impl App {
                     }
                 }
             }
-            AppEvent::DashboardCopyFinished { path, error } => {
-                if let Some(dashboard) = self.dashboard.as_mut() {
-                    let notice = match error {
-                        None => format!("Copied {} to clipboard.", fold_path(&path)),
-                        Some(err) => format!("Clipboard copy failed: {err}"),
-                    };
-                    dashboard.set_notice(notice);
+            AppEvent::DashboardCopyFinished { path, error } => match error {
+                None => self.show_toast(
+                    ToastVariant::Info,
+                    format!("Copied {} to clipboard.", fold_path(&path)),
+                ),
+                Some(err) => {
+                    self.show_toast(ToastVariant::Error, format!("Clipboard copy failed: {err}"))
                 }
-            }
+            },
         }
     }
 
@@ -777,19 +809,35 @@ impl App {
         let Some(watch) = self.dashboard_watch.as_mut() else {
             return;
         };
-        let Some(screen) = self.dashboard.as_mut() else {
-            return;
-        };
+        let mut rows_batch = Vec::new();
+        let mut notices = Vec::new();
         while let Ok(rows) = watch.rx.try_recv() {
-            screen.set_rows(rows);
+            rows_batch.push(rows);
         }
         while let Ok(notice) = watch.notice_rx.try_recv() {
-            if screen.has_rows() {
-                screen.set_notice(notice);
-            } else {
+            notices.push(notice);
+        }
+
+        if let Some(screen) = self.dashboard.as_mut() {
+            for rows in rows_batch {
+                screen.set_rows(rows);
+            }
+        }
+        let has_rows = self
+            .dashboard
+            .as_ref()
+            .is_some_and(DashboardScreen::has_rows);
+        for notice in notices {
+            if has_rows {
+                self.show_toast(ToastVariant::Error, notice);
+            } else if let Some(screen) = self.dashboard.as_mut() {
                 screen.set_error(notice);
             }
         }
+    }
+
+    fn show_toast(&mut self, variant: ToastVariant, message: impl Into<String>) {
+        self.toast.show(message, variant);
     }
 
     fn build_menu_screen(&self) -> MenuScreen {
@@ -1385,6 +1433,8 @@ mod tests {
     use crate::config::service::ConfigService;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::fs;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -1982,5 +2032,54 @@ mod tests {
         app.handle_key(ctrl_c, &tx);
         assert!(app.quit_requested);
         assert!(app.selected_path().is_none());
+    }
+
+    #[test]
+    fn delete_finished_with_branch_warning_shows_toast() {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::Delete;
+        app.delete = Some(DeleteScreen::new(true));
+
+        app.handle_app_event(
+            AppEvent::DeleteFinished(Ok(ServiceDeleteOutcome {
+                worktree_deleted: true,
+                branch_deleted: false,
+                branch_name: Some("ignore-local".into()),
+                branch_delete_error: Some(
+                    "Branch 'ignore-local' was kept.\nerror: the branch 'ignore-local' is not fully merged"
+                        .into(),
+                ),
+            })),
+            &app_event_tx(),
+        );
+
+        let toast = app.toast.current().expect("toast should be shown");
+        assert_eq!(toast.variant, ToastVariant::Warning);
+        assert!(toast.message.contains("ignore-local"));
+        assert!(toast.message.contains("not fully merged"));
+        assert_eq!(
+            app.delete.as_ref().unwrap().step(),
+            screens::delete::DeleteStep::Success
+        );
+    }
+
+    #[test]
+    fn draw_renders_active_toast_overlay() {
+        let mut app = initialized_menu_app();
+        app.show_toast(ToastVariant::Info, "Copied to clipboard");
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let dumped = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(dumped.contains("Choose wisely"));
+        assert!(dumped.contains("Copied to clipboard"));
     }
 }

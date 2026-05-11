@@ -64,6 +64,10 @@ pub struct DeleteScreen {
     select: Option<SelectPrompt<String>>,
     confirm: Option<ConfirmDialog>,
     outcome: Option<DeleteOutcome>,
+    /// True when we bypassed the Select step (dashboard's Backspace
+    /// shortcut). Esc on Confirm should then cancel the whole screen
+    /// instead of falling back to Select.
+    entered_via_jump: bool,
     pub tick: usize,
 }
 
@@ -79,6 +83,7 @@ impl DeleteScreen {
             select: None,
             confirm: None,
             outcome: None,
+            entered_via_jump: false,
             tick: 0,
         }
     }
@@ -140,6 +145,7 @@ impl DeleteScreen {
         self.confirm = self.build_confirm();
         if self.confirm.is_some() {
             self.step = DeleteStep::Confirm;
+            self.entered_via_jump = true;
         }
     }
 
@@ -340,8 +346,12 @@ impl DeleteScreen {
             }
             ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => {
                 self.confirm = None;
-                self.step = DeleteStep::Select;
-                DeleteAction::Continue
+                if self.entered_via_jump {
+                    DeleteAction::Cancelled
+                } else {
+                    self.step = DeleteStep::Select;
+                    DeleteAction::Continue
+                }
             }
             ConfirmOutcome::Pending => DeleteAction::Continue,
         }

@@ -41,5 +41,8 @@ pub async fn run(args: CliArgs, service: &WorktreeService) -> Result<()> {
             println!("Branch deleted: {branch}");
         }
     }
+    if let Some(message) = outcome.branch_delete_error {
+        eprintln!("Warning: {message}");
+    }
     Ok(())
 }
