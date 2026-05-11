@@ -523,7 +523,7 @@ impl SettingsScreen {
             SelectOption::new(UPDATE_CHECK_MENU, SettingsStep::CheckUpdates)
                 .with_description("Check npm for latest version"),
         ];
-        SelectPrompt::new("Select setting to view:", opts)
+        SelectPrompt::new("Select setting to view:", opts).with_footer_spacer()
     }
 
     fn build_copy_settings_select(&self) -> SelectPrompt<CopyDirection> {
@@ -536,6 +536,7 @@ impl SettingsScreen {
                     .with_description("Overwrite/create the global config from local"),
             ],
         )
+        .with_footer_spacer()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsAction {
@@ -1079,15 +1080,15 @@ impl SettingsScreen {
         }
         match self.step {
             // Settings menu select prompt: ~7 entries + label + spacer + hint.
-            SettingsStep::Menu => 14,
-            SettingsStep::CheckUpdates => 6,
+            SettingsStep::Menu => 15,
+            SettingsStep::CheckUpdates => 7,
             // Detail panes: header + value lines + hint.
             SettingsStep::CopyPatterns | SettingsStep::IgnorePatterns => 12,
             SettingsStep::PathTemplate => self.path_template_preferred_height(),
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
             SettingsStep::PostCmd => self.post_cmd_preferred_height(),
             SettingsStep::DeleteBranch => 16,
-            SettingsStep::CopySettings => 12,
+            SettingsStep::CopySettings => 13,
         }
     }
 
@@ -1930,6 +1931,7 @@ Safety features:\n\
                 Style::default().fg(colors::SUCCESS),
             )));
         }
+        lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "Press any key to go back.",
             Style::default()
