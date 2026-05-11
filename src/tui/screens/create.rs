@@ -288,7 +288,9 @@ impl CreateScreen {
 
     fn build_source_select(&self) -> SelectPrompt<String> {
         let opts = self.branch_options();
-        SelectPrompt::new(CREATE_SOURCE_BRANCH_PROMPT, opts).searchable()
+        SelectPrompt::new(CREATE_SOURCE_BRANCH_PROMPT, opts)
+            .searchable()
+            .with_footer_spacer()
     }
 
     fn handle_source_branch(&mut self, key: KeyEvent) -> CreateAction {
@@ -447,8 +449,11 @@ impl CreateScreen {
             return 4;
         }
         match self.step {
-            CreateStep::Directory | CreateStep::CustomRef | CreateStep::NewBranch => 6,
-            CreateStep::SourceBranch => 6 + (self.branches.len() + 1).max(1) as u16,
+            CreateStep::Directory => 7,
+            CreateStep::CustomRef | CreateStep::NewBranch => 6,
+            CreateStep::SourceBranch => {
+                (6 + (self.branches.len() + 1).max(1) as u16).min(15)
+            }
             CreateStep::Confirm | CreateStep::NavigateConfirm => 10,
             CreateStep::Creating => 3,
             CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
@@ -563,6 +568,7 @@ fn prioritize_branches(branches: Vec<GitBranch>) -> Vec<GitBranch> {
 fn directory_input() -> InputPrompt {
     InputPrompt::new(CREATE_DIRECTORY_PROMPT)
         .with_placeholder(CREATE_DIRECTORY_PLACEHOLDER)
+        .with_footer_spacer()
         .with_validator(|v| validate_directory_name(v).map(|e| e.to_string()))
 }
 

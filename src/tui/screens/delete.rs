@@ -303,7 +303,9 @@ impl DeleteScreen {
                 o
             })
             .collect();
-        SelectPrompt::new(DELETE_SELECT_PROMPT, opts).searchable()
+        SelectPrompt::new(DELETE_SELECT_PROMPT, opts)
+            .searchable()
+            .with_footer_spacer()
     }
 
     fn build_confirm(&self) -> Option<ConfirmDialog> {
@@ -532,7 +534,11 @@ impl DeleteScreen {
             return 4;
         }
         match self.step {
-            DeleteStep::Select => 6 + self.worktrees.len().max(1) as u16,
+            DeleteStep::Select => {
+                let visible = (self.worktrees.len() as u16).min(10);
+                let overflow = if self.worktrees.len() > 10 { 2 } else { 0 };
+                6 + visible + overflow
+            }
             DeleteStep::Confirm => {
                 // Bulk confirm renders prompt + blank + N path lines +
                 // blank + warning inside the dialog message area, plus

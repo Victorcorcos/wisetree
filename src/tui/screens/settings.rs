@@ -536,7 +536,7 @@ impl SettingsScreen {
                 self.config.dashboard.columns.len()
             )),
         ];
-        SelectPrompt::new("Select setting to view:", opts)
+        SelectPrompt::new("Select setting to view:", opts).with_footer_spacer()
     }
 
     fn build_copy_settings_select(&self) -> SelectPrompt<CopyDirection> {
@@ -549,6 +549,7 @@ impl SettingsScreen {
                     .with_description("Overwrite/create the global config from local"),
             ],
         )
+        .with_footer_spacer()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsAction {
@@ -1091,9 +1092,8 @@ impl SettingsScreen {
             return 6;
         }
         match self.step {
-            // Settings menu select prompt: config path line + title/search body
-            // + all visible entries + hint.
-            SettingsStep::Menu => 16,
+            // Settings menu: config path header + select prompt + hint.
+            SettingsStep::Menu => 15,
             SettingsStep::CheckUpdates => 6,
             SettingsStep::CopyPatterns => {
                 self.field_preferred_height(self.config.worktree_copy_patterns.len(), true)
@@ -1107,7 +1107,7 @@ impl SettingsScreen {
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
             SettingsStep::PostCmd => self.post_cmd_preferred_height(),
             SettingsStep::DeleteBranch => 16,
-            SettingsStep::CopySettings => 12,
+            SettingsStep::CopySettings => 13,
         }
     }
 
@@ -1998,6 +1998,7 @@ Safety features:\n\
                 Style::default().fg(colors::SUCCESS),
             )));
         }
+        lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "Press any key to go back.",
             Style::default()
