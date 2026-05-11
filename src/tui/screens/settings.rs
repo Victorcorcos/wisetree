@@ -1297,7 +1297,7 @@ impl SettingsScreen {
             "Dashboard",
             "Live dashboard settings resolved from the active config:",
             items,
-            false,
+            true,
         );
     }
 
