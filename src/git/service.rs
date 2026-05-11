@@ -122,9 +122,13 @@ impl GitService {
                 let (resolved_branch, branch_status) = if branch.is_empty() {
                     ("detached".to_string(), None)
                 } else {
-                    let status =
-                        compute_branch_status(&git_root, &default_branch, current_branch.as_deref(), &branch)
-                            .await;
+                    let status = compute_branch_status(
+                        &git_root,
+                        &default_branch,
+                        current_branch.as_deref(),
+                        &branch,
+                    )
+                    .await;
                     (branch, status)
                 };
                 (index, is_clean, resolved_branch, branch_status)
@@ -132,8 +136,8 @@ impl GitService {
         }
 
         while let Some(joined) = tasks.join_next().await {
-            let (index, is_clean, branch, branch_status) =
-                joined.map_err(|err| WisetreeError::other(format!("list worktrees task: {err}")))?;
+            let (index, is_clean, branch, branch_status) = joined
+                .map_err(|err| WisetreeError::other(format!("list worktrees task: {err}")))?;
             let wt = &mut worktrees[index];
             wt.is_clean = is_clean;
             wt.branch = branch;

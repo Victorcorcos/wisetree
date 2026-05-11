@@ -26,7 +26,7 @@ use crate::files::service::open_terminal;
 use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
-use crate::messages::colors;
+use crate::messages::{colors, CREATE_SUCCESS};
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
@@ -547,30 +547,7 @@ impl App {
                 kick_off_create_worktree(self.git_root.clone(), options, tx.clone());
             }
             CreateAction::Done => {
-                let navigate = self
-                    .create
-                    .as_ref()
-                    .map(|c| c.navigate_after_create)
-                    .unwrap_or(false);
-                let path = self
-                    .create
-                    .as_ref()
-                    .and_then(|c| c.created_worktree_path().map(str::to_string));
-                if navigate {
-                    if let Some(path) = path {
-                        if self.is_from_wrapper {
-                            self.selected_path = Some(path);
-                            self.quit_requested = true;
-                            return;
-                        }
-                        if let Some(config) = self.current_config() {
-                            if !config.terminal_command.trim().is_empty() {
-                                let _ = open_terminal(&config.terminal_command, &path);
-                            }
-                        }
-                    }
-                }
-                self.back_to_menu();
+                self.finish_create_success();
             }
         }
     }
@@ -701,7 +678,7 @@ impl App {
                     match result {
                         Ok(path) => {
                             create.set_created_worktree_path(path);
-                            create.mark_complete();
+                            self.finish_create_success();
                         }
                         Err(message) => create.set_error(message),
                     }
@@ -877,6 +854,37 @@ impl App {
         self.screen = Screen::Menu;
         self.pending_delete_path = None;
         self.menu = Some(self.build_menu_screen());
+    }
+
+    fn finish_create_success(&mut self) {
+        let navigate = self
+            .create
+            .as_ref()
+            .map(|c| c.navigate_after_create)
+            .unwrap_or(false);
+        let path = self
+            .create
+            .as_ref()
+            .and_then(|c| c.created_worktree_path().map(str::to_string));
+
+        self.show_toast(ToastVariant::Success, CREATE_SUCCESS);
+
+        if navigate {
+            if let Some(path) = path {
+                if self.is_from_wrapper {
+                    self.selected_path = Some(path);
+                    self.quit_requested = true;
+                    return;
+                }
+                if let Some(config) = self.current_config() {
+                    if !config.terminal_command.trim().is_empty() {
+                        let _ = open_terminal(&config.terminal_command, &path);
+                    }
+                }
+            }
+        }
+
+        self.back_to_menu();
     }
 
     fn poll_dashboard_updates(&mut self) {
@@ -2105,6 +2113,62 @@ mod tests {
         app.handle_key(ctrl_c, &tx);
         assert!(app.quit_requested);
         assert!(app.selected_path().is_none());
+    }
+
+    #[test]
+    fn create_finished_returns_to_menu_with_success_toast() {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::Create;
+        app.menu = None;
+        app.create = Some(CreateScreen::new());
+        if let Some(create) = app.create.as_mut() {
+            create.navigate_after_create = false;
+        }
+
+        app.handle_app_event(
+            AppEvent::CreateFinished(Ok(PathBuf::from("/tmp/repo/feat-x"))),
+            &app_event_tx(),
+        );
+
+        assert_eq!(app.screen, Screen::Menu);
+        assert!(app.create.is_none());
+
+        let toast = app.toast.current().expect("toast should be shown");
+        assert_eq!(toast.variant, ToastVariant::Success);
+        assert_eq!(toast.message, CREATE_SUCCESS);
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let dumped = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(dumped.contains("Choose wisely"));
+        assert!(dumped.contains(CREATE_SUCCESS));
+    }
+
+    #[test]
+    fn create_finished_in_wrapper_mode_selects_path_and_quits() {
+        let service = WorktreeService::new(None);
+        let mut app = App::new(AppMode::Create, true);
+        app.phase = InitPhase::Ready;
+        app.screen = Screen::Create;
+        app.worktree_service = Some(service);
+        app.git_root = Some("/tmp/repo".into());
+        app.create = Some(CreateScreen::new());
+
+        app.handle_app_event(
+            AppEvent::CreateFinished(Ok(PathBuf::from("/tmp/repo/feat-x"))),
+            &app_event_tx(),
+        );
+
+        assert!(app.quit_requested);
+        assert_eq!(app.selected_path(), Some("/tmp/repo/feat-x"));
     }
 
     #[test]

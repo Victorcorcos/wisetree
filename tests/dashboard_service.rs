@@ -30,12 +30,7 @@ fn repo_with_worktree() -> Fixture {
     git(&repo, &["config", "user.name", "Test"]);
     git(
         &repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:example/repo.git",
-        ],
+        &["remote", "add", "origin", "git@github.com:example/repo.git"],
     );
     fs::write(repo.join("README.md"), "# repo\n").unwrap();
     git(&repo, &["add", "README.md"]);
@@ -229,8 +224,8 @@ async fn watch_reports_refresh_errors_without_emitting_empty_rows() {
     let missing_root = tempfile::tempdir().expect("tempdir");
     let repo = missing_root.path().join("missing-repo");
     let cache = missing_root.path().join("cache.json");
-    let service = DashboardService::new(repo, DashboardConfig::default())
-        .with_cache_path(Some(cache));
+    let service =
+        DashboardService::new(repo, DashboardConfig::default()).with_cache_path(Some(cache));
     let mut watch = service.watch();
 
     let notice = tokio::time::timeout(std::time::Duration::from_secs(2), watch.notice_rx.recv())
@@ -283,8 +278,11 @@ async fn rate_limit_response_emits_single_notice_and_backs_off() {
 
     // Force a refresh — should NOT emit another notice while backed off.
     watch.refresh();
-    let second =
-        tokio::time::timeout(std::time::Duration::from_millis(500), watch.notice_rx.recv()).await;
+    let second = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        watch.notice_rx.recv(),
+    )
+    .await;
     assert!(
         second.is_err(),
         "second notice should be suppressed while backoff is active, got {second:?}"

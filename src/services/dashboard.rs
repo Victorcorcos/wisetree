@@ -232,10 +232,8 @@ impl DashboardService {
 
         self.ensure_cache_loaded();
 
-        let live_branches: HashSet<String> = rows
-            .iter()
-            .map(|row| row.worktree.branch.clone())
-            .collect();
+        let live_branches: HashSet<String> =
+            rows.iter().map(|row| row.worktree.branch.clone()).collect();
         self.prune_cache(&live_branches);
 
         self.refresh_pull_requests(&rows).await;
