@@ -11,3 +11,5 @@ Cargo.lock.bak
 # Generated artifacts
 .idea/
 .vscode/
+
+local/
