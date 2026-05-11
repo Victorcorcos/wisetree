@@ -119,7 +119,7 @@ fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
 
 #[test]
 fn loading_render_shows_loading_message() {
-    let screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new());
+    let mut screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new());
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
     assert!(dumped.contains("Loading dashboard"));
 }
@@ -134,7 +134,7 @@ fn empty_state_renders_no_worktrees_found() {
 
 #[test]
 fn table_renders_configured_columns_in_order() {
-    let screen = ready_screen(true);
+    let mut screen = ready_screen(true);
     let dumped = dump(120, 12, |f| screen.render(f, f.area()));
     let branch = dumped.find("Branch").unwrap();
     let status = dumped.find("Status").unwrap();
@@ -292,7 +292,7 @@ fn selected_worktree_row_shows_selection_marker() {
 
 #[test]
 fn dirty_row_uses_error_palette() {
-    let screen = ready_screen(true);
+    let mut screen = ready_screen(true);
     let backend = TestBackend::new(120, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| screen.render(f, f.area())).unwrap();
@@ -308,7 +308,7 @@ fn dirty_row_uses_error_palette() {
 
 #[test]
 fn clean_row_uses_accent_palette() {
-    let screen = ready_screen(true);
+    let mut screen = ready_screen(true);
     let backend = TestBackend::new(120, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| screen.render(f, f.area())).unwrap();
@@ -424,8 +424,8 @@ fn table_uses_available_height_before_scrolling() {
     screen.set_rows(rows);
 
     // Height must fit exactly: 4 (banner/search) + 13 (header + 12 rows)
-    // + 4 (4-line footer with Status / Ahead-Behind legends).
-    let dumped = dump(120, 21, |f| screen.render(f, f.area()));
+    // + 7 (7-line footer with bordered bulk-delete buttons row).
+    let dumped = dump(120, 24, |f| screen.render(f, f.area()));
     assert!(dumped.contains("repo-11"));
     assert!(!dumped.contains("more above"));
     assert!(!dumped.contains("more below"));
@@ -503,7 +503,7 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
 
     insta::assert_snapshot!(
         "dashboard_wide_pr_footer",
-        dump_lines(110, 14, |f| screen.render(f, f.area()))
+        dump_lines(110, 16, |f| screen.render(f, f.area()))
     );
 }
 

@@ -12,10 +12,10 @@ Worktree           Branch        Status   A/B         Commit
  ➤ /tmp/repo-bug   bug           Opened   +1 -0       deadbee work on ..
    /tmp/repo-feat  feat          Clean    =0          deadbee work on ..
 
-
-
-
 Narrow view: 1 hidden  •  PR #42 Open: Improve dashboard...
-↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Type to Search  Ctrl+R
+                              ┌────────┐  ┌────┐  ┌────────┐  ┌────────┐
+Delete worktrees with status: │ Merged │  │ Op │  │ Clean  │  │ Dirty  │
+                              └────────┘  └────┘  └────────┘  └────────┘
+↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type t
 Status: Dirty = has uncommitted changes  Clean = no uncommitted changes
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls b

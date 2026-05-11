@@ -36,7 +36,7 @@ use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::create::{CreateAction, CreateScreen};
-use crate::tui::screens::dashboard::{DashboardAction, DashboardScreen};
+use crate::tui::screens::dashboard::{BulkDeleteStatus, DashboardAction, DashboardScreen};
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
 };
@@ -100,6 +100,12 @@ pub struct App {
     /// stdout once the TUI tears down. Only set in `is_from_wrapper` mode.
     selected_path: Option<String>,
     pending_delete_path: Option<String>,
+    /// Worktree paths queued by a dashboard bulk-delete button; consumed
+    /// once the Delete screen finishes loading.
+    pending_bulk_delete_paths: Vec<String>,
+    /// Remaining `(path, force)` items still to delete in the current
+    /// bulk run, processed one at a time via `kick_off_delete_worktree`.
+    bulk_delete_queue: Vec<(String, bool)>,
 }
 
 impl App {
@@ -128,6 +134,8 @@ impl App {
             mouse_selection: None,
             selected_path: None,
             pending_delete_path: None,
+            pending_bulk_delete_paths: Vec::new(),
+            bulk_delete_queue: Vec::new(),
         }
     }
 
@@ -396,8 +404,20 @@ impl App {
                     selection.update(position);
                 }
 
+                // A click without drag is a button activation, not a text
+                // selection. Try the dashboard's bulk-delete buttons first;
+                // fall back to clipboard copy when the click missed.
                 if let Some(text) = extract_text(snapshot, &selection) {
                     kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
+                    return;
+                }
+                if matches!(self.screen, Screen::Dashboard) {
+                    let action = self
+                        .dashboard
+                        .as_mut()
+                        .map(|dashboard| dashboard.handle_mouse_click(raw_position))
+                        .unwrap_or(DashboardAction::Continue);
+                    self.apply_dashboard_action(action, tx);
                 }
             }
             _ => {}
@@ -478,7 +498,14 @@ impl App {
             Some(dashboard) => dashboard.handle_key(key),
             None => return,
         };
+        self.apply_dashboard_action(action, tx);
+    }
 
+    fn apply_dashboard_action(
+        &mut self,
+        action: DashboardAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
         match action {
             DashboardAction::Continue => {}
             DashboardAction::Back => self.back_to_menu(),
@@ -513,11 +540,31 @@ impl App {
                 self.pending_delete_path = Some(path);
                 self.enter_screen(Screen::Delete, tx);
             }
+            DashboardAction::BulkDelete(status, paths) => {
+                self.start_bulk_delete_flow(status, paths, tx);
+            }
             DashboardAction::CopyPath(path) => {
                 let success_message = format!("Copied {} to clipboard.", fold_path(&path));
                 kick_off_clipboard_copy(path, success_message, tx.clone());
             }
         }
+    }
+
+    fn start_bulk_delete_flow(
+        &mut self,
+        status: BulkDeleteStatus,
+        paths: Vec<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if paths.is_empty() {
+            self.show_toast(
+                ToastVariant::Info,
+                format!("No worktrees with status '{}' to delete.", status.label()),
+            );
+            return;
+        }
+        self.pending_bulk_delete_paths = paths;
+        self.enter_screen(Screen::Delete, tx);
     }
 
     fn handle_create_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -560,23 +607,73 @@ impl App {
 
         match action {
             DeleteAction::Continue => {}
-            DeleteAction::Cancelled => self.leave_delete_screen(tx),
+            DeleteAction::Cancelled => {
+                self.bulk_delete_queue.clear();
+                self.leave_delete_screen(tx);
+            }
             DeleteAction::Confirmed { path, force } => {
                 if let Some(delete) = self.delete.as_mut() {
                     delete.start_deleting();
                 }
                 kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
             }
+            DeleteAction::BulkConfirmed { items } => {
+                self.bulk_delete_queue = items;
+                if let Some(delete) = self.delete.as_mut() {
+                    delete.start_deleting();
+                }
+                self.dispatch_next_bulk_delete(tx);
+            }
             DeleteAction::Done => self.leave_delete_screen(tx),
         }
     }
 
+    fn dispatch_next_bulk_delete(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if self.bulk_delete_queue.is_empty() {
+            // Bulk run finished. Mirror the post-Create flow: surface a
+            // success toast (plus any per-item warnings) and drop the
+            // user back on the Dashboard rather than rendering a
+            // dedicated success page.
+            let summary = self
+                .delete
+                .as_mut()
+                .and_then(|d| d.take_bulk_summary());
+            if let Some((message, warnings)) = summary {
+                self.show_toast(ToastVariant::Success, message);
+                for warning in warnings {
+                    self.show_toast(ToastVariant::Warning, warning);
+                }
+            }
+            // Bulk delete always originates from the Dashboard, so go
+            // straight there. We can't rely on `leave_delete_screen`
+            // here because `take_bulk_summary` already cleared the
+            // bulk markers that `leave_delete_screen` inspects.
+            self.pending_delete_path = None;
+            self.pending_bulk_delete_paths.clear();
+            if self.git_root.is_some() {
+                self.enter_screen(Screen::Dashboard, tx);
+            } else {
+                self.back_to_menu();
+            }
+            return;
+        }
+        let (path, force) = self.bulk_delete_queue.remove(0);
+        kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
+    }
+
     /// Exit the Delete screen back to wherever we came from. When the
-    /// dashboard's Backspace shortcut jumped us straight to confirm,
-    /// `pending_delete_path` is set — return to the Dashboard rather than
-    /// the main menu so the user lands where they started.
+    /// dashboard jumped us straight to a single-target or bulk confirm,
+    /// return to the Dashboard rather than the main menu so the user
+    /// lands where they started.
     fn leave_delete_screen(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
-        if self.pending_delete_path.take().is_some() && self.git_root.is_some() {
+        let from_dashboard_single = self.pending_delete_path.take().is_some();
+        let from_dashboard_bulk = self
+            .delete
+            .as_ref()
+            .map(|d| d.is_bulk())
+            .unwrap_or(false)
+            || !self.pending_bulk_delete_paths.is_empty();
+        if (from_dashboard_single || from_dashboard_bulk) && self.git_root.is_some() {
             self.enter_screen(Screen::Dashboard, tx);
         } else {
             self.back_to_menu();
@@ -689,7 +786,11 @@ impl App {
                     match result {
                         Ok(worktrees) => {
                             delete.set_worktrees(worktrees);
-                            if let Some(path) = self.pending_delete_path.as_deref() {
+                            if !self.pending_bulk_delete_paths.is_empty() {
+                                let paths =
+                                    std::mem::take(&mut self.pending_bulk_delete_paths);
+                                delete.jump_to_bulk_confirm(paths);
+                            } else if let Some(path) = self.pending_delete_path.as_deref() {
                                 delete.jump_to_confirm_path(path);
                             }
                         }
@@ -697,21 +798,43 @@ impl App {
                     }
                 }
             }
-            AppEvent::DeleteFinished(result) => match result {
-                Ok(outcome) => {
-                    if let Some(message) = outcome.branch_delete_error.clone() {
-                        self.show_toast(ToastVariant::Warning, message);
+            AppEvent::DeleteFinished(result) => {
+                let in_bulk = self
+                    .delete
+                    .as_ref()
+                    .map(|d| d.is_bulk())
+                    .unwrap_or(false);
+                match result {
+                    Ok(outcome) => {
+                        if in_bulk {
+                            // Defer per-item branch warnings to the end of
+                            // the bulk run so they're surfaced together
+                            // with the summary toast (otherwise a long run
+                            // would flash many 5-second warning toasts
+                            // back-to-back, hiding earlier ones).
+                            if let Some(delete) = self.delete.as_mut() {
+                                delete.bulk_record_progress(outcome.branch_delete_error.clone());
+                            }
+                            self.dispatch_next_bulk_delete(tx);
+                        } else {
+                            if let Some(message) = outcome.branch_delete_error.clone() {
+                                self.show_toast(ToastVariant::Warning, message);
+                            }
+                            if let Some(delete) = self.delete.as_mut() {
+                                delete.mark_complete(screen_delete_outcome(outcome));
+                            }
+                        }
                     }
-                    if let Some(delete) = self.delete.as_mut() {
-                        delete.mark_complete(screen_delete_outcome(outcome));
+                    Err(message) => {
+                        // Abort the remaining bulk run on the first failure
+                        // and surface the error.
+                        self.bulk_delete_queue.clear();
+                        if let Some(delete) = self.delete.as_mut() {
+                            delete.set_error(message);
+                        }
                     }
                 }
-                Err(message) => {
-                    if let Some(delete) = self.delete.as_mut() {
-                        delete.set_error(message);
-                    }
-                }
-            },
+            }
             AppEvent::SettingsUpdateChecked(result) => {
                 if let Some(settings) = self.settings.as_mut() {
                     settings.set_update_result(result);
@@ -835,6 +958,8 @@ impl App {
 
         if !matches!(screen, Screen::Delete) {
             self.pending_delete_path = None;
+            self.pending_bulk_delete_paths.clear();
+            self.bulk_delete_queue.clear();
         }
     }
 
@@ -853,6 +978,8 @@ impl App {
         self.clear_screen_state();
         self.screen = Screen::Menu;
         self.pending_delete_path = None;
+        self.pending_bulk_delete_paths.clear();
+        self.bulk_delete_queue.clear();
         self.menu = Some(self.build_menu_screen());
     }
 

@@ -3,10 +3,10 @@
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::messages::colors;
@@ -30,6 +30,43 @@ enum ActionChoice {
     CopyPath,
 }
 
+/// Status filter for the bulk-delete buttons row rendered above the
+/// footer. Matches the labels produced by `status_label_and_style`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkDeleteStatus {
+    Merged,
+    Opened,
+    Clean,
+    Dirty,
+}
+
+impl BulkDeleteStatus {
+    pub const ALL: [BulkDeleteStatus; 4] = [
+        BulkDeleteStatus::Merged,
+        BulkDeleteStatus::Opened,
+        BulkDeleteStatus::Clean,
+        BulkDeleteStatus::Dirty,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BulkDeleteStatus::Merged => "Merged",
+            BulkDeleteStatus::Opened => "Opened",
+            BulkDeleteStatus::Clean => "Clean",
+            BulkDeleteStatus::Dirty => "Dirty",
+        }
+    }
+
+    fn color(self) -> ratatui::style::Color {
+        match self {
+            BulkDeleteStatus::Merged => colors::SUCCESS,
+            BulkDeleteStatus::Opened => colors::INFO,
+            BulkDeleteStatus::Clean => colors::ACCENT,
+            BulkDeleteStatus::Dirty => colors::ERROR,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardAction {
     Continue,
@@ -38,6 +75,7 @@ pub enum DashboardAction {
     NavigateTo(String),
     OpenTerminal(String),
     JumpToDelete(String),
+    BulkDelete(BulkDeleteStatus, Vec<String>),
     CopyPath(String),
 }
 
@@ -92,6 +130,13 @@ pub struct DashboardScreen {
     warnings: Vec<String>,
     notice: Option<String>,
     refreshed_at: Option<Instant>,
+    /// `Some` while the bulk-delete buttons row owns the keyboard focus.
+    /// Tab moves through buttons in `BulkDeleteStatus::ALL` order; Esc
+    /// returns focus to the table.
+    bulk_focus: Option<BulkDeleteStatus>,
+    /// Captured during render so mouse clicks on the footer buttons can
+    /// be hit-tested by the app.
+    bulk_button_rects: Vec<(BulkDeleteStatus, Rect)>,
     pub tick: usize,
 }
 
@@ -122,6 +167,8 @@ impl DashboardScreen {
             warnings,
             notice: None,
             refreshed_at: None,
+            bulk_focus: None,
+            bulk_button_rects: Vec::new(),
             tick: 0,
         }
     }
@@ -164,8 +211,8 @@ impl DashboardScreen {
             return 11;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
-        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 4 footer.
-        9 + table_rows
+        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 7 footer.
+        12 + table_rows
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -197,6 +244,22 @@ impl DashboardScreen {
             return DashboardAction::Refresh;
         }
 
+        // Tab cycles through the bulk-delete buttons (and back to the
+        // table). BackTab cycles in reverse. Available even while the
+        // search query has text — Tab is never typeable into the search.
+        if matches!(key.code, KeyCode::Tab) {
+            self.bulk_focus = next_bulk_focus(self.bulk_focus, true);
+            return DashboardAction::Continue;
+        }
+        if matches!(key.code, KeyCode::BackTab) {
+            self.bulk_focus = next_bulk_focus(self.bulk_focus, false);
+            return DashboardAction::Continue;
+        }
+
+        if let Some(focused) = self.bulk_focus {
+            return self.handle_bulk_focus_key(key, focused);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 if !self.query.is_empty() {
@@ -208,10 +271,25 @@ impl DashboardScreen {
                 }
             }
             KeyCode::Up => {
+                // Up from the first filtered row jumps focus to the bulk
+                // delete buttons (mirroring Down at the last row).
+                let filtered_len = self.filtered_indices().len();
+                if filtered_len > 0 && self.selected == 0 {
+                    self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
+                    return DashboardAction::Continue;
+                }
                 self.move_selection(-1);
                 DashboardAction::Continue
             }
             KeyCode::Down => {
+                // Down at the last filtered row moves focus onto the bulk
+                // delete buttons (matching the Post-Create Commands page
+                // pattern). Otherwise advance selection within the table.
+                let filtered_len = self.filtered_indices().len();
+                if filtered_len > 0 && self.selected + 1 >= filtered_len {
+                    self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
+                    return DashboardAction::Continue;
+                }
                 self.move_selection(1);
                 DashboardAction::Continue
             }
@@ -253,7 +331,9 @@ impl DashboardScreen {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.bulk_button_rects.clear();
+
         if self.loading {
             StatusIndicator::new(Status::Loading, "Loading dashboard...")
                 .with_tick(self.tick)
@@ -279,8 +359,8 @@ impl DashboardScreen {
                 Constraint::Length(1), // spacer above search
                 Constraint::Length(1), // search line
                 Constraint::Length(1), // spacer below search
-                Constraint::Min(4),    // table
-                Constraint::Length(4), // footer
+                Constraint::Min(4),     // table
+                Constraint::Length(7),  // footer
             ])
             .split(area);
 
@@ -288,10 +368,91 @@ impl DashboardScreen {
         frame.render_widget(Paragraph::new(self.search_line()), chunks[2]);
         let layout = self.table_layout(chunks[4].width);
         self.render_table(frame, chunks[4], &layout);
-        frame.render_widget(
-            Paragraph::new(self.footer_lines(chunks[4].width, &layout)),
-            chunks[5],
-        );
+        self.render_footer(frame, chunks[5], chunks[4].width, &layout);
+    }
+
+    fn handle_bulk_focus_key(
+        &mut self,
+        key: KeyEvent,
+        focused: BulkDeleteStatus,
+    ) -> DashboardAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.bulk_focus = None;
+                DashboardAction::Continue
+            }
+            KeyCode::Up => {
+                // Mirror the Post-Create Commands page: Up from the
+                // buttons row returns focus to the last item in the
+                // worktree list.
+                self.bulk_focus = None;
+                let filtered_len = self.filtered_indices().len();
+                if filtered_len > 0 {
+                    self.selected = filtered_len - 1;
+                }
+                DashboardAction::Continue
+            }
+            KeyCode::Down => {
+                // Down from the buttons row jumps focus back to the
+                // first worktree (symmetric with Up from the first row
+                // landing on the buttons).
+                self.bulk_focus = None;
+                self.selected = 0;
+                DashboardAction::Continue
+            }
+            KeyCode::Left => {
+                self.bulk_focus = next_bulk_focus(Some(focused), false);
+                if self.bulk_focus.is_none() {
+                    self.bulk_focus = Some(*BulkDeleteStatus::ALL.last().unwrap());
+                }
+                DashboardAction::Continue
+            }
+            KeyCode::Right => {
+                self.bulk_focus = next_bulk_focus(Some(focused), true);
+                if self.bulk_focus.is_none() {
+                    self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
+                }
+                DashboardAction::Continue
+            }
+            KeyCode::Enter => self.trigger_bulk_delete(focused),
+            _ => DashboardAction::Continue,
+        }
+    }
+
+    fn trigger_bulk_delete(&mut self, status: BulkDeleteStatus) -> DashboardAction {
+        let paths = self.bulk_target_paths(status);
+        self.bulk_focus = None;
+        // The empty case (no worktrees match this status) is reported via
+        // a toast by the app layer — keep this method side-effect-free
+        // beyond clearing focus so the toast is the single source of
+        // truth for that user feedback.
+        DashboardAction::BulkDelete(status, paths)
+    }
+
+    /// Returns the worktree paths whose live status matches `status`,
+    /// excluding the main repository checkout (never deletable).
+    fn bulk_target_paths(&self, status: BulkDeleteStatus) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|row| !row.worktree.is_main)
+            .filter(|row| row_matches_bulk_status(row, status))
+            .map(|row| row.worktree.path.clone())
+            .collect()
+    }
+
+    /// Hit-test a mouse position against the latest captured button
+    /// rects. Public so `App::handle_mouse` can dispatch clicks.
+    pub fn handle_mouse_click(&mut self, position: Position) -> DashboardAction {
+        for (status, rect) in self.bulk_button_rects.clone() {
+            if position.x >= rect.left()
+                && position.x < rect.right()
+                && position.y >= rect.top()
+                && position.y < rect.bottom()
+            {
+                return self.trigger_bulk_delete(status);
+            }
+        }
+        DashboardAction::Continue
     }
 
     fn build_action_select(&self, _row: &DashboardRow) -> SelectPrompt<ActionChoice> {
@@ -601,45 +762,81 @@ impl DashboardScreen {
         widths
     }
 
-    fn footer_lines(&self, width: u16, layout: &DashboardTableLayout) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
+    fn render_footer(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        table_width: u16,
+        layout: &DashboardTableLayout,
+    ) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // notice / row warning / detail
+                Constraint::Length(3), // bulk delete buttons row (bordered)
+                Constraint::Length(1), // navigate / shortcuts
+                Constraint::Length(1), // status legend
+                Constraint::Length(1), // ahead/behind legend
+            ])
+            .split(area);
+
+        frame.render_widget(
+            Paragraph::new(self.notice_line(table_width, layout)),
+            chunks[0],
+        );
+        self.render_bulk_delete_buttons(frame, chunks[1]);
+        frame.render_widget(Paragraph::new(self.shortcuts_line()), chunks[2]);
+        frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[3]);
+        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[4]);
+    }
+
+    fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
         if let Some(notice) = &self.notice {
-            lines.push(Line::from(Span::styled(
+            return Line::from(Span::styled(
                 notice.clone(),
                 Style::default().fg(colors::INFO),
-            )));
-        } else if let Some(row) = self.selected_row() {
+            ));
+        }
+        if let Some(row) = self.selected_row() {
             if let Some(error) = &row.error {
-                lines.push(Line::from(Span::styled(
+                return Line::from(Span::styled(
                     format!("Selected row warning: {error}"),
                     Style::default().fg(colors::WARNING),
-                )));
-            } else if self.rows.iter().any(|candidate| candidate.error.is_some()) {
-                lines.push(Line::from(Span::styled(
+                ));
+            }
+            if self.rows.iter().any(|candidate| candidate.error.is_some()) {
+                return Line::from(Span::styled(
                     "Some worktrees have refresh warnings. Move the selection onto [!] rows to inspect them.",
                     Style::default().fg(colors::WARNING),
-                )));
-            } else if let Some(warning) = self.warnings.first() {
-                lines.push(Line::from(Span::styled(
+                ));
+            }
+            if let Some(warning) = self.warnings.first() {
+                return Line::from(Span::styled(
                     warning.clone(),
                     Style::default().fg(colors::WARNING),
-                )));
-            } else if let Some(detail) = self.selected_detail_line(width, row, layout) {
-                lines.push(detail);
+                ));
+            }
+            if let Some(detail) = self.selected_detail_line(width, row, layout) {
+                return detail;
             }
         }
+        Line::from("")
+    }
 
-        lines.push(Line::from(Span::styled(
-            "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
+    fn shortcuts_line(&self) -> Line<'static> {
+        Line::from(Span::styled(
+            "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
             Style::default()
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM),
-        )));
+        ))
+    }
 
+    fn status_legend_line(&self) -> Line<'static> {
         let muted_dim = Style::default()
             .fg(colors::MUTED)
             .add_modifier(Modifier::DIM);
-        lines.push(Line::from(vec![
+        Line::from(vec![
             Span::styled("Status: ", muted_dim),
             Span::styled("Dirty", Style::default().fg(colors::ERROR)),
             Span::styled(" = has uncommitted changes  ", muted_dim),
@@ -649,15 +846,107 @@ impl DashboardScreen {
             Span::styled(" = PR open  ", muted_dim),
             Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
             Span::styled(" = PR merged", muted_dim),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Ahead/Behind: ", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
+        ])
+    }
+
+    fn ahead_behind_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("Ahead/Behind: ", muted_dim),
             Span::styled("+N", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" lines added  ", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
+            Span::styled(" lines added  ", muted_dim),
             Span::styled("-N", Style::default().fg(colors::ERROR)),
-            Span::styled(" lines removed vs upstream/main (falls back to upstream/master, origin/main, origin/master)", Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
-        ]));
-        lines
+            Span::styled(
+                " lines removed vs upstream/main (falls back to upstream/master, origin/main, origin/master)",
+                muted_dim,
+            ),
+        ])
+    }
+
+    fn render_bulk_delete_buttons(&mut self, frame: &mut Frame, area: Rect) {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        let prefix = "Delete worktrees with status:";
+        let prefix_width = prefix.chars().count() as u16 + 1; // trailing space
+
+        // Each button is sized to fit "Merged" (longest label) + 2 padding
+        // + 2 border so all four share a consistent width.
+        let max_label_width = BulkDeleteStatus::ALL
+            .iter()
+            .map(|s| s.label().chars().count() as u16)
+            .max()
+            .unwrap_or(6);
+        let button_width = max_label_width + 4; // 2 padding + 2 border
+        let gap: u16 = 2;
+
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(BulkDeleteStatus::ALL.len() * 2 + 2);
+        constraints.push(Constraint::Length(prefix_width));
+        for index in 0..BulkDeleteStatus::ALL.len() {
+            if index > 0 {
+                constraints.push(Constraint::Length(gap));
+            }
+            constraints.push(Constraint::Length(button_width));
+        }
+        constraints.push(Constraint::Min(0));
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .split(area);
+
+        // The prefix label sits on the middle row of the 3-line area so it
+        // visually aligns with the button contents.
+        if cols[0].width > 0 {
+            let label_row = Rect {
+                x: cols[0].x,
+                y: cols[0].y + cols[0].height / 2,
+                width: cols[0].width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(prefix, muted_dim))),
+                label_row,
+            );
+        }
+
+        for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
+            // Column layout: prefix at 0, then alternating gap/button. The
+            // first button is at index 1, subsequent buttons at index 1 + 2k.
+            let col_index = 1 + index * 2;
+            if col_index >= cols.len() {
+                break;
+            }
+            let rect = cols[col_index];
+            if rect.width == 0 {
+                continue;
+            }
+
+            let focused = self.bulk_focus == Some(*status);
+            let text_style = if focused {
+                Style::default()
+                    .fg(colors::WHITE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(status.color())
+                    .add_modifier(Modifier::BOLD)
+            };
+            let border_style = Style::default().fg(status.color());
+
+            let button = Paragraph::new(Line::from(Span::styled(status.label(), text_style)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(border_style)
+                        .padding(Padding::horizontal(1)),
+                );
+            frame.render_widget(button, rect);
+            self.bulk_button_rects.push((*status, rect));
+        }
     }
 
     fn render_action_menu(&self, frame: &mut Frame, area: Rect) {
@@ -1060,6 +1349,41 @@ fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
         Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),
+    }
+}
+
+fn row_matches_bulk_status(row: &DashboardRow, status: BulkDeleteStatus) -> bool {
+    let (label, _) = status_label_and_style(row);
+    label == status.label()
+}
+
+/// Returns the next focused bulk-delete button, or `None` to land back
+/// on the table. `forward` controls direction (`Tab` vs `BackTab`).
+fn next_bulk_focus(
+    current: Option<BulkDeleteStatus>,
+    forward: bool,
+) -> Option<BulkDeleteStatus> {
+    let all = BulkDeleteStatus::ALL;
+    let index = match current {
+        None => {
+            return if forward {
+                Some(all[0])
+            } else {
+                Some(*all.last().unwrap())
+            };
+        }
+        Some(status) => all.iter().position(|s| *s == status).unwrap_or(0),
+    };
+    if forward {
+        if index + 1 >= all.len() {
+            None
+        } else {
+            Some(all[index + 1])
+        }
+    } else if index == 0 {
+        None
+    } else {
+        Some(all[index - 1])
     }
 }
 
