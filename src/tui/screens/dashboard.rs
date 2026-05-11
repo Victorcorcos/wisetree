@@ -12,9 +12,7 @@ use ratatui::Frame;
 use crate::messages::colors;
 use crate::services::{DashboardRow, PrState};
 use crate::tui::widgets::welcome_header::fold_home;
-use crate::tui::widgets::{
-    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
-};
+use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
 
 const MAX_VISIBLE_ROWS: usize = 10;
 
@@ -639,7 +637,9 @@ impl DashboardScreen {
             )));
         }
 
-        let muted_dim = Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM);
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
         lines.push(Line::from(vec![
             Span::styled("Status: ", muted_dim),
             Span::styled("Dirty", Style::default().fg(colors::ERROR)),

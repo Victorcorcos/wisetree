@@ -854,28 +854,36 @@ impl App {
     }
 
     fn save_delete_branch_with_worktree(&mut self, enabled: bool) -> Result<(), String> {
-        let mut config_service = ConfigService::new();
-        let mut config = config_service.load_global().map_err(|e| e.to_string())?;
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
         config.delete_branch_with_worktree = enabled;
-        config_service
-            .save(&config, None)
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
             .map_err(|e| e.to_string())?;
 
-        if self.active_config_uses_global() {
-            let service = self
-                .worktree_service
-                .as_mut()
-                .ok_or_else(|| "Worktree service not initialized".to_string())?;
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
             service
                 .config_service_mut()
-                .load_global()
+                .load(project_path)
                 .map_err(|e| e.to_string())?;
         }
 
-        let path = config_service
-            .config_path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| global_config_file().display().to_string());
+        let path = target_path.display().to_string();
 
         if let Some(settings) = self.settings.as_mut() {
             settings.set_config(config, path);
@@ -1514,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_delete_branch_toggle_updates_global_config_file() {
+    fn settings_delete_branch_toggle_updates_global_config_file_when_local_missing() {
         with_home(|home| {
             let mut config_service = ConfigService::new();
             let global_path = home.path().join(".wisetree").join("settings.json");
@@ -1548,6 +1556,10 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
             assert!(saved.delete_branch_with_worktree);
             assert_eq!(saved.terminal_command, "code $WORKTREE_PATH");
+            assert_eq!(
+                app.settings.as_ref().unwrap().config_path(),
+                global_path.display().to_string()
+            );
             assert!(
                 app.settings
                     .as_ref()
@@ -1562,6 +1574,89 @@ mod tests {
                     .config_service()
                     .config()
                     .delete_branch_with_worktree
+            );
+        });
+    }
+
+    #[test]
+    fn settings_delete_branch_toggle_updates_local_config_file_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                terminal_command: "global $WORKTREE_PATH".into(),
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                terminal_command: "local $WORKTREE_PATH".into(),
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.screen = Screen::Settings;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let tx = app_event_tx();
+            app.enter_screen(Screen::Settings, &tx);
+
+            for _ in 0..5 {
+                app.handle_key(key(KeyCode::Down), &tx);
+            }
+            app.handle_key(key(KeyCode::Enter), &tx);
+            app.handle_key(key(KeyCode::Char('y')), &tx);
+            app.handle_key(key(KeyCode::Enter), &tx);
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert!(saved_local.delete_branch_with_worktree);
+            assert_eq!(saved_local.terminal_command, "local $WORKTREE_PATH");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert!(!saved_global.delete_branch_with_worktree);
+            assert_eq!(saved_global.terminal_command, "global $WORKTREE_PATH");
+
+            assert_eq!(
+                app.settings.as_ref().unwrap().config_path(),
+                local_path.display().to_string()
+            );
+            assert!(
+                app.settings
+                    .as_ref()
+                    .unwrap()
+                    .config()
+                    .delete_branch_with_worktree
+            );
+            assert!(
+                app.worktree_service
+                    .as_ref()
+                    .unwrap()
+                    .config_service()
+                    .config()
+                    .delete_branch_with_worktree
+            );
+            assert_eq!(
+                app.worktree_service
+                    .as_ref()
+                    .unwrap()
+                    .config_service()
+                    .config_path(),
+                Some(local_path.as_path())
             );
         });
     }

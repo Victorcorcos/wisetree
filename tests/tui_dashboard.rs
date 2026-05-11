@@ -88,12 +88,7 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
     row
 }
 
-fn row_with_pr_state(
-    path: &str,
-    branch: &str,
-    is_clean: bool,
-    state: PrState,
-) -> DashboardRow {
+fn row_with_pr_state(path: &str, branch: &str, is_clean: bool, state: PrState) -> DashboardRow {
     let mut row = row_with_pr(path, branch, is_clean);
     if let Some(pr) = row.pull_request.as_mut() {
         pr.state = state;

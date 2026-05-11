@@ -283,11 +283,7 @@ impl DashboardService {
     ) -> std::result::Result<(bool, Option<BranchStatus>), String> {
         let output = time::timeout(
             COMMAND_TIMEOUT,
-            run_command(
-                &self.git_binary,
-                &["status", "--porcelain=v2"],
-                Some(cwd),
-            ),
+            run_command(&self.git_binary, &["status", "--porcelain=v2"], Some(cwd)),
         )
         .await
         .map_err(|_| "timed out after 1s".to_string())??;
@@ -433,7 +429,6 @@ impl DashboardService {
             title: pr.title,
         }))
     }
-
 }
 
 fn binary_available(binary: &Path) -> bool {
