@@ -12,7 +12,6 @@ use crate::messages::colors;
 const DEFAULT_TOAST_DURATION: Duration = Duration::from_secs(5);
 const TOAST_MARGIN_X: u16 = 2;
 const TOAST_MARGIN_Y: u16 = 2;
-const TOAST_MIN_WIDTH: u16 = 24;
 const TOAST_MAX_WIDTH: u16 = 72;
 const TOAST_MAX_HEIGHT: u16 = 8;
 
@@ -116,9 +115,8 @@ impl ToastVariant {
 fn toast_rect(area: Rect, message: &str) -> Rect {
     let available_width = area.width.saturating_sub(TOAST_MARGIN_X.saturating_mul(2));
     let max_width = available_width.min(TOAST_MAX_WIDTH).max(1);
-    let min_width = TOAST_MIN_WIDTH.min(max_width);
     let desired_width = longest_line_width(message).saturating_add(2);
-    let width = desired_width.max(min_width).min(max_width);
+    let width = desired_width.min(max_width).max(3);
 
     let inner_width = width.saturating_sub(2).max(1);
     let available_height = area.height.saturating_sub(TOAST_MARGIN_Y.saturating_mul(2));
@@ -221,5 +219,12 @@ mod tests {
             .collect::<String>();
         assert!(dumped.contains("Choose wisely"));
         assert!(dumped.contains("Copied to clipboard"));
+    }
+
+    #[test]
+    fn short_toast_width_fits_content_without_forced_padding() {
+        let area = Rect::new(0, 0, 80, 20);
+        let rect = toast_rect(area, "Copied to clipboard");
+        assert_eq!(rect.width, "Copied to clipboard".chars().count() as u16 + 2);
     }
 }
