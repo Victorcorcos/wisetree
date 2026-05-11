@@ -876,22 +876,18 @@ impl DashboardScreen {
         let prefix = "Delete worktrees with status:";
         let prefix_width = prefix.chars().count() as u16 + 1; // trailing space
 
-        // Each button is sized to fit "Merged" (longest label) + 2 padding
-        // + 2 border so all four share a consistent width.
-        let max_label_width = BulkDeleteStatus::ALL
-            .iter()
-            .map(|s| s.label().chars().count() as u16)
-            .max()
-            .unwrap_or(6);
-        let button_width = max_label_width + 4; // 2 padding + 2 border
+        // Each button hugs its own label (label + 2 padding + 2 border) so
+        // shorter labels like "Clean"/"Dirty" don't end up with a stray
+        // half-char of leftover space on one side.
         let gap: u16 = 2;
 
         let mut constraints: Vec<Constraint> = Vec::with_capacity(BulkDeleteStatus::ALL.len() * 2 + 2);
         constraints.push(Constraint::Length(prefix_width));
-        for index in 0..BulkDeleteStatus::ALL.len() {
+        for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
             if index > 0 {
                 constraints.push(Constraint::Length(gap));
             }
+            let button_width = status.label().chars().count() as u16 + 4;
             constraints.push(Constraint::Length(button_width));
         }
         constraints.push(Constraint::Min(0));
