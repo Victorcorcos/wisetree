@@ -25,7 +25,7 @@ const GH_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long a cached PR record stays fresh when the branch HEAD hasn't moved.
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API.
-const PR_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+const PR_CACHE_TTL_MS: u64 = 30 * 1000;
 /// How long to suspend PR fetches after a rate-limit error.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
