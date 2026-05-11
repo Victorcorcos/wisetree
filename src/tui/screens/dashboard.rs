@@ -56,6 +56,18 @@ struct DashboardTableLayout {
     visible_columns: Vec<DashboardColumn>,
     hidden_columns: Vec<DashboardColumn>,
     compact: bool,
+    extra_for_last_commit: u16,
+}
+
+impl DashboardTableLayout {
+    fn column_width(&self, column: DashboardColumn) -> u16 {
+        let base = column.width(self.compact);
+        if matches!(column, DashboardColumn::LastCommit) {
+            base.saturating_add(self.extra_for_last_commit)
+        } else {
+            base
+        }
+    }
 }
 
 pub struct DashboardScreen {
@@ -589,7 +601,7 @@ impl DashboardScreen {
         ]))];
 
         for column in &layout.visible_columns {
-            cells.push(column.cell(row, layout.compact));
+            cells.push(column.cell(row, layout.compact, layout.column_width(*column)));
         }
 
         cells
@@ -598,7 +610,7 @@ impl DashboardScreen {
     fn column_widths(&self, layout: &DashboardTableLayout) -> Vec<Constraint> {
         let mut widths = vec![Constraint::Length(layout.worktree_width)];
         for column in &layout.visible_columns {
-            widths.push(Constraint::Length(column.width(layout.compact)));
+            widths.push(Constraint::Length(layout.column_width(*column)));
         }
         widths
     }
@@ -721,13 +733,48 @@ impl DashboardScreen {
             }
         }
 
-        let worktree_width = width.saturating_sub(used).max(min_worktree);
+        let max_available = width.saturating_sub(used).max(min_worktree);
+
+        // Size the worktree column to the longest visible path so other columns
+        // sit right after it, instead of being pushed to the far right.
+        let marker_width = SELECT_MARKER.chars().count() as u16;
+        let error_suffix = if self.rows.iter().any(|row| row.error.is_some()) {
+            4 // " [!]"
+        } else {
+            0
+        };
+        let longest_path = self
+            .rows
+            .iter()
+            .map(|row| fold_home(&row.worktree.path).chars().count() as u16)
+            .max()
+            .unwrap_or(0);
+        let header_min = "Worktree".chars().count() as u16;
+        let desired_worktree_width = longest_path
+            .saturating_add(marker_width)
+            .saturating_add(error_suffix)
+            .max(header_min)
+            .max(min_worktree);
+        let worktree_width = desired_worktree_width.min(max_available);
+
+        // Hand the leftover width to LastCommit so commit summaries aren't
+        // perpetually truncated. Falls through as trailing space if hidden.
+        let leftover = max_available.saturating_sub(worktree_width);
+        let extra_for_last_commit = if visible_columns
+            .iter()
+            .any(|c| matches!(c, DashboardColumn::LastCommit))
+        {
+            leftover
+        } else {
+            0
+        };
 
         DashboardTableLayout {
             worktree_width,
             visible_columns,
             hidden_columns,
             compact,
+            extra_for_last_commit,
         }
     }
 
@@ -929,11 +976,11 @@ impl DashboardColumn {
         }
     }
 
-    fn cell(self, row: &DashboardRow, compact: bool) -> Cell<'static> {
+    fn cell(self, row: &DashboardRow, compact: bool, width: u16) -> Cell<'static> {
         match self {
             Self::Branch => Cell::from(Line::from(Span::raw(truncate(
                 &row.worktree.branch,
-                self.width(compact) as usize,
+                width as usize,
             )))),
             Self::Status => {
                 let (text, style) = status_label_and_style(row);
@@ -970,10 +1017,7 @@ impl DashboardColumn {
                         format!(
                             "{} {}",
                             commit.sha,
-                            truncate(
-                                &commit.summary,
-                                self.width(compact).saturating_sub(9) as usize
-                            )
+                            truncate(&commit.summary, width.saturating_sub(9) as usize)
                         )
                     })
                     .unwrap_or_else(|| "-".to_string());
