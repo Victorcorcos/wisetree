@@ -249,11 +249,23 @@ fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
 #[test]
 fn backspace_with_empty_search_jumps_to_delete_for_selected_row() {
     let mut screen = ready_screen(true);
-    // Default selection is the first row.
+    // First row is the mother worktree (protected) — move onto the
+    // second row, which is a regular deletable worktree.
+    screen.handle_key(key(KeyCode::Down));
     match screen.handle_key(key(KeyCode::Backspace)) {
-        DashboardAction::JumpToDelete(path) => assert_eq!(path, "/tmp/repo"),
+        DashboardAction::JumpToDelete(path) => assert_eq!(path, "/tmp/repo-bug"),
         other => panic!("expected JumpToDelete, got {other:?}"),
     }
+}
+
+#[test]
+fn backspace_on_mother_worktree_emits_protected_action() {
+    let mut screen = ready_screen(true);
+    // Default selection is the first row, which is the mother worktree.
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Backspace)),
+        DashboardAction::MotherWorktreeProtected
+    );
 }
 
 #[test]
