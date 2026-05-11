@@ -728,36 +728,17 @@ impl App {
             }
             Screen::Settings => {
                 let local_path = self.local_config_path_str();
-                let active_post_create =
-                    self.current_config().map(|cfg| cfg.post_create_cmd.clone());
-                let active_terminal_command = self
-                    .current_config()
-                    .map(|cfg| cfg.terminal_command.clone());
-                let active_path_template = self
-                    .current_config()
-                    .map(|cfg| cfg.worktree_path_template.clone());
-                let active_dashboard = self.current_config().map(|cfg| cfg.dashboard.clone());
-                let settings = match self.global_settings_snapshot() {
-                    Ok((mut config, config_path)) => {
-                        if let Some(commands) = active_post_create {
-                            config.post_create_cmd = commands;
-                        }
-                        if let Some(command) = active_terminal_command {
-                            config.terminal_command = command;
-                        }
-                        if let Some(template) = active_path_template {
-                            config.worktree_path_template = template;
-                        }
-                        if let Some(dashboard) = active_dashboard {
-                            config.dashboard = dashboard;
-                        }
-                        SettingsScreen::new(config, config_path).with_local_config_path(local_path)
-                    }
+                let global_path = global_config_file().display().to_string();
+                let settings = match self.settings_snapshot() {
+                    Ok((config, config_path)) => SettingsScreen::new(config, config_path)
+                        .with_global_config_path(global_path)
+                        .with_local_config_path(local_path),
                     Err(err) => {
                         let mut settings = SettingsScreen::new(
                             WorktreeConfig::default(),
                             global_config_file().display().to_string(),
                         )
+                        .with_global_config_path(global_config_file().display().to_string())
                         .with_local_config_path(local_path);
                         settings.set_error(err);
                         settings
@@ -834,7 +815,14 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn global_settings_snapshot(&self) -> Result<(WorktreeConfig, String), String> {
+    fn settings_snapshot(&self) -> Result<(WorktreeConfig, String), String> {
+        if let Some(service) = self.worktree_service.as_ref() {
+            let config_service = service.config_service();
+            if let Some(path) = config_service.config_path() {
+                return Ok((config_service.config().clone(), path.display().to_string()));
+            }
+        }
+
         let mut config_service = ConfigService::new();
         let config = config_service.load_global().map_err(|e| e.to_string())?;
         let path = config_service
@@ -1050,27 +1038,7 @@ impl App {
     }
 
     fn refresh_settings_screen(&mut self) -> Result<(), String> {
-        let active_post_create = self.current_config().map(|cfg| cfg.post_create_cmd.clone());
-        let active_terminal_command = self
-            .current_config()
-            .map(|cfg| cfg.terminal_command.clone());
-        let active_path_template = self
-            .current_config()
-            .map(|cfg| cfg.worktree_path_template.clone());
-        let active_dashboard = self.current_config().map(|cfg| cfg.dashboard.clone());
-        let (mut config, path) = self.global_settings_snapshot()?;
-        if let Some(commands) = active_post_create {
-            config.post_create_cmd = commands;
-        }
-        if let Some(command) = active_terminal_command {
-            config.terminal_command = command;
-        }
-        if let Some(template) = active_path_template {
-            config.worktree_path_template = template;
-        }
-        if let Some(dashboard) = active_dashboard {
-            config.dashboard = dashboard;
-        }
+        let (config, path) = self.settings_snapshot()?;
 
         if let Some(settings) = self.settings.as_mut() {
             settings.set_config(config, path);
@@ -1657,6 +1625,64 @@ mod tests {
                     .config_service()
                     .config_path(),
                 Some(local_path.as_path())
+            );
+        });
+    }
+
+    #[test]
+    fn settings_reenter_uses_local_delete_branch_value_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                delete_branch_with_worktree: false,
+                ..WorktreeConfig::default()
+            };
+
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.screen = Screen::Settings;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let tx = app_event_tx();
+            app.enter_screen(Screen::Settings, &tx);
+
+            for _ in 0..5 {
+                app.handle_key(key(KeyCode::Down), &tx);
+            }
+            app.handle_key(key(KeyCode::Enter), &tx);
+            app.handle_key(key(KeyCode::Char('y')), &tx);
+            app.handle_key(key(KeyCode::Enter), &tx);
+
+            app.back_to_menu();
+            app.enter_screen(Screen::Settings, &tx);
+
+            assert_eq!(
+                app.settings.as_ref().unwrap().config_path(),
+                local_path.display().to_string()
+            );
+            assert!(
+                app.settings
+                    .as_ref()
+                    .unwrap()
+                    .config()
+                    .delete_branch_with_worktree
             );
         });
     }

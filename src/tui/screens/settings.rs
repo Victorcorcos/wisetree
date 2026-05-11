@@ -1,4 +1,4 @@
-//! Settings screen — mostly read-only view of the global `WorktreeConfig`
+//! Settings screen — mostly read-only view of the active `WorktreeConfig`
 //! plus a writable `Delete Branch with Worktree` toggle and a
 //! "Check for Updates" entry. Mirrors upstream `SettingsMenu` (steps:
 //! `Menu`, five read-only field detail views, the toggle view, and
@@ -64,12 +64,12 @@ pub enum SettingsAction {
     /// `.wisetree.json`. Empty entries and deletion-marked rectangles are
     /// filtered out by the caller before they reach disk.
     SavePostCreateCommands(Vec<String>),
-    /// Persist the supplied terminal command to the project-local
-    /// `.wisetree.json`. An empty string clears the configured command.
+    /// Persist the supplied terminal command to the active config file.
+    /// An empty string clears the configured command.
     SaveTerminalCommand(String),
-    /// Persist the supplied worktree path template to the project-local
-    /// `.wisetree.json`. An empty string falls back to the default template
-    /// on next load via the schema default.
+    /// Persist the supplied worktree path template to the active config file.
+    /// An empty string falls back to the default template on next load via
+    /// the schema default.
     SavePathTemplate(String),
     /// Copy the active config from one location to the other.
     CopySettings(CopyDirection),
@@ -347,6 +347,7 @@ pub struct SettingsScreen {
     step: SettingsStep,
     config: WorktreeConfig,
     config_path: String,
+    global_config_path: Option<String>,
     /// Optional path of the project-local config the post-create commands
     /// editor will write to. Shown to the user while they edit.
     local_config_path: Option<String>,
@@ -371,6 +372,7 @@ impl SettingsScreen {
             step: SettingsStep::Menu,
             config,
             config_path,
+            global_config_path: None,
             local_config_path: None,
             error: None,
             select: None,
@@ -394,6 +396,11 @@ impl SettingsScreen {
     /// Stored verbatim and surfaced in the editor footer.
     pub fn with_local_config_path(mut self, path: Option<String>) -> Self {
         self.local_config_path = path;
+        self
+    }
+
+    pub fn with_global_config_path(mut self, path: String) -> Self {
+        self.global_config_path = Some(path);
         self
     }
 
@@ -1088,16 +1095,25 @@ impl SettingsScreen {
             // + all visible entries + hint.
             SettingsStep::Menu => 16,
             SettingsStep::CheckUpdates => 6,
-            // Detail panes: header + value lines + hint.
-            SettingsStep::CopyPatterns | SettingsStep::IgnorePatterns | SettingsStep::Dashboard => {
-                12
+            SettingsStep::CopyPatterns => {
+                self.field_preferred_height(self.config.worktree_copy_patterns.len(), true)
             }
+            SettingsStep::IgnorePatterns => {
+                self.field_preferred_height(self.config.worktree_copy_ignores.len(), true)
+            }
+            // Detail pane: header + value lines + hint.
+            SettingsStep::Dashboard => 12,
             SettingsStep::PathTemplate => self.path_template_preferred_height(),
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
             SettingsStep::PostCmd => self.post_cmd_preferred_height(),
             SettingsStep::DeleteBranch => 16,
             SettingsStep::CopySettings => 12,
         }
+    }
+
+    fn field_preferred_height(&self, item_count: usize, spacer_before_footer: bool) -> u16 {
+        let footer_lines = if spacer_before_footer { 2 } else { 1 };
+        item_count.saturating_add(2 + footer_lines).max(12usize) as u16
     }
 
     fn post_cmd_preferred_height(&self) -> u16 {
@@ -1197,8 +1213,15 @@ impl SettingsScreen {
         }
     }
 
-    fn render_field<I, S>(&self, frame: &mut Frame, area: Rect, title: &str, hint: &str, items: I)
-    where
+    fn render_field<I, S>(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        hint: &str,
+        items: I,
+        spacer_before_footer: bool,
+    ) where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
@@ -1207,6 +1230,20 @@ impl SettingsScreen {
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+        let footer_lines = if spacer_before_footer {
+            vec![
+                Line::default(),
+                Line::from(branded_line(
+                    &format!("Edit in {}. Press any key to go back.", self.config_path),
+                    dim_muted_style,
+                )),
+            ]
+        } else {
+            vec![Line::from(branded_line(
+                &format!("Edit in {}. Press any key to go back.", self.config_path),
+                dim_muted_style,
+            ))]
+        };
         let lines: Vec<Line> = std::iter::once(Line::from(branded_line(title, title_style)))
             .chain(std::iter::once(Line::from(branded_line(hint, muted_style))))
             .chain(items.into_iter().map(|s| {
@@ -1214,10 +1251,7 @@ impl SettingsScreen {
                 spans.extend(branded_line(&s.into(), Style::default()));
                 Line::from(spans)
             }))
-            .chain(std::iter::once(Line::from(branded_line(
-                &format!("Edit in {}. Press any key to go back.", self.config_path),
-                dim_muted_style,
-            ))))
+            .chain(footer_lines)
             .collect();
         frame.render_widget(Paragraph::new(lines), area);
     }
@@ -1229,6 +1263,7 @@ impl SettingsScreen {
             "Copy Patterns",
             "Files/patterns copied to new worktrees:",
             self.config.worktree_copy_patterns.clone(),
+            true,
         );
     }
 
@@ -1239,6 +1274,7 @@ impl SettingsScreen {
             "Ignore Patterns",
             "Files/patterns excluded from copying:",
             self.config.worktree_copy_ignores.clone(),
+            true,
         );
     }
 
@@ -1261,6 +1297,7 @@ impl SettingsScreen {
             "Dashboard",
             "Live dashboard settings resolved from the active config:",
             items,
+            false,
         );
     }
 
@@ -1382,10 +1419,7 @@ impl SettingsScreen {
 
         self.render_path_template_save_button(frame, chunks[7], editor);
 
-        let target = self
-            .local_config_path
-            .clone()
-            .unwrap_or_else(|| ".wisetree.json (project local)".to_string());
+        let target = self.config_path.clone();
         let saving_line = Line::from(vec![
             Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
             Span::styled(target, Style::default().fg(colors::EMPHASIS)),
@@ -1444,6 +1478,10 @@ impl SettingsScreen {
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
         let emphasis_style = Style::default().fg(colors::EMPHASIS);
+        let global_path = self
+            .global_config_path
+            .clone()
+            .unwrap_or_else(|| self.config_path.clone());
         let local_path = self
             .local_config_path
             .clone()
@@ -1454,6 +1492,7 @@ impl SettingsScreen {
             .constraints([
                 Constraint::Length(2),
                 Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Min(1),
             ])
             .split(area);
@@ -1473,7 +1512,7 @@ impl SettingsScreen {
             Paragraph::new(vec![
                 Line::from(vec![
                     Span::styled("Global: ", muted_style),
-                    Span::styled(self.config_path.clone(), emphasis_style),
+                    Span::styled(global_path, emphasis_style),
                 ]),
                 Line::from(vec![
                     Span::styled("Local:  ", muted_style),
@@ -1484,7 +1523,7 @@ impl SettingsScreen {
         );
 
         if let Some(select) = &self.copy_settings_select {
-            select.render(frame, chunks[2]);
+            select.render(frame, chunks[3]);
         }
     }
 
@@ -1810,10 +1849,7 @@ impl SettingsScreen {
 
         self.render_terminal_cmd_save_button(frame, chunks[4], editor);
 
-        let target = self
-            .local_config_path
-            .clone()
-            .unwrap_or_else(|| ".wisetree.json (project local)".to_string());
+        let target = self.config_path.clone();
         let saving_line = Line::from(vec![
             Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
             Span::styled(target, Style::default().fg(colors::EMPHASIS)),
