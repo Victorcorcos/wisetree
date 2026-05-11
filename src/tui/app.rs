@@ -540,6 +540,12 @@ impl App {
                 self.pending_delete_path = Some(path);
                 self.enter_screen(Screen::Delete, tx);
             }
+            DashboardAction::MotherWorktreeProtected => {
+                self.show_toast(
+                    ToastVariant::Warning,
+                    "The mother worktree is protected and cannot be deleted.",
+                );
+            }
             DashboardAction::BulkDelete(status, paths) => {
                 self.start_bulk_delete_flow(status, paths, tx);
             }

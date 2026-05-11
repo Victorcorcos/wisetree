@@ -77,6 +77,10 @@ pub enum DashboardAction {
     JumpToDelete(String),
     BulkDelete(BulkDeleteStatus, Vec<String>),
     CopyPath(String),
+    /// The user tried to delete the mother (main) worktree. The app
+    /// layer should surface a toast explaining that this worktree is
+    /// protected, instead of routing to the delete screen.
+    MotherWorktreeProtected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,8 +313,11 @@ impl DashboardScreen {
                 // typing into the search box, Backspace edits the query.
                 if self.query.is_empty() {
                     if let Some(index) = self.selected_row_index() {
-                        let path = self.rows[index].worktree.path.clone();
-                        return DashboardAction::JumpToDelete(path);
+                        let row = &self.rows[index];
+                        if row.worktree.is_main {
+                            return DashboardAction::MotherWorktreeProtected;
+                        }
+                        return DashboardAction::JumpToDelete(row.worktree.path.clone());
                     }
                     return DashboardAction::Continue;
                 }
@@ -842,6 +849,8 @@ impl DashboardScreen {
             .add_modifier(Modifier::DIM);
         Line::from(vec![
             Span::styled("Status: ", muted_dim),
+            Span::styled("Mother", Style::default().fg(colors::BRAND)),
+            Span::styled(" = main worktree (protected)  ", muted_dim),
             Span::styled("Dirty", Style::default().fg(colors::ERROR)),
             Span::styled(" = has uncommitted changes  ", muted_dim),
             Span::styled("Clean", Style::default().fg(colors::ACCENT)),
@@ -1346,6 +1355,13 @@ impl PrState {
 }
 
 fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
+    // The main worktree is the "mother" — it generates every other
+    // worktree and cannot be deleted. Surface that uniqueness with its
+    // own status label so users can distinguish it at a glance and so
+    // bulk-delete filters never match against it.
+    if row.worktree.is_main {
+        return ("Mother", Style::default().fg(colors::BRAND));
+    }
     match row.pull_request.as_ref().map(|pr| pr.state) {
         Some(PrState::Merged) => ("Merged", Style::default().fg(colors::SUCCESS)),
         Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),

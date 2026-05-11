@@ -1,6 +1,6 @@
 ---
 source: tests/tui_dashboard.rs
-assertion_line: 532
+assertion_line: 544
 expression: "dump_lines(72, 16, |f| screen.render(f, f.area()))"
 ---
 Refreshed just now - 3 worktrees, 0 dirty, 1 PR open
@@ -8,7 +8,7 @@ Refreshed just now - 3 worktrees, 0 dirty, 1 PR open
 Search: type to filter...
 
 Worktree           Branch        Status   A/B         Commit
-   /tmp/repo       main          Clean    =0          deadbee work on ..
+   /tmp/repo       main          Mother   =0          deadbee work on ..
  ➤ /tmp/repo-bug   bug           Opened   +1 -0       deadbee work on ..
    /tmp/repo-feat  feat          Clean    =0          deadbee work on ..
 
@@ -17,5 +17,5 @@ Narrow view: 1 hidden  •  PR #42 Open: Improve dashboard...
 Delete worktrees with status: │ Merged │  │ Open │  │ Clean │  │ Dirty │
                               └────────┘  └──────┘  └───────┘  └───────┘
 ↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type t
-Status: Dirty = has uncommitted changes  Clean = no uncommitted changes
+Status: Mother = main worktree (protected)  Dirty = has uncommitted chan
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls b
