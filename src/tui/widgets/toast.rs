@@ -114,13 +114,13 @@ impl ToastVariant {
 
 fn toast_rect(area: Rect, message: &str) -> Rect {
     let available_width = area.width.saturating_sub(TOAST_MARGIN_X.saturating_mul(2));
-    let max_width = available_width.min(TOAST_MAX_WIDTH).max(1);
+    let max_width = available_width.clamp(1, TOAST_MAX_WIDTH);
     let desired_width = longest_line_width(message).saturating_add(2);
     let width = desired_width.min(max_width).max(3);
 
     let inner_width = width.saturating_sub(2).max(1);
     let available_height = area.height.saturating_sub(TOAST_MARGIN_Y.saturating_mul(2));
-    let max_height = available_height.min(TOAST_MAX_HEIGHT).max(3);
+    let max_height = available_height.clamp(3, TOAST_MAX_HEIGHT);
     let desired_height = wrapped_line_count(message, inner_width as usize)
         .saturating_add(2)
         .max(3);

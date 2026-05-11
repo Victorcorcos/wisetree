@@ -629,21 +629,12 @@ impl DashboardScreen {
             }
         }
 
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            )));
-        }
+        lines.push(Line::from(Span::styled(
+            "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        )));
 
         let muted_dim = Style::default()
             .fg(colors::MUTED)
