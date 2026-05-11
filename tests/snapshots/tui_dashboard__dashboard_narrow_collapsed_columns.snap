@@ -1,6 +1,6 @@
 ---
 source: tests/tui_dashboard.rs
-assertion_line: 467
+assertion_line: 499
 expression: "dump_lines(72, 16, |f| screen.render(f, f.area()))"
 ---
 Refreshed just now - 3 worktrees, 1 dirty, 1 PR open
@@ -16,6 +16,6 @@ Worktree             Branch        Status   A/B         Commit
 
 
 Narrow view: 1 hidden  •  PR #42 Open: Improve dashboard...
-↑↓ Navigate  ↵ Actions  Type to Search  Ctrl+R Refresh  Esc Clear / Back
+↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Type to Search  Ctrl+R
 Status: Dirty = has uncommitted changes  Clean = no uncommitted changes
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls b

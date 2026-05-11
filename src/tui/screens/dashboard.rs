@@ -27,7 +27,6 @@ enum ActionChoice {
     Navigate,
     OpenWithCommand,
     CopyPath,
-    Delete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,9 +212,18 @@ impl DashboardScreen {
                 DashboardAction::Continue
             }
             KeyCode::Backspace | KeyCode::Delete => {
-                if self.query.pop().is_some() {
-                    self.selected = 0;
+                // Backspace on an empty search jumps directly to the delete
+                // confirmation for the highlighted worktree. While the user is
+                // typing into the search box, Backspace edits the query.
+                if self.query.is_empty() {
+                    if let Some(index) = self.selected_row_index() {
+                        let path = self.rows[index].worktree.path.clone();
+                        return DashboardAction::JumpToDelete(path);
+                    }
+                    return DashboardAction::Continue;
                 }
+                self.query.pop();
+                self.selected = 0;
                 DashboardAction::Continue
             }
             KeyCode::Char(c)
@@ -272,7 +280,7 @@ impl DashboardScreen {
         );
     }
 
-    fn build_action_select(&self, row: &DashboardRow) -> SelectPrompt<ActionChoice> {
+    fn build_action_select(&self, _row: &DashboardRow) -> SelectPrompt<ActionChoice> {
         let mut options = Vec::new();
         if self.is_from_wrapper {
             options.push(SelectOption::new(
@@ -286,18 +294,6 @@ impl DashboardScreen {
                     .with_description("Open using configured terminal command"),
             );
         }
-        // Delete is intentionally placed above Copy path: from the dashboard
-        // the user is more likely to want to delete the selected worktree than
-        // to copy its path.
-        options.push(
-            SelectOption::new("Delete this worktree", ActionChoice::Delete).with_description(
-                format!(
-                    "{} ({})",
-                    fold_home(&row.worktree.path),
-                    row.worktree.branch
-                ),
-            ),
-        );
         if self.has_clipboard {
             options.push(SelectOption::new(
                 "Copy path to clipboard",
@@ -327,7 +323,6 @@ impl DashboardScreen {
                     ActionChoice::Navigate => DashboardAction::NavigateTo(path),
                     ActionChoice::OpenWithCommand => DashboardAction::OpenTerminal(path),
                     ActionChoice::CopyPath => DashboardAction::CopyPath(path),
-                    ActionChoice::Delete => DashboardAction::JumpToDelete(path),
                 }
             }
             SelectOutcome::Cancelled => {
@@ -623,14 +618,14 @@ impl DashboardScreen {
 
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
-                "↑↓ Navigate  ↵ Actions  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
+                "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),
             )));
         } else {
             lines.push(Line::from(Span::styled(
-                "↑↓ Navigate  ↵ Actions  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
+                "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),

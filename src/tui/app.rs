@@ -615,7 +615,7 @@ impl App {
                         Ok(worktrees) => {
                             delete.set_worktrees(worktrees);
                             if let Some(path) = self.pending_delete_path.as_deref() {
-                                delete.preselect_path(path);
+                                delete.jump_to_confirm_path(path);
                             }
                         }
                         Err(message) => delete.set_error(message),

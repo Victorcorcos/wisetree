@@ -247,17 +247,38 @@ fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
 }
 
 #[test]
-fn jump_to_delete_action_is_emitted_for_selected_row() {
-    // Without wrapper-mode the menu is Open / Delete / Copy, so a single
-    // Down lands on Delete (Copy is intentionally below Delete now).
-    let mut screen = ready_screen(false);
-    screen.handle_key(key(KeyCode::Enter));
-    let action = screen.handle_key(key(KeyCode::Down));
-    assert_eq!(action, DashboardAction::Continue);
-    match screen.handle_key(key(KeyCode::Enter)) {
+fn backspace_with_empty_search_jumps_to_delete_for_selected_row() {
+    let mut screen = ready_screen(true);
+    // Default selection is the first row.
+    match screen.handle_key(key(KeyCode::Backspace)) {
         DashboardAction::JumpToDelete(path) => assert_eq!(path, "/tmp/repo"),
         other => panic!("expected JumpToDelete, got {other:?}"),
     }
+}
+
+#[test]
+fn backspace_while_typing_only_edits_search_query() {
+    let mut screen = ready_screen(true);
+    for c in "bug".chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+    // Backspace while the query is non-empty must edit it, not jump to delete.
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Backspace)),
+        DashboardAction::Continue
+    );
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    // Query is now "bu" — repo-bug still matches, repo-feat does not.
+    assert!(dumped.contains("repo-bug"));
+    assert!(!dumped.contains("repo-feat"));
+}
+
+#[test]
+fn action_menu_no_longer_exposes_delete_choice() {
+    let mut screen = ready_screen(true);
+    screen.handle_key(key(KeyCode::Enter));
+    let dumped = dump(120, 14, |f| screen.render(f, f.area()));
+    assert!(!dumped.contains("Delete this worktree"));
 }
 
 #[test]
