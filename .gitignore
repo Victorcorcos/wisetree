@@ -2,6 +2,7 @@
 *.pem
 
 .claude/
+.aider/
 *.tsbuildinfo
 
 /target
