@@ -1,10 +1,10 @@
 //! Terminal lifecycle: raw mode, fixed viewport, and panic-safe
 //! restoration.
 //!
-//! The TUI renders into a fixed-height viewport anchored at the top of a
-//! cleared terminal instead of taking over the alternate screen. This keeps
-//! the compact stacked layout while avoiding the leading blank rows produced
-//! by Ratatui's inline viewport initialization.
+//! The TUI renders into a top-anchored viewport over a cleared terminal
+//! instead of taking over the alternate screen. This avoids the leading blank
+//! rows produced by Ratatui's inline viewport initialization while still
+//! letting screens use the full terminal height.
 //!
 //! Two flavors:
 //! - `enter` renders to `stdout` (default).
@@ -24,12 +24,6 @@ use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Rect, Size};
 use ratatui::style::Color;
 use ratatui::{Terminal as RatTerminal, TerminalOptions, Viewport};
-
-/// Maximum number of rows the TUI reserves at the top of the terminal. Sized to fit
-/// the tallest screen (Setup → Confirm preview); shorter screens leave the
-/// trailing rows blank rather than painting them with a backdrop, so the
-/// user's terminal background shows through.
-pub const INLINE_VIEWPORT_HEIGHT: u16 = 25;
 
 pub type Backend = AdaptiveBackend<Stdout>;
 pub type WrapperBackend = AdaptiveBackend<File>;
@@ -318,8 +312,7 @@ pub fn enter_wrapper() -> io::Result<WrapperTerminal> {
 }
 
 fn app_viewport(size: Size) -> Viewport {
-    let viewport_height = INLINE_VIEWPORT_HEIGHT.min(size.height);
-    Viewport::Fixed(Rect::new(0, 0, size.width, viewport_height))
+    Viewport::Fixed(Rect::new(0, 0, size.width, size.height))
 }
 
 fn clear_terminal_for_app<B: RatatuiBackend>(terminal: &mut RatTerminal<B>) -> io::Result<()> {
@@ -427,10 +420,10 @@ mod tests {
     }
 
     #[test]
-    fn app_viewport_is_top_anchored_and_capped() {
+    fn app_viewport_is_top_anchored_and_uses_full_height() {
         assert_eq!(
             app_viewport(Size::new(80, 40)),
-            Viewport::Fixed(Rect::new(0, 0, 80, 25))
+            Viewport::Fixed(Rect::new(0, 0, 80, 40))
         );
         assert_eq!(
             app_viewport(Size::new(80, 20)),

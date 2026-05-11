@@ -251,11 +251,7 @@ impl App {
                 menu.render(frame, area);
             }
             Screen::Dashboard => {
-                let h = self
-                    .dashboard
-                    .as_ref()
-                    .map_or(12, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                let panel = self.render_framed_panel_fill(frame, area);
                 if let Some(dashboard) = self.dashboard.as_mut() {
                     dashboard.tick = self.tick;
                     dashboard.render(frame, panel);
@@ -322,13 +318,29 @@ impl App {
         let cwd = self.git_root.as_deref().unwrap_or("");
         WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
 
+        self.render_panel_block(frame, chunks[1])
+    }
+
+    fn render_framed_panel_fill(&self, frame: &mut Frame, area: Rect) -> Rect {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(0)])
+            .split(area);
+
+        let cwd = self.git_root.as_deref().unwrap_or("");
+        WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+
+        self.render_panel_block(frame, chunks[1])
+    }
+
+    fn render_panel_block(&self, frame: &mut Frame, area: Rect) -> Rect {
         let panel = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(colors::MENU_BORDER).bg(colors::MENU_BG))
             .style(Style::default().bg(colors::MENU_BG));
-        let inner = panel.inner(chunks[1]);
-        frame.render_widget(panel, chunks[1]);
+        let inner = panel.inner(area);
+        frame.render_widget(panel, area);
         Rect {
             x: inner.x.saturating_add(2),
             y: inner.y,

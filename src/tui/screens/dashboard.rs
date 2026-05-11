@@ -14,7 +14,6 @@ use crate::services::{DashboardRow, PrState};
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
 
-const MAX_VISIBLE_ROWS: usize = 10;
 const SELECT_MARKER: &str = " ➤ ";
 const BLANK_SELECT_MARKER: &str = "   ";
 
@@ -57,6 +56,13 @@ struct DashboardTableLayout {
     hidden_columns: Vec<DashboardColumn>,
     compact: bool,
     extra_for_last_commit: u16,
+}
+
+struct DashboardTableViewport {
+    start: usize,
+    end: usize,
+    show_above_overflow: bool,
+    show_below_overflow: bool,
 }
 
 impl DashboardTableLayout {
@@ -157,15 +163,9 @@ impl DashboardScreen {
         if matches!(self.mode, DashboardMode::ActionMenu) {
             return 11;
         }
-        let visible = self.filtered_indices().len().min(MAX_VISIBLE_ROWS) as u16;
-        let overflow = if self.filtered_indices().len() > MAX_VISIBLE_ROWS {
-            2
-        } else {
-            0
-        };
-        let table_rows = visible.max(1);
-        // Search bar (1 line) plus a blank spacer above and below it (2 lines).
-        5 + 3 + table_rows + overflow + 4
+        let table_rows = self.filtered_indices().len().max(1) as u16;
+        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 4 footer.
+        9 + table_rows
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -506,29 +506,22 @@ impl DashboardScreen {
             return;
         }
 
-        let (start, end) = visible_window(self.selected, filtered.len(), MAX_VISIBLE_ROWS);
-        let visible = &filtered[start..end];
-        let hidden_above = start;
-        let hidden_below = filtered.len().saturating_sub(end);
+        let viewport = table_viewport(self.selected, filtered.len(), area.height);
+        let visible = &filtered[viewport.start..viewport.end];
+        let hidden_above = viewport.start;
+        let hidden_below = filtered.len().saturating_sub(viewport.end);
         let headers = self.header_cells(layout);
         let widths = self.column_widths(layout);
 
         let mut rows: Vec<Row> = Vec::new();
 
-        if filtered.len() > MAX_VISIBLE_ROWS {
-            rows.push(self.overflow_row(
-                if hidden_above > 0 {
-                    format!("↑ {hidden_above} more above")
-                } else {
-                    "↑ top".to_string()
-                },
-                hidden_above > 0,
-            ));
+        if viewport.show_above_overflow {
+            rows.push(self.overflow_row(format!("↑ {hidden_above} more above"), true));
         }
 
         rows.extend(visible.iter().enumerate().map(|(offset, index)| {
             let row = &self.rows[*index];
-            let is_selected = start + offset == self.selected;
+            let is_selected = viewport.start + offset == self.selected;
             let style = if is_selected {
                 Style::default()
                     .bg(colors::MENU_SELECTION_BG)
@@ -539,15 +532,8 @@ impl DashboardScreen {
             Row::new(self.row_cells(row, layout, is_selected)).style(style)
         }));
 
-        if filtered.len() > MAX_VISIBLE_ROWS {
-            rows.push(self.overflow_row(
-                if hidden_below > 0 {
-                    format!("↓ {hidden_below} more below")
-                } else {
-                    "↓ bottom".to_string()
-                },
-                hidden_below > 0,
-            ));
+        if viewport.show_below_overflow {
+            rows.push(self.overflow_row(format!("↓ {hidden_below} more below"), true));
         }
 
         let table = Table::new(rows, widths)
@@ -1098,6 +1084,39 @@ fn visible_window(selected: usize, total: usize, max_visible: usize) -> (usize, 
     }
     end = (start + max_visible).min(total);
     (start, end)
+}
+
+fn table_viewport(selected: usize, total: usize, height: u16) -> DashboardTableViewport {
+    let available_slots = usize::from(height.saturating_sub(1)).max(1);
+    if total <= available_slots {
+        return DashboardTableViewport {
+            start: 0,
+            end: total,
+            show_above_overflow: false,
+            show_below_overflow: false,
+        };
+    }
+
+    let mut overflow_rows = 1usize;
+    loop {
+        let visible_rows = available_slots.saturating_sub(overflow_rows).max(1);
+        let (start, end) = visible_window(selected, total, visible_rows);
+        let show_above_overflow = start > 0;
+        let show_below_overflow = end < total;
+        let needed_overflow_rows =
+            usize::from(show_above_overflow) + usize::from(show_below_overflow);
+
+        if needed_overflow_rows == overflow_rows {
+            return DashboardTableViewport {
+                start,
+                end,
+                show_above_overflow,
+                show_below_overflow,
+            };
+        }
+
+        overflow_rows = needed_overflow_rows;
+    }
 }
 
 fn format_elapsed(duration: std::time::Duration) -> String {
