@@ -38,6 +38,7 @@ pub struct InputPrompt {
     pub error: Option<String>,
     /// Cursor position as a char index into `value` (0..=char_count).
     pub cursor: usize,
+    pub footer_spacer: bool,
     validator: Option<Validator>,
 }
 
@@ -49,6 +50,7 @@ impl InputPrompt {
             value: String::new(),
             error: None,
             cursor: 0,
+            footer_spacer: false,
             validator: None,
         }
     }
@@ -69,6 +71,11 @@ impl InputPrompt {
         F: Fn(&str) -> Option<String> + 'static,
     {
         self.validator = Some(Box::new(validator));
+        self
+    }
+
+    pub fn with_footer_spacer(mut self) -> Self {
+        self.footer_spacer = true;
         self
     }
 
@@ -303,14 +310,18 @@ impl InputPrompt {
             colors::SUCCESS
         };
 
+        let mut constraints = vec![
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ];
+        if self.footer_spacer {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Length(1));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
+            .constraints(constraints)
             .split(area);
 
         let label_style = Style::default().fg(colors::WHITE);
@@ -342,7 +353,8 @@ impl InputPrompt {
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM),
         );
-        frame.render_widget(hint, chunks[3]);
+        let hint_idx = if self.footer_spacer { 4 } else { 3 };
+        frame.render_widget(hint, chunks[hint_idx]);
     }
 
     /// Renderable single-line content with the same solid block cursor used by

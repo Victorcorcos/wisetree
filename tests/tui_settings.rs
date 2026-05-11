@@ -130,7 +130,7 @@ fn ready_with_commands(commands: &[&str]) -> SettingsScreen {
 #[test]
 fn menu_renders_with_config_path() {
     let s = ready();
-    let dumped = dump(80, 12, |f| s.render(f, f.area()));
+    let dumped = dump(80, 13, |f| s.render(f, f.area()));
     assert!(dumped.contains("Configuration file"));
     assert!(dumped.contains("/tmp/.wisetree.json"));
     assert!(dumped.contains("➤"));

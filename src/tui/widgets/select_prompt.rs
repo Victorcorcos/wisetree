@@ -78,6 +78,7 @@ pub struct SelectPrompt<T: Clone> {
     pub searchable: bool,
     pub style: SelectStyle,
     pub show_hint: bool,
+    pub footer_spacer: bool,
 }
 
 impl<T: Clone> SelectPrompt<T> {
@@ -90,6 +91,7 @@ impl<T: Clone> SelectPrompt<T> {
             searchable: false,
             style: SelectStyle::Plain,
             show_hint: true,
+            footer_spacer: false,
         }
     }
 
@@ -112,6 +114,11 @@ impl<T: Clone> SelectPrompt<T> {
 
     pub fn without_hint(mut self) -> Self {
         self.show_hint = false;
+        self
+    }
+
+    pub fn with_footer_spacer(mut self) -> Self {
+        self.footer_spacer = true;
         self
     }
 
@@ -296,6 +303,9 @@ impl<T: Clone> SelectPrompt<T> {
         if has_more_below {
             constraints.push(Constraint::Length(1));
         }
+        if self.show_hint && self.footer_spacer {
+            constraints.push(Constraint::Length(1));
+        }
         if self.show_hint {
             constraints.push(Constraint::Length(1));
         }
@@ -443,6 +453,9 @@ impl<T: Clone> SelectPrompt<T> {
         }
 
         if self.show_hint {
+            if self.footer_spacer {
+                idx += 1;
+            }
             let hint = if self.searchable {
                 "Use ↑↓ arrows to navigate, Enter to select, Esc to clear search/cancel"
             } else {
