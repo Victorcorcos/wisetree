@@ -13,9 +13,9 @@ Worktree            Branch              Status      Ahead/Behind  Last Commit   
 
 
 PR #42 Open: Improve dashboard footer details for live workflows
-                              ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐
-Delete worktrees with status: │ Merged │  │ Opened │  │ Clean  │  │ Dirty  │
-                              └────────┘  └────────┘  └────────┘  └────────┘
+                              ┌────────┐  ┌────────┐  ┌───────┐  ┌───────┐
+Delete worktrees with status: │ Merged │  │ Opened │  │ Clean │  │ Dirty │
+                              └────────┘  └────────┘  └───────┘  └───────┘
 ↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear /
 Status: Dirty = has uncommitted changes  Clean = no uncommitted changes  Opened = PR open  Merged = PR merged
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls back to upstream/master, origin/main, o
