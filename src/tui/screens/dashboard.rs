@@ -642,13 +642,13 @@ impl DashboardScreen {
         let muted_dim = Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM);
         lines.push(Line::from(vec![
             Span::styled("Status: ", muted_dim),
-            Span::styled("Clean", Style::default().fg(colors::ACCENT)),
-            Span::styled(" = no uncommitted changes  ", muted_dim),
             Span::styled("Dirty", Style::default().fg(colors::ERROR)),
             Span::styled(" = has uncommitted changes  ", muted_dim),
-            Span::styled("Opened", Style::default().fg(colors::WARNING)),
+            Span::styled("Clean", Style::default().fg(colors::ACCENT)),
+            Span::styled(" = no uncommitted changes  ", muted_dim),
+            Span::styled("Opened", Style::default().fg(colors::INFO)),
             Span::styled(" = PR open  ", muted_dim),
-            Span::styled("Merged", Style::default().fg(colors::INFO)),
+            Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
             Span::styled(" = PR merged", muted_dim),
         ]));
         lines.push(Line::from(vec![
@@ -1025,8 +1025,8 @@ impl PrState {
 
 fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
     match row.pull_request.as_ref().map(|pr| pr.state) {
-        Some(PrState::Merged) => ("Merged", Style::default().fg(colors::INFO)),
-        Some(PrState::Open) => ("Opened", Style::default().fg(colors::WARNING)),
+        Some(PrState::Merged) => ("Merged", Style::default().fg(colors::SUCCESS)),
+        Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),
     }
