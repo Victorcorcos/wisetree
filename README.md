@@ -24,15 +24,17 @@ If you have ever tried to spin up three or four agents at once, you have probabl
 - Re-running `bundle install`, `npm install`, `pnpm install`, `pip install`, `cargo build`, or `make setup` by hand every single time you spin up a new directory.
 - Manually `cd`-ing into the new path, opening a new editor window, and only *then* starting the agent.
 - Cleaning up dangling worktrees and stale branches one by one when the experiment is over.
+- Having *zero* situational awareness once a handful of worktrees and agents are running in parallel. `git worktree list` gives you paths and SHAs, but not "which one is dirty?", "which one is behind main?", "which one already has an open PR?", "which one did I forget about?". You end up `cd`-ing into each directory and running `git status`, `git log -1`, and `gh pr view` by hand just to remember what is going on.
 
 `wisetree` collapses all of that into a single interactive session. It is opinionated where it helps you, and configurable where you need it.
 
-The two features that make it especially powerful for AI-assisted development are:
+The three features that make it especially powerful for AI-assisted development are:
 
 | Feature | What it does | Why it matters for AI agents |
 | --- | --- | --- |
 | **Copy Patterns** (`worktreeCopyPatterns` / `worktreeCopyIgnores`) | Glob-based file copying from the source repo into the freshly created worktree, with an explicit ignore list. | Untracked-but-required files (`.env*`, `.vscode/**`, local credentials, editor settings) land in the new worktree automatically, so the agent can run, test, and inspect the code without any manual seeding step. |
 | **Post-Create Commands** (`postCreateCmd`) | An ordered list of shell commands executed inside the new worktree right after it is created, with progress reporting in the TUI. | Bootstraps the environment with commands like `bundle install`, `npm install`, `docker compose up -d`, `rails db:prepare`, and `make seed`, so by the time you hand control over to the agent, the project is already runnable. |
+| **Dashboard** (`wisetree dashboard`) | A live, auto-refreshing table of every worktree in the repo, with branch, dirty/clean status, ahead/behind vs upstream, last commit, and PR state — plus instant search, row actions, and a one-keystroke delete shortcut. | When several agents are working in parallel, you need a single screen that answers "what is the state of *all* my worktrees right now?". The dashboard turns the mental model from "remember every directory" into "scan a table" and is the fastest way to triage which agent to look at next. |
 
 Combined with the optional **`terminalCommand`** (e.g. `code $WORKTREE_PATH`, `cursor $WORKTREE_PATH`, `idea $WORKTREE_PATH`) and the **shell integration** (which `cd`s your current shell into the selected worktree the moment you confirm), the loop becomes:
 
@@ -150,12 +152,48 @@ You land on the main menu, where the available actions are:
 | --- | --- |
 | **Setup Shell Integration** | One-time installer for the shell wrapper + completions (only shown when integration is not yet installed). |
 | **Create** | Guided flow: pick a source branch, name the directory, optionally name a new branch, confirm. Copy patterns, post-create commands, and terminal launch run automatically afterwards. |
-| **Dashboard** | Live table of all worktrees with refreshable dirty/clean state, ahead/behind, last commit, optional PR state, and row actions like copy path, open editor, and jump to delete. |
+| **Dashboard** | Live, auto-refreshing table of every worktree. See [Dashboard](#-dashboard) for the full feature breakdown — status, ahead/behind, last commit, PR state, fuzzy search, row actions, and the one-keystroke delete shortcut. |
 | **Delete** | Pick a worktree, confirm, and it is gone. Optionally deletes the matching branch (`deleteBranchWithWorktree`). Falls back to manual cleanup for corrupted worktrees. |
 | **Settings** | Inspect and edit the active configuration (project-local or global), reset to defaults, and toggle integration. |
 | **Exit** | Close the TUI without changing anything. |
 
 Each screen renders the **Monokai-inspired Wisetree palette** (defined in `design/pallete.md`) and supports `↑/↓` to navigate, `Enter` to confirm, and `Esc` / `Ctrl+C` to back out.
+
+### 📊 Dashboard
+
+The dashboard is the single most impactful upgrade over raw `git worktree`. Where `git worktree list` only prints paths and SHAs, the dashboard renders a **live, polling table of every worktree** in the repo, enriched with information that previously required running half a dozen commands inside each directory.
+
+#### What it shows out of the box
+
+| Column | Description |
+| --- | --- |
+| **Worktree** | Filesystem path of the worktree, with the home directory folded to `~` for readability. A trailing `[!]` flags any row whose refresh produced a warning, so you can spot data-staleness at a glance. |
+| **Branch** | The branch currently checked out in that worktree. |
+| **Status** | A coloured label — **`Clean`** (no uncommitted changes), **`Dirty`** (has uncommitted changes), **`Opened`** (a PR is open for the branch), or **`Merged`** (the PR has been merged). The labels combine local working-tree state and remote PR state into a single column, so you can immediately tell a worktree apart that is "done and merged, safe to delete" from one that is "dirty, careful". |
+| **Ahead/Behind** | `+N -N` versus the upstream tracking branch (falls back to `upstream/main`, `upstream/master`, `origin/main`, `origin/master`). `=0` when the branch is fully in sync. Green for ahead, red for behind. |
+| **Last Commit** | Short SHA plus the commit's summary line. The column dynamically grabs leftover horizontal space, so commit messages stay readable on wide terminals instead of being truncated. |
+| **PR** | When the GitHub CLI (`gh`) is installed and `dashboard.showPullRequests` is enabled, the row is enriched with the PR number, state (`Open`, `Draft`, `Merged`, `Closed`), and title. PR fetches are batched, cached on disk at `~/.wisetree/dashboard_prs.json`, refreshed when the branch SHA changes, and automatically back-off for 5 minutes after a `gh` rate-limit error, so the dashboard stays useful even on busy repositories. |
+
+A status banner at the top of the screen shows the last refresh time, the total number of worktrees, how many are dirty, and how many have an open PR — a one-line health check across all your parallel agents.
+
+#### What you can do from it
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move the selection up and down the table. |
+| `Type any character` | Live fuzzy search across path, branch, commit SHA, commit message, status label, ahead/behind, PR title, and PR URL. The match is incremental — every keystroke re-filters the table. |
+| `Esc` | Clear the active search if there is one, otherwise return to the previous screen. |
+| `↵` (Enter) | Open the **row actions** menu for the selected worktree: `Navigate to Directory` (your shell `cd`s into it via the wrapper), `Open with Command` (runs your configured `terminalCommand`, e.g. `code $WORKTREE_PATH`), and `Copy path to clipboard`. |
+| `⌫` (Backspace, when the search is empty) | Jump straight into the **delete** confirmation for the highlighted worktree, skipping the picker. While you are typing into the search, Backspace edits the query instead — the binding only fires on an empty search. |
+| `Ctrl+R` | Force an immediate refresh, on top of the configured polling interval. |
+
+#### Adapts to your terminal
+
+The dashboard inspects the available width and either renders the full table or falls into a **compact mode** that drops less-essential columns and shortens header labels (e.g. `Ahead/Behind` → `A/B`). Anything that does not fit in the grid surfaces on the footer as a `Narrow view: N hidden` indicator with the most important detail (PR title, commit summary) pulled out into a per-row detail line, so you never lose information just because the terminal is narrow.
+
+#### Why this matters when running multiple agents
+
+Without the dashboard, the only way to answer "which of my five agents has something interesting going on?" is to `cd` into each worktree, run `git status`, `git log -1`, and possibly `gh pr view`, then write the result down somewhere because you will forget by the time you check the fifth. The dashboard collapses that loop into a single always-fresh screen — and the row actions let you go from "I see something I want to check" to "I am in the right directory with my editor open" in one keystroke. For parallel AI workflows, that is the difference between *managing* the agents and *being managed by* them.
 
 ### Configuration
 
