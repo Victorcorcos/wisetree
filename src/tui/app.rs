@@ -26,7 +26,7 @@ use crate::files::service::open_terminal;
 use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
-use crate::messages::{colors, CREATE_SUCCESS};
+use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
@@ -814,9 +814,14 @@ impl App {
                             if let Some(message) = outcome.branch_delete_error.clone() {
                                 self.show_toast(ToastVariant::Warning, message);
                             }
-                            if let Some(delete) = self.delete.as_mut() {
-                                delete.mark_complete(screen_delete_outcome(outcome));
-                            }
+                            let screen_outcome = screen_delete_outcome(outcome);
+                            let success_msg = self
+                                .delete
+                                .as_ref()
+                                .map(|d| d.success_message_for(&screen_outcome))
+                                .unwrap_or_else(|| DELETE_SUCCESS.to_string());
+                            self.show_toast(ToastVariant::Success, success_msg);
+                            self.leave_delete_screen(tx);
                         }
                     }
                     Err(message) => {

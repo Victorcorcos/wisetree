@@ -658,6 +658,20 @@ impl DeleteScreen {
         }
     }
 
+    pub fn success_message_for(&self, outcome: &DeleteOutcome) -> String {
+        if outcome.branch_deleted {
+            if let Some(name) = &outcome.branch_name {
+                return format!("Worktree and branch '{name}' deleted successfully");
+            }
+        }
+        if let Some(name) = &outcome.branch_name {
+            if self.delete_branch_with_worktree {
+                return format!("Worktree deleted. Branch '{name}' was kept.");
+            }
+        }
+        DELETE_SUCCESS.to_string()
+    }
+
     fn success_message(&self) -> String {
         if self.bulk_total > 0 {
             let label = if self.bulk_completed == 1 {
@@ -668,19 +682,7 @@ impl DeleteScreen {
             return format!("{} {label} deleted successfully", self.bulk_completed);
         }
         match &self.outcome {
-            Some(o) => {
-                if o.branch_deleted {
-                    if let Some(name) = &o.branch_name {
-                        return format!("Worktree and branch '{name}' deleted successfully");
-                    }
-                }
-                if let Some(name) = &o.branch_name {
-                    if self.delete_branch_with_worktree {
-                        return format!("Worktree deleted. Branch '{name}' was kept.");
-                    }
-                }
-                DELETE_SUCCESS.to_string()
-            }
+            Some(o) => self.success_message_for(o),
             None => DELETE_SUCCESS.to_string(),
         }
     }

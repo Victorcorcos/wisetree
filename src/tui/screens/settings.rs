@@ -19,6 +19,7 @@ use ratatui::Frame;
 use std::ops::Range;
 
 use crate::config::schema::WorktreeConfig;
+use crate::constants::global_config_file;
 use crate::messages::{
     colors, UPDATE_CHECKING, UPDATE_CHECK_MENU, UPDATE_FAILED, UPDATE_INSTALL_CMD,
     UPDATE_UP_TO_DATE,
@@ -430,6 +431,15 @@ impl SettingsScreen {
 
     pub fn config_path(&self) -> &str {
         &self.config_path
+    }
+
+    fn config_source_label(&self) -> String {
+        let global = global_config_file().display().to_string();
+        if self.config_path == global {
+            format!("{} (global)", self.config_path)
+        } else {
+            format!("{} (local)", self.config_path)
+        }
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -1230,17 +1240,18 @@ impl SettingsScreen {
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+        let source_label = self.config_source_label();
         let footer_lines = if spacer_before_footer {
             vec![
                 Line::default(),
                 Line::from(branded_line(
-                    &format!("Edit in {}. Press any key to go back.", self.config_path),
+                    &format!("Edit in {}. Press any key to go back.", source_label),
                     dim_muted_style,
                 )),
             ]
         } else {
             vec![Line::from(branded_line(
-                &format!("Edit in {}. Press any key to go back.", self.config_path),
+                &format!("Edit in {}. Press any key to go back.", source_label),
                 dim_muted_style,
             ))]
         };
