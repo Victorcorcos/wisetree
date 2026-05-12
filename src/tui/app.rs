@@ -810,10 +810,13 @@ impl App {
                                 delete.bulk_record_progress(outcome.branch_delete_error.clone());
                             }
                             self.dispatch_next_bulk_delete(tx);
-                        } else {
-                            if let Some(message) = outcome.branch_delete_error.clone() {
-                                self.show_toast(ToastVariant::Warning, message);
+                        } else if let Some(warning) = outcome.branch_delete_error.clone() {
+                            let screen_outcome = screen_delete_outcome(outcome);
+                            if let Some(delete) = self.delete.as_mut() {
+                                delete.mark_complete(screen_outcome);
                             }
+                            self.show_toast(ToastVariant::Warning, warning);
+                        } else {
                             let screen_outcome = screen_delete_outcome(outcome);
                             let success_msg = self
                                 .delete
