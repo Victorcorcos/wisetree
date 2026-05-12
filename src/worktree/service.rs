@@ -211,7 +211,7 @@ impl WorktreeService {
         let mut branch_deleted = false;
         let mut branch_delete_error = None;
         if let Some(name) = &branch_name {
-            match self.git_service.delete_branch(name, force).await {
+            match self.git_service.delete_branch(name, true).await {
                 Ok(()) => branch_deleted = true,
                 Err(e) => {
                     branch_delete_error = Some(format!("Branch '{name}' was kept.\n{e}"));
