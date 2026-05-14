@@ -888,16 +888,11 @@ impl DashboardScreen {
             .add_modifier(Modifier::DIM);
         Line::from(vec![
             Span::styled("PR Checks: ", muted_dim),
-            Span::raw("⚪"),
-            Span::styled("(Pending)", Style::default().fg(colors::WHITE)),
-            Span::raw("  🟡"),
-            Span::styled("(Running)", Style::default().fg(colors::YELLOW)),
-            Span::raw("  🟢"),
-            Span::styled("(Passed)", Style::default().fg(colors::GREEN)),
-            Span::raw("  🔴"),
-            Span::styled("(Failed)", Style::default().fg(colors::PINK)),
-            Span::raw("  ⚠️"),
-            Span::styled("(Errored)", Style::default().fg(colors::ORANGE)),
+            Span::styled("⚪(Pending)", muted_dim),
+            Span::styled("  🟡(Running)", muted_dim),
+            Span::styled("  🟢(Passed)", muted_dim),
+            Span::styled("  🔴(Failed)", muted_dim),
+            Span::styled("  ⚠️(Errored)", muted_dim),
         ])
     }
 
