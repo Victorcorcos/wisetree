@@ -887,7 +887,7 @@ impl DashboardScreen {
             .fg(colors::MUTED)
             .add_modifier(Modifier::DIM);
         Line::from(vec![
-            Span::styled("Checks: ", muted_dim),
+            Span::styled("PR Checks: ", muted_dim),
             Span::raw("⚪"),
             Span::styled("(Pending)", Style::default().fg(colors::WHITE)),
             Span::raw("  🟡"),

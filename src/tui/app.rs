@@ -18,7 +18,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::cli::AppMode;
-use crate::config::schema::WorktreeConfig;
+use crate::config::schema::{DashboardConfig, WorktreeConfig};
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
@@ -745,6 +745,13 @@ impl App {
                     }
                 }
             }
+            SettingsAction::SaveDashboard(dashboard) => {
+                if let Err(err) = self.save_dashboard(dashboard) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save dashboard settings: {err}"));
+                    }
+                }
+            }
         }
     }
 
@@ -1256,6 +1263,42 @@ impl App {
 
         if let Some(settings) = self.settings.as_mut() {
             settings.mark_path_template_saved(template);
+        }
+        Ok(())
+    }
+
+    fn save_dashboard(&mut self, dashboard: DashboardConfig) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        config.dashboard = dashboard.clone();
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_dashboard_saved(dashboard);
         }
         Ok(())
     }
