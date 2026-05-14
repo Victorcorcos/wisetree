@@ -176,10 +176,21 @@ impl DashboardService {
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             loop {
-                match service.snapshot().await {
-                    Ok(rows) => {
-                        if rows_tx.send(rows).await.is_err() {
+                // Emit git-only rows (with cached PRs applied) first so the
+                // UI exits "Loading dashboard..." without waiting on the gh
+                // GraphQL round-trip. Then refresh PRs and emit again.
+                match service.collect_git_rows().await {
+                    Ok(mut rows) => {
+                        if rows_tx.send(rows.clone()).await.is_err() {
                             break;
+                        }
+                        if service.gh_available {
+                            service.refresh_pull_requests(&rows).await;
+                            service.apply_cached_prs(&mut rows);
+                            service.save_cache();
+                            if rows_tx.send(rows).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Err(err) => {
@@ -210,6 +221,18 @@ impl DashboardService {
     }
 
     pub async fn snapshot(&self) -> Result<Vec<DashboardRow>> {
+        let mut rows = self.collect_git_rows().await?;
+        self.refresh_pull_requests(&rows).await;
+        self.apply_cached_prs(&mut rows);
+        self.save_cache();
+        Ok(rows)
+    }
+
+    /// Gather worktree + git-derived state (status, upstream diff, last commit)
+    /// for every worktree in parallel, then layer cached PR data on top. No
+    /// network calls — safe to emit immediately so the UI can render before
+    /// the slower `gh` refresh completes.
+    async fn collect_git_rows(&self) -> Result<Vec<DashboardRow>> {
         let worktrees = self.list_worktrees_basic().await?;
         let mut tasks = JoinSet::new();
 
@@ -236,9 +259,7 @@ impl DashboardService {
             rows.iter().map(|row| row.worktree.branch.clone()).collect();
         self.prune_cache(&live_branches);
 
-        self.refresh_pull_requests(&rows).await;
         self.apply_cached_prs(&mut rows);
-        self.save_cache();
 
         rows.sort_by_key(|row| (!row.worktree.is_main, row.worktree.path.clone()));
         Ok(rows)
