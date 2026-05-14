@@ -4,16 +4,18 @@
 //! status filter (Merged / Opened / Clean / Dirty) feeds a list of
 //! worktree paths in; the user can then deselect any rows they'd rather
 //! keep before pressing Yes. By default every row is checked, so a user
-//! who wants the original "delete all of them" behavior just presses
-//! Enter once.
+//! who wants to delete them must first move focus down to the buttons,
+//! where `No` is selected by default for safety.
 //!
 //! Focus moves between three zones — the list, the Yes button, and the
-//! No button — via `Tab` (`Shift+Tab` wraps the other way). `↑/↓`
-//! navigate within the list; `Space` toggles the focused row; `a`
-//! toggles all rows. `←/→` only swap the two buttons (matching
-//! `ConfirmDialog`). Enter on the list or on Yes confirms with the
-//! currently-checked indices; an empty selection collapses to
-//! `Cancelled` so the caller can treat it as a plain dismissal.
+//! No button. From the list, `Tab` or `Enter` moves to the button row
+//! with `No` selected by default; `↑/↓` navigate within the list;
+//! `Space` toggles the focused row; `a` toggles all rows. `←/→` only
+//! swap the two buttons (matching `ConfirmDialog`). `Esc` on the
+//! buttons steps back into the list, while `Esc` on the list cancels
+//! the dialog. Enter on Yes confirms with the currently-checked
+//! indices; an empty selection collapses to `Cancelled` so the caller
+//! can treat it as a plain dismissal.
 //!
 //! The widget owns no rendering opinion about the parent panel — it
 //! returns a `preferred_content_height` so callers can size the
@@ -34,7 +36,7 @@ pub const CHECKBOX_CHECKED: &str = "☒";
 pub const CHECKBOX_UNCHECKED: &str = "☐";
 
 const FOOTER_HINT: &str =
-    "↑↓ navigate, Space toggle, a select all, Tab to buttons, Enter confirm, Esc cancel";
+    "↑↓ navigate, Space toggle, a select all, Tab/Enter to buttons, ←→ choose, Esc back, Enter confirm";
 
 /// One row in the bulk-confirm list. `label` is rendered verbatim after
 /// the checkbox glyph; `checked` controls which glyph appears and
@@ -67,9 +69,8 @@ pub enum BulkConfirmFocus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BulkConfirmOutcome {
-    /// User pressed Enter on the list or on the confirm button while
-    /// at least one item was checked. Indices refer to the original
-    /// `items` order.
+    /// User pressed Enter on the confirm button while at least one item
+    /// was checked. Indices refer to the original `items` order.
     Confirmed(Vec<usize>),
     /// User pressed Esc, pressed Enter on the No button, or pressed
     /// Enter while no items were checked.
@@ -87,6 +88,7 @@ pub struct BulkConfirmDialog {
     pub cancel_label: String,
     pub items: Vec<BulkConfirmItem>,
     pub focus: BulkConfirmFocus,
+    last_list_focus: usize,
 }
 
 impl BulkConfirmDialog {
@@ -116,6 +118,7 @@ impl BulkConfirmDialog {
             cancel_label: "No".into(),
             items,
             focus,
+            last_list_focus: 0,
         }
     }
 
@@ -146,12 +149,24 @@ impl BulkConfirmDialog {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> BulkConfirmOutcome {
         match key.code {
-            KeyCode::Esc => BulkConfirmOutcome::Cancelled,
-            KeyCode::Enter => self.activate(),
+            KeyCode::Esc => match self.focus {
+                BulkConfirmFocus::List(_) => BulkConfirmOutcome::Cancelled,
+                BulkConfirmFocus::Confirm | BulkConfirmFocus::Cancel => {
+                    self.focus_last_list_row();
+                    BulkConfirmOutcome::Pending
+                }
+            },
+            KeyCode::Enter => match self.focus {
+                BulkConfirmFocus::List(_) => {
+                    self.focus_buttons_default_cancel();
+                    BulkConfirmOutcome::Pending
+                }
+                BulkConfirmFocus::Confirm | BulkConfirmFocus::Cancel => self.activate(),
+            },
             KeyCode::Up => {
                 if let BulkConfirmFocus::List(i) = self.focus {
                     if i > 0 {
-                        self.focus = BulkConfirmFocus::List(i - 1);
+                        self.set_list_focus(i - 1);
                     }
                 }
                 BulkConfirmOutcome::Pending
@@ -159,20 +174,20 @@ impl BulkConfirmDialog {
             KeyCode::Down => {
                 if let BulkConfirmFocus::List(i) = self.focus {
                     if i + 1 < self.items.len() {
-                        self.focus = BulkConfirmFocus::List(i + 1);
+                        self.set_list_focus(i + 1);
                     }
                 }
                 BulkConfirmOutcome::Pending
             }
             KeyCode::Tab => {
                 self.focus = match self.focus {
-                    BulkConfirmFocus::List(_) => BulkConfirmFocus::Confirm,
+                    BulkConfirmFocus::List(_) => BulkConfirmFocus::Cancel,
                     BulkConfirmFocus::Confirm => BulkConfirmFocus::Cancel,
                     BulkConfirmFocus::Cancel => {
                         if self.items.is_empty() {
                             BulkConfirmFocus::Confirm
                         } else {
-                            BulkConfirmFocus::List(0)
+                            BulkConfirmFocus::List(self.last_list_focus)
                         }
                     }
                 };
@@ -218,6 +233,21 @@ impl BulkConfirmDialog {
                 }
             }
         }
+    }
+
+    fn focus_buttons_default_cancel(&mut self) {
+        self.focus = BulkConfirmFocus::Cancel;
+    }
+
+    fn focus_last_list_row(&mut self) {
+        if !self.items.is_empty() {
+            self.focus = BulkConfirmFocus::List(self.last_list_focus.min(self.items.len() - 1));
+        }
+    }
+
+    fn set_list_focus(&mut self, index: usize) {
+        self.last_list_focus = index;
+        self.focus = BulkConfirmFocus::List(index);
     }
 
     /// Total inner-panel rows the dialog needs:

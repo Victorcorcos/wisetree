@@ -224,7 +224,8 @@ fn bulk_confirm_yes_emits_bulk_confirmed() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
     s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
-    s.handle_key(key(KeyCode::Char('y')));
+    s.handle_key(key(KeyCode::Tab));
+    s.handle_key(key(KeyCode::Left));
     let action = s.handle_key(key(KeyCode::Enter));
     match action {
         DeleteAction::BulkConfirmed { items } => {
@@ -258,21 +259,11 @@ fn jump_to_bulk_confirm_starts_with_all_checked() {
     ]);
     assert_eq!(s.step(), DeleteStep::Confirm);
     let action = s.handle_key(key(KeyCode::Enter));
-    match action {
-        DeleteAction::BulkConfirmed { items } => {
-            assert_eq!(items.len(), 3);
-            let paths: Vec<&str> = items.iter().map(|(p, _)| p.as_str()).collect();
-            assert_eq!(
-                paths,
-                vec!["/tmp/repo-feat", "/tmp/repo-bug", "/tmp/repo-chore"]
-            );
-        }
-        other => panic!("expected BulkConfirmed, got {other:?}"),
-    }
+    assert_eq!(action, DeleteAction::Continue);
 }
 
 #[test]
-fn bulk_confirm_space_toggles_focused_row_and_yes_deletes_subset() {
+fn bulk_confirm_enter_then_left_then_yes_deletes_checked_subset() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(three_worktrees());
     s.jump_to_bulk_confirm(vec![
@@ -283,6 +274,9 @@ fn bulk_confirm_space_toggles_focused_row_and_yes_deletes_subset() {
     // Move down to the second row, uncheck it, then confirm.
     s.handle_key(key(KeyCode::Down));
     s.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(s.handle_key(key(KeyCode::Enter)), DeleteAction::Continue);
+    let action = s.handle_key(key(KeyCode::Left));
+    assert_eq!(action, DeleteAction::Continue);
     let action = s.handle_key(key(KeyCode::Enter));
     match action {
         DeleteAction::BulkConfirmed { items } => {
@@ -300,6 +294,8 @@ fn bulk_confirm_a_select_all_toggle_round_trips() {
     s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
     s.handle_key(key(KeyCode::Char(' '))); // uncheck row 0
     s.handle_key(key(KeyCode::Char('a'))); // re-check all
+    assert_eq!(s.handle_key(key(KeyCode::Enter)), DeleteAction::Continue);
+    assert_eq!(s.handle_key(key(KeyCode::Left)), DeleteAction::Continue);
     let action = s.handle_key(key(KeyCode::Enter));
     match action {
         DeleteAction::BulkConfirmed { items } => assert_eq!(items.len(), 2),
@@ -308,11 +304,13 @@ fn bulk_confirm_a_select_all_toggle_round_trips() {
 }
 
 #[test]
-fn bulk_confirm_all_unchecked_returns_cancelled() {
+fn bulk_confirm_all_unchecked_defaults_to_no_after_enter() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(three_worktrees());
     s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
     s.handle_key(key(KeyCode::Char('a'))); // uncheck all
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, DeleteAction::Continue);
     let action = s.handle_key(key(KeyCode::Enter));
     assert_eq!(action, DeleteAction::Cancelled);
 }
@@ -324,6 +322,18 @@ fn bulk_confirm_esc_cancels_screen() {
     s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into()]);
     let action = s.handle_key(key(KeyCode::Esc));
     assert_eq!(action, DeleteAction::Cancelled);
+}
+
+#[test]
+fn bulk_confirm_esc_from_buttons_returns_to_selection() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(three_worktrees());
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    assert_eq!(s.handle_key(key(KeyCode::Enter)), DeleteAction::Continue);
+
+    let action = s.handle_key(key(KeyCode::Esc));
+
+    assert_eq!(action, DeleteAction::Continue);
 }
 
 #[test]
@@ -352,6 +362,8 @@ fn bulk_confirm_subset_resets_bulk_total_for_progress() {
     // Uncheck the middle row → 2 of 3 will be confirmed.
     s.handle_key(key(KeyCode::Down));
     s.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(s.handle_key(key(KeyCode::Enter)), DeleteAction::Continue);
+    assert_eq!(s.handle_key(key(KeyCode::Left)), DeleteAction::Continue);
     let _ = s.handle_key(key(KeyCode::Enter));
     // After confirm, the bulk progress denominator should match the
     // selected subset, not the original 3.

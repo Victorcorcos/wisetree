@@ -2330,6 +2330,49 @@ mod tests {
     }
 
     #[test]
+    fn bulk_delete_esc_from_selection_returns_to_dashboard() {
+        with_home(|_| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut app = initialized_menu_app();
+                app.screen = Screen::Delete;
+                app.menu = None;
+
+                let mut delete = DeleteScreen::new(false);
+                delete.set_worktrees(vec![
+                    GitWorktree {
+                        path: "/tmp/repo".into(),
+                        branch: "main".into(),
+                        commit: "deadbeef".into(),
+                        is_main: true,
+                        is_clean: true,
+                        branch_status: None,
+                    },
+                    GitWorktree {
+                        path: "/tmp/repo-feat".into(),
+                        branch: "feat".into(),
+                        commit: "deadbeef".into(),
+                        is_main: false,
+                        is_clean: true,
+                        branch_status: None,
+                    },
+                ]);
+                delete.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into()]);
+                app.delete = Some(delete);
+
+                app.handle_delete_key(key(KeyCode::Esc), &app_event_tx());
+                tokio::task::yield_now().await;
+
+                assert_eq!(app.screen, Screen::Dashboard);
+                assert!(app.dashboard.is_some());
+            });
+        });
+    }
+
+    #[test]
     fn draw_renders_active_toast_overlay() {
         let mut app = initialized_menu_app();
         app.show_toast(ToastVariant::Info, "Copied to clipboard");

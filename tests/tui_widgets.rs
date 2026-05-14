@@ -644,14 +644,13 @@ fn bulk_confirm_a_toggles_select_all() {
 }
 
 #[test]
-fn bulk_confirm_tab_cycles_list_to_confirm_to_cancel_to_list() {
+fn bulk_confirm_tab_cycles_list_to_cancel_to_list() {
     let mut d = bulk_dialog(&["a", "b"]);
-    d.handle_key(key(KeyCode::Tab));
-    assert_eq!(d.focus, BulkConfirmFocus::Confirm);
+    d.handle_key(key(KeyCode::Down));
     d.handle_key(key(KeyCode::Tab));
     assert_eq!(d.focus, BulkConfirmFocus::Cancel);
     d.handle_key(key(KeyCode::Tab));
-    assert_eq!(d.focus, BulkConfirmFocus::List(0));
+    assert_eq!(d.focus, BulkConfirmFocus::List(1));
 }
 
 #[test]
@@ -661,26 +660,28 @@ fn bulk_confirm_left_right_swap_buttons_only() {
     d.handle_key(key(KeyCode::Right));
     assert_eq!(d.focus, BulkConfirmFocus::List(0));
     d.handle_key(key(KeyCode::Tab));
-    assert_eq!(d.focus, BulkConfirmFocus::Confirm);
-    d.handle_key(key(KeyCode::Right));
     assert_eq!(d.focus, BulkConfirmFocus::Cancel);
-    d.handle_key(key(KeyCode::Left));
+    d.handle_key(key(KeyCode::Right));
     assert_eq!(d.focus, BulkConfirmFocus::Confirm);
+    d.handle_key(key(KeyCode::Left));
+    assert_eq!(d.focus, BulkConfirmFocus::Cancel);
 }
 
 #[test]
-fn bulk_confirm_enter_on_list_confirms_with_checked_indices() {
+fn bulk_confirm_enter_on_list_moves_focus_to_no_button() {
     let mut d = bulk_dialog(&["a", "b", "c"]);
     d.handle_key(key(KeyCode::Down));
     d.handle_key(key(KeyCode::Char(' '))); // uncheck index 1
     let outcome = d.handle_key(key(KeyCode::Enter));
-    assert_eq!(outcome, BulkConfirmOutcome::Confirmed(vec![0, 2]));
+    assert_eq!(outcome, BulkConfirmOutcome::Pending);
+    assert_eq!(d.focus, BulkConfirmFocus::Cancel);
 }
 
 #[test]
 fn bulk_confirm_enter_on_yes_confirms_with_checked_indices() {
     let mut d = bulk_dialog(&["a", "b"]);
     d.handle_key(key(KeyCode::Tab));
+    d.handle_key(key(KeyCode::Left));
     let outcome = d.handle_key(key(KeyCode::Enter));
     assert_eq!(outcome, BulkConfirmOutcome::Confirmed(vec![0, 1]));
 }
@@ -689,17 +690,17 @@ fn bulk_confirm_enter_on_yes_confirms_with_checked_indices() {
 fn bulk_confirm_enter_on_no_cancels() {
     let mut d = bulk_dialog(&["a", "b"]);
     d.handle_key(key(KeyCode::Tab));
-    d.handle_key(key(KeyCode::Tab)); // focus → Cancel
     let outcome = d.handle_key(key(KeyCode::Enter));
     assert_eq!(outcome, BulkConfirmOutcome::Cancelled);
 }
 
 #[test]
-fn bulk_confirm_enter_with_nothing_checked_cancels() {
+fn bulk_confirm_enter_with_nothing_checked_still_requires_button_confirmation() {
     let mut d = bulk_dialog(&["a", "b"]);
     d.handle_key(key(KeyCode::Char('a'))); // uncheck all
     let outcome = d.handle_key(key(KeyCode::Enter));
-    assert_eq!(outcome, BulkConfirmOutcome::Cancelled);
+    assert_eq!(outcome, BulkConfirmOutcome::Pending);
+    assert_eq!(d.focus, BulkConfirmFocus::Cancel);
 }
 
 #[test]
@@ -757,13 +758,21 @@ fn bulk_confirm_cursor_visible_on_first_and_last_row_at_preferred_height() {
 }
 
 #[test]
-fn bulk_confirm_esc_cancels_from_any_focus() {
-    for warmup in [vec![], vec![KeyCode::Tab], vec![KeyCode::Tab, KeyCode::Tab]] {
-        let mut d = bulk_dialog(&["a", "b"]);
-        for code in warmup {
-            d.handle_key(key(code));
-        }
-        let outcome = d.handle_key(key(KeyCode::Esc));
-        assert_eq!(outcome, BulkConfirmOutcome::Cancelled);
-    }
+fn bulk_confirm_esc_on_buttons_returns_to_last_list_row() {
+    let mut d = bulk_dialog(&["a", "b", "c"]);
+    d.handle_key(key(KeyCode::Down));
+    d.handle_key(key(KeyCode::Down));
+    d.handle_key(key(KeyCode::Enter));
+
+    let outcome = d.handle_key(key(KeyCode::Esc));
+
+    assert_eq!(outcome, BulkConfirmOutcome::Pending);
+    assert_eq!(d.focus, BulkConfirmFocus::List(2));
+}
+
+#[test]
+fn bulk_confirm_esc_on_list_cancels() {
+    let mut d = bulk_dialog(&["a", "b"]);
+    let outcome = d.handle_key(key(KeyCode::Esc));
+    assert_eq!(outcome, BulkConfirmOutcome::Cancelled);
 }

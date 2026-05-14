@@ -461,8 +461,6 @@ impl DeleteScreen {
             }
             BulkConfirmOutcome::Cancelled => {
                 self.bulk_confirm = None;
-                self.bulk_paths.clear();
-                self.bulk_total = 0;
                 DeleteAction::Cancelled
             }
             BulkConfirmOutcome::Pending => DeleteAction::Continue,
