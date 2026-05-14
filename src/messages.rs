@@ -11,7 +11,6 @@ pub const MENU_TITLE: &str = "Choose wisely...";
 pub const MENU_SETUP: &str = "Setup Shell Integration";
 pub const MENU_CREATE: &str = "Create";
 pub const MENU_DASHBOARD: &str = "Dashboard";
-pub const MENU_DELETE: &str = "Delete";
 pub const MENU_SETTINGS: &str = "Settings";
 pub const MENU_EXIT: &str = "Exit";
 
@@ -30,17 +29,10 @@ pub const CREATE_SUCCESS: &str = "Worktree created successfully!";
 pub const CREATE_CREATING: &str = "Creating worktree...";
 
 // Delete flow
-pub const DELETE_SELECT_PROMPT: &str = "Select worktree to delete:";
 pub const DELETE_CONFIRM_TITLE: &str = "Delete Worktree Confirmation";
 pub const DELETE_WARNING: &str = "This action cannot be undone.";
 pub const DELETE_SUCCESS: &str = "Worktree deleted successfully!";
 pub const DELETE_DELETING: &str = "Deleting worktree...";
-
-// List view
-pub const LIST_TITLE: &str = "Git Worktrees";
-pub const LIST_NO_WORKTREES: &str = "No additional worktrees found.";
-pub const LIST_MAIN_INDICATOR: &str = "(main)";
-pub const LIST_DIRTY_INDICATOR: &str = "(dirty)";
 
 // Validation errors
 pub const ERROR_NOT_GIT_REPO: &str = "Current directory is not a git repository.";

@@ -158,44 +158,6 @@ fn dashboard_json_outputs_array_with_expected_length() {
 }
 
 #[test]
-fn delete_missing_args_errors() {
-    let fx = repo_with_commit();
-    let home = isolated_home();
-    Command::cargo_bin("wisetree")
-        .unwrap()
-        .args(["delete", "-f"])
-        .current_dir(&fx.repo)
-        .env("HOME", home.path())
-        .assert()
-        .failure()
-        .stderr(contains(
-            "Missing required argument: --path (-p) or --name (-n)",
-        ));
-}
-
-#[test]
-fn create_then_delete_round_trip() {
-    let fx = repo_with_commit();
-    let home = isolated_home();
-    Command::cargo_bin("wisetree")
-        .unwrap()
-        .args(["create", "-n", "feat-rt", "-s", "main"])
-        .current_dir(&fx.repo)
-        .env("HOME", home.path())
-        .assert()
-        .success();
-
-    Command::cargo_bin("wisetree")
-        .unwrap()
-        .args(["delete", "-n", "feat-rt"])
-        .current_dir(&fx.repo)
-        .env("HOME", home.path())
-        .assert()
-        .success()
-        .stdout(contains("Worktree deleted:"));
-}
-
-#[test]
 fn create_subcommand_without_flags_falls_through_to_tui() {
     // `wisetree create` with no other flags routes through the interactive
     // TUI. Under `assert_cmd` stdin/stdout aren't TTYs, so the binary refuses

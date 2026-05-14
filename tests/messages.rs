@@ -11,7 +11,6 @@ fn key_user_facing_strings_exist() {
     assert!(!messages::MENU_TITLE.is_empty());
     assert!(!messages::CREATE_CONFIRM_TITLE.is_empty());
     assert!(!messages::DELETE_CONFIRM_TITLE.is_empty());
-    assert!(!messages::LIST_NO_WORKTREES.is_empty());
     assert!(!messages::ERROR_NOT_GIT_REPO.is_empty());
     assert_eq!(messages::UPDATE_INSTALL_CMD, "npm install -g wisetree");
 }
