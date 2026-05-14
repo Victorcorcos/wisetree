@@ -261,6 +261,128 @@ fn select_step_preferred_height_grows_to_fit_all_worktrees() {
     assert_eq!(s.preferred_content_height(), 18);
 }
 
+// -- Bulk delete with checkboxes ----------------------------------------------
+
+fn three_worktrees() -> Vec<GitWorktree> {
+    vec![
+        wt("/tmp/repo", "main", true, true),
+        wt("/tmp/repo-feat", "feat", false, true),
+        wt("/tmp/repo-bug", "bug", false, true),
+        wt("/tmp/repo-chore", "chore", false, true),
+    ]
+}
+
+#[test]
+fn jump_to_bulk_confirm_starts_with_all_checked() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(three_worktrees());
+    s.jump_to_bulk_confirm(vec![
+        "/tmp/repo-feat".into(),
+        "/tmp/repo-bug".into(),
+        "/tmp/repo-chore".into(),
+    ]);
+    assert_eq!(s.step(), DeleteStep::Confirm);
+    let action = s.handle_key(key(KeyCode::Enter));
+    match action {
+        DeleteAction::BulkConfirmed { items } => {
+            assert_eq!(items.len(), 3);
+            let paths: Vec<&str> = items.iter().map(|(p, _)| p.as_str()).collect();
+            assert_eq!(
+                paths,
+                vec!["/tmp/repo-feat", "/tmp/repo-bug", "/tmp/repo-chore"]
+            );
+        }
+        other => panic!("expected BulkConfirmed, got {other:?}"),
+    }
+}
+
+#[test]
+fn bulk_confirm_space_toggles_focused_row_and_yes_deletes_subset() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(three_worktrees());
+    s.jump_to_bulk_confirm(vec![
+        "/tmp/repo-feat".into(),
+        "/tmp/repo-bug".into(),
+        "/tmp/repo-chore".into(),
+    ]);
+    // Move down to the second row, uncheck it, then confirm.
+    s.handle_key(key(KeyCode::Down));
+    s.handle_key(key(KeyCode::Char(' ')));
+    let action = s.handle_key(key(KeyCode::Enter));
+    match action {
+        DeleteAction::BulkConfirmed { items } => {
+            let paths: Vec<&str> = items.iter().map(|(p, _)| p.as_str()).collect();
+            assert_eq!(paths, vec!["/tmp/repo-feat", "/tmp/repo-chore"]);
+        }
+        other => panic!("expected BulkConfirmed, got {other:?}"),
+    }
+}
+
+#[test]
+fn bulk_confirm_a_select_all_toggle_round_trips() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(three_worktrees());
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    s.handle_key(key(KeyCode::Char(' '))); // uncheck row 0
+    s.handle_key(key(KeyCode::Char('a'))); // re-check all
+    let action = s.handle_key(key(KeyCode::Enter));
+    match action {
+        DeleteAction::BulkConfirmed { items } => assert_eq!(items.len(), 2),
+        other => panic!("expected BulkConfirmed, got {other:?}"),
+    }
+}
+
+#[test]
+fn bulk_confirm_all_unchecked_returns_cancelled() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(three_worktrees());
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    s.handle_key(key(KeyCode::Char('a'))); // uncheck all
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, DeleteAction::Cancelled);
+}
+
+#[test]
+fn bulk_confirm_esc_cancels_screen() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(three_worktrees());
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into()]);
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, DeleteAction::Cancelled);
+}
+
+#[test]
+fn bulk_confirm_render_shows_checkbox_glyphs() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(three_worktrees());
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    let dumped = dump(100, 20, |f| s.render(f, f.area()));
+    assert!(dumped.contains("☒"));
+    assert!(dumped.contains("Are you sure"));
+    s.handle_key(key(KeyCode::Char(' '))); // uncheck row 0
+    let dumped = dump(100, 20, |f| s.render(f, f.area()));
+    assert!(dumped.contains("☐"));
+    assert!(dumped.contains("☒"));
+}
+
+#[test]
+fn bulk_confirm_subset_resets_bulk_total_for_progress() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(three_worktrees());
+    s.jump_to_bulk_confirm(vec![
+        "/tmp/repo-feat".into(),
+        "/tmp/repo-bug".into(),
+        "/tmp/repo-chore".into(),
+    ]);
+    // Uncheck the middle row → 2 of 3 will be confirmed.
+    s.handle_key(key(KeyCode::Down));
+    s.handle_key(key(KeyCode::Char(' ')));
+    let _ = s.handle_key(key(KeyCode::Enter));
+    // After confirm, the bulk progress denominator should match the
+    // selected subset, not the original 3.
+    assert_eq!(s.bulk_progress(), Some((0, 2)));
+}
+
 #[test]
 fn select_step_uses_available_height_before_scrolling() {
     let mut s = DeleteScreen::new(false);
