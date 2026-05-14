@@ -907,7 +907,7 @@ impl App {
                 let service = DashboardService::new(git_root, config.clone());
                 let gh_warning = default_dashboard_warning(&config, service.gh_available());
                 let (columns, runtime_warnings) =
-                    resolve_dashboard_columns(&config.columns, service.gh_available());
+                    resolve_dashboard_columns(&config.columns, service.pr_enrichment_enabled());
                 warnings.extend(runtime_warnings);
                 if let Some(warning) = gh_warning {
                     warnings.push(warning);

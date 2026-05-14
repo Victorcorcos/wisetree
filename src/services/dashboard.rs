@@ -188,6 +188,10 @@ impl DashboardService {
         self.gh_available
     }
 
+    pub fn pr_enrichment_enabled(&self) -> bool {
+        self.config.show_pull_requests && self.gh_available
+    }
+
     pub fn watch(&self) -> DashboardWatch {
         let (rows_tx, rows_rx) = mpsc::channel(8);
         let (notice_tx, notice_rx) = mpsc::channel(8);
@@ -212,7 +216,7 @@ impl DashboardService {
                         if rows_tx.send(rows.clone()).await.is_err() {
                             break;
                         }
-                        if service.gh_available {
+                        if service.pr_enrichment_enabled() {
                             service.refresh_pull_requests(&rows).await;
                             service.apply_cached_prs(&mut rows);
                             service.save_cache();
@@ -252,9 +256,11 @@ impl DashboardService {
 
     pub async fn snapshot(&self) -> Result<Vec<DashboardRow>> {
         let mut rows = self.collect_git_rows().await?;
-        self.refresh_pull_requests(&rows).await;
-        self.apply_cached_prs(&mut rows);
-        self.save_cache();
+        if self.pr_enrichment_enabled() {
+            self.refresh_pull_requests(&rows).await;
+            self.apply_cached_prs(&mut rows);
+            self.save_cache();
+        }
         Ok(rows)
     }
 
@@ -466,7 +472,7 @@ impl DashboardService {
     /// Decide which branches need a PR refresh, then (if any) issue a single
     /// batched GraphQL request and update the cache.
     async fn refresh_pull_requests(&self, rows: &[DashboardRow]) {
-        if !self.gh_available {
+        if !self.pr_enrichment_enabled() {
             return;
         }
         if self.is_rate_limited() {
@@ -927,13 +933,13 @@ pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -
 
 pub fn resolve_dashboard_columns(
     columns: &[String],
-    gh_available: bool,
+    pr_enrichment_enabled: bool,
 ) -> (Vec<String>, Vec<String>) {
     let (normalized, warnings) = normalize_dashboard_columns(columns);
     let mut resolved = Vec::new();
 
     for column in normalized {
-        if column == "pull_request" && !gh_available {
+        if column == "pull_request" && !pr_enrichment_enabled {
             continue;
         }
         resolved.push(column);
@@ -1029,5 +1035,25 @@ mod tests {
         let body = r#"{"errors":[{"message":"API rate limit exceeded"}]}"#;
         let err = parse_graphql_response(body, &["feat"]).unwrap_err();
         assert!(is_rate_limit_error(&err));
+    }
+
+    #[test]
+    fn resolves_dashboard_columns_hides_pr_when_enrichment_disabled() {
+        let (columns, warnings) = resolve_dashboard_columns(
+            &["branch".into(), "pull_request".into(), "status".into()],
+            false,
+        );
+        assert_eq!(columns, vec!["branch", "status"]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn resolves_dashboard_columns_keeps_pr_when_enrichment_enabled() {
+        let (columns, warnings) = resolve_dashboard_columns(
+            &["branch".into(), "pull_request".into(), "status".into()],
+            true,
+        );
+        assert_eq!(columns, vec!["branch", "pull_request", "status"]);
+        assert!(warnings.is_empty());
     }
 }
