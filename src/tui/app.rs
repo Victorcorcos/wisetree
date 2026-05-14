@@ -2279,6 +2279,107 @@ mod tests {
     }
 
     #[test]
+    fn save_dashboard_writes_to_local_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                dashboard: DashboardConfig {
+                    refresh_interval_ms: 5000,
+                    show_pull_requests: false,
+                    columns: vec!["branch".into(), "status".into()],
+                },
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                dashboard: DashboardConfig {
+                    refresh_interval_ms: 6000,
+                    show_pull_requests: false,
+                    columns: vec!["branch".into()],
+                },
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let new_dashboard = DashboardConfig {
+                refresh_interval_ms: 7000,
+                show_pull_requests: true,
+                columns: vec!["branch".into(), "status".into(), "pull_request".into()],
+            };
+            app.save_dashboard(new_dashboard.clone()).unwrap();
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert_eq!(saved_local.dashboard, new_dashboard);
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.dashboard, global.dashboard);
+
+            assert_eq!(app.current_config().unwrap().dashboard, new_dashboard);
+        });
+    }
+
+    #[test]
+    fn save_dashboard_writes_to_global_when_local_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                dashboard: DashboardConfig {
+                    refresh_interval_ms: 5000,
+                    show_pull_requests: false,
+                    columns: vec!["branch".into()],
+                },
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let new_dashboard = DashboardConfig {
+                refresh_interval_ms: 8000,
+                show_pull_requests: true,
+                columns: vec!["branch".into(), "status".into()],
+            };
+            app.save_dashboard(new_dashboard.clone()).unwrap();
+
+            assert!(!local_path.exists(), "local config must not be created");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.dashboard, new_dashboard);
+
+            assert_eq!(app.current_config().unwrap().dashboard, new_dashboard);
+        });
+    }
+
+    #[test]
     fn ctrl_c_quits_without_emitting_path() {
         let mut app = App::new(AppMode::Dashboard, true);
         app.phase = InitPhase::Ready;
