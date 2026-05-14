@@ -11,8 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::messages::{
-    colors, MENU_CREATE, MENU_DASHBOARD, MENU_EXIT, MENU_SETTINGS, MENU_SETUP,
-    MENU_TITLE,
+    colors, MENU_CREATE, MENU_DASHBOARD, MENU_EXIT, MENU_SETTINGS, MENU_SETUP, MENU_TITLE,
 };
 use crate::tui::router::Screen;
 use crate::tui::widgets::welcome_header::{fold_home, WelcomeHeader};

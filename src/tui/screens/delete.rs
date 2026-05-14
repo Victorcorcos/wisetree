@@ -21,13 +21,13 @@ use ratatui::Frame;
 
 use crate::git::types::GitWorktree;
 use crate::messages::{
-    colors, DELETE_CONFIRM_TITLE, DELETE_DELETING, DELETE_SUCCESS,
-    DELETE_WARNING, LOADING_WORKTREES,
+    colors, DELETE_CONFIRM_TITLE, DELETE_DELETING, DELETE_SUCCESS, DELETE_WARNING,
+    LOADING_WORKTREES,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    branded_line, ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant,
-    Status, StatusIndicator,
+    branded_line, ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status,
+    StatusIndicator,
 };
 
 const BULK_DELETE_CONFIRM_PROMPT: &str = "Are you sure you want to delete all these worktrees?";
@@ -374,7 +374,9 @@ impl DeleteScreen {
         }
         if self.error.is_some() {
             self.error = None;
-            if self.worktrees.is_empty() || (self.selected_path.is_none() && self.bulk_paths.is_empty()) {
+            if self.worktrees.is_empty()
+                || (self.selected_path.is_none() && self.bulk_paths.is_empty())
+            {
                 return DeleteAction::Cancelled;
             }
             self.step = DeleteStep::Confirm;
