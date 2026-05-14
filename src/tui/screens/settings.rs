@@ -1671,7 +1671,10 @@ impl SettingsScreen {
             ]
         } else {
             vec![
-                Line::from(branded_line(&format!("Edit in {}.", source_label), dim_muted_style)),
+                Line::from(branded_line(
+                    &format!("Edit in {}.", source_label),
+                    dim_muted_style,
+                )),
                 Line::from(branded_line(
                     "Press Enter to copy the path, any other key to go back.",
                     dim_muted_style,
@@ -2259,10 +2262,7 @@ impl SettingsScreen {
                 .border_type(BorderType::Plain)
                 .border_style(border_style)
                 .padding(Padding::horizontal(1))
-                .title(Span::styled(
-                    format!(" postCreateCmd[{}] ", i),
-                    info_style,
-                ));
+                .title(Span::styled(format!(" postCreateCmd[{}] ", i), info_style));
             frame.render_widget(Paragraph::new(inner_line).block(block), chunk);
 
             let hint_line = Line::from(vec![

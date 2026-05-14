@@ -219,11 +219,7 @@ fn copy_patterns_footer_renders_after_blank_line() {
 
     let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
     let (_, item_y) = find_text_start(&buffer, "docker/.env-backuper").unwrap();
-    let (_, edit_y) = find_text_start(
-        &buffer,
-        "Edit in /tmp/.wisetree.json (local).",
-    )
-    .unwrap();
+    let (_, edit_y) = find_text_start(&buffer, "Edit in /tmp/.wisetree.json (local).").unwrap();
     let (_, hint_y) = find_text_start(
         &buffer,
         "Press Enter to copy the path, any other key to go back.",
@@ -275,11 +271,7 @@ fn ignore_patterns_footer_renders_after_blank_line() {
 
     let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
     let (_, item_y) = find_text_start(&buffer, "storage/**").unwrap();
-    let (_, edit_y) = find_text_start(
-        &buffer,
-        "Edit in /tmp/.wisetree.json (local).",
-    )
-    .unwrap();
+    let (_, edit_y) = find_text_start(&buffer, "Edit in /tmp/.wisetree.json (local).").unwrap();
     let (_, hint_y) = find_text_start(
         &buffer,
         "Press Enter to copy the path, any other key to go back.",

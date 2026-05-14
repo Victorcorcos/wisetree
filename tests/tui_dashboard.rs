@@ -133,14 +133,30 @@ fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
 
 #[test]
 fn loading_render_shows_loading_message() {
-    let mut screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false, 5000);
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
     assert!(dumped.contains("Loading dashboard"));
 }
 
 #[test]
 fn empty_state_renders_no_worktrees_found() {
-    let mut screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false, 5000);
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
     screen.set_rows(vec![]);
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
     assert!(dumped.contains("No worktrees found"));

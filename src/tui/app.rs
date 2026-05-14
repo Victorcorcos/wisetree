@@ -699,11 +699,7 @@ impl App {
             SettingsAction::Back => self.back_to_menu(),
             SettingsAction::CopySettingsFilePath => {
                 let path = self.settings_edit_file_path().display().to_string();
-                kick_off_clipboard_copy(
-                    path,
-                    SETTINGS_PATH_COPIED_MESSAGE.to_string(),
-                    tx.clone(),
-                );
+                kick_off_clipboard_copy(path, SETTINGS_PATH_COPIED_MESSAGE.to_string(), tx.clone());
             }
             SettingsAction::CheckUpdates => {
                 if let Some(settings) = self.settings.as_mut() {
