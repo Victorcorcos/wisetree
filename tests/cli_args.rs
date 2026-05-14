@@ -49,8 +49,6 @@ fn from_wrapper_flag_detected() {
 fn mode_flag_sets_mode() {
     let p = parse_args::<Vec<String>>(vec!["--mode".into(), "create".into()]).unwrap();
     assert_eq!(p.mode, AppMode::Create);
-    let p = parse_args::<Vec<String>>(vec!["-m".into(), "delete".into()]).unwrap();
-    assert_eq!(p.mode, AppMode::Delete);
 }
 
 #[test]
@@ -113,21 +111,6 @@ fn dashboard_watch_flag_is_supported() {
 fn mode_dashboard_is_supported() {
     let p = parse_args::<Vec<String>>(vec!["--mode".into(), "dashboard".into()]).unwrap();
     assert_eq!(p.mode, AppMode::Dashboard);
-}
-
-#[test]
-fn delete_with_path_and_force() {
-    let p = parse_args::<Vec<String>>(vec![
-        "delete".into(),
-        "-p".into(),
-        "/tmp/wt".into(),
-        "-f".into(),
-    ])
-    .unwrap();
-    let args = p.cli_args.expect("must be cli");
-    assert_eq!(args.command, CliCommand::Delete);
-    assert_eq!(args.path.as_deref(), Some("/tmp/wt"));
-    assert!(args.force);
 }
 
 #[test]

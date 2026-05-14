@@ -45,9 +45,9 @@ fn generate_setup_block_for_zsh_includes_signature_and_marker() {
 fn generate_setup_block_for_bash_includes_completions() {
     let block = generate_setup_block(Shell::Bash, "wisetree", "2026-05-05".into());
     assert!(block.contains("_wisetree_completions"));
-    assert!(block.contains("create list delete settings"));
+    assert!(block.contains("create dashboard settings"));
     assert!(block.contains("--help --version --mode --from-wrapper"));
-    assert!(block.contains("menu create list delete settings"));
+    assert!(block.contains("menu create dashboard settings"));
 }
 
 #[test]

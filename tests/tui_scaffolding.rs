@@ -14,7 +14,6 @@ fn screen_from_mode_maps_every_variant() {
     assert_eq!(Screen::from_mode(AppMode::Menu), Screen::Menu);
     assert_eq!(Screen::from_mode(AppMode::Create), Screen::Create);
     assert_eq!(Screen::from_mode(AppMode::Dashboard), Screen::Dashboard);
-    assert_eq!(Screen::from_mode(AppMode::Delete), Screen::Delete);
     assert_eq!(Screen::from_mode(AppMode::Settings), Screen::Settings);
 }
 
@@ -24,7 +23,6 @@ fn screen_as_str_round_trip_for_known_modes() {
         Screen::Menu,
         Screen::Create,
         Screen::Dashboard,
-        Screen::Delete,
         Screen::Settings,
     ] {
         let parsed = AppMode::parse(s.as_str()).expect("valid mode");
@@ -33,6 +31,9 @@ fn screen_as_str_round_trip_for_known_modes() {
     // Setup is reachable only via the menu, so AppMode has no entry.
     assert_eq!(Screen::Setup.as_str(), "setup");
     assert!(AppMode::parse("setup").is_none());
+    // Delete is now internal-only (dashboard), so AppMode has no entry.
+    assert_eq!(Screen::Delete.as_str(), "delete");
+    assert!(AppMode::parse("delete").is_none());
 }
 
 #[test]
