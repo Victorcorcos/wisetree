@@ -4,7 +4,7 @@ use ratatui::Terminal;
 
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::messages::colors;
-use wisetree::services::{CommitSummary, DashboardRow, PrState, PullRequest};
+use wisetree::services::{CheckStatus, CommitSummary, DashboardRow, PrState, PullRequest};
 use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -84,6 +84,7 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
         state: PrState::Open,
         url: "https://github.com/example/repo/pull/42".into(),
         title: "Improve dashboard footer details for live workflows".into(),
+        checks_status: None,
     });
     row
 }
@@ -92,6 +93,19 @@ fn row_with_pr_state(path: &str, branch: &str, is_clean: bool, state: PrState) -
     let mut row = row_with_pr(path, branch, is_clean);
     if let Some(pr) = row.pull_request.as_mut() {
         pr.state = state;
+    }
+    row
+}
+
+fn row_with_check(
+    path: &str,
+    branch: &str,
+    is_clean: bool,
+    checks: CheckStatus,
+) -> DashboardRow {
+    let mut row = row_with_pr(path, branch, is_clean);
+    if let Some(pr) = row.pull_request.as_mut() {
+        pr.checks_status = Some(checks);
     }
     row
 }
@@ -395,6 +409,92 @@ fn merged_pr_row_renders_merged_status_in_success_palette() {
 }
 
 #[test]
+fn opened_pr_with_running_checks_renders_yellow_circle() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_check("/tmp/repo-bug", "bug", false, CheckStatus::Running),
+    ]);
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(
+        dumped.contains("Opened 🟡"),
+        "expected `Opened 🟡` in rendered output: {dumped}"
+    );
+}
+
+#[test]
+fn opened_pr_with_failed_checks_renders_red_circle() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_check("/tmp/repo-bug", "bug", false, CheckStatus::Failed),
+    ]);
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Opened 🔴"));
+}
+
+#[test]
+fn opened_pr_without_checks_keeps_plain_label() {
+    // Regression: PRs from repos without CI configured (or before any
+    // checks have reported) must still render the historical "Opened"
+    // label, NOT a circle. This protects backwards visual compatibility.
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open),
+    ]);
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Opened"));
+    for emoji in ["⚪", "🟡", "🟢", "🔴", "⚠"] {
+        assert!(
+            !dumped.contains(emoji),
+            "rendered table must not contain {emoji} for an Opened PR with no checks: {dumped}"
+        );
+    }
+}
+
+#[test]
+fn search_matches_opened_for_rows_with_check_circles() {
+    // Searching for "opened" must still match rows that render
+    // "Opened 🟢" — the filter compares against the base label, not
+    // the rendered text with the emoji suffix.
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_check("/tmp/repo-bug", "bug", false, CheckStatus::Passed),
+    ]);
+    for c in "opened".chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+    let filtered = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(filtered.contains("repo-bug"));
+}
+
+#[test]
 fn search_matches_opened_status_text() {
     let mut screen = DashboardScreen::new(
         true,
@@ -436,8 +536,8 @@ fn table_uses_available_height_before_scrolling() {
     screen.set_rows(rows);
 
     // Height must fit exactly: 4 (banner/search) + 13 (header + 12 rows)
-    // + 7 (7-line footer with bordered bulk-delete buttons row).
-    let dumped = dump(120, 24, |f| screen.render(f, f.area()));
+    // + 8 (8-line footer with bordered bulk-delete buttons row + checks legend).
+    let dumped = dump(120, 25, |f| screen.render(f, f.area()));
     assert!(dumped.contains("repo-11"));
     assert!(!dumped.contains("more above"));
     assert!(!dumped.contains("more below"));
@@ -467,10 +567,23 @@ fn overflow_rows_show_more_above_and_below_indicators() {
     }
 
     // Height must fit: 4 (banner/search) + 13 (header + 2 overflow + 10 rows)
-    // + 4 (4-line footer with Status / Ahead-Behind legends).
-    let dumped = dump(120, 21, |f| screen.render(f, f.area()));
+    // + 8 (8-line footer with Status / Checks / Ahead-Behind legends).
+    let dumped = dump(120, 25, |f| screen.render(f, f.area()));
     assert!(dumped.contains("more above"));
     assert!(dumped.contains("more below"));
+}
+
+#[test]
+fn footer_includes_checks_legend_with_all_circles() {
+    let mut screen = ready_screen(true);
+    let dumped = dump(140, 22, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Checks:"), "expected Checks legend: {dumped}");
+    for label in ["Pending", "Running", "Passed", "Failed", "Errored"] {
+        assert!(dumped.contains(label), "missing {label} in legend: {dumped}");
+    }
+    for emoji in ["⚪", "🟡", "🟢", "🔴", "⚠"] {
+        assert!(dumped.contains(emoji), "missing {emoji} in legend: {dumped}");
+    }
 }
 
 #[test]
@@ -515,7 +628,7 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
 
     insta::assert_snapshot!(
         "dashboard_wide_pr_footer",
-        dump_lines(110, 16, |f| screen.render(f, f.area()))
+        dump_lines(110, 17, |f| screen.render(f, f.area()))
     );
 }
 
@@ -543,6 +656,6 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
 
     insta::assert_snapshot!(
         "dashboard_narrow_collapsed_columns",
-        dump_lines(72, 16, |f| screen.render(f, f.area()))
+        dump_lines(72, 17, |f| screen.render(f, f.area()))
     );
 }

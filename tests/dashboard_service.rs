@@ -6,6 +6,15 @@ use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
 use wisetree::services::DashboardService;
 
+/// Tests that exercise the PR-fetching path need `show_pull_requests`
+/// enabled — otherwise the service short-circuits before calling gh.
+fn config_with_prs() -> DashboardConfig {
+    DashboardConfig {
+        show_pull_requests: true,
+        ..DashboardConfig::default()
+    }
+}
+
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -71,7 +80,7 @@ fn service_with_isolated_cache(fixture: &Fixture) -> DashboardService {
         .parent()
         .unwrap()
         .join("dashboard_pr_cache.json");
-    DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
+    DashboardService::new(fixture.repo.clone(), config_with_prs())
         .with_cache_path(Some(cache))
 }
 
@@ -275,6 +284,145 @@ async fn watch_reports_refresh_errors_without_emitting_empty_rows() {
     );
 }
 
+/// Spawn a fake `gh` that returns a PR whose only check_run is
+/// IN_PROGRESS, then assert the resulting cache file persists the
+/// derived `checksStatus`. Guards against schema regressions in
+/// `PrCacheEntry` / `PullRequest` serde annotations.
+#[tokio::test]
+async fn cache_persists_checks_status_after_snapshot() {
+    let fixture = repo_with_worktree();
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    // Reply to every gh api graphql call with one PR that has a single
+    // IN_PROGRESS check. Both branches in the fixture (`main` and
+    // `feat-dashboard`) get the same payload via b0/b1 wildcards.
+    let body = "{\"data\":{\"repository\":{\"b0\":{\"nodes\":[{\"number\":7,\"state\":\"OPEN\",\"url\":\"u\",\"title\":\"t\",\"isDraft\":false,\"commits\":{\"nodes\":[{\"commit\":{\"statusCheckRollup\":{\"contexts\":{\"nodes\":[{\"__typename\":\"CheckRun\",\"status\":\"IN_PROGRESS\",\"conclusion\":null}]}}}}]}}]},\"b1\":{\"nodes\":[{\"number\":8,\"state\":\"OPEN\",\"url\":\"u\",\"title\":\"t\",\"isDraft\":false,\"commits\":{\"nodes\":[{\"commit\":{\"statusCheckRollup\":{\"contexts\":{\"nodes\":[{\"__typename\":\"CheckRun\",\"status\":\"IN_PROGRESS\",\"conclusion\":null}]}}}}]}}]}}}}";
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  printf '%s' '{body}'\n  exit 0\nfi\nprintf '[]'\n",
+            log = log_path.display(),
+            body = body
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let cache = fixture
+        .repo
+        .parent()
+        .unwrap()
+        .join("dashboard_pr_cache.json");
+    let service = DashboardService::new(fixture.repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path.clone())
+        .with_cache_path(Some(cache.clone()));
+
+    service.snapshot().await.expect("snapshot");
+
+    let on_disk = fs::read_to_string(&cache).expect("cache file written");
+    assert!(
+        on_disk.contains("\"checksStatus\""),
+        "cache must persist the new checksStatus field; cache was {on_disk:?}"
+    );
+    assert!(
+        on_disk.contains("\"Running\""),
+        "IN_PROGRESS check should aggregate to Running; cache was {on_disk:?}"
+    );
+}
+
+/// On a second snapshot within the 30s TTL, the cached check status
+/// must be restored without invoking gh again — which keeps us within
+/// the GitHub rate limit even when the dashboard refreshes frequently.
+#[tokio::test]
+async fn cached_checks_status_survives_second_snapshot_without_gh_call() {
+    let fixture = repo_with_worktree();
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    let body = "{\"data\":{\"repository\":{\"b0\":{\"nodes\":[{\"number\":7,\"state\":\"OPEN\",\"url\":\"u\",\"title\":\"t\",\"isDraft\":false,\"commits\":{\"nodes\":[{\"commit\":{\"statusCheckRollup\":{\"contexts\":{\"nodes\":[{\"__typename\":\"CheckRun\",\"status\":\"IN_PROGRESS\",\"conclusion\":null}]}}}}]}}]},\"b1\":{\"nodes\":[{\"number\":8,\"state\":\"OPEN\",\"url\":\"u\",\"title\":\"t\",\"isDraft\":false,\"commits\":{\"nodes\":[{\"commit\":{\"statusCheckRollup\":{\"contexts\":{\"nodes\":[{\"__typename\":\"CheckRun\",\"status\":\"IN_PROGRESS\",\"conclusion\":null}]}}}}]}}]}}}}";
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  printf '%s' '{body}'\n  exit 0\nfi\nprintf '[]'\n",
+            log = log_path.display(),
+            body = body
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let cache = fixture
+        .repo
+        .parent()
+        .unwrap()
+        .join("dashboard_pr_cache.json");
+    let service = DashboardService::new(fixture.repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path.clone())
+        .with_cache_path(Some(cache));
+
+    let _first = service.snapshot().await.expect("first snapshot");
+    let first_calls = fs::read_to_string(&log_path)
+        .unwrap()
+        .matches("api graphql")
+        .count();
+
+    let second = service.snapshot().await.expect("second snapshot");
+    let second_calls = fs::read_to_string(&log_path)
+        .unwrap()
+        .matches("api graphql")
+        .count();
+    assert_eq!(
+        first_calls, second_calls,
+        "second snapshot should not trigger a fresh gh call inside the TTL"
+    );
+
+    let opened = second
+        .iter()
+        .find(|row| {
+            row.pull_request
+                .as_ref()
+                .map(|pr| matches!(pr.state, wisetree::services::PrState::Open))
+                .unwrap_or(false)
+        })
+        .expect("opened PR row");
+    assert_eq!(
+        opened.pull_request.as_ref().unwrap().checks_status,
+        Some(wisetree::services::CheckStatus::Running)
+    );
+}
+
+/// Old cache files (written before this feature) must still load — the
+/// `#[serde(default)]` annotation on `checks_status` lets us skip a
+/// migration step on first launch.
+#[tokio::test]
+async fn legacy_cache_without_checks_field_still_loads() {
+    let fixture = repo_with_worktree();
+    let cache = fixture
+        .repo
+        .parent()
+        .unwrap()
+        .join("dashboard_pr_cache.json");
+    let key = fixture.repo.to_string_lossy().to_string();
+    let legacy = serde_json::json!({
+        key: {
+            "feat-dashboard": {
+                "sha": "deadbeef",
+                "fetchedAtMs": 1_000u64,
+                "pullRequest": {
+                    "number": 1,
+                    "state": "Open",
+                    "url": "u",
+                    "title": "t"
+                }
+            }
+        }
+    });
+    fs::write(&cache, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
+        .with_cache_path(Some(cache));
+    service.snapshot().await.expect("snapshot must accept legacy cache");
+}
+
 #[tokio::test]
 async fn rate_limit_response_emits_single_notice_and_backs_off() {
     let fixture = repo_with_worktree();
@@ -296,7 +444,7 @@ async fn rate_limit_response_emits_single_notice_and_backs_off() {
         .parent()
         .unwrap()
         .join("dashboard_pr_cache.json");
-    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
+    let service = DashboardService::new(fixture.repo.clone(), config_with_prs())
         .with_gh_binary(gh_path.clone())
         .with_cache_path(Some(cache));
 
@@ -322,5 +470,41 @@ async fn rate_limit_response_emits_single_notice_and_backs_off() {
     assert!(
         second.is_err(),
         "second notice should be suppressed while backoff is active, got {second:?}"
+    );
+}
+
+/// When `show_pull_requests` is disabled, the service must not invoke gh
+/// at all — even if the binary is available. Guards the rate-limit budget
+/// for users who keep PR enrichment off.
+#[tokio::test]
+async fn show_pull_requests_disabled_skips_gh_entirely() {
+    let fixture = repo_with_worktree();
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nprintf '{{}}'\n",
+            log = log_path.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let cache = fixture
+        .repo
+        .parent()
+        .unwrap()
+        .join("dashboard_pr_cache.json");
+    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
+        .with_gh_binary(gh_path.clone())
+        .with_cache_path(Some(cache));
+
+    service.snapshot().await.expect("snapshot");
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !log.contains("api graphql"),
+        "show_pull_requests=false must not trigger gh api graphql; log was {log:?}"
     );
 }

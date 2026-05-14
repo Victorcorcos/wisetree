@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row
 use ratatui::Frame;
 
 use crate::messages::colors;
-use crate::services::{DashboardRow, PrState};
+use crate::services::{CheckStatus, DashboardRow, PrState};
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
 
@@ -215,8 +215,8 @@ impl DashboardScreen {
             return 11;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
-        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 7 footer.
-        12 + table_rows
+        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 8 footer.
+        13 + table_rows
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -367,7 +367,7 @@ impl DashboardScreen {
                 Constraint::Length(1), // search line
                 Constraint::Length(1), // spacer below search
                 Constraint::Min(4),    // table
-                Constraint::Length(7), // footer
+                Constraint::Length(8), // footer (notice + 3-row buttons + 4 legend lines)
             ])
             .split(area);
 
@@ -787,6 +787,7 @@ impl DashboardScreen {
                 Constraint::Length(3), // bulk delete buttons row (bordered)
                 Constraint::Length(1), // navigate / shortcuts
                 Constraint::Length(1), // status legend
+                Constraint::Length(1), // checks legend (between status and ahead/behind)
                 Constraint::Length(1), // ahead/behind legend
             ])
             .split(area);
@@ -798,7 +799,8 @@ impl DashboardScreen {
         self.render_bulk_delete_buttons(frame, chunks[1]);
         frame.render_widget(Paragraph::new(self.shortcuts_line()), chunks[2]);
         frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[3]);
-        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[4]);
+        frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[4]);
+        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[5]);
     }
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
@@ -859,6 +861,28 @@ impl DashboardScreen {
             Span::styled(" = PR open  ", muted_dim),
             Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
             Span::styled(" = PR merged", muted_dim),
+        ])
+    }
+
+    fn checks_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        let label = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        Line::from(vec![
+            Span::styled("Checks: ", muted_dim),
+            Span::styled("Pending ", label),
+            Span::raw("⚪"),
+            Span::styled("  Running ", label),
+            Span::raw("🟡"),
+            Span::styled("  Passed ", label),
+            Span::raw("🟢"),
+            Span::styled("  Failed ", label),
+            Span::raw("🔴"),
+            Span::styled("  Errored ", label),
+            Span::raw("⚠️"),
         ])
     }
 
@@ -1223,10 +1247,15 @@ impl DashboardColumn {
                 }
             }
             Self::Status => {
+                // Wide enough to render "Opened 🟡" / "Opened ⚠️" without
+                // truncating the emoji. Emoji codepoints are 1 grapheme
+                // but ratatui counts them as 2 columns wide, so we
+                // budget label (6) + space (1) + emoji (2) = 9, plus
+                // a margin of safety.
                 if compact {
-                    7
-                } else {
                     10
+                } else {
+                    12
                 }
             }
             Self::AheadBehind => {
@@ -1261,7 +1290,14 @@ impl DashboardColumn {
             )))),
             Self::Status => {
                 let (text, style) = status_label_and_style(row);
-                Cell::from(Line::from(Span::styled(text, style)))
+                if let Some(emoji) = opened_check_emoji(row) {
+                    Cell::from(Line::from(vec![
+                        Span::styled(text, style),
+                        Span::raw(format!(" {emoji}")),
+                    ]))
+                } else {
+                    Cell::from(Line::from(Span::styled(text, style)))
+                }
             }
             Self::AheadBehind => match row.worktree.branch_status.as_ref() {
                 Some(branch_status) if branch_status.ahead == 0 && branch_status.behind == 0 => {
@@ -1368,6 +1404,31 @@ fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),
     }
+}
+
+/// Map a [`CheckStatus`] to the circle emoji rendered next to the
+/// "Opened" status label. Kept separate from the legend rendering so
+/// both surfaces stay in sync.
+fn check_status_emoji(status: CheckStatus) -> &'static str {
+    match status {
+        CheckStatus::Pending => "⚪",
+        CheckStatus::Running => "🟡",
+        CheckStatus::Passed => "🟢",
+        CheckStatus::Failed => "🔴",
+        CheckStatus::Errored => "⚠️",
+    }
+}
+
+/// Returns the optional check-circle suffix for a row's Status cell.
+/// Only Opened PRs with an aggregated check status get a circle — every
+/// other state (Mother / Merged / Clean / Dirty / no-checks Opened)
+/// renders unchanged.
+fn opened_check_emoji(row: &DashboardRow) -> Option<&'static str> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    pr.checks_status.map(check_status_emoji)
 }
 
 fn row_matches_bulk_status(row: &DashboardRow, status: BulkDeleteStatus) -> bool {
