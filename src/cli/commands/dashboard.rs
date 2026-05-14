@@ -17,10 +17,10 @@ pub async fn run(service: &WorktreeService, watch: bool) -> Result<()> {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
                 maybe_rows = watch.rx.recv() => {
-                    let Some(rows) = maybe_rows else {
+                    let Some(update) = maybe_rows else {
                         break;
                     };
-                    let line = serde_json::to_string(&rows)?;
+                    let line = serde_json::to_string(update.rows())?;
                     println!("{line}");
                     let _ = std::io::stdout().flush();
                 }

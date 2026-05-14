@@ -30,7 +30,7 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult,
+    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -942,6 +942,8 @@ impl App {
                     clipboard_available(),
                     columns,
                     warnings,
+                    service.pr_enrichment_enabled(),
+                    config.refresh_interval_ms,
                 ));
                 self.dashboard_watch = Some(service.watch());
             }
@@ -1044,18 +1046,22 @@ impl App {
         let Some(watch) = self.dashboard_watch.as_mut() else {
             return;
         };
-        let mut rows_batch = Vec::new();
+        let mut updates_batch = Vec::new();
         let mut notices = Vec::new();
-        while let Ok(rows) = watch.rx.try_recv() {
-            rows_batch.push(rows);
+        while let Ok(update) = watch.rx.try_recv() {
+            updates_batch.push(update);
         }
         while let Ok(notice) = watch.notice_rx.try_recv() {
             notices.push(notice);
         }
 
         if let Some(screen) = self.dashboard.as_mut() {
-            for rows in rows_batch {
-                screen.set_rows(rows);
+            for update in updates_batch {
+                let is_gh = matches!(update, DashboardUpdate::WithPRs(_));
+                screen.set_rows(update.into_rows());
+                if is_gh {
+                    screen.mark_gh_refreshed();
+                }
             }
         }
         let has_rows = self

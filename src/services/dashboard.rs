@@ -113,9 +113,31 @@ impl DashboardNotice {
     }
 }
 
+/// Discriminates the two row emissions per refresh cycle so the UI can
+/// tell apart git-only data from gh-enriched data (PR state + CI checks).
+#[derive(Debug)]
+pub enum DashboardUpdate {
+    GitOnly(Vec<DashboardRow>),
+    WithPRs(Vec<DashboardRow>),
+}
+
+impl DashboardUpdate {
+    pub fn rows(&self) -> &Vec<DashboardRow> {
+        match self {
+            Self::GitOnly(rows) | Self::WithPRs(rows) => rows,
+        }
+    }
+
+    pub fn into_rows(self) -> Vec<DashboardRow> {
+        match self {
+            Self::GitOnly(rows) | Self::WithPRs(rows) => rows,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DashboardWatch {
-    pub rx: mpsc::Receiver<Vec<DashboardRow>>,
+    pub rx: mpsc::Receiver<DashboardUpdate>,
     pub notice_rx: mpsc::Receiver<DashboardNotice>,
     cancel: Option<oneshot::Sender<()>>,
     refresh_tx: mpsc::Sender<()>,
@@ -232,14 +254,14 @@ impl DashboardService {
                 // GraphQL round-trip. Then refresh PRs and emit again.
                 match service.collect_git_rows().await {
                     Ok(mut rows) => {
-                        if rows_tx.send(rows.clone()).await.is_err() {
+                        if rows_tx.send(DashboardUpdate::GitOnly(rows.clone())).await.is_err() {
                             break;
                         }
                         if service.pr_enrichment_enabled() {
                             service.refresh_pull_requests(&rows).await;
                             service.apply_cached_prs(&mut rows);
                             service.save_cache();
-                            if rows_tx.send(rows).await.is_err() {
+                            if rows_tx.send(DashboardUpdate::WithPRs(rows)).await.is_err() {
                                 break;
                             }
                         }

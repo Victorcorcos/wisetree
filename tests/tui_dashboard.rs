@@ -120,6 +120,8 @@ fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
             "last_commit".into(),
         ],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -131,14 +133,14 @@ fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
 
 #[test]
 fn loading_render_shows_loading_message() {
-    let mut screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new());
+    let mut screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false, 5000);
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
     assert!(dumped.contains("Loading dashboard"));
 }
 
 #[test]
 fn empty_state_renders_no_worktrees_found() {
-    let mut screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new());
+    let mut screen = DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false, 5000);
     screen.set_rows(vec![]);
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
     assert!(dumped.contains("No worktrees found"));
@@ -250,6 +252,8 @@ fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
         false,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     plain.set_rows(vec![row("/tmp/repo", "main", true)]);
     plain.handle_key(key(KeyCode::Enter));
@@ -354,6 +358,8 @@ fn opened_pr_row_renders_opened_status_in_info_palette() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -384,6 +390,8 @@ fn merged_pr_row_renders_merged_status_in_success_palette() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -414,6 +422,8 @@ fn opened_pr_with_running_checks_renders_yellow_circle() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -434,6 +444,8 @@ fn opened_pr_with_failed_checks_renders_red_circle() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -454,6 +466,8 @@ fn opened_pr_without_checks_keeps_plain_label() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -480,6 +494,8 @@ fn search_matches_opened_for_rows_with_check_circles() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -500,6 +516,8 @@ fn search_matches_opened_status_text() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -521,6 +539,8 @@ fn table_uses_available_height_before_scrolling() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     let rows: Vec<DashboardRow> = (0..12)
         .map(|index| {
@@ -549,6 +569,8 @@ fn overflow_rows_show_more_above_and_below_indicators() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     let rows: Vec<DashboardRow> = (0..15)
         .map(|index| {
@@ -601,6 +623,8 @@ fn selected_row_warning_is_rendered_in_footer() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     let mut broken = row("/tmp/repo-bug", "bug", false);
     broken.error = Some("status timed out".into());
@@ -620,6 +644,8 @@ fn dashboard_notice_renders_in_footer_detail_slot() {
         true,
         vec!["branch".into(), "status".into()],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -651,6 +677,8 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
             "pull_request".into(),
         ],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -678,6 +706,8 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
             "pull_request".into(),
         ],
         Vec::new(),
+        false,
+        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),

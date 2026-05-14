@@ -136,6 +136,9 @@ pub struct DashboardScreen {
     warnings: Vec<String>,
     notice: Option<DashboardNotice>,
     refreshed_at: Option<Instant>,
+    gh_refreshed_at: Option<Instant>,
+    pr_enrichment_enabled: bool,
+    refresh_interval_ms: u64,
     /// `Some` while the bulk-delete buttons row owns the keyboard focus.
     /// Tab moves through buttons in `BulkDeleteStatus::ALL` order; Esc
     /// returns focus to the table.
@@ -153,6 +156,8 @@ impl DashboardScreen {
         has_clipboard: bool,
         columns: Vec<String>,
         warnings: Vec<String>,
+        pr_enrichment_enabled: bool,
+        refresh_interval_ms: u64,
     ) -> Self {
         Self {
             rows: Vec::new(),
@@ -173,6 +178,9 @@ impl DashboardScreen {
             warnings,
             notice: None,
             refreshed_at: None,
+            gh_refreshed_at: None,
+            pr_enrichment_enabled,
+            refresh_interval_ms,
             bulk_focus: None,
             bulk_button_rects: Vec::new(),
             tick: 0,
@@ -191,6 +199,10 @@ impl DashboardScreen {
         } else if self.selected >= filtered_len {
             self.selected = filtered_len - 1;
         }
+    }
+
+    pub fn mark_gh_refreshed(&mut self) {
+        self.gh_refreshed_at = Some(Instant::now());
     }
 
     pub fn set_notice(&mut self, notice: DashboardNotice) {
@@ -741,9 +753,47 @@ impl DashboardScreen {
     fn header_cells(&self, layout: &DashboardTableLayout) -> Vec<Cell<'static>> {
         let mut cells = vec![Cell::from("Worktree")];
         for column in &layout.visible_columns {
-            cells.push(Cell::from(column.title(layout.compact)));
+            if *column == DashboardColumn::Status && self.pr_enrichment_enabled {
+                cells.push(self.status_header_cell());
+            } else {
+                cells.push(Cell::from(column.title(layout.compact)));
+            }
         }
         cells
+    }
+
+    fn status_header_cell(&self) -> Cell<'static> {
+        let refresh_interval_secs = (self.refresh_interval_ms / 1000).max(1);
+        match self.gh_refreshed_at {
+            None => Cell::from("Status"),
+            Some(instant) => {
+                let elapsed = instant.elapsed().as_secs();
+                if elapsed == 0 {
+                    Cell::from(Line::from(vec![Span::styled(
+                        "Status (✔)",
+                        Style::default()
+                            .fg(colors::SUCCESS)
+                            .add_modifier(Modifier::BOLD),
+                    )]))
+                } else {
+                    let remaining = refresh_interval_secs.saturating_sub(elapsed);
+                    let label = if remaining == 0 {
+                        "Status (✔)".to_string()
+                    } else {
+                        format!("Status ({remaining}s)")
+                    };
+                    let color = if remaining == 0 {
+                        colors::SUCCESS
+                    } else {
+                        colors::MUTED
+                    };
+                    Cell::from(Line::from(vec![Span::styled(
+                        label,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )]))
+                }
+            }
+        }
     }
 
     fn row_cells(

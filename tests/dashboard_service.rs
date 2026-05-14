@@ -312,11 +312,11 @@ async fn watch_emits_initial_snapshot() {
     let service = service_with_isolated_cache(&fixture);
 
     let mut watch = service.watch();
-    let rows = tokio::time::timeout(std::time::Duration::from_secs(2), watch.rx.recv())
+    let update = tokio::time::timeout(std::time::Duration::from_secs(2), watch.rx.recv())
         .await
         .expect("watch timeout")
         .expect("watch rows");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(update.rows().len(), 2);
 }
 
 #[tokio::test]
