@@ -22,7 +22,7 @@ use crate::config::schema::WorktreeConfig;
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
-use crate::files::service::open_terminal;
+use crate::files::service::{open_terminal, open_url};
 use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
@@ -552,6 +552,16 @@ impl App {
                 let success_message = format!("Copied {} to clipboard.", fold_path(&path));
                 kick_off_clipboard_copy(path, success_message, tx.clone());
             }
+            DashboardAction::OpenPullRequest(url) => match open_url(&url) {
+                Ok(()) => self.show_toast(
+                    ToastVariant::Info,
+                    format!("Opened pull request {url}"),
+                ),
+                Err(err) => self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to open pull request: {err}"),
+                ),
+            },
         }
     }
 

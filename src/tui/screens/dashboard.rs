@@ -28,6 +28,7 @@ enum ActionChoice {
     Navigate,
     OpenWithCommand,
     CopyPath,
+    OpenPullRequest,
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
@@ -77,6 +78,7 @@ pub enum DashboardAction {
     JumpToDelete(String),
     BulkDelete(BulkDeleteStatus, Vec<String>),
     CopyPath(String),
+    OpenPullRequest(String),
     /// The user tried to delete the mother (main) worktree. The app
     /// layer should surface a toast explaining that this worktree is
     /// protected, instead of routing to the delete screen.
@@ -462,7 +464,7 @@ impl DashboardScreen {
         DashboardAction::Continue
     }
 
-    fn build_action_select(&self, _row: &DashboardRow) -> SelectPrompt<ActionChoice> {
+    fn build_action_select(&self, row: &DashboardRow) -> SelectPrompt<ActionChoice> {
         let mut options = Vec::new();
         if self.is_from_wrapper {
             options.push(SelectOption::new(
@@ -482,6 +484,16 @@ impl DashboardScreen {
                 ActionChoice::CopyPath,
             ));
         }
+        if row
+            .pull_request
+            .as_ref()
+            .is_some_and(|pr| matches!(pr.state, PrState::Open | PrState::Merged))
+        {
+            options.push(SelectOption::new(
+                "Open Pull Request",
+                ActionChoice::OpenPullRequest,
+            ));
+        }
         SelectPrompt::new("Choose action:", options).without_hint()
     }
 
@@ -497,7 +509,9 @@ impl DashboardScreen {
                     self.action_select = None;
                     return DashboardAction::Continue;
                 };
-                let path = self.rows[index].worktree.path.clone();
+                let row = &self.rows[index];
+                let path = row.worktree.path.clone();
+                let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
                 self.mode = DashboardMode::Table;
                 self.action_select = None;
                 self.action_target = None;
@@ -505,6 +519,10 @@ impl DashboardScreen {
                     ActionChoice::Navigate => DashboardAction::NavigateTo(path),
                     ActionChoice::OpenWithCommand => DashboardAction::OpenTerminal(path),
                     ActionChoice::CopyPath => DashboardAction::CopyPath(path),
+                    ActionChoice::OpenPullRequest => match pr_url {
+                        Some(url) => DashboardAction::OpenPullRequest(url),
+                        None => DashboardAction::Continue,
+                    },
                 }
             }
             SelectOutcome::Cancelled => {

@@ -246,6 +246,32 @@ async fn execute_shell_command(resolved: &str, cwd: &Path, original: &str) -> Co
     }
 }
 
+/// Open `url` in the user's default browser, detached. Returns the spawn
+/// error (if any) so the caller can surface a toast. Picks the
+/// platform-appropriate launcher: `open` on macOS, `cmd /C start ""` on
+/// Windows, `xdg-open` on Linux/BSD.
+pub fn open_url(url: &str) -> Result<(), String> {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        // `start` treats its first quoted argument as a window title, so we
+        // pass an empty title before the URL to avoid losing it.
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg("start").arg("").arg(url);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// Spawn `terminal_command` detached in `worktree_path`. Empty command is a
 /// no-op. The child's stdio is ignored and the process is not awaited
 /// (matches branchlet's `child.unref()`).
