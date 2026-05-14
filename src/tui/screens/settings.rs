@@ -116,7 +116,11 @@ pub struct PostCmdEditor {
 /// Duration of the post-swap flash animation, in ticks (≈100ms each ⇒ 2s).
 const SWAP_ANIM_TICKS: usize = 20;
 
-fn lerp_rgb(from: ratatui::style::Color, to: ratatui::style::Color, t: f32) -> ratatui::style::Color {
+fn lerp_rgb(
+    from: ratatui::style::Color,
+    to: ratatui::style::Color,
+    t: f32,
+) -> ratatui::style::Color {
     use ratatui::style::Color;
     let t = t.clamp(0.0, 1.0);
     match (from, to) {
