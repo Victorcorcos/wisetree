@@ -1531,20 +1531,20 @@ impl SettingsScreen {
     }
 
     fn post_cmd_preferred_height(&self) -> u16 {
-        // Title + description + N rectangles (3 rows each) + spacer + buttons
-        // (3 rows) + footer hint + saving-to line.
+        // Title + description + N rectangles (3 rows each + 1 hint row each)
+        // + spacer + buttons (3 rows) + footer hint + saving-to line.
         let n = self
             .post_cmd_editor
             .as_ref()
             .map(|e| e.commands.len() as u16)
             .unwrap_or(0);
-        2 + n.saturating_mul(3) + 1 + 3 + 2
+        2 + n.saturating_mul(4) + 1 + 3 + 2
     }
 
     fn terminal_cmd_preferred_height(&self) -> u16 {
-        // Title + description + 1 rectangle (3 rows) + spacer + Save button
-        // (3 rows) + saving-to line + footer hint.
-        2 + 3 + 1 + 3 + 2
+        // Title + description + 1 rectangle (3 rows) + per-field hint +
+        // spacer + Save button (3 rows) + saving-to line + footer hint.
+        2 + 3 + 1 + 1 + 3 + 2
     }
 
     fn dashboard_preferred_height(&self) -> u16 {
@@ -1555,9 +1555,10 @@ impl SettingsScreen {
     }
 
     fn path_template_preferred_height(&self) -> u16 {
-        // Title + description + 1 rectangle (3 rows) + 3 variable hints
-        // + spacer + Save button (3 rows) + saving-to line + footer hint.
-        2 + 3 + 3 + 1 + 3 + 2
+        // Title + description + 1 rectangle (3 rows) + per-field hint
+        // + 3 variable hints + spacer + Save button (3 rows) + saving-to
+        // line + footer hint.
+        2 + 3 + 1 + 3 + 1 + 3 + 2
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -1895,16 +1896,17 @@ impl SettingsScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(1), // title
+                Constraint::Length(1), // description
+                Constraint::Length(3), // rectangle
+                Constraint::Length(1), // per-field hint
+                Constraint::Length(1), // variables label
+                Constraint::Length(1), // variable line 1
+                Constraint::Length(1), // variable lines
+                Constraint::Min(0),    // spacer
+                Constraint::Length(3), // save button
+                Constraint::Length(1), // saving-to
+                Constraint::Length(1), // footer hint
             ])
             .split(area);
         frame.render_widget(
@@ -1967,19 +1969,29 @@ impl SettingsScreen {
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
-            .padding(Padding::horizontal(1));
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(" worktreePathTemplate ", info_style));
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
+
+        let hint_line = Line::from(vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled(
+                "Directory path for new worktrees (variables below)",
+                muted_style,
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
 
         frame.render_widget(
             Paragraph::new(Line::from(branded_line("Available variables:", info_style))),
-            chunks[3],
+            chunks[4],
         );
         frame.render_widget(
             Paragraph::new(Line::from(branded_line(
                 "  • $BASE_PATH - Repository name",
                 muted_style,
             ))),
-            chunks[4],
+            chunks[5],
         );
         frame.render_widget(
             Paragraph::new(vec![
@@ -1992,24 +2004,24 @@ impl SettingsScreen {
                     muted_style,
                 )),
             ]),
-            chunks[5],
+            chunks[6],
         );
 
-        self.render_path_template_save_button(frame, chunks[7], editor);
+        self.render_path_template_save_button(frame, chunks[8], editor);
 
         let target = self.config_path.clone();
         let saving_line = Line::from(vec![
             Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
             Span::styled(target, Style::default().fg(colors::EMPHASIS)),
         ]);
-        frame.render_widget(Paragraph::new(saving_line), chunks[8]);
+        frame.render_widget(Paragraph::new(saving_line), chunks[9]);
 
         let hint = if is_editing {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else {
             "↑↓ to move • Enter to edit/Save • Esc to go back"
         };
-        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[9]);
+        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[10]);
     }
 
     fn render_path_template_save_button(
@@ -2115,6 +2127,7 @@ impl SettingsScreen {
             .fg(colors::INFO)
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
         let chunks = Layout::default()
@@ -2146,20 +2159,30 @@ impl SettingsScreen {
 
         let editing_idx = editor.editing_index();
         let command_area = chunks[2];
-        let visible_range = editor.visible_range((command_area.height / 3) as usize);
+        let visible_range = editor.visible_range((command_area.height / 4) as usize);
         let hidden_above = visible_range.start;
         let hidden_below = editor.commands.len().saturating_sub(visible_range.end);
         let is_scrollable = hidden_above > 0 || hidden_below > 0;
-        let command_chunks: Vec<Rect> = (0..visible_range.len())
-            .map(|i| Rect {
-                x: command_area.x,
-                y: command_area.y + (i as u16) * 3,
-                width: command_area.width,
-                height: 3,
+        let command_chunks: Vec<(Rect, Rect)> = (0..visible_range.len())
+            .map(|i| {
+                let base_y = command_area.y + (i as u16) * 4;
+                let rect = Rect {
+                    x: command_area.x,
+                    y: base_y,
+                    width: command_area.width,
+                    height: 3,
+                };
+                let hint = Rect {
+                    x: command_area.x,
+                    y: base_y + 3,
+                    width: command_area.width,
+                    height: 1,
+                };
+                (rect, hint)
             })
             .collect();
 
-        for (chunk, i) in command_chunks.into_iter().zip(visible_range.clone()) {
+        for ((chunk, hint_chunk), i) in command_chunks.into_iter().zip(visible_range.clone()) {
             let cmd = &editor.commands[i];
             let status = editor.statuses[i];
             let is_selected = matches!(editor.selection, PostCmdSelection::Rect(j) if j == i);
@@ -2224,8 +2247,21 @@ impl SettingsScreen {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
                 .border_style(border_style)
-                .padding(Padding::horizontal(1));
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(
+                    format!(" postCreateCmd[{}] ", i),
+                    info_style,
+                ));
             frame.render_widget(Paragraph::new(inner_line).block(block), chunk);
+
+            let hint_line = Line::from(vec![
+                Span::styled("  ↳ ", muted_style),
+                Span::styled(
+                    "Shell command • $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",
+                    muted_style,
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(hint_line), hint_chunk);
         }
 
         if is_scrollable {
@@ -2367,18 +2403,20 @@ impl SettingsScreen {
             .fg(colors::INFO)
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(1), // title
+                Constraint::Length(1), // description
+                Constraint::Length(3), // rectangle
+                Constraint::Length(1), // per-field hint
+                Constraint::Min(0),    // spacer
+                Constraint::Length(3), // save button
+                Constraint::Length(1), // saving-to
+                Constraint::Length(1), // footer hint
             ])
             .split(area);
         frame.render_widget(
@@ -2438,24 +2476,34 @@ impl SettingsScreen {
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
-            .padding(Padding::horizontal(1));
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(" terminalCommand ", info_style));
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
 
-        self.render_terminal_cmd_save_button(frame, chunks[4], editor);
+        let hint_line = Line::from(vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled(
+                "Shell command (e.g., 'code $WORKTREE_PATH') — leave empty to disable",
+                muted_style,
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
+
+        self.render_terminal_cmd_save_button(frame, chunks[5], editor);
 
         let target = self.config_path.clone();
         let saving_line = Line::from(vec![
             Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
             Span::styled(target, Style::default().fg(colors::EMPHASIS)),
         ]);
-        frame.render_widget(Paragraph::new(saving_line), chunks[5]);
+        frame.render_widget(Paragraph::new(saving_line), chunks[6]);
 
         let hint = if is_editing {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else {
             "↑↓ to move • Enter to edit/Save • Esc to go back"
         };
-        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[6]);
+        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
     }
 
     fn render_terminal_cmd_save_button(

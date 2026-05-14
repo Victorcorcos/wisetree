@@ -531,7 +531,7 @@ fn post_cmd_overflow_keeps_button_labels_visible() {
     assert!(dumped.contains("Create"));
     assert!(dumped.contains("Save"));
     assert!(dumped.contains("▲/▼ to scroll"));
-    assert!(dumped.contains("▼ 1 below"));
+    assert!(dumped.contains("▼ 2 below"));
 }
 
 #[test]
@@ -550,7 +550,7 @@ fn post_cmd_overflow_keeps_last_selected_rectangle_in_view() {
     let dumped = dump(80, 18, |f| s.render(f, f.area()));
     assert!(dumped.contains("mkdir eu_abri4"));
     assert!(dumped.contains("Create"));
-    assert!(dumped.contains("▲ 1 above"));
+    assert!(dumped.contains("▲ 2 above"));
     assert!(dumped.contains("▼ bottom"));
 }
 
