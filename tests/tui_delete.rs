@@ -78,38 +78,19 @@ fn empty_list_cancels_on_keypress() {
 }
 
 #[test]
-fn select_step_enter_advances_to_confirm() {
+fn jump_to_confirm_advances_to_confirm_step() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
-    assert_eq!(s.step(), DeleteStep::Select);
-    s.handle_key(key(KeyCode::Enter));
+    s.jump_to_confirm_path("/tmp/repo-feat");
     assert_eq!(s.step(), DeleteStep::Confirm);
     assert_eq!(s.selected_path(), Some("/tmp/repo-feat"));
 }
 
 #[test]
-fn esc_in_select_cancels() {
-    let mut s = DeleteScreen::new(false);
-    s.set_worktrees(worktrees());
-    let action = s.handle_key(key(KeyCode::Esc));
-    assert_eq!(action, DeleteAction::Cancelled);
-}
-
-#[test]
-fn esc_in_confirm_returns_to_select() {
-    let mut s = DeleteScreen::new(false);
-    s.set_worktrees(worktrees());
-    s.handle_key(key(KeyCode::Enter));
-    s.handle_key(key(KeyCode::Esc));
-    assert_eq!(s.step(), DeleteStep::Select);
-}
-
-#[test]
-fn esc_in_confirm_after_jump_cancels_screen() {
+fn esc_in_confirm_cancels() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
     s.jump_to_confirm_path("/tmp/repo-feat");
-    assert_eq!(s.step(), DeleteStep::Confirm);
     let action = s.handle_key(key(KeyCode::Esc));
     assert_eq!(action, DeleteAction::Cancelled);
 }
@@ -118,7 +99,7 @@ fn esc_in_confirm_after_jump_cancels_screen() {
 fn confirm_yes_emits_confirmed_with_force_false_for_clean() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
-    s.handle_key(key(KeyCode::Enter));
+    s.jump_to_confirm_path("/tmp/repo-feat");
     s.handle_key(key(KeyCode::Char('y'))); // pre-select Confirm
     let action = s.handle_key(key(KeyCode::Enter));
     match action {
@@ -137,7 +118,7 @@ fn confirm_force_when_dirty() {
         wt("/tmp/repo", "main", true, true),
         wt("/tmp/repo-dirty", "dirty", false, false),
     ]);
-    s.handle_key(key(KeyCode::Enter));
+    s.jump_to_confirm_path("/tmp/repo-dirty");
     s.handle_key(key(KeyCode::Char('y')));
     let action = s.handle_key(key(KeyCode::Enter));
     match action {
@@ -153,7 +134,7 @@ fn confirm_force_when_dirty() {
 fn deleting_state_renders_branch_in_message() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
-    s.handle_key(key(KeyCode::Enter));
+    s.jump_to_confirm_path("/tmp/repo-feat");
     s.start_deleting();
     let dumped = dump(60, 4, |f| s.render(f, f.area()));
     assert!(dumped.contains("Deleting worktree"));
@@ -164,7 +145,7 @@ fn deleting_state_renders_branch_in_message() {
 fn success_with_branch_deleted_message() {
     let mut s = DeleteScreen::new(true);
     s.set_worktrees(worktrees());
-    s.handle_key(key(KeyCode::Enter));
+    s.jump_to_confirm_path("/tmp/repo-feat");
     s.start_deleting();
     s.mark_complete(DeleteOutcome {
         worktree_deleted: true,
@@ -179,7 +160,7 @@ fn success_with_branch_deleted_message() {
 fn success_with_branch_kept_message() {
     let mut s = DeleteScreen::new(true);
     s.set_worktrees(worktrees());
-    s.handle_key(key(KeyCode::Enter));
+    s.jump_to_confirm_path("/tmp/repo-feat");
     s.start_deleting();
     s.mark_complete(DeleteOutcome {
         worktree_deleted: true,
@@ -194,7 +175,7 @@ fn success_with_branch_kept_message() {
 fn success_default_message_when_branch_unset() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
-    s.handle_key(key(KeyCode::Enter));
+    s.jump_to_confirm_path("/tmp/repo-feat");
     s.start_deleting();
     s.mark_complete(DeleteOutcome {
         worktree_deleted: true,
@@ -223,42 +204,36 @@ fn confirm_dialog_shows_branch_status_when_will_delete_branch() {
         upstream_branch: Some("origin/feat-x".into()),
     });
     s.set_worktrees(vec![wt("/tmp/repo", "main", true, true), wt_dirty]);
-    s.handle_key(key(KeyCode::Enter));
+    s.jump_to_confirm_path("/tmp/repo-x");
     let dumped = dump(80, 12, |f| s.render(f, f.area()));
     assert!(dumped.contains("uncommitted changes"));
     assert!(dumped.contains("delete branch 'feat-x'"));
 }
 
 #[test]
-fn error_overlay_clears_and_returns_to_select() {
+fn jump_to_bulk_confirm_advances_to_confirm_step() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
-    s.set_error("boom".into());
-    assert_eq!(s.step(), DeleteStep::Select);
-    let dumped = dump(60, 4, |f| s.render(f, f.area()));
-    assert!(dumped.contains("boom"));
-    assert!(dumped.contains("Press any key"));
-    s.handle_key(key(KeyCode::Char('x')));
-    assert!(s.error().is_none());
-    assert_eq!(s.step(), DeleteStep::Select);
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    assert_eq!(s.step(), DeleteStep::Confirm);
+    assert!(s.is_bulk());
 }
 
 #[test]
-fn select_step_preferred_height_grows_to_fit_all_worktrees() {
+fn bulk_confirm_yes_emits_bulk_confirmed() {
     let mut s = DeleteScreen::new(false);
-    let rows: Vec<GitWorktree> = std::iter::once(wt("/tmp/repo", "main", true, true))
-        .chain((0..12).map(|index| {
-            wt(
-                &format!("/tmp/repo-{index}"),
-                &format!("feat-{index}"),
-                false,
-                true,
-            )
-        }))
-        .collect();
-    s.set_worktrees(rows);
-
-    assert_eq!(s.preferred_content_height(), 18);
+    s.set_worktrees(worktrees());
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    s.handle_key(key(KeyCode::Char('y')));
+    let action = s.handle_key(key(KeyCode::Enter));
+    match action {
+        DeleteAction::BulkConfirmed { items } => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].0, "/tmp/repo-feat");
+            assert_eq!(items[1].0, "/tmp/repo-bug");
+        }
+        other => panic!("expected BulkConfirmed, got {other:?}"),
+    }
 }
 
 // -- Bulk delete with checkboxes ----------------------------------------------
@@ -384,22 +359,24 @@ fn bulk_confirm_subset_resets_bulk_total_for_progress() {
 }
 
 #[test]
-fn select_step_uses_available_height_before_scrolling() {
+fn bulk_deleting_renders_progress() {
     let mut s = DeleteScreen::new(false);
-    let rows: Vec<GitWorktree> = std::iter::once(wt("/tmp/repo", "main", true, true))
-        .chain((0..12).map(|index| {
-            wt(
-                &format!("/tmp/repo-{index}"),
-                &format!("feat-{index}"),
-                false,
-                true,
-            )
-        }))
-        .collect();
-    s.set_worktrees(rows);
+    s.set_worktrees(worktrees());
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    s.start_deleting();
+    let dumped = dump(80, 4, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Deleting worktree"));
+    assert!(dumped.contains("(1 of 2: feat)"));
+}
 
-    let dumped = dump(100, 18, |f| s.render(f, f.area()));
-    assert!(dumped.contains("repo-11"));
-    assert!(!dumped.contains("more below"));
-    assert!(!dumped.contains("more above"));
+#[test]
+fn bulk_success_message() {
+    let mut s = DeleteScreen::new(false);
+    s.set_worktrees(worktrees());
+    s.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    s.bulk_record_progress(None);
+    s.bulk_record_progress(None);
+    s.mark_bulk_complete();
+    let dumped = dump(80, 4, |f| s.render(f, f.area()));
+    assert!(dumped.contains("2 worktrees deleted successfully"));
 }

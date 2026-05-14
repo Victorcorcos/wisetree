@@ -1,6 +1,5 @@
-//! Delete Worktree screen. Four-step state machine:
+//! Delete Worktree screen. Three-step state machine:
 //!
-//! - `Select`  : `SelectPrompt` over the deletable worktrees (main excluded).
 //! - `Confirm` : `ConfirmDialog`. Variant=Danger when the worktree is dirty
 //!   or the branch will be deleted alongside it; Warning otherwise. The
 //!   confirm label flips to "Force Delete" when the worktree is dirty.
@@ -22,14 +21,13 @@ use ratatui::Frame;
 
 use crate::git::types::GitWorktree;
 use crate::messages::{
-    colors, DELETE_CONFIRM_TITLE, DELETE_DELETING, DELETE_SELECT_PROMPT, DELETE_SUCCESS,
-    DELETE_WARNING, LOADING_WORKTREES,
+    colors, DELETE_CONFIRM_TITLE, DELETE_DELETING, DELETE_SUCCESS, DELETE_WARNING,
+    LOADING_WORKTREES,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
     branded_line, BulkConfirmDialog, BulkConfirmItem, BulkConfirmOutcome, ConfirmChoice,
-    ConfirmDialog, ConfirmOutcome, ConfirmVariant, SelectOption, SelectOutcome, SelectPrompt,
-    Status, StatusIndicator,
+    ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status, StatusIndicator,
 };
 
 const BULK_DELETE_CONFIRM_PROMPT: &str = "Are you sure you want to delete all these worktrees?";
@@ -37,7 +35,6 @@ const BULK_DELETE_BRANCH_WARNING: &str = "This will also delete their branches!"
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteStep {
-    Select,
     Confirm,
     Deleting,
     Success,
@@ -74,14 +71,9 @@ pub struct DeleteScreen {
     delete_branch_with_worktree: bool,
     loading: bool,
     error: Option<String>,
-    select: Option<SelectPrompt<String>>,
     confirm: Option<ConfirmDialog>,
     bulk_confirm: Option<BulkConfirmDialog>,
     outcome: Option<DeleteOutcome>,
-    /// True when we bypassed the Select step (dashboard's Backspace
-    /// shortcut). Esc on Confirm should then cancel the whole screen
-    /// instead of falling back to Select.
-    entered_via_jump: bool,
     /// Paths queued for a bulk delete from the dashboard. Empty for
     /// single-target deletions.
     bulk_paths: Vec<String>,
@@ -99,17 +91,15 @@ pub struct DeleteScreen {
 impl DeleteScreen {
     pub fn new(delete_branch_with_worktree: bool) -> Self {
         Self {
-            step: DeleteStep::Select,
+            step: DeleteStep::Confirm,
             worktrees: Vec::new(),
             selected_path: None,
             delete_branch_with_worktree,
             loading: true,
             error: None,
-            select: None,
             confirm: None,
             bulk_confirm: None,
             outcome: None,
-            entered_via_jump: false,
             bulk_paths: Vec::new(),
             bulk_total: 0,
             bulk_completed: 0,
@@ -177,20 +167,10 @@ impl DeleteScreen {
         self.worktrees = worktrees.into_iter().filter(|w| !w.is_main).collect();
         self.loading = false;
         self.error = None;
-        self.select = Some(self.build_select());
     }
 
-    pub fn preselect_path(&mut self, path: &str) {
-        let Some(select) = self.select.as_mut() else {
-            return;
-        };
-        if let Some(index) = self
-            .worktrees
-            .iter()
-            .position(|worktree| worktree.path == path)
-        {
-            select.selected = index;
-        }
+    pub fn preselect_path(&mut self, _path: &str) {
+        // No-op: Select step is gone.
     }
 
     /// Like `preselect_path`, but also bypasses the worktree picker and
@@ -200,12 +180,10 @@ impl DeleteScreen {
         if !self.worktrees.iter().any(|worktree| worktree.path == path) {
             return;
         }
-        self.preselect_path(path);
         self.selected_path = Some(path.to_string());
         self.confirm = self.build_confirm();
         if self.confirm.is_some() {
             self.step = DeleteStep::Confirm;
-            self.entered_via_jump = true;
         }
     }
 
@@ -228,15 +206,12 @@ impl DeleteScreen {
         if let Some(dialog) = self.build_bulk_confirm() {
             self.bulk_confirm = Some(dialog);
             self.step = DeleteStep::Confirm;
-            self.entered_via_jump = true;
         }
     }
 
     pub fn set_error(&mut self, message: String) {
         self.error = Some(message);
         self.loading = false;
-        // Upstream resets to the select step when delete fails.
-        self.step = DeleteStep::Select;
     }
 
     pub fn start_deleting(&mut self) {
@@ -274,41 +249,6 @@ impl DeleteScreen {
         self.selected_path
             .as_deref()
             .and_then(|p| self.worktrees.iter().find(|w| w.path == p))
-    }
-
-    fn build_select(&self) -> SelectPrompt<String> {
-        let opts: Vec<SelectOption<String>> = self
-            .worktrees
-            .iter()
-            .map(|wt| {
-                let label = format!("{} [{}]", fold_home(&wt.path), wt.branch);
-                let mut parts: Vec<String> = Vec::new();
-                if !wt.is_clean {
-                    parts.push("has changes".into());
-                }
-                if let Some(bs) = &wt.branch_status {
-                    if bs.ahead > 0 || bs.behind > 0 {
-                        let mut diff: Vec<String> = Vec::new();
-                        if bs.ahead > 0 {
-                            diff.push(format!("+{}", bs.ahead));
-                        }
-                        if bs.behind > 0 {
-                            diff.push(format!("-{}", bs.behind));
-                        }
-                        let upstream = bs.upstream_branch.as_deref().unwrap_or("");
-                        parts.push(format!("{} vs {}", diff.join(" "), upstream));
-                    }
-                }
-                let mut o = SelectOption::new(label, wt.path.clone());
-                if !parts.is_empty() {
-                    o = o.with_description(parts.join(", "));
-                }
-                o
-            })
-            .collect();
-        SelectPrompt::new(DELETE_SELECT_PROMPT, opts)
-            .searchable()
-            .with_footer_spacer()
     }
 
     fn build_confirm(&self) -> Option<ConfirmDialog> {
@@ -432,10 +372,12 @@ impl DeleteScreen {
         }
         if self.error.is_some() {
             self.error = None;
-            if self.worktrees.is_empty() {
+            if self.worktrees.is_empty()
+                || (self.selected_path.is_none() && self.bulk_paths.is_empty())
+            {
                 return DeleteAction::Cancelled;
             }
-            self.step = DeleteStep::Select;
+            self.step = DeleteStep::Confirm;
             return DeleteAction::Continue;
         }
         if self.loading {
@@ -446,27 +388,9 @@ impl DeleteScreen {
         }
 
         match self.step {
-            DeleteStep::Select => self.handle_select(key),
             DeleteStep::Confirm => self.handle_confirm(key),
             DeleteStep::Deleting => DeleteAction::Continue,
             DeleteStep::Success => DeleteAction::Continue,
-        }
-    }
-
-    fn handle_select(&mut self, key: KeyEvent) -> DeleteAction {
-        let select = match self.select.as_mut() {
-            Some(s) => s,
-            None => return DeleteAction::Cancelled,
-        };
-        match select.handle_key(key) {
-            SelectOutcome::Selected(_, path) => {
-                self.selected_path = Some(path);
-                self.confirm = self.build_confirm();
-                self.step = DeleteStep::Confirm;
-                DeleteAction::Continue
-            }
-            SelectOutcome::Cancelled => DeleteAction::Cancelled,
-            SelectOutcome::Pending => DeleteAction::Continue,
         }
     }
 
@@ -477,10 +401,7 @@ impl DeleteScreen {
         let outcome = {
             let dialog = match self.confirm.as_mut() {
                 Some(d) => d,
-                None => {
-                    self.step = DeleteStep::Select;
-                    return DeleteAction::Continue;
-                }
+                None => return DeleteAction::Cancelled,
             };
             dialog.handle_key(key)
         };
@@ -488,10 +409,7 @@ impl DeleteScreen {
             ConfirmOutcome::Confirmed => {
                 let wt = match self.selected() {
                     Some(w) => w,
-                    None => {
-                        self.step = DeleteStep::Select;
-                        return DeleteAction::Continue;
-                    }
+                    None => return DeleteAction::Cancelled,
                 };
                 let force = !wt.is_clean;
                 let path = wt.path.clone();
@@ -499,12 +417,7 @@ impl DeleteScreen {
             }
             ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => {
                 self.confirm = None;
-                if self.entered_via_jump {
-                    DeleteAction::Cancelled
-                } else {
-                    self.step = DeleteStep::Select;
-                    DeleteAction::Continue
-                }
+                DeleteAction::Cancelled
             }
             ConfirmOutcome::Pending => DeleteAction::Continue,
         }
@@ -566,11 +479,6 @@ impl DeleteScreen {
             return 4;
         }
         match self.step {
-            DeleteStep::Select => {
-                let visible = (self.worktrees.len() as u16).min(10);
-                let overflow = if self.worktrees.len() > 10 { 2 } else { 0 };
-                6 + visible + overflow
-            }
             DeleteStep::Confirm => {
                 if let Some(bulk) = self.bulk_confirm.as_ref() {
                     bulk.preferred_content_height()
@@ -629,11 +537,6 @@ impl DeleteScreen {
         }
 
         match self.step {
-            DeleteStep::Select => {
-                if let Some(s) = &self.select {
-                    s.render(frame, area);
-                }
-            }
             DeleteStep::Confirm => {
                 if let Some(c) = &self.bulk_confirm {
                     c.render(frame, area);

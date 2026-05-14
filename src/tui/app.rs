@@ -484,7 +484,6 @@ impl App {
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                     MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
-                    MenuChoice::Delete => self.enter_screen(Screen::Delete, tx),
                     MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
                 }
             }
@@ -1741,7 +1740,6 @@ mod tests {
             let mut app = initialized_menu_app();
             let tx = app_event_tx();
 
-            app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Enter), &tx);

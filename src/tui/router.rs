@@ -19,7 +19,6 @@ impl Screen {
             AppMode::Menu => Self::Menu,
             AppMode::Create => Self::Create,
             AppMode::Dashboard => Self::Dashboard,
-            AppMode::Delete => Self::Delete,
             AppMode::Settings => Self::Settings,
         }
     }
