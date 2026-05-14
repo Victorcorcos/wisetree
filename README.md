@@ -89,6 +89,27 @@ After installation, confirm the binary is on your `$PATH`:
 wisetree --version
 ```
 
+### Enable the local pre-push hook (contributors)
+
+This repository ships a tracked `githooks/pre-push` hook that mirrors the CI checks run in GitHub Actions before code is pushed.
+
+After cloning, enable repo-local hooks once:
+
+```rb
+git config core.hooksPath githooks
+```
+
+From that point on, every `git push` runs these checks locally and blocks the push if any of them fail:
+
+```rb
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --all-targets
+cargo test --all-features
+```
+
+If the hook reports an offense, fix it locally and push again. This keeps formatting, lint, build, and test failures from reaching CI.
+
 ### Local development workflow
 
 If you are hacking on `wisetree` itself and want every rebuild to land in your `$PATH` without reinstalling, symlink the release binary into a directory already on your `$PATH`:
