@@ -17,5 +17,5 @@ Delete worktrees with status: │ Merged │  │ Opened │  │ Clean │  │
                               └────────┘  └────────┘  └───────┘  └───────┘
 ↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear /
 Status: Mother = main worktree (protected)  Dirty = has uncommitted changes  Clean = no uncommitted changes  O
-Checks: ⚪ (Pending)  🟡 (Running)  🟢 (Passed)  🔴 (Failed)  ⚠️ (Errored)
+PR Checks: ⚪ (Pending)  🟡 (Running)  🟢 (Passed)  🔴 (Failed)  ⚠️ (Errored)
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls back to upstream/master, origin/main, o
