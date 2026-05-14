@@ -906,7 +906,7 @@ impl App {
                 let service = DashboardService::new(git_root, config.clone());
                 let gh_warning = default_dashboard_warning(&config, service.gh_available());
                 let (columns, runtime_warnings) =
-                    resolve_dashboard_columns(&config.columns, service.gh_available());
+                    resolve_dashboard_columns(&config.columns, service.pr_enrichment_enabled());
                 warnings.extend(runtime_warnings);
                 if let Some(warning) = gh_warning {
                     warnings.push(warning);
@@ -1038,10 +1038,12 @@ impl App {
             .as_ref()
             .is_some_and(DashboardScreen::has_rows);
         for notice in notices {
-            if has_rows {
-                self.show_toast(ToastVariant::Error, notice);
-            } else if let Some(screen) = self.dashboard.as_mut() {
-                screen.set_error(notice);
+            if let Some(screen) = self.dashboard.as_mut() {
+                if has_rows {
+                    screen.set_notice(notice);
+                } else {
+                    screen.set_error(notice.message);
+                }
             }
         }
     }
@@ -2325,6 +2327,49 @@ mod tests {
             app.delete.as_ref().unwrap().step(),
             screens::delete::DeleteStep::Success
         );
+    }
+
+    #[test]
+    fn bulk_delete_esc_from_selection_returns_to_dashboard() {
+        with_home(|_| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut app = initialized_menu_app();
+                app.screen = Screen::Delete;
+                app.menu = None;
+
+                let mut delete = DeleteScreen::new(false);
+                delete.set_worktrees(vec![
+                    GitWorktree {
+                        path: "/tmp/repo".into(),
+                        branch: "main".into(),
+                        commit: "deadbeef".into(),
+                        is_main: true,
+                        is_clean: true,
+                        branch_status: None,
+                    },
+                    GitWorktree {
+                        path: "/tmp/repo-feat".into(),
+                        branch: "feat".into(),
+                        commit: "deadbeef".into(),
+                        is_main: false,
+                        is_clean: true,
+                        branch_status: None,
+                    },
+                ]);
+                delete.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into()]);
+                app.delete = Some(delete);
+
+                app.handle_delete_key(key(KeyCode::Esc), &app_event_tx());
+                tokio::task::yield_now().await;
+
+                assert_eq!(app.screen, Screen::Dashboard);
+                assert!(app.dashboard.is_some());
+            });
+        });
     }
 
     #[test]

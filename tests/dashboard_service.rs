@@ -4,7 +4,7 @@ use std::process::Command;
 
 use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
-use wisetree::services::DashboardService;
+use wisetree::services::{DashboardNoticeLevel, DashboardService};
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -66,13 +66,19 @@ fn make_executable(path: &Path) {
 /// Build a service that does not touch the user's real `$HOME` for its PR
 /// cache file. Each test gets a unique cache path under the fixture tempdir.
 fn service_with_isolated_cache(fixture: &Fixture) -> DashboardService {
+    service_with_isolated_cache_and_config(fixture, DashboardConfig::default())
+}
+
+fn service_with_isolated_cache_and_config(
+    fixture: &Fixture,
+    config: DashboardConfig,
+) -> DashboardService {
     let cache = fixture
         .repo
         .parent()
         .unwrap()
         .join("dashboard_pr_cache.json");
-    DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
-        .with_cache_path(Some(cache))
+    DashboardService::new(fixture.repo.clone(), config).with_cache_path(Some(cache))
 }
 
 #[tokio::test]
@@ -120,7 +126,14 @@ async fn resolves_pr_repo_via_upstream_when_origin_is_a_fork() {
     fs::write(&gh_path, fake_gh_script(&log_path)).unwrap();
     make_executable(&gh_path);
 
-    let service = service_with_isolated_cache(&fixture).with_gh_binary(gh_path.clone());
+    let service = service_with_isolated_cache_and_config(
+        &fixture,
+        DashboardConfig {
+            show_pull_requests: true,
+            ..DashboardConfig::default()
+        },
+    )
+    .with_gh_binary(gh_path.clone());
     service.snapshot().await.expect("snapshot");
 
     let log = fs::read_to_string(&log_path).unwrap();
@@ -135,7 +148,7 @@ async fn resolves_pr_repo_via_upstream_when_origin_is_a_fork() {
 }
 
 #[tokio::test]
-async fn gh_is_called_whenever_available() {
+async fn snapshot_skips_gh_by_default_when_pull_requests_disabled() {
     let fixture = repo_with_worktree();
     let log_path = fixture.repo.parent().unwrap().join("gh.log");
     let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
@@ -146,8 +159,32 @@ async fn gh_is_called_whenever_available() {
     service.snapshot().await.expect("snapshot");
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(
+        !log.contains("api graphql"),
+        "gh api graphql should be skipped when showPullRequests is false — log was: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn gh_is_called_when_pr_enrichment_is_enabled() {
+    let fixture = repo_with_worktree();
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_script(&log_path)).unwrap();
+    make_executable(&gh_path);
+
+    let service = service_with_isolated_cache_and_config(
+        &fixture,
+        DashboardConfig {
+            show_pull_requests: true,
+            ..DashboardConfig::default()
+        },
+    )
+    .with_gh_binary(gh_path.clone());
+    service.snapshot().await.expect("snapshot");
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
         log.contains("api graphql"),
-        "gh api graphql should drive the batched PR fetch — log was: {log:?}"
+        "gh api graphql should drive the batched PR fetch when enabled — log was: {log:?}"
     );
 }
 
@@ -159,7 +196,14 @@ async fn second_snapshot_skips_gh_when_sha_unchanged() {
     fs::write(&gh_path, fake_gh_script(&log_path)).unwrap();
     make_executable(&gh_path);
 
-    let service = service_with_isolated_cache(&fixture).with_gh_binary(gh_path.clone());
+    let service = service_with_isolated_cache_and_config(
+        &fixture,
+        DashboardConfig {
+            show_pull_requests: true,
+            ..DashboardConfig::default()
+        },
+    )
+    .with_gh_binary(gh_path.clone());
     service.snapshot().await.expect("first snapshot");
     let first = fs::read_to_string(&log_path).unwrap();
     let first_graphql_calls = first.matches("api graphql").count();
@@ -182,6 +226,10 @@ async fn pruning_removes_cache_entries_for_deleted_worktrees() {
         .parent()
         .unwrap()
         .join("dashboard_pr_cache.json");
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_script(&log_path)).unwrap();
+    make_executable(&gh_path);
 
     // Seed the disk cache with a stale entry whose branch is not in the
     // current worktree list, plus an entry for an unrelated repo.
@@ -204,8 +252,15 @@ async fn pruning_removes_cache_entries_for_deleted_worktrees() {
     });
     fs::write(&cache_path, serde_json::to_string(&seeded).unwrap()).unwrap();
 
-    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
-        .with_cache_path(Some(cache_path.clone()));
+    let service = DashboardService::new(
+        fixture.repo.clone(),
+        DashboardConfig {
+            show_pull_requests: true,
+            ..DashboardConfig::default()
+        },
+    )
+    .with_gh_binary(gh_path)
+    .with_cache_path(Some(cache_path.clone()));
     service.snapshot().await.expect("snapshot");
 
     let on_disk: serde_json::Value =
@@ -268,7 +323,8 @@ async fn watch_reports_refresh_errors_without_emitting_empty_rows() {
         .await
         .expect("watch notice timeout")
         .expect("watch notice");
-    assert!(notice.contains("Dashboard refresh failed"));
+    assert_eq!(notice.level, DashboardNoticeLevel::Error);
+    assert!(notice.message.contains("Dashboard refresh failed"));
     assert!(
         watch.rx.try_recv().is_err(),
         "should not emit empty rows on error"
@@ -296,9 +352,15 @@ async fn rate_limit_response_emits_single_notice_and_backs_off() {
         .parent()
         .unwrap()
         .join("dashboard_pr_cache.json");
-    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
-        .with_gh_binary(gh_path.clone())
-        .with_cache_path(Some(cache));
+    let service = DashboardService::new(
+        fixture.repo.clone(),
+        DashboardConfig {
+            show_pull_requests: true,
+            ..DashboardConfig::default()
+        },
+    )
+    .with_gh_binary(gh_path.clone())
+    .with_cache_path(Some(cache));
 
     let mut watch = service.watch();
 
@@ -308,9 +370,10 @@ async fn rate_limit_response_emits_single_notice_and_backs_off() {
         .expect("notice timeout")
         .expect("notice");
     assert!(
-        notice.to_lowercase().contains("rate-limited"),
+        notice.message.to_lowercase().contains("rate-limited"),
         "expected rate-limit notice, got {notice:?}"
     );
+    assert_eq!(notice.level, DashboardNoticeLevel::Warning);
 
     // Force a refresh — should NOT emit another notice while backed off.
     watch.refresh();
@@ -323,4 +386,37 @@ async fn rate_limit_response_emits_single_notice_and_backs_off() {
         second.is_err(),
         "second notice should be suppressed while backoff is active, got {second:?}"
     );
+}
+
+#[tokio::test]
+async fn non_rate_limit_gh_failures_emit_inline_cache_notice() {
+    let fixture = repo_with_worktree();
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  printf 'authentication failed for github.com\\n' 1>&2\n  exit 1\nfi\nprintf '[]'\n",
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let service = service_with_isolated_cache_and_config(
+        &fixture,
+        DashboardConfig {
+            show_pull_requests: true,
+            ..DashboardConfig::default()
+        },
+    )
+    .with_gh_binary(gh_path);
+    let mut watch = service.watch();
+
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(2), watch.notice_rx.recv())
+        .await
+        .expect("notice timeout")
+        .expect("notice");
+    assert_eq!(notice.level, DashboardNoticeLevel::Error);
+    assert!(notice.message.contains("GitHub PR refresh failed"));
+    assert!(notice
+        .message
+        .contains("authentication failed for github.com"));
+    assert!(notice.message.contains("showing cached data"));
 }

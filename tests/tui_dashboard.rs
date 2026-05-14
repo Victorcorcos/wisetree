@@ -4,7 +4,9 @@ use ratatui::Terminal;
 
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::messages::colors;
-use wisetree::services::{CommitSummary, DashboardRow, PrState, PullRequest};
+use wisetree::services::{
+    CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState, PullRequest,
+};
 use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -490,6 +492,31 @@ fn selected_row_warning_is_rendered_in_footer() {
     let dumped = dump(120, 14, |f| screen.render(f, f.area()));
     assert!(dumped.contains("Selected row warning"));
     assert!(dumped.contains("status timed out"));
+}
+
+#[test]
+fn dashboard_notice_renders_in_footer_detail_slot() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr("/tmp/repo-bug", "bug", false),
+    ]);
+    screen.handle_key(key(KeyCode::Down));
+    screen.set_notice(DashboardNotice {
+        level: DashboardNoticeLevel::Error,
+        message: "GitHub PR refresh failed: auth error - showing cached data.".into(),
+    });
+
+    let dumped = dump_lines(110, 16, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("GitHub PR refresh failed: auth error - showing cached data."));
+    assert!(dumped.contains("Delete worktrees with status:"));
+    assert!(!dumped.contains("PR #42 Open"));
 }
 
 #[test]

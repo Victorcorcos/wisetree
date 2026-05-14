@@ -8,9 +8,10 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use wisetree::tui::widgets::{
-    CommandListProgress, CommandProgress, ConfirmChoice, ConfirmDialog, ConfirmOutcome,
-    ConfirmVariant, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Spinner,
-    Status, StatusIndicator, SPINNER_FRAMES,
+    BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, CommandListProgress,
+    CommandProgress, ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, InputOutcome,
+    InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Spinner, Status, StatusIndicator,
+    SPINNER_FRAMES,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -566,4 +567,212 @@ fn command_progress_shows_executing_command() {
     });
     assert!(dumped.contains("Running post-create commands (1/3)"));
     assert!(dumped.contains("Executing: bun install"));
+}
+
+// -- BulkConfirmDialog --------------------------------------------------------
+
+fn bulk_items(labels: &[&str]) -> Vec<BulkConfirmItem> {
+    labels.iter().map(|l| BulkConfirmItem::new(*l)).collect()
+}
+
+fn bulk_dialog(labels: &[&str]) -> BulkConfirmDialog {
+    BulkConfirmDialog::new(
+        "Delete worktrees",
+        "Are you sure?",
+        bulk_items(labels),
+        "This will also delete their branches!",
+        ratatui::style::Color::Red,
+    )
+}
+
+#[test]
+fn bulk_confirm_starts_focused_on_first_row_with_all_checked() {
+    let d = bulk_dialog(&["a", "b", "c"]);
+    assert_eq!(d.focus, BulkConfirmFocus::List(0));
+    assert!(d.items.iter().all(|i| i.checked));
+    assert_eq!(d.selected_indices(), vec![0, 1, 2]);
+}
+
+#[test]
+fn bulk_confirm_empty_items_focus_falls_back_to_confirm() {
+    let d = BulkConfirmDialog::new(
+        "t",
+        "p",
+        Vec::<BulkConfirmItem>::new(),
+        "w",
+        ratatui::style::Color::Red,
+    );
+    assert_eq!(d.focus, BulkConfirmFocus::Confirm);
+    assert!(d.selected_indices().is_empty());
+}
+
+#[test]
+fn bulk_confirm_arrow_keys_move_within_list() {
+    let mut d = bulk_dialog(&["a", "b", "c"]);
+    d.handle_key(key(KeyCode::Down));
+    assert_eq!(d.focus, BulkConfirmFocus::List(1));
+    d.handle_key(key(KeyCode::Down));
+    assert_eq!(d.focus, BulkConfirmFocus::List(2));
+    d.handle_key(key(KeyCode::Down));
+    assert_eq!(d.focus, BulkConfirmFocus::List(2)); // saturates at end
+    d.handle_key(key(KeyCode::Up));
+    assert_eq!(d.focus, BulkConfirmFocus::List(1));
+    d.handle_key(key(KeyCode::Up));
+    d.handle_key(key(KeyCode::Up));
+    assert_eq!(d.focus, BulkConfirmFocus::List(0)); // saturates at top
+}
+
+#[test]
+fn bulk_confirm_space_toggles_focused_row() {
+    let mut d = bulk_dialog(&["a", "b"]);
+    d.handle_key(key(KeyCode::Char(' ')));
+    assert!(!d.items[0].checked);
+    assert!(d.items[1].checked);
+    d.handle_key(key(KeyCode::Char(' ')));
+    assert!(d.items[0].checked);
+}
+
+#[test]
+fn bulk_confirm_a_toggles_select_all() {
+    let mut d = bulk_dialog(&["a", "b", "c"]);
+    d.handle_key(key(KeyCode::Char(' ')));
+    assert!(d.any_unchecked());
+    d.handle_key(key(KeyCode::Char('a'))); // re-checks everything
+    assert!(!d.any_unchecked());
+    d.handle_key(key(KeyCode::Char('a'))); // unchecks everything
+    assert!(d.items.iter().all(|i| !i.checked));
+}
+
+#[test]
+fn bulk_confirm_tab_cycles_list_to_cancel_to_list() {
+    let mut d = bulk_dialog(&["a", "b"]);
+    d.handle_key(key(KeyCode::Down));
+    d.handle_key(key(KeyCode::Tab));
+    assert_eq!(d.focus, BulkConfirmFocus::Cancel);
+    d.handle_key(key(KeyCode::Tab));
+    assert_eq!(d.focus, BulkConfirmFocus::List(1));
+}
+
+#[test]
+fn bulk_confirm_left_right_swap_buttons_only() {
+    let mut d = bulk_dialog(&["a", "b"]);
+    // ←/→ on the list is a no-op.
+    d.handle_key(key(KeyCode::Right));
+    assert_eq!(d.focus, BulkConfirmFocus::List(0));
+    d.handle_key(key(KeyCode::Tab));
+    assert_eq!(d.focus, BulkConfirmFocus::Cancel);
+    d.handle_key(key(KeyCode::Right));
+    assert_eq!(d.focus, BulkConfirmFocus::Confirm);
+    d.handle_key(key(KeyCode::Left));
+    assert_eq!(d.focus, BulkConfirmFocus::Cancel);
+}
+
+#[test]
+fn bulk_confirm_enter_on_list_moves_focus_to_no_button() {
+    let mut d = bulk_dialog(&["a", "b", "c"]);
+    d.handle_key(key(KeyCode::Down));
+    d.handle_key(key(KeyCode::Char(' '))); // uncheck index 1
+    let outcome = d.handle_key(key(KeyCode::Enter));
+    assert_eq!(outcome, BulkConfirmOutcome::Pending);
+    assert_eq!(d.focus, BulkConfirmFocus::Cancel);
+}
+
+#[test]
+fn bulk_confirm_enter_on_yes_confirms_with_checked_indices() {
+    let mut d = bulk_dialog(&["a", "b"]);
+    d.handle_key(key(KeyCode::Tab));
+    d.handle_key(key(KeyCode::Left));
+    let outcome = d.handle_key(key(KeyCode::Enter));
+    assert_eq!(outcome, BulkConfirmOutcome::Confirmed(vec![0, 1]));
+}
+
+#[test]
+fn bulk_confirm_enter_on_no_cancels() {
+    let mut d = bulk_dialog(&["a", "b"]);
+    d.handle_key(key(KeyCode::Tab));
+    let outcome = d.handle_key(key(KeyCode::Enter));
+    assert_eq!(outcome, BulkConfirmOutcome::Cancelled);
+}
+
+#[test]
+fn bulk_confirm_enter_with_nothing_checked_still_requires_button_confirmation() {
+    let mut d = bulk_dialog(&["a", "b"]);
+    d.handle_key(key(KeyCode::Char('a'))); // uncheck all
+    let outcome = d.handle_key(key(KeyCode::Enter));
+    assert_eq!(outcome, BulkConfirmOutcome::Pending);
+    assert_eq!(d.focus, BulkConfirmFocus::Cancel);
+}
+
+#[test]
+fn bulk_confirm_render_shows_checkbox_glyphs_and_footer() {
+    let d = bulk_dialog(&["/tmp/repo-feat [feat]", "/tmp/repo-bug [bug]"]);
+    let dumped = dump(100, 16, |f| d.render(f, f.area()));
+    assert!(dumped.contains("☒"));
+    assert!(dumped.contains("/tmp/repo-feat"));
+    assert!(dumped.contains("Yes"));
+    assert!(dumped.contains("No"));
+    assert!(dumped.contains("Space toggle"));
+    assert!(dumped.contains("select all"));
+}
+
+#[test]
+fn bulk_confirm_render_swaps_glyph_after_space() {
+    let mut d = bulk_dialog(&["/tmp/repo-feat [feat]", "/tmp/repo-bug [bug]"]);
+    d.handle_key(key(KeyCode::Char(' ')));
+    let dumped = dump(100, 16, |f| d.render(f, f.area()));
+    assert!(dumped.contains("☐"));
+    assert!(dumped.contains("☒"));
+}
+
+#[test]
+fn bulk_confirm_render_marks_focused_row_with_cursor() {
+    let d = bulk_dialog(&["/tmp/repo-feat [feat]", "/tmp/repo-bug [bug]"]);
+    let dumped = dump(100, 16, |f| d.render(f, f.area()));
+    // The focused row carries the ➤ cursor; the other row gets two spaces.
+    assert!(dumped.contains("➤"));
+}
+
+#[test]
+fn bulk_confirm_cursor_visible_on_first_and_last_row_at_preferred_height() {
+    // Production sizes the panel to exactly `preferred_content_height`. If
+    // the dialog's render constraints sum to more than that, ratatui's
+    // solver squeezes — historically wiping the first/last item rows.
+    let mut d = bulk_dialog(&["row-a", "row-b", "row-c"]);
+    let h = d.preferred_content_height();
+    let dumped_first = dump(80, h, |f| d.render(f, f.area()));
+    assert!(
+        dumped_first.contains("➤"),
+        "expected cursor visible on first row at preferred height; got: {dumped_first}"
+    );
+    // Move focus to the last row and re-render.
+    d.handle_key(key(KeyCode::Down));
+    d.handle_key(key(KeyCode::Down));
+    let dumped_last = dump(80, h, |f| d.render(f, f.area()));
+    assert!(
+        dumped_last.contains("➤"),
+        "expected cursor visible on last row at preferred height; got: {dumped_last}"
+    );
+    // Sanity: the footer hint and warning must also be present, proving the
+    // bottom of the layout isn't being clipped.
+    assert!(dumped_last.contains("Space toggle"));
+}
+
+#[test]
+fn bulk_confirm_esc_on_buttons_returns_to_last_list_row() {
+    let mut d = bulk_dialog(&["a", "b", "c"]);
+    d.handle_key(key(KeyCode::Down));
+    d.handle_key(key(KeyCode::Down));
+    d.handle_key(key(KeyCode::Enter));
+
+    let outcome = d.handle_key(key(KeyCode::Esc));
+
+    assert_eq!(outcome, BulkConfirmOutcome::Pending);
+    assert_eq!(d.focus, BulkConfirmFocus::List(2));
+}
+
+#[test]
+fn bulk_confirm_esc_on_list_cancels() {
+    let mut d = bulk_dialog(&["a", "b"]);
+    let outcome = d.handle_key(key(KeyCode::Esc));
+    assert_eq!(outcome, BulkConfirmOutcome::Cancelled);
 }
