@@ -4,7 +4,7 @@ use std::process::Command;
 
 use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
-use wisetree::services::DashboardService;
+use wisetree::services::{DashboardNoticeLevel, DashboardService};
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -268,7 +268,8 @@ async fn watch_reports_refresh_errors_without_emitting_empty_rows() {
         .await
         .expect("watch notice timeout")
         .expect("watch notice");
-    assert!(notice.contains("Dashboard refresh failed"));
+    assert_eq!(notice.level, DashboardNoticeLevel::Error);
+    assert!(notice.message.contains("Dashboard refresh failed"));
     assert!(
         watch.rx.try_recv().is_err(),
         "should not emit empty rows on error"
@@ -308,9 +309,10 @@ async fn rate_limit_response_emits_single_notice_and_backs_off() {
         .expect("notice timeout")
         .expect("notice");
     assert!(
-        notice.to_lowercase().contains("rate-limited"),
+        notice.message.to_lowercase().contains("rate-limited"),
         "expected rate-limit notice, got {notice:?}"
     );
+    assert_eq!(notice.level, DashboardNoticeLevel::Warning);
 
     // Force a refresh — should NOT emit another notice while backed off.
     watch.refresh();
@@ -323,4 +325,30 @@ async fn rate_limit_response_emits_single_notice_and_backs_off() {
         second.is_err(),
         "second notice should be suppressed while backoff is active, got {second:?}"
     );
+}
+
+#[tokio::test]
+async fn non_rate_limit_gh_failures_emit_inline_cache_notice() {
+    let fixture = repo_with_worktree();
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  printf 'authentication failed for github.com\\n' 1>&2\n  exit 1\nfi\nprintf '[]'\n",
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let service = service_with_isolated_cache(&fixture).with_gh_binary(gh_path);
+    let mut watch = service.watch();
+
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(2), watch.notice_rx.recv())
+        .await
+        .expect("notice timeout")
+        .expect("notice");
+    assert_eq!(notice.level, DashboardNoticeLevel::Error);
+    assert!(notice.message.contains("GitHub PR refresh failed"));
+    assert!(notice
+        .message
+        .contains("authentication failed for github.com"));
+    assert!(notice.message.contains("showing cached data"));
 }

@@ -1039,10 +1039,12 @@ impl App {
             .as_ref()
             .is_some_and(DashboardScreen::has_rows);
         for notice in notices {
-            if has_rows {
-                self.show_toast(ToastVariant::Error, notice);
-            } else if let Some(screen) = self.dashboard.as_mut() {
-                screen.set_error(notice);
+            if let Some(screen) = self.dashboard.as_mut() {
+                if has_rows {
+                    screen.set_notice(notice);
+                } else {
+                    screen.set_error(notice.message);
+                }
             }
         }
     }

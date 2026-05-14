@@ -243,7 +243,7 @@ impl BulkConfirmDialog {
                 Constraint::Length(1),         // blank
                 Constraint::Length(1),         // warning
                 Constraint::Length(3),         // buttons row
-                Constraint::Length(1),         // footer hint (no blank above — buttons row already breathes)
+                Constraint::Length(1), // footer hint (no blank above — buttons row already breathes)
                 Constraint::Min(0),
             ])
             .split(area);
@@ -268,7 +268,10 @@ impl BulkConfirmDialog {
             .fg(self.warning_color)
             .add_modifier(Modifier::BOLD);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(self.warning.clone(), warning_style))),
+            Paragraph::new(Line::from(Span::styled(
+                self.warning.clone(),
+                warning_style,
+            ))),
             chunks[6],
         );
 
@@ -286,8 +289,9 @@ impl BulkConfirmDialog {
         if self.items.is_empty() {
             return;
         }
-        let constraints: Vec<Constraint> =
-            (0..self.items.len()).map(|_| Constraint::Length(1)).collect();
+        let constraints: Vec<Constraint> = (0..self.items.len())
+            .map(|_| Constraint::Length(1))
+            .collect();
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)

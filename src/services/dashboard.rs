@@ -66,10 +66,38 @@ pub struct DashboardRow {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardNoticeLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardNotice {
+    pub level: DashboardNoticeLevel,
+    pub message: String,
+}
+
+impl DashboardNotice {
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            level: DashboardNoticeLevel::Warning,
+            message: message.into(),
+        }
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            level: DashboardNoticeLevel::Error,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DashboardWatch {
     pub rx: mpsc::Receiver<Vec<DashboardRow>>,
-    pub notice_rx: mpsc::Receiver<String>,
+    pub notice_rx: mpsc::Receiver<DashboardNotice>,
     cancel: Option<oneshot::Sender<()>>,
     refresh_tx: mpsc::Sender<()>,
 }
@@ -107,7 +135,7 @@ struct PrCacheState {
     rate_limited_until: Option<Instant>,
     rate_limit_notice_sent: bool,
     loaded_from_disk: bool,
-    notice_tx: Option<mpsc::Sender<String>>,
+    notice_tx: Option<mpsc::Sender<DashboardNotice>>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +223,9 @@ impl DashboardService {
                     }
                     Err(err) => {
                         let _ = notice_tx
-                            .send(format!("Dashboard refresh failed: {err}"))
+                            .send(DashboardNotice::error(format!(
+                                "Dashboard refresh failed: {err}"
+                            )))
                             .await;
                     }
                 }
@@ -496,10 +526,12 @@ impl DashboardService {
             Err(err) => {
                 if is_rate_limit_error(&err) {
                     self.mark_rate_limited();
+                } else {
+                    self.mark_pr_refresh_failed(&err);
                 }
-                // Non-rate-limit failures are silently ignored: rows fall back
-                // to cached or empty PR data. Surfacing per-row errors here
-                // would be misleading because the call covers all branches.
+                // Failures fall back to cached or empty PR data. Surface a
+                // single dashboard-level notice instead of per-row errors,
+                // because this GraphQL request covers every branch at once.
             }
         }
     }
@@ -534,14 +566,30 @@ impl DashboardService {
                 None
             } else {
                 state.rate_limit_notice_sent = true;
-                state.notice_tx.clone()
+                Some((
+                    state.notice_tx.clone(),
+                    DashboardNotice::warning(
+                        "GitHub API rate-limited — pausing PR refresh for 5 min; showing cached data.",
+                    ),
+                ))
             }
         };
-        if let Some(tx) = notice {
-            let _ = tx.try_send(
-                "GitHub API rate-limited — pausing PR refresh for 5 min; showing cached data."
-                    .to_string(),
-            );
+        if let Some((Some(tx), notice)) = notice {
+            let _ = tx.try_send(notice);
+        }
+    }
+
+    fn mark_pr_refresh_failed(&self, err: &str) {
+        let notice = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state.notice_tx.clone().map(|tx| {
+                let summary = summarize_notice_text(err);
+                let message = format!("GitHub PR refresh failed: {summary} — showing cached data.");
+                (tx, DashboardNotice::error(message))
+            })
+        };
+        if let Some((tx, notice)) = notice {
+            let _ = tx.try_send(notice);
         }
     }
 
@@ -688,6 +736,15 @@ fn now_ms() -> u64 {
 fn is_rate_limit_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("rate limit") || lower.contains("rate-limit")
+}
+
+fn summarize_notice_text(message: &str) -> String {
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "unknown error".to_string()
+    } else {
+        compact
+    }
 }
 
 /// Extract `(owner, repo)` from a GitHub remote URL. Handles the common SSH,
