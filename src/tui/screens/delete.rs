@@ -26,8 +26,8 @@ use crate::messages::{
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    branded_line, ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status,
-    StatusIndicator,
+    branded_line, BulkConfirmDialog, BulkConfirmItem, BulkConfirmOutcome, ConfirmChoice,
+    ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status, StatusIndicator,
 };
 
 const BULK_DELETE_CONFIRM_PROMPT: &str = "Are you sure you want to delete all these worktrees?";
@@ -72,6 +72,7 @@ pub struct DeleteScreen {
     loading: bool,
     error: Option<String>,
     confirm: Option<ConfirmDialog>,
+    bulk_confirm: Option<BulkConfirmDialog>,
     outcome: Option<DeleteOutcome>,
     /// Paths queued for a bulk delete from the dashboard. Empty for
     /// single-target deletions.
@@ -97,6 +98,7 @@ impl DeleteScreen {
             loading: true,
             error: None,
             confirm: None,
+            bulk_confirm: None,
             outcome: None,
             bulk_paths: Vec::new(),
             bulk_total: 0,
@@ -107,7 +109,7 @@ impl DeleteScreen {
     }
 
     pub fn is_bulk(&self) -> bool {
-        !self.bulk_paths.is_empty() || self.bulk_total > 0
+        !self.bulk_paths.is_empty() || self.bulk_total > 0 || self.bulk_confirm.is_some()
     }
 
     pub fn bulk_progress(&self) -> Option<(usize, usize)> {
@@ -202,7 +204,7 @@ impl DeleteScreen {
         self.bulk_completed = 0;
         self.bulk_warnings.clear();
         if let Some(dialog) = self.build_bulk_confirm() {
-            self.confirm = Some(dialog);
+            self.bulk_confirm = Some(dialog);
             self.step = DeleteStep::Confirm;
         }
     }
@@ -315,38 +317,30 @@ impl DeleteScreen {
         )
     }
 
-    fn build_bulk_confirm(&self) -> Option<ConfirmDialog> {
+    fn build_bulk_confirm(&self) -> Option<BulkConfirmDialog> {
         if self.bulk_paths.is_empty() {
             return None;
         }
 
-        let white = Style::default().fg(colors::WHITE);
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::from(Span::styled(BULK_DELETE_CONFIRM_PROMPT, white)));
-        lines.push(Line::from(""));
-
-        for (index, path) in self.bulk_paths.iter().enumerate() {
-            let label = self
-                .worktrees
-                .iter()
-                .find(|w| &w.path == path)
-                .map(|w| format!("{}. {} [{}]", index + 1, fold_home(&w.path), w.branch))
-                .unwrap_or_else(|| format!("{}. {}", index + 1, fold_home(path)));
-            lines.push(Line::from(Span::styled(label, white)));
-        }
-        lines.push(Line::from(""));
+        let items: Vec<BulkConfirmItem> = self
+            .bulk_paths
+            .iter()
+            .map(|path| {
+                let label = self
+                    .worktrees
+                    .iter()
+                    .find(|w| &w.path == path)
+                    .map(|w| format!("{} [{}]", fold_home(&w.path), w.branch))
+                    .unwrap_or_else(|| fold_home(path));
+                BulkConfirmItem::new(label)
+            })
+            .collect();
 
         let (warning_text, warning_color) = if self.delete_branch_with_worktree {
             (BULK_DELETE_BRANCH_WARNING, colors::ERROR)
         } else {
             (DELETE_WARNING, colors::WARNING)
         };
-        lines.push(Line::from(Span::styled(
-            warning_text,
-            Style::default()
-                .fg(warning_color)
-                .add_modifier(Modifier::BOLD),
-        )));
 
         let variant = if self.delete_branch_with_worktree {
             ConfirmVariant::Danger
@@ -355,11 +349,15 @@ impl DeleteScreen {
         };
 
         Some(
-            ConfirmDialog::new(DELETE_CONFIRM_TITLE.to_string(), String::new())
-                .with_message_lines(lines)
-                .with_labels("Yes", "No")
-                .with_variant(variant)
-                .with_default(ConfirmChoice::Cancel),
+            BulkConfirmDialog::new(
+                DELETE_CONFIRM_TITLE.to_string(),
+                BULK_DELETE_CONFIRM_PROMPT.to_string(),
+                items,
+                warning_text.to_string(),
+                warning_color,
+            )
+            .with_variant(variant)
+            .with_labels("Yes", "No"),
         )
     }
 
@@ -397,6 +395,9 @@ impl DeleteScreen {
     }
 
     fn handle_confirm(&mut self, key: KeyEvent) -> DeleteAction {
+        if self.bulk_confirm.is_some() {
+            return self.handle_bulk_confirm(key);
+        }
         let outcome = {
             let dialog = match self.confirm.as_mut() {
                 Some(d) => d,
@@ -406,22 +407,6 @@ impl DeleteScreen {
         };
         match outcome {
             ConfirmOutcome::Confirmed => {
-                if !self.bulk_paths.is_empty() {
-                    let items: Vec<(String, bool)> = self
-                        .bulk_paths
-                        .iter()
-                        .filter_map(|p| {
-                            self.worktrees
-                                .iter()
-                                .find(|w| &w.path == p)
-                                .map(|w| (w.path.clone(), !w.is_clean))
-                        })
-                        .collect();
-                    if items.is_empty() {
-                        return DeleteAction::Cancelled;
-                    }
-                    return DeleteAction::BulkConfirmed { items };
-                }
                 let wt = match self.selected() {
                     Some(w) => w,
                     None => return DeleteAction::Cancelled,
@@ -438,6 +423,50 @@ impl DeleteScreen {
         }
     }
 
+    fn handle_bulk_confirm(&mut self, key: KeyEvent) -> DeleteAction {
+        let outcome = match self.bulk_confirm.as_mut() {
+            Some(d) => d.handle_key(key),
+            None => return DeleteAction::Continue,
+        };
+        match outcome {
+            BulkConfirmOutcome::Confirmed(indices) => {
+                let selected_paths: Vec<String> = indices
+                    .iter()
+                    .filter_map(|i| self.bulk_paths.get(*i).cloned())
+                    .collect();
+                let items: Vec<(String, bool)> = selected_paths
+                    .iter()
+                    .filter_map(|p| {
+                        self.worktrees
+                            .iter()
+                            .find(|w| &w.path == p)
+                            .map(|w| (w.path.clone(), !w.is_clean))
+                    })
+                    .collect();
+                if items.is_empty() {
+                    self.bulk_confirm = None;
+                    self.bulk_paths.clear();
+                    self.bulk_total = 0;
+                    return DeleteAction::Cancelled;
+                }
+                // Trim the bulk bookkeeping down to the actually-selected
+                // subset so progress, success message, and toast counts
+                // reflect what the user confirmed (not the original
+                // dashboard filter).
+                self.bulk_paths = selected_paths;
+                self.bulk_total = self.bulk_paths.len();
+                self.bulk_completed = 0;
+                self.bulk_confirm = None;
+                DeleteAction::BulkConfirmed { items }
+            }
+            BulkConfirmOutcome::Cancelled => {
+                self.bulk_confirm = None;
+                DeleteAction::Cancelled
+            }
+            BulkConfirmOutcome::Pending => DeleteAction::Continue,
+        }
+    }
+
     /// Inner content height for the framed panel (excludes the rounded
     /// border).
     pub fn preferred_content_height(&self) -> u16 {
@@ -449,14 +478,8 @@ impl DeleteScreen {
         }
         match self.step {
             DeleteStep::Confirm => {
-                // Bulk confirm renders prompt + blank + N path lines +
-                // blank + warning inside the dialog message area, plus
-                // title + spacer + 3-line buttons + 2-line hint. Allow
-                // the panel to grow with the number of items so paths
-                // aren't clipped to a single visible row.
-                if self.bulk_total > 0 {
-                    let item_count = self.bulk_paths.len().max(self.bulk_total) as u16;
-                    11u16.saturating_add(item_count)
+                if let Some(bulk) = self.bulk_confirm.as_ref() {
+                    bulk.preferred_content_height()
                 } else {
                     10
                 }
@@ -513,7 +536,9 @@ impl DeleteScreen {
 
         match self.step {
             DeleteStep::Confirm => {
-                if let Some(c) = &self.confirm {
+                if let Some(c) = &self.bulk_confirm {
+                    c.render(frame, area);
+                } else if let Some(c) = &self.confirm {
                     c.render(frame, area);
                 }
             }

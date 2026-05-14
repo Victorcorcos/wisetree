@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row
 use ratatui::Frame;
 
 use crate::messages::colors;
-use crate::services::{CheckStatus, DashboardRow, PrState};
+use crate::services::{CheckStatus, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState};
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
 
@@ -134,7 +134,7 @@ pub struct DashboardScreen {
     has_clipboard: bool,
     columns: Vec<DashboardColumn>,
     warnings: Vec<String>,
-    notice: Option<String>,
+    notice: Option<DashboardNotice>,
     refreshed_at: Option<Instant>,
     /// `Some` while the bulk-delete buttons row owns the keyboard focus.
     /// Tab moves through buttons in `BulkDeleteStatus::ALL` order; Esc
@@ -193,7 +193,7 @@ impl DashboardScreen {
         }
     }
 
-    pub fn set_notice(&mut self, notice: String) {
+    pub fn set_notice(&mut self, notice: DashboardNotice) {
         self.notice = Some(notice);
     }
 
@@ -824,8 +824,8 @@ impl DashboardScreen {
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
         if let Some(notice) = &self.notice {
             return Line::from(Span::styled(
-                notice.clone(),
-                Style::default().fg(colors::INFO),
+                truncate(&notice.message, width.max(1) as usize),
+                notice_style(notice.level),
             ));
         }
         if let Some(row) = self.selected_row() {
@@ -1546,6 +1546,13 @@ fn format_refreshed_label(duration: std::time::Duration) -> String {
         "Refreshed just now".to_string()
     } else {
         format!("Refreshed {elapsed} ago")
+    }
+}
+
+fn notice_style(level: DashboardNoticeLevel) -> Style {
+    match level {
+        DashboardNoticeLevel::Warning => Style::default().fg(colors::WARNING),
+        DashboardNoticeLevel::Error => Style::default().fg(colors::ERROR),
     }
 }
 

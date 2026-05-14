@@ -85,10 +85,38 @@ pub struct DashboardRow {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardNoticeLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardNotice {
+    pub level: DashboardNoticeLevel,
+    pub message: String,
+}
+
+impl DashboardNotice {
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            level: DashboardNoticeLevel::Warning,
+            message: message.into(),
+        }
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            level: DashboardNoticeLevel::Error,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DashboardWatch {
     pub rx: mpsc::Receiver<Vec<DashboardRow>>,
-    pub notice_rx: mpsc::Receiver<String>,
+    pub notice_rx: mpsc::Receiver<DashboardNotice>,
     cancel: Option<oneshot::Sender<()>>,
     refresh_tx: mpsc::Sender<()>,
 }
@@ -126,7 +154,7 @@ struct PrCacheState {
     rate_limited_until: Option<Instant>,
     rate_limit_notice_sent: bool,
     loaded_from_disk: bool,
-    notice_tx: Option<mpsc::Sender<String>>,
+    notice_tx: Option<mpsc::Sender<DashboardNotice>>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +207,10 @@ impl DashboardService {
         self.gh_available
     }
 
+    pub fn pr_enrichment_enabled(&self) -> bool {
+        self.config.show_pull_requests && self.gh_available
+    }
+
     pub fn watch(&self) -> DashboardWatch {
         let (rows_tx, rows_rx) = mpsc::channel(8);
         let (notice_tx, notice_rx) = mpsc::channel(8);
@@ -195,15 +227,28 @@ impl DashboardService {
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             loop {
-                match service.snapshot().await {
-                    Ok(rows) => {
-                        if rows_tx.send(rows).await.is_err() {
+                // Emit git-only rows (with cached PRs applied) first so the
+                // UI exits "Loading dashboard..." without waiting on the gh
+                // GraphQL round-trip. Then refresh PRs and emit again.
+                match service.collect_git_rows().await {
+                    Ok(mut rows) => {
+                        if rows_tx.send(rows.clone()).await.is_err() {
                             break;
+                        }
+                        if service.pr_enrichment_enabled() {
+                            service.refresh_pull_requests(&rows).await;
+                            service.apply_cached_prs(&mut rows);
+                            service.save_cache();
+                            if rows_tx.send(rows).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Err(err) => {
                         let _ = notice_tx
-                            .send(format!("Dashboard refresh failed: {err}"))
+                            .send(DashboardNotice::error(format!(
+                                "Dashboard refresh failed: {err}"
+                            )))
                             .await;
                     }
                 }
@@ -229,6 +274,20 @@ impl DashboardService {
     }
 
     pub async fn snapshot(&self) -> Result<Vec<DashboardRow>> {
+        let mut rows = self.collect_git_rows().await?;
+        if self.pr_enrichment_enabled() {
+            self.refresh_pull_requests(&rows).await;
+            self.apply_cached_prs(&mut rows);
+            self.save_cache();
+        }
+        Ok(rows)
+    }
+
+    /// Gather worktree + git-derived state (status, upstream diff, last commit)
+    /// for every worktree in parallel, then layer cached PR data on top. No
+    /// network calls — safe to emit immediately so the UI can render before
+    /// the slower `gh` refresh completes.
+    async fn collect_git_rows(&self) -> Result<Vec<DashboardRow>> {
         let worktrees = self.list_worktrees_basic().await?;
         let mut tasks = JoinSet::new();
 
@@ -255,9 +314,7 @@ impl DashboardService {
             rows.iter().map(|row| row.worktree.branch.clone()).collect();
         self.prune_cache(&live_branches);
 
-        self.refresh_pull_requests(&rows).await;
         self.apply_cached_prs(&mut rows);
-        self.save_cache();
 
         rows.sort_by_key(|row| (!row.worktree.is_main, row.worktree.path.clone()));
         Ok(rows)
@@ -434,10 +491,7 @@ impl DashboardService {
     /// Decide which branches need a PR refresh, then (if any) issue a single
     /// batched GraphQL request and update the cache.
     async fn refresh_pull_requests(&self, rows: &[DashboardRow]) {
-        if !self.config.show_pull_requests {
-            return;
-        }
-        if !self.gh_available {
+        if !self.pr_enrichment_enabled() {
             return;
         }
         if self.is_rate_limited() {
@@ -497,10 +551,12 @@ impl DashboardService {
             Err(err) => {
                 if is_rate_limit_error(&err) {
                     self.mark_rate_limited();
+                } else {
+                    self.mark_pr_refresh_failed(&err);
                 }
-                // Non-rate-limit failures are silently ignored: rows fall back
-                // to cached or empty PR data. Surfacing per-row errors here
-                // would be misleading because the call covers all branches.
+                // Failures fall back to cached or empty PR data. Surface a
+                // single dashboard-level notice instead of per-row errors,
+                // because this GraphQL request covers every branch at once.
             }
         }
     }
@@ -535,14 +591,30 @@ impl DashboardService {
                 None
             } else {
                 state.rate_limit_notice_sent = true;
-                state.notice_tx.clone()
+                Some((
+                    state.notice_tx.clone(),
+                    DashboardNotice::warning(
+                        "GitHub API rate-limited — pausing PR refresh for 5 min; showing cached data.",
+                    ),
+                ))
             }
         };
-        if let Some(tx) = notice {
-            let _ = tx.try_send(
-                "GitHub API rate-limited — pausing PR refresh for 5 min; showing cached data."
-                    .to_string(),
-            );
+        if let Some((Some(tx), notice)) = notice {
+            let _ = tx.try_send(notice);
+        }
+    }
+
+    fn mark_pr_refresh_failed(&self, err: &str) {
+        let notice = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state.notice_tx.clone().map(|tx| {
+                let summary = summarize_notice_text(err);
+                let message = format!("GitHub PR refresh failed: {summary} — showing cached data.");
+                (tx, DashboardNotice::error(message))
+            })
+        };
+        if let Some((tx, notice)) = notice {
+            let _ = tx.try_send(notice);
         }
     }
 
@@ -689,6 +761,15 @@ fn now_ms() -> u64 {
 fn is_rate_limit_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("rate limit") || lower.contains("rate-limit")
+}
+
+fn summarize_notice_text(message: &str) -> String {
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "unknown error".to_string()
+    } else {
+        compact
+    }
 }
 
 /// Extract `(owner, repo)` from a GitHub remote URL. Handles the common SSH,
@@ -985,13 +1066,13 @@ pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -
 
 pub fn resolve_dashboard_columns(
     columns: &[String],
-    gh_available: bool,
+    pr_enrichment_enabled: bool,
 ) -> (Vec<String>, Vec<String>) {
     let (normalized, warnings) = normalize_dashboard_columns(columns);
     let mut resolved = Vec::new();
 
     for column in normalized {
-        if column == "pull_request" && !gh_available {
+        if column == "pull_request" && !pr_enrichment_enabled {
             continue;
         }
         resolved.push(column);
@@ -1268,5 +1349,25 @@ mod tests {
             out.get("feat").unwrap().as_ref().unwrap().checks_status,
             None
         );
+    }
+
+    #[test]
+    fn resolves_dashboard_columns_hides_pr_when_enrichment_disabled() {
+        let (columns, warnings) = resolve_dashboard_columns(
+            &["branch".into(), "pull_request".into(), "status".into()],
+            false,
+        );
+        assert_eq!(columns, vec!["branch", "status"]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn resolves_dashboard_columns_keeps_pr_when_enrichment_enabled() {
+        let (columns, warnings) = resolve_dashboard_columns(
+            &["branch".into(), "pull_request".into(), "status".into()],
+            true,
+        );
+        assert_eq!(columns, vec!["branch", "pull_request", "status"]);
+        assert!(warnings.is_empty());
     }
 }
