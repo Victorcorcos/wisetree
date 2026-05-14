@@ -182,6 +182,48 @@ impl PostCmdEditor {
         self.set_selection(next);
     }
 
+    pub fn move_selected_up(&mut self) {
+        if self.editing_index().is_some() {
+            return;
+        }
+        let PostCmdSelection::Rect(i) = self.selection else {
+            return;
+        };
+        if i == 0 {
+            return;
+        }
+        self.commands.swap(i, i - 1);
+        self.statuses.swap(i, i - 1);
+        self.statuses[i] = Self::mark_modified(self.statuses[i]);
+        self.statuses[i - 1] = Self::mark_modified(self.statuses[i - 1]);
+        self.set_selection(PostCmdSelection::Rect(i - 1));
+    }
+
+    pub fn move_selected_down(&mut self) {
+        if self.editing_index().is_some() {
+            return;
+        }
+        let PostCmdSelection::Rect(i) = self.selection else {
+            return;
+        };
+        if i + 1 >= self.commands.len() {
+            return;
+        }
+        self.commands.swap(i, i + 1);
+        self.statuses.swap(i, i + 1);
+        self.statuses[i] = Self::mark_modified(self.statuses[i]);
+        self.statuses[i + 1] = Self::mark_modified(self.statuses[i + 1]);
+        self.set_selection(PostCmdSelection::Rect(i + 1));
+    }
+
+    fn mark_modified(status: PostCmdRectStatus) -> PostCmdRectStatus {
+        if status == PostCmdRectStatus::MarkedForDeletion {
+            PostCmdRectStatus::MarkedForDeletion
+        } else {
+            PostCmdRectStatus::Modified
+        }
+    }
+
     fn toggle_buttons(&mut self) {
         let next = match self.selection {
             PostCmdSelection::Create => PostCmdSelection::Save,
@@ -682,6 +724,14 @@ impl SettingsScreen {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 editor.move_down();
+                SettingsAction::Continue
+            }
+            KeyCode::Char('K') => {
+                editor.move_selected_up();
+                SettingsAction::Continue
+            }
+            KeyCode::Char('J') => {
+                editor.move_selected_down();
                 SettingsAction::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
@@ -1665,9 +1715,9 @@ impl SettingsScreen {
         let hint = if editing_idx.is_some() {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else if is_scrollable {
-            "▲/▼ scroll commands • Enter to edit/Create/Save • Backspace toggles delete mark • ←→ between buttons • Esc to go back"
+            "▲/▼ scroll • Shift+K reorder up • Shift+J reorder down • Enter edit/Create/Save • Backspace toggles delete • ←→ between buttons • Esc back"
         } else {
-            "↑↓ to move • Enter to edit/Create/Save • Backspace toggles delete mark • ←→ between buttons • Esc to go back"
+            "↑↓ move • Shift+K reorder up • Shift+J reorder down • Enter edit/Create/Save • Backspace toggles delete • ←→ between buttons • Esc back"
         };
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[6]);
     }
