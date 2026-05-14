@@ -1264,6 +1264,9 @@ mod tests {
         // Unknown contexts are ignored; with no recognized contexts the
         // PR has no aggregated check status (so the dashboard renders a
         // plain "Opened" label).
-        assert_eq!(out.get("feat").unwrap().as_ref().unwrap().checks_status, None);
+        assert_eq!(
+            out.get("feat").unwrap().as_ref().unwrap().checks_status,
+            None
+        );
     }
 }

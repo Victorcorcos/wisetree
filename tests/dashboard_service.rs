@@ -80,8 +80,7 @@ fn service_with_isolated_cache(fixture: &Fixture) -> DashboardService {
         .parent()
         .unwrap()
         .join("dashboard_pr_cache.json");
-    DashboardService::new(fixture.repo.clone(), config_with_prs())
-        .with_cache_path(Some(cache))
+    DashboardService::new(fixture.repo.clone(), config_with_prs()).with_cache_path(Some(cache))
 }
 
 #[tokio::test]
@@ -420,7 +419,10 @@ async fn legacy_cache_without_checks_field_still_loads() {
 
     let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
         .with_cache_path(Some(cache));
-    service.snapshot().await.expect("snapshot must accept legacy cache");
+    service
+        .snapshot()
+        .await
+        .expect("snapshot must accept legacy cache");
 }
 
 #[tokio::test]

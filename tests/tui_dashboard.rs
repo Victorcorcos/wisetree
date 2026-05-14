@@ -97,12 +97,7 @@ fn row_with_pr_state(path: &str, branch: &str, is_clean: bool, state: PrState) -
     row
 }
 
-fn row_with_check(
-    path: &str,
-    branch: &str,
-    is_clean: bool,
-    checks: CheckStatus,
-) -> DashboardRow {
+fn row_with_check(path: &str, branch: &str, is_clean: bool, checks: CheckStatus) -> DashboardRow {
     let mut row = row_with_pr(path, branch, is_clean);
     if let Some(pr) = row.pull_request.as_mut() {
         pr.checks_status = Some(checks);
@@ -577,12 +572,21 @@ fn overflow_rows_show_more_above_and_below_indicators() {
 fn footer_includes_checks_legend_with_all_circles() {
     let mut screen = ready_screen(true);
     let dumped = dump(140, 22, |f| screen.render(f, f.area()));
-    assert!(dumped.contains("Checks:"), "expected Checks legend: {dumped}");
+    assert!(
+        dumped.contains("Checks:"),
+        "expected Checks legend: {dumped}"
+    );
     for label in ["Pending", "Running", "Passed", "Failed", "Errored"] {
-        assert!(dumped.contains(label), "missing {label} in legend: {dumped}");
+        assert!(
+            dumped.contains(label),
+            "missing {label} in legend: {dumped}"
+        );
     }
     for emoji in ["⚪", "🟡", "🟢", "🔴", "⚠"] {
-        assert!(dumped.contains(emoji), "missing {emoji} in legend: {dumped}");
+        assert!(
+            dumped.contains(emoji),
+            "missing {emoji} in legend: {dumped}"
+        );
     }
 }
 

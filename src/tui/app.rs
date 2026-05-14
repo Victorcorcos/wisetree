@@ -553,10 +553,7 @@ impl App {
                 kick_off_clipboard_copy(path, success_message, tx.clone());
             }
             DashboardAction::OpenPullRequest(url) => match open_url(&url) {
-                Ok(()) => self.show_toast(
-                    ToastVariant::Info,
-                    format!("Opened pull request {url}"),
-                ),
+                Ok(()) => self.show_toast(ToastVariant::Info, format!("Opened pull request {url}")),
                 Err(err) => self.show_toast(
                     ToastVariant::Error,
                     format!("Failed to open pull request: {err}"),

@@ -464,7 +464,9 @@ impl DashboardField {
         match self {
             DashboardField::RefreshIntervalMs => "5000..60000 (ms)",
             DashboardField::ShowPullRequests => "Press Enter to toggle",
-            DashboardField::Columns => "Comma-separated: branch, status, ahead_behind, last_commit, pull_request",
+            DashboardField::Columns => {
+                "Comma-separated: branch, status, ahead_behind, last_commit, pull_request"
+            }
         }
     }
 
@@ -866,8 +868,7 @@ impl SettingsScreen {
                     ));
                 }
                 if matches!(value, SettingsStep::Dashboard) {
-                    self.dashboard_editor =
-                        Some(DashboardEditor::new(&self.config.dashboard));
+                    self.dashboard_editor = Some(DashboardEditor::new(&self.config.dashboard));
                 }
                 if matches!(value, SettingsStep::CopySettings) {
                     self.copy_settings_select = Some(self.build_copy_settings_select());
