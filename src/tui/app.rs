@@ -52,6 +52,9 @@ use crate::worktree::service::DeleteOutcome as ServiceDeleteOutcome;
 use crate::worktree::WorktreeService;
 use crate::VERSION;
 
+const SETTINGS_PATH_COPIED_MESSAGE: &str =
+    "Setting file copied to Clipboard, edit it with your favorite editor!";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitPhase {
     Loading,
@@ -694,6 +697,14 @@ impl App {
         match action {
             SettingsAction::Continue => {}
             SettingsAction::Back => self.back_to_menu(),
+            SettingsAction::CopySettingsFilePath => {
+                let path = self.settings_edit_file_path().display().to_string();
+                kick_off_clipboard_copy(
+                    path,
+                    SETTINGS_PATH_COPIED_MESSAGE.to_string(),
+                    tx.clone(),
+                );
+            }
             SettingsAction::CheckUpdates => {
                 if let Some(settings) = self.settings.as_mut() {
                     settings.start_checking_updates();
@@ -1161,6 +1172,12 @@ impl App {
 
     fn local_config_path_str(&self) -> Option<String> {
         self.local_config_path().map(|p| p.display().to_string())
+    }
+
+    fn settings_edit_file_path(&self) -> PathBuf {
+        self.local_config_path()
+            .filter(|path| path.exists())
+            .unwrap_or_else(global_config_file)
     }
 
     fn save_post_create_commands(&mut self, commands: Vec<String>) -> Result<(), String> {
@@ -1823,7 +1840,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..5 {
+            for _ in 0..3 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -1892,7 +1909,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..5 {
+            for _ in 0..3 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -1973,7 +1990,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..5 {
+            for _ in 0..3 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -1994,6 +2011,44 @@ mod tests {
                     .config()
                     .delete_branch_with_worktree
             );
+        });
+    }
+
+    #[test]
+    fn settings_edit_file_path_prefers_global_when_local_config_is_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.git_root = Some(repo_root.display().to_string());
+
+            assert_eq!(
+                app.settings_edit_file_path(),
+                home.path().join(".wisetree").join("settings.json")
+            );
+            assert_eq!(
+                SETTINGS_PATH_COPIED_MESSAGE,
+                "Setting file copied to Clipboard, edit it with your favorite editor!"
+            );
+        });
+    }
+
+    #[test]
+    fn settings_edit_file_path_prefers_local_when_local_config_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            fs::write(&local_path, "{}\n").unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.git_root = Some(repo_root.display().to_string());
+
+            assert_eq!(app.settings_edit_file_path(), local_path);
         });
     }
 
@@ -2026,7 +2081,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..6 {
+            for _ in 0..5 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -2086,7 +2141,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..6 {
+            for _ in 0..5 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);

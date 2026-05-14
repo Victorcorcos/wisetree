@@ -168,6 +168,9 @@ fn esc_on_menu_returns_back() {
 #[test]
 fn selecting_copy_patterns_shows_detail_view() {
     let mut s = ready();
+    for _ in 0..6 {
+        s.handle_key(key(KeyCode::Down));
+    }
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::CopyPatterns);
     let dumped = dump(80, 12, |f| s.render(f, f.area()));
@@ -195,6 +198,9 @@ fn copy_patterns_view_grows_to_show_every_pattern() {
         &["**/node_modules/**"],
     );
 
+    for _ in 0..6 {
+        s.handle_key(key(KeyCode::Down));
+    }
     s.handle_key(key(KeyCode::Enter));
 
     let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
@@ -206,17 +212,26 @@ fn copy_patterns_view_grows_to_show_every_pattern() {
 fn copy_patterns_footer_renders_after_blank_line() {
     let mut s = ready_with_patterns(&["docker/.env-backuper"], &["**/node_modules/**"]);
 
+    for _ in 0..6 {
+        s.handle_key(key(KeyCode::Down));
+    }
     s.handle_key(key(KeyCode::Enter));
 
     let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
     let (_, item_y) = find_text_start(&buffer, "docker/.env-backuper").unwrap();
-    let (_, footer_y) = find_text_start(
+    let (_, edit_y) = find_text_start(
         &buffer,
-        "Edit in /tmp/.wisetree.json (local). Press any key to go back.",
+        "Edit in /tmp/.wisetree.json (local).",
+    )
+    .unwrap();
+    let (_, hint_y) = find_text_start(
+        &buffer,
+        "Press Enter to copy the path, any other key to go back.",
     )
     .unwrap();
 
-    assert_eq!(footer_y, item_y + 2);
+    assert_eq!(edit_y, item_y + 2);
+    assert_eq!(hint_y, item_y + 3);
 }
 
 #[test]
@@ -239,7 +254,9 @@ fn ignore_patterns_view_grows_to_show_every_pattern() {
         ],
     );
 
-    s.handle_key(key(KeyCode::Down));
+    for _ in 0..7 {
+        s.handle_key(key(KeyCode::Down));
+    }
     s.handle_key(key(KeyCode::Enter));
 
     let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
@@ -251,23 +268,34 @@ fn ignore_patterns_view_grows_to_show_every_pattern() {
 fn ignore_patterns_footer_renders_after_blank_line() {
     let mut s = ready_with_patterns(&[".env*"], &["storage/**"]);
 
-    s.handle_key(key(KeyCode::Down));
+    for _ in 0..7 {
+        s.handle_key(key(KeyCode::Down));
+    }
     s.handle_key(key(KeyCode::Enter));
 
     let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
     let (_, item_y) = find_text_start(&buffer, "storage/**").unwrap();
-    let (_, footer_y) = find_text_start(
+    let (_, edit_y) = find_text_start(
         &buffer,
-        "Edit in /tmp/.wisetree.json (local). Press any key to go back.",
+        "Edit in /tmp/.wisetree.json (local).",
+    )
+    .unwrap();
+    let (_, hint_y) = find_text_start(
+        &buffer,
+        "Press Enter to copy the path, any other key to go back.",
     )
     .unwrap();
 
-    assert_eq!(footer_y, item_y + 2);
+    assert_eq!(edit_y, item_y + 2);
+    assert_eq!(hint_y, item_y + 3);
 }
 
 #[test]
 fn any_key_in_detail_returns_to_menu() {
     let mut s = ready();
+    for _ in 0..6 {
+        s.handle_key(key(KeyCode::Down));
+    }
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::CopyPatterns);
     let action = s.handle_key(key(KeyCode::Char('x')));
@@ -276,9 +304,35 @@ fn any_key_in_detail_returns_to_menu() {
 }
 
 #[test]
+fn enter_on_copy_patterns_emits_copy_settings_file_path_action() {
+    let mut s = ready();
+    for _ in 0..6 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::CopySettingsFilePath);
+    assert_eq!(s.step(), SettingsStep::CopyPatterns);
+}
+
+#[test]
+fn enter_on_ignore_patterns_emits_copy_settings_file_path_action() {
+    let mut s = ready();
+    for _ in 0..7 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::CopySettingsFilePath);
+    assert_eq!(s.step(), SettingsStep::IgnorePatterns);
+}
+
+#[test]
 fn delete_branch_setting_renders_yes_no_toggle() {
     let mut s = ready();
-    for _ in 0..5 {
+    for _ in 0..3 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -294,7 +348,7 @@ fn delete_branch_setting_renders_yes_no_toggle() {
 #[test]
 fn delete_branch_setting_emits_true_when_yes_selected() {
     let mut s = ready();
-    for _ in 0..5 {
+    for _ in 0..3 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -306,7 +360,7 @@ fn delete_branch_setting_emits_true_when_yes_selected() {
 #[test]
 fn delete_branch_setting_emits_false_when_no_selected() {
     let mut s = ready();
-    for _ in 0..5 {
+    for _ in 0..3 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -319,8 +373,8 @@ fn delete_branch_setting_emits_false_when_no_selected() {
 #[test]
 fn select_check_updates_emits_action() {
     let mut s = ready();
-    // Navigate to last entry "Check for Updates" — 7 downs from the first.
-    for _ in 0..7 {
+    // Navigate to last entry "Check for Updates" — 8 downs from the first.
+    for _ in 0..8 {
         s.handle_key(key(KeyCode::Down));
     }
     let action = s.handle_key(key(KeyCode::Enter));
@@ -331,7 +385,7 @@ fn select_check_updates_emits_action() {
 #[test]
 fn selecting_copy_settings_shows_copy_directions() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..5 {
         s.handle_key(key(KeyCode::Down));
     }
 
@@ -346,7 +400,7 @@ fn selecting_copy_settings_shows_copy_directions() {
 #[test]
 fn copy_settings_default_selection_emits_global_to_local() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..5 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -361,7 +415,7 @@ fn copy_settings_default_selection_emits_global_to_local() {
 #[test]
 fn copy_settings_second_selection_emits_local_to_global() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..5 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -377,7 +431,7 @@ fn copy_settings_second_selection_emits_local_to_global() {
 #[test]
 fn check_updates_loading_renders_spinner_message() {
     let mut s = ready();
-    for _ in 0..7 {
+    for _ in 0..8 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -389,7 +443,7 @@ fn check_updates_loading_renders_spinner_message() {
 #[test]
 fn check_updates_with_new_version_shows_install_command() {
     let mut s = ready();
-    for _ in 0..7 {
+    for _ in 0..8 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -410,7 +464,7 @@ fn check_updates_with_new_version_shows_install_command() {
 #[test]
 fn check_updates_up_to_date_message() {
     let mut s = ready();
-    for _ in 0..7 {
+    for _ in 0..8 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -429,7 +483,7 @@ fn check_updates_up_to_date_message() {
 #[test]
 fn check_updates_error_shows_failure_message() {
     let mut s = ready();
-    for _ in 0..7 {
+    for _ in 0..8 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -445,8 +499,8 @@ fn check_updates_error_shows_failure_message() {
 }
 
 fn enter_post_cmd(s: &mut SettingsScreen) {
-    // Menu order: Copy(0), Ignore(1), Path(2), PostCmd(3).
-    for _ in 0..3 {
+    // Menu order: Dashboard(0), TerminalCmd(1), PostCmd(2).
+    for _ in 0..2 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -936,8 +990,8 @@ fn post_cmd_hint_contains_shift_k_j_reorder() {
 }
 
 fn enter_terminal_cmd(s: &mut SettingsScreen) {
-    // Menu order: Copy(0), Ignore(1), Path(2), PostCmd(3), TerminalCmd(4).
-    for _ in 0..4 {
+    // Menu order: Dashboard(0), TerminalCmd(1).
+    for _ in 0..1 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -1131,8 +1185,8 @@ fn terminal_cmd_selected_rectangle_shows_orange_marker_and_keeps_status_border()
 }
 
 fn enter_path_template(s: &mut SettingsScreen) {
-    // Menu order: Copy(0), Ignore(1), Path(2).
-    for _ in 0..2 {
+    // Menu order: Dashboard(0), TerminalCmd(1), PostCmd(2), DeleteBranch(3), Path(4).
+    for _ in 0..4 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));

@@ -58,6 +58,7 @@ pub enum CopyDirection {
 pub enum SettingsAction {
     Continue,
     Back,
+    CopySettingsFilePath,
     CheckUpdates,
     SetDeleteBranchWithWorktree(bool),
     Reset,
@@ -758,16 +759,11 @@ impl SettingsScreen {
 
     fn build_menu(&self) -> SelectPrompt<SettingsStep> {
         let opts: Vec<SelectOption<SettingsStep>> = vec![
-            SelectOption::new("Copy Patterns", SettingsStep::CopyPatterns).with_description(
-                format!("{} patterns", self.config.worktree_copy_patterns.len()),
-            ),
-            SelectOption::new("Ignore Patterns", SettingsStep::IgnorePatterns).with_description(
-                format!("{} patterns", self.config.worktree_copy_ignores.len()),
-            ),
-            SelectOption::new("Path Template", SettingsStep::PathTemplate)
-                .with_description(self.config.worktree_path_template.clone()),
-            SelectOption::new("Post-Create Commands", SettingsStep::PostCmd)
-                .with_description(format!("{} commands", self.config.post_create_cmd.len())),
+            SelectOption::new("Dashboard", SettingsStep::Dashboard).with_description(format!(
+                "{}ms refresh, {} columns",
+                self.config.dashboard.refresh_interval_ms,
+                self.config.dashboard.columns.len()
+            )),
             SelectOption::new("Terminal Command", SettingsStep::TerminalCmd).with_description(
                 if self.config.terminal_command.is_empty() {
                     "(none)".to_string()
@@ -775,21 +771,26 @@ impl SettingsScreen {
                     self.config.terminal_command.clone()
                 },
             ),
+            SelectOption::new("Post-Create Commands", SettingsStep::PostCmd)
+                .with_description(format!("{} commands", self.config.post_create_cmd.len())),
             SelectOption::new("Delete Branch with Worktree", SettingsStep::DeleteBranch)
                 .with_description(if self.config.delete_branch_with_worktree {
                     "enabled"
                 } else {
                     "disabled"
                 }),
+            SelectOption::new("Path Template", SettingsStep::PathTemplate)
+                .with_description(self.config.worktree_path_template.clone()),
             SelectOption::new("Copy Settings", SettingsStep::CopySettings)
                 .with_description("Sync global and local config"),
+            SelectOption::new("Copy Patterns", SettingsStep::CopyPatterns).with_description(
+                format!("{} patterns", self.config.worktree_copy_patterns.len()),
+            ),
+            SelectOption::new("Ignore Patterns", SettingsStep::IgnorePatterns).with_description(
+                format!("{} patterns", self.config.worktree_copy_ignores.len()),
+            ),
             SelectOption::new(UPDATE_CHECK_MENU, SettingsStep::CheckUpdates)
                 .with_description("Check npm for latest version"),
-            SelectOption::new("Dashboard", SettingsStep::Dashboard).with_description(format!(
-                "{}ms refresh, {} columns",
-                self.config.dashboard.refresh_interval_ms,
-                self.config.dashboard.columns.len()
-            )),
         ];
         SelectPrompt::new("Select setting to view:", opts).with_footer_spacer()
     }
@@ -820,6 +821,9 @@ impl SettingsScreen {
         }
         match self.step {
             SettingsStep::Menu => self.handle_menu(key),
+            SettingsStep::CopyPatterns | SettingsStep::IgnorePatterns => {
+                self.handle_copyable_detail(key)
+            }
             SettingsStep::DeleteBranch => self.handle_delete_branch(key),
             SettingsStep::CopySettings => self.handle_copy_settings(key),
             SettingsStep::CheckUpdates => self.handle_check_updates(key),
@@ -827,16 +831,6 @@ impl SettingsScreen {
             SettingsStep::TerminalCmd => self.handle_terminal_cmd(key),
             SettingsStep::PathTemplate => self.handle_path_template(key),
             SettingsStep::Dashboard => self.handle_dashboard(key),
-            _ => match key.code {
-                KeyCode::Esc => {
-                    self.step = SettingsStep::Menu;
-                    SettingsAction::Continue
-                }
-                _ => {
-                    self.step = SettingsStep::Menu;
-                    SettingsAction::Continue
-                }
-            },
         }
     }
 
@@ -897,6 +891,16 @@ impl SettingsScreen {
                 SettingsAction::Continue
             }
             SelectOutcome::Pending => SettingsAction::Continue,
+        }
+    }
+
+    fn handle_copyable_detail(&mut self, key: KeyEvent) -> SettingsAction {
+        match key.code {
+            KeyCode::Enter => SettingsAction::CopySettingsFilePath,
+            _ => {
+                self.step = SettingsStep::Menu;
+                SettingsAction::Continue
+            }
         }
     }
 
@@ -1526,7 +1530,7 @@ impl SettingsScreen {
     }
 
     fn field_preferred_height(&self, item_count: usize, spacer_before_footer: bool) -> u16 {
-        let footer_lines = if spacer_before_footer { 2 } else { 1 };
+        let footer_lines = if spacer_before_footer { 3 } else { 2 };
         item_count.saturating_add(2 + footer_lines).max(12usize) as u16
     }
 
@@ -1657,15 +1661,22 @@ impl SettingsScreen {
             vec![
                 Line::default(),
                 Line::from(branded_line(
-                    &format!("Edit in {}. Press any key to go back.", source_label),
+                    &format!("Edit in {}.", source_label),
+                    dim_muted_style,
+                )),
+                Line::from(branded_line(
+                    "Press Enter to copy the path, any other key to go back.",
                     dim_muted_style,
                 )),
             ]
         } else {
-            vec![Line::from(branded_line(
-                &format!("Edit in {}. Press any key to go back.", source_label),
-                dim_muted_style,
-            ))]
+            vec![
+                Line::from(branded_line(&format!("Edit in {}.", source_label), dim_muted_style)),
+                Line::from(branded_line(
+                    "Press Enter to copy the path, any other key to go back.",
+                    dim_muted_style,
+                )),
+            ]
         };
         let lines: Vec<Line> = std::iter::once(Line::from(branded_line(title, title_style)))
             .chain(std::iter::once(Line::from(branded_line(hint, muted_style))))
