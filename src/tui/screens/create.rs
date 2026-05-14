@@ -24,7 +24,9 @@ use crate::tui::widgets::{
     ConfirmVariant, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status,
     StatusIndicator,
 };
-use crate::utils::validation::{validate_branch_name, validate_directory_name};
+use crate::utils::validation::{
+    normalize_branch_name, validate_branch_name, validate_directory_name,
+};
 
 const CUSTOM_REF_VALUE: &str = "__CUSTOM_REF__";
 
@@ -235,14 +237,14 @@ impl CreateScreen {
     }
 
     fn validate_new_branch(branches: Arc<Vec<GitBranch>>, name: &str) -> Option<String> {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
+        let normalized = normalize_branch_name(name);
+        if normalized.is_empty() {
             return None;
         }
-        if let Some(e) = validate_branch_name(trimmed) {
+        if let Some(e) = validate_branch_name(&normalized) {
             return Some(e.to_string());
         }
-        if branches.iter().any(|b| b.name == trimmed && !b.is_remote) {
+        if branches.iter().any(|b| b.name == normalized && !b.is_remote) {
             return Some("Branch already exists".to_string());
         }
         None
@@ -349,8 +351,8 @@ impl CreateScreen {
         let prompt = self.new_branch_input.as_mut().expect("set above");
         match prompt.handle_key(key) {
             InputOutcome::Submitted(value) => {
-                let trimmed = value.trim().to_string();
-                if trimmed.is_empty() {
+                let normalized = normalize_branch_name(&value);
+                if normalized.is_empty() {
                     let derived = self
                         .branches
                         .iter()
@@ -362,9 +364,9 @@ impl CreateScreen {
                                 .unwrap_or_else(|| b.name.clone())
                         })
                         .unwrap_or_else(|| self.source_branch.clone());
-                    self.new_branch = derived;
+                    self.new_branch = normalize_branch_name(&derived);
                 } else {
-                    self.new_branch = trimmed;
+                    self.new_branch = normalized;
                 }
                 self.new_branch_input = None;
                 self.confirm_dialog = Some(self.build_confirm());
