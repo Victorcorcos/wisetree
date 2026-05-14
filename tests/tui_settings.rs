@@ -815,6 +815,126 @@ fn post_cmd_backspace_toggles_delete_mark() {
     assert_eq!(editor.statuses, vec![PostCmdRectStatus::MarkedForDeletion]);
 }
 
+#[test]
+fn post_cmd_shift_k_swaps_selected_with_above() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    // Navigate to Rect(2)
+    s.handle_key(key(KeyCode::Up)); // Rect(2)
+    s.handle_key(key(KeyCode::Up)); // Rect(1)
+    s.handle_key(key(KeyCode::Up)); // Rect(0)
+    s.handle_key(key(KeyCode::Down)); // Rect(1)
+    s.handle_key(key(KeyCode::Down)); // Rect(2)
+
+    s.handle_key(key(KeyCode::Char('K')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["A", "C", "B"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(1));
+    assert_eq!(editor.statuses[1], PostCmdRectStatus::Modified);
+    assert_eq!(editor.statuses[2], PostCmdRectStatus::Modified);
+}
+
+#[test]
+fn post_cmd_shift_j_swaps_selected_with_below() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    // Navigate to Rect(0)
+    s.handle_key(key(KeyCode::Up)); // Rect(2)
+    s.handle_key(key(KeyCode::Up)); // Rect(1)
+    s.handle_key(key(KeyCode::Up)); // Rect(0)
+
+    s.handle_key(key(KeyCode::Char('J')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["B", "A", "C"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(1));
+    assert_eq!(editor.statuses[1], PostCmdRectStatus::Modified);
+    assert_eq!(editor.statuses[0], PostCmdRectStatus::Modified);
+}
+
+#[test]
+fn post_cmd_shift_k_on_first_rect_is_noop() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    s.handle_key(key(KeyCode::Up)); // Rect(2)
+    s.handle_key(key(KeyCode::Up)); // Rect(1)
+    s.handle_key(key(KeyCode::Up)); // Rect(0)
+
+    s.handle_key(key(KeyCode::Char('K')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["A", "B", "C"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(0));
+}
+
+#[test]
+fn post_cmd_shift_j_on_last_rect_is_noop() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    s.handle_key(key(KeyCode::Up)); // Rect(2)
+
+    s.handle_key(key(KeyCode::Char('J')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["A", "B", "C"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(2));
+}
+
+#[test]
+fn post_cmd_shift_k_on_create_selection_is_noop() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    assert_eq!(
+        s.post_cmd_editor().unwrap().selection,
+        PostCmdSelection::Create
+    );
+
+    s.handle_key(key(KeyCode::Char('K')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["A", "B", "C"]);
+    assert_eq!(editor.selection, PostCmdSelection::Create);
+}
+
+#[test]
+fn post_cmd_shift_swap_preserves_marked_for_deletion_status() {
+    let mut s = ready_with_commands(&["A", "B"]);
+    enter_post_cmd(&mut s);
+    // Navigate to Rect(0) and mark for deletion
+    s.handle_key(key(KeyCode::Up)); // Rect(1)
+    s.handle_key(key(KeyCode::Up)); // Rect(0)
+    s.handle_key(key(KeyCode::Backspace)); // mark Rect(0) as MarkedForDeletion
+
+    s.handle_key(key(KeyCode::Char('J')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["B", "A"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(1));
+    assert_eq!(editor.statuses[1], PostCmdRectStatus::MarkedForDeletion);
+    assert_eq!(editor.statuses[0], PostCmdRectStatus::Modified);
+}
+
+#[test]
+fn post_cmd_hint_contains_shift_k_j_reorder() {
+    let mut s = ready_with_commands(&["A", "B"]);
+    enter_post_cmd(&mut s);
+
+    let dumped = dump(160, 16, |f| s.render(f, f.area()));
+    assert!(
+        dumped.contains("Shift+K"),
+        "hint should mention Shift+K: {dumped}"
+    );
+    assert!(
+        dumped.contains("Shift+J"),
+        "hint should mention Shift+J: {dumped}"
+    );
+    assert!(
+        dumped.contains("reorder"),
+        "hint should mention reorder: {dumped}"
+    );
+}
+
 fn enter_terminal_cmd(s: &mut SettingsScreen) {
     // Menu order: Copy(0), Ignore(1), Path(2), PostCmd(3), TerminalCmd(4).
     for _ in 0..4 {
