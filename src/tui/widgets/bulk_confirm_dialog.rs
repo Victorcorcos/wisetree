@@ -253,6 +253,7 @@ impl BulkConfirmDialog {
     /// Total inner-panel rows the dialog needs:
     ///   title(1) + blank(1) + prompt(1) + blank(1) + N rows + blank(1)
     ///   + warning(1) + buttons(3) + hint(1) = 10 + items.
+    ///
     /// Undersizing this caused ratatui's layout solver to squeeze the
     /// first/last item rows down to zero height, hiding their cursor.
     pub fn preferred_content_height(&self) -> u16 {
