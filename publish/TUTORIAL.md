@@ -109,6 +109,15 @@ cargo dist plan                   # prints the artifacts the next tag will produ
 The pinned version must match `cargo-dist-version` in `Cargo.toml` and the
 installer URL in `.github/workflows/release.yml` (both currently `0.23.0`).
 
+> ⚠️ **The release workflow is hand-edited.** cargo-dist 0.23.0's
+> template emits `runs-on: ubuntu-20.04`, which GitHub Actions retired
+> in 2025 — release jobs queue forever on that label. We pinned
+> `ubuntu-22.04` in `.github/workflows/release.yml` and set
+> `allow-dirty = ["ci"]` in `[workspace.metadata.dist]` so `cargo dist
+> plan` accepts the manual edit. If you ever re-run `cargo dist init`
+> or `cargo dist generate`, **re-apply the ubuntu pin** before pushing:
+> `sed -i'' -e 's/ubuntu-20\.04/ubuntu-22.04/g' .github/workflows/release.yml`.
+
 The output should list five targets:
 `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`,
