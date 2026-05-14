@@ -7,8 +7,9 @@ pub mod update;
 
 pub use app_state::AppStateService;
 pub use dashboard::{
-    default_dashboard_warning, resolve_dashboard_columns, CommitSummary, DashboardNotice,
-    DashboardNoticeLevel, DashboardRow, DashboardService, DashboardWatch, PrState, PullRequest,
+    default_dashboard_warning, resolve_dashboard_columns, CheckStatus, CommitSummary,
+    DashboardNotice, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardWatch, PrState,
+    PullRequest,
 };
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,

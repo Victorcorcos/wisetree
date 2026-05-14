@@ -46,12 +46,31 @@ pub enum PrState {
     Draft,
 }
 
+/// Aggregated CI status for the PR's most recent commit. Populated from the
+/// GitHub Checks API and the legacy commit-status API so providers like
+/// Drone CI (status contexts) and GitHub Actions (check runs) both feed the
+/// same field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckStatus {
+    Pending,
+    Running,
+    Passed,
+    Failed,
+    Errored,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
     pub state: PrState,
     pub url: String,
     pub title: String,
+    #[serde(
+        rename = "checksStatus",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub checks_status: Option<CheckStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,7 +798,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -807,31 +826,6 @@ fn parse_graphql_response(
     body: &str,
     branches: &[&str],
 ) -> std::result::Result<HashMap<String, Option<PullRequest>>, String> {
-    #[derive(Deserialize)]
-    struct GhNode {
-        number: u64,
-        state: String,
-        url: String,
-        title: String,
-        #[serde(rename = "isDraft")]
-        is_draft: bool,
-    }
-    #[derive(Deserialize)]
-    struct GhConnection {
-        nodes: Vec<GhNode>,
-    }
-    #[derive(Deserialize)]
-    struct GhError {
-        message: String,
-    }
-    #[derive(Deserialize)]
-    struct GhEnvelope {
-        #[serde(default)]
-        data: Option<serde_json::Value>,
-        #[serde(default)]
-        errors: Option<Vec<GhError>>,
-    }
-
     let envelope: GhEnvelope =
         serde_json::from_str(body).map_err(|err| format!("invalid gh response: {err}"))?;
 
@@ -869,16 +863,155 @@ fn parse_graphql_response(
                         _ => PrState::Closed,
                     }
                 };
+                let checks_status = node
+                    .commits
+                    .nodes
+                    .into_iter()
+                    .next()
+                    .and_then(|c| c.commit)
+                    .and_then(|c| c.status_check_rollup)
+                    .and_then(|r| aggregate_checks(&r.contexts.nodes));
                 PullRequest {
                     number: node.number,
                     state,
                     url: node.url,
                     title: node.title,
+                    checks_status,
                 }
             });
         out.insert((*branch).to_string(), pr);
     }
     Ok(out)
+}
+
+#[derive(Deserialize)]
+struct GhContextNode {
+    #[serde(rename = "__typename", default)]
+    typename: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+#[derive(Deserialize, Default)]
+struct GhContexts {
+    #[serde(default)]
+    nodes: Vec<GhContextNode>,
+}
+#[derive(Deserialize)]
+struct GhStatusCheckRollup {
+    #[serde(default)]
+    contexts: GhContexts,
+}
+#[derive(Deserialize)]
+struct GhCommit {
+    #[serde(rename = "statusCheckRollup", default)]
+    status_check_rollup: Option<GhStatusCheckRollup>,
+}
+#[derive(Deserialize)]
+struct GhCommitWrapper {
+    #[serde(default)]
+    commit: Option<GhCommit>,
+}
+#[derive(Deserialize, Default)]
+struct GhCommits {
+    #[serde(default)]
+    nodes: Vec<GhCommitWrapper>,
+}
+#[derive(Deserialize)]
+struct GhNode {
+    number: u64,
+    state: String,
+    url: String,
+    title: String,
+    #[serde(rename = "isDraft")]
+    is_draft: bool,
+    #[serde(default)]
+    commits: GhCommits,
+}
+#[derive(Deserialize)]
+struct GhConnection {
+    nodes: Vec<GhNode>,
+}
+#[derive(Deserialize)]
+struct GhError {
+    message: String,
+}
+#[derive(Deserialize)]
+struct GhEnvelope {
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+    #[serde(default)]
+    errors: Option<Vec<GhError>>,
+}
+
+/// Aggregate raw check-run + status-context nodes into a single
+/// [`CheckStatus`]. Returns `None` when no contexts are present so the
+/// dashboard can render a plain "Opened" label without a circle.
+///
+/// Precedence (worst-case wins):
+/// `Failed` > `Errored` > `Running` > `Pending` > `Passed`.
+fn aggregate_checks(contexts: &[GhContextNode]) -> Option<CheckStatus> {
+    if contexts.is_empty() {
+        return None;
+    }
+    let mut acc: Option<CheckStatus> = None;
+    for ctx in contexts {
+        let candidate = match ctx.typename.as_str() {
+            "CheckRun" => {
+                let status = ctx.status.as_deref().unwrap_or("").to_ascii_uppercase();
+                let conclusion = ctx.conclusion.as_deref().unwrap_or("").to_ascii_uppercase();
+                match status.as_str() {
+                    "QUEUED" | "WAITING" | "PENDING" | "REQUESTED" => Some(CheckStatus::Pending),
+                    "IN_PROGRESS" => Some(CheckStatus::Running),
+                    "COMPLETED" => match conclusion.as_str() {
+                        "SUCCESS" | "NEUTRAL" | "SKIPPED" | "STALE" => Some(CheckStatus::Passed),
+                        "FAILURE" => Some(CheckStatus::Failed),
+                        "ACTION_REQUIRED" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" => {
+                            Some(CheckStatus::Errored)
+                        }
+                        "" => None,
+                        _ => Some(CheckStatus::Errored),
+                    },
+                    _ => None,
+                }
+            }
+            "StatusContext" => {
+                let state = ctx.state.as_deref().unwrap_or("").to_ascii_uppercase();
+                match state.as_str() {
+                    "EXPECTED" => Some(CheckStatus::Pending),
+                    "PENDING" => Some(CheckStatus::Running),
+                    "SUCCESS" => Some(CheckStatus::Passed),
+                    "FAILURE" => Some(CheckStatus::Failed),
+                    "ERROR" => Some(CheckStatus::Errored),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            let beats = match acc {
+                None => true,
+                Some(existing) => check_priority(candidate) > check_priority(existing),
+            };
+            if beats {
+                acc = Some(candidate);
+            }
+        }
+    }
+    acc
+}
+
+fn check_priority(status: CheckStatus) -> u8 {
+    match status {
+        CheckStatus::Passed => 0,
+        CheckStatus::Pending => 1,
+        CheckStatus::Running => 2,
+        CheckStatus::Errored => 3,
+        CheckStatus::Failed => 4,
+    }
 }
 
 /// Parse `git diff --shortstat` output and return `(insertions, deletions)`.
@@ -1016,6 +1149,19 @@ mod tests {
     }
 
     #[test]
+    fn graphql_query_includes_status_check_rollup_for_each_branch() {
+        let q = build_graphql_query("owner", "repo", &["feat"]);
+        assert!(
+            q.contains("statusCheckRollup"),
+            "query must request statusCheckRollup so the dashboard can colour the Opened circle: {q}"
+        );
+        assert!(q.contains("commits(last: 1)"));
+        assert!(q.contains("__typename"));
+        assert!(q.contains("CheckRun"));
+        assert!(q.contains("StatusContext"));
+    }
+
+    #[test]
     fn parses_graphql_response_into_branch_map() {
         let body = r#"{
           "data": {
@@ -1035,6 +1181,174 @@ mod tests {
         let body = r#"{"errors":[{"message":"API rate limit exceeded"}]}"#;
         let err = parse_graphql_response(body, &["feat"]).unwrap_err();
         assert!(is_rate_limit_error(&err));
+    }
+
+    fn check_run(status: &str, conclusion: &str) -> GhContextNode {
+        GhContextNode {
+            typename: "CheckRun".to_string(),
+            status: Some(status.to_string()),
+            conclusion: Some(conclusion.to_string()),
+            state: None,
+        }
+    }
+
+    fn status_context(state: &str) -> GhContextNode {
+        GhContextNode {
+            typename: "StatusContext".to_string(),
+            status: None,
+            conclusion: None,
+            state: Some(state.to_string()),
+        }
+    }
+
+    #[test]
+    fn empty_contexts_yield_no_check_status() {
+        assert_eq!(aggregate_checks(&[]), None);
+    }
+
+    #[test]
+    fn running_beats_passed_in_aggregation() {
+        let nodes = vec![
+            check_run("IN_PROGRESS", ""),
+            check_run("COMPLETED", "SUCCESS"),
+        ];
+        assert_eq!(aggregate_checks(&nodes), Some(CheckStatus::Running));
+    }
+
+    #[test]
+    fn failed_beats_running_in_aggregation() {
+        let nodes = vec![
+            check_run("IN_PROGRESS", ""),
+            check_run("COMPLETED", "FAILURE"),
+        ];
+        assert_eq!(aggregate_checks(&nodes), Some(CheckStatus::Failed));
+    }
+
+    #[test]
+    fn errored_beats_running_but_loses_to_failed() {
+        let mixed = vec![
+            check_run("IN_PROGRESS", ""),
+            check_run("COMPLETED", "TIMED_OUT"),
+        ];
+        assert_eq!(aggregate_checks(&mixed), Some(CheckStatus::Errored));
+
+        let with_failure = vec![
+            check_run("COMPLETED", "TIMED_OUT"),
+            check_run("COMPLETED", "FAILURE"),
+        ];
+        assert_eq!(aggregate_checks(&with_failure), Some(CheckStatus::Failed));
+    }
+
+    #[test]
+    fn errored_conclusions_cover_drone_failure_modes() {
+        for conclusion in [
+            "ACTION_REQUIRED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "STARTUP_FAILURE",
+        ] {
+            assert_eq!(
+                aggregate_checks(&[check_run("COMPLETED", conclusion)]),
+                Some(CheckStatus::Errored),
+                "{conclusion} should be Errored"
+            );
+        }
+    }
+
+    #[test]
+    fn status_context_states_map_to_check_statuses() {
+        // Drone CI / legacy status API contributes StatusContext nodes.
+        assert_eq!(
+            aggregate_checks(&[status_context("EXPECTED")]),
+            Some(CheckStatus::Pending)
+        );
+        assert_eq!(
+            aggregate_checks(&[status_context("PENDING")]),
+            Some(CheckStatus::Running)
+        );
+        assert_eq!(
+            aggregate_checks(&[status_context("SUCCESS")]),
+            Some(CheckStatus::Passed)
+        );
+        assert_eq!(
+            aggregate_checks(&[status_context("FAILURE")]),
+            Some(CheckStatus::Failed)
+        );
+        assert_eq!(
+            aggregate_checks(&[status_context("ERROR")]),
+            Some(CheckStatus::Errored)
+        );
+    }
+
+    #[test]
+    fn parses_graphql_response_with_check_status() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 9,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false,
+                "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
+                  {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": null}
+                ]}}}}]}
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.checks_status, Some(CheckStatus::Running));
+    }
+
+    #[test]
+    fn parses_graphql_response_without_checks_keeps_status_none() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 1,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.checks_status, None);
+    }
+
+    #[test]
+    fn parses_graphql_response_with_unknown_typename_does_not_panic() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 1,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false,
+                "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
+                  {"__typename": "FuturisticThing"}
+                ]}}}}]}
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        // Unknown contexts are ignored; with no recognized contexts the
+        // PR has no aggregated check status (so the dashboard renders a
+        // plain "Opened" label).
+        assert_eq!(
+            out.get("feat").unwrap().as_ref().unwrap().checks_status,
+            None
+        );
     }
 
     #[test]

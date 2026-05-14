@@ -18,11 +18,11 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::cli::AppMode;
-use crate::config::schema::WorktreeConfig;
+use crate::config::schema::{DashboardConfig, WorktreeConfig};
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
-use crate::files::service::open_terminal;
+use crate::files::service::{open_terminal, open_url};
 use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
@@ -552,6 +552,13 @@ impl App {
                 let success_message = format!("Copied {} to clipboard.", fold_path(&path));
                 kick_off_clipboard_copy(path, success_message, tx.clone());
             }
+            DashboardAction::OpenPullRequest(url) => match open_url(&url) {
+                Ok(()) => self.show_toast(ToastVariant::Info, format!("Opened pull request {url}")),
+                Err(err) => self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to open pull request: {err}"),
+                ),
+            },
         }
     }
 
@@ -732,6 +739,13 @@ impl App {
                 if let Err(err) = self.save_path_template(template) {
                     if let Some(settings) = self.settings.as_mut() {
                         settings.set_error(format!("Failed to save path template: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveDashboard(dashboard) => {
+                if let Err(err) = self.save_dashboard(dashboard) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save dashboard settings: {err}"));
                     }
                 }
             }
@@ -1248,6 +1262,42 @@ impl App {
 
         if let Some(settings) = self.settings.as_mut() {
             settings.mark_path_template_saved(template);
+        }
+        Ok(())
+    }
+
+    fn save_dashboard(&mut self, dashboard: DashboardConfig) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        config.dashboard = dashboard.clone();
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_dashboard_saved(dashboard);
         }
         Ok(())
     }

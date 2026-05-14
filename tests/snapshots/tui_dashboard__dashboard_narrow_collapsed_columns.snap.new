@@ -1,5 +1,6 @@
 ---
 source: tests/tui_dashboard.rs
+assertion_line: 657
 expression: "dump_lines(72, 17, |f| screen.render(f, f.area()))"
 ---
 Refreshed just now - 3 worktrees, 0 dirty, 1 PR open
