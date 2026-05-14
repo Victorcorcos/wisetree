@@ -254,7 +254,11 @@ impl DashboardService {
                 // GraphQL round-trip. Then refresh PRs and emit again.
                 match service.collect_git_rows().await {
                     Ok(mut rows) => {
-                        if rows_tx.send(DashboardUpdate::GitOnly(rows.clone())).await.is_err() {
+                        if rows_tx
+                            .send(DashboardUpdate::GitOnly(rows.clone()))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                         if service.pr_enrichment_enabled() {

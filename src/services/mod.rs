@@ -16,5 +16,6 @@ pub use shell_integration::{
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,
 };
 pub use update::{
-    check_for_updates, get_cached_update_status, should_check_for_updates, UpdateCheckResult,
+    check_for_updates, check_for_updates_all_sources, get_cached_update_status,
+    should_check_for_updates, MultiSourceUpdateResult, UpdateCheckResult, UpdateSource,
 };

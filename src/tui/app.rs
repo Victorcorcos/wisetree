@@ -28,9 +28,9 @@ use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::{
-    check_for_updates, default_dashboard_warning, detect_shell_integration,
-    install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult,
+    check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
+    install_shell_integration, resolve_dashboard_columns, DashboardService, DashboardUpdate,
+    DashboardWatch, MultiSourceUpdateResult, Shell, ShellIntegrationStatus, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -41,7 +41,9 @@ use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
 };
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
-use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
+use crate::tui::screens::settings::{
+    CopyDirection, SettingsAction, SettingsScreen, UpgradeOutcome,
+};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
 use crate::tui::selection::{
     clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
@@ -68,7 +70,11 @@ enum AppEvent {
     CreateFinished(Result<PathBuf, String>),
     DeleteLoaded(Result<Vec<GitWorktree>, String>),
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
-    SettingsUpdateChecked(UpdateCheckResult),
+    SettingsUpdateChecked(MultiSourceUpdateResult),
+    SettingsUpgradeFinished {
+        source: UpdateSource,
+        result: Result<String, String>,
+    },
     SetupInstalled(Result<ShellIntegrationStatus, String>),
     ClipboardCopyFinished {
         success_message: String,
@@ -699,17 +705,19 @@ impl App {
             SettingsAction::Back => self.back_to_menu(),
             SettingsAction::CopySettingsFilePath => {
                 let path = self.settings_edit_file_path().display().to_string();
-                kick_off_clipboard_copy(
-                    path,
-                    SETTINGS_PATH_COPIED_MESSAGE.to_string(),
-                    tx.clone(),
-                );
+                kick_off_clipboard_copy(path, SETTINGS_PATH_COPIED_MESSAGE.to_string(), tx.clone());
             }
             SettingsAction::CheckUpdates => {
                 if let Some(settings) = self.settings.as_mut() {
                     settings.start_checking_updates();
                 }
                 kick_off_update_check(tx.clone());
+            }
+            SettingsAction::UpgradeSource(source) => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.start_upgrade(source);
+                }
+                kick_off_upgrade(source, tx.clone());
             }
             SettingsAction::SetDeleteBranchWithWorktree(enabled) => {
                 if let Err(err) = self.save_delete_branch_with_worktree(enabled) {
@@ -865,6 +873,30 @@ impl App {
                 if let Some(settings) = self.settings.as_mut() {
                     settings.set_update_result(result);
                 }
+            }
+            AppEvent::SettingsUpgradeFinished { source, result } => {
+                let outcome = match result {
+                    Ok(message) => UpgradeOutcome {
+                        source,
+                        success: true,
+                        message,
+                    },
+                    Err(message) => UpgradeOutcome {
+                        source,
+                        success: false,
+                        message,
+                    },
+                };
+                let variant = if outcome.success {
+                    ToastVariant::Success
+                } else {
+                    ToastVariant::Error
+                };
+                let toast_msg = format!("{}: {}", source.label(), outcome.message);
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.set_upgrade_outcome(outcome);
+                }
+                self.show_toast(variant, toast_msg);
             }
             AppEvent::SetupInstalled(result) => {
                 if let Some(setup) = self.setup.as_mut() {
@@ -1524,11 +1556,47 @@ fn kick_off_delete_worktree(
 
 fn kick_off_update_check(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
-        let mut state = AppStateService::new();
-        state.load();
-        let result = check_for_updates(VERSION, &mut state, true).await;
+        let result = check_for_updates_all_sources(VERSION).await;
         let _ = tx.send(AppEvent::SettingsUpdateChecked(result));
     });
+}
+
+fn kick_off_upgrade(source: UpdateSource, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || run_upgrade(source))
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|inner| inner);
+        let _ = tx.send(AppEvent::SettingsUpgradeFinished { source, result });
+    });
+}
+
+fn run_upgrade(source: UpdateSource) -> Result<String, String> {
+    let argv = source.upgrade_argv();
+    let (program, rest) = argv
+        .split_first()
+        .ok_or_else(|| "empty upgrade command".to_string())?;
+    let output = std::process::Command::new(program)
+        .args(rest)
+        .output()
+        .map_err(|err| format!("failed to spawn `{program}`: {err}"))?;
+    if output.status.success() {
+        Ok(format!(
+            "upgraded via `{}`",
+            source.upgrade_command_display()
+        ))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exited with status {}", output.status)
+        };
+        Err(detail)
+    }
 }
 
 fn kick_off_clipboard_copy(
