@@ -868,21 +868,18 @@ impl DashboardScreen {
         let muted_dim = Style::default()
             .fg(colors::MUTED)
             .add_modifier(Modifier::DIM);
-        let label = Style::default()
-            .fg(colors::INFO)
-            .add_modifier(Modifier::BOLD);
         Line::from(vec![
             Span::styled("Checks: ", muted_dim),
-            Span::styled("Pending ", label),
             Span::raw("⚪"),
-            Span::styled("  Running ", label),
-            Span::raw("🟡"),
-            Span::styled("  Passed ", label),
-            Span::raw("🟢"),
-            Span::styled("  Failed ", label),
-            Span::raw("🔴"),
-            Span::styled("  Errored ", label),
-            Span::raw("⚠️"),
+            Span::styled("(Pending)", Style::default().fg(colors::WHITE)),
+            Span::raw("  🟡"),
+            Span::styled("(Running)", Style::default().fg(colors::YELLOW)),
+            Span::raw("  🟢"),
+            Span::styled("(Passed)", Style::default().fg(colors::GREEN)),
+            Span::raw("  🔴"),
+            Span::styled("(Failed)", Style::default().fg(colors::PINK)),
+            Span::raw("  ⚠️"),
+            Span::styled("(Errored)", Style::default().fg(colors::ORANGE)),
         ])
     }
 
