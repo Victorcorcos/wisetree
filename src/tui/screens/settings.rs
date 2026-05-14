@@ -108,19 +108,49 @@ pub struct PostCmdEditor {
     last_rect_selection: Option<usize>,
     /// Snapshot taken when the user enters edit mode, used to restore on Esc.
     edit_backup: Option<(String, PostCmdRectStatus)>,
+    /// For each rectangle, the tick at which a swap-flash animation started.
+    /// `None` means no active animation. Parallel to `commands` / `statuses`.
+    swap_highlights: Vec<Option<usize>>,
+}
+
+/// Duration of the post-swap flash animation, in ticks (≈100ms each ⇒ 2s).
+const SWAP_ANIM_TICKS: usize = 20;
+
+fn lerp_rgb(from: ratatui::style::Color, to: ratatui::style::Color, t: f32) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    let t = t.clamp(0.0, 1.0);
+    match (from, to) {
+        (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) => {
+            let r = (fr as f32 + (tr as f32 - fr as f32) * t).round() as u8;
+            let g = (fg as f32 + (tg as f32 - fg as f32) * t).round() as u8;
+            let b = (fb as f32 + (tb as f32 - fb as f32) * t).round() as u8;
+            Color::Rgb(r, g, b)
+        }
+        _ => to,
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
 impl PostCmdEditor {
     pub fn new(commands: Vec<String>) -> Self {
         let has_commands = !commands.is_empty();
         let statuses = vec![PostCmdRectStatus::Saved; commands.len()];
+        let swap_highlights = vec![None; commands.len()];
         Self {
             commands,
             statuses,
             selection: PostCmdSelection::Create,
             last_rect_selection: if has_commands { Some(0) } else { None },
             edit_backup: None,
+            swap_highlights,
         }
+    }
+
+    pub fn swap_highlight_start(&self, idx: usize) -> Option<usize> {
+        self.swap_highlights.get(idx).copied().flatten()
     }
 
     pub fn editing_index(&self) -> Option<usize> {
@@ -182,7 +212,7 @@ impl PostCmdEditor {
         self.set_selection(next);
     }
 
-    pub fn move_selected_up(&mut self) {
+    pub fn move_selected_up(&mut self, current_tick: usize) {
         if self.editing_index().is_some() {
             return;
         }
@@ -194,12 +224,15 @@ impl PostCmdEditor {
         }
         self.commands.swap(i, i - 1);
         self.statuses.swap(i, i - 1);
+        self.swap_highlights.swap(i, i - 1);
         self.statuses[i] = Self::mark_modified(self.statuses[i]);
         self.statuses[i - 1] = Self::mark_modified(self.statuses[i - 1]);
+        self.swap_highlights[i] = Some(current_tick);
+        self.swap_highlights[i - 1] = Some(current_tick);
         self.set_selection(PostCmdSelection::Rect(i - 1));
     }
 
-    pub fn move_selected_down(&mut self) {
+    pub fn move_selected_down(&mut self, current_tick: usize) {
         if self.editing_index().is_some() {
             return;
         }
@@ -211,8 +244,11 @@ impl PostCmdEditor {
         }
         self.commands.swap(i, i + 1);
         self.statuses.swap(i, i + 1);
+        self.swap_highlights.swap(i, i + 1);
         self.statuses[i] = Self::mark_modified(self.statuses[i]);
         self.statuses[i + 1] = Self::mark_modified(self.statuses[i + 1]);
+        self.swap_highlights[i] = Some(current_tick);
+        self.swap_highlights[i + 1] = Some(current_tick);
         self.set_selection(PostCmdSelection::Rect(i + 1));
     }
 
@@ -727,11 +763,11 @@ impl SettingsScreen {
                 SettingsAction::Continue
             }
             KeyCode::Char('K') => {
-                editor.move_selected_up();
+                editor.move_selected_up(self.tick);
                 SettingsAction::Continue
             }
             KeyCode::Char('J') => {
-                editor.move_selected_down();
+                editor.move_selected_down(self.tick);
                 SettingsAction::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
@@ -746,6 +782,7 @@ impl SettingsScreen {
                 PostCmdSelection::Create => {
                     editor.commands.push(String::new());
                     editor.statuses.push(PostCmdRectStatus::Unchanged);
+                    editor.swap_highlights.push(None);
                     let idx = editor.commands.len() - 1;
                     editor.set_selection(PostCmdSelection::Rect(idx));
                     start_editing = Some(idx);
@@ -1648,13 +1685,23 @@ impl SettingsScreen {
             let is_selected = matches!(editor.selection, PostCmdSelection::Rect(j) if j == i);
             let is_editing = editing_idx == Some(i);
             let is_focused = is_selected || is_editing;
-            let border_color = match status {
+            let base_border_color = match status {
                 PostCmdRectStatus::Unchanged => colors::WHITE,
                 PostCmdRectStatus::Editing => colors::WARNING,
                 PostCmdRectStatus::Modified => colors::ACCENT,
                 PostCmdRectStatus::MarkedForDeletion => colors::ERROR,
                 PostCmdRectStatus::Saved => colors::SUCCESS,
             };
+            let (border_color, animating) = editor
+                .swap_highlight_start(i)
+                .map(|start| (start, self.tick.saturating_sub(start)))
+                .filter(|(_, elapsed)| *elapsed < SWAP_ANIM_TICKS)
+                .map(|(_, elapsed)| {
+                    let progress = elapsed as f32 / SWAP_ANIM_TICKS as f32;
+                    let eased = ease_out_cubic(progress);
+                    (lerp_rgb(colors::TEAL, base_border_color, eased), true)
+                })
+                .unwrap_or((base_border_color, false));
             let show_selection_marker = is_selected && !is_editing;
             let content_style = if is_focused {
                 Style::default()
@@ -1663,7 +1710,13 @@ impl SettingsScreen {
             } else {
                 Style::default()
             };
-            let border_style = Style::default().fg(border_color);
+            let border_style = if animating {
+                Style::default()
+                    .fg(border_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(border_color)
+            };
             let mut inner_line = if is_editing {
                 self.post_cmd_input
                     .as_ref()
