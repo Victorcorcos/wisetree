@@ -409,11 +409,11 @@ impl DashboardScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // status banner
-                Constraint::Length(1), // spacer above search
-                Constraint::Length(1), // search line
-                Constraint::Length(1), // spacer below search
-                Constraint::Min(4),    // table
+                Constraint::Length(1),  // status banner
+                Constraint::Length(1),  // spacer above search
+                Constraint::Length(1),  // search line
+                Constraint::Length(1),  // spacer below search
+                Constraint::Min(4),     // table
                 Constraint::Length(10), // footer (notice + 3-row buttons + 6 legend lines)
             ])
             .split(area);
