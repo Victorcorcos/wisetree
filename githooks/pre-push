@@ -34,3 +34,9 @@ run_fix \
   cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged
 
 run_fix "cargo fmt --all" cargo fmt --all
+
+if ! git diff --quiet; then
+  printf 'pre-push: committing auto-formatted changes\n'
+  git add -u
+  git commit -m "chore: auto-format and fix (cargo fmt + clippy)"
+fi
