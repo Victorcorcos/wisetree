@@ -22,10 +22,14 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// `gh api graphql` may include the network round-trip — give it more headroom
 /// than local git calls.
 const GH_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(8);
+/// `gh pr merge` may wait on branch protections, required reviews, or remote
+/// merge processing, so it deserves a longer leash than the read paths.
+const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a cached PR record stays fresh when the branch HEAD hasn't moved.
 /// Catches remote-only changes (merge, close, title edit) without hammering
-/// the API.
-const PR_CACHE_TTL_MS: u64 = 30 * 1000;
+/// the API. The Status column countdown anchors to this so the displayed
+/// timer matches when the next real GraphQL refetch will happen.
+pub const PR_CACHE_TTL_MS: u64 = 30 * 1000;
 /// How long to suspend PR fetches after a rate-limit error.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
@@ -89,6 +93,16 @@ pub struct PullRequest {
     pub review_status: Option<ReviewStatus>,
 }
 
+/// Title + body for a single pull request, fetched on demand by the merge
+/// confirmation screen. Kept separate from `PullRequest` (which lives in the
+/// dashboard cache and is intentionally lean) so PR descriptions never bloat
+/// the persistent cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestDetails {
+    pub title: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashboardRow {
     #[serde(flatten)]
@@ -131,22 +145,30 @@ impl DashboardNotice {
 
 /// Discriminates the two row emissions per refresh cycle so the UI can
 /// tell apart git-only data from gh-enriched data (PR state + CI checks).
+/// `WithPRs` carries a `fetched` flag: `true` when this tick made a real
+/// GraphQL call, `false` when every branch was served from cache. The UI
+/// uses this to anchor the Status countdown only to real fetches.
 #[derive(Debug)]
 pub enum DashboardUpdate {
     GitOnly(Vec<DashboardRow>),
-    WithPRs(Vec<DashboardRow>),
+    WithPRs {
+        rows: Vec<DashboardRow>,
+        fetched: bool,
+    },
 }
 
 impl DashboardUpdate {
     pub fn rows(&self) -> &Vec<DashboardRow> {
         match self {
-            Self::GitOnly(rows) | Self::WithPRs(rows) => rows,
+            Self::GitOnly(rows) => rows,
+            Self::WithPRs { rows, .. } => rows,
         }
     }
 
     pub fn into_rows(self) -> Vec<DashboardRow> {
         match self {
-            Self::GitOnly(rows) | Self::WithPRs(rows) => rows,
+            Self::GitOnly(rows) => rows,
+            Self::WithPRs { rows, .. } => rows,
         }
     }
 }
@@ -278,10 +300,14 @@ impl DashboardService {
                             break;
                         }
                         if service.pr_enrichment_enabled() {
-                            service.refresh_pull_requests(&rows).await;
+                            let fetched = service.refresh_pull_requests(&rows).await;
                             service.apply_cached_prs(&mut rows);
                             service.save_cache();
-                            if rows_tx.send(DashboardUpdate::WithPRs(rows)).await.is_err() {
+                            if rows_tx
+                                .send(DashboardUpdate::WithPRs { rows, fetched })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -323,6 +349,64 @@ impl DashboardService {
             self.save_cache();
         }
         Ok(rows)
+    }
+
+    /// Fetch the latest title + body for a single pull request via
+    /// `gh pr view`. Bypasses the dashboard cache so the merge confirmation
+    /// screen always shows the description GitHub currently has.
+    pub async fn fetch_pr_details(&self, number: u64) -> Result<PullRequestDetails> {
+        if !self.gh_available {
+            return Err(WisetreeError::other(
+                "gh CLI not found — install `gh` to fetch pull request details.",
+            ));
+        }
+        let number_arg = number.to_string();
+        let output = time::timeout(
+            GH_GRAPHQL_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &["pr", "view", &number_arg, "--json", "title,body"],
+                Some(&self.git_root),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh pr view timed out after 8s"))?
+        .map_err(WisetreeError::other)?;
+
+        parse_pr_view_json(&output)
+    }
+
+    /// Squash-merge a pull request, passing the supplied subject and body
+    /// straight through to `gh pr merge` so the resulting commit message is
+    /// byte-for-byte the PR's title + description.
+    pub async fn merge_pull_request(&self, number: u64, subject: &str, body: &str) -> Result<()> {
+        if !self.gh_available {
+            return Err(WisetreeError::other(
+                "gh CLI not found — install `gh` to merge pull requests.",
+            ));
+        }
+        let number_arg = number.to_string();
+        time::timeout(
+            PR_MERGE_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &[
+                    "pr",
+                    "merge",
+                    &number_arg,
+                    "--squash",
+                    "--subject",
+                    subject,
+                    "--body",
+                    body,
+                ],
+                Some(&self.git_root),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh pr merge timed out after 60s"))?
+        .map_err(WisetreeError::other)?;
+        Ok(())
     }
 
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
@@ -532,15 +616,32 @@ impl DashboardService {
 
     /// Decide which branches need a PR refresh, then (if any) issue a single
     /// batched GraphQL request and update the cache.
-    async fn refresh_pull_requests(&self, rows: &[DashboardRow]) {
+    ///
+    /// Returns `true` only on a *scheduled* full-cycle refresh — i.e., when
+    /// the oldest cached entry has aged past `PR_CACHE_TTL_MS` (or the cache
+    /// is empty) and every branch is brought back in sync. Off-cycle fetches
+    /// triggered by a brand-new branch or a SHA change return `false` and
+    /// stay invisible to the UI, so the Status countdown anchors to a stable
+    /// rhythm instead of resetting whenever a single branch happens to be
+    /// fetched.
+    async fn refresh_pull_requests(&self, rows: &[DashboardRow]) -> bool {
         if !self.pr_enrichment_enabled() {
-            return;
+            return false;
         }
         if self.is_rate_limited() {
-            return;
+            return false;
         }
 
         let now = now_ms();
+        let scheduled_due = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state.entries.is_empty()
+                || state
+                    .entries
+                    .values()
+                    .any(|e| now.saturating_sub(e.fetched_at_ms) > PR_CACHE_TTL_MS)
+        };
+
         let to_fetch: Vec<(String, String)> = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
             rows.iter()
@@ -551,10 +652,7 @@ impl DashboardService {
                         return None;
                     }
                     let needs = match state.entries.get(&branch) {
-                        Some(entry) => {
-                            entry.sha != sha
-                                || now.saturating_sub(entry.fetched_at_ms) > PR_CACHE_TTL_MS
-                        }
+                        Some(entry) => entry.sha != sha || scheduled_due,
                         None => true,
                     };
                     needs.then_some((branch, sha))
@@ -563,11 +661,11 @@ impl DashboardService {
         };
 
         if to_fetch.is_empty() {
-            return;
+            return false;
         }
 
         let Some((owner, repo)) = self.resolve_repo_slug().await else {
-            return;
+            return false;
         };
 
         let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
@@ -589,6 +687,7 @@ impl DashboardService {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
+                scheduled_due
             }
             Err(err) => {
                 if is_rate_limit_error(&err) {
@@ -599,6 +698,7 @@ impl DashboardService {
                 // Failures fall back to cached or empty PR data. Surface a
                 // single dashboard-level notice instead of per-row errors,
                 // because this GraphQL request covers every branch at once.
+                false
             }
         }
     }
@@ -862,6 +962,27 @@ fn escape_graphql_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Parse the JSON `gh pr view <N> --json title,body` returns. Missing
+/// fields default to empty strings — that's the right behavior for both
+/// the title (would surprise but won't crash) and the body (open PRs are
+/// allowed to have an empty description).
+fn parse_pr_view_json(body: &str) -> Result<PullRequestDetails> {
+    #[derive(Deserialize)]
+    struct PrViewJson {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        body: String,
+    }
+
+    let parsed: PrViewJson = serde_json::from_str(body)
+        .map_err(|err| WisetreeError::other(format!("invalid gh pr view output: {err}")))?;
+    Ok(PullRequestDetails {
+        title: parsed.title,
+        body: parsed.body,
+    })
 }
 
 fn parse_graphql_response(
@@ -1240,6 +1361,43 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_pr_view_json_with_title_and_body() {
+        let raw = r#"{"title":"Add merge action","body":"Closes #42.\n\nNotes."}"#;
+        let parsed = parse_pr_view_json(raw).unwrap();
+        assert_eq!(parsed.title, "Add merge action");
+        assert_eq!(parsed.body, "Closes #42.\n\nNotes.");
+    }
+
+    #[test]
+    fn parses_pr_view_json_with_missing_body_as_empty() {
+        let raw = r#"{"title":"Tweak copy"}"#;
+        let parsed = parse_pr_view_json(raw).unwrap();
+        assert_eq!(parsed.title, "Tweak copy");
+        assert_eq!(parsed.body, "");
+    }
+
+    #[test]
+    fn parses_pr_view_json_preserves_unicode_and_newlines() {
+        // The PR body must reach `gh pr merge --body` byte-for-byte identical
+        // to what GitHub stores — guard against any silent munging in the
+        // serde path.
+        let raw = r#"{"title":"🚀 ship it","body":"line one\nline two\n• emoji ✅"}"#;
+        let parsed = parse_pr_view_json(raw).unwrap();
+        assert_eq!(parsed.title, "🚀 ship it");
+        assert_eq!(parsed.body, "line one\nline two\n• emoji ✅");
+    }
+
+    #[test]
+    fn parse_pr_view_json_rejects_invalid_json() {
+        let err = parse_pr_view_json("not json at all").unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("invalid gh pr view output"),
+            "unexpected error message: {message}"
+        );
+    }
 
     #[test]
     fn parses_github_ssh_scp_form() {

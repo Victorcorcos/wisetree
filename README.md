@@ -4,7 +4,9 @@
   <img src="https://i.imgur.com/vO0AOis.gif" alt="Wisetree" width="50%" />
 </div>
 
-<img width="1727" height="906" alt="image" src="https://github.com/user-attachments/assets/96634c72-6498-49c8-9395-2eb353b9ac7a" />
+---
+
+<img width="3456" height="1816" alt="Screenshot 2026-05-15 at 03 26 28" src="https://github.com/user-attachments/assets/05126a3e-6980-4139-aaf2-aa758fc0d282" />
 
 **Wisetree** is an interactive, terminal-first manager for `git worktree`s. It wraps the raw `git worktree` plumbing in a polished TUI (built with Rust + Ratatui) and a scriptable CLI, so creating, surveying, navigating, and deleting worktrees becomes a single keystroke instead of a paragraph of commands.
 
