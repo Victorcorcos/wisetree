@@ -355,7 +355,7 @@ fn selected_worktree_row_shows_selection_marker() {
     screen.handle_key(key(KeyCode::Down));
 
     let dumped = dump(120, 12, |f| screen.render(f, f.area()));
-    assert!(dumped.contains(" ➤ /tmp/repo-bug"));
+    assert!(dumped.contains(" ➤ repo-bug"));
 }
 
 #[test]
