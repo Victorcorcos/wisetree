@@ -1057,10 +1057,7 @@ impl App {
                 // Cached WithPRs ticks would otherwise reset the timer every
                 // 5s while showing data that's actually up to PR_CACHE_TTL_MS
                 // old, which is the misleading-countdown bug.
-                let did_fetch = matches!(
-                    update,
-                    DashboardUpdate::WithPRs { fetched: true, .. }
-                );
+                let did_fetch = matches!(update, DashboardUpdate::WithPRs { fetched: true, .. });
                 screen.set_rows(update.into_rows());
                 if did_fetch {
                     screen.mark_gh_refreshed();
