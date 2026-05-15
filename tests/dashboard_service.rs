@@ -607,3 +607,114 @@ async fn non_rate_limit_gh_failures_emit_inline_cache_notice() {
         .contains("authentication failed for github.com"));
     assert!(notice.message.contains("showing cached data"));
 }
+
+/// Stub script that reacts to `gh pr view` and `gh pr merge` so the
+/// merge-flow tests stay deterministic. Logs every invocation to `log_path`
+/// so the test can assert exactly which flags reached `gh`.
+fn fake_gh_pr_script(log_path: &Path, pr_view_json: &str, merge_exit_code: i32) -> String {
+    // `printf '%s\n' "$*"` flattens args with spaces so the log is a stable
+    // single-line trace per invocation — good enough for substring asserts.
+    format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n  printf '%s' '{view}'\n  exit 0\nfi\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  if [ {exit} -ne 0 ]; then\n    printf 'gh: simulated merge failure\\n' 1>&2\n  fi\n  exit {exit}\nfi\n\
+         printf '[]'\n",
+        log = log_path.display(),
+        view = pr_view_json,
+        exit = merge_exit_code,
+    )
+}
+
+#[tokio::test]
+async fn fetch_pr_details_returns_title_and_body() {
+    let fixture = repo_with_worktree();
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    let view_json = r#"{"title":"Add merge action","body":"Closes #42."}"#;
+    fs::write(&gh_path, fake_gh_pr_script(&log_path, view_json, 0)).unwrap();
+    make_executable(&gh_path);
+
+    let service = service_with_isolated_cache_and_config(&fixture, config_with_prs())
+        .with_gh_binary(gh_path.clone());
+
+    let details = service.fetch_pr_details(7).await.expect("fetch_pr_details");
+    assert_eq!(details.title, "Add merge action");
+    assert_eq!(details.body, "Closes #42.");
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("pr view 7 --json title,body"),
+        "fetch must call `gh pr view <N> --json title,body`; log was {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn merge_pull_request_invokes_gh_with_squash_flag_and_passthrough_message() {
+    let fixture = repo_with_worktree();
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_pr_script(&log_path, "{}", 0)).unwrap();
+    make_executable(&gh_path);
+
+    let service = service_with_isolated_cache_and_config(&fixture, config_with_prs())
+        .with_gh_binary(gh_path.clone());
+
+    service
+        .merge_pull_request(7, "Add merge action", "Closes #42 with notes.")
+        .await
+        .expect("merge ok");
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("--squash"),
+        "merge must use --squash; log was {log:?}"
+    );
+    assert!(
+        log.contains("--subject Add merge action"),
+        "subject must reach gh verbatim; log was {log:?}"
+    );
+    assert!(
+        log.contains("--body Closes #42 with notes."),
+        "body must reach gh verbatim; log was {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn merge_pull_request_surfaces_gh_stderr_on_failure() {
+    let fixture = repo_with_worktree();
+    let log_path = fixture.repo.parent().unwrap().join("gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_pr_script(&log_path, "{}", 1)).unwrap();
+    make_executable(&gh_path);
+
+    let service = service_with_isolated_cache_and_config(&fixture, config_with_prs())
+        .with_gh_binary(gh_path.clone());
+
+    let err = service
+        .merge_pull_request(7, "subject", "body")
+        .await
+        .expect_err("merge should fail when gh exits non-zero");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("simulated merge failure"),
+        "error must surface gh's stderr; got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn merge_pull_request_errors_clearly_when_gh_missing() {
+    let fixture = repo_with_worktree();
+    // Point at a binary that doesn't exist so `binary_available` reports
+    // false. The service should refuse to even attempt the merge.
+    let missing = fixture.repo.parent().unwrap().join("nope-gh");
+    let service =
+        service_with_isolated_cache_and_config(&fixture, config_with_prs()).with_gh_binary(missing);
+
+    let err = service
+        .merge_pull_request(7, "subject", "body")
+        .await
+        .expect_err("merge should fail without gh");
+    assert!(format!("{err}").contains("gh CLI not found"));
+}
