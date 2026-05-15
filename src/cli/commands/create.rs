@@ -5,7 +5,9 @@ use crate::cli::args::CliArgs;
 use crate::errors::{Result, WisetreeError};
 use crate::git::types::WorktreeCreateOptions;
 use crate::utils::path::get_worktree_path;
-use crate::utils::validation::{normalize_branch_name, validate_branch_name, validate_directory_name};
+use crate::utils::validation::{
+    normalize_branch_name, validate_branch_name, validate_directory_name,
+};
 use crate::worktree::WorktreeService;
 
 pub async fn run(args: CliArgs, service: &WorktreeService) -> Result<()> {

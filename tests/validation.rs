@@ -1,4 +1,6 @@
-use wisetree::utils::validation::{normalize_branch_name, validate_branch_name, validate_directory_name};
+use wisetree::utils::validation::{
+    normalize_branch_name, validate_branch_name, validate_directory_name,
+};
 
 #[test]
 fn directory_empty() {

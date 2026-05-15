@@ -244,7 +244,10 @@ impl CreateScreen {
         if let Some(e) = validate_branch_name(&normalized) {
             return Some(e.to_string());
         }
-        if branches.iter().any(|b| b.name == normalized && !b.is_remote) {
+        if branches
+            .iter()
+            .any(|b| b.name == normalized && !b.is_remote)
+        {
             return Some("Branch already exists".to_string());
         }
         None
