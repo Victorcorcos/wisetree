@@ -172,7 +172,10 @@ async fn confirm_flow_invokes_gh_pr_merge_with_live_title_and_body() {
         .expect("merge ok");
 
     let log = fs::read_to_string(&log_path).unwrap();
-    assert!(log.contains("--squash"), "log should record --squash; got {log:?}");
+    assert!(
+        log.contains("--squash"),
+        "log should record --squash; got {log:?}"
+    );
     assert!(
         log.contains(&format!("--subject {live_title}")),
         "live title must reach gh verbatim; got {log:?}"
@@ -263,10 +266,7 @@ async fn esc_during_load_returns_cancelled_without_calling_gh() {
 
     let mut screen = MergePullRequestScreen::new(sample_request());
     assert_eq!(screen.step(), MergeStep::Loading);
-    assert_eq!(
-        screen.handle_key(key(KeyCode::Esc)),
-        MergeAction::Cancelled
-    );
+    assert_eq!(screen.handle_key(key(KeyCode::Esc)), MergeAction::Cancelled);
     // The screen never invokes gh directly — App owns the kick-off
     // helpers. Sanity check: no log file ever got created from the
     // screen itself (we never constructed a service in this test).

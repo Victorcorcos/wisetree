@@ -240,14 +240,14 @@ impl MergePullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),                 // title
-                Constraint::Length(1),                 // blank
-                Constraint::Length(detail_height),     // labeled rows
-                Constraint::Length(1),                 // blank
-                Constraint::Length(1),                 // "Description:" label
-                Constraint::Length(body_height),       // body preview
-                Constraint::Length(1),                 // blank
-                Constraint::Length(confirm_height),    // ConfirmDialog
+                Constraint::Length(1),              // title
+                Constraint::Length(1),              // blank
+                Constraint::Length(detail_height),  // labeled rows
+                Constraint::Length(1),              // blank
+                Constraint::Length(1),              // "Description:" label
+                Constraint::Length(body_height),    // body preview
+                Constraint::Length(1),              // blank
+                Constraint::Length(confirm_height), // ConfirmDialog
                 Constraint::Min(0),
             ])
             .split(area);
@@ -275,13 +275,10 @@ fn build_confirm(request: &MergePullRequestRequest) -> ConfirmDialog {
         "Squash-merge Pull Request #{} into its base branch?",
         request.number
     );
-    ConfirmDialog::new(
-        format!("Merge Pull Request #{}", request.number),
-        prompt,
-    )
-    .with_labels("Yes", "No")
-    .with_variant(ConfirmVariant::Default)
-    .with_default(ConfirmChoice::Cancel)
+    ConfirmDialog::new(format!("Merge Pull Request #{}", request.number), prompt)
+        .with_labels("Yes", "No")
+        .with_variant(ConfirmVariant::Default)
+        .with_default(ConfirmChoice::Cancel)
 }
 
 fn build_detail_lines(request: &MergePullRequestRequest) -> Vec<Line<'static>> {
@@ -316,10 +313,7 @@ fn build_detail_lines(request: &MergePullRequestRequest) -> Vec<Line<'static>> {
 
     rows.push(labeled_line(
         "URL",
-        Span::styled(
-            request.url.clone(),
-            Style::default().fg(colors::EMPHASIS),
-        ),
+        Span::styled(request.url.clone(), Style::default().fg(colors::EMPHASIS)),
         None,
     ));
 
@@ -376,10 +370,7 @@ fn build_detail_lines(request: &MergePullRequestRequest) -> Vec<Line<'static>> {
         let value = format!("{}  {}", short_sha(&commit.sha), commit.summary);
         rows.push(labeled_line(
             "Last commit",
-            Span::styled(
-                value,
-                Style::default().fg(colors::EMPHASIS),
-            ),
+            Span::styled(value, Style::default().fg(colors::EMPHASIS)),
             None,
         ));
     }
@@ -406,7 +397,9 @@ fn labeled_line(
     Line::from(spans)
 }
 
-fn check_status_descriptor(status: CheckStatus) -> (&'static str, &'static str, ratatui::style::Color) {
+fn check_status_descriptor(
+    status: CheckStatus,
+) -> (&'static str, &'static str, ratatui::style::Color) {
     match status {
         CheckStatus::Pending => ("⚪", "pending", colors::MUTED),
         CheckStatus::Running => ("🟡", "running", colors::WARNING),
@@ -437,10 +430,7 @@ fn body_preview_lines(body: Option<&str>) -> Vec<Line<'static>> {
         .map(|raw| Line::from(Span::styled(raw.to_string(), body_style)))
         .collect();
     if trimmed.lines().count() > BODY_PREVIEW_MAX_LINES {
-        lines.push(Line::from(Span::styled(
-            "…".to_string(),
-            muted,
-        )));
+        lines.push(Line::from(Span::styled("…".to_string(), muted)));
     }
     lines
 }
@@ -580,9 +570,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 28);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| screen.render(f, f.area()))
-            .unwrap();
+        terminal.draw(|f| screen.render(f, f.area())).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let dumped: String = (0..buffer.area.height)
             .map(|y| {

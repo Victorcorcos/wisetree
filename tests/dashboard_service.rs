@@ -709,8 +709,8 @@ async fn merge_pull_request_errors_clearly_when_gh_missing() {
     // Point at a binary that doesn't exist so `binary_available` reports
     // false. The service should refuse to even attempt the merge.
     let missing = fixture.repo.parent().unwrap().join("nope-gh");
-    let service = service_with_isolated_cache_and_config(&fixture, config_with_prs())
-        .with_gh_binary(missing);
+    let service =
+        service_with_isolated_cache_and_config(&fixture, config_with_prs()).with_gh_binary(missing);
 
     let err = service
         .merge_pull_request(7, "subject", "body")

@@ -350,12 +350,7 @@ impl DashboardService {
     /// Squash-merge a pull request, passing the supplied subject and body
     /// straight through to `gh pr merge` so the resulting commit message is
     /// byte-for-byte the PR's title + description.
-    pub async fn merge_pull_request(
-        &self,
-        number: u64,
-        subject: &str,
-        body: &str,
-    ) -> Result<()> {
+    pub async fn merge_pull_request(&self, number: u64, subject: &str, body: &str) -> Result<()> {
         if !self.gh_available {
             return Err(WisetreeError::other(
                 "gh CLI not found — install `gh` to merge pull requests.",
