@@ -89,6 +89,7 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
         title: "Improve dashboard footer details for live workflows".into(),
         checks_status: None,
         review_status: None,
+        merge_status: None,
     });
     row
 }
