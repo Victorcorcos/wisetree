@@ -1071,8 +1071,7 @@ impl DashboardScreen {
             }
         }
 
-        let mut constraints: Vec<Constraint> =
-            Vec::with_capacity(visible_statuses.len() * 2 + 2);
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_statuses.len() * 2 + 2);
         constraints.push(Constraint::Length(prefix_width));
         for (index, status) in visible_statuses.iter().enumerate() {
             if index > 0 {
@@ -1129,14 +1128,14 @@ impl DashboardScreen {
 
             let button =
                 Paragraph::new(Line::from(Span::styled(status.button_label(), text_style)))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .border_style(border_style)
-                        .padding(Padding::horizontal(1)),
-                );
+                    .alignment(Alignment::Center)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Plain)
+                            .border_style(border_style)
+                            .padding(Padding::horizontal(1)),
+                    );
             frame.render_widget(button, rect);
             self.bulk_button_rects.push((*status, rect));
         }
