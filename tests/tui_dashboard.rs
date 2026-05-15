@@ -737,3 +737,119 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
         dump_lines(72, 17, |f| screen.render(f, f.area()))
     );
 }
+
+fn open_action_menu_for_second_row(screen: &mut DashboardScreen) -> String {
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Enter));
+    dump(120, 14, |f| screen.render(f, f.area()))
+}
+
+#[test]
+fn action_menu_shows_merge_option_for_open_pr_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        dumped.contains("Merge Pull Request"),
+        "expected `Merge Pull Request` for an Open PR row: {dumped}"
+    );
+    assert!(dumped.contains("Open Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_merge_option_for_merged_pr_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Merged),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        !dumped.contains("Merge Pull Request"),
+        "Merge Pull Request must not appear for a Merged PR row: {dumped}"
+    );
+    // Already-merged PRs should still expose the `Open Pull Request` link.
+    assert!(dumped.contains("Open Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_merge_option_for_closed_pr_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Closed),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Merge Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_merge_option_for_draft_pr_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Draft),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Merge Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_merge_option_when_no_pr_present() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", false),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Merge Pull Request"));
+    assert!(!dumped.contains("Open Pull Request"));
+}

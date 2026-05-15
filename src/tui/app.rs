@@ -36,11 +36,14 @@ use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::create::{CreateAction, CreateScreen};
-use crate::tui::screens::dashboard::{BulkDeleteStatus, DashboardAction, DashboardScreen};
+use crate::tui::screens::dashboard::{
+    BulkDeleteStatus, DashboardAction, DashboardScreen, MergePullRequestRequest,
+};
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
 };
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
+use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
 use crate::tui::selection::{
@@ -74,6 +77,18 @@ enum AppEvent {
         success_message: String,
         error: Option<String>,
     },
+    MergePrDetailsLoaded(Result<MergePrDetailsPayload, String>),
+    MergePrFinished(Result<u64, MergePrFailure>),
+}
+
+struct MergePrDetailsPayload {
+    title: String,
+    body: String,
+}
+
+struct MergePrFailure {
+    number: u64,
+    message: String,
 }
 
 /// State the TUI carries across frames.
@@ -95,6 +110,7 @@ pub struct App {
     delete: Option<DeleteScreen>,
     settings: Option<SettingsScreen>,
     setup: Option<SetupScreen>,
+    merge_pr: Option<MergePullRequestScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
     last_rendered_buffer: Option<Buffer>,
@@ -131,6 +147,7 @@ impl App {
             delete: None,
             settings: None,
             setup: None,
+            merge_pr: None,
             shell_integration_status: None,
             toast: ToastState::default(),
             last_rendered_buffer: None,
@@ -312,6 +329,17 @@ impl App {
                     setup.render(frame, panel);
                 }
             }
+            Screen::MergePullRequest => {
+                let h = self
+                    .merge_pr
+                    .as_ref()
+                    .map_or(8, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
+                if let Some(merge_pr) = self.merge_pr.as_mut() {
+                    merge_pr.tick = self.tick;
+                    merge_pr.render(frame, panel);
+                }
+            }
         }
     }
 
@@ -471,6 +499,38 @@ impl App {
             Screen::Delete => self.handle_delete_key(key, tx),
             Screen::Settings => self.handle_settings_key(key, tx),
             Screen::Setup => self.handle_setup_key(key, tx),
+            Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
+        }
+    }
+
+    fn handle_merge_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.merge_pr.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+        match action {
+            MergeAction::Continue => {}
+            MergeAction::Cancelled => {
+                self.merge_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+            MergeAction::Confirmed {
+                number,
+                title,
+                body,
+            } => {
+                if let Some(screen) = self.merge_pr.as_mut() {
+                    screen.start_merging();
+                }
+                kick_off_merge_pull_request(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    number,
+                    title,
+                    body,
+                    tx.clone(),
+                );
+            }
         }
     }
 
@@ -562,7 +622,32 @@ impl App {
                     format!("Failed to open pull request: {err}"),
                 ),
             },
+            DashboardAction::MergePullRequest(request) => {
+                self.start_merge_pr_flow(*request, tx);
+            }
         }
+    }
+
+    fn start_merge_pr_flow(
+        &mut self,
+        request: MergePullRequestRequest,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let number = request.number;
+        self.merge_pr = Some(MergePullRequestScreen::new(request));
+        self.screen = Screen::MergePullRequest;
+        kick_off_fetch_pr_details(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            number,
+            tx.clone(),
+        );
+    }
+
+    fn current_dashboard_config(&self) -> DashboardConfig {
+        self.current_config()
+            .map(|cfg| cfg.dashboard.clone())
+            .unwrap_or_default()
     }
 
     fn start_bulk_delete_flow(
@@ -883,7 +968,67 @@ impl App {
                     self.show_toast(ToastVariant::Error, format!("Clipboard copy failed: {err}"))
                 }
             },
+            AppEvent::MergePrDetailsLoaded(result) => self.apply_merge_pr_details(result, tx),
+            AppEvent::MergePrFinished(result) => self.apply_merge_pr_finished(result, tx),
         }
+    }
+
+    fn apply_merge_pr_details(
+        &mut self,
+        result: Result<MergePrDetailsPayload, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // If the user already left the merge screen (Esc during load) we
+        // drop the result silently — there's no screen left to update and
+        // toasting would surprise the user.
+        let Some(screen) = self.merge_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(payload) => {
+                screen.override_title(payload.title);
+                screen.set_body(payload.body);
+            }
+            Err(message) => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to load pull request details: {message}"),
+                );
+                self.merge_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+        }
+    }
+
+    fn apply_merge_pr_finished(
+        &mut self,
+        result: Result<u64, MergePrFailure>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match result {
+            Ok(number) => {
+                self.show_toast(
+                    ToastVariant::Success,
+                    format!("Pull Request #{number} squash-merged."),
+                );
+            }
+            Err(failure) => {
+                let trimmed = failure.message.trim();
+                let snippet: String = trimmed.chars().take(160).collect();
+                let suffix = if trimmed.chars().count() > 160 { "…" } else { "" };
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!(
+                        "Failed to merge Pull Request #{}: {}{}",
+                        failure.number, snippet, suffix
+                    ),
+                );
+            }
+        }
+        self.merge_pr = None;
+        // Routing through `enter_screen` rebuilds the Dashboard so the
+        // freshly merged row re-fetches and the Merge action disappears.
+        self.enter_screen(Screen::Dashboard, tx);
     }
 
     fn apply_init_outcome(&mut self, outcome: InitOutcome, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -978,6 +1123,15 @@ impl App {
             Screen::Setup => {
                 self.setup = Some(SetupScreen::new(self.shell_integration_status.as_ref()));
             }
+            Screen::MergePullRequest => {
+                // Entered explicitly from `DashboardAction::MergePullRequest`,
+                // which seeds `merge_pr` before flipping the screen. If we
+                // got here some other way (e.g. user navigated manually),
+                // bail back to the menu rather than render an empty shell.
+                if self.merge_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
         }
 
         if !matches!(screen, Screen::Delete) {
@@ -995,6 +1149,7 @@ impl App {
         self.delete = None;
         self.settings = None;
         self.setup = None;
+        self.merge_pr = None;
         self.mouse_selection = None;
     }
 
@@ -1541,6 +1696,60 @@ fn kick_off_clipboard_copy(
             success_message,
             error: result.err(),
         });
+    });
+}
+
+fn kick_off_fetch_pr_details(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    number: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::MergePrDetailsLoaded(Err(
+            "Could not resolve git root for PR details fetch.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .fetch_pr_details(number)
+            .await
+            .map(|details| MergePrDetailsPayload {
+                title: details.title,
+                body: details.body,
+            })
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::MergePrDetailsLoaded(result));
+    });
+}
+
+fn kick_off_merge_pull_request(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    number: u64,
+    subject: String,
+    body: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::MergePrFinished(Err(MergePrFailure {
+            number,
+            message: "Could not resolve git root for merge.".to_string(),
+        })));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = match service.merge_pull_request(number, &subject, &body).await {
+            Ok(()) => Ok(number),
+            Err(err) => Err(MergePrFailure {
+                number,
+                message: user_friendly_message(&err),
+            }),
+        };
+        let _ = tx.send(AppEvent::MergePrFinished(result));
     });
 }
 

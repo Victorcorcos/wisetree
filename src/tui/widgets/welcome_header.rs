@@ -27,6 +27,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::Create => Some("Create"),
             Screen::Dashboard => Some("Dashboard"),
             Screen::Delete => Some("Delete"),
+            Screen::MergePullRequest => Some("Merge Pull Request"),
             Screen::Settings => Some("Settings"),
             Screen::Setup => Some("Setup"),
         }

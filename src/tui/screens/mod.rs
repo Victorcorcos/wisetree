@@ -7,5 +7,6 @@ pub mod delete;
 pub mod error;
 pub mod loading;
 pub mod menu;
+pub mod merge_pr;
 pub mod settings;
 pub mod setup;

@@ -9,6 +9,7 @@ pub enum Screen {
     Create,
     Dashboard,
     Delete,
+    MergePullRequest,
     Settings,
     Setup,
 }
@@ -29,6 +30,7 @@ impl Screen {
             Self::Create => "create",
             Self::Dashboard => "dashboard",
             Self::Delete => "delete",
+            Self::MergePullRequest => "merge_pull_request",
             Self::Settings => "settings",
             Self::Setup => "setup",
         }
