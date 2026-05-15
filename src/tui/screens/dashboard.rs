@@ -51,29 +51,44 @@ pub struct MergePullRequestRequest {
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
-/// footer. Matches the labels produced by `status_label_and_style`.
+/// footer. `button_label` can differ from the row label when a shorter
+/// footer caption keeps narrow layouts readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkDeleteStatus {
     Merged,
     Opened,
+    Closed,
     Clean,
     Dirty,
 }
 
 impl BulkDeleteStatus {
-    pub const ALL: [BulkDeleteStatus; 4] = [
+    pub const ALL: [BulkDeleteStatus; 5] = [
         BulkDeleteStatus::Merged,
+        BulkDeleteStatus::Closed,
         BulkDeleteStatus::Opened,
         BulkDeleteStatus::Clean,
         BulkDeleteStatus::Dirty,
     ];
 
     pub fn label(self) -> &'static str {
+        self.row_label()
+    }
+
+    pub fn button_label(self) -> &'static str {
         match self {
             BulkDeleteStatus::Merged => "Merged",
-            BulkDeleteStatus::Opened => "Opened",
+            BulkDeleteStatus::Opened => "Open",
+            BulkDeleteStatus::Closed => "Closed",
             BulkDeleteStatus::Clean => "Clean",
             BulkDeleteStatus::Dirty => "Dirty",
+        }
+    }
+
+    fn row_label(self) -> &'static str {
+        match self {
+            BulkDeleteStatus::Opened => "Opened",
+            _ => self.button_label(),
         }
     }
 
@@ -81,6 +96,7 @@ impl BulkDeleteStatus {
         match self {
             BulkDeleteStatus::Merged => colors::SUCCESS,
             BulkDeleteStatus::Opened => colors::INFO,
+            BulkDeleteStatus::Closed => colors::GRAY_LIGHT,
             BulkDeleteStatus::Clean => colors::ACCENT,
             BulkDeleteStatus::Dirty => colors::ERROR,
         }
@@ -973,7 +989,9 @@ impl DashboardScreen {
             Span::styled("Opened", Style::default().fg(colors::INFO)),
             Span::styled(" = PR open  ", muted_dim),
             Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" = PR merged", muted_dim),
+            Span::styled(" = PR merged  ", muted_dim),
+            Span::styled("Closed", Style::default().fg(colors::GRAY_LIGHT)),
+            Span::styled(" = PR closed", muted_dim),
         ])
     }
 
@@ -1031,14 +1049,36 @@ impl DashboardScreen {
         // half-char of leftover space on one side.
         let gap: u16 = 2;
 
+        let mut visible_statuses = Vec::with_capacity(BulkDeleteStatus::ALL.len());
+        let mut used_width = prefix_width;
+        for status in BulkDeleteStatus::ALL {
+            let button_width = status.button_label().chars().count() as u16 + 4;
+            let required_width = if visible_statuses.is_empty() {
+                button_width
+            } else {
+                gap + button_width
+            };
+            if used_width.saturating_add(required_width) > area.width {
+                break;
+            }
+            visible_statuses.push(status);
+            used_width = used_width.saturating_add(required_width);
+        }
+
+        if let Some(focused) = self.bulk_focus {
+            if !visible_statuses.contains(&focused) {
+                self.bulk_focus = visible_statuses.last().copied();
+            }
+        }
+
         let mut constraints: Vec<Constraint> =
-            Vec::with_capacity(BulkDeleteStatus::ALL.len() * 2 + 2);
+            Vec::with_capacity(visible_statuses.len() * 2 + 2);
         constraints.push(Constraint::Length(prefix_width));
-        for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
+        for (index, status) in visible_statuses.iter().enumerate() {
             if index > 0 {
                 constraints.push(Constraint::Length(gap));
             }
-            let button_width = status.label().chars().count() as u16 + 4;
+            let button_width = status.button_label().chars().count() as u16 + 4;
             constraints.push(Constraint::Length(button_width));
         }
         constraints.push(Constraint::Min(0));
@@ -1063,7 +1103,7 @@ impl DashboardScreen {
             );
         }
 
-        for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
+        for (index, status) in visible_statuses.iter().enumerate() {
             // Column layout: prefix at 0, then alternating gap/button. The
             // first button is at index 1, subsequent buttons at index 1 + 2k.
             let col_index = 1 + index * 2;
@@ -1087,7 +1127,8 @@ impl DashboardScreen {
             };
             let border_style = Style::default().fg(status.color());
 
-            let button = Paragraph::new(Line::from(Span::styled(status.label(), text_style)))
+            let button =
+                Paragraph::new(Line::from(Span::styled(status.button_label(), text_style)))
                 .alignment(Alignment::Center)
                 .block(
                     Block::default()
@@ -1544,6 +1585,7 @@ fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
     match row.pull_request.as_ref().map(|pr| pr.state) {
         Some(PrState::Merged) => ("Merged", Style::default().fg(colors::SUCCESS)),
         Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),
+        Some(PrState::Closed) => ("Closed", Style::default().fg(colors::GRAY_LIGHT)),
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),
     }
@@ -1597,7 +1639,7 @@ fn opened_review_emoji(row: &DashboardRow) -> Option<&'static str> {
 
 fn row_matches_bulk_status(row: &DashboardRow, status: BulkDeleteStatus) -> bool {
     let (label, _) = status_label_and_style(row);
-    label == status.label()
+    label == status.row_label()
 }
 
 /// Returns the next focused bulk-delete button, or `None` to land back

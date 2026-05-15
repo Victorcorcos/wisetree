@@ -12,9 +12,9 @@ Worktree            Branch              Status           Ahead/Behind  Last Comm
 
 
 Narrow view: 1 hidden  •  PR #42 Open: Improve dashboard footer details for live workflows
-                              ┌────────┐  ┌────────┐  ┌───────┐  ┌───────┐
-Delete worktrees with status: │ Merged │  │ Opened │  │ Clean │  │ Dirty │
-                              └────────┘  └────────┘  └───────┘  └───────┘
+                              ┌────────┐  ┌────────┐  ┌──────┐  ┌───────┐  ┌───────┐
+Delete worktrees with status: │ Merged │  │ Closed │  │ Open │  │ Clean │  │ Dirty │
+                              └────────┘  └────────┘  └──────┘  └───────┘  └───────┘
 ↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear /
 Status: Mother = main worktree (protected)  Dirty = has uncommitted changes  Clean = no uncommitted changes  O
 PR Checks: ⚪ (Pending)  🟡 (Running)  🟢 (Passed)  🔴 (Failed)  ⚠️ (Errored)
