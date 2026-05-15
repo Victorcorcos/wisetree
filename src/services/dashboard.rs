@@ -24,8 +24,9 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const GH_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long a cached PR record stays fresh when the branch HEAD hasn't moved.
 /// Catches remote-only changes (merge, close, title edit) without hammering
-/// the API.
-const PR_CACHE_TTL_MS: u64 = 30 * 1000;
+/// the API. The Status column countdown anchors to this so the displayed
+/// timer matches when the next real GraphQL refetch will happen.
+pub const PR_CACHE_TTL_MS: u64 = 30 * 1000;
 /// How long to suspend PR fetches after a rate-limit error.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
@@ -59,6 +60,16 @@ pub enum CheckStatus {
     Errored,
 }
 
+/// Aggregated review status for the PR, derived from GitHub's
+/// `reviewDecision` plus pending reviewer requests. Drives the secondary
+/// emoji rendered next to the check status in the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
@@ -71,6 +82,12 @@ pub struct PullRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub checks_status: Option<CheckStatus>,
+    #[serde(
+        rename = "reviewStatus",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub review_status: Option<ReviewStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,22 +132,30 @@ impl DashboardNotice {
 
 /// Discriminates the two row emissions per refresh cycle so the UI can
 /// tell apart git-only data from gh-enriched data (PR state + CI checks).
+/// `WithPRs` carries a `fetched` flag: `true` when this tick made a real
+/// GraphQL call, `false` when every branch was served from cache. The UI
+/// uses this to anchor the Status countdown only to real fetches.
 #[derive(Debug)]
 pub enum DashboardUpdate {
     GitOnly(Vec<DashboardRow>),
-    WithPRs(Vec<DashboardRow>),
+    WithPRs {
+        rows: Vec<DashboardRow>,
+        fetched: bool,
+    },
 }
 
 impl DashboardUpdate {
     pub fn rows(&self) -> &Vec<DashboardRow> {
         match self {
-            Self::GitOnly(rows) | Self::WithPRs(rows) => rows,
+            Self::GitOnly(rows) => rows,
+            Self::WithPRs { rows, .. } => rows,
         }
     }
 
     pub fn into_rows(self) -> Vec<DashboardRow> {
         match self {
-            Self::GitOnly(rows) | Self::WithPRs(rows) => rows,
+            Self::GitOnly(rows) => rows,
+            Self::WithPRs { rows, .. } => rows,
         }
     }
 }
@@ -262,10 +287,14 @@ impl DashboardService {
                             break;
                         }
                         if service.pr_enrichment_enabled() {
-                            service.refresh_pull_requests(&rows).await;
+                            let fetched = service.refresh_pull_requests(&rows).await;
                             service.apply_cached_prs(&mut rows);
                             service.save_cache();
-                            if rows_tx.send(DashboardUpdate::WithPRs(rows)).await.is_err() {
+                            if rows_tx
+                                .send(DashboardUpdate::WithPRs { rows, fetched })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -516,15 +545,32 @@ impl DashboardService {
 
     /// Decide which branches need a PR refresh, then (if any) issue a single
     /// batched GraphQL request and update the cache.
-    async fn refresh_pull_requests(&self, rows: &[DashboardRow]) {
+    ///
+    /// Returns `true` only on a *scheduled* full-cycle refresh — i.e., when
+    /// the oldest cached entry has aged past `PR_CACHE_TTL_MS` (or the cache
+    /// is empty) and every branch is brought back in sync. Off-cycle fetches
+    /// triggered by a brand-new branch or a SHA change return `false` and
+    /// stay invisible to the UI, so the Status countdown anchors to a stable
+    /// rhythm instead of resetting whenever a single branch happens to be
+    /// fetched.
+    async fn refresh_pull_requests(&self, rows: &[DashboardRow]) -> bool {
         if !self.pr_enrichment_enabled() {
-            return;
+            return false;
         }
         if self.is_rate_limited() {
-            return;
+            return false;
         }
 
         let now = now_ms();
+        let scheduled_due = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state.entries.is_empty()
+                || state
+                    .entries
+                    .values()
+                    .any(|e| now.saturating_sub(e.fetched_at_ms) > PR_CACHE_TTL_MS)
+        };
+
         let to_fetch: Vec<(String, String)> = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
             rows.iter()
@@ -535,10 +581,7 @@ impl DashboardService {
                         return None;
                     }
                     let needs = match state.entries.get(&branch) {
-                        Some(entry) => {
-                            entry.sha != sha
-                                || now.saturating_sub(entry.fetched_at_ms) > PR_CACHE_TTL_MS
-                        }
+                        Some(entry) => entry.sha != sha || scheduled_due,
                         None => true,
                     };
                     needs.then_some((branch, sha))
@@ -547,11 +590,11 @@ impl DashboardService {
         };
 
         if to_fetch.is_empty() {
-            return;
+            return false;
         }
 
         let Some((owner, repo)) = self.resolve_repo_slug().await else {
-            return;
+            return false;
         };
 
         let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
@@ -573,6 +616,7 @@ impl DashboardService {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
+                scheduled_due
             }
             Err(err) => {
                 if is_rate_limit_error(&err) {
@@ -583,6 +627,7 @@ impl DashboardService {
                 // Failures fall back to cached or empty PR data. Surface a
                 // single dashboard-level notice instead of per-row errors,
                 // because this GraphQL request covers every branch at once.
+                false
             }
         }
     }
@@ -824,7 +869,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -897,12 +942,40 @@ fn parse_graphql_response(
                     .and_then(|c| c.commit)
                     .and_then(|c| c.status_check_rollup)
                     .and_then(|r| aggregate_checks(&r.contexts.nodes));
+                let requested_user_logins: HashSet<String> = node
+                    .review_requests
+                    .nodes
+                    .iter()
+                    .filter_map(|r| {
+                        r.requested_reviewer.as_ref().and_then(|rev| {
+                            if rev.typename == "User" {
+                                rev.login.clone()
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect();
+                let changes_requested_logins: HashSet<String> = node
+                    .latest_opinionated_reviews
+                    .nodes
+                    .iter()
+                    .filter(|r| r.state.as_deref() == Some("CHANGES_REQUESTED"))
+                    .filter_map(|r| r.author.as_ref().and_then(|a| a.login.clone()))
+                    .collect();
+                let review_status = derive_review_status(
+                    node.review_decision.as_deref(),
+                    node.review_requests.total_count,
+                    &changes_requested_logins,
+                    &requested_user_logins,
+                );
                 PullRequest {
                     number: node.number,
                     state,
                     url: node.url,
                     title: node.title,
                     checks_status,
+                    review_status,
                 }
             });
         out.insert((*branch).to_string(), pr);
@@ -946,6 +1019,42 @@ struct GhCommits {
     #[serde(default)]
     nodes: Vec<GhCommitWrapper>,
 }
+#[derive(Deserialize, Default)]
+struct GhReviewRequests {
+    #[serde(rename = "totalCount", default)]
+    total_count: u64,
+    #[serde(default)]
+    nodes: Vec<GhReviewRequestNode>,
+}
+#[derive(Deserialize, Default)]
+struct GhReviewRequestNode {
+    #[serde(rename = "requestedReviewer", default)]
+    requested_reviewer: Option<GhRequestedReviewer>,
+}
+#[derive(Deserialize, Default)]
+struct GhRequestedReviewer {
+    #[serde(rename = "__typename", default)]
+    typename: String,
+    #[serde(default)]
+    login: Option<String>,
+}
+#[derive(Deserialize, Default)]
+struct GhOpinionatedReviews {
+    #[serde(default)]
+    nodes: Vec<GhOpinionatedReviewNode>,
+}
+#[derive(Deserialize, Default)]
+struct GhOpinionatedReviewNode {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    author: Option<GhReviewAuthor>,
+}
+#[derive(Deserialize, Default)]
+struct GhReviewAuthor {
+    #[serde(default)]
+    login: Option<String>,
+}
 #[derive(Deserialize)]
 struct GhNode {
     number: u64,
@@ -954,6 +1063,12 @@ struct GhNode {
     title: String,
     #[serde(rename = "isDraft")]
     is_draft: bool,
+    #[serde(rename = "reviewDecision", default)]
+    review_decision: Option<String>,
+    #[serde(rename = "reviewRequests", default)]
+    review_requests: GhReviewRequests,
+    #[serde(rename = "latestOpinionatedReviews", default)]
+    latest_opinionated_reviews: GhOpinionatedReviews,
     #[serde(default)]
     commits: GhCommits,
 }
@@ -1037,6 +1152,41 @@ fn check_priority(status: CheckStatus) -> u8 {
         CheckStatus::Running => 2,
         CheckStatus::Errored => 3,
         CheckStatus::Failed => 4,
+    }
+}
+
+/// Translate GitHub's `reviewDecision` (plus the still-pending reviewer
+/// requests and the users who left CHANGES_REQUESTED reviews) into a
+/// [`ReviewStatus`]. Returns `None` when no one has been asked to review yet
+/// so the dashboard renders nothing.
+///
+/// When a reviewer leaves CHANGES_REQUESTED and the author later re-requests
+/// their review, GitHub keeps `reviewDecision` as `CHANGES_REQUESTED` even
+/// though the PR is back in "Awaiting requested review" — the decision only
+/// flips after the reviewer leaves a fresh review. We detect that case by
+/// checking whether every user who left CHANGES_REQUESTED is currently
+/// listed in the outstanding `reviewRequests`, and surface Pending so the
+/// dashboard matches what the GitHub UI shows in the Reviewers section.
+fn derive_review_status(
+    decision: Option<&str>,
+    pending_requests: u64,
+    changes_requested_logins: &HashSet<String>,
+    requested_user_logins: &HashSet<String>,
+) -> Option<ReviewStatus> {
+    match decision {
+        Some("APPROVED") => Some(ReviewStatus::Approved),
+        Some("CHANGES_REQUESTED") => {
+            if !changes_requested_logins.is_empty()
+                && changes_requested_logins.is_subset(requested_user_logins)
+            {
+                Some(ReviewStatus::Pending)
+            } else {
+                Some(ReviewStatus::Rejected)
+            }
+        }
+        Some("REVIEW_REQUIRED") => Some(ReviewStatus::Pending),
+        _ if pending_requests > 0 => Some(ReviewStatus::Pending),
+        _ => None,
     }
 }
 
@@ -1375,6 +1525,237 @@ mod tests {
             out.get("feat").unwrap().as_ref().unwrap().checks_status,
             None
         );
+    }
+
+    #[test]
+    fn graphql_query_includes_review_fields() {
+        let q = build_graphql_query("owner", "repo", &["feat"]);
+        assert!(
+            q.contains("reviewDecision"),
+            "query must request reviewDecision so we can render the review emoji: {q}"
+        );
+        assert!(
+            q.contains("reviewRequests(first: 100)"),
+            "query must request reviewRequests with reviewer logins to detect re-requests: {q}"
+        );
+        assert!(q.contains("requestedReviewer"));
+        assert!(
+            q.contains("latestOpinionatedReviews"),
+            "query must request latestOpinionatedReviews so we know who left CHANGES_REQUESTED: {q}"
+        );
+        assert!(q.contains("totalCount"));
+    }
+
+    fn logins<I: IntoIterator<Item = &'static str>>(values: I) -> HashSet<String> {
+        values.into_iter().map(String::from).collect()
+    }
+
+    #[test]
+    fn derive_review_status_maps_known_decisions() {
+        let empty = HashSet::new();
+        assert_eq!(
+            derive_review_status(Some("APPROVED"), 0, &empty, &empty),
+            Some(ReviewStatus::Approved)
+        );
+        assert_eq!(
+            derive_review_status(Some("CHANGES_REQUESTED"), 0, &logins(["alice"]), &empty),
+            Some(ReviewStatus::Rejected)
+        );
+        assert_eq!(
+            derive_review_status(Some("REVIEW_REQUIRED"), 0, &empty, &empty),
+            Some(ReviewStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn derive_review_status_flips_to_pending_when_author_re_requests_changes_reviewer() {
+        // GitHub keeps reviewDecision = CHANGES_REQUESTED after the author
+        // re-requests the rejecting reviewer; we detect that by seeing every
+        // CHANGES_REQUESTED user listed back in reviewRequests and surface
+        // Pending to mirror what the Reviewers panel shows.
+        let changes = logins(["mrprey"]);
+        let pending = logins(["mrprey", "tiagogoncalves"]);
+        assert_eq!(
+            derive_review_status(Some("CHANGES_REQUESTED"), 2, &changes, &pending),
+            Some(ReviewStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn derive_review_status_stays_rejected_when_changes_requester_not_re_requested() {
+        // Some reviewers are still pending initial review, but the user who
+        // rejected hasn't been re-requested — author still needs to react,
+        // so we keep Rejected.
+        let changes = logins(["alice"]);
+        let pending = logins(["bob"]);
+        assert_eq!(
+            derive_review_status(Some("CHANGES_REQUESTED"), 1, &changes, &pending),
+            Some(ReviewStatus::Rejected)
+        );
+    }
+
+    #[test]
+    fn derive_review_status_uses_pending_requests_when_decision_missing() {
+        let empty = HashSet::new();
+        assert_eq!(
+            derive_review_status(None, 2, &empty, &empty),
+            Some(ReviewStatus::Pending),
+            "null decision with outstanding reviewer requests must surface as Pending"
+        );
+        assert_eq!(
+            derive_review_status(None, 0, &empty, &empty),
+            None,
+            "null decision with no requests means nobody was asked yet"
+        );
+    }
+
+    #[test]
+    fn derive_review_status_treats_unknown_decision_as_none_unless_pending() {
+        let empty = HashSet::new();
+        assert_eq!(
+            derive_review_status(Some("COMMENTED"), 0, &empty, &empty),
+            None
+        );
+        assert_eq!(
+            derive_review_status(Some("COMMENTED"), 1, &empty, &empty),
+            Some(ReviewStatus::Pending),
+            "outstanding requests still surface as pending even when decision is unrecognized"
+        );
+    }
+
+    #[test]
+    fn parses_graphql_response_with_review_decision() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 11,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false,
+                "reviewDecision": "APPROVED",
+                "reviewRequests": {"totalCount": 0}
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.review_status, Some(ReviewStatus::Approved));
+    }
+
+    #[test]
+    fn parses_graphql_response_treats_outstanding_requests_as_pending() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 12,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false,
+                "reviewDecision": null,
+                "reviewRequests": {"totalCount": 3}
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.review_status, Some(ReviewStatus::Pending));
+    }
+
+    #[test]
+    fn parses_graphql_response_treats_re_requested_changes_reviewer_as_pending() {
+        // PR has reviewDecision = CHANGES_REQUESTED from Mrprey, but the
+        // author re-requested Mrprey's review, so Mrprey is back in
+        // reviewRequests. The dashboard must render "Pending" (✋), not
+        // "Rejected" (👎), matching what GitHub's Reviewers panel shows.
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 4288,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false,
+                "reviewDecision": "CHANGES_REQUESTED",
+                "reviewRequests": {
+                  "totalCount": 2,
+                  "nodes": [
+                    {"requestedReviewer": {"__typename": "User", "login": "tiagogoncalves"}},
+                    {"requestedReviewer": {"__typename": "User", "login": "mrprey"}}
+                  ]
+                },
+                "latestOpinionatedReviews": {
+                  "nodes": [
+                    {"state": "CHANGES_REQUESTED", "author": {"login": "mrprey"}}
+                  ]
+                }
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.review_status, Some(ReviewStatus::Pending));
+    }
+
+    #[test]
+    fn parses_graphql_response_keeps_rejected_when_changes_reviewer_not_re_requested() {
+        // CHANGES_REQUESTED reviewer is not back in reviewRequests, so the
+        // author still owes them a response — keep Rejected.
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 1,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false,
+                "reviewDecision": "CHANGES_REQUESTED",
+                "reviewRequests": {
+                  "totalCount": 1,
+                  "nodes": [
+                    {"requestedReviewer": {"__typename": "User", "login": "bob"}}
+                  ]
+                },
+                "latestOpinionatedReviews": {
+                  "nodes": [
+                    {"state": "CHANGES_REQUESTED", "author": {"login": "alice"}}
+                  ]
+                }
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.review_status, Some(ReviewStatus::Rejected));
+    }
+
+    #[test]
+    fn parses_graphql_response_without_review_fields_keeps_status_none() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 13,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.review_status, None);
     }
 
     #[test]

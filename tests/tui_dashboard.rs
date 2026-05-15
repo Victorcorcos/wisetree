@@ -6,7 +6,7 @@ use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::messages::colors;
 use wisetree::services::{
     CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState,
-    PullRequest,
+    PullRequest, ReviewStatus,
 };
 use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 
@@ -88,6 +88,7 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
         url: "https://github.com/example/repo/pull/42".into(),
         title: "Improve dashboard footer details for live workflows".into(),
         checks_status: None,
+        review_status: None,
     });
     row
 }
@@ -104,6 +105,29 @@ fn row_with_check(path: &str, branch: &str, is_clean: bool, checks: CheckStatus)
     let mut row = row_with_pr(path, branch, is_clean);
     if let Some(pr) = row.pull_request.as_mut() {
         pr.checks_status = Some(checks);
+    }
+    row
+}
+
+fn row_with_review(path: &str, branch: &str, is_clean: bool, review: ReviewStatus) -> DashboardRow {
+    let mut row = row_with_pr(path, branch, is_clean);
+    if let Some(pr) = row.pull_request.as_mut() {
+        pr.review_status = Some(review);
+    }
+    row
+}
+
+fn row_with_check_and_review(
+    path: &str,
+    branch: &str,
+    is_clean: bool,
+    checks: CheckStatus,
+    review: ReviewStatus,
+) -> DashboardRow {
+    let mut row = row_with_pr(path, branch, is_clean);
+    if let Some(pr) = row.pull_request.as_mut() {
+        pr.checks_status = Some(checks);
+        pr.review_status = Some(review);
     }
     row
 }
@@ -453,6 +477,142 @@ fn opened_pr_with_running_checks_renders_yellow_circle() {
 }
 
 #[test]
+fn opened_pr_with_pending_review_renders_raised_hand() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_review("/tmp/repo-bug", "bug", false, ReviewStatus::Pending),
+    ]);
+    let dumped = dump_lines(120, 14, |f| screen.render(f, f.area()));
+    let opened_row = dumped
+        .lines()
+        .find(|line| line.contains("repo-bug") && line.contains("Opened"))
+        .unwrap_or_else(|| panic!("missing row with `Opened` label: {dumped}"));
+    assert!(
+        opened_row.contains("Opened ✋"),
+        "Status cell must include the pending-review hand: {opened_row}"
+    );
+}
+
+#[test]
+fn opened_pr_with_running_check_and_approved_review_renders_both_emojis() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_check_and_review(
+            "/tmp/repo-bug",
+            "bug",
+            false,
+            CheckStatus::Running,
+            ReviewStatus::Approved,
+        ),
+    ]);
+    let dumped = dump_lines(120, 14, |f| screen.render(f, f.area()));
+    let opened_row = dumped
+        .lines()
+        .find(|line| line.contains("repo-bug") && line.contains("Opened"))
+        .unwrap_or_else(|| panic!("missing row with `Opened` label: {dumped}"));
+    // ratatui pads each 2-column emoji with a continuation cell, so the
+    // grapheme dump shows an extra space between the two emojis.
+    assert!(
+        opened_row.contains("Opened 🟡") && opened_row.contains("👍"),
+        "Status cell must include both drone and review emojis: {opened_row}"
+    );
+    let drone_pos = opened_row.find("🟡").unwrap();
+    let review_pos = opened_row.find("👍").unwrap();
+    assert!(
+        drone_pos < review_pos,
+        "Drone emoji must render to the LEFT of review emoji: {opened_row}"
+    );
+}
+
+#[test]
+fn opened_pr_with_passed_check_and_rejected_review_renders_thumbs_down() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_check_and_review(
+            "/tmp/repo-bug",
+            "bug",
+            false,
+            CheckStatus::Passed,
+            ReviewStatus::Rejected,
+        ),
+    ]);
+    let dumped = dump_lines(120, 14, |f| screen.render(f, f.area()));
+    let opened_row = dumped
+        .lines()
+        .find(|line| line.contains("repo-bug") && line.contains("Opened"))
+        .unwrap_or_else(|| panic!("missing row with `Opened` label: {dumped}"));
+    assert!(
+        opened_row.contains("Opened 🟢") && opened_row.contains("👎"),
+        "Status cell must show drone + changes-requested thumb: {opened_row}"
+    );
+    let drone_pos = opened_row.find("🟢").unwrap();
+    let review_pos = opened_row.find("👎").unwrap();
+    assert!(
+        drone_pos < review_pos,
+        "Drone emoji must render to the LEFT of review emoji: {opened_row}"
+    );
+}
+
+#[test]
+fn merged_pr_with_review_status_still_renders_plain_label() {
+    // Review emoji must only surface for Open PRs. Stale review data on a
+    // merged PR (e.g. left over from before the merge) should never show
+    // up in the Merged label.
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+        5000,
+    );
+    let mut merged = row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Merged);
+    if let Some(pr) = merged.pull_request.as_mut() {
+        pr.review_status = Some(ReviewStatus::Approved);
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), merged]);
+    let dumped = dump_lines(120, 14, |f| screen.render(f, f.area()));
+    let merged_row = dumped
+        .lines()
+        .find(|line| line.contains("repo-bug") && line.contains("Merged"))
+        .unwrap_or_else(|| panic!("missing row with `Merged` label: {dumped}"));
+    for emoji in ["✋", "👍", "👎"] {
+        assert!(
+            !merged_row.contains(emoji),
+            "Merged row must not surface review emoji {emoji}: {merged_row}"
+        );
+    }
+}
+
+#[test]
 fn opened_pr_with_failed_checks_renders_red_circle() {
     let mut screen = DashboardScreen::new(
         true,
@@ -489,12 +649,15 @@ fn opened_pr_without_checks_keeps_plain_label() {
         row("/tmp/repo", "main", true),
         row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open),
     ]);
-    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
-    assert!(dumped.contains("Opened"));
+    let dumped = dump_lines(120, 14, |f| screen.render(f, f.area()));
+    let opened_row = dumped
+        .lines()
+        .find(|line| line.contains("repo-bug") && line.contains("Opened"))
+        .unwrap_or_else(|| panic!("missing row with `Opened` label: {dumped}"));
     for emoji in ["⚪", "🟡", "🟢", "🔴", "⚠"] {
         assert!(
-            !dumped.contains(emoji),
-            "rendered table must not contain {emoji} for an Opened PR with no checks: {dumped}"
+            !opened_row.contains(emoji),
+            "Status cell must not contain {emoji} for an Opened PR with no checks: {opened_row}"
         );
     }
 }
@@ -570,8 +733,8 @@ fn table_uses_available_height_before_scrolling() {
     screen.set_rows(rows);
 
     // Height must fit exactly: 4 (banner/search) + 13 (header + 12 rows)
-    // + 8 (8-line footer with bordered bulk-delete buttons row + checks legend).
-    let dumped = dump(120, 25, |f| screen.render(f, f.area()));
+    // + 9 (9-line footer with bordered bulk-delete buttons row + checks/reviews legends).
+    let dumped = dump(120, 26, |f| screen.render(f, f.area()));
     assert!(dumped.contains("repo-11"));
     assert!(!dumped.contains("more above"));
     assert!(!dumped.contains("more below"));
@@ -603,8 +766,8 @@ fn overflow_rows_show_more_above_and_below_indicators() {
     }
 
     // Height must fit: 4 (banner/search) + 13 (header + 2 overflow + 10 rows)
-    // + 8 (8-line footer with Status / Checks / Ahead-Behind legends).
-    let dumped = dump(120, 25, |f| screen.render(f, f.area()));
+    // + 9 (9-line footer with Status / Checks / Reviews / Ahead-Behind legends).
+    let dumped = dump(120, 26, |f| screen.render(f, f.area()));
     assert!(dumped.contains("more above"));
     assert!(dumped.contains("more below"));
 }
@@ -629,6 +792,42 @@ fn footer_includes_checks_legend_with_all_circles() {
             "missing {emoji} in legend: {dumped}"
         );
     }
+}
+
+#[test]
+fn footer_includes_reviews_legend_below_checks_legend() {
+    let mut screen = ready_screen(true);
+    let dumped = dump_lines(140, 22, |f| screen.render(f, f.area()));
+
+    let reviews_line = dumped
+        .lines()
+        .find(|line| line.contains("PR Reviews:"))
+        .unwrap_or_else(|| panic!("missing PR Reviews legend: {dumped}"));
+    for emoji in ["✋", "👍", "👎"] {
+        assert!(
+            reviews_line.contains(emoji),
+            "missing {emoji} in PR Reviews legend: {reviews_line}"
+        );
+    }
+    for label in ["Pending", "Approved", "Changes Requested"] {
+        assert!(
+            reviews_line.contains(label),
+            "missing {label} in PR Reviews legend: {reviews_line}"
+        );
+    }
+
+    let checks_line_no = dumped
+        .lines()
+        .position(|line| line.contains("PR Checks:"))
+        .unwrap();
+    let reviews_line_no = dumped
+        .lines()
+        .position(|line| line.contains("PR Reviews:"))
+        .unwrap();
+    assert!(
+        checks_line_no < reviews_line_no,
+        "PR Reviews legend must render below PR Checks legend"
+    );
 }
 
 #[test]
@@ -704,7 +903,7 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
 
     insta::assert_snapshot!(
         "dashboard_wide_pr_footer",
-        dump_lines(110, 17, |f| screen.render(f, f.area()))
+        dump_lines(110, 18, |f| screen.render(f, f.area()))
     );
 }
 
@@ -734,6 +933,6 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
 
     insta::assert_snapshot!(
         "dashboard_narrow_collapsed_columns",
-        dump_lines(72, 17, |f| screen.render(f, f.area()))
+        dump_lines(72, 18, |f| screen.render(f, f.area()))
     );
 }
