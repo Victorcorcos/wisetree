@@ -27,8 +27,9 @@ const GH_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(8);
 const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a cached PR record stays fresh when the branch HEAD hasn't moved.
 /// Catches remote-only changes (merge, close, title edit) without hammering
-/// the API.
-const PR_CACHE_TTL_MS: u64 = 30 * 1000;
+/// the API. The Status column countdown anchors to this so the displayed
+/// timer matches when the next real GraphQL refetch will happen.
+pub const PR_CACHE_TTL_MS: u64 = 30 * 1000;
 /// How long to suspend PR fetches after a rate-limit error.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
@@ -144,22 +145,30 @@ impl DashboardNotice {
 
 /// Discriminates the two row emissions per refresh cycle so the UI can
 /// tell apart git-only data from gh-enriched data (PR state + CI checks).
+/// `WithPRs` carries a `fetched` flag: `true` when this tick made a real
+/// GraphQL call, `false` when every branch was served from cache. The UI
+/// uses this to anchor the Status countdown only to real fetches.
 #[derive(Debug)]
 pub enum DashboardUpdate {
     GitOnly(Vec<DashboardRow>),
-    WithPRs(Vec<DashboardRow>),
+    WithPRs {
+        rows: Vec<DashboardRow>,
+        fetched: bool,
+    },
 }
 
 impl DashboardUpdate {
     pub fn rows(&self) -> &Vec<DashboardRow> {
         match self {
-            Self::GitOnly(rows) | Self::WithPRs(rows) => rows,
+            Self::GitOnly(rows) => rows,
+            Self::WithPRs { rows, .. } => rows,
         }
     }
 
     pub fn into_rows(self) -> Vec<DashboardRow> {
         match self {
-            Self::GitOnly(rows) | Self::WithPRs(rows) => rows,
+            Self::GitOnly(rows) => rows,
+            Self::WithPRs { rows, .. } => rows,
         }
     }
 }
@@ -291,10 +300,14 @@ impl DashboardService {
                             break;
                         }
                         if service.pr_enrichment_enabled() {
-                            service.refresh_pull_requests(&rows).await;
+                            let fetched = service.refresh_pull_requests(&rows).await;
                             service.apply_cached_prs(&mut rows);
                             service.save_cache();
-                            if rows_tx.send(DashboardUpdate::WithPRs(rows)).await.is_err() {
+                            if rows_tx
+                                .send(DashboardUpdate::WithPRs { rows, fetched })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -603,15 +616,32 @@ impl DashboardService {
 
     /// Decide which branches need a PR refresh, then (if any) issue a single
     /// batched GraphQL request and update the cache.
-    async fn refresh_pull_requests(&self, rows: &[DashboardRow]) {
+    ///
+    /// Returns `true` only on a *scheduled* full-cycle refresh — i.e., when
+    /// the oldest cached entry has aged past `PR_CACHE_TTL_MS` (or the cache
+    /// is empty) and every branch is brought back in sync. Off-cycle fetches
+    /// triggered by a brand-new branch or a SHA change return `false` and
+    /// stay invisible to the UI, so the Status countdown anchors to a stable
+    /// rhythm instead of resetting whenever a single branch happens to be
+    /// fetched.
+    async fn refresh_pull_requests(&self, rows: &[DashboardRow]) -> bool {
         if !self.pr_enrichment_enabled() {
-            return;
+            return false;
         }
         if self.is_rate_limited() {
-            return;
+            return false;
         }
 
         let now = now_ms();
+        let scheduled_due = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state.entries.is_empty()
+                || state
+                    .entries
+                    .values()
+                    .any(|e| now.saturating_sub(e.fetched_at_ms) > PR_CACHE_TTL_MS)
+        };
+
         let to_fetch: Vec<(String, String)> = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
             rows.iter()
@@ -622,10 +652,7 @@ impl DashboardService {
                         return None;
                     }
                     let needs = match state.entries.get(&branch) {
-                        Some(entry) => {
-                            entry.sha != sha
-                                || now.saturating_sub(entry.fetched_at_ms) > PR_CACHE_TTL_MS
-                        }
+                        Some(entry) => entry.sha != sha || scheduled_due,
                         None => true,
                     };
                     needs.then_some((branch, sha))
@@ -634,11 +661,11 @@ impl DashboardService {
         };
 
         if to_fetch.is_empty() {
-            return;
+            return false;
         }
 
         let Some((owner, repo)) = self.resolve_repo_slug().await else {
-            return;
+            return false;
         };
 
         let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
@@ -660,6 +687,7 @@ impl DashboardService {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
+                scheduled_due
             }
             Err(err) => {
                 if is_rate_limit_error(&err) {
@@ -670,6 +698,7 @@ impl DashboardService {
                 // Failures fall back to cached or empty PR data. Surface a
                 // single dashboard-level notice instead of per-row errors,
                 // because this GraphQL request covers every branch at once.
+                false
             }
         }
     }
