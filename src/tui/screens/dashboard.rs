@@ -12,6 +12,7 @@ use ratatui::Frame;
 use crate::messages::colors;
 use crate::services::{
     CheckStatus, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState, ReviewStatus,
+    PR_CACHE_TTL_MS,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
@@ -765,7 +766,13 @@ impl DashboardScreen {
     }
 
     fn status_header_cell(&self) -> Cell<'static> {
-        let refresh_interval_secs = (self.refresh_interval_ms / 1000).max(1);
+        // Anchor the countdown to whichever interval gates the next *real*
+        // GraphQL refetch: the dashboard tick or the PR cache TTL, whichever
+        // is longer. `gh_refreshed_at` is only updated when an actual fetch
+        // succeeds (not on cached ticks), so this honestly represents when
+        // the displayed Status will next change.
+        let countdown_ms = self.refresh_interval_ms.max(PR_CACHE_TTL_MS);
+        let countdown_secs = (countdown_ms / 1000).max(1);
         match self.gh_refreshed_at {
             None => Cell::from("Status"),
             Some(instant) => {
@@ -778,7 +785,7 @@ impl DashboardScreen {
                             .add_modifier(Modifier::BOLD),
                     )]))
                 } else {
-                    let remaining = refresh_interval_secs.saturating_sub(elapsed);
+                    let remaining = countdown_secs.saturating_sub(elapsed);
                     let label = if remaining == 0 {
                         "Status (✔)".to_string()
                     } else {
