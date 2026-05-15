@@ -1088,7 +1088,6 @@ impl App {
                     columns,
                     warnings,
                     service.pr_enrichment_enabled(),
-                    config.refresh_interval_ms,
                 ));
                 self.dashboard_watch = Some(service.watch());
             }
@@ -1212,15 +1211,13 @@ impl App {
 
         if let Some(screen) = self.dashboard.as_mut() {
             for update in updates_batch {
-                // Only anchor the Status countdown to *real* GraphQL fetches.
-                // Cached WithPRs ticks would otherwise reset the timer every
-                // 5s while showing data that's actually up to PR_CACHE_TTL_MS
-                // old, which is the misleading-countdown bug.
-                let did_fetch = matches!(update, DashboardUpdate::WithPRs { fetched: true, .. });
-                screen.set_rows(update.into_rows());
-                if did_fetch {
-                    screen.mark_gh_refreshed();
+                if let DashboardUpdate::WithPRs {
+                    next_pr_fetch_at, ..
+                } = &update
+                {
+                    screen.set_next_pr_fetch_at(*next_pr_fetch_at);
                 }
+                screen.set_rows(update.into_rows());
             }
         }
         let has_rows = self

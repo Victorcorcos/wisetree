@@ -145,7 +145,6 @@ fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
         ],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -164,7 +163,6 @@ fn loading_render_shows_loading_message() {
         vec!["branch".into()],
         Vec::new(),
         false,
-        5000,
     );
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
     assert!(dumped.contains("Loading dashboard"));
@@ -179,7 +177,6 @@ fn empty_state_renders_no_worktrees_found() {
         vec!["branch".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![]);
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
@@ -293,7 +290,6 @@ fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     plain.set_rows(vec![row("/tmp/repo", "main", true)]);
     plain.handle_key(key(KeyCode::Enter));
@@ -399,7 +395,6 @@ fn opened_pr_row_renders_opened_status_in_info_palette() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -431,7 +426,6 @@ fn merged_pr_row_renders_merged_status_in_success_palette() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -463,7 +457,6 @@ fn opened_pr_with_running_checks_renders_yellow_circle() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -485,7 +478,6 @@ fn opened_pr_with_pending_review_renders_raised_hand() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -511,7 +503,6 @@ fn opened_pr_with_running_check_and_approved_review_renders_both_emojis() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -551,7 +542,6 @@ fn opened_pr_with_passed_check_and_rejected_review_renders_thumbs_down() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -592,7 +582,6 @@ fn merged_pr_with_review_status_still_renders_plain_label() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     let mut merged = row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Merged);
     if let Some(pr) = merged.pull_request.as_mut() {
@@ -621,7 +610,6 @@ fn opened_pr_with_failed_checks_renders_red_circle() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -643,7 +631,6 @@ fn opened_pr_without_checks_keeps_plain_label() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -674,7 +661,6 @@ fn search_matches_opened_for_rows_with_check_circles() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -696,7 +682,6 @@ fn search_matches_opened_status_text() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -719,7 +704,6 @@ fn table_uses_available_height_before_scrolling() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     let rows: Vec<DashboardRow> = (0..12)
         .map(|index| {
@@ -749,7 +733,6 @@ fn overflow_rows_show_more_above_and_below_indicators() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     let rows: Vec<DashboardRow> = (0..15)
         .map(|index| {
@@ -839,7 +822,6 @@ fn selected_row_warning_is_rendered_in_footer() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     let mut broken = row("/tmp/repo-bug", "bug", false);
     broken.error = Some("status timed out".into());
@@ -860,7 +842,6 @@ fn dashboard_notice_renders_in_footer_detail_slot() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -893,7 +874,6 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
         ],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -922,7 +902,6 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
         ],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -952,7 +931,6 @@ fn action_menu_shows_merge_option_for_open_pr_row() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -976,7 +954,6 @@ fn action_menu_hides_merge_option_for_merged_pr_row() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -1001,7 +978,6 @@ fn action_menu_hides_merge_option_for_closed_pr_row() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -1021,7 +997,6 @@ fn action_menu_hides_merge_option_for_draft_pr_row() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -1041,7 +1016,6 @@ fn action_menu_hides_merge_option_when_no_pr_present() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
