@@ -12,7 +12,7 @@ use ratatui::Frame;
 use crate::messages::colors;
 use crate::services::{
     CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState,
-    ReviewStatus, PR_CACHE_TTL_MS,
+    ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
@@ -172,9 +172,8 @@ pub struct DashboardScreen {
     warnings: Vec<String>,
     notice: Option<DashboardNotice>,
     refreshed_at: Option<Instant>,
-    gh_refreshed_at: Option<Instant>,
+    next_pr_fetch_at: Option<Instant>,
     pr_enrichment_enabled: bool,
-    refresh_interval_ms: u64,
     /// `Some` while the bulk-delete buttons row owns the keyboard focus.
     /// Tab moves through buttons in `BulkDeleteStatus::ALL` order; Esc
     /// returns focus to the table.
@@ -193,7 +192,6 @@ impl DashboardScreen {
         columns: Vec<String>,
         warnings: Vec<String>,
         pr_enrichment_enabled: bool,
-        refresh_interval_ms: u64,
     ) -> Self {
         Self {
             rows: Vec::new(),
@@ -214,9 +212,8 @@ impl DashboardScreen {
             warnings,
             notice: None,
             refreshed_at: None,
-            gh_refreshed_at: None,
+            next_pr_fetch_at: None,
             pr_enrichment_enabled,
-            refresh_interval_ms,
             bulk_focus: None,
             bulk_button_rects: Vec::new(),
             tick: 0,
@@ -237,8 +234,8 @@ impl DashboardScreen {
         }
     }
 
-    pub fn mark_gh_refreshed(&mut self) {
-        self.gh_refreshed_at = Some(Instant::now());
+    pub fn set_next_pr_fetch_at(&mut self, next_pr_fetch_at: Option<Instant>) {
+        self.next_pr_fetch_at = next_pr_fetch_at;
     }
 
     pub fn set_notice(&mut self, notice: DashboardNotice) {
@@ -816,43 +813,23 @@ impl DashboardScreen {
     }
 
     fn status_header_cell(&self) -> Cell<'static> {
-        // Anchor the countdown to whichever interval gates the next *real*
-        // GraphQL refetch: the dashboard tick or the PR cache TTL, whichever
-        // is longer. `gh_refreshed_at` is only updated when an actual fetch
-        // succeeds (not on cached ticks), so this honestly represents when
-        // the displayed Status will next change.
-        let countdown_ms = self.refresh_interval_ms.max(PR_CACHE_TTL_MS);
-        let countdown_secs = (countdown_ms / 1000).max(1);
-        match self.gh_refreshed_at {
-            None => Cell::from("Status"),
-            Some(instant) => {
-                let elapsed = instant.elapsed().as_secs();
-                if elapsed == 0 {
-                    Cell::from(Line::from(vec![Span::styled(
-                        "Status (✔)",
-                        Style::default()
-                            .fg(colors::SUCCESS)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                } else {
-                    let remaining = countdown_secs.saturating_sub(elapsed);
-                    let label = if remaining == 0 {
-                        "Status (✔)".to_string()
-                    } else {
-                        format!("Status ({remaining}s)")
-                    };
-                    let color = if remaining == 0 {
-                        colors::SUCCESS
-                    } else {
-                        colors::MUTED
-                    };
-                    Cell::from(Line::from(vec![Span::styled(
-                        label,
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    )]))
-                }
-            }
-        }
+        let Some(due) = self.next_pr_fetch_at else {
+            return Cell::from("Status");
+        };
+        // Round up so the countdown reads "(1s)" right until the deadline,
+        // then flips to "(✔)" exactly at the deadline. With truncation,
+        // "(✔)" would show up to a second early.
+        let remaining_ms = due.saturating_duration_since(Instant::now()).as_millis();
+        let remaining = remaining_ms.div_ceil(1000) as u64;
+        let (label, color) = if remaining == 0 {
+            ("Status (✔)".to_string(), colors::SUCCESS)
+        } else {
+            (format!("Status ({remaining}s)"), colors::MUTED)
+        };
+        Cell::from(Line::from(vec![Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )]))
     }
 
     fn row_cells(
