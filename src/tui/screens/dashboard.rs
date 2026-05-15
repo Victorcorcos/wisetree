@@ -11,8 +11,8 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::services::{
-    CheckStatus, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState, ReviewStatus,
-    PR_CACHE_TTL_MS,
+    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState,
+    ReviewStatus, PR_CACHE_TTL_MS,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
@@ -32,6 +32,22 @@ enum ActionChoice {
     OpenWithCommand,
     CopyPath,
     OpenPullRequest,
+    MergePullRequest,
+}
+
+/// Payload the dashboard hands to the merge confirmation screen.
+/// Bundling these fields here keeps `DashboardAction` lean and saves the
+/// merge screen from having to re-derive ahead/behind or commit data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePullRequestRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub checks_status: Option<CheckStatus>,
+    pub ahead_behind: Option<(u64, u64)>,
+    pub last_commit: Option<CommitSummary>,
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
@@ -82,6 +98,7 @@ pub enum DashboardAction {
     BulkDelete(BulkDeleteStatus, Vec<String>),
     CopyPath(String),
     OpenPullRequest(String),
+    MergePullRequest(Box<MergePullRequestRequest>),
     /// The user tried to delete the mother (main) worktree. The app
     /// layer should surface a toast explaining that this worktree is
     /// protected, instead of routing to the delete screen.
@@ -509,6 +526,18 @@ impl DashboardScreen {
                 ActionChoice::OpenPullRequest,
             ));
         }
+        // Merge is only meaningful for PRs still in the Open state — a
+        // Merged / Closed / Draft PR can't be squash-merged again.
+        if row
+            .pull_request
+            .as_ref()
+            .is_some_and(|pr| matches!(pr.state, PrState::Open))
+        {
+            options.push(SelectOption::new(
+                "Merge Pull Request",
+                ActionChoice::MergePullRequest,
+            ));
+        }
         SelectPrompt::new("Choose action:", options).without_hint()
     }
 
@@ -527,6 +556,7 @@ impl DashboardScreen {
                 let row = &self.rows[index];
                 let path = row.worktree.path.clone();
                 let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
+                let merge_request = build_merge_request(row);
                 self.mode = DashboardMode::Table;
                 self.action_select = None;
                 self.action_target = None;
@@ -536,6 +566,10 @@ impl DashboardScreen {
                     ActionChoice::CopyPath => DashboardAction::CopyPath(path),
                     ActionChoice::OpenPullRequest => match pr_url {
                         Some(url) => DashboardAction::OpenPullRequest(url),
+                        None => DashboardAction::Continue,
+                    },
+                    ActionChoice::MergePullRequest => match merge_request {
+                        Some(request) => DashboardAction::MergePullRequest(Box::new(request)),
                         None => DashboardAction::Continue,
                     },
                 }
@@ -1471,6 +1505,32 @@ impl PrState {
                 .add_modifier(Modifier::DIM),
         }
     }
+}
+
+/// Assemble the payload the merge confirmation screen needs from a row.
+/// Returns `None` when the row's PR is missing or not in the `Open` state —
+/// matches the guard in `build_action_select` so the menu and the dispatch
+/// stay in lockstep.
+fn build_merge_request(row: &DashboardRow) -> Option<MergePullRequestRequest> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    let ahead_behind = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .map(|status| (status.ahead, status.behind));
+    Some(MergePullRequestRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+        checks_status: pr.checks_status,
+        ahead_behind,
+        last_commit: row.last_commit.clone(),
+    })
 }
 
 fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
