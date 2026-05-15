@@ -56,14 +56,16 @@ pub struct MergePullRequestRequest {
 pub enum BulkDeleteStatus {
     Merged,
     Opened,
+    Closed,
     Clean,
     Dirty,
 }
 
 impl BulkDeleteStatus {
-    pub const ALL: [BulkDeleteStatus; 4] = [
+    pub const ALL: [BulkDeleteStatus; 5] = [
         BulkDeleteStatus::Merged,
         BulkDeleteStatus::Opened,
+        BulkDeleteStatus::Closed,
         BulkDeleteStatus::Clean,
         BulkDeleteStatus::Dirty,
     ];
@@ -72,6 +74,7 @@ impl BulkDeleteStatus {
         match self {
             BulkDeleteStatus::Merged => "Merged",
             BulkDeleteStatus::Opened => "Opened",
+            BulkDeleteStatus::Closed => "Closed",
             BulkDeleteStatus::Clean => "Clean",
             BulkDeleteStatus::Dirty => "Dirty",
         }
@@ -81,6 +84,7 @@ impl BulkDeleteStatus {
         match self {
             BulkDeleteStatus::Merged => colors::SUCCESS,
             BulkDeleteStatus::Opened => colors::INFO,
+            BulkDeleteStatus::Closed => colors::GRAY_LIGHT,
             BulkDeleteStatus::Clean => colors::ACCENT,
             BulkDeleteStatus::Dirty => colors::ERROR,
         }
@@ -973,7 +977,9 @@ impl DashboardScreen {
             Span::styled("Opened", Style::default().fg(colors::INFO)),
             Span::styled(" = PR open  ", muted_dim),
             Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" = PR merged", muted_dim),
+            Span::styled(" = PR merged  ", muted_dim),
+            Span::styled("Closed", Style::default().fg(colors::GRAY_LIGHT)),
+            Span::styled(" = PR closed", muted_dim),
         ])
     }
 
@@ -1544,6 +1550,7 @@ fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
     match row.pull_request.as_ref().map(|pr| pr.state) {
         Some(PrState::Merged) => ("Merged", Style::default().fg(colors::SUCCESS)),
         Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),
+        Some(PrState::Closed) => ("Closed", Style::default().fg(colors::GRAY_LIGHT)),
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),
     }
