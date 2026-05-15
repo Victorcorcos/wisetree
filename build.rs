@@ -18,7 +18,11 @@ fn main() {
         return;
     }
 
-    if !Path::new(&manifest_dir).join("githooks").join("pre-push").exists() {
+    if !Path::new(&manifest_dir)
+        .join("githooks")
+        .join("pre-push")
+        .exists()
+    {
         return;
     }
 

@@ -304,8 +304,8 @@ impl DashboardService {
                             break;
                         }
                         if service.pr_enrichment_enabled() {
-                            let on_cycle = next_pr_fetch_at
-                                .map_or(true, |due| Instant::now() >= due);
+                            let on_cycle =
+                                next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
                             service.refresh_pull_requests(&rows, on_cycle).await;
                             if on_cycle {
                                 next_pr_fetch_at = Some(Instant::now() + period);
