@@ -633,13 +633,20 @@ impl DashboardService {
         }
 
         let now = now_ms();
+        // Look ahead by one tick: fetch if the cache will be stale before the
+        // next tick fires. `fetched_at_ms` is stamped *after* the gh round-trip,
+        // so without this lookahead the cache becomes stale a beat after the
+        // aligned tick and the refresh slips an entire tick — visible to the
+        // user as a Status (✔) that lingers for ~refresh_interval_ms.
+        let lookahead_ms = self.config.refresh_interval_ms;
         let scheduled_due = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
             state.entries.is_empty()
-                || state
-                    .entries
-                    .values()
-                    .any(|e| now.saturating_sub(e.fetched_at_ms) > PR_CACHE_TTL_MS)
+                || state.entries.values().any(|e| {
+                    now.saturating_sub(e.fetched_at_ms)
+                        .saturating_add(lookahead_ms)
+                        >= PR_CACHE_TTL_MS
+                })
         };
 
         let to_fetch: Vec<(String, String)> = {
