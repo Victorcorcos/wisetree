@@ -546,9 +546,13 @@ impl DashboardService {
     /// Decide which branches need a PR refresh, then (if any) issue a single
     /// batched GraphQL request and update the cache.
     ///
-    /// Returns `true` when a real GraphQL round-trip succeeded this call, so
-    /// the UI can anchor its Status countdown to actual fetches rather than
-    /// to ticks served from cache.
+    /// Returns `true` only on a *scheduled* full-cycle refresh — i.e., when
+    /// the oldest cached entry has aged past `PR_CACHE_TTL_MS` (or the cache
+    /// is empty) and every branch is brought back in sync. Off-cycle fetches
+    /// triggered by a brand-new branch or a SHA change return `false` and
+    /// stay invisible to the UI, so the Status countdown anchors to a stable
+    /// rhythm instead of resetting whenever a single branch happens to be
+    /// fetched.
     async fn refresh_pull_requests(&self, rows: &[DashboardRow]) -> bool {
         if !self.pr_enrichment_enabled() {
             return false;
@@ -558,6 +562,15 @@ impl DashboardService {
         }
 
         let now = now_ms();
+        let scheduled_due = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state.entries.is_empty()
+                || state
+                    .entries
+                    .values()
+                    .any(|e| now.saturating_sub(e.fetched_at_ms) > PR_CACHE_TTL_MS)
+        };
+
         let to_fetch: Vec<(String, String)> = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
             rows.iter()
@@ -568,10 +581,7 @@ impl DashboardService {
                         return None;
                     }
                     let needs = match state.entries.get(&branch) {
-                        Some(entry) => {
-                            entry.sha != sha
-                                || now.saturating_sub(entry.fetched_at_ms) > PR_CACHE_TTL_MS
-                        }
+                        Some(entry) => entry.sha != sha || scheduled_due,
                         None => true,
                     };
                     needs.then_some((branch, sha))
@@ -606,7 +616,7 @@ impl DashboardService {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
-                true
+                scheduled_due
             }
             Err(err) => {
                 if is_rate_limit_error(&err) {
