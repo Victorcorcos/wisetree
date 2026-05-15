@@ -5,21 +5,32 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-run_check() {
+run_fix() {
   local name="$1"
   shift
 
-  printf 'pre-push: running %s\n' "$name"
+  printf 'pre-push: applying %s\n' "$name"
 
   if ! "$@"; then
     printf '\nwarning: push blocked because `%s` failed.\n' "$name" >&2
-    printf 'warning: fix the reported offenses locally, then push again.\n' >&2
+    printf 'warning: resolve the reported issue locally, then push again.\n' >&2
     exit 1
   fi
 }
 
-# Mirror the checks defined in .github/workflows/ci.yml.
-run_check "cargo fmt --all -- --check" cargo fmt --all -- --check
-run_check "cargo clippy --all-targets --all-features -- -D warnings" cargo clippy --all-targets --all-features -- -D warnings
-run_check "cargo build --all-targets" cargo build --all-targets
-run_check "cargo test --all-features" cargo test --all-features
+# Apply the local autofix equivalents for CI checks where they exist.
+#
+# CI step                            Local autofix
+# cargo fmt --all -- --check         cargo fmt --all
+# cargo clippy ... -D warnings       cargo clippy --fix ...
+# cargo build --all-targets          cargo fix --all-targets --all-features
+# cargo test --all-features          no automatic fix available
+run_fix \
+  "cargo fix --all-targets --all-features" \
+  cargo fix --all-targets --all-features --allow-dirty --allow-staged
+
+run_fix \
+  "cargo clippy --fix --all-targets --all-features" \
+  cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged
+
+run_fix "cargo fmt --all" cargo fmt --all

@@ -1,4 +1,6 @@
-use wisetree::utils::validation::{validate_branch_name, validate_directory_name};
+use wisetree::utils::validation::{
+    normalize_branch_name, validate_branch_name, validate_directory_name,
+};
 
 #[test]
 fn directory_empty() {
@@ -140,4 +142,16 @@ fn branch_valid() {
     assert_eq!(validate_branch_name("feature/foo"), None);
     assert_eq!(validate_branch_name("release-1.2.x"), None);
     assert_eq!(validate_branch_name("main"), None);
+}
+
+#[test]
+fn normalize_branch_name_trims_and_collapses_whitespace() {
+    assert_eq!(normalize_branch_name(" foo bar "), "foo_bar");
+    assert_eq!(normalize_branch_name("foo    bar"), "foo_bar");
+    assert_eq!(normalize_branch_name("foo\tbar\nbaz"), "foo_bar_baz");
+    assert_eq!(normalize_branch_name("   "), "");
+    assert_eq!(
+        validate_branch_name(&normalize_branch_name("   ")),
+        Some("Branch name cannot be empty")
+    );
 }
