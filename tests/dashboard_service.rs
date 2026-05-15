@@ -15,14 +15,9 @@ fn config_with_prs() -> DashboardConfig {
     }
 }
 
-fn git(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .status()
-        .expect("git invocation");
-    assert!(status.success(), "git {args:?} failed in {cwd:?}");
-}
+mod support;
+
+use support::{git, init_repo_with_main};
 
 struct Fixture {
     _parent: TempDir,
@@ -34,7 +29,7 @@ fn repo_with_worktree() -> Fixture {
     let repo = parent.path().join("repo");
     let worktree = parent.path().join("repo-feature");
     fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
+    init_repo_with_main(&repo);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test"]);
     git(

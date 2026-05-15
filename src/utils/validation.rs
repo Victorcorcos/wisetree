@@ -3,6 +3,32 @@
 //! Predicates and messages are ported verbatim from
 //! `branchlet/src/utils/path-utils.ts` to preserve user-facing wording.
 
+/// Normalize a git branch name entered by the user into a common, git-valid
+/// format.
+///
+/// Rules:
+/// - Trims leading/trailing whitespace
+/// - Collapses any internal whitespace sequences into a single `_`
+pub fn normalize_branch_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_underscore = false;
+
+    for c in name.trim().chars() {
+        if c.is_whitespace() {
+            if !last_was_underscore {
+                out.push('_');
+                last_was_underscore = true;
+            }
+            continue;
+        }
+
+        out.push(c);
+        last_was_underscore = false;
+    }
+
+    out
+}
+
 /// Validate a worktree directory name. Returns `Some(error)` on failure.
 pub fn validate_directory_name(name: &str) -> Option<&'static str> {
     if name.trim().is_empty() {
