@@ -72,6 +72,19 @@ pub enum ReviewStatus {
     Rejected,
 }
 
+/// Merge readiness of a PR branch, derived from GitHub's `mergeStateStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeStatus {
+    Draft,
+    Dirty,
+    Blocked,
+    Unknown,
+    Behind,
+    HasHooks,
+    Unstable,
+    Clean,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
@@ -90,6 +103,12 @@ pub struct PullRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub review_status: Option<ReviewStatus>,
+    #[serde(
+        rename = "mergeStatus",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub merge_status: Option<MergeStatus>,
 }
 
 /// Title + body for a single pull request, fetched on demand by the merge
@@ -304,8 +323,8 @@ impl DashboardService {
                             break;
                         }
                         if service.pr_enrichment_enabled() {
-                            let on_cycle = next_pr_fetch_at
-                                .map_or(true, |due| Instant::now() >= due);
+                            let on_cycle =
+                                next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
                             service.refresh_pull_requests(&rows, on_cycle).await;
                             if on_cycle {
                                 next_pr_fetch_at = Some(Instant::now() + period);
@@ -937,7 +956,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft mergeStateStatus reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -1058,6 +1077,17 @@ fn parse_graphql_response(
                     &changes_requested_logins,
                     &requested_user_logins,
                 );
+                let merge_status = match node.merge_state_status.as_deref() {
+                    Some("DRAFT") => Some(MergeStatus::Draft),
+                    Some("DIRTY") => Some(MergeStatus::Dirty),
+                    Some("BLOCKED") => Some(MergeStatus::Blocked),
+                    Some("UNKNOWN") => Some(MergeStatus::Unknown),
+                    Some("BEHIND") => Some(MergeStatus::Behind),
+                    Some("HAS_HOOKS") => Some(MergeStatus::HasHooks),
+                    Some("UNSTABLE") => Some(MergeStatus::Unstable),
+                    Some("CLEAN") => Some(MergeStatus::Clean),
+                    _ => None,
+                };
                 PullRequest {
                     number: node.number,
                     state,
@@ -1065,6 +1095,7 @@ fn parse_graphql_response(
                     title: node.title,
                     checks_status,
                     review_status,
+                    merge_status,
                 }
             });
         out.insert((*branch).to_string(), pr);
@@ -1152,6 +1183,8 @@ struct GhNode {
     title: String,
     #[serde(rename = "isDraft")]
     is_draft: bool,
+    #[serde(rename = "mergeStateStatus", default)]
+    merge_state_status: Option<String>,
     #[serde(rename = "reviewDecision", default)]
     review_decision: Option<String>,
     #[serde(rename = "reviewRequests", default)]

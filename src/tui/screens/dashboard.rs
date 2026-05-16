@@ -11,8 +11,8 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState,
-    ReviewStatus,
+    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
+    PrState, ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
@@ -262,8 +262,8 @@ impl DashboardScreen {
             return 11;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
-        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 8 footer.
-        13 + table_rows
+        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 9 footer.
+        14 + table_rows
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -409,12 +409,12 @@ impl DashboardScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // status banner
-                Constraint::Length(1), // spacer above search
-                Constraint::Length(1), // search line
-                Constraint::Length(1), // spacer below search
-                Constraint::Min(4),    // table
-                Constraint::Length(9), // footer (notice + 3-row buttons + 5 legend lines)
+                Constraint::Length(1),  // status banner
+                Constraint::Length(1),  // spacer above search
+                Constraint::Length(1),  // search line
+                Constraint::Length(1),  // spacer below search
+                Constraint::Min(4),     // table
+                Constraint::Length(10), // footer (notice + 3-row buttons + 6 legend lines)
             ])
             .split(area);
 
@@ -892,7 +892,8 @@ impl DashboardScreen {
                 Constraint::Length(1), // navigate / shortcuts
                 Constraint::Length(1), // status legend
                 Constraint::Length(1), // checks legend
-                Constraint::Length(1), // reviews legend (between checks and ahead/behind)
+                Constraint::Length(1), // reviews legend
+                Constraint::Length(1), // merges legend
                 Constraint::Length(1), // ahead/behind legend
             ])
             .split(area);
@@ -906,7 +907,8 @@ impl DashboardScreen {
         frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[3]);
         frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[4]);
         frame.render_widget(Paragraph::new(self.reviews_legend_line()), chunks[5]);
-        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[6]);
+        frame.render_widget(Paragraph::new(self.merges_legend_line()), chunks[6]);
+        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[7]);
     }
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
@@ -978,11 +980,11 @@ impl DashboardScreen {
             .add_modifier(Modifier::DIM);
         Line::from(vec![
             Span::styled("PR Checks: ", muted_dim),
-            Span::styled("⚪(Pending)", muted_dim),
-            Span::styled("  🟡(Running)", muted_dim),
-            Span::styled("  🟢(Passed)", muted_dim),
-            Span::styled("  🔴(Failed)", muted_dim),
-            Span::styled("  ⚠️(Errored)", muted_dim),
+            Span::styled("⚪ (Pending)", muted_dim),
+            Span::styled("  🟡 (Running)", muted_dim),
+            Span::styled("  ⚠️ (Errored)", muted_dim),
+            Span::styled("  🔴 (Failed)", muted_dim),
+            Span::styled("  🟢 (Passed)", muted_dim),
         ])
     }
 
@@ -992,9 +994,26 @@ impl DashboardScreen {
             .add_modifier(Modifier::DIM);
         Line::from(vec![
             Span::styled("PR Reviews: ", muted_dim),
-            Span::styled("✋(Pending)", muted_dim),
-            Span::styled("  👍(Approved)", muted_dim),
-            Span::styled("  👎(Changes Requested)", muted_dim),
+            Span::styled("✋ (Pending)", muted_dim),
+            Span::styled("  👎 (Changes Requested)", muted_dim),
+            Span::styled("  👍 (Approved)", muted_dim),
+        ])
+    }
+
+    fn merges_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("PR Merges: ", muted_dim),
+            Span::styled("📝 (Draft)", muted_dim),
+            Span::styled("  ❌ (Dirty)", muted_dim),
+            Span::styled("  🚫 (Blocked)", muted_dim),
+            Span::styled("  ❓ (Unknown)", muted_dim),
+            Span::styled("  🍂 (Behind)", muted_dim),
+            Span::styled("  ⏳ (Has Hooks)", muted_dim),
+            Span::styled("  🏚️ (Unstable)", muted_dim),
+            Span::styled("  ✅ (Clean)", muted_dim),
         ])
     }
 
@@ -1381,11 +1400,12 @@ impl DashboardColumn {
                 }
             }
             Self::Status => {
-                // Wide enough to render "Opened 🟡 👍" without truncating
-                // either emoji. Emoji codepoints are 1 grapheme but
+                // Wide enough to render "Opened 🟡 👍 🍂" without truncating
+                // any emoji. Emoji codepoints are 1 grapheme but
                 // ratatui counts them as 2 columns wide, so we budget
                 // label (6) + space (1) + check emoji (2) + space (1)
-                // + review emoji (2) = 12, plus a margin of safety.
+                // + review emoji (2) + space (1) + merge emoji (2) = 15,
+                // plus a margin of safety.
                 if compact {
                     13
                 } else {
@@ -1425,11 +1445,16 @@ impl DashboardColumn {
             Self::Status => {
                 let (text, style) = status_label_and_style(row);
                 let mut spans: Vec<Span<'static>> = vec![Span::styled(text, style)];
-                if let Some(emoji) = opened_check_emoji(row) {
-                    spans.push(Span::raw(format!(" {emoji}")));
-                }
-                if let Some(emoji) = opened_review_emoji(row) {
-                    spans.push(Span::raw(format!(" {emoji}")));
+                let emojis: Vec<&'static str> = [
+                    opened_check_emoji(row),
+                    opened_review_emoji(row),
+                    opened_merge_emoji(row),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if !emojis.is_empty() {
+                    spans.push(Span::raw(format!(" {}", emojis.join(""))));
                 }
                 Cell::from(Line::from(spans))
             }
@@ -1611,6 +1636,29 @@ fn opened_review_emoji(row: &DashboardRow) -> Option<&'static str> {
         return None;
     }
     pr.review_status.map(review_status_emoji)
+}
+
+fn merge_status_emoji(status: MergeStatus) -> &'static str {
+    match status {
+        MergeStatus::Draft => "📝",
+        MergeStatus::Dirty => "❌",
+        MergeStatus::Blocked => "🚫",
+        MergeStatus::Unknown => "❓",
+        MergeStatus::Behind => "🍂",
+        MergeStatus::HasHooks => "⏳",
+        MergeStatus::Unstable => "🏚️",
+        MergeStatus::Clean => "✅",
+    }
+}
+
+/// Returns the optional merge emoji suffix for a row's Status cell.
+/// Only Open PRs with a resolved `merge_status` surface an emoji.
+fn opened_merge_emoji(row: &DashboardRow) -> Option<&'static str> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    pr.merge_status.map(merge_status_emoji)
 }
 
 fn row_matches_bulk_status(row: &DashboardRow, status: BulkDeleteStatus) -> bool {
