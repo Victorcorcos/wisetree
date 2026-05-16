@@ -704,12 +704,7 @@ impl DashboardService {
         worktree_path: &str,
     ) -> Result<UpdatePullRequestOutcome> {
         let cwd = PathBuf::from(worktree_path);
-        let reset = run_command(
-            &self.git_binary,
-            &["reset", "--hard", "HEAD~1"],
-            Some(&cwd),
-        )
-        .await;
+        let reset = run_command(&self.git_binary, &["reset", "--hard", "HEAD~1"], Some(&cwd)).await;
         match reset {
             Ok(_) => Ok(UpdatePullRequestOutcome::DiscardedAfterReview),
             Err(err) => Ok(UpdatePullRequestOutcome::DiscardFailed(err)),
