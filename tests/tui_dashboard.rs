@@ -706,8 +706,8 @@ fn table_uses_available_height_before_scrolling() {
     screen.set_rows(rows);
 
     // Height must fit exactly: 4 (banner/search) + 13 (header + 12 rows)
-    // + 9 (9-line footer with bordered bulk-delete buttons row + checks/reviews legends).
-    let dumped = dump(120, 26, |f| screen.render(f, f.area()));
+    // + 10 (10-line footer with bordered bulk-delete buttons row + checks/reviews/merges legends).
+    let dumped = dump(120, 27, |f| screen.render(f, f.area()));
     assert!(dumped.contains("repo-11"));
     assert!(!dumped.contains("more above"));
     assert!(!dumped.contains("more below"));
