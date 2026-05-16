@@ -17,6 +17,12 @@ pub const APP_STATE_FILE_NAME: &str = "state.json";
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 
+/// Commit message written when the "Update Pull Request" flow committed
+/// the result of an AI-assisted conflict resolution. Kept as a constant
+/// so downstream tooling (release notes, blame heuristics) can recognise
+/// the synthetic commit.
+pub const UPDATE_MERGE_COMMIT_MESSAGE: &str = "Merging and solving conflicts";
+
 /// Resolve the global config directory (`~/.wisetree/`).
 ///
 /// Mirrors the upstream behaviour of synthesising the path from `$HOME`. We

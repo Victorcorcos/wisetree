@@ -10,3 +10,4 @@ pub mod menu;
 pub mod merge_pr;
 pub mod settings;
 pub mod setup;
+pub mod update_pr;

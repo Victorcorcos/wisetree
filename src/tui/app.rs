@@ -38,6 +38,7 @@ use crate::tui::screens;
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BulkDeleteStatus, DashboardAction, DashboardScreen, MergePullRequestRequest,
+    UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
@@ -46,6 +47,7 @@ use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
+use crate::tui::screens::update_pr::{UpdateAction, UpdatePullRequestScreen};
 use crate::tui::selection::{
     clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
 };
@@ -79,6 +81,11 @@ enum AppEvent {
     },
     MergePrDetailsLoaded(Result<MergePrDetailsPayload, String>),
     MergePrFinished(Result<u64, MergePrFailure>),
+    UpdatePrBaseRefResolved {
+        number: u64,
+        base_ref: Option<String>,
+    },
+    UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
 }
 
 struct MergePrDetailsPayload {
@@ -87,6 +94,17 @@ struct MergePrDetailsPayload {
 }
 
 struct MergePrFailure {
+    number: u64,
+    message: String,
+}
+
+struct UpdatePrSuccess {
+    number: u64,
+    base_ref: String,
+    outcome: crate::services::UpdatePullRequestOutcome,
+}
+
+struct UpdatePrFailure {
     number: u64,
     message: String,
 }
@@ -111,6 +129,7 @@ pub struct App {
     settings: Option<SettingsScreen>,
     setup: Option<SetupScreen>,
     merge_pr: Option<MergePullRequestScreen>,
+    update_pr: Option<UpdatePullRequestScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
     last_rendered_buffer: Option<Buffer>,
@@ -148,6 +167,7 @@ impl App {
             settings: None,
             setup: None,
             merge_pr: None,
+            update_pr: None,
             shell_integration_status: None,
             toast: ToastState::default(),
             last_rendered_buffer: None,
@@ -340,6 +360,17 @@ impl App {
                     merge_pr.render(frame, panel);
                 }
             }
+            Screen::UpdatePullRequest => {
+                let h = self
+                    .update_pr
+                    .as_ref()
+                    .map_or(8, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
+                if let Some(update_pr) = self.update_pr.as_mut() {
+                    update_pr.tick = self.tick;
+                    update_pr.render(frame, panel);
+                }
+            }
         }
     }
 
@@ -500,6 +531,7 @@ impl App {
             Screen::Settings => self.handle_settings_key(key, tx),
             Screen::Setup => self.handle_setup_key(key, tx),
             Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
+            Screen::UpdatePullRequest => self.handle_update_pr_key(key, tx),
         }
     }
 
@@ -530,6 +562,77 @@ impl App {
                     body,
                     tx.clone(),
                 );
+            }
+        }
+    }
+
+    fn handle_update_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.update_pr.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+        match action {
+            UpdateAction::Continue => {}
+            UpdateAction::Cancelled => {
+                self.update_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+            UpdateAction::Confirmed => {
+                let Some(screen) = self.update_pr.as_mut() else {
+                    return;
+                };
+                let request = screen.request().clone();
+                screen.start_updating();
+                kick_off_update_pull_request(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    request,
+                    tx.clone(),
+                );
+            }
+            UpdateAction::PushReviewed => {
+                let Some(screen) = self.update_pr.as_mut() else {
+                    return;
+                };
+                let request = screen.request().clone();
+                screen.start_post_review(true);
+                kick_off_push_after_review(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    request,
+                    tx.clone(),
+                );
+            }
+            UpdateAction::DiscardReviewed => {
+                let Some(screen) = self.update_pr.as_mut() else {
+                    return;
+                };
+                let request = screen.request().clone();
+                screen.start_post_review(false);
+                kick_off_discard_after_review(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    request,
+                    tx.clone(),
+                );
+            }
+            UpdateAction::ReviewBackedOut => {
+                // Surface the SHA in a Warning toast so the user has a
+                // concrete handle for cleaning up the local commit later.
+                let sha = self
+                    .update_pr
+                    .as_ref()
+                    .and_then(|s| s.review_commit_sha().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "HEAD".to_string());
+                self.show_toast(
+                    ToastVariant::Warning,
+                    format!(
+                        "Merge commit `{sha}` is still local on this branch. \
+                         Push it or run `git reset --hard HEAD~1` to discard."
+                    ),
+                );
+                self.update_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
             }
         }
     }
@@ -625,6 +728,9 @@ impl App {
             DashboardAction::MergePullRequest(request) => {
                 self.start_merge_pr_flow(*request, tx);
             }
+            DashboardAction::UpdatePullRequest(request) => {
+                self.start_update_pr_flow(*request, tx);
+            }
         }
     }
 
@@ -642,6 +748,21 @@ impl App {
             number,
             tx.clone(),
         );
+    }
+
+    fn start_update_pr_flow(
+        &mut self,
+        request: UpdatePullRequestRequest,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let worktree_path = request.worktree_path.clone();
+        let number = request.number;
+        // Mount the screen with `base_ref = None` first so the confirm
+        // panel renders immediately; the resolver runs in the background
+        // and populates the field before the user can answer.
+        self.update_pr = Some(UpdatePullRequestScreen::new(request));
+        self.screen = Screen::UpdatePullRequest;
+        kick_off_resolve_base_ref(worktree_path, number, tx.clone());
     }
 
     fn current_dashboard_config(&self) -> DashboardConfig {
@@ -970,6 +1091,10 @@ impl App {
             },
             AppEvent::MergePrDetailsLoaded(result) => self.apply_merge_pr_details(result, tx),
             AppEvent::MergePrFinished(result) => self.apply_merge_pr_finished(result, tx),
+            AppEvent::UpdatePrBaseRefResolved { number, base_ref } => {
+                self.apply_update_pr_base_ref(number, base_ref);
+            }
+            AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
         }
     }
 
@@ -998,6 +1123,145 @@ impl App {
                 self.enter_screen(Screen::Dashboard, tx);
             }
         }
+    }
+
+    fn apply_update_pr_base_ref(&mut self, number: u64, base_ref: Option<String>) {
+        let Some(screen) = self.update_pr.as_mut() else {
+            return;
+        };
+        if screen.request().number != number {
+            return;
+        }
+        match base_ref {
+            Some(base_ref) => screen.set_base_ref(base_ref),
+            None => screen.set_error(
+                "No base ref reachable (looked for upstream/main, upstream/master, \
+                 origin/main, origin/master)."
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn apply_update_pr_finished(
+        &mut self,
+        result: Result<UpdatePrSuccess, UpdatePrFailure>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        use crate::services::UpdatePullRequestOutcome;
+        // `MergedAwaitingReview` does NOT close the screen — it transitions
+        // it into the review step. All other variants are terminal.
+        if let Ok(UpdatePrSuccess {
+            outcome: UpdatePullRequestOutcome::MergedAwaitingReview { commit_sha, stat },
+            ..
+        }) = &result
+        {
+            if let Some(screen) = self.update_pr.as_mut() {
+                screen.present_review(commit_sha.clone(), stat.clone());
+                return;
+            }
+        }
+        match result {
+            Ok(UpdatePrSuccess {
+                number,
+                base_ref,
+                outcome,
+            }) => match outcome {
+                UpdatePullRequestOutcome::AlreadyUpToDate => {
+                    self.show_toast(
+                        ToastVariant::Info,
+                        format!("Pull Request #{number} is already up to date with `{base_ref}`."),
+                    );
+                }
+                UpdatePullRequestOutcome::MergedCleanly => {
+                    self.show_toast(
+                        ToastVariant::Success,
+                        format!("Pull Request #{number} updated with `{base_ref}` and pushed."),
+                    );
+                }
+                UpdatePullRequestOutcome::MergedWithAiResolution => {
+                    self.show_toast(
+                        ToastVariant::Success,
+                        format!(
+                            "Pull Request #{number} updated (Gemini-resolved, reviewed) \
+                             and pushed."
+                        ),
+                    );
+                }
+                UpdatePullRequestOutcome::MergedAwaitingReview { .. } => {
+                    // Handled by the early-return branch above; this arm
+                    // only fires if `update_pr` was already torn down.
+                }
+                UpdatePullRequestOutcome::DiscardedAfterReview => {
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        format!(
+                            "Discarded AI merge commit for PR #{number}. \
+                             Branch is back where it was before the update."
+                        ),
+                    );
+                }
+                UpdatePullRequestOutcome::GeminiMissing { conflicts } => {
+                    let count = conflicts.len();
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Merge has {count} conflicted file(s). \
+                             `gemini` CLI not found — install and set it up, then retry. \
+                             Pull Request #{number} was NOT updated."
+                        ),
+                    );
+                }
+                UpdatePullRequestOutcome::FetchFailed(detail) => {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Failed to fetch remotes while updating PR #{number}: {}",
+                            truncate_error(&detail)
+                        ),
+                    );
+                }
+                UpdatePullRequestOutcome::MergeFailed(detail) => {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Failed to merge `{base_ref}` into PR #{number}: {}",
+                            truncate_error(&detail)
+                        ),
+                    );
+                }
+                UpdatePullRequestOutcome::PushFailed(detail) => {
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        format!(
+                            "Merge of `{base_ref}` into PR #{number} succeeded locally, \
+                             but push failed — retry the push: {}",
+                            truncate_error(&detail)
+                        ),
+                    );
+                }
+                UpdatePullRequestOutcome::DiscardFailed(detail) => {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Failed to discard AI merge for PR #{number}: {}",
+                            truncate_error(&detail)
+                        ),
+                    );
+                }
+            },
+            Err(failure) => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!(
+                        "Failed to update Pull Request #{}: {}",
+                        failure.number,
+                        truncate_error(&failure.message)
+                    ),
+                );
+            }
+        }
+        self.update_pr = None;
+        self.enter_screen(Screen::Dashboard, tx);
     }
 
     fn apply_merge_pr_finished(
@@ -1135,6 +1399,14 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::UpdatePullRequest => {
+                // Same guard as MergePullRequest: only reachable through
+                // `start_update_pr_flow`, which seeds `update_pr` before
+                // flipping the screen.
+                if self.update_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
         }
 
         if !matches!(screen, Screen::Delete) {
@@ -1153,6 +1425,7 @@ impl App {
         self.settings = None;
         self.setup = None;
         self.merge_pr = None;
+        self.update_pr = None;
         self.mouse_selection = None;
     }
 
@@ -1758,6 +2031,134 @@ fn kick_off_merge_pull_request(
     });
 }
 
+fn kick_off_resolve_base_ref(
+    worktree_path: String,
+    number: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let base_ref =
+            crate::services::dashboard::resolve_base_ref(&PathBuf::from(&worktree_path)).await;
+        let _ = tx.send(AppEvent::UpdatePrBaseRefResolved { number, base_ref });
+    });
+}
+
+fn kick_off_push_after_review(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    request: UpdatePullRequestRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let number = request.number;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
+            number,
+            message: "Could not resolve git root for push.".to_string(),
+        })));
+        return;
+    };
+    let base_ref = request
+        .base_ref
+        .clone()
+        .unwrap_or_else(|| "(unknown)".to_string());
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service.push_after_review(&request.worktree_path).await;
+        let event = match result {
+            Ok(outcome) => Ok(UpdatePrSuccess {
+                number,
+                base_ref,
+                outcome,
+            }),
+            Err(err) => Err(UpdatePrFailure {
+                number,
+                message: user_friendly_message(&err),
+            }),
+        };
+        let _ = tx.send(AppEvent::UpdatePrFinished(event));
+    });
+}
+
+fn kick_off_discard_after_review(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    request: UpdatePullRequestRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let number = request.number;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
+            number,
+            message: "Could not resolve git root for discard.".to_string(),
+        })));
+        return;
+    };
+    let base_ref = request
+        .base_ref
+        .clone()
+        .unwrap_or_else(|| "(unknown)".to_string());
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service.discard_after_review(&request.worktree_path).await;
+        let event = match result {
+            Ok(outcome) => Ok(UpdatePrSuccess {
+                number,
+                base_ref,
+                outcome,
+            }),
+            Err(err) => Err(UpdatePrFailure {
+                number,
+                message: user_friendly_message(&err),
+            }),
+        };
+        let _ = tx.send(AppEvent::UpdatePrFinished(event));
+    });
+}
+
+fn kick_off_update_pull_request(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    request: UpdatePullRequestRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let number = request.number;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
+            number,
+            message: "Could not resolve git root for update.".to_string(),
+        })));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        // `base_ref` must be Some here — `handle_update_pr_key` only
+        // fires Confirmed after the resolver event populated it. Guard
+        // anyway so a race can't blow up the worker.
+        let Some(base_ref) = request.base_ref.clone() else {
+            let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
+                number,
+                message: "Base ref was not resolved before confirmation.".to_string(),
+            })));
+            return;
+        };
+        let result = service
+            .update_pull_request(&request.worktree_path, &base_ref)
+            .await;
+        let event = match result {
+            Ok(outcome) => Ok(UpdatePrSuccess {
+                number,
+                base_ref,
+                outcome,
+            }),
+            Err(err) => Err(UpdatePrFailure {
+                number,
+                message: user_friendly_message(&err),
+            }),
+        };
+        let _ = tx.send(AppEvent::UpdatePrFinished(event));
+    });
+}
+
 fn kick_off_setup_install(shell: Shell, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
@@ -1862,6 +2263,26 @@ fn copy_to_clipboard(value: &str) -> std::result::Result<(), String> {
 
 fn fold_path(path: &str) -> String {
     crate::tui::widgets::welcome_header::fold_home(path)
+}
+
+/// Cap a captured stderr/stdout snippet to a single readable line so it
+/// fits in a toast. Joins all lines on a single space and adds an ellipsis
+/// when the text exceeds the limit.
+fn truncate_error(text: &str) -> String {
+    let compact = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = compact.trim();
+    let limit = 160;
+    if trimmed.chars().count() > limit {
+        let truncated: String = trimmed.chars().take(limit).collect();
+        format!("{truncated}…")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn clipboard_available() -> bool {

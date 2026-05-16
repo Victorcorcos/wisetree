@@ -25,6 +25,22 @@ const GH_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(8);
 /// `gh pr merge` may wait on branch protections, required reviews, or remote
 /// merge processing, so it deserves a longer leash than the read paths.
 const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeouts for the update_pull_request pipeline. Network round-trips and
+/// AI conflict resolution are inherently slower than the read-only paths,
+/// so they each get their own ceiling.
+const UPDATE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const UPDATE_MERGE_TIMEOUT: Duration = Duration::from_secs(120);
+const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+const UPDATE_GEMINI_TIMEOUT: Duration = Duration::from_secs(600);
+/// Priority list for the base ref the "Update Pull Request" flow merges
+/// in. Kept in one place so the dashboard's behind probe and the update
+/// pipeline never drift apart.
+pub const BASE_REF_PRIORITY: [&str; 4] = [
+    "upstream/main",
+    "upstream/master",
+    "origin/main",
+    "origin/master",
+];
 /// How often the service refetches PR data when branches are otherwise idle.
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API. The Status column countdown is driven by the same timer.
@@ -119,6 +135,44 @@ pub struct PullRequest {
 pub struct PullRequestDetails {
     pub title: String,
     pub body: String,
+}
+
+/// Outcome of the `update_pull_request` pipeline. Surfaced verbatim to the
+/// UI which maps each variant to a palette-colored toast or to a follow-up
+/// screen (in the case of `MergedAwaitingReview`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatePullRequestOutcome {
+    /// The recheck after `git fetch` showed the branch was already up to
+    /// date with the resolved base ref. No merge or push was attempted.
+    AlreadyUpToDate,
+    /// `git merge` succeeded with no conflicts; the result has been pushed.
+    MergedCleanly,
+    /// Gemini resolved at least one conflict and the merge commit was
+    /// created with the standard message. The push has NOT been run yet —
+    /// the UI must present the diff for review and let the user choose to
+    /// push or discard.
+    MergedAwaitingReview { commit_sha: String, stat: String },
+    /// Reviewed AI merge was pushed successfully. Only returned by
+    /// `push_after_review`.
+    MergedWithAiResolution,
+    /// User chose to discard the AI merge and the reset succeeded. Only
+    /// returned by `discard_after_review`.
+    DiscardedAfterReview,
+    /// Merge produced conflicts but the `gemini` CLI is not installed.
+    /// The half-applied merge was aborted; the worktree is back to a clean
+    /// state. The list of conflicted files is included so the toast can
+    /// show how many files need attention.
+    GeminiMissing { conflicts: Vec<String> },
+    /// `git fetch` failed (network, auth, …). stderr included.
+    FetchFailed(String),
+    /// `git merge` failed for a non-conflict reason (e.g. dirty tree), or
+    /// gemini ran but conflicts remained, or `git add`/`git commit` failed
+    /// during AI resolution. stderr/details included.
+    MergeFailed(String),
+    /// `git push origin HEAD` failed. stderr included.
+    PushFailed(String),
+    /// `git reset --hard HEAD~1` failed during discard. stderr included.
+    DiscardFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +295,9 @@ pub struct DashboardService {
     gh_available: bool,
     git_binary: PathBuf,
     gh_binary: PathBuf,
+    /// Path to the AI conflict-resolution binary. Defaults to `gemini` so
+    /// the regular PATH lookup applies; tests override it with a stub.
+    gemini_binary: PathBuf,
     cache_path: Option<PathBuf>,
     pr_state: Arc<Mutex<PrCacheState>>,
 }
@@ -250,6 +307,7 @@ impl DashboardService {
         config.clamp();
         let git_binary = PathBuf::from("git");
         let gh_binary = PathBuf::from("gh");
+        let gemini_binary = PathBuf::from("gemini");
         let gh_available = binary_available(&gh_binary);
         Self {
             git_root,
@@ -257,6 +315,7 @@ impl DashboardService {
             gh_available,
             git_binary,
             gh_binary,
+            gemini_binary,
             cache_path: Some(dashboard_pr_cache_file()),
             pr_state: Arc::new(Mutex::new(PrCacheState::default())),
         }
@@ -270,6 +329,13 @@ impl DashboardService {
     pub fn with_gh_binary(mut self, gh_binary: PathBuf) -> Self {
         self.gh_binary = gh_binary;
         self.gh_available = binary_available(&self.gh_binary);
+        self
+    }
+
+    /// Override the AI conflict-resolution binary path. Used by tests to
+    /// inject a deterministic stub script in place of `gemini`.
+    pub fn with_gemini_binary(mut self, gemini_binary: PathBuf) -> Self {
+        self.gemini_binary = gemini_binary;
         self
     }
 
@@ -452,6 +518,204 @@ impl DashboardService {
         Ok(())
     }
 
+    /// Drive the "Update Pull Request" pipeline against `worktree_path`.
+    ///
+    /// 1. `git fetch --all --prune`
+    /// 2. Recheck behind count against `base_ref`; if zero → `AlreadyUpToDate`.
+    /// 3. `git merge <base_ref>`.
+    ///    - Exit 0 → push and return `MergedCleanly`.
+    ///    - Non-zero → look for conflicts. If `gemini` binary is missing,
+    ///      abort the merge and return `GeminiMissing { conflicts }`.
+    ///      Otherwise spawn `gemini --skip-trust --yolo -m gemini-2.5-pro --prompt=<MERGE_PROMPT>`,
+    ///      `git add -A`, `git commit -m "Merging and solving conflicts"`,
+    ///      then capture commit SHA + stat and return
+    ///      `MergedAwaitingReview { commit_sha, stat }` — the push is
+    ///      deferred until the UI confirms via `push_after_review` /
+    ///      `discard_after_review`.
+    /// 4. Clean merges proceed straight to `git push origin HEAD`.
+    pub async fn update_pull_request(
+        &self,
+        worktree_path: &str,
+        base_ref: &str,
+    ) -> Result<UpdatePullRequestOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+
+        // 1. fetch
+        let fetch = time::timeout(
+            UPDATE_FETCH_TIMEOUT,
+            run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git fetch timed out after 60s"))?;
+        if let Err(err) = fetch {
+            return Ok(UpdatePullRequestOutcome::FetchFailed(err));
+        }
+
+        // 2. recheck behind
+        let behind = behind_against_base(&self.git_binary, &cwd, base_ref).await;
+        if matches!(behind, Some(0)) {
+            return Ok(UpdatePullRequestOutcome::AlreadyUpToDate);
+        }
+
+        // 3. merge
+        let merge = time::timeout(
+            UPDATE_MERGE_TIMEOUT,
+            run_command(&self.git_binary, &["merge", base_ref], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git merge timed out after 120s"))?;
+
+        let ai_conflicts: Option<Vec<String>> = match merge {
+            Ok(_) => None,
+            Err(stderr) => {
+                let conflicts = conflicted_files(&self.git_binary, &cwd).await;
+                if conflicts.is_empty() {
+                    // Merge failed for some non-conflict reason (e.g. dirty
+                    // tree, refusing to merge). Bubble the stderr.
+                    return Ok(UpdatePullRequestOutcome::MergeFailed(stderr));
+                }
+                if !binary_available(&self.gemini_binary) {
+                    // Abort the half-applied merge so the worktree is in a
+                    // clean state for the user to retry.
+                    let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                    return Ok(UpdatePullRequestOutcome::GeminiMissing { conflicts });
+                }
+                Some(conflicts)
+            }
+        };
+
+        if let Some(conflicts) = ai_conflicts {
+            // Use `--prompt=<value>` (equals form) rather than `-p <value>`:
+            // arbitrary content in the prompt body could otherwise be parsed
+            // by yargs as a flag (e.g. anything starting with `-`) and yield
+            // "Not enough arguments following: p".
+            let prompt_arg = format!("--prompt={}", build_merge_prompt(base_ref, &conflicts));
+            let gemini_result = time::timeout(
+                UPDATE_GEMINI_TIMEOUT,
+                run_command(
+                    &self.gemini_binary,
+                    &[
+                        "--skip-trust",
+                        "--yolo",
+                        "-m",
+                        "gemini-2.5-pro",
+                        &prompt_arg,
+                    ],
+                    Some(&cwd),
+                ),
+            )
+            .await
+            .map_err(|_| WisetreeError::other("gemini timed out after 10m"))?;
+            if let Err(err) = gemini_result {
+                let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
+                    "gemini failed: {err}"
+                )));
+            }
+
+            // Verify nothing remains in conflict state.
+            let remaining = conflicted_files(&self.git_binary, &cwd).await;
+            if !remaining.is_empty() {
+                let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
+                    "conflicts unresolved after gemini: {}",
+                    remaining.join(", ")
+                )));
+            }
+
+            // Stage + commit.
+            if let Err(err) = run_command(&self.git_binary, &["add", "-A"], Some(&cwd)).await {
+                return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
+                    "git add failed: {err}"
+                )));
+            }
+            if let Err(err) = run_command(
+                &self.git_binary,
+                &[
+                    "commit",
+                    "-m",
+                    crate::constants::UPDATE_MERGE_COMMIT_MESSAGE,
+                ],
+                Some(&cwd),
+            )
+            .await
+            {
+                return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
+                    "git commit failed: {err}"
+                )));
+            }
+
+            // AI resolved — stop here and let the UI present the merge
+            // commit for review before push. Capture SHA + stat for the
+            // review screen.
+            let commit_sha = run_command(
+                &self.git_binary,
+                &["rev-parse", "--short", "HEAD"],
+                Some(&cwd),
+            )
+            .await
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "HEAD".to_string());
+            let stat = run_command(
+                &self.git_binary,
+                &["show", "--stat", "--format=", "HEAD"],
+                Some(&cwd),
+            )
+            .await
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+            return Ok(UpdatePullRequestOutcome::MergedAwaitingReview { commit_sha, stat });
+        }
+
+        // 4. push (clean merge path only — AI merges return above for review)
+        let push = time::timeout(
+            UPDATE_PUSH_TIMEOUT,
+            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+        if let Err(err) = push {
+            return Ok(UpdatePullRequestOutcome::PushFailed(err));
+        }
+
+        Ok(UpdatePullRequestOutcome::MergedCleanly)
+    }
+
+    /// Push the AI-resolved merge commit after the user reviewed it.
+    /// Wraps `git push origin HEAD` and maps result → outcome.
+    pub async fn push_after_review(&self, worktree_path: &str) -> Result<UpdatePullRequestOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+        let push = time::timeout(
+            UPDATE_PUSH_TIMEOUT,
+            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+        match push {
+            Ok(_) => Ok(UpdatePullRequestOutcome::MergedWithAiResolution),
+            Err(err) => Ok(UpdatePullRequestOutcome::PushFailed(err)),
+        }
+    }
+
+    /// Discard the AI-resolved merge commit (`git reset --hard HEAD~1`)
+    /// after the user rejected the review.
+    pub async fn discard_after_review(
+        &self,
+        worktree_path: &str,
+    ) -> Result<UpdatePullRequestOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+        let reset = run_command(
+            &self.git_binary,
+            &["reset", "--hard", "HEAD~1"],
+            Some(&cwd),
+        )
+        .await;
+        match reset {
+            Ok(_) => Ok(UpdatePullRequestOutcome::DiscardedAfterReview),
+            Err(err) => Ok(UpdatePullRequestOutcome::DiscardFailed(err)),
+        }
+    }
+
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
     /// for every worktree in parallel, then layer cached PR data on top. No
     /// network calls — safe to emit immediately so the UI can render before
@@ -598,31 +862,24 @@ impl DashboardService {
     /// deletions in `behind` so the renderer can show `+<ins> -<del>`.
     /// Returns `None` when none of those remote refs are reachable.
     async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
-        for upstream in [
-            "upstream/main",
-            "upstream/master",
-            "origin/main",
-            "origin/master",
-        ] {
-            let result = time::timeout(
-                COMMAND_TIMEOUT,
-                run_command(
-                    &self.git_binary,
-                    &["diff", "--shortstat", upstream],
-                    Some(cwd),
-                ),
-            )
-            .await
-            .ok()?;
-            let Ok(output) = result else { continue };
-            let (insertions, deletions) = parse_shortstat(&output);
-            return Some(BranchStatus {
-                ahead: insertions,
-                behind: deletions,
-                upstream_branch: Some(upstream.to_string()),
-            });
-        }
-        None
+        let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd).await?;
+        let result = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["diff", "--shortstat", &upstream],
+                Some(cwd),
+            ),
+        )
+        .await
+        .ok()?;
+        let Ok(output) = result else { return None };
+        let (insertions, deletions) = parse_shortstat(&output);
+        Some(BranchStatus {
+            ahead: insertions,
+            behind: deletions,
+            upstream_branch: Some(upstream),
+        })
     }
 
     async fn fetch_last_commit(
@@ -1354,6 +1611,117 @@ async fn run_command(
     }
 }
 
+/// Return the first reachable base ref in `BASE_REF_PRIORITY`. Probes each
+/// ref with `git rev-parse --verify` against the supplied worktree. Used
+/// by both the dashboard's behind probe and the "Update Pull Request"
+/// flow so the priority order can never drift.
+pub async fn resolve_base_ref(cwd: &Path) -> Option<String> {
+    resolve_base_ref_with_binary(Path::new("git"), cwd).await
+}
+
+pub(crate) async fn resolve_base_ref_with_binary(git_binary: &Path, cwd: &Path) -> Option<String> {
+    for candidate in BASE_REF_PRIORITY {
+        let result = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                git_binary,
+                &["rev-parse", "--verify", "--quiet", candidate],
+                Some(cwd),
+            ),
+        )
+        .await
+        .ok()?;
+        if result.is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// True when the row's branch is behind its base — either the PR's
+/// `merge_status` reports `Behind`, or git's local ahead/behind shows
+/// `behind > 0`. Single source of truth for the "Update Pull Request"
+/// menu-visibility rule and tests.
+pub fn is_behind(row: &DashboardRow) -> bool {
+    let merge_says_behind = row
+        .pull_request
+        .as_ref()
+        .and_then(|pr| pr.merge_status)
+        .map(|status| matches!(status, MergeStatus::Behind))
+        .unwrap_or(false);
+    let git_says_behind = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .map(|status| status.behind > 0)
+        .unwrap_or(false);
+    merge_says_behind || git_says_behind
+}
+
+/// Count of commits HEAD is behind `base_ref`. `None` when the count
+/// can't be produced (ref missing, parse error, …). Used by the update
+/// pipeline to short-circuit `AlreadyUpToDate` after a fetch.
+async fn behind_against_base(git_binary: &Path, cwd: &Path, base_ref: &str) -> Option<u64> {
+    let spec = format!("HEAD...{base_ref}");
+    let output = run_command(
+        git_binary,
+        &["rev-list", "--left-right", "--count", &spec],
+        Some(cwd),
+    )
+    .await
+    .ok()?;
+    let mut parts = output.split_whitespace();
+    let _ahead = parts.next()?;
+    let behind = parts.next()?;
+    behind.parse::<u64>().ok()
+}
+
+/// Return the list of files currently in conflict (`UU`, `AA`, etc.).
+/// Empty when there are no conflicts.
+async fn conflicted_files(git_binary: &Path, cwd: &Path) -> Vec<String> {
+    match run_command(
+        git_binary,
+        &["diff", "--name-only", "--diff-filter=U"],
+        Some(cwd),
+    )
+    .await
+    {
+        Ok(out) => out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The full prompt passed to `gemini --skip-trust --prompt=...` when resolving
+/// merge conflicts. The body of `prompts/merger.md` is embedded at compile
+/// time so the binary has no runtime dependency on the prompt file.
+/// `MERGE_REF` is substituted with the resolved base ref; `CONFLICTED_FILES`
+/// is substituted with the bulleted list of unmerged paths produced by
+/// `git diff --name-only --diff-filter=U`.
+///
+/// The prompt deliberately ships **without** YAML frontmatter — Gemini's
+/// CLI treats `--- name: X ---` as a skill manifest under `--yolo` mode
+/// and will package the prompt into a `.skill` archive instead of editing
+/// files. Keeping the content as a plain instruction body avoids that.
+fn build_merge_prompt(base_ref: &str, conflicts: &[String]) -> String {
+    const MERGER_PROMPT: &str = include_str!("../../prompts/merger.md");
+    let bulleted = if conflicts.is_empty() {
+        "  (none reported — re-run `git diff --name-only --diff-filter=U`)".to_string()
+    } else {
+        conflicts
+            .iter()
+            .map(|path| format!("  - {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    MERGER_PROMPT
+        .replace("MERGE_REF", base_ref)
+        .replace("CONFLICTED_FILES", &bulleted)
+}
+
 pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -> Option<String> {
     if config.show_pull_requests && !gh_available {
         Some("gh CLI not found - PR column hidden.".to_string())
@@ -1935,5 +2303,44 @@ mod tests {
         );
         assert_eq!(columns, vec!["branch", "pull_request", "status"]);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn build_merge_prompt_has_no_yaml_frontmatter() {
+        // Regression guard: a leading `--- name: X ---` block would make
+        // Gemini's CLI treat the prompt as a skill manifest and package it
+        // into a `.skill` archive instead of resolving conflicts.
+        let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()]);
+        assert!(
+            !prompt.trim_start().starts_with("---"),
+            "prompt must not start with YAML frontmatter, got:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn build_merge_prompt_substitutes_base_ref_and_conflicts() {
+        let prompt = build_merge_prompt(
+            "upstream/main",
+            &["src/foo.rs".to_string(), "tests/snap.snap".to_string()],
+        );
+        assert!(!prompt.contains("MERGE_REF"));
+        assert!(
+            prompt.contains("upstream/main"),
+            "prompt should reference the resolved base ref, got:\n{prompt}"
+        );
+        assert!(prompt.contains("  - src/foo.rs"));
+        assert!(prompt.contains("  - tests/snap.snap"));
+        assert!(!prompt.contains("CONFLICTED_FILES"));
+    }
+
+    #[test]
+    fn build_merge_prompt_forbids_skill_creation_and_pipeline_git_ops() {
+        let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()]);
+        // The prompt must tell Gemini to stay out of pipeline-managed git ops
+        // and not to package itself as a skill — both are concrete failure
+        // modes we've already observed in production.
+        assert!(prompt.contains("git commit"));
+        assert!(prompt.contains("git push"));
+        assert!(prompt.to_lowercase().contains("skill"));
     }
 }
