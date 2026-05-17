@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -25,11 +25,10 @@ const GH_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(8);
 /// `gh pr merge` may wait on branch protections, required reviews, or remote
 /// merge processing, so it deserves a longer leash than the read paths.
 const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a cached PR record stays fresh when the branch HEAD hasn't moved.
+/// How often the service refetches PR data when branches are otherwise idle.
 /// Catches remote-only changes (merge, close, title edit) without hammering
-/// the API. The Status column countdown anchors to this so the displayed
-/// timer matches when the next real GraphQL refetch will happen.
-pub const PR_CACHE_TTL_MS: u64 = 30 * 1000;
+/// the API. The Status column countdown is driven by the same timer.
+pub const PR_REFRESH_PERIOD_MS: u64 = 30 * 1000;
 /// How long to suspend PR fetches after a rate-limit error.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
@@ -73,6 +72,19 @@ pub enum ReviewStatus {
     Rejected,
 }
 
+/// Merge readiness of a PR branch, derived from GitHub's `mergeStateStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeStatus {
+    Draft,
+    Dirty,
+    Blocked,
+    Unknown,
+    Behind,
+    HasHooks,
+    Unstable,
+    Clean,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
@@ -91,6 +103,12 @@ pub struct PullRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub review_status: Option<ReviewStatus>,
+    #[serde(
+        rename = "mergeStatus",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub merge_status: Option<MergeStatus>,
 }
 
 /// Title + body for a single pull request, fetched on demand by the merge
@@ -145,15 +163,16 @@ impl DashboardNotice {
 
 /// Discriminates the two row emissions per refresh cycle so the UI can
 /// tell apart git-only data from gh-enriched data (PR state + CI checks).
-/// `WithPRs` carries a `fetched` flag: `true` when this tick made a real
-/// GraphQL call, `false` when every branch was served from cache. The UI
-/// uses this to anchor the Status countdown only to real fetches.
+/// `WithPRs` carries `next_pr_fetch_at`: the instant when the service will
+/// run the next on-cycle PR refresh. The UI countdown renders directly
+/// from this, so the displayed timer and the actual refresh are always
+/// in sync.
 #[derive(Debug)]
 pub enum DashboardUpdate {
     GitOnly(Vec<DashboardRow>),
     WithPRs {
         rows: Vec<DashboardRow>,
-        fetched: bool,
+        next_pr_fetch_at: Option<Instant>,
     },
 }
 
@@ -198,8 +217,6 @@ impl Drop for DashboardWatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PrCacheEntry {
     sha: String,
-    #[serde(rename = "fetchedAtMs")]
-    fetched_at_ms: u64,
     #[serde(rename = "pullRequest")]
     pull_request: Option<PullRequest>,
 }
@@ -285,6 +302,12 @@ impl DashboardService {
             let interval_ms = service.config.refresh_interval_ms;
             let mut interval = time::interval(Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let period = Duration::from_millis(PR_REFRESH_PERIOD_MS);
+            // Single source of truth for when the next on-cycle PR fetch
+            // is due. The UI countdown reads this verbatim, and the loop
+            // wakes precisely at this instant so the fetch fires the moment
+            // the countdown hits 0.
+            let mut next_pr_fetch_at: Option<Instant> = None;
 
             loop {
                 // Emit git-only rows (with cached PRs applied) first so the
@@ -300,11 +323,19 @@ impl DashboardService {
                             break;
                         }
                         if service.pr_enrichment_enabled() {
-                            let fetched = service.refresh_pull_requests(&rows).await;
+                            let on_cycle =
+                                next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
+                            service.refresh_pull_requests(&rows, on_cycle).await;
+                            if on_cycle {
+                                next_pr_fetch_at = Some(Instant::now() + period);
+                            }
                             service.apply_cached_prs(&mut rows);
                             service.save_cache();
                             if rows_tx
-                                .send(DashboardUpdate::WithPRs { rows, fetched })
+                                .send(DashboardUpdate::WithPRs {
+                                    rows,
+                                    next_pr_fetch_at,
+                                })
                                 .await
                                 .is_err()
                             {
@@ -321,9 +352,17 @@ impl DashboardService {
                     }
                 }
 
+                // Wake on whichever fires first: the git interval (snappy
+                // local data), the PR deadline (the countdown hitting 0),
+                // a manual refresh, or cancel. Aligning the wake-up to the
+                // deadline is what keeps `Status (✔)` visible for ~1s.
+                let pr_sleep = next_pr_fetch_at
+                    .map(|due| due.saturating_duration_since(Instant::now()))
+                    .unwrap_or(period);
                 tokio::select! {
                     _ = &mut cancel_rx => break,
                     _ = interval.tick() => {}
+                    _ = tokio::time::sleep(pr_sleep) => {}
                     maybe_refresh = refresh_rx.recv() => {
                         if maybe_refresh.is_none() {
                             break;
@@ -344,7 +383,11 @@ impl DashboardService {
     pub async fn snapshot(&self) -> Result<Vec<DashboardRow>> {
         let mut rows = self.collect_git_rows().await?;
         if self.pr_enrichment_enabled() {
-            self.refresh_pull_requests(&rows).await;
+            // Snapshot serves cached PR data when available; new branches and
+            // SHA changes still trigger a fetch, but unchanged branches reuse
+            // the cache so repeated `wisetree dashboard` calls don't hammer
+            // the gh API.
+            self.refresh_pull_requests(&rows, false).await;
             self.apply_cached_prs(&mut rows);
             self.save_cache();
         }
@@ -617,30 +660,14 @@ impl DashboardService {
     /// Decide which branches need a PR refresh, then (if any) issue a single
     /// batched GraphQL request and update the cache.
     ///
-    /// Returns `true` only on a *scheduled* full-cycle refresh — i.e., when
-    /// the oldest cached entry has aged past `PR_CACHE_TTL_MS` (or the cache
-    /// is empty) and every branch is brought back in sync. Off-cycle fetches
-    /// triggered by a brand-new branch or a SHA change return `false` and
-    /// stay invisible to the UI, so the Status countdown anchors to a stable
-    /// rhythm instead of resetting whenever a single branch happens to be
-    /// fetched.
-    async fn refresh_pull_requests(&self, rows: &[DashboardRow]) -> bool {
-        if !self.pr_enrichment_enabled() {
-            return false;
+    /// `on_cycle` is decided by the watch loop based on `next_pr_fetch_at`:
+    /// `true` once per refresh period, `false` between periods. Off-cycle
+    /// runs still pick up brand-new branches and SHA changes so the UI
+    /// keeps up with local commits without disturbing the cycle rhythm.
+    async fn refresh_pull_requests(&self, rows: &[DashboardRow], on_cycle: bool) {
+        if !self.pr_enrichment_enabled() || self.is_rate_limited() {
+            return;
         }
-        if self.is_rate_limited() {
-            return false;
-        }
-
-        let now = now_ms();
-        let scheduled_due = {
-            let state = self.pr_state.lock().expect("pr_state poisoned");
-            state.entries.is_empty()
-                || state
-                    .entries
-                    .values()
-                    .any(|e| now.saturating_sub(e.fetched_at_ms) > PR_CACHE_TTL_MS)
-        };
 
         let to_fetch: Vec<(String, String)> = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
@@ -652,7 +679,7 @@ impl DashboardService {
                         return None;
                     }
                     let needs = match state.entries.get(&branch) {
-                        Some(entry) => entry.sha != sha || scheduled_due,
+                        Some(entry) => entry.sha != sha || on_cycle,
                         None => true,
                     };
                     needs.then_some((branch, sha))
@@ -661,25 +688,23 @@ impl DashboardService {
         };
 
         if to_fetch.is_empty() {
-            return false;
+            return;
         }
 
         let Some((owner, repo)) = self.resolve_repo_slug().await else {
-            return false;
+            return;
         };
 
         let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
         match self.fetch_prs_batched(&owner, &repo, &branches).await {
             Ok(results) => {
                 let mut state = self.pr_state.lock().expect("pr_state poisoned");
-                let now = now_ms();
                 for (branch, sha) in &to_fetch {
                     let pr = results.get(branch).cloned().flatten();
                     state.entries.insert(
                         branch.clone(),
                         PrCacheEntry {
                             sha: sha.clone(),
-                            fetched_at_ms: now,
                             pull_request: pr,
                         },
                     );
@@ -687,7 +712,6 @@ impl DashboardService {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
-                scheduled_due
             }
             Err(err) => {
                 if is_rate_limit_error(&err) {
@@ -698,7 +722,6 @@ impl DashboardService {
                 // Failures fall back to cached or empty PR data. Surface a
                 // single dashboard-level notice instead of per-row errors,
                 // because this GraphQL request covers every branch at once.
-                false
             }
         }
     }
@@ -893,13 +916,6 @@ fn binary_available(binary: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn is_rate_limit_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("rate limit") || lower.contains("rate-limit")
@@ -940,7 +956,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft mergeStateStatus reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -1061,6 +1077,17 @@ fn parse_graphql_response(
                     &changes_requested_logins,
                     &requested_user_logins,
                 );
+                let merge_status = match node.merge_state_status.as_deref() {
+                    Some("DRAFT") => Some(MergeStatus::Draft),
+                    Some("DIRTY") => Some(MergeStatus::Dirty),
+                    Some("BLOCKED") => Some(MergeStatus::Blocked),
+                    Some("UNKNOWN") => Some(MergeStatus::Unknown),
+                    Some("BEHIND") => Some(MergeStatus::Behind),
+                    Some("HAS_HOOKS") => Some(MergeStatus::HasHooks),
+                    Some("UNSTABLE") => Some(MergeStatus::Unstable),
+                    Some("CLEAN") => Some(MergeStatus::Clean),
+                    _ => None,
+                };
                 PullRequest {
                     number: node.number,
                     state,
@@ -1068,6 +1095,7 @@ fn parse_graphql_response(
                     title: node.title,
                     checks_status,
                     review_status,
+                    merge_status,
                 }
             });
         out.insert((*branch).to_string(), pr);
@@ -1155,6 +1183,8 @@ struct GhNode {
     title: String,
     #[serde(rename = "isDraft")]
     is_draft: bool,
+    #[serde(rename = "mergeStateStatus", default)]
+    merge_state_status: Option<String>,
     #[serde(rename = "reviewDecision", default)]
     review_decision: Option<String>,
     #[serde(rename = "reviewRequests", default)]

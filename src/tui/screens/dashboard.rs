@@ -12,8 +12,8 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState,
-    ReviewStatus, PR_CACHE_TTL_MS,
+    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
+    PrState, ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
@@ -60,29 +60,44 @@ pub struct MergePullRequestRequest {
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
-/// footer. Matches the labels produced by `status_label_and_style`.
+/// footer. `button_label` can differ from the row label when a shorter
+/// footer caption keeps narrow layouts readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkDeleteStatus {
     Merged,
     Opened,
+    Closed,
     Clean,
     Dirty,
 }
 
 impl BulkDeleteStatus {
-    pub const ALL: [BulkDeleteStatus; 4] = [
+    pub const ALL: [BulkDeleteStatus; 5] = [
         BulkDeleteStatus::Merged,
+        BulkDeleteStatus::Closed,
         BulkDeleteStatus::Opened,
         BulkDeleteStatus::Clean,
         BulkDeleteStatus::Dirty,
     ];
 
     pub fn label(self) -> &'static str {
+        self.row_label()
+    }
+
+    pub fn button_label(self) -> &'static str {
         match self {
             BulkDeleteStatus::Merged => "Merged",
-            BulkDeleteStatus::Opened => "Opened",
+            BulkDeleteStatus::Opened => "Open",
+            BulkDeleteStatus::Closed => "Closed",
             BulkDeleteStatus::Clean => "Clean",
             BulkDeleteStatus::Dirty => "Dirty",
+        }
+    }
+
+    fn row_label(self) -> &'static str {
+        match self {
+            BulkDeleteStatus::Opened => "Opened",
+            _ => self.button_label(),
         }
     }
 
@@ -90,6 +105,7 @@ impl BulkDeleteStatus {
         match self {
             BulkDeleteStatus::Merged => colors::SUCCESS,
             BulkDeleteStatus::Opened => colors::INFO,
+            BulkDeleteStatus::Closed => colors::GRAY_LIGHT,
             BulkDeleteStatus::Clean => colors::ACCENT,
             BulkDeleteStatus::Dirty => colors::ERROR,
         }
@@ -165,9 +181,8 @@ pub struct DashboardScreen {
     warnings: Vec<String>,
     notice: Option<DashboardNotice>,
     refreshed_at: Option<Instant>,
-    gh_refreshed_at: Option<Instant>,
+    next_pr_fetch_at: Option<Instant>,
     pr_enrichment_enabled: bool,
-    refresh_interval_ms: u64,
     /// `Some` while the bulk-delete buttons row owns the keyboard focus.
     /// Tab moves through buttons in `BulkDeleteStatus::ALL` order; Esc
     /// returns focus to the table.
@@ -186,7 +201,6 @@ impl DashboardScreen {
         columns: Vec<String>,
         warnings: Vec<String>,
         pr_enrichment_enabled: bool,
-        refresh_interval_ms: u64,
     ) -> Self {
         Self {
             rows: Vec::new(),
@@ -207,9 +221,8 @@ impl DashboardScreen {
             warnings,
             notice: None,
             refreshed_at: None,
-            gh_refreshed_at: None,
+            next_pr_fetch_at: None,
             pr_enrichment_enabled,
-            refresh_interval_ms,
             bulk_focus: None,
             bulk_button_rects: Vec::new(),
             tick: 0,
@@ -230,8 +243,8 @@ impl DashboardScreen {
         }
     }
 
-    pub fn mark_gh_refreshed(&mut self) {
-        self.gh_refreshed_at = Some(Instant::now());
+    pub fn set_next_pr_fetch_at(&mut self, next_pr_fetch_at: Option<Instant>) {
+        self.next_pr_fetch_at = next_pr_fetch_at;
     }
 
     pub fn set_notice(&mut self, notice: DashboardNotice) {
@@ -258,8 +271,8 @@ impl DashboardScreen {
             return 11;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
-        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 8 footer.
-        13 + table_rows
+        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 9 footer.
+        14 + table_rows
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -405,12 +418,12 @@ impl DashboardScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // status banner
-                Constraint::Length(1), // spacer above search
-                Constraint::Length(1), // search line
-                Constraint::Length(1), // spacer below search
-                Constraint::Min(4),    // table
-                Constraint::Length(9), // footer (notice + 3-row buttons + 5 legend lines)
+                Constraint::Length(1),  // status banner
+                Constraint::Length(1),  // spacer above search
+                Constraint::Length(1),  // search line
+                Constraint::Length(1),  // spacer below search
+                Constraint::Min(4),     // table
+                Constraint::Length(10), // footer (notice + 3-row buttons + 6 legend lines)
             ])
             .split(area);
 
@@ -809,43 +822,23 @@ impl DashboardScreen {
     }
 
     fn status_header_cell(&self) -> Cell<'static> {
-        // Anchor the countdown to whichever interval gates the next *real*
-        // GraphQL refetch: the dashboard tick or the PR cache TTL, whichever
-        // is longer. `gh_refreshed_at` is only updated when an actual fetch
-        // succeeds (not on cached ticks), so this honestly represents when
-        // the displayed Status will next change.
-        let countdown_ms = self.refresh_interval_ms.max(PR_CACHE_TTL_MS);
-        let countdown_secs = (countdown_ms / 1000).max(1);
-        match self.gh_refreshed_at {
-            None => Cell::from("Status"),
-            Some(instant) => {
-                let elapsed = instant.elapsed().as_secs();
-                if elapsed == 0 {
-                    Cell::from(Line::from(vec![Span::styled(
-                        "Status (✔)",
-                        Style::default()
-                            .fg(colors::SUCCESS)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                } else {
-                    let remaining = countdown_secs.saturating_sub(elapsed);
-                    let label = if remaining == 0 {
-                        "Status (✔)".to_string()
-                    } else {
-                        format!("Status ({remaining}s)")
-                    };
-                    let color = if remaining == 0 {
-                        colors::SUCCESS
-                    } else {
-                        colors::MUTED
-                    };
-                    Cell::from(Line::from(vec![Span::styled(
-                        label,
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    )]))
-                }
-            }
-        }
+        let Some(due) = self.next_pr_fetch_at else {
+            return Cell::from("Status");
+        };
+        // Round up so the countdown reads "(1s)" right until the deadline,
+        // then flips to "(✔)" exactly at the deadline. With truncation,
+        // "(✔)" would show up to a second early.
+        let remaining_ms = due.saturating_duration_since(Instant::now()).as_millis();
+        let remaining = remaining_ms.div_ceil(1000) as u64;
+        let (label, color) = if remaining == 0 {
+            ("Status (✔)".to_string(), colors::SUCCESS)
+        } else {
+            (format!("Status ({remaining}s)"), colors::MUTED)
+        };
+        Cell::from(Line::from(vec![Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )]))
     }
 
     fn row_cells(
@@ -908,7 +901,8 @@ impl DashboardScreen {
                 Constraint::Length(1), // navigate / shortcuts
                 Constraint::Length(1), // status legend
                 Constraint::Length(1), // checks legend
-                Constraint::Length(1), // reviews legend (between checks and ahead/behind)
+                Constraint::Length(1), // reviews legend
+                Constraint::Length(1), // merges legend
                 Constraint::Length(1), // ahead/behind legend
             ])
             .split(area);
@@ -922,7 +916,8 @@ impl DashboardScreen {
         frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[3]);
         frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[4]);
         frame.render_widget(Paragraph::new(self.reviews_legend_line()), chunks[5]);
-        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[6]);
+        frame.render_widget(Paragraph::new(self.merges_legend_line()), chunks[6]);
+        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[7]);
     }
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
@@ -982,7 +977,9 @@ impl DashboardScreen {
             Span::styled("Opened", Style::default().fg(colors::INFO)),
             Span::styled(" = PR open  ", muted_dim),
             Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" = PR merged", muted_dim),
+            Span::styled(" = PR merged  ", muted_dim),
+            Span::styled("Closed", Style::default().fg(colors::GRAY_LIGHT)),
+            Span::styled(" = PR closed", muted_dim),
         ])
     }
 
@@ -992,11 +989,11 @@ impl DashboardScreen {
             .add_modifier(Modifier::DIM);
         Line::from(vec![
             Span::styled("PR Checks: ", muted_dim),
-            Span::styled("⚪(Pending)", muted_dim),
-            Span::styled("  🟡(Running)", muted_dim),
-            Span::styled("  🟢(Passed)", muted_dim),
-            Span::styled("  🔴(Failed)", muted_dim),
-            Span::styled("  ⚠️(Errored)", muted_dim),
+            Span::styled("⚪ (Pending)", muted_dim),
+            Span::styled("  🟡 (Running)", muted_dim),
+            Span::styled("  ⚠️ (Errored)", muted_dim),
+            Span::styled("  🔴 (Failed)", muted_dim),
+            Span::styled("  🟢 (Passed)", muted_dim),
         ])
     }
 
@@ -1006,9 +1003,26 @@ impl DashboardScreen {
             .add_modifier(Modifier::DIM);
         Line::from(vec![
             Span::styled("PR Reviews: ", muted_dim),
-            Span::styled("✋(Pending)", muted_dim),
-            Span::styled("  👍(Approved)", muted_dim),
-            Span::styled("  👎(Changes Requested)", muted_dim),
+            Span::styled("✋ (Pending)", muted_dim),
+            Span::styled("  👎 (Changes Requested)", muted_dim),
+            Span::styled("  👍 (Approved)", muted_dim),
+        ])
+    }
+
+    fn merges_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("PR Merges: ", muted_dim),
+            Span::styled("📝 (Draft)", muted_dim),
+            Span::styled("  ❌ (Dirty)", muted_dim),
+            Span::styled("  🚫 (Blocked)", muted_dim),
+            Span::styled("  ❓ (Unknown)", muted_dim),
+            Span::styled("  🍂 (Behind)", muted_dim),
+            Span::styled("  ⏳ (Has Hooks)", muted_dim),
+            Span::styled("  🏚️ (Unstable)", muted_dim),
+            Span::styled("  ✅ (Clean)", muted_dim),
         ])
     }
 
@@ -1040,14 +1054,35 @@ impl DashboardScreen {
         // half-char of leftover space on one side.
         let gap: u16 = 2;
 
-        let mut constraints: Vec<Constraint> =
-            Vec::with_capacity(BulkDeleteStatus::ALL.len() * 2 + 2);
+        let mut visible_statuses = Vec::with_capacity(BulkDeleteStatus::ALL.len());
+        let mut used_width = prefix_width;
+        for status in BulkDeleteStatus::ALL {
+            let button_width = status.button_label().chars().count() as u16 + 4;
+            let required_width = if visible_statuses.is_empty() {
+                button_width
+            } else {
+                gap + button_width
+            };
+            if used_width.saturating_add(required_width) > area.width {
+                break;
+            }
+            visible_statuses.push(status);
+            used_width = used_width.saturating_add(required_width);
+        }
+
+        if let Some(focused) = self.bulk_focus {
+            if !visible_statuses.contains(&focused) {
+                self.bulk_focus = visible_statuses.last().copied();
+            }
+        }
+
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_statuses.len() * 2 + 2);
         constraints.push(Constraint::Length(prefix_width));
-        for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
+        for (index, status) in visible_statuses.iter().enumerate() {
             if index > 0 {
                 constraints.push(Constraint::Length(gap));
             }
-            let button_width = status.label().chars().count() as u16 + 4;
+            let button_width = status.button_label().chars().count() as u16 + 4;
             constraints.push(Constraint::Length(button_width));
         }
         constraints.push(Constraint::Min(0));
@@ -1072,7 +1107,7 @@ impl DashboardScreen {
             );
         }
 
-        for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
+        for (index, status) in visible_statuses.iter().enumerate() {
             // Column layout: prefix at 0, then alternating gap/button. The
             // first button is at index 1, subsequent buttons at index 1 + 2k.
             let col_index = 1 + index * 2;
@@ -1096,15 +1131,16 @@ impl DashboardScreen {
             };
             let border_style = Style::default().fg(status.color());
 
-            let button = Paragraph::new(Line::from(Span::styled(status.label(), text_style)))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .border_style(border_style)
-                        .padding(Padding::horizontal(1)),
-                );
+            let button =
+                Paragraph::new(Line::from(Span::styled(status.button_label(), text_style)))
+                    .alignment(Alignment::Center)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Plain)
+                            .border_style(border_style)
+                            .padding(Padding::horizontal(1)),
+                    );
             frame.render_widget(button, rect);
             self.bulk_button_rects.push((*status, rect));
         }
@@ -1373,11 +1409,12 @@ impl DashboardColumn {
                 }
             }
             Self::Status => {
-                // Wide enough to render "Opened 🟡 👍" without truncating
-                // either emoji. Emoji codepoints are 1 grapheme but
+                // Wide enough to render "Opened 🟡 👍 🍂" without truncating
+                // any emoji. Emoji codepoints are 1 grapheme but
                 // ratatui counts them as 2 columns wide, so we budget
                 // label (6) + space (1) + check emoji (2) + space (1)
-                // + review emoji (2) = 12, plus a margin of safety.
+                // + review emoji (2) + space (1) + merge emoji (2) = 15,
+                // plus a margin of safety.
                 if compact {
                     13
                 } else {
@@ -1417,11 +1454,16 @@ impl DashboardColumn {
             Self::Status => {
                 let (text, style) = status_label_and_style(row);
                 let mut spans: Vec<Span<'static>> = vec![Span::styled(text, style)];
-                if let Some(emoji) = opened_check_emoji(row) {
-                    spans.push(Span::raw(format!(" {emoji}")));
-                }
-                if let Some(emoji) = opened_review_emoji(row) {
-                    spans.push(Span::raw(format!(" {emoji}")));
+                let emojis: Vec<&'static str> = [
+                    opened_check_emoji(row),
+                    opened_review_emoji(row),
+                    opened_merge_emoji(row),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if !emojis.is_empty() {
+                    spans.push(Span::raw(format!(" {}", emojis.join(""))));
                 }
                 Cell::from(Line::from(spans))
             }
@@ -1553,6 +1595,7 @@ fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
     match row.pull_request.as_ref().map(|pr| pr.state) {
         Some(PrState::Merged) => ("Merged", Style::default().fg(colors::SUCCESS)),
         Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),
+        Some(PrState::Closed) => ("Closed", Style::default().fg(colors::GRAY_LIGHT)),
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),
     }
@@ -1604,9 +1647,32 @@ fn opened_review_emoji(row: &DashboardRow) -> Option<&'static str> {
     pr.review_status.map(review_status_emoji)
 }
 
+fn merge_status_emoji(status: MergeStatus) -> &'static str {
+    match status {
+        MergeStatus::Draft => "📝",
+        MergeStatus::Dirty => "❌",
+        MergeStatus::Blocked => "🚫",
+        MergeStatus::Unknown => "❓",
+        MergeStatus::Behind => "🍂",
+        MergeStatus::HasHooks => "⏳",
+        MergeStatus::Unstable => "🏚️",
+        MergeStatus::Clean => "✅",
+    }
+}
+
+/// Returns the optional merge emoji suffix for a row's Status cell.
+/// Only Open PRs with a resolved `merge_status` surface an emoji.
+fn opened_merge_emoji(row: &DashboardRow) -> Option<&'static str> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    pr.merge_status.map(merge_status_emoji)
+}
+
 fn row_matches_bulk_status(row: &DashboardRow, status: BulkDeleteStatus) -> bool {
     let (label, _) = status_label_and_style(row);
-    label == status.label()
+    label == status.row_label()
 }
 
 /// Returns the next focused bulk-delete button, or `None` to land back
