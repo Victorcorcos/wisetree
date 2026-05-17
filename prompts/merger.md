@@ -12,6 +12,13 @@ Understand *why* both sides differ using read-only commands:
 - `git show :1:<file>` / `:2:<file>` / `:3:<file>` — ancestor, ours, theirs
 - `git log --oneline HEAD..MERGE_HEAD -- <file>` / `MERGE_HEAD..HEAD -- <file>`
 
+## Tools
+
+- Prefer structured file tools for code edits when available.
+- Use shell commands for git inspection, targeted tests, and repo-wide search.
+- The outer pipeline handles the final bulk stage + commit after you finish, but you may still stage individual files explicitly when your local checks need it.
+- Never create, package, or modify any Gemini skill/skill manifest artifacts.
+
 ## Resolution rules
 
 1. **Read the entire file**, not just conflict hunks — context outside markers matters.
@@ -45,7 +52,7 @@ Understand *why* both sides differ using read-only commands:
 
 ## Forbidden
 
-- Git commands that affect repo state: `fetch`, `pull`, `merge`, `merge --abort`, `reset`, `checkout`, `commit`, `push`.
+- Git commands that affect repo state: `git fetch`, `git pull`, `git merge`, `git merge --abort`, `git reset`, `git checkout`, `git commit`, `git push`.
 - `--ours`, `--theirs`, `--no-verify` (discards one side wholesale).
 - Editing files outside the conflict list (exception: a non-conflicted file that references a renamed symbol and causes a targeted test to fail).
 - Touching `.git/` internals or changing dependencies.

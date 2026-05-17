@@ -28,6 +28,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
+use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
     ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status, StatusIndicator,
@@ -39,7 +40,7 @@ const UPDATE_PUSHING_MESSAGE: &str = "Pushing reviewed merge...";
 const UPDATE_DISCARDING_MESSAGE: &str = "Discarding merge commit...";
 
 /// Hard cap on the number of AI activity lines retained in memory. A
-/// long Gemini run can emit thousands of lines (file edits, reasoning,
+/// long Gemini run can emit thousands of rows (tool calls, file edits,
 /// progress dots); we only ever render the bottom slice that fits the
 /// activity panel, so anything older is pure memory pressure.
 const AI_LOG_MAX_LINES: usize = 1024;
@@ -77,6 +78,11 @@ pub struct UpdatePullRequestScreen {
     /// Visible scroll offset (in diff lines) for the review panel.
     /// Clamped against the rendered diff height every frame.
     review_scroll: u16,
+    /// Scroll offset from the bottom of the AI activity log. `0` means
+    /// "follow the latest output". When the user wheels upward we increase
+    /// this offset and preserve it as new lines arrive so the viewport stays
+    /// stable instead of snapping back to the tail.
+    ai_scroll: u16,
     post_review_message: Option<&'static str>,
     /// Label shown next to the spinner during `Updating`. Updated as the
     /// pipeline emits `UpdatePhase` events so the user knows whether
@@ -85,7 +91,7 @@ pub struct UpdatePullRequestScreen {
     /// Streaming log of the AI subprocess output. Capped at
     /// `AI_LOG_MAX_LINES`; the activity panel always renders the bottom
     /// slice so the latest line stays visible.
-    ai_log: Vec<String>,
+    ai_log: Vec<AiActivityEvent>,
     /// `true` once the pipeline has reached `ConflictsDetected` and the
     /// AI is about to (or already started) work on the merge. Drives the
     /// AI Activity panel: when `false`, the `Updating` step renders just
@@ -115,6 +121,7 @@ impl UpdatePullRequestScreen {
             review_stat: None,
             review_diff: None,
             review_scroll: 0,
+            ai_scroll: 0,
             post_review_message: None,
             phase_message: UPDATE_RUNNING_MESSAGE.to_string(),
             ai_log: Vec::new(),
@@ -157,6 +164,7 @@ impl UpdatePullRequestScreen {
         self.step = UpdateStep::Updating;
         self.phase_message = UPDATE_RUNNING_MESSAGE.to_string();
         self.ai_log.clear();
+        self.ai_scroll = 0;
         self.ai_active = false;
     }
 
@@ -187,24 +195,49 @@ impl UpdatePullRequestScreen {
         self.phase_message = message;
     }
 
-    /// Append a line of AI subprocess output to the streaming activity
-    /// log. Empties are dropped to keep the panel dense.
-    pub fn append_ai_line(&mut self, line: impl Into<String>) {
+    /// Append a streamed AI activity event to the log. Consecutive assistant /
+    /// thinking deltas are coalesced so the panel reads as a sentence instead
+    /// of a pile of token-sized fragments.
+    pub fn append_ai_line(&mut self, line: impl Into<AiActivityEvent>) {
         let line = line.into();
-        if line.is_empty() {
+        if line.plain_text().is_empty() {
             return;
+        }
+        match (self.ai_log.last_mut(), &line) {
+            (
+                Some(AiActivityEvent::AssistantText { content: existing }),
+                AiActivityEvent::AssistantText { content },
+            ) => {
+                existing.push_str(content);
+                return;
+            }
+            (
+                Some(AiActivityEvent::Thinking { content: existing }),
+                AiActivityEvent::Thinking { content },
+            ) => {
+                existing.push_str(content);
+                return;
+            }
+            _ => {}
+        }
+        if self.ai_scroll > 0 {
+            self.ai_scroll = self.ai_scroll.saturating_add(1);
         }
         self.ai_log.push(line);
         // Trim from the front so the latest output is always retained.
         if self.ai_log.len() > AI_LOG_MAX_LINES {
             let drop = self.ai_log.len() - AI_LOG_MAX_LINES;
             self.ai_log.drain(0..drop);
+            self.ai_scroll = self.ai_scroll.saturating_sub(drop as u16);
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn ai_log_lines(&self) -> &[String] {
-        &self.ai_log
+    pub(crate) fn ai_log_lines(&self) -> Vec<String> {
+        self.ai_log
+            .iter()
+            .map(AiActivityEvent::plain_text)
+            .collect()
     }
 
     #[cfg(test)]
@@ -241,32 +274,44 @@ impl UpdatePullRequestScreen {
         self.review_commit_sha.as_deref()
     }
 
-    /// Scroll the review diff panel up by `lines`. Returns `true` when
-    /// the screen consumed the event (i.e. we're currently in the
-    /// `AwaitingReview` step). Used by `App::handle_mouse` to forward
-    /// wheel events.
+    /// Scroll the active wheel-scrollable panel up by `lines`. During merge
+    /// review that is the diff panel; while the AI is actively resolving
+    /// conflicts it is the AI Activity panel.
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
-        if !matches!(self.step, UpdateStep::AwaitingReview) {
-            return false;
+        if matches!(self.step, UpdateStep::AwaitingReview) {
+            self.review_scroll = self.review_scroll.saturating_sub(lines);
+            return true;
         }
-        self.review_scroll = self.review_scroll.saturating_sub(lines);
-        true
+        if matches!(self.step, UpdateStep::Updating) && self.ai_active {
+            self.ai_scroll = self.ai_scroll.saturating_add(lines);
+            return true;
+        }
+        false
     }
 
-    /// Scroll the review diff panel down by `lines`. The render path
-    /// clamps the value against the rendered diff height every frame, so
-    /// over-scrolling is safe here.
+    /// Scroll the active wheel-scrollable panel down by `lines`. The render
+    /// path clamps against the content height every frame, so over-scrolling is
+    /// safe here.
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
-        if !matches!(self.step, UpdateStep::AwaitingReview) {
-            return false;
+        if matches!(self.step, UpdateStep::AwaitingReview) {
+            self.review_scroll = self.review_scroll.saturating_add(lines);
+            return true;
         }
-        self.review_scroll = self.review_scroll.saturating_add(lines);
-        true
+        if matches!(self.step, UpdateStep::Updating) && self.ai_active {
+            self.ai_scroll = self.ai_scroll.saturating_sub(lines);
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
     pub(crate) fn review_scroll(&self) -> u16 {
         self.review_scroll
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ai_scroll(&self) -> u16 {
+        self.ai_scroll
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
@@ -556,15 +601,13 @@ impl UpdatePullRequestScreen {
                     .add_modifier(Modifier::DIM),
             ))]
         } else {
-            let start = self.ai_log.len().saturating_sub(visible_rows);
-            self.ai_log[start..]
+            let max_scroll = self.ai_log.len().saturating_sub(visible_rows) as u16;
+            let scroll = self.ai_scroll.min(max_scroll) as usize;
+            let end = self.ai_log.len().saturating_sub(scroll);
+            let start = end.saturating_sub(visible_rows);
+            self.ai_log[start..end]
                 .iter()
-                .map(|line| {
-                    Line::from(Span::styled(
-                        line.clone(),
-                        Style::default().fg(colors::WHITE),
-                    ))
-                })
+                .map(ai_activity_event_to_line)
                 .collect()
         };
         frame.render_widget(Paragraph::new(lines), inner);
@@ -709,6 +752,319 @@ fn diff_line_to_styled(line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), style))
 }
 
+fn ai_activity_event_to_line(event: &AiActivityEvent) -> Line<'static> {
+    match event {
+        AiActivityEvent::SessionStart { model } => Line::from(vec![
+            Span::styled("[session started] ".to_string(), muted_bold()),
+            Span::styled("model".to_string(), muted_dim()),
+            Span::styled(": ".to_string(), muted_dim()),
+            Span::styled(
+                model.clone(),
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        AiActivityEvent::AssistantText { content } => Line::from(vec![
+            Span::styled(
+                "AI".to_string(),
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": ".to_string(), muted_dim()),
+            Span::styled(content.clone(), Style::default().fg(colors::WHITE)),
+        ]),
+        AiActivityEvent::Thinking { content } => Line::from(vec![
+            Span::styled(
+                "Thinking".to_string(),
+                Style::default()
+                    .fg(colors::INFO)
+                    .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            ),
+            Span::styled(": ".to_string(), muted_dim()),
+            Span::styled(
+                content.clone(),
+                Style::default()
+                    .fg(colors::GRAY_LIGHT)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]),
+        AiActivityEvent::ToolCall { tool_name, summary } => {
+            let mut spans = vec![
+                Span::styled("> ".to_string(), Style::default().fg(colors::INFO)),
+                Span::styled(
+                    tool_name.clone(),
+                    Style::default()
+                        .fg(colors::SUCCESS)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("(".to_string(), muted_dim()),
+            ];
+            push_highlighted_fragment(&mut spans, summary);
+            spans.push(Span::styled(")".to_string(), muted_dim()));
+            Line::from(spans)
+        }
+        AiActivityEvent::ToolResult {
+            tool_name,
+            status,
+            detail,
+        } => {
+            let (label, label_style) = match status {
+                AiToolResultStatus::Success => (
+                    "ok",
+                    Style::default()
+                        .fg(colors::SUCCESS)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                AiToolResultStatus::Error => (
+                    "error",
+                    Style::default()
+                        .fg(colors::ERROR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            };
+            let mut spans = vec![Span::styled(
+                "< ".to_string(),
+                Style::default().fg(match status {
+                    AiToolResultStatus::Success => colors::SUCCESS,
+                    AiToolResultStatus::Error => colors::ERROR,
+                }),
+            )];
+            if let Some(tool_name) = tool_name {
+                spans.push(Span::styled(
+                    tool_name.clone(),
+                    Style::default()
+                        .fg(colors::INFO)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" ".to_string()));
+            }
+            spans.push(Span::styled(label.to_string(), label_style));
+            spans.push(Span::styled(": ".to_string(), muted_dim()));
+            push_highlighted_fragment(&mut spans, detail);
+            Line::from(spans)
+        }
+        AiActivityEvent::Notice { severity, message } => Line::from(vec![
+            Span::styled(
+                match severity {
+                    AiActivitySeverity::Info => "info",
+                    AiActivitySeverity::Warning => "warning",
+                    AiActivitySeverity::Error => "error",
+                }
+                .to_string(),
+                Style::default()
+                    .fg(match severity {
+                        AiActivitySeverity::Info => colors::INFO,
+                        AiActivitySeverity::Warning => colors::WARNING,
+                        AiActivitySeverity::Error => colors::ERROR,
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": ".to_string(), muted_dim()),
+            Span::styled(
+                message.clone(),
+                Style::default().fg(match severity {
+                    AiActivitySeverity::Info => colors::WHITE,
+                    AiActivitySeverity::Warning => colors::WARNING,
+                    AiActivitySeverity::Error => colors::ERROR,
+                }),
+            ),
+        ]),
+        AiActivityEvent::Summary {
+            tool_calls,
+            duration_ms,
+            total_tokens,
+        } => Line::from(vec![
+            Span::styled(
+                "[done] ".to_string(),
+                Style::default()
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(tool_calls.to_string(), Style::default().fg(colors::ACCENT)),
+            Span::styled(" tools · ".to_string(), muted_dim()),
+            Span::styled(
+                format!("{:.1}s", *duration_ms as f64 / 1000.0),
+                Style::default().fg(colors::ACCENT),
+            ),
+            Span::styled(" · ".to_string(), muted_dim()),
+            Span::styled(
+                total_tokens.to_string(),
+                Style::default().fg(colors::ACCENT),
+            ),
+            Span::styled(" tokens".to_string(), muted_dim()),
+        ]),
+        AiActivityEvent::Raw { text } => Line::from(Span::styled(
+            text.clone(),
+            Style::default().fg(colors::GRAY_LIGHT),
+        )),
+    }
+}
+
+fn push_highlighted_fragment(spans: &mut Vec<Span<'static>>, fragment: &str) {
+    let mut chars = fragment.chars().peekable();
+    let mut first_token = true;
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_whitespace() {
+            let mut ws = String::new();
+            while let Some(next) = chars.peek().copied() {
+                if !next.is_whitespace() {
+                    break;
+                }
+                ws.push(next);
+                chars.next();
+            }
+            spans.push(Span::raw(ws));
+            continue;
+        }
+
+        let mut token = String::new();
+        let mut quote: Option<char> = None;
+        while let Some(next) = chars.peek().copied() {
+            if let Some(active_quote) = quote {
+                token.push(next);
+                chars.next();
+                if next == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+            if next.is_whitespace() {
+                break;
+            }
+            if matches!(next, '"' | '\'' | '`') {
+                quote = Some(next);
+            }
+            token.push(next);
+            chars.next();
+        }
+
+        push_highlighted_token(spans, &token, &mut first_token);
+    }
+}
+
+fn push_highlighted_token(spans: &mut Vec<Span<'static>>, token: &str, first_token: &mut bool) {
+    if let Some((lhs, rhs)) = token.split_once('=') {
+        if is_assignment_like(lhs) {
+            spans.push(Span::styled(
+                lhs.to_string(),
+                if lhs.starts_with('-') {
+                    Style::default().fg(colors::BRAND)
+                } else {
+                    Style::default().fg(colors::INFO)
+                },
+            ));
+            spans.push(Span::styled("=".to_string(), muted_dim()));
+            if !rhs.is_empty() {
+                spans.push(Span::styled(
+                    rhs.to_string(),
+                    classify_token_style(rhs, false),
+                ));
+            }
+            *first_token = false;
+            return;
+        }
+    }
+
+    spans.push(Span::styled(
+        token.to_string(),
+        classify_token_style(token, *first_token),
+    ));
+    *first_token = false;
+}
+
+fn classify_token_style(token: &str, first_token: bool) -> Style {
+    if is_shell_operator(token) {
+        return Style::default().fg(colors::INFO);
+    }
+    if token.starts_with("--") || (token.starts_with('-') && token.len() > 1) {
+        return Style::default().fg(colors::BRAND);
+    }
+    if is_quoted(token) || is_placeholder(token) {
+        return Style::default().fg(colors::WARNING);
+    }
+    if looks_like_url(token) {
+        return Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::UNDERLINED);
+    }
+    if looks_like_path(token) {
+        return Style::default().fg(colors::EMPHASIS);
+    }
+    if looks_like_number(token) {
+        return Style::default().fg(colors::ACCENT);
+    }
+    if first_token {
+        return Style::default()
+            .fg(colors::SUCCESS)
+            .add_modifier(Modifier::BOLD);
+    }
+    Style::default().fg(colors::WHITE)
+}
+
+fn is_assignment_like(token: &str) -> bool {
+    token.starts_with('-')
+        || token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn is_shell_operator(token: &str) -> bool {
+    matches!(token, "&&" | "||" | "|" | ";" | "->" | "=>")
+}
+
+fn is_quoted(token: &str) -> bool {
+    token.len() >= 2
+        && ((token.starts_with('"') && token.ends_with('"'))
+            || (token.starts_with('\'') && token.ends_with('\''))
+            || (token.starts_with('`') && token.ends_with('`')))
+}
+
+fn is_placeholder(token: &str) -> bool {
+    token.starts_with('<') && token.ends_with('>')
+}
+
+fn looks_like_url(token: &str) -> bool {
+    token.starts_with("http://") || token.starts_with("https://")
+}
+
+fn looks_like_path(token: &str) -> bool {
+    let trimmed = token
+        .trim_matches(|ch: char| matches!(ch, ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'));
+    trimmed.starts_with("~/")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with('/')
+        || trimmed.contains('/')
+        || trimmed.ends_with(".rs")
+        || trimmed.ends_with(".rb")
+        || trimmed.ends_with(".ts")
+        || trimmed.ends_with(".tsx")
+        || trimmed.ends_with(".js")
+        || trimmed.ends_with(".json")
+        || trimmed.ends_with(".md")
+}
+
+fn looks_like_number(token: &str) -> bool {
+    token.chars().any(|ch| ch.is_ascii_digit())
+        && token.chars().all(|ch| {
+            ch.is_ascii_digit() || matches!(ch, '.' | '%' | ':' | '+' | '-' | '_' | 's' | 'm')
+        })
+}
+
+fn muted_dim() -> Style {
+    Style::default()
+        .fg(colors::MUTED)
+        .add_modifier(Modifier::DIM)
+}
+
+fn muted_bold() -> Style {
+    Style::default()
+        .fg(colors::MUTED)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> {
     let mut rows: Vec<Line<'static>> = Vec::new();
 
@@ -825,7 +1181,7 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
             Span::styled(
-                "on conflict: gemini --skip-trust --yolo -m gemini-3.1-pro-preview -o stream-json --prompt=\"<merger>\" → commit".to_string(),
+                "on conflict: direct Gemini API stream + local tools → commit".to_string(),
                 bullet_style,
             ),
         ]),
@@ -1024,10 +1380,51 @@ mod tests {
         for i in 0..(AI_LOG_MAX_LINES + 50) {
             screen.append_ai_line(format!("line {i}"));
         }
-        assert_eq!(screen.ai_log_lines().len(), AI_LOG_MAX_LINES);
+        let lines = screen.ai_log_lines();
+        assert_eq!(lines.len(), AI_LOG_MAX_LINES);
         assert_eq!(
-            screen.ai_log_lines().last().unwrap(),
+            lines.last().unwrap(),
             &format!("line {}", AI_LOG_MAX_LINES + 49)
+        );
+    }
+
+    #[test]
+    fn assistant_activity_deltas_coalesce_into_one_row() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.append_ai_line(AiActivityEvent::AssistantText {
+            content: "git".to_string(),
+        });
+        screen.append_ai_line(AiActivityEvent::AssistantText {
+            content: " status".to_string(),
+        });
+
+        assert_eq!(screen.ai_log_lines(), vec!["AI: git status".to_string()]);
+    }
+
+    #[test]
+    fn tool_call_activity_uses_monokai_style_roles() {
+        let line = ai_activity_event_to_line(&AiActivityEvent::ToolCall {
+            tool_name: "run_shell_command".to_string(),
+            summary: "git diff -- src/main.rs --color=never".to_string(),
+        });
+
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(colors::SUCCESS)),
+            "expected command token highlighting: {line:?}"
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(colors::BRAND)),
+            "expected flag highlighting: {line:?}"
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(colors::EMPHASIS)),
+            "expected path highlighting: {line:?}"
         );
     }
 
@@ -1071,6 +1468,39 @@ mod tests {
         assert_eq!(screen.review_scroll(), 0);
         screen.start_updating();
         assert!(!screen.handle_mouse_scroll_down(3));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_ai_activity_when_ai_active() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+
+        assert_eq!(screen.ai_scroll(), 0);
+        assert!(screen.handle_mouse_scroll_up(3));
+        assert_eq!(screen.ai_scroll(), 3);
+        assert!(screen.handle_mouse_scroll_down(2));
+        assert_eq!(screen.ai_scroll(), 1);
+        assert!(screen.handle_mouse_scroll_down(9));
+        assert_eq!(screen.ai_scroll(), 0);
+    }
+
+    #[test]
+    fn ai_activity_scroll_stays_stable_when_new_lines_arrive() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        for i in 0..10 {
+            screen.append_ai_line(format!("line {i}"));
+        }
+
+        assert!(screen.handle_mouse_scroll_up(4));
+        assert_eq!(screen.ai_scroll(), 4);
+
+        screen.append_ai_line("line 10");
+        assert_eq!(screen.ai_scroll(), 5);
     }
 
     #[test]

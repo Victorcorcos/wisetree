@@ -495,9 +495,10 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
-                // Web-page semantics: wheel scrolls the only scrollable
-                // region on the current screen. Today that's the AI merge
-                // review diff panel; add more screens here as needed.
+                // Web-page semantics: wheel scrolls the screen's active
+                // scrollable region. On Update Pull Request that is either
+                // the live AI Activity panel (during conflict resolution) or
+                // the review diff panel (after the AI creates a merge commit).
                 if matches!(self.screen, Screen::UpdatePullRequest) {
                     if let Some(screen) = self.update_pr.as_mut() {
                         screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
@@ -1316,7 +1317,7 @@ impl App {
                         ToastVariant::Error,
                         format!(
                             "Merge has {count} conflicted file(s). \
-                             `gemini` CLI not found — install and set it up, then retry. \
+                             Gemini is unavailable — sign in with Gemini CLI or set `GEMINI_API_KEY` / `GOOGLE_API_KEY`, then retry. \
                              Pull Request #{number} was NOT updated."
                         ),
                     );
