@@ -6,15 +6,16 @@
 //! - `Confirm`       : details panel on top, `ConfirmDialog` (Yes/No,
 //!   **No** default) on the bottom. Enter on Yes returns
 //!   `UpdateAction::Confirmed`.
-//! - `Updating`      : spinner while the background pipeline runs (`git
-//!   fetch --all --prune` → `git merge BASE_REF` → optional Gemini
-//!   conflict resolution → either auto-push on clean merges or surface
-//!   the AI-authored commit for review).
-//! - `AwaitingReview`: shown after Gemini resolved conflicts. Renders the
-//!   merge commit SHA and `git show --stat` output, plus a Push/Discard
-//!   `ConfirmDialog` (default = **Discard**). Push asks the App to run
-//!   `git push origin HEAD`; Discard asks it to run `git reset --hard
-//!   HEAD~1`.
+//! - `Updating`      : spinner with a phase-specific label on top
+//!   (driven by `set_phase_message` as the pipeline progresses), plus a
+//!   bordered "AI Activity" panel below that streams the AI subprocess's
+//!   stdout/stderr lines as they arrive (auto-scrolled to the latest).
+//! - `AwaitingReview`: shown after Gemini resolved conflicts. Renders
+//!   the merge commit SHA on top, the full `git diff HEAD~1 HEAD` in a
+//!   scrollable colorized panel (Up/Down/PgUp/PgDn/Home/End), and the
+//!   Push/Discard `ConfirmDialog` at the bottom (Left/Right toggle,
+//!   default = **Discard**). Push asks the App to run `git push origin
+//!   HEAD`; Discard asks it to run `git reset --hard HEAD~1`.
 //!
 //! Async work is owned by `App`; this screen is purely a presentation
 //! state machine.
@@ -23,7 +24,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
@@ -36,6 +37,12 @@ const UPDATE_LOADING_MESSAGE: &str = "Resolving base ref...";
 const UPDATE_RUNNING_MESSAGE: &str = "Updating pull request...";
 const UPDATE_PUSHING_MESSAGE: &str = "Pushing reviewed merge...";
 const UPDATE_DISCARDING_MESSAGE: &str = "Discarding merge commit...";
+
+/// Hard cap on the number of AI activity lines retained in memory. A
+/// long Gemini run can emit thousands of lines (file edits, reasoning,
+/// progress dots); we only ever render the bottom slice that fits the
+/// activity panel, so anything older is pure memory pressure.
+const AI_LOG_MAX_LINES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateStep {
@@ -66,7 +73,19 @@ pub struct UpdatePullRequestScreen {
     review_confirm: Option<ConfirmDialog>,
     review_commit_sha: Option<String>,
     review_stat: Option<String>,
+    review_diff: Option<String>,
+    /// Visible scroll offset (in diff lines) for the review panel.
+    /// Clamped against the rendered diff height every frame.
+    review_scroll: u16,
     post_review_message: Option<&'static str>,
+    /// Label shown next to the spinner during `Updating`. Updated as the
+    /// pipeline emits `UpdatePhase` events so the user knows whether
+    /// we're fetching, merging, waiting on the AI, or committing.
+    phase_message: String,
+    /// Streaming log of the AI subprocess output. Capped at
+    /// `AI_LOG_MAX_LINES`; the activity panel always renders the bottom
+    /// slice so the latest line stays visible.
+    ai_log: Vec<String>,
     error: Option<String>,
     step: UpdateStep,
     pub tick: usize,
@@ -89,7 +108,11 @@ impl UpdatePullRequestScreen {
             review_confirm: None,
             review_commit_sha: None,
             review_stat: None,
+            review_diff: None,
+            review_scroll: 0,
             post_review_message: None,
+            phase_message: UPDATE_RUNNING_MESSAGE.to_string(),
+            ai_log: Vec::new(),
             error: None,
             step,
             tick: 0,
@@ -126,18 +149,60 @@ impl UpdatePullRequestScreen {
 
     pub fn start_updating(&mut self) {
         self.step = UpdateStep::Updating;
+        self.phase_message = UPDATE_RUNNING_MESSAGE.to_string();
+        self.ai_log.clear();
     }
 
     pub fn is_updating(&self) -> bool {
         matches!(self.step, UpdateStep::Updating | UpdateStep::PostReview)
     }
 
+    /// Update the spinner label during `Updating` so the user knows what
+    /// the pipeline is actively doing (fetching, merging, AI resolving,
+    /// committing, …). No-op outside the `Updating` step.
+    pub fn set_phase_message(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if message.is_empty() {
+            return;
+        }
+        self.phase_message = message;
+    }
+
+    /// Append a line of AI subprocess output to the streaming activity
+    /// log. Empties are dropped to keep the panel dense.
+    pub fn append_ai_line(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if line.is_empty() {
+            return;
+        }
+        self.ai_log.push(line);
+        // Trim from the front so the latest output is always retained.
+        if self.ai_log.len() > AI_LOG_MAX_LINES {
+            let drop = self.ai_log.len() - AI_LOG_MAX_LINES;
+            self.ai_log.drain(0..drop);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ai_log_lines(&self) -> &[String] {
+        &self.ai_log
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phase_message(&self) -> &str {
+        &self.phase_message
+    }
+
     /// App calls this when the pipeline returned `MergedAwaitingReview`.
     /// Transitions the screen into the review step and builds the
-    /// Push/Discard dialog with **Discard** as the default.
-    pub fn present_review(&mut self, commit_sha: String, stat: String) {
+    /// Push/Discard dialog with **Discard** as the default. `diff` is
+    /// the full `git diff HEAD~1 HEAD` output; the review panel renders
+    /// it line by line with `+` / `-` coloring.
+    pub fn present_review(&mut self, commit_sha: String, stat: String, diff: String) {
         self.review_commit_sha = Some(commit_sha);
         self.review_stat = Some(stat);
+        self.review_diff = Some(diff);
+        self.review_scroll = 0;
         self.review_confirm = Some(build_review_confirm(&self.request));
         self.step = UpdateStep::AwaitingReview;
     }
@@ -155,6 +220,34 @@ impl UpdatePullRequestScreen {
 
     pub fn review_commit_sha(&self) -> Option<&str> {
         self.review_commit_sha.as_deref()
+    }
+
+    /// Scroll the review diff panel up by `lines`. Returns `true` when
+    /// the screen consumed the event (i.e. we're currently in the
+    /// `AwaitingReview` step). Used by `App::handle_mouse` to forward
+    /// wheel events.
+    pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
+        if !matches!(self.step, UpdateStep::AwaitingReview) {
+            return false;
+        }
+        self.review_scroll = self.review_scroll.saturating_sub(lines);
+        true
+    }
+
+    /// Scroll the review diff panel down by `lines`. The render path
+    /// clamps the value against the rendered diff height every frame, so
+    /// over-scrolling is safe here.
+    pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
+        if !matches!(self.step, UpdateStep::AwaitingReview) {
+            return false;
+        }
+        self.review_scroll = self.review_scroll.saturating_add(lines);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn review_scroll(&self) -> u16 {
+        self.review_scroll
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
@@ -176,6 +269,36 @@ impl UpdatePullRequestScreen {
             // warning toast pointing at the SHA.
             if matches!(key.code, KeyCode::Esc) {
                 return UpdateAction::ReviewBackedOut;
+            }
+            // Scroll keys for the diff panel are intercepted BEFORE
+            // delegating to the dialog so they don't toggle Push/Discard.
+            // Left/Right stay with the dialog for the variant selection.
+            match key.code {
+                KeyCode::Up => {
+                    self.review_scroll = self.review_scroll.saturating_sub(1);
+                    return UpdateAction::Continue;
+                }
+                KeyCode::Down => {
+                    self.review_scroll = self.review_scroll.saturating_add(1);
+                    return UpdateAction::Continue;
+                }
+                KeyCode::PageUp => {
+                    self.review_scroll = self.review_scroll.saturating_sub(10);
+                    return UpdateAction::Continue;
+                }
+                KeyCode::PageDown => {
+                    self.review_scroll = self.review_scroll.saturating_add(10);
+                    return UpdateAction::Continue;
+                }
+                KeyCode::Home => {
+                    self.review_scroll = 0;
+                    return UpdateAction::Continue;
+                }
+                KeyCode::End => {
+                    self.review_scroll = u16::MAX;
+                    return UpdateAction::Continue;
+                }
+                _ => {}
             }
             let dialog = match self.review_confirm.as_mut() {
                 Some(d) => d,
@@ -201,7 +324,13 @@ impl UpdatePullRequestScreen {
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
-            UpdateStep::Loading | UpdateStep::Updating | UpdateStep::PostReview => 3,
+            UpdateStep::Loading | UpdateStep::PostReview => 3,
+            UpdateStep::Updating => {
+                // Spinner + AI Activity panel. Reserve a generous chunk
+                // so the user actually sees the streaming output instead
+                // of a one-line strip.
+                24
+            }
             UpdateStep::Confirm => {
                 let detail_rows = self.detail_line_count() as u16;
                 let steps_rows = self.steps_line_count() as u16;
@@ -211,12 +340,13 @@ impl UpdatePullRequestScreen {
                     .max(16)
             }
             UpdateStep::AwaitingReview => {
-                let stat_rows = self
-                    .review_stat
+                let diff_rows = self
+                    .review_diff
                     .as_deref()
                     .map(|s| s.lines().count() as u16)
                     .unwrap_or(0);
-                stat_rows.saturating_add(14).max(16)
+                // Title + sha + blank + scrollable diff + blank + dialog.
+                diff_rows.saturating_add(16).max(24)
             }
         }
     }
@@ -265,11 +395,7 @@ impl UpdatePullRequestScreen {
                     .with_tick(self.tick)
                     .render(frame, area);
             }
-            UpdateStep::Updating => {
-                StatusIndicator::new(Status::Loading, UPDATE_RUNNING_MESSAGE)
-                    .with_tick(self.tick)
-                    .render(frame, area);
-            }
+            UpdateStep::Updating => self.render_updating(frame, area),
             UpdateStep::PostReview => {
                 StatusIndicator::new(
                     Status::Loading,
@@ -348,6 +474,76 @@ fn build_review_confirm(request: &UpdatePullRequestRequest) -> ConfirmDialog {
 }
 
 impl UpdatePullRequestScreen {
+    fn render_updating(&self, frame: &mut Frame, area: Rect) {
+        // If the area is too short for a meaningful split, fall back to
+        // just the spinner so we never overflow or render a stub box.
+        if area.height < 5 {
+            StatusIndicator::new(Status::Loading, self.phase_message.clone())
+                .with_tick(self.tick)
+                .render(frame, area);
+            return;
+        }
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // spinner line
+                Constraint::Length(1), // blank
+                Constraint::Min(3),    // AI Activity panel
+            ])
+            .split(area);
+
+        StatusIndicator::new(Status::Loading, self.phase_message.clone())
+            .with_tick(self.tick)
+            .render(frame, chunks[0]);
+        self.render_ai_activity(frame, chunks[2]);
+    }
+
+    fn render_ai_activity(&self, frame: &mut Frame, area: Rect) {
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "AI Activity",
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(colors::INFO))
+            .title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let visible_rows = inner.height as usize;
+        if visible_rows == 0 {
+            return;
+        }
+        let lines: Vec<Line<'static>> = if self.ai_log.is_empty() {
+            vec![Line::from(Span::styled(
+                "Waiting for AI to start working on the conflicts...",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ))]
+        } else {
+            let start = self.ai_log.len().saturating_sub(visible_rows);
+            self.ai_log[start..]
+                .iter()
+                .map(|line| {
+                    Line::from(Span::styled(
+                        line.clone(),
+                        Style::default().fg(colors::WHITE),
+                    ))
+                })
+                .collect()
+        };
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn render_review(&self, frame: &mut Frame, area: Rect) {
         let title = Line::from(Span::styled(
             format!("Review AI Merge for PR #{}?", self.request.number),
@@ -377,17 +573,12 @@ impl UpdatePullRequestScreen {
                     .add_modifier(Modifier::DIM),
             ),
         ]);
-        let stat_text = self.review_stat.as_deref().unwrap_or("(no stat available)");
-        let stat_lines: Vec<Line<'static>> = stat_text
-            .lines()
-            .map(|line| {
-                Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(colors::EMPHASIS),
-                ))
-            })
-            .collect();
-        let stat_height = stat_lines.len().max(1) as u16;
+        let hint_line = Line::from(Span::styled(
+            "Scroll: ↑/↓ or wheel · PgUp/PgDn page · Home/End jump · ←/→ Push/Discard",
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        ));
 
         let confirm_height: u16 = 8;
         let chunks = Layout::default()
@@ -396,21 +587,99 @@ impl UpdatePullRequestScreen {
                 Constraint::Length(1),              // title
                 Constraint::Length(1),              // blank
                 Constraint::Length(1),              // sha line
-                Constraint::Length(1),              // blank
-                Constraint::Length(stat_height),    // git show --stat
+                Constraint::Length(1),              // hint line
+                Constraint::Min(3),                 // scrollable diff panel
                 Constraint::Length(1),              // blank
                 Constraint::Length(confirm_height), // ConfirmDialog
-                Constraint::Min(0),
             ])
             .split(area);
 
         frame.render_widget(Paragraph::new(title), chunks[0]);
         frame.render_widget(Paragraph::new(sha_line), chunks[2]);
-        frame.render_widget(Paragraph::new(stat_lines), chunks[4]);
+        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
+        self.render_diff_panel(frame, chunks[4]);
         if let Some(dialog) = self.review_confirm.as_ref() {
             dialog.render(frame, chunks[6]);
         }
     }
+
+    fn render_diff_panel(&self, frame: &mut Frame, area: Rect) {
+        let diff_text = self.review_diff.as_deref().unwrap_or("");
+        let stat_summary = self
+            .review_stat
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let title_text: String = match stat_summary {
+            Some(stat) => {
+                let first = stat.lines().last().unwrap_or(stat);
+                format!(" Diff vs HEAD~1 — {first} ")
+            }
+            None => " Diff vs HEAD~1 ".to_string(),
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(colors::INFO))
+            .title(Line::from(Span::styled(
+                title_text,
+                Style::default()
+                    .fg(colors::INFO)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.height == 0 {
+            return;
+        }
+
+        let all_lines: Vec<Line<'static>> = if diff_text.trim().is_empty() {
+            vec![Line::from(Span::styled(
+                "(no diff captured — the merge commit may have no textual changes)",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ))]
+        } else {
+            diff_text.lines().map(diff_line_to_styled).collect()
+        };
+
+        let total = all_lines.len();
+        let visible = inner.height as usize;
+        // Clamp scroll so End / repeated Down never run past the bottom.
+        let max_scroll = total.saturating_sub(visible) as u16;
+        let scroll = self.review_scroll.min(max_scroll) as usize;
+        let end = (scroll + visible).min(total);
+        let slice: Vec<Line<'static>> = all_lines[scroll..end].to_vec();
+        frame.render_widget(Paragraph::new(slice), inner);
+    }
+}
+
+/// Color a raw diff line based on its leading marker. Matches the
+/// classic git diff palette (green added, red removed, cyan hunk
+/// header, dim file metadata) so the AI's changes are easy to scan.
+fn diff_line_to_styled(line: &str) -> Line<'static> {
+    let style = if line.starts_with("+++") || line.starts_with("---") {
+        Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM)
+    } else if line.starts_with("@@") {
+        Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with("diff ") || line.starts_with("index ") {
+        Style::default()
+            .fg(colors::EMPHASIS)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with('+') {
+        Style::default().fg(colors::SUCCESS)
+    } else if line.starts_with('-') {
+        Style::default().fg(colors::ERROR)
+    } else {
+        Style::default().fg(colors::WHITE)
+    };
+    Line::from(Span::styled(line.to_string(), style))
 }
 
 fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> {
@@ -649,7 +918,11 @@ mod tests {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
-        screen.present_review("deadbee".to_string(), "README.md | 2 +-\n".to_string());
+        screen.present_review(
+            "deadbee".to_string(),
+            "README.md | 2 +-\n".to_string(),
+            "diff --git a/README.md b/README.md\n+added\n-removed\n".to_string(),
+        );
         assert_eq!(screen.step(), UpdateStep::AwaitingReview);
         let dialog = screen
             .review_confirm
@@ -664,7 +937,7 @@ mod tests {
     fn enter_on_discard_returns_discard_reviewed() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".to_string(), "stat".to_string());
+        screen.present_review("deadbee".to_string(), "stat".to_string(), "diff".to_string());
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(enter), UpdateAction::DiscardReviewed);
     }
@@ -673,7 +946,7 @@ mod tests {
     fn tab_then_enter_on_review_returns_push_reviewed() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".to_string(), "stat".to_string());
+        screen.present_review("deadbee".to_string(), "stat".to_string(), "diff".to_string());
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -684,9 +957,86 @@ mod tests {
     fn esc_during_review_returns_review_backed_out() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".to_string(), "stat".to_string());
+        screen.present_review("deadbee".to_string(), "stat".to_string(), "diff".to_string());
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(esc), UpdateAction::ReviewBackedOut);
+    }
+
+    #[test]
+    fn ai_log_truncates_at_cap() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        for i in 0..(AI_LOG_MAX_LINES + 50) {
+            screen.append_ai_line(format!("line {i}"));
+        }
+        assert_eq!(screen.ai_log_lines().len(), AI_LOG_MAX_LINES);
+        assert_eq!(
+            screen.ai_log_lines().last().unwrap(),
+            &format!("line {}", AI_LOG_MAX_LINES + 49)
+        );
+    }
+
+    #[test]
+    fn phase_message_updates_during_updating() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.set_phase_message("Conflict found — Gemini resolving...");
+        assert_eq!(
+            screen.phase_message(),
+            "Conflict found — Gemini resolving..."
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_review_diff() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
+        assert_eq!(screen.review_scroll(), 0);
+        assert!(screen.handle_mouse_scroll_down(3));
+        assert_eq!(screen.review_scroll(), 3);
+        assert!(screen.handle_mouse_scroll_down(2));
+        assert_eq!(screen.review_scroll(), 5);
+        assert!(screen.handle_mouse_scroll_up(4));
+        assert_eq!(screen.review_scroll(), 1);
+        // Scroll up past the top clamps to 0 (no underflow).
+        assert!(screen.handle_mouse_scroll_up(99));
+        assert_eq!(screen.review_scroll(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_is_ignored_outside_review_step() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        // In Confirm step the wheel must not advance the (unused)
+        // review scroll counter, and the call must report unhandled so
+        // the App layer could in principle route it elsewhere later.
+        assert!(!screen.handle_mouse_scroll_down(3));
+        assert_eq!(screen.review_scroll(), 0);
+        screen.start_updating();
+        assert!(!screen.handle_mouse_scroll_down(3));
+    }
+
+    #[test]
+    fn mouse_wheel_does_not_toggle_push_discard() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
+        screen.handle_mouse_scroll_down(3);
+        let dialog = screen.review_confirm.as_ref().unwrap();
+        assert_eq!(dialog.selected, ConfirmChoice::Cancel);
+    }
+
+    #[test]
+    fn scroll_keys_during_review_do_not_toggle_push_discard() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(down), UpdateAction::Continue);
+        let dialog = screen.review_confirm.as_ref().unwrap();
+        // Default is Cancel (Discard); Down must not have toggled it.
+        assert_eq!(dialog.selected, ConfirmChoice::Cancel);
     }
 
     #[test]

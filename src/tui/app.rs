@@ -31,6 +31,7 @@ use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
     DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult,
+    UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -60,6 +61,10 @@ use crate::VERSION;
 const SETTINGS_PATH_COPIED_MESSAGE: &str =
     "Setting file copied to Clipboard, edit it with your favorite editor!";
 
+/// Lines a single mouse-wheel tick advances a scrollable panel by.
+/// Matches the common browser default (3) so the diff feels familiar.
+const WHEEL_LINES_PER_TICK: u16 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitPhase {
     Loading,
@@ -84,6 +89,13 @@ enum AppEvent {
     UpdatePrBaseRefResolved {
         number: u64,
         base_ref: Option<String>,
+    },
+    /// Live progress signal from the update-PR pipeline. Drives both the
+    /// granular phase toasts and the AI activity panel inside the
+    /// UpdatePullRequestScreen.
+    UpdatePrProgress {
+        number: u64,
+        progress: UpdateProgress,
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
 }
@@ -480,6 +492,23 @@ impl App {
                         .map(|dashboard| dashboard.handle_mouse_click(raw_position))
                         .unwrap_or(DashboardAction::Continue);
                     self.apply_dashboard_action(action, tx);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                // Web-page semantics: wheel scrolls the only scrollable
+                // region on the current screen. Today that's the AI merge
+                // review diff panel; add more screens here as needed.
+                if matches!(self.screen, Screen::UpdatePullRequest) {
+                    if let Some(screen) = self.update_pr.as_mut() {
+                        screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if matches!(self.screen, Screen::UpdatePullRequest) {
+                    if let Some(screen) = self.update_pr.as_mut() {
+                        screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
+                    }
                 }
             }
             _ => {}
@@ -1094,7 +1123,84 @@ impl App {
             AppEvent::UpdatePrBaseRefResolved { number, base_ref } => {
                 self.apply_update_pr_base_ref(number, base_ref);
             }
+            AppEvent::UpdatePrProgress { number, progress } => {
+                self.apply_update_pr_progress(number, progress);
+            }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
+        }
+    }
+
+    /// Translate a single `UpdateProgress` event into UI state changes:
+    /// phase transitions become toasts + an updated spinner label, AI
+    /// output lines append to the streaming activity panel.
+    fn apply_update_pr_progress(&mut self, number: u64, progress: UpdateProgress) {
+        // If the user already left the screen (Esc during the run), drop
+        // late events silently — there's nothing to update and toasting
+        // out-of-flow phases would surprise them.
+        let stale = self
+            .update_pr
+            .as_ref()
+            .map(|s| s.request().number != number)
+            .unwrap_or(true);
+        if stale {
+            return;
+        }
+        match progress {
+            UpdateProgress::Phase(phase) => self.apply_update_pr_phase(number, phase),
+            UpdateProgress::AiOutput(line) => {
+                if let Some(screen) = self.update_pr.as_mut() {
+                    screen.append_ai_line(line);
+                }
+            }
+        }
+    }
+
+    fn apply_update_pr_phase(&mut self, number: u64, phase: UpdatePhase) {
+        match phase {
+            UpdatePhase::Fetching => {
+                self.set_update_pr_phase_label("Fetching latest from remotes...");
+            }
+            UpdatePhase::AlreadyUpToDate => {
+                self.show_toast(
+                    ToastVariant::Info,
+                    format!("Pull Request #{number} is already up to date — no action needed."),
+                );
+            }
+            UpdatePhase::Merging => {
+                self.set_update_pr_phase_label("Merging base ref into branch...");
+            }
+            UpdatePhase::NoConflicts => {
+                self.show_toast(
+                    ToastVariant::Success,
+                    format!(
+                        "No conflicts in PR #{number} — merging ahead and pushing to origin."
+                    ),
+                );
+                self.set_update_pr_phase_label("Pushing merge to origin...");
+            }
+            UpdatePhase::ConflictsDetected { count, model } => {
+                self.show_toast(
+                    ToastVariant::Warning,
+                    format!(
+                        "PR #{number}: {count} conflicted file(s) — handing off to {model}."
+                    ),
+                );
+            }
+            UpdatePhase::AiResolving { model } => {
+                self.set_update_pr_phase_label(format!("{model} is resolving conflicts..."));
+            }
+            UpdatePhase::Committing => {
+                self.set_update_pr_phase_label("Staging resolved files and committing...");
+            }
+            UpdatePhase::Pushing => {
+                self.set_update_pr_phase_label("Pushing merge to origin...");
+            }
+        }
+    }
+
+    fn set_update_pr_phase_label(&mut self, label: impl Into<String>) {
+        if let Some(screen) = self.update_pr.as_mut() {
+            screen.set_phase_message(label);
         }
     }
 
@@ -1151,12 +1257,17 @@ impl App {
         // `MergedAwaitingReview` does NOT close the screen — it transitions
         // it into the review step. All other variants are terminal.
         if let Ok(UpdatePrSuccess {
-            outcome: UpdatePullRequestOutcome::MergedAwaitingReview { commit_sha, stat },
+            outcome:
+                UpdatePullRequestOutcome::MergedAwaitingReview {
+                    commit_sha,
+                    stat,
+                    diff,
+                },
             ..
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                screen.present_review(commit_sha.clone(), stat.clone());
+                screen.present_review(commit_sha.clone(), stat.clone(), diff.clone());
                 return;
             }
         }
@@ -2141,9 +2252,36 @@ fn kick_off_update_pull_request(
             })));
             return;
         };
+
+        // Bridge: pipe `UpdateProgress` events from the service into the
+        // App's `AppEvent` channel so phase toasts and AI output land on
+        // the same event loop as everything else.
+        let (progress_tx, mut progress_rx) =
+            mpsc::unbounded_channel::<UpdateProgress>();
+        let forward_tx = tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                if forward_tx
+                    .send(AppEvent::UpdatePrProgress { number, progress })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         let result = service
-            .update_pull_request(&request.worktree_path, &base_ref)
+            .update_pull_request_with_progress(
+                &request.worktree_path,
+                &base_ref,
+                Some(progress_tx),
+            )
             .await;
+        // Drop the progress sender (the service already did, but be
+        // explicit) and wait for the forwarder to drain before emitting
+        // the terminal event so the activity panel never lags behind.
+        let _ = forwarder.await;
+
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,

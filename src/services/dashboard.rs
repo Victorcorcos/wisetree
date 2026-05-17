@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -137,6 +138,36 @@ pub struct PullRequestDetails {
     pub body: String,
 }
 
+/// Live progress signal emitted by `update_pull_request` while the
+/// pipeline runs. The UI consumes these to drive granular toasts (one per
+/// phase transition) and a streaming activity panel that mirrors what the
+/// AI is doing in real time. Pass `None` for the progress sender when the
+/// caller doesn't care (e.g. integration tests).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateProgress {
+    Phase(UpdatePhase),
+    /// A single line of stdout/stderr from the AI subprocess. ANSI escape
+    /// sequences are already stripped so the UI can render the line as
+    /// plain text.
+    AiOutput(String),
+}
+
+/// Coarse-grained pipeline phases. One phase fires before the matching
+/// git/AI command runs (so the toast/spinner reflects what is *about* to
+/// happen, not what just finished). Terminal outcomes are reported through
+/// `UpdatePullRequestOutcome` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatePhase {
+    Fetching,
+    AlreadyUpToDate,
+    Merging,
+    NoConflicts,
+    ConflictsDetected { count: usize, model: String },
+    AiResolving { model: String },
+    Committing,
+    Pushing,
+}
+
 /// Outcome of the `update_pull_request` pipeline. Surfaced verbatim to the
 /// UI which maps each variant to a palette-colored toast or to a follow-up
 /// screen (in the case of `MergedAwaitingReview`).
@@ -150,8 +181,14 @@ pub enum UpdatePullRequestOutcome {
     /// Gemini resolved at least one conflict and the merge commit was
     /// created with the standard message. The push has NOT been run yet —
     /// the UI must present the diff for review and let the user choose to
-    /// push or discard.
-    MergedAwaitingReview { commit_sha: String, stat: String },
+    /// push or discard. `diff` is the full `git diff HEAD~1 HEAD` so the
+    /// review screen can render added/removed lines, not just per-file
+    /// counts.
+    MergedAwaitingReview {
+        commit_sha: String,
+        stat: String,
+        diff: String,
+    },
     /// Reviewed AI merge was pushed successfully. Only returned by
     /// `push_after_review`.
     MergedWithAiResolution,
@@ -538,9 +575,30 @@ impl DashboardService {
         worktree_path: &str,
         base_ref: &str,
     ) -> Result<UpdatePullRequestOutcome> {
+        self.update_pull_request_with_progress(worktree_path, base_ref, None)
+            .await
+    }
+
+    /// Same pipeline as `update_pull_request`, but emits `UpdateProgress`
+    /// events through `progress` as phases transition and (for AI runs)
+    /// streams the subprocess's stdout/stderr line by line. Callers that
+    /// don't need live feedback pass `None` and behave identically to
+    /// the legacy entry point.
+    pub async fn update_pull_request_with_progress(
+        &self,
+        worktree_path: &str,
+        base_ref: &str,
+        progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
+    ) -> Result<UpdatePullRequestOutcome> {
         let cwd = PathBuf::from(worktree_path);
+        let send_phase = |phase: UpdatePhase| {
+            if let Some(tx) = progress.as_ref() {
+                let _ = tx.send(UpdateProgress::Phase(phase));
+            }
+        };
 
         // 1. fetch
+        send_phase(UpdatePhase::Fetching);
         let fetch = time::timeout(
             UPDATE_FETCH_TIMEOUT,
             run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
@@ -554,10 +612,12 @@ impl DashboardService {
         // 2. recheck behind
         let behind = behind_against_base(&self.git_binary, &cwd, base_ref).await;
         if matches!(behind, Some(0)) {
+            send_phase(UpdatePhase::AlreadyUpToDate);
             return Ok(UpdatePullRequestOutcome::AlreadyUpToDate);
         }
 
         // 3. merge
+        send_phase(UpdatePhase::Merging);
         let merge = time::timeout(
             UPDATE_MERGE_TIMEOUT,
             run_command(&self.git_binary, &["merge", base_ref], Some(&cwd)),
@@ -585,6 +645,14 @@ impl DashboardService {
         };
 
         if let Some(conflicts) = ai_conflicts {
+            let model = crate::constants::UPDATE_GEMINI_MODEL.to_string();
+            send_phase(UpdatePhase::ConflictsDetected {
+                count: conflicts.len(),
+                model: model.clone(),
+            });
+            send_phase(UpdatePhase::AiResolving {
+                model: model.clone(),
+            });
             // Use `--prompt=<value>` (equals form) rather than `-p <value>`:
             // arbitrary content in the prompt body could otherwise be parsed
             // by yargs as a flag (e.g. anything starting with `-`) and yield
@@ -592,16 +660,17 @@ impl DashboardService {
             let prompt_arg = format!("--prompt={}", build_merge_prompt(base_ref, &conflicts));
             let gemini_result = time::timeout(
                 UPDATE_GEMINI_TIMEOUT,
-                run_command(
+                run_command_streamed(
                     &self.gemini_binary,
                     &[
                         "--skip-trust",
                         "--yolo",
                         "-m",
-                        "gemini-3.1-pro-preview",
+                        &model,
                         &prompt_arg,
                     ],
                     Some(&cwd),
+                    progress.clone(),
                 ),
             )
             .await
@@ -623,7 +692,20 @@ impl DashboardService {
                 )));
             }
 
+            // Guard against catastrophic truncation (e.g. Gemini writing the
+            // single word "resolved" to a file instead of merging it).
+            if let Some(bad_file) =
+                catastrophically_truncated(&self.git_binary, &cwd, &conflicts).await
+            {
+                let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
+                    "gemini replaced '{bad_file}' with near-empty content; \
+                     refusing to commit a destructive resolution"
+                )));
+            }
+
             // Stage + commit.
+            send_phase(UpdatePhase::Committing);
             if let Err(err) = run_command(&self.git_binary, &["add", "-A"], Some(&cwd)).await {
                 return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
                     "git add failed: {err}"
@@ -646,8 +728,9 @@ impl DashboardService {
             }
 
             // AI resolved — stop here and let the UI present the merge
-            // commit for review before push. Capture SHA + stat for the
-            // review screen.
+            // commit for review before push. Capture SHA + stat + the full
+            // diff against the parent commit (`HEAD~1`) so the review
+            // screen can render added/removed lines, not just file stats.
             let commit_sha = run_command(
                 &self.git_binary,
                 &["rev-parse", "--short", "HEAD"],
@@ -664,10 +747,23 @@ impl DashboardService {
             .await
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-            return Ok(UpdatePullRequestOutcome::MergedAwaitingReview { commit_sha, stat });
+            let diff = run_command(
+                &self.git_binary,
+                &["diff", "HEAD~1", "HEAD"],
+                Some(&cwd),
+            )
+            .await
+            .unwrap_or_default();
+            return Ok(UpdatePullRequestOutcome::MergedAwaitingReview {
+                commit_sha,
+                stat,
+                diff,
+            });
         }
 
         // 4. push (clean merge path only — AI merges return above for review)
+        send_phase(UpdatePhase::NoConflicts);
+        send_phase(UpdatePhase::Pushing);
         let push = time::timeout(
             UPDATE_PUSH_TIMEOUT,
             run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
@@ -1604,6 +1700,190 @@ async fn run_command(
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+/// Returns the path of the first file that looks catastrophically truncated
+/// after AI conflict resolution. A file is considered truncated when its
+/// resolved size is less than 10 % of the larger pre-merge side, provided
+/// that larger side was at least 100 bytes. This catches the failure mode
+/// where an AI writes a placeholder word (e.g. "resolved") instead of
+/// properly merging the content.
+async fn catastrophically_truncated(
+    git: &Path,
+    cwd: &Path,
+    conflicts: &[String],
+) -> Option<String> {
+    for file in conflicts {
+        let ours = run_command(git, &["show", &format!(":2:{file}")], Some(cwd))
+            .await
+            .unwrap_or_default()
+            .len();
+        let theirs = run_command(git, &["show", &format!(":3:{file}")], Some(cwd))
+            .await
+            .unwrap_or_default()
+            .len();
+        let baseline = ours.max(theirs);
+        if baseline < 100 {
+            continue;
+        }
+        let resolved = tokio::fs::metadata(cwd.join(file))
+            .await
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        if resolved < baseline / 10 {
+            return Some(file.clone());
+        }
+    }
+    None
+}
+
+/// Spawn a subprocess and forward every stdout/stderr line through
+/// `progress` (as `UpdateProgress::AiOutput`) as it arrives. Returns the
+/// same `Ok(stdout) / Err(stderr)` shape as `run_command` once the
+/// process exits so callers can keep their post-processing logic
+/// unchanged. Used to give the user a live view of the Gemini CLI
+/// reasoning and file edits during conflict resolution.
+async fn run_command_streamed(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
+) -> std::result::Result<String, String> {
+    let mut cmd = Command::new(binary);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+
+    let mut child = cmd.spawn().map_err(|err| err.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "child stderr unavailable".to_string())?;
+
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+
+    let stdout_task = tokio::spawn(forward_stream(
+        BufReader::new(stdout),
+        Arc::clone(&stdout_buf),
+        progress.clone(),
+    ));
+    let stderr_task = tokio::spawn(forward_stream(
+        BufReader::new(stderr),
+        Arc::clone(&stderr_buf),
+        progress.clone(),
+    ));
+
+    let status = child.wait().await.map_err(|err| err.to_string())?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    let stdout_str = stdout_buf
+        .lock()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let stderr_str = stderr_buf
+        .lock()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    if status.success() {
+        Ok(stdout_str)
+    } else if stderr_str.is_empty() {
+        Err(format!("exit status: {status}"))
+    } else {
+        Err(stderr_str)
+    }
+}
+
+/// Read `reader` line-by-line, append each (raw) line to `buf`, and
+/// forward an ANSI-stripped copy through `progress`. Lines without a
+/// trailing newline (the final partial line) are flushed when EOF hits.
+async fn forward_stream<R>(
+    mut reader: BufReader<R>,
+    buf: Arc<Mutex<String>>,
+    progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                if let Ok(mut guard) = buf.lock() {
+                    guard.push_str(&line);
+                }
+                if let Some(tx) = progress.as_ref() {
+                    let clean = strip_ansi(line.trim_end_matches(['\r', '\n']));
+                    if !clean.is_empty() {
+                        let _ = tx.send(UpdateProgress::AiOutput(clean));
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Strip CSI / OSC ANSI escape sequences and bare ESC characters so
+/// streamed AI output renders cleanly in a TUI Paragraph (which doesn't
+/// interpret escapes). Intentionally minimal — handles the
+/// `ESC [ ... <final>` and `ESC ] ... BEL` forms that account for
+/// virtually all color/cursor output. UTF-8 safe.
+fn strip_ansi(input: &str) -> String {
+    const ESC: char = '\x1b';
+    const BEL: char = '\x07';
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ESC {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                // Consume params then the final byte (range 0x40..=0x7E).
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    let code = next as u32;
+                    if (0x40..=0x7e).contains(&code) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                // OSC: terminated by BEL or ESC \.
+                while let Some(&next) = chars.peek() {
+                    if next == BEL {
+                        chars.next();
+                        break;
+                    }
+                    if next == ESC {
+                        chars.next();
+                        if let Some('\\') = chars.peek() {
+                            chars.next();
+                        }
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 /// Return the first reachable base ref in `BASE_REF_PRIORITY`. Probes each

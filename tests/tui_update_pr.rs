@@ -273,7 +273,11 @@ async fn pipeline_returns_merged_awaiting_review_when_gemini_writes_a_fix() {
         .expect("update should succeed");
 
     match outcome {
-        UpdatePullRequestOutcome::MergedAwaitingReview { commit_sha, stat } => {
+        UpdatePullRequestOutcome::MergedAwaitingReview {
+            commit_sha,
+            stat,
+            diff,
+        } => {
             assert!(
                 !commit_sha.is_empty() && commit_sha != "HEAD",
                 "expected real SHA, got `{commit_sha}`"
@@ -281,6 +285,10 @@ async fn pipeline_returns_merged_awaiting_review_when_gemini_writes_a_fix() {
             assert!(
                 stat.contains("README.md"),
                 "expected README.md in stat, got: {stat}"
+            );
+            assert!(
+                diff.contains("README.md"),
+                "expected README.md in full diff, got: {diff}"
             );
         }
         other => panic!("expected MergedAwaitingReview, got {other:?}"),

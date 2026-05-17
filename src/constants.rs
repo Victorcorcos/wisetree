@@ -23,6 +23,11 @@ pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 /// the synthetic commit.
 pub const UPDATE_MERGE_COMMIT_MESSAGE: &str = "Merging and solving conflicts";
 
+/// The Gemini model that resolves merge conflicts. Surfaced in both the
+/// CLI invocation and the UI toasts so user-facing copy stays in sync
+/// with what actually runs.
+pub const UPDATE_GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
+
 /// Resolve the global config directory (`~/.wisetree/`).
 ///
 /// Mirrors the upstream behaviour of synthesising the path from `$HOME`. We
