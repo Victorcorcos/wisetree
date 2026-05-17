@@ -662,13 +662,7 @@ impl DashboardService {
                 UPDATE_GEMINI_TIMEOUT,
                 run_command_streamed(
                     &self.gemini_binary,
-                    &[
-                        "--skip-trust",
-                        "--yolo",
-                        "-m",
-                        &model,
-                        &prompt_arg,
-                    ],
+                    &["--skip-trust", "--yolo", "-m", &model, &prompt_arg],
                     Some(&cwd),
                     progress.clone(),
                 ),
@@ -747,13 +741,9 @@ impl DashboardService {
             .await
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-            let diff = run_command(
-                &self.git_binary,
-                &["diff", "HEAD~1", "HEAD"],
-                Some(&cwd),
-            )
-            .await
-            .unwrap_or_default();
+            let diff = run_command(&self.git_binary, &["diff", "HEAD~1", "HEAD"], Some(&cwd))
+                .await
+                .unwrap_or_default();
             return Ok(UpdatePullRequestOutcome::MergedAwaitingReview {
                 commit_sha,
                 stat,

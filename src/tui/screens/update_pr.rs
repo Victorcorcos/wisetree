@@ -937,7 +937,11 @@ mod tests {
     fn enter_on_discard_returns_discard_reviewed() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".to_string(), "stat".to_string(), "diff".to_string());
+        screen.present_review(
+            "deadbee".to_string(),
+            "stat".to_string(),
+            "diff".to_string(),
+        );
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(enter), UpdateAction::DiscardReviewed);
     }
@@ -946,7 +950,11 @@ mod tests {
     fn tab_then_enter_on_review_returns_push_reviewed() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".to_string(), "stat".to_string(), "diff".to_string());
+        screen.present_review(
+            "deadbee".to_string(),
+            "stat".to_string(),
+            "diff".to_string(),
+        );
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -957,7 +965,11 @@ mod tests {
     fn esc_during_review_returns_review_backed_out() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".to_string(), "stat".to_string(), "diff".to_string());
+        screen.present_review(
+            "deadbee".to_string(),
+            "stat".to_string(),
+            "diff".to_string(),
+        );
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(esc), UpdateAction::ReviewBackedOut);
     }

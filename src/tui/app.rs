@@ -30,8 +30,8 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult,
-    UpdatePhase, UpdateProgress,
+    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult, UpdatePhase,
+    UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -1172,18 +1172,14 @@ impl App {
             UpdatePhase::NoConflicts => {
                 self.show_toast(
                     ToastVariant::Success,
-                    format!(
-                        "No conflicts in PR #{number} — merging ahead and pushing to origin."
-                    ),
+                    format!("No conflicts in PR #{number} — merging ahead and pushing to origin."),
                 );
                 self.set_update_pr_phase_label("Pushing merge to origin...");
             }
             UpdatePhase::ConflictsDetected { count, model } => {
                 self.show_toast(
                     ToastVariant::Warning,
-                    format!(
-                        "PR #{number}: {count} conflicted file(s) — handing off to {model}."
-                    ),
+                    format!("PR #{number}: {count} conflicted file(s) — handing off to {model}."),
                 );
             }
             UpdatePhase::AiResolving { model } => {
@@ -2256,8 +2252,7 @@ fn kick_off_update_pull_request(
         // Bridge: pipe `UpdateProgress` events from the service into the
         // App's `AppEvent` channel so phase toasts and AI output land on
         // the same event loop as everything else.
-        let (progress_tx, mut progress_rx) =
-            mpsc::unbounded_channel::<UpdateProgress>();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<UpdateProgress>();
         let forward_tx = tx.clone();
         let forwarder = tokio::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
@@ -2271,11 +2266,7 @@ fn kick_off_update_pull_request(
         });
 
         let result = service
-            .update_pull_request_with_progress(
-                &request.worktree_path,
-                &base_ref,
-                Some(progress_tx),
-            )
+            .update_pull_request_with_progress(&request.worktree_path, &base_ref, Some(progress_tx))
             .await;
         // Drop the progress sender (the service already did, but be
         // explicit) and wait for the forwarder to drain before emitting
