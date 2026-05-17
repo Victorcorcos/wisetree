@@ -598,7 +598,7 @@ impl DashboardService {
                         "--skip-trust",
                         "--yolo",
                         "-m",
-                        "gemini-2.5-pro",
+                        "gemini-3.1-pro-preview",
                         &prompt_arg,
                     ],
                     Some(&cwd),

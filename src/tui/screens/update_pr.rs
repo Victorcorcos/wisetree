@@ -529,7 +529,7 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
             Span::styled(
-                "on conflict: gemini --skip-trust --yolo -m gemini-2.5-pro --prompt=\"<merger>\" → commit".to_string(),
+                "on conflict: gemini --skip-trust --yolo -m gemini-3.1-pro-preview --prompt=\"<merger>\" → commit".to_string(),
                 bullet_style,
             ),
         ]),
