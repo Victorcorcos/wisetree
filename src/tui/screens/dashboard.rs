@@ -1,5 +1,6 @@
 //! Live dashboard screen.
 
+use std::path::Path;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,6 +20,14 @@ use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, Sta
 
 const SELECT_MARKER: &str = " ➤ ";
 const BLANK_SELECT_MARKER: &str = "   ";
+
+fn worktree_display_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| fold_home(path))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardMode {
@@ -886,7 +895,7 @@ impl DashboardScreen {
             Span::raw(marker),
             Span::styled(
                 truncate(
-                    &fold_home(&row.worktree.path),
+                    &worktree_display_name(&row.worktree.path),
                     layout
                         .worktree_width
                         .saturating_sub(marker.chars().count() as u16) as usize,
@@ -1239,7 +1248,7 @@ impl DashboardScreen {
         let longest_path = self
             .rows
             .iter()
-            .map(|row| fold_home(&row.worktree.path).chars().count() as u16)
+            .map(|row| worktree_display_name(&row.worktree.path).chars().count() as u16)
             .max()
             .unwrap_or(0);
         let header_min = "Worktree".chars().count() as u16;
