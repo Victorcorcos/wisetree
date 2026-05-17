@@ -64,7 +64,9 @@ impl SetupProjectScreen {
             .map(|p| {
                 let mut opt = SelectOption::new(p.label, p.id);
                 if Some(p.id) == detected {
-                    opt = opt.with_description("detected");
+                    opt = opt
+                        .with_description("detected")
+                        .with_description_color(colors::SUCCESS);
                 } else {
                     opt = opt.with_description(p.description);
                 }
