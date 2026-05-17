@@ -206,7 +206,7 @@ A status banner at the top of the screen shows the last refresh time, the total 
 | `↑` / `↓` | Move the selection up and down the table. |
 | `Type any character` | Live fuzzy search across path, branch, commit SHA, commit message, status label, ahead/behind, PR title, and PR URL. The match is incremental — every keystroke re-filters the table. |
 | `Esc` | Clear the active search if there is one, otherwise return to the previous screen. |
-| `↵` (Enter) | Open the **row actions** menu for the selected worktree: `Navigate to Directory` (your shell `cd`s into it via the wrapper), `Open with Command` (runs your configured `terminalCommand`, e.g. `code $WORKTREE_PATH`), and `Copy path to clipboard`. |
+| `↵` (Enter) | Open the **row actions** menu for the selected worktree: `Navigate to Directory` (your shell `cd`s into it via the wrapper), `Open with Command` (runs your configured `terminalCommand`, e.g. `code $WORKTREE_PATH`), `Copy path to clipboard`, and, for PR-backed rows, `Update Pull Request` / `Merge Pull Request` when those actions are valid. |
 | `⌫` (Backspace, when the search is empty) | Jump straight into the **delete** confirmation for the highlighted worktree, skipping the picker. While you are typing into the search, Backspace edits the query instead — the binding only fires on an empty search. |
 | `Tab` / `Shift+Tab` | Move focus into and through the **bulk-delete buttons** row in the footer (see below). `↑` at the first table row and `↓` at the last table row also land on the buttons; `↑` / `↓` from the buttons return focus to the worktree list. |
 | `Ctrl+R` | Force an immediate refresh, on top of the configured polling interval. |
@@ -229,6 +229,35 @@ The dashboard inspects the available width and either renders the full table or 
 #### Why this matters when running multiple agents
 
 Without the dashboard, the only way to answer "which of my five agents has something interesting going on?" is to `cd` into each worktree, run `git status`, `git log -1`, and possibly `gh pr view`, then write the result down somewhere because you will forget by the time you check the fifth. The dashboard collapses that loop into a single always-fresh screen — and the row actions let you go from "I see something I want to check" to "I am in the right directory with my editor open" in one keystroke. For parallel AI workflows, that is the difference between *managing* the agents and *being managed by* them.
+
+#### Update Pull Request route
+
+For worktrees backed by an **open PR** that is behind its base branch, the row actions menu exposes **`Update Pull Request`**. The route is intentionally conservative:
+
+1. Resolve the base ref in priority order: `upstream/main` → `upstream/master` → `origin/main` → `origin/master`.
+2. Run `git fetch --all --prune`.
+3. Attempt `git merge <base_ref>` inside the selected worktree.
+4. If the merge is clean, push immediately with `git push origin HEAD`.
+5. If the merge conflicts, Wisetree opens the **AI Activity** panel and hands the worktree to Gemini.
+6. After the AI finishes, Wisetree verifies the merge state, creates the synthetic merge commit locally, shows the full `git diff HEAD~1 HEAD`, and asks you to **Push** or **Discard**. Nothing is pushed until you explicitly approve it.
+
+During the conflict-resolution phase, the **AI Activity** panel streams assistant text, thinking summaries, tool calls, tool results, warnings, and the final token summary. It is syntax-highlighted with the Wisetree Monokai palette and supports mouse / touchpad wheel scrolling both up and down while the run is live.
+
+##### Gemini auth / fallback order
+
+The auto-resolution route currently uses Gemini and tries auth in this order:
+
+1. `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+2. An existing Gemini CLI **`oauth-personal`** session from `~/.gemini/oauth_creds.json`
+3. The installed `gemini` CLI as a fallback harness
+
+If none of those are available, Wisetree aborts the in-progress merge with `git merge --abort` and leaves the branch untouched. The PR update is not pushed.
+
+##### What if the user has no Gemini account?
+
+Wisetree itself still works fully for **create / dashboard / navigate / delete / settings** workflows without any Gemini account. The only feature gated today is the **AI-assisted merge-conflict auto-resolution** step inside `Update Pull Request`.
+
+If the user has no Gemini account and no Gemini-compatible credentials, Wisetree safely stops at the conflict, reports how many files are conflicted, aborts the merge, and lets the user resolve the conflict manually. In other words: **Wisetree still works; only the auto-solver path is unavailable.**
 
 ### Configuration
 
