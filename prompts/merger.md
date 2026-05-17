@@ -66,7 +66,14 @@ For every conflicted file:
    any DSL or schema must remain parseable.
 5. **Remove every marker.** No `<<<<<<<`, `=======`, or `>>>>>>>` may
    remain anywhere in the file when you save.
-6. **Save the file**, then run `git add <file>` to stage it.
+6. **Never replace a file's content with a placeholder.** Writing a
+   single word such as "resolved", "done", or "merged" as the entire
+   file body is a critical failure — it silently destroys content. The
+   resolved file must contain all substantive content that existed on
+   either side of the merge. If you cannot safely merge the content,
+   leave the markers in place and stop (see "If you cannot resolve a
+   file" below) rather than overwriting the file with a placeholder.
+7. **Save the file**, then run `git add <file>` to stage it.
 
 ### File-category heuristics
 
@@ -127,13 +134,70 @@ After you have edited and staged every conflicted file:
    touched (pre-existing errors, missing tools, missing dependencies),
    ignore the failure and continue. If no such fast check is obvious,
    skip this step rather than guessing.
+4. **Run the targeted automated tests for the code you touched.** A
+   merge that compiles but breaks a test on either side is a failure
+   you must catch *here*, not after the pipeline pushes. Two cases:
 
-Do **not** run the full test suite, build the project end-to-end, run
-formatters, run linters, or install dependencies — those are out of
-scope for this step.
+   - **Conflicted test files**: any test file that appeared in the
+     conflict list is itself a target. Run it directly.
+   - **Conflicted source files**: locate the test(s) that cover each
+     conflicted source file using the repository's own convention
+     (sibling `*_test.*` / `*.test.*` / `*.spec.*` file, a parallel
+     `tests/` directory mirroring the source path, an inline `#[cfg(test)]`
+     module, an `__tests__/` sibling, etc.). Prefer searching the repo
+     for an existing reference to the source file's symbols over guessing
+     a path. If no test covers the file directly, run the nearest
+     enclosing module / package test group.
 
-When all listed files are resolved, staged, and pass the sanity check,
-stop. You are done.
+   Invoke the project's native test runner with a filter / path argument
+   so you only run those targeted tests — never the full suite. Examples
+   of the *shape* of the invocation in common ecosystems (the actual
+   command is whatever the repo's tooling files declare):
+
+   - Rust:        `cargo test --test <name>` or `cargo test <module>::`
+   - Node / TS:   `npm test -- <path>` / `pnpm test <path>` / `npx vitest run <path>` / `npx jest <path>`
+   - Python:      `pytest <path>::<test>` or `python -m unittest <module>`
+   - Go:          `go test ./<pkg>/... -run <Name>`
+   - Ruby:        `bundle exec rspec <path>` or `ruby -Itest <path>`
+   - Java / Kotlin: `./gradlew test --tests <FQN>` or `mvn -Dtest=<Name> test`
+
+   If a targeted test **fails**, do not stop and do not paper over it.
+   Diagnose first, then fix forward:
+
+   a. Read the failure output in full. Identify the assertion that
+      failed and the line of production code (or test code) it points
+      to.
+   b. Compare against `git show :2:<file>` (ours) and `:3:<file>` (theirs)
+      for both the failing test *and* the production code it covers.
+      The failure is almost always one of:
+      - Your resolution dropped or garbled a behavior change one side
+        introduced (test on one side asserts the new behavior; your
+        merged source still does the old behavior). **Fix the source
+        to match the new behavior.**
+      - One side renamed / reshaped a symbol; the other side added a
+        new caller or a new test that still uses the old name. **Update
+        the new code to use the new name.**
+      - Both sides changed the same contract differently; the test on
+        one side now disagrees with the merged source. **Choose the
+        contract that preserves both sides' intent and update both the
+        source and the test to match.**
+      - A pre-existing failure unrelated to anything in the conflict
+        list. Confirm by checking `git log -1 -- <test_path>` and the
+        failure's stack trace touches no conflicted file. Then ignore.
+   c. Apply the fix, `git add` the changed file(s), and re-run the
+      targeted tests. Repeat until they pass.
+   d. If after honest investigation you cannot identify a safe fix
+      (the two sides' intents are genuinely incompatible, or the fix
+      requires designing new behavior), follow "If you cannot resolve a
+      file" below: leave the conflict-driven changes staged, do not
+      invent a fix, and explain the failure in your final summary.
+
+Do **not** run the *full* test suite, build the project end-to-end,
+run formatters, run linters, or install dependencies. The targeted
+tests above are in scope; anything broader is not.
+
+When all listed files are resolved, staged, and the targeted tests pass
+(or are confirmed unrelated pre-existing failures), stop. You are done.
 
 ## What NOT to do
 
@@ -144,7 +208,13 @@ stop. You are done.
   `--no-verify`, or any flag that discards one side wholesale.
 - Do **not** create a Gemini skill, extension, or `.skill` archive. This
   prompt is not a skill manifest — it is an instruction to edit files.
-- Do **not** touch files that are not in the conflicted list above.
+- Do **not** touch files that are not in the conflicted list above —
+  with one exception: the targeted-test phase in the sanity check may
+  reveal that a non-conflicted file references a symbol that one side
+  renamed or reshaped (a textual conflict didn't fire because only one
+  side touched that file). In that *narrow* case you may edit the
+  non-conflicted file to update the reference so the test passes.
+  Every other edit outside the conflict list is forbidden.
 - Do **not** modify `.git/` internals.
 - Do **not** install, upgrade, or remove dependencies.
 - Do **not** "clean up" unrelated code, reorder imports, reformat, or
