@@ -662,7 +662,15 @@ impl DashboardService {
                 UPDATE_GEMINI_TIMEOUT,
                 run_command_streamed(
                     &self.gemini_binary,
-                    &["--skip-trust", "--yolo", "-m", &model, &prompt_arg],
+                    &[
+                        "--skip-trust",
+                        "--yolo",
+                        "-m",
+                        &model,
+                        "-o",
+                        "stream-json",
+                        &prompt_arg,
+                    ],
                     Some(&cwd),
                     progress.clone(),
                 ),
@@ -1794,6 +1802,13 @@ async fn run_command_streamed(
 /// Read `reader` line-by-line, append each (raw) line to `buf`, and
 /// forward an ANSI-stripped copy through `progress`. Lines without a
 /// trailing newline (the final partial line) are flushed when EOF hits.
+///
+/// Gemini's `-o stream-json` mode emits one NDJSON event per line
+/// (`init` / `message` / `tool_use` / `tool_result` / `result`); those
+/// are translated into compact human-readable activity rows. Non-JSON
+/// lines (the four startup warnings Gemini prints on stderr before
+/// switching to structured output) pass through verbatim so the user
+/// still sees them.
 async fn forward_stream<R>(
     mut reader: BufReader<R>,
     buf: Arc<Mutex<String>>,
@@ -1812,14 +1827,133 @@ async fn forward_stream<R>(
                 }
                 if let Some(tx) = progress.as_ref() {
                     let clean = strip_ansi(line.trim_end_matches(['\r', '\n']));
-                    if !clean.is_empty() {
-                        let _ = tx.send(UpdateProgress::AiOutput(clean));
+                    if let Some(formatted) = format_stream_event(&clean) {
+                        let _ = tx.send(UpdateProgress::AiOutput(formatted));
                     }
                 }
             }
             Err(_) => break,
         }
     }
+}
+
+/// Translate a single line of Gemini stdout/stderr into a row for the
+/// AI Activity panel. Returns `None` for lines we deliberately hide
+/// (empties, the user-prompt echo, successful tool acks). Lines that
+/// don't parse as a known NDJSON event are returned as-is so the
+/// startup warnings still surface to the user.
+fn format_stream_event(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return Some(line.to_string()),
+    };
+    let event_type = value.get("type").and_then(|v| v.as_str())?;
+    match event_type {
+        "init" => {
+            let model = value.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("[session started · model: {model}]"))
+        }
+        "message" => {
+            let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role != "assistant" {
+                return None;
+            }
+            let content = value
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(format!("AI: {content}"))
+        }
+        "tool_use" => {
+            let tool = value
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let summary = summarize_tool_params(value.get("parameters"));
+            if summary.is_empty() {
+                Some(format!("> {tool}()"))
+            } else {
+                Some(format!("> {tool}({summary})"))
+            }
+        }
+        "tool_result" => {
+            let status = value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("success");
+            if status == "success" {
+                return None;
+            }
+            let detail = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("output").and_then(|v| v.as_str()))
+                .unwrap_or("failed");
+            Some(format!("< tool {status}: {detail}"))
+        }
+        "result" => {
+            let stats = value.get("stats");
+            let tool_calls = stats
+                .and_then(|s| s.get("tool_calls"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let duration_ms = stats
+                .and_then(|s| s.get("duration_ms"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let tokens = stats
+                .and_then(|s| s.get("total_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Some(format!(
+                "[done · {tool_calls} tool calls · {:.1}s · {tokens} tokens]",
+                duration_ms as f64 / 1000.0
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Pick the single most informative key in a tool-call parameter blob.
+/// Gemini's tools all carry one obvious "what is this about" field
+/// (`file_path` for read/edit, `command` for shell, `pattern` for
+/// grep, …); rendering just that keeps the activity row short. Falls
+/// back to the first key=value pair when nothing recognisable is
+/// found.
+fn summarize_tool_params(params: Option<&serde_json::Value>) -> String {
+    let Some(obj) = params.and_then(|v| v.as_object()) else {
+        return String::new();
+    };
+    const PREFERRED: &[&str] = &[
+        "file_path",
+        "path",
+        "absolute_path",
+        "command",
+        "pattern",
+        "query",
+        "url",
+        "strategic_intent",
+    ];
+    for key in PREFERRED {
+        if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
+            return v.to_string();
+        }
+    }
+    obj.iter()
+        .next()
+        .map(|(k, v)| match v.as_str() {
+            Some(s) => format!("{k}={s}"),
+            None => format!("{k}={v}"),
+        })
+        .unwrap_or_default()
 }
 
 /// Strip CSI / OSC ANSI escape sequences and bare ESC characters so

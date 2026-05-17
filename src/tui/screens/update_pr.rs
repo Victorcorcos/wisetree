@@ -614,6 +614,7 @@ impl UpdatePullRequestScreen {
                 Constraint::Length(1),              // blank
                 Constraint::Length(1),              // sha line
                 Constraint::Length(1),              // hint line
+                Constraint::Length(1),              // blank
                 Constraint::Min(3),                 // scrollable diff panel
                 Constraint::Length(1),              // blank
                 Constraint::Length(confirm_height), // ConfirmDialog
@@ -623,9 +624,9 @@ impl UpdatePullRequestScreen {
         frame.render_widget(Paragraph::new(title), chunks[0]);
         frame.render_widget(Paragraph::new(sha_line), chunks[2]);
         frame.render_widget(Paragraph::new(hint_line), chunks[3]);
-        self.render_diff_panel(frame, chunks[4]);
+        self.render_diff_panel(frame, chunks[5]);
         if let Some(dialog) = self.review_confirm.as_ref() {
-            dialog.render(frame, chunks[6]);
+            dialog.render(frame, chunks[7]);
         }
     }
 
@@ -824,7 +825,7 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
             Span::styled(
-                "on conflict: gemini --skip-trust --yolo -m gemini-3.1-pro-preview --prompt=\"<merger>\" → commit".to_string(),
+                "on conflict: gemini --skip-trust --yolo -m gemini-3.1-pro-preview -o stream-json --prompt=\"<merger>\" → commit".to_string(),
                 bullet_style,
             ),
         ]),
@@ -858,6 +859,23 @@ fn labeled_line(
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render_dump(screen: &UpdatePullRequestScreen, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| screen.render(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     fn sample_request() -> UpdatePullRequestRequest {
         UpdatePullRequestRequest {
@@ -1079,30 +1097,12 @@ mod tests {
 
     #[test]
     fn ai_activity_panel_hidden_until_marked_active() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         assert!(!screen.ai_active());
 
-        let render = |s: &UpdatePullRequestScreen| {
-            let backend = TestBackend::new(100, 24);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|f| s.render(f, f.area())).unwrap();
-            let buffer = terminal.backend().buffer().clone();
-            (0..buffer.area.height)
-                .map(|y| {
-                    (0..buffer.area.width)
-                        .map(|x| buffer[(x, y)].symbol())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        let before = render(&screen);
+        let before = render_dump(&screen, 100, 24);
         assert!(
             !before.contains("AI Activity"),
             "AI Activity panel rendered before conflicts detected:\n{before}"
@@ -1110,7 +1110,7 @@ mod tests {
 
         screen.mark_ai_active();
         assert!(screen.ai_active());
-        let after = render(&screen);
+        let after = render_dump(&screen, 100, 24);
         assert!(
             after.contains("AI Activity"),
             "AI Activity panel missing after mark_ai_active:\n{after}"
@@ -1144,24 +1144,10 @@ mod tests {
 
     #[test]
     fn render_confirm_shows_base_ref_and_buttons() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
 
-        let backend = TestBackend::new(100, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| screen.render(f, f.area())).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let dumped: String = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let dumped = render_dump(&screen, 100, 28);
 
         assert!(
             dumped.contains("Update Pull Request #21?"),
@@ -1171,5 +1157,41 @@ mod tests {
         assert!(dumped.contains("-7"));
         assert!(dumped.contains("Yes"));
         assert!(dumped.contains("No"));
+    }
+
+    #[test]
+    fn render_review_inserts_blank_lines_before_diff_and_buttons() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.present_review(
+            "deadbee".to_string(),
+            "1 file changed, 2 insertions(+)".to_string(),
+            "diff --git a/README.md b/README.md\n+added\n".to_string(),
+        );
+
+        let dumped = render_dump(&screen, 100, 28);
+        let lines: Vec<&str> = dumped.lines().collect();
+
+        let scroll_idx = lines
+            .iter()
+            .position(|line| line.contains("Scroll: ↑/↓ or wheel"))
+            .expect("missing scroll hint");
+        assert!(
+            lines[scroll_idx + 1].trim().is_empty(),
+            "expected blank line after scroll hint:\n{dumped}"
+        );
+
+        let push_idx = lines
+            .iter()
+            .position(|line| line.contains("│ Push │") || line.contains(" Push "))
+            .expect("missing Push button");
+        assert!(
+            lines[push_idx - 1].trim().is_empty(),
+            "expected blank line before buttons:\n{dumped}"
+        );
+        assert!(
+            !lines[push_idx - 2].trim().is_empty(),
+            "expected review message immediately above the blank line before buttons:\n{dumped}"
+        );
     }
 }
