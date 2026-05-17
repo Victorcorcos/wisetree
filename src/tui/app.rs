@@ -1181,6 +1181,9 @@ impl App {
                     ToastVariant::Warning,
                     format!("PR #{number}: {count} conflicted file(s) — handing off to {model}."),
                 );
+                if let Some(screen) = self.update_pr.as_mut() {
+                    screen.mark_ai_active();
+                }
             }
             UpdatePhase::AiResolving { model } => {
                 self.set_update_pr_phase_label(format!("{model} is resolving conflicts..."));

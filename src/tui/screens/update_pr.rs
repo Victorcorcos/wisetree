@@ -86,6 +86,11 @@ pub struct UpdatePullRequestScreen {
     /// `AI_LOG_MAX_LINES`; the activity panel always renders the bottom
     /// slice so the latest line stays visible.
     ai_log: Vec<String>,
+    /// `true` once the pipeline has reached `ConflictsDetected` and the
+    /// AI is about to (or already started) work on the merge. Drives the
+    /// AI Activity panel: when `false`, the `Updating` step renders just
+    /// the spinner so the panel doesn't appear during clean merges.
+    ai_active: bool,
     error: Option<String>,
     step: UpdateStep,
     pub tick: usize,
@@ -113,6 +118,7 @@ impl UpdatePullRequestScreen {
             post_review_message: None,
             phase_message: UPDATE_RUNNING_MESSAGE.to_string(),
             ai_log: Vec::new(),
+            ai_active: false,
             error: None,
             step,
             tick: 0,
@@ -151,6 +157,19 @@ impl UpdatePullRequestScreen {
         self.step = UpdateStep::Updating;
         self.phase_message = UPDATE_RUNNING_MESSAGE.to_string();
         self.ai_log.clear();
+        self.ai_active = false;
+    }
+
+    /// Flip on the AI Activity panel. Called by the App once the pipeline
+    /// has surfaced the "handing off to AI" toast (i.e. `ConflictsDetected`),
+    /// so the panel only appears for runs that actually need the AI.
+    pub fn mark_ai_active(&mut self) {
+        self.ai_active = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ai_active(&self) -> bool {
+        self.ai_active
     }
 
     pub fn is_updating(&self) -> bool {
@@ -326,10 +345,15 @@ impl UpdatePullRequestScreen {
         match self.step {
             UpdateStep::Loading | UpdateStep::PostReview => 3,
             UpdateStep::Updating => {
-                // Spinner + AI Activity panel. Reserve a generous chunk
-                // so the user actually sees the streaming output instead
-                // of a one-line strip.
-                24
+                // Pre-conflict phases (fetching, merging, pushing-clean)
+                // don't need the AI Activity panel — keep the panel tall
+                // only once we've flipped into AI mode so the streaming
+                // output has room to breathe.
+                if self.ai_active {
+                    24
+                } else {
+                    3
+                }
             }
             UpdateStep::Confirm => {
                 let detail_rows = self.detail_line_count() as u16;
@@ -475,9 +499,11 @@ fn build_review_confirm(request: &UpdatePullRequestRequest) -> ConfirmDialog {
 
 impl UpdatePullRequestScreen {
     fn render_updating(&self, frame: &mut Frame, area: Rect) {
-        // If the area is too short for a meaningful split, fall back to
-        // just the spinner so we never overflow or render a stub box.
-        if area.height < 5 {
+        // Pre-conflict (or "no conflict at all") runs render as just a
+        // spinner — the AI Activity panel is reserved for the post-
+        // `ConflictsDetected` portion of the pipeline. We also fall back
+        // to the spinner-only layout when the area is too short to split.
+        if !self.ai_active || area.height < 5 {
             StatusIndicator::new(Status::Loading, self.phase_message.clone())
                 .with_tick(self.tick)
                 .render(frame, area);
@@ -1049,6 +1075,71 @@ mod tests {
         let dialog = screen.review_confirm.as_ref().unwrap();
         // Default is Cancel (Discard); Down must not have toggled it.
         assert_eq!(dialog.selected, ConfirmChoice::Cancel);
+    }
+
+    #[test]
+    fn ai_activity_panel_hidden_until_marked_active() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        assert!(!screen.ai_active());
+
+        let render = |s: &UpdatePullRequestScreen| {
+            let backend = TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| s.render(f, f.area())).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let before = render(&screen);
+        assert!(
+            !before.contains("AI Activity"),
+            "AI Activity panel rendered before conflicts detected:\n{before}"
+        );
+
+        screen.mark_ai_active();
+        assert!(screen.ai_active());
+        let after = render(&screen);
+        assert!(
+            after.contains("AI Activity"),
+            "AI Activity panel missing after mark_ai_active:\n{after}"
+        );
+    }
+
+    #[test]
+    fn updating_height_is_compact_until_ai_active() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        let compact = screen.preferred_content_height();
+        screen.mark_ai_active();
+        let expanded = screen.preferred_content_height();
+        assert!(
+            expanded > compact,
+            "expected AI-active height ({expanded}) to exceed pre-AI height ({compact})"
+        );
+    }
+
+    #[test]
+    fn start_updating_resets_ai_active_flag() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        assert!(screen.ai_active());
+        screen.start_updating();
+        assert!(!screen.ai_active());
     }
 
     #[test]
