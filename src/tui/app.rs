@@ -46,6 +46,9 @@ use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
+use crate::tui::screens::setup_project::{
+    SetupProjectAction, SetupProjectScreen, SetupProjectStep,
+};
 use crate::tui::selection::{
     clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
 };
@@ -110,6 +113,7 @@ pub struct App {
     delete: Option<DeleteScreen>,
     settings: Option<SettingsScreen>,
     setup: Option<SetupScreen>,
+    setup_project: Option<SetupProjectScreen>,
     merge_pr: Option<MergePullRequestScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
@@ -147,6 +151,7 @@ impl App {
             delete: None,
             settings: None,
             setup: None,
+            setup_project: None,
             merge_pr: None,
             shell_integration_status: None,
             toast: ToastState::default(),
@@ -340,6 +345,26 @@ impl App {
                     merge_pr.render(frame, panel);
                 }
             }
+            Screen::SetupProject => {
+                let panel = match self.setup_project.as_ref().map(|s| s.step()) {
+                    // Preset list fills the full panel like Dashboard so all
+                    // 24 entries can fit without scrolling on tall terminals.
+                    Some(SetupProjectStep::PresetList) | None => {
+                        self.render_framed_panel_fill(frame, area)
+                    }
+                    Some(SetupProjectStep::Confirm) => {
+                        let h = self
+                            .setup_project
+                            .as_ref()
+                            .map_or(12, |s| s.preferred_content_height());
+                        self.render_framed_panel(frame, area, h)
+                    }
+                };
+                if let Some(screen) = self.setup_project.as_mut() {
+                    screen.tick = self.tick;
+                    screen.render(frame, panel);
+                }
+            }
         }
     }
 
@@ -499,6 +524,7 @@ impl App {
             Screen::Delete => self.handle_delete_key(key, tx),
             Screen::Settings => self.handle_settings_key(key, tx),
             Screen::Setup => self.handle_setup_key(key, tx),
+            Screen::SetupProject => self.handle_setup_project_key(key, tx),
             Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
         }
     }
@@ -544,6 +570,7 @@ impl App {
                 self.last_menu_index = idx;
                 match choice {
                     MenuChoice::Exit => self.quit_requested = true,
+                    MenuChoice::SetupProject => self.enter_screen(Screen::SetupProject, tx),
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                     MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
@@ -863,6 +890,64 @@ impl App {
         }
     }
 
+    fn handle_setup_project_key(&mut self, key: KeyEvent, _tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.setup_project.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+
+        match action {
+            SetupProjectAction::Continue => {}
+            SetupProjectAction::Cancelled => self.back_to_menu(),
+            SetupProjectAction::Apply(preset_id) => self.apply_setup_project_preset(preset_id),
+        }
+    }
+
+    fn apply_setup_project_preset(&mut self, preset_id: crate::services::presets::PresetId) {
+        let preset = match crate::services::presets::find_by_id(preset_id) {
+            Some(p) => p,
+            None => {
+                self.show_toast(ToastVariant::Error, "Preset not found.");
+                return;
+            }
+        };
+
+        let local_path = match self.local_config_path() {
+            Some(path) => path,
+            None => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    "No git repository in scope — cannot write .wisetree.json.",
+                );
+                return;
+            }
+        };
+
+        let mut config = self.current_config().cloned().unwrap_or_default();
+        config.worktree_copy_patterns = preset.copy_patterns_owned();
+        config.worktree_copy_ignores = preset.copy_ignores_owned();
+        config.post_create_cmd = preset.post_create_cmd_owned();
+
+        let mut writer = ConfigService::new();
+        if let Err(err) = writer.save(&config, Some(&local_path)) {
+            self.show_toast(
+                ToastVariant::Error,
+                format!("Failed to write .wisetree.json: {err}"),
+            );
+            return;
+        }
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let _ = service.config_service_mut().load(local_path.parent());
+        }
+
+        self.show_toast(
+            ToastVariant::Success,
+            format!("Applied {} preset to .wisetree.json", preset.label),
+        );
+        self.back_to_menu();
+    }
+
     fn handle_app_event(&mut self, event: AppEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match event {
             AppEvent::Initialized(outcome) => self.apply_init_outcome(*outcome, tx),
@@ -1126,6 +1211,10 @@ impl App {
             Screen::Setup => {
                 self.setup = Some(SetupScreen::new(self.shell_integration_status.as_ref()));
             }
+            Screen::SetupProject => {
+                let root = self.git_root.as_ref().map(PathBuf::from);
+                self.setup_project = Some(SetupProjectScreen::new(root.as_deref()));
+            }
             Screen::MergePullRequest => {
                 // Entered explicitly from `DashboardAction::MergePullRequest`,
                 // which seeds `merge_pr` before flipping the screen. If we
@@ -1152,6 +1241,7 @@ impl App {
         self.delete = None;
         self.settings = None;
         self.setup = None;
+        self.setup_project = None;
         self.merge_pr = None;
         self.mouse_selection = None;
     }
@@ -1246,7 +1336,17 @@ impl App {
             self.shell_integration_status
                 .as_ref()
                 .map(|status| status.is_installed),
+            self.has_local_config(),
         )
+    }
+
+    /// True when the active project already has a `.wisetree.json`. The
+    /// menu uses this to decide whether to surface the one-keystroke
+    /// "Setup Project Config" entry.
+    fn has_local_config(&self) -> bool {
+        self.local_config_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     fn current_config(&self) -> Option<&WorktreeConfig> {
@@ -1967,12 +2067,19 @@ mod tests {
     }
 
     fn initialized_menu_app() -> App {
+        // A persistent tempdir with a stub `.wisetree.json` so
+        // `has_local_config()` is true and the "Setup Project Config"
+        // entry is hidden — keeping menu ordering stable for these tests.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.keep();
+        fs::write(repo_root.join(LOCAL_CONFIG_FILE_NAME), "{}").expect("write local config");
+
         let service = WorktreeService::new(None);
 
         let mut app = App::new(AppMode::Menu, false);
         app.phase = InitPhase::Ready;
         app.worktree_service = Some(service);
-        app.git_root = Some("/tmp/repo".into());
+        app.git_root = Some(repo_root.display().to_string());
         app.shell_integration_status = Some(ShellIntegrationStatus {
             is_installed: true,
             shell: Shell::Zsh,

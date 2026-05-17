@@ -30,6 +30,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::MergePullRequest => Some("Merge Pull Request"),
             Screen::Settings => Some("Settings"),
             Screen::Setup => Some("Setup"),
+            Screen::SetupProject => Some("Setup Project Config"),
         }
     }
 
