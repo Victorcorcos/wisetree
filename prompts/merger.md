@@ -20,7 +20,7 @@ Understand *why* both sides differ using read-only commands:
 4. **Preserve language invariants** — imports resolve, interfaces are complete, exhaustive matches stay exhaustive, signatures agree across call sites.
 5. **Remove all markers.** No `<<<<<<<`, `=======`, or `>>>>>>>` may remain.
 6. **Never use a placeholder.** Writing "resolved" or "done" as the file body silently destroys content. If you can't merge safely, leave markers and stop.
-7. **Stage each file:** `git add <file>`.
+7. **Stage each file by explicit path:** `git add <file>`. Never use `git add .` or `git add -A` — they pick up temp files.
 
 ## File-type defaults
 
@@ -50,6 +50,7 @@ Understand *why* both sides differ using read-only commands:
 - Editing files outside the conflict list (exception: a non-conflicted file that references a renamed symbol and causes a targeted test to fail).
 - Touching `.git/` internals or changing dependencies.
 - Unrelated cleanup — reformatting, reordering imports, renaming symbols.
+- Staging or committing temp backup files (`*.theirs`, `*.ours`, `*.orig`) — delete them before staging.
 
 ## If you cannot resolve a file
 
