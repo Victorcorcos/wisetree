@@ -43,6 +43,7 @@ enum ActionChoice {
     OpenPullRequest,
     MergePullRequest,
     UpdatePullRequest,
+    UpdateBranch,
 }
 
 /// Payload the dashboard hands to the merge confirmation screen.
@@ -143,6 +144,11 @@ pub enum DashboardAction {
     OpenPullRequest(String),
     MergePullRequest(Box<MergePullRequestRequest>),
     UpdatePullRequest(Box<UpdatePullRequestRequest>),
+    /// Fetch the remote and merge the mother branch with the first
+    /// reachable ref in `BASE_REF_PRIORITY` (upstream/main →
+    /// upstream/master → origin/main → origin/master). Only offered on
+    /// the main worktree row.
+    UpdateBranch(String),
     /// The user tried to delete the mother (main) worktree. The app
     /// layer should surface a toast explaining that this worktree is
     /// protected, instead of routing to the delete screen.
@@ -594,6 +600,16 @@ impl DashboardScreen {
                 ActionChoice::UpdatePullRequest,
             ));
         }
+        // The mother (main) worktree has no PR of its own, but we still
+        // want a one-click way to pull the upstream tip into it. Fetches
+        // the remote and merges the first reachable ref from
+        // `BASE_REF_PRIORITY`.
+        if row.worktree.is_main {
+            options.push(SelectOption::new(
+                "Update Branch",
+                ActionChoice::UpdateBranch,
+            ));
+        }
         SelectPrompt::new("Choose action:", options).without_hint()
     }
 
@@ -633,6 +649,7 @@ impl DashboardScreen {
                         Some(request) => DashboardAction::UpdatePullRequest(Box::new(request)),
                         None => DashboardAction::Continue,
                     },
+                    ActionChoice::UpdateBranch => DashboardAction::UpdateBranch(path),
                 }
             }
             SelectOutcome::Cancelled => {

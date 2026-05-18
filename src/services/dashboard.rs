@@ -332,6 +332,33 @@ pub enum UpdatePullRequestOutcome {
     DiscardFailed(String),
 }
 
+/// Outcome of the `update_branch` pipeline (fetch + merge on the mother
+/// worktree). The success variants split out what `git merge` actually
+/// did so the UI can show a toast that reflects reality (a no-op vs a
+/// fast-forward vs a real merge commit) instead of a generic "updated".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateBranchOutcome {
+    /// `git merge` printed "Already up to date." — the worktree was
+    /// already at or ahead of `base_ref`, nothing changed on disk.
+    AlreadyUpToDate { base_ref: String },
+    /// `git merge` advanced HEAD as a fast-forward (no merge commit).
+    /// `summary` is the first non-empty line of git's stdout, which
+    /// typically reads `Updating <old>..<new>` — useful for the toast.
+    FastForwarded { base_ref: String, summary: String },
+    /// `git merge` created a merge commit (divergent histories). The
+    /// commit message is git's default `Merge ...`. `summary` carries
+    /// the first non-empty line of git's stdout for the toast.
+    Merged { base_ref: String, summary: String },
+    /// None of the refs in `BASE_REF_PRIORITY` resolved against the
+    /// worktree, even after `git fetch`. Nothing to merge against.
+    NoBaseRef,
+    /// `git fetch --all --prune` failed (network, auth, ...). stderr included.
+    FetchFailed(String),
+    /// `git merge {base_ref}` failed for any reason (conflicts, dirty
+    /// tree, refusal). stderr included.
+    MergeFailed { base_ref: String, message: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashboardRow {
     #[serde(flatten)]
@@ -897,6 +924,43 @@ impl DashboardService {
         }
 
         Ok(UpdatePullRequestOutcome::MergedCleanly)
+    }
+
+    /// Fetch the remote and merge the worktree at `worktree_path` with
+    /// the first reachable ref in `BASE_REF_PRIORITY` (upstream/main →
+    /// upstream/master → origin/main → origin/master). Powers the
+    /// dashboard's "Update Branch" action on the mother worktree.
+    pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+
+        let fetch = time::timeout(
+            UPDATE_FETCH_TIMEOUT,
+            run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git fetch timed out after 60s"))?;
+        if let Err(err) = fetch {
+            return Ok(UpdateBranchOutcome::FetchFailed(err));
+        }
+
+        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd).await else {
+            return Ok(UpdateBranchOutcome::NoBaseRef);
+        };
+
+        let merge = time::timeout(
+            UPDATE_MERGE_TIMEOUT,
+            run_command(&self.git_binary, &["merge", &base_ref], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git merge timed out after 120s"))?;
+
+        match merge {
+            Ok(stdout) => Ok(classify_merge_output(base_ref, &stdout)),
+            Err(stderr) => Ok(UpdateBranchOutcome::MergeFailed {
+                base_ref,
+                message: stderr,
+            }),
+        }
     }
 
     /// Push the AI-resolved merge commit after the user reviewed it.
@@ -2034,6 +2098,33 @@ fn derive_review_status(
 ///   ` 28 files changed, 2815 insertions(+), 42 deletions(-)`
 ///   ` 1 file changed, 5 insertions(+)`
 ///   `` (no diff → both zero)
+/// Classify the stdout of `git merge <ref>` into the corresponding
+/// `UpdateBranchOutcome` variant so the dashboard toast can describe
+/// what actually happened. Git's output is stable enough to key on:
+/// - "Already up to date." for the no-op case,
+/// - a line containing "Fast-forward" for the fast-forward case,
+/// - everything else (including "Merge made by ...") is a merge commit.
+///
+/// `summary` is the first non-empty line of stdout — short enough for
+/// the toast and informative enough to anchor what just happened.
+fn classify_merge_output(base_ref: String, stdout: &str) -> UpdateBranchOutcome {
+    let trimmed = stdout.trim();
+    if trimmed.starts_with("Already up to date") || trimmed.starts_with("Already up-to-date") {
+        return UpdateBranchOutcome::AlreadyUpToDate { base_ref };
+    }
+    let summary = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if trimmed.lines().any(|line| line.trim() == "Fast-forward") {
+        UpdateBranchOutcome::FastForwarded { base_ref, summary }
+    } else {
+        UpdateBranchOutcome::Merged { base_ref, summary }
+    }
+}
+
 fn parse_shortstat(output: &str) -> (u64, u64) {
     let mut insertions = 0u64;
     let mut deletions = 0u64;
@@ -3367,6 +3458,55 @@ mod tests {
         // threshold doesn't fire on toy fixtures.
         let existing = "<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> base\n";
         assert!(guard_destructive_overwrite(existing, "z").is_ok());
+    }
+
+    #[test]
+    fn classify_merge_output_recognizes_already_up_to_date() {
+        let outcome = classify_merge_output("upstream/main".into(), "Already up to date.\n");
+        assert_eq!(
+            outcome,
+            UpdateBranchOutcome::AlreadyUpToDate {
+                base_ref: "upstream/main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_merge_output_recognizes_hyphenated_already_up_to_date() {
+        // Older git versions print "Already up-to-date." with hyphens.
+        let outcome = classify_merge_output("origin/main".into(), "Already up-to-date.");
+        assert_eq!(
+            outcome,
+            UpdateBranchOutcome::AlreadyUpToDate {
+                base_ref: "origin/main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_merge_output_detects_fast_forward() {
+        let stdout = "Updating abc1234..def5678\nFast-forward\n README.md | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n";
+        let outcome = classify_merge_output("upstream/main".into(), stdout);
+        assert_eq!(
+            outcome,
+            UpdateBranchOutcome::FastForwarded {
+                base_ref: "upstream/main".into(),
+                summary: "Updating abc1234..def5678".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_merge_output_treats_real_merge_as_merged() {
+        let stdout = "Merge made by the 'ort' strategy.\n README.md | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n";
+        let outcome = classify_merge_output("origin/master".into(), stdout);
+        assert_eq!(
+            outcome,
+            UpdateBranchOutcome::Merged {
+                base_ref: "origin/master".into(),
+                summary: "Merge made by the 'ort' strategy.".into(),
+            }
+        );
     }
 
     #[test]

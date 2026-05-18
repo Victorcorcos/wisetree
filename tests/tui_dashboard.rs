@@ -1192,3 +1192,58 @@ fn action_menu_hides_update_option_when_no_pr_present() {
     let dumped = open_action_menu_for_second_row(&mut screen);
     assert!(!dumped.contains("Update Pull Request"));
 }
+
+// ---- "Update Branch" visibility -----------------------------------------
+// The mother (main) worktree is the only row that exposes "Update Branch".
+// It's the dashboard's one-click way to pull the upstream tip into the
+// mother — irrelevant on derived worktrees that already track their own
+// PR base via "Update Pull Request".
+
+fn open_action_menu_for_first_row(screen: &mut DashboardScreen) -> String {
+    screen.handle_key(key(KeyCode::Enter));
+    dump(120, 14, |f| screen.render(f, f.area()))
+}
+
+#[test]
+fn action_menu_shows_update_branch_on_mother_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", true),
+    ]);
+
+    let dumped = open_action_menu_for_first_row(&mut screen);
+    assert!(
+        dumped.contains("Update Branch"),
+        "expected `Update Branch` on mother row: {dumped}"
+    );
+}
+
+#[test]
+fn action_menu_hides_update_branch_on_non_main_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", true),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        !dumped.contains("Update Branch"),
+        "Update Branch must not appear on non-main rows: {dumped}"
+    );
+}
