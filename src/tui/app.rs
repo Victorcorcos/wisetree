@@ -30,8 +30,8 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
-    install_shell_integration, resolve_dashboard_columns, DashboardService,
-    DashboardUpdate, DashboardWatch, MultiSourceUpdateResult, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    install_shell_integration, resolve_dashboard_columns, DashboardService, DashboardUpdate,
+    DashboardWatch, MultiSourceUpdateResult, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
     UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
