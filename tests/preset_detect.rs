@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use tempfile::TempDir;
-use wisetree::services::presets::{catalog, detect, PresetId};
+use wisetree::services::presets::{catalog, detect, discover_all, discover_wise, PresetId};
 
 fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
@@ -252,4 +252,134 @@ fn catalog_ids_are_unique() {
     sorted_ids.sort_by_key(|id| id.as_str());
     sorted_ids.dedup();
     assert_eq!(ids.len(), sorted_ids.len(), "duplicate preset ids");
+}
+
+#[test]
+fn discover_all_finds_multiple_nested_presets() {
+    let dir = fixture();
+    touch(dir.path(), "api/Gemfile");
+    touch(dir.path(), "api/config/application.rb");
+    write(
+        dir.path(),
+        "web/package.json",
+        "{\"dependencies\": {\"react\": \"18\"}}",
+    );
+
+    assert_eq!(
+        discover_all(dir.path()),
+        vec![PresetId::RubyOnRails, PresetId::React]
+    );
+}
+
+#[test]
+fn discover_all_dedupes_duplicate_nested_frameworks() {
+    let dir = fixture();
+    write(
+        dir.path(),
+        "admin/package.json",
+        "{\"dependencies\": {\"react\": \"18\"}}",
+    );
+    write(
+        dir.path(),
+        "web/package.json",
+        "{\"dependencies\": {\"react\": \"18\"}}",
+    );
+
+    assert_eq!(discover_all(dir.path()), vec![PresetId::React]);
+}
+
+#[test]
+fn discover_wise_merges_values_in_stable_order() {
+    let dir = fixture();
+    touch(dir.path(), "api/Gemfile");
+    touch(dir.path(), "api/config/application.rb");
+    touch(dir.path(), "api/config/master.key");
+    write(
+        dir.path(),
+        "web/package.json",
+        "{\"dependencies\": {\"react\": \"18\"}}",
+    );
+    touch(dir.path(), "web/.env.local");
+
+    let wise = discover_wise(dir.path()).expect("wise preset");
+
+    assert_eq!(
+        wise.matched_ids,
+        vec![PresetId::RubyOnRails, PresetId::React]
+    );
+    assert!(wise
+        .copy_patterns
+        .iter()
+        .any(|value| value == "api/config/master.key"));
+    assert!(wise
+        .copy_patterns
+        .iter()
+        .any(|value| value == "web/.env.local"));
+    assert!(wise
+        .copy_ignores
+        .iter()
+        .any(|value| value == "api/**/vendor/bundle/**"));
+    assert!(wise
+        .copy_ignores
+        .iter()
+        .any(|value| value == "web/**/node_modules/**"));
+    assert_eq!(
+        wise.post_create_cmd,
+        vec![
+            "(cd 'api' && bundle install --jobs 5 --verbose --retry 4)".to_string(),
+            "(cd 'api' && yarn install)".to_string(),
+            "(cd 'api' && bin/rails db:prepare)".to_string(),
+            "(cd 'web' && npm install)".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn discover_wise_falls_back_to_generic_when_no_specific_preset_matches() {
+    let dir = fixture();
+
+    let wise = discover_wise(dir.path()).expect("wise preset");
+
+    assert_eq!(wise.matched_ids, vec![PresetId::Generic]);
+    assert!(wise.used_generic_fallback());
+    assert!(wise.copy_patterns.is_empty());
+    assert!(wise
+        .copy_ignores
+        .iter()
+        .any(|pattern| pattern == "**/node_modules/**"));
+    assert!(wise.post_create_cmd.is_empty());
+}
+
+#[test]
+fn discover_wise_keeps_same_framework_commands_for_multiple_roots() {
+    let dir = fixture();
+    write(
+        dir.path(),
+        "admin/package.json",
+        "{\"dependencies\": {\"react\": \"18\"}}",
+    );
+    write(
+        dir.path(),
+        "web/package.json",
+        "{\"dependencies\": {\"react\": \"18\"}}",
+    );
+    touch(dir.path(), "admin/.env");
+    touch(dir.path(), "web/.env.local");
+
+    let wise = discover_wise(dir.path()).expect("wise preset");
+
+    assert_eq!(wise.matched_ids, vec![PresetId::React]);
+    assert!(wise.copy_patterns.iter().any(|value| value == "admin/.env"));
+    assert!(wise
+        .copy_patterns
+        .iter()
+        .any(|value| value == "web/.env.local"));
+    assert!(wise
+        .post_create_cmd
+        .iter()
+        .any(|command| command == "(cd 'admin' && npm install)"));
+    assert!(wise
+        .post_create_cmd
+        .iter()
+        .any(|command| command == "(cd 'web' && npm install)"));
 }

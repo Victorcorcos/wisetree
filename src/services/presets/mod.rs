@@ -8,4 +8,4 @@ pub mod catalog;
 pub mod detect;
 
 pub use catalog::{catalog, find_by_id, Preset, PresetId};
-pub use detect::detect;
+pub use detect::{detect, discover_all, discover_wise, WisePresetDiscovery};

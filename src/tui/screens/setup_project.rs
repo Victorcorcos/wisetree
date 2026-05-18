@@ -1,18 +1,19 @@
 //! Setup Project Config screen.
 //!
-//! Two-step flow that bootstraps a new project's `.wisetree.json` from a
+//! Three-step flow that bootstraps a new project's `.wisetree.json` from a
 //! preset:
 //!
-//! 1. `PresetList` — `SelectPrompt` over every entry in
-//!    [`presets::catalog`]. The preset whose signature matches the current
-//!    repository is pre-selected and tagged `detected`.
-//! 2. `Confirm` — three rectangle blocks (Copy Patterns / Ignore Patterns /
+//! 1. `PresetList`  — `SelectPrompt` over `Wise Preset` plus the static preset
+//!    catalog. A root-level match is still tagged `detected`; otherwise Wise is
+//!    the default choice.
+//! 2. `Discovering` — spinner while `App` performs the deep Wise scan.
+//! 3. `Confirm`     — three rectangle blocks (Copy Patterns / Ignore Patterns /
 //!    Post-Create Commands) showing the values that will be written, plus a
 //!    Yes/No row with Yes pre-selected.
 //!
 //! `Esc` walks back one step (Confirm → PresetList; PresetList → menu).
-//! `App` owns persistence and consumes [`SetupProjectAction::Apply`] to write
-//! the chosen preset to disk.
+//! `App` owns Wise discovery + persistence and consumes
+//! [`SetupProjectAction::Apply`] to write the chosen values to disk.
 
 use std::path::Path;
 
@@ -24,13 +25,53 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
-use crate::services::presets::{catalog, detect, Preset, PresetId};
-use crate::tui::widgets::{branded_line, ConfirmChoice, SelectOption, SelectOutcome, SelectPrompt};
+use crate::services::presets::{catalog, detect, Preset, PresetId, WisePresetDiscovery};
+use crate::tui::widgets::{
+    branded_line, ConfirmChoice, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+};
+
+const WISE_PRESET_LIST_LABEL: &str = "Wise Preset";
+const WISE_PRESET_CONFIRM_LABEL: &str = "Wise Preset";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupProjectStep {
     PresetList,
+    Discovering,
     Confirm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetChoice {
+    Wise,
+    Catalog(PresetId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupProjectPresetValues {
+    pub label: String,
+    pub copy_patterns: Vec<String>,
+    pub copy_ignores: Vec<String>,
+    pub post_create_cmd: Vec<String>,
+}
+
+impl SetupProjectPresetValues {
+    fn from_preset(preset: &Preset) -> Self {
+        Self {
+            label: preset.label.to_string(),
+            copy_patterns: preset.copy_patterns_owned(),
+            copy_ignores: preset.copy_ignores_owned(),
+            post_create_cmd: preset.post_create_cmd_owned(),
+        }
+    }
+
+    fn wise(discovery: WisePresetDiscovery) -> Self {
+        Self {
+            label: WISE_PRESET_CONFIRM_LABEL.to_string(),
+            copy_patterns: discovery.copy_patterns,
+            copy_ignores: discovery.copy_ignores,
+            post_create_cmd: discovery.post_create_cmd,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,17 +80,20 @@ pub enum SetupProjectAction {
     Continue,
     /// User hit Esc on the preset list. Caller should `back_to_menu()`.
     Cancelled,
+    /// User selected Wise Preset; caller should start async discovery.
+    DiscoverWise,
     /// User confirmed Yes; caller should persist the preset to disk.
-    Apply(PresetId),
+    Apply(SetupProjectPresetValues),
 }
 
 pub struct SetupProjectScreen {
     step: SetupProjectStep,
     presets: Vec<Preset>,
     detected: Option<PresetId>,
-    selected_preset: PresetId,
-    select: SelectPrompt<PresetId>,
+    selected_choice: PresetChoice,
+    select: SelectPrompt<PresetChoice>,
     confirm_choice: ConfirmChoice,
+    pending_preset: Option<SetupProjectPresetValues>,
     pub tick: usize,
 }
 
@@ -57,26 +101,36 @@ impl SetupProjectScreen {
     pub fn new(project_root: Option<&Path>) -> Self {
         let presets = catalog();
         let detected = project_root.and_then(detect);
-        let selected_preset = detected.unwrap_or(PresetId::Generic);
+        let selected_choice = detected
+            .map(PresetChoice::Catalog)
+            .unwrap_or(PresetChoice::Wise);
 
-        let options: Vec<SelectOption<PresetId>> = presets
-            .iter()
-            .map(|p| {
-                let mut opt = SelectOption::new(p.label, p.id);
-                if Some(p.id) == detected {
-                    opt = opt
-                        .with_description("detected")
-                        .with_description_color(colors::SUCCESS);
-                } else {
-                    opt = opt.with_description(p.description);
-                }
-                opt
-            })
-            .collect();
+        let mut wise_option =
+            SelectOption::new(WISE_PRESET_LIST_LABEL, PresetChoice::Wise).with_color(colors::BRAND);
+        wise_option = if detected.is_none() {
+            wise_option
+                .with_description("recommended")
+                .with_description_color(colors::SUCCESS)
+        } else {
+            wise_option.with_description("deep scan nested apps")
+        };
 
-        let default_idx = presets
+        let mut options: Vec<SelectOption<PresetChoice>> = vec![wise_option];
+        options.extend(presets.iter().map(|preset| {
+            let mut option = SelectOption::new(preset.label, PresetChoice::Catalog(preset.id));
+            if Some(preset.id) == detected {
+                option = option
+                    .with_description("detected")
+                    .with_description_color(colors::SUCCESS);
+            } else {
+                option = option.with_description(preset.description);
+            }
+            option
+        }));
+
+        let default_idx = options
             .iter()
-            .position(|p| p.id == selected_preset)
+            .position(|option| option.value == selected_choice)
             .unwrap_or(0);
 
         let select = SelectPrompt::new("Choose a preset", options)
@@ -88,9 +142,10 @@ impl SetupProjectScreen {
             step: SetupProjectStep::PresetList,
             presets,
             detected,
-            selected_preset,
+            selected_choice,
             select,
             confirm_choice: ConfirmChoice::Confirm,
+            pending_preset: None,
             tick: 0,
         }
     }
@@ -103,35 +158,69 @@ impl SetupProjectScreen {
         self.detected
     }
 
-    pub fn selected_preset(&self) -> PresetId {
-        self.selected_preset
+    pub fn selected_choice(&self) -> PresetChoice {
+        self.selected_choice
+    }
+
+    pub fn selected_preset(&self) -> Option<PresetId> {
+        match self.selected_choice {
+            PresetChoice::Wise => None,
+            PresetChoice::Catalog(id) => Some(id),
+        }
     }
 
     pub fn confirm_choice(&self) -> ConfirmChoice {
         self.confirm_choice
     }
 
-    fn preset(&self, id: PresetId) -> &Preset {
-        self.presets
-            .iter()
-            .find(|p| p.id == id)
-            .expect("preset id from catalog")
+    pub fn complete_wise_discovery(&mut self, discovery: WisePresetDiscovery) {
+        self.pending_preset = Some(SetupProjectPresetValues::wise(discovery));
+        self.confirm_choice = ConfirmChoice::Confirm;
+        self.step = SetupProjectStep::Confirm;
+    }
+
+    pub fn reset_after_wise_discovery_failure(&mut self) {
+        self.pending_preset = None;
+        self.step = SetupProjectStep::PresetList;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SetupProjectAction {
         match self.step {
             SetupProjectStep::PresetList => self.handle_preset_list(key),
+            SetupProjectStep::Discovering => SetupProjectAction::Continue,
             SetupProjectStep::Confirm => self.handle_confirm(key),
         }
     }
 
+    fn preset(&self, id: PresetId) -> &Preset {
+        self.presets
+            .iter()
+            .find(|preset| preset.id == id)
+            .expect("preset id from catalog")
+    }
+
+    fn confirm_preset(&self) -> Option<&SetupProjectPresetValues> {
+        self.pending_preset.as_ref()
+    }
+
     fn handle_preset_list(&mut self, key: KeyEvent) -> SetupProjectAction {
         match self.select.handle_key(key) {
-            SelectOutcome::Selected(_, id) => {
-                self.selected_preset = id;
+            SelectOutcome::Selected(_, choice) => {
+                self.selected_choice = choice;
                 self.confirm_choice = ConfirmChoice::Confirm;
-                self.step = SetupProjectStep::Confirm;
-                SetupProjectAction::Continue
+                match choice {
+                    PresetChoice::Wise => {
+                        self.pending_preset = None;
+                        self.step = SetupProjectStep::Discovering;
+                        SetupProjectAction::DiscoverWise
+                    }
+                    PresetChoice::Catalog(id) => {
+                        self.pending_preset =
+                            Some(SetupProjectPresetValues::from_preset(self.preset(id)));
+                        self.step = SetupProjectStep::Confirm;
+                        SetupProjectAction::Continue
+                    }
+                }
             }
             SelectOutcome::Cancelled => SetupProjectAction::Cancelled,
             SelectOutcome::Pending => SetupProjectAction::Continue,
@@ -160,7 +249,11 @@ impl SetupProjectScreen {
                 SetupProjectAction::Continue
             }
             KeyCode::Enter => match self.confirm_choice {
-                ConfirmChoice::Confirm => SetupProjectAction::Apply(self.selected_preset),
+                ConfirmChoice::Confirm => self
+                    .confirm_preset()
+                    .cloned()
+                    .map(SetupProjectAction::Apply)
+                    .unwrap_or(SetupProjectAction::Continue),
                 ConfirmChoice::Cancel => {
                     self.step = SetupProjectStep::PresetList;
                     SetupProjectAction::Continue
@@ -175,20 +268,20 @@ impl SetupProjectScreen {
             // Intro line + spacer + select prompt (label + spacer + N rows
             // + footer) + footer description (2 lines).
             SetupProjectStep::PresetList => {
-                let rows = self.presets.len().min(12) as u16;
+                let rows = self.select.options.len().min(12) as u16;
                 3 + rows + 4
             }
+            SetupProjectStep::Discovering => 3,
             // Header + 3 boxed blocks (sizes derived from the chosen preset)
             // + Yes/No row + footer.
             SetupProjectStep::Confirm => {
-                let preset = self.preset(self.selected_preset);
+                let Some(preset) = self.confirm_preset() else {
+                    return 3;
+                };
                 let copy = preset.copy_patterns.len() as u16;
                 let ignore = preset.copy_ignores.len() as u16;
                 let post = preset.post_create_cmd.len().max(1) as u16;
-                // 2 borders + content per block.
                 let blocks = (copy + 2) + (ignore + 2) + (post + 2);
-                // Title (1) + spacer (1) + blocks + spacer (1) + buttons (3)
-                // + footer (1).
                 2 + blocks + 1 + 3 + 1
             }
         }
@@ -197,6 +290,7 @@ impl SetupProjectScreen {
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         match self.step {
             SetupProjectStep::PresetList => self.render_preset_list(frame, area),
+            SetupProjectStep::Discovering => self.render_discovering(frame, area),
             SetupProjectStep::Confirm => self.render_confirm(frame, area),
         }
     }
@@ -262,8 +356,37 @@ impl SetupProjectScreen {
         frame.render_widget(Paragraph::new(footer_lines), chunks[2]);
     }
 
+    fn render_discovering(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        StatusIndicator::new(
+            Status::Loading,
+            "Wise Preset is researching the repository...",
+        )
+        .with_tick(self.tick)
+        .render(frame, chunks[0]);
+        frame.render_widget(
+            Paragraph::new("Scanning nested apps and framework-specific folders.").style(
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+            chunks[1],
+        );
+    }
+
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
-        let preset = self.preset(self.selected_preset);
+        let Some(preset) = self.confirm_preset() else {
+            self.render_discovering(frame, area);
+            return;
+        };
 
         let copy_h = (preset.copy_patterns.len() as u16).saturating_add(2);
         let ignore_h = (preset.copy_ignores.len() as u16).saturating_add(2);
@@ -272,14 +395,14 @@ impl SetupProjectScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // title
-                Constraint::Length(1), // spacer
+                Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Length(copy_h),
                 Constraint::Length(ignore_h),
                 Constraint::Length(post_h),
-                Constraint::Length(1), // spacer
-                Constraint::Length(3), // buttons
-                Constraint::Length(1), // footer
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
             ])
             .split(area);
 
@@ -291,13 +414,13 @@ impl SetupProjectScreen {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                preset.label,
+                preset.label.clone(),
                 Style::default()
                     .fg(colors::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " preset to ",
+                " to ",
                 Style::default()
                     .fg(colors::INFO)
                     .add_modifier(Modifier::BOLD),
@@ -356,7 +479,7 @@ fn render_block(
     frame: &mut Frame,
     area: Rect,
     title: &str,
-    lines: &[&'static str],
+    lines: &[String],
     accent: ratatui::style::Color,
 ) {
     let body: Vec<Line<'static>> = if lines.is_empty() {
@@ -369,9 +492,9 @@ fn render_block(
     } else {
         lines
             .iter()
-            .map(|s| {
+            .map(|line| {
                 Line::from(Span::styled(
-                    s.to_string(),
+                    line.clone(),
                     Style::default().fg(colors::WHITE),
                 ))
             })
