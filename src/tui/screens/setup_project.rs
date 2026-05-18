@@ -15,10 +15,11 @@
 //! `App` owns Wise discovery + persistence and consumes
 //! [`SetupProjectAction::Apply`] to write the chosen values to disk.
 
+use std::cell::Cell;
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
@@ -32,6 +33,7 @@ use crate::tui::widgets::{
 
 const WISE_PRESET_LIST_LABEL: &str = "Wise Preset";
 const WISE_PRESET_CONFIRM_LABEL: &str = "Wise Preset";
+const CONFIRM_BLOCK_COUNT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupProjectStep {
@@ -94,6 +96,8 @@ pub struct SetupProjectScreen {
     select: SelectPrompt<PresetChoice>,
     confirm_choice: ConfirmChoice,
     pending_preset: Option<SetupProjectPresetValues>,
+    confirm_block_scrolls: [u16; CONFIRM_BLOCK_COUNT],
+    confirm_block_rects: Cell<[Rect; CONFIRM_BLOCK_COUNT]>,
     pub tick: usize,
 }
 
@@ -146,6 +150,8 @@ impl SetupProjectScreen {
             select,
             confirm_choice: ConfirmChoice::Confirm,
             pending_preset: None,
+            confirm_block_scrolls: [0; CONFIRM_BLOCK_COUNT],
+            confirm_block_rects: Cell::new([Rect::default(); CONFIRM_BLOCK_COUNT]),
             tick: 0,
         }
     }
@@ -175,6 +181,7 @@ impl SetupProjectScreen {
 
     pub fn complete_wise_discovery(&mut self, discovery: WisePresetDiscovery) {
         self.pending_preset = Some(SetupProjectPresetValues::wise(discovery));
+        self.confirm_block_scrolls = [0; CONFIRM_BLOCK_COUNT];
         self.confirm_choice = ConfirmChoice::Confirm;
         self.step = SetupProjectStep::Confirm;
     }
@@ -189,6 +196,32 @@ impl SetupProjectScreen {
             SetupProjectStep::PresetList => self.handle_preset_list(key),
             SetupProjectStep::Discovering => SetupProjectAction::Continue,
             SetupProjectStep::Confirm => self.handle_confirm(key),
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(self.step, SetupProjectStep::Confirm) {
+            return false;
+        }
+
+        let block_idx = self.confirm_block_index_at(Position {
+            x: mouse.column,
+            y: mouse.row,
+        });
+        let Some(block_idx) = block_idx else {
+            return false;
+        };
+
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                self.scroll_confirm_block(block_idx, 1);
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_confirm_block(block_idx, -1);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -211,12 +244,14 @@ impl SetupProjectScreen {
                 match choice {
                     PresetChoice::Wise => {
                         self.pending_preset = None;
+                        self.confirm_block_scrolls = [0; CONFIRM_BLOCK_COUNT];
                         self.step = SetupProjectStep::Discovering;
                         SetupProjectAction::DiscoverWise
                     }
                     PresetChoice::Catalog(id) => {
                         self.pending_preset =
                             Some(SetupProjectPresetValues::from_preset(self.preset(id)));
+                        self.confirm_block_scrolls = [0; CONFIRM_BLOCK_COUNT];
                         self.step = SetupProjectStep::Confirm;
                         SetupProjectAction::Continue
                     }
@@ -272,18 +307,7 @@ impl SetupProjectScreen {
                 3 + rows + 4
             }
             SetupProjectStep::Discovering => 3,
-            // Header + 3 boxed blocks (sizes derived from the chosen preset)
-            // + Yes/No row + footer.
-            SetupProjectStep::Confirm => {
-                let Some(preset) = self.confirm_preset() else {
-                    return 3;
-                };
-                let copy = preset.copy_patterns.len() as u16;
-                let ignore = preset.copy_ignores.len() as u16;
-                let post = preset.post_create_cmd.len().max(1) as u16;
-                let blocks = (copy + 2) + (ignore + 2) + (post + 2);
-                2 + blocks + 1 + 3 + 1
-            }
+            SetupProjectStep::Confirm => 18,
         }
     }
 
@@ -296,6 +320,8 @@ impl SetupProjectScreen {
     }
 
     fn render_preset_list(&self, frame: &mut Frame, area: Rect) {
+        self.confirm_block_rects
+            .set([Rect::default(); CONFIRM_BLOCK_COUNT]);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -357,6 +383,8 @@ impl SetupProjectScreen {
     }
 
     fn render_discovering(&self, frame: &mut Frame, area: Rect) {
+        self.confirm_block_rects
+            .set([Rect::default(); CONFIRM_BLOCK_COUNT]);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -388,9 +416,8 @@ impl SetupProjectScreen {
             return;
         };
 
-        let copy_h = (preset.copy_patterns.len() as u16).saturating_add(2);
-        let ignore_h = (preset.copy_ignores.len() as u16).saturating_add(2);
-        let post_h = (preset.post_create_cmd.len().max(1) as u16).saturating_add(2);
+        let detail_total_height = area.height.saturating_sub(7);
+        let [copy_h, ignore_h, post_h] = split_detail_heights(detail_total_height);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -440,12 +467,16 @@ impl SetupProjectScreen {
         ]);
         frame.render_widget(Paragraph::new(title), chunks[0]);
 
+        self.confirm_block_rects
+            .set([chunks[2], chunks[3], chunks[4]]);
+
         render_block(
             frame,
             chunks[2],
             "worktreeCopyPatterns",
             &preset.copy_patterns,
             colors::SUCCESS,
+            self.confirm_block_scrolls[0],
         );
         render_block(
             frame,
@@ -453,6 +484,7 @@ impl SetupProjectScreen {
             "worktreeCopyIgnores",
             &preset.copy_ignores,
             colors::ERROR,
+            self.confirm_block_scrolls[1],
         );
         render_block(
             frame,
@@ -460,18 +492,46 @@ impl SetupProjectScreen {
             "postCreateCmd",
             &preset.post_create_cmd,
             colors::ACCENT,
+            self.confirm_block_scrolls[2],
         );
 
         render_yes_no(frame, chunks[6], self.confirm_choice);
 
-        let hint = Paragraph::new("←→/Tab toggle • Enter confirm • Esc back to preset list")
-            .style(
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            )
-            .alignment(Alignment::Center);
+        let hint = Paragraph::new(
+            "Mouse wheel scrolls inside preset boxes • ←→/Tab toggle • Enter confirm • Esc back",
+        )
+        .style(
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        )
+        .alignment(Alignment::Center);
         frame.render_widget(hint, chunks[7]);
+    }
+
+    fn confirm_block_index_at(&self, position: Position) -> Option<usize> {
+        self.confirm_block_rects
+            .get()
+            .iter()
+            .position(|rect| contains_position(*rect, position))
+    }
+
+    fn scroll_confirm_block(&mut self, block_idx: usize, delta: i16) {
+        let Some(preset) = self.confirm_preset() else {
+            return;
+        };
+
+        let rect = self.confirm_block_rects.get()[block_idx];
+        let visible_lines = rect.height.saturating_sub(2) as usize;
+        let total_lines = confirm_block_line_count(preset, block_idx);
+        let max_scroll = total_lines.saturating_sub(visible_lines) as u16;
+        let current = self.confirm_block_scrolls[block_idx];
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as u16).min(max_scroll)
+        };
+        self.confirm_block_scrolls[block_idx] = next.min(max_scroll);
     }
 }
 
@@ -481,6 +541,7 @@ fn render_block(
     title: &str,
     lines: &[String],
     accent: ratatui::style::Color,
+    scroll: u16,
 ) {
     let body: Vec<Line<'static>> = if lines.is_empty() {
         vec![Line::from(Span::styled(
@@ -510,7 +571,33 @@ fn render_block(
             format!(" {title} "),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
-    frame.render_widget(Paragraph::new(body).block(block), area);
+    frame.render_widget(Paragraph::new(body).scroll((scroll, 0)).block(block), area);
+}
+
+fn split_detail_heights(total: u16) -> [u16; CONFIRM_BLOCK_COUNT] {
+    let base = total / CONFIRM_BLOCK_COUNT as u16;
+    let remainder = total % CONFIRM_BLOCK_COUNT as u16;
+    let mut heights = [base; CONFIRM_BLOCK_COUNT];
+    for height in heights.iter_mut().take(remainder as usize) {
+        *height = height.saturating_add(1);
+    }
+    heights
+}
+
+fn confirm_block_line_count(preset: &SetupProjectPresetValues, block_idx: usize) -> usize {
+    match block_idx {
+        0 => preset.copy_patterns.len().max(1),
+        1 => preset.copy_ignores.len().max(1),
+        2 => preset.post_create_cmd.len().max(1),
+        _ => 0,
+    }
+}
+
+fn contains_position(area: Rect, position: Position) -> bool {
+    position.x >= area.left()
+        && position.x < area.right()
+        && position.y >= area.top()
+        && position.y < area.bottom()
 }
 
 fn render_yes_no(frame: &mut Frame, area: Rect, choice: ConfirmChoice) {

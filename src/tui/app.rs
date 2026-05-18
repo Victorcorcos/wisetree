@@ -354,12 +354,13 @@ impl App {
             }
             Screen::SetupProject => {
                 let panel = match self.setup_project.as_ref().map(|s| s.step()) {
-                    // Preset list fills the full panel like Dashboard so all
-                    // 24 entries can fit without scrolling on tall terminals.
-                    Some(SetupProjectStep::PresetList) | None => {
+                    // Preset list and confirm both benefit from the full panel:
+                    // the list can show more options, and the confirm step keeps
+                    // its Yes/No footer pinned below scrollable preset blocks.
+                    Some(SetupProjectStep::PresetList) | Some(SetupProjectStep::Confirm) | None => {
                         self.render_framed_panel_fill(frame, area)
                     }
-                    Some(SetupProjectStep::Discovering) | Some(SetupProjectStep::Confirm) => {
+                    Some(SetupProjectStep::Discovering) => {
                         let h = self
                             .setup_project
                             .as_ref()
@@ -447,6 +448,19 @@ impl App {
             y: mouse.row,
         };
         let clamped = clamp_position(raw_position, snapshot.area);
+
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && matches!(self.phase, InitPhase::Ready)
+            && matches!(self.screen, Screen::SetupProject)
+            && self
+                .setup_project
+                .as_mut()
+                .is_some_and(|screen| screen.handle_mouse(mouse))
+        {
+            return;
+        }
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -2144,6 +2158,15 @@ mod tests {
         }
     }
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
@@ -3136,6 +3159,57 @@ mod tests {
             assert_eq!(toast.variant, ToastVariant::Success);
             assert_eq!(toast.message, "Applied Wise Preset to .wisetree.json");
         });
+    }
+
+    #[test]
+    fn mouse_wheel_scroll_routes_into_setup_project_confirm_blocks() {
+        let repo_root = tempfile::tempdir().unwrap().keep();
+        let mut app = initialized_setup_project_app(&repo_root);
+        app.setup_project.as_mut().unwrap().complete_wise_discovery(
+            crate::services::presets::WisePresetDiscovery {
+                matched_ids: vec![crate::services::presets::PresetId::Generic],
+                copy_patterns: vec![
+                    "copy-1".into(),
+                    "copy-2".into(),
+                    "copy-3".into(),
+                    "copy-4".into(),
+                    "copy-5".into(),
+                    "copy-6".into(),
+                ],
+                copy_ignores: vec!["ignore-1".into()],
+                post_create_cmd: vec!["cmd-1".into()],
+            },
+        );
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let completed = terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.last_rendered_buffer = Some(completed.buffer.clone());
+        let initial = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(initial.contains("copy-1"));
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 8), &app_event_tx());
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 8), &app_event_tx());
+
+        let completed = terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.last_rendered_buffer = Some(completed.buffer.clone());
+        let scrolled = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!scrolled.contains("copy-1"));
+        assert!(scrolled.contains("copy-4"));
+        assert!(scrolled.contains("Yes"));
+        assert!(scrolled.contains("No"));
     }
 
     #[test]

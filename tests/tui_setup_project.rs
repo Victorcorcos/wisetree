@@ -2,14 +2,16 @@
 
 use std::fs;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use tempfile::tempdir;
 
 use wisetree::config::schema::WorktreeConfig;
 use wisetree::config::service::ConfigService;
-use wisetree::services::presets::{catalog, discover_wise, PresetId};
+use wisetree::services::presets::{catalog, discover_wise, PresetId, WisePresetDiscovery};
 use wisetree::tui::screens::setup_project::{
     PresetChoice, SetupProjectAction, SetupProjectScreen, SetupProjectStep,
 };
@@ -21,6 +23,37 @@ fn key(code: KeyCode) -> KeyEvent {
         modifiers: KeyModifiers::NONE,
         kind: KeyEventKind::Press,
         state: KeyEventState::NONE,
+    }
+}
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn wise_preset(
+    copy_patterns: &[&str],
+    copy_ignores: &[&str],
+    post_create_cmd: &[&str],
+) -> WisePresetDiscovery {
+    WisePresetDiscovery {
+        matched_ids: vec![PresetId::Generic],
+        copy_patterns: copy_patterns
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        copy_ignores: copy_ignores
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        post_create_cmd: post_create_cmd
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
     }
 }
 
@@ -148,6 +181,45 @@ fn wise_discovery_completion_renders_three_blocks_and_yes_no() {
     assert!(dumped.contains("(cd 'web' && npm install)"));
     assert!(dumped.contains("Yes"));
     assert!(dumped.contains("No"));
+}
+
+#[test]
+fn wise_confirm_keeps_yes_no_visible_with_long_preset_values() {
+    let mut screen = SetupProjectScreen::new(None);
+    screen.complete_wise_discovery(wise_preset(
+        &[
+            "copy-1", "copy-2", "copy-3", "copy-4", "copy-5", "copy-6", "copy-7", "copy-8",
+        ],
+        &["ignore-1", "ignore-2", "ignore-3", "ignore-4", "ignore-5"],
+        &["cmd-1", "cmd-2", "cmd-3", "cmd-4"],
+    ));
+
+    let dumped = dump(90, 18, |frame| screen.render(frame, frame.area()));
+    assert!(dumped.contains("Yes"));
+    assert!(dumped.contains("No"));
+}
+
+#[test]
+fn mouse_scroll_inside_confirm_block_scrolls_that_block() {
+    let mut screen = SetupProjectScreen::new(None);
+    screen.complete_wise_discovery(wise_preset(
+        &["copy-1", "copy-2", "copy-3", "copy-4", "copy-5", "copy-6"],
+        &["ignore-1"],
+        &["cmd-1"],
+    ));
+
+    let initial = dump(90, 18, |frame| screen.render(frame, frame.area()));
+    assert!(initial.contains("copy-1"));
+    assert!(!initial.contains("copy-4"));
+
+    assert!(screen.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 3)));
+    assert!(screen.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 3)));
+
+    let scrolled = dump(90, 18, |frame| screen.render(frame, frame.area()));
+    assert!(!scrolled.contains("copy-1"));
+    assert!(scrolled.contains("copy-4"));
+    assert!(scrolled.contains("Yes"));
+    assert!(scrolled.contains("No"));
 }
 
 #[test]
