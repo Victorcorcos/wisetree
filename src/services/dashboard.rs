@@ -2079,7 +2079,10 @@ async fn run_command(
 /// guard). The returned error is fed back to the model as the tool
 /// response so it can retry within its remaining turns instead of the
 /// outer pipeline only catching the destruction post-hoc.
-fn guard_destructive_overwrite(existing: &str, new_content: &str) -> std::result::Result<(), String> {
+fn guard_destructive_overwrite(
+    existing: &str,
+    new_content: &str,
+) -> std::result::Result<(), String> {
     let has_markers = existing.contains("<<<<<<<")
         || existing.contains("=======")
         || existing.contains(">>>>>>>");
@@ -3342,7 +3345,11 @@ mod tests {
             "x".repeat(500),
             "y".repeat(500),
         );
-        let merged = format!("{}\nmerged body line\n{}\n", "x".repeat(500), "y".repeat(500));
+        let merged = format!(
+            "{}\nmerged body line\n{}\n",
+            "x".repeat(500),
+            "y".repeat(500)
+        );
         assert!(guard_destructive_overwrite(&existing, &merged).is_ok());
     }
 
