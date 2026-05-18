@@ -13,6 +13,7 @@ pub enum Screen {
     UpdatePullRequest,
     Settings,
     Setup,
+    SetupProject,
 }
 
 impl Screen {
@@ -35,6 +36,7 @@ impl Screen {
             Self::UpdatePullRequest => "update_pull_request",
             Self::Settings => "settings",
             Self::Setup => "setup",
+            Self::SetupProject => "setup_project",
         }
     }
 }

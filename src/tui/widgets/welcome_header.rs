@@ -31,6 +31,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::UpdatePullRequest => Some("Update Pull Request"),
             Screen::Settings => Some("Settings"),
             Screen::Setup => Some("Setup"),
+            Screen::SetupProject => Some("Setup Project Config"),
         }
     }
 

@@ -11,7 +11,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::messages::{
-    colors, MENU_CREATE, MENU_DASHBOARD, MENU_EXIT, MENU_SETTINGS, MENU_SETUP, MENU_TITLE,
+    colors, MENU_CREATE, MENU_DASHBOARD, MENU_EXIT, MENU_SETTINGS, MENU_SETUP, MENU_SETUP_PROJECT,
+    MENU_TITLE,
 };
 use crate::tui::router::Screen;
 use crate::tui::widgets::welcome_header::{fold_home, WelcomeHeader};
@@ -19,6 +20,7 @@ use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, SelectStyle
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuChoice {
+    SetupProject,
     Setup,
     Create,
     Dashboard,
@@ -36,18 +38,33 @@ pub struct MenuScreen {
     select: SelectPrompt<MenuChoice>,
     git_root: Option<String>,
     has_setup_entry: bool,
+    has_setup_project_entry: bool,
 }
 
 impl MenuScreen {
     /// `shell_installed = None` means "not yet known" (or unsupported shell)
     /// — the setup entry stays hidden in both cases.
+    ///
+    /// `has_local_config` controls the new "Setup Project Config" entry: it
+    /// renders as the first option only when the project lacks a local
+    /// `.wisetree.json` and we know which repository we're in (so the user
+    /// can bootstrap their three preset lists with a single keystroke).
     pub fn new(
         default_index: usize,
         git_root: Option<String>,
         shell_installed: Option<bool>,
+        has_local_config: bool,
     ) -> Self {
+        let has_setup_project_entry = git_root.is_some() && !has_local_config;
         let has_setup_entry = matches!(shell_installed, Some(false));
         let mut options: Vec<SelectOption<MenuChoice>> = Vec::new();
+        if has_setup_project_entry {
+            options.push(
+                SelectOption::new(MENU_SETUP_PROJECT, MenuChoice::SetupProject)
+                    .with_color(colors::WARNING)
+                    .with_description("recommended"),
+            );
+        }
         if has_setup_entry {
             options.push(
                 SelectOption::new(MENU_SETUP, MenuChoice::Setup)
@@ -68,6 +85,7 @@ impl MenuScreen {
             select,
             git_root,
             has_setup_entry,
+            has_setup_project_entry,
         }
     }
 
@@ -77,6 +95,10 @@ impl MenuScreen {
 
     pub fn has_setup_entry(&self) -> bool {
         self.has_setup_entry
+    }
+
+    pub fn has_setup_project_entry(&self) -> bool {
+        self.has_setup_project_entry
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> MenuOutcome {
