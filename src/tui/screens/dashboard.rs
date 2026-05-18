@@ -296,8 +296,9 @@ impl DashboardScreen {
             return 11;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
-        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 9 footer.
-        14 + table_rows
+        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows
+        // + footer (10 lines, +1 when the highlighted PR has reviewers to show).
+        14 + table_rows + self.reviewers_footer_height()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -440,15 +441,16 @@ impl DashboardScreen {
             return;
         }
 
+        let footer_height = 10u16 + self.reviewers_footer_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // status banner
-                Constraint::Length(1),  // spacer above search
-                Constraint::Length(1),  // search line
-                Constraint::Length(1),  // spacer below search
-                Constraint::Min(4),     // table
-                Constraint::Length(10), // footer (notice + 3-row buttons + 6 legend lines)
+                Constraint::Length(1),             // status banner
+                Constraint::Length(1),             // spacer above search
+                Constraint::Length(1),             // search line
+                Constraint::Length(1),             // spacer below search
+                Constraint::Min(4),                // table
+                Constraint::Length(footer_height), // footer (notice [+ reviewers] + 3-row buttons + 6 legend lines)
             ])
             .split(area);
 
@@ -949,31 +951,53 @@ impl DashboardScreen {
         table_width: u16,
         layout: &DashboardTableLayout,
     ) {
+        let reviewers_height = self.reviewers_footer_height();
+
+        // Build constraints conditionally so the layout has exactly the
+        // number of rows it actually needs — ratatui's solver can drop a
+        // neighbour's row when a zero-length constraint sits inside an
+        // already-saturated column.
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(9);
+        constraints.push(Constraint::Length(1)); // notice / row warning / detail
+        if reviewers_height > 0 {
+            constraints.push(Constraint::Length(reviewers_height));
+        }
+        constraints.push(Constraint::Length(3)); // bulk delete buttons row (bordered)
+        constraints.push(Constraint::Length(1)); // navigate / shortcuts
+        constraints.push(Constraint::Length(1)); // status legend
+        constraints.push(Constraint::Length(1)); // checks legend
+        constraints.push(Constraint::Length(1)); // reviews legend
+        constraints.push(Constraint::Length(1)); // merges legend
+        constraints.push(Constraint::Length(1)); // ahead/behind legend
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // notice / row warning / detail
-                Constraint::Length(3), // bulk delete buttons row (bordered)
-                Constraint::Length(1), // navigate / shortcuts
-                Constraint::Length(1), // status legend
-                Constraint::Length(1), // checks legend
-                Constraint::Length(1), // reviews legend
-                Constraint::Length(1), // merges legend
-                Constraint::Length(1), // ahead/behind legend
-            ])
+            .constraints(constraints)
             .split(area);
 
+        let mut idx = 0;
         frame.render_widget(
             Paragraph::new(self.notice_line(table_width, layout)),
-            chunks[0],
+            chunks[idx],
         );
-        self.render_bulk_delete_buttons(frame, chunks[1]);
-        frame.render_widget(Paragraph::new(self.shortcuts_line()), chunks[2]);
-        frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[3]);
-        frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[4]);
-        frame.render_widget(Paragraph::new(self.reviews_legend_line()), chunks[5]);
-        frame.render_widget(Paragraph::new(self.merges_legend_line()), chunks[6]);
-        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[7]);
+        idx += 1;
+        if reviewers_height > 0 {
+            frame.render_widget(Paragraph::new(self.reviewers_line()), chunks[idx]);
+            idx += 1;
+        }
+        self.render_bulk_delete_buttons(frame, chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.shortcuts_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.reviews_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.merges_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[idx]);
     }
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
@@ -1007,6 +1031,82 @@ impl DashboardScreen {
             }
         }
         Line::from("")
+    }
+
+    /// `1` when the highlighted row has reviewer data to surface, `0`
+    /// otherwise. Lets the outer layout collapse the row instead of leaving
+    /// a blank gap above the bulk-delete buttons.
+    fn reviewers_footer_height(&self) -> u16 {
+        let Some(row) = self.selected_row() else {
+            return 0;
+        };
+        let Some(pr) = &row.pull_request else {
+            return 0;
+        };
+        if !matches!(pr.state, PrState::Open) {
+            return 0;
+        }
+        if pr.reviewers.is_empty() {
+            return 0;
+        }
+        1
+    }
+
+    /// Footer line that lists the reviewers of the highlighted Opened PR
+    /// grouped by status. Rendered only for PRs in the Open state so we
+    /// don't bloat the footer with stale data for merged / closed PRs.
+    fn reviewers_line(&self) -> Line<'static> {
+        let Some(row) = self.selected_row() else {
+            return Line::from("");
+        };
+        let Some(pr) = &row.pull_request else {
+            return Line::from("");
+        };
+        if !matches!(pr.state, PrState::Open) {
+            return Line::from("");
+        }
+        if pr.reviewers.is_empty() {
+            return Line::from("");
+        }
+
+        let muted = Style::default().fg(colors::MUTED);
+        let mut spans: Vec<Span<'static>> = vec![Span::styled("Reviewers: ", muted)];
+
+        let mut first = true;
+        let mut push_group = |label: &str, color: ratatui::style::Color, logins: &[String]| {
+            if logins.is_empty() {
+                return;
+            }
+            if !first {
+                spans.push(Span::styled("  ", muted));
+            }
+            first = false;
+            spans.push(Span::styled(
+                label.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" ", muted));
+            for (i, login) in logins.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(", ", muted));
+                }
+                spans.push(Span::styled(
+                    format!("@{login}"),
+                    Style::default().fg(color),
+                ));
+            }
+        };
+
+        push_group("✋ Pending", colors::WARNING, &pr.reviewers.pending);
+        push_group("👍 Approved", colors::SUCCESS, &pr.reviewers.approved);
+        push_group(
+            "👎 Rejected",
+            colors::ERROR,
+            &pr.reviewers.changes_requested,
+        );
+        push_group("💬 Commented", colors::ACCENT, &pr.reviewers.commented);
+
+        Line::from(spans)
     }
 
     fn shortcuts_line(&self) -> Line<'static> {
