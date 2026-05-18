@@ -42,6 +42,7 @@ enum ActionChoice {
     CopyPath,
     OpenPullRequest,
     MergePullRequest,
+    UpdatePullRequest,
 }
 
 /// Payload the dashboard hands to the merge confirmation screen.
@@ -57,6 +58,23 @@ pub struct MergePullRequestRequest {
     pub checks_status: Option<CheckStatus>,
     pub ahead_behind: Option<(u64, u64)>,
     pub last_commit: Option<CommitSummary>,
+}
+
+/// Payload the dashboard hands to the "Update Pull Request" confirmation
+/// screen. `base_ref` is filled in by the app layer once the actual
+/// reachable remote ref has been resolved (the dashboard hands `None`
+/// through the action; resolving requires running `git` inside the
+/// worktree which is async work owned by `App`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePullRequestRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub ahead: u64,
+    pub behind: u64,
+    pub base_ref: Option<String>,
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
@@ -124,6 +142,7 @@ pub enum DashboardAction {
     CopyPath(String),
     OpenPullRequest(String),
     MergePullRequest(Box<MergePullRequestRequest>),
+    UpdatePullRequest(Box<UpdatePullRequestRequest>),
     /// The user tried to delete the mother (main) worktree. The app
     /// layer should surface a toast explaining that this worktree is
     /// protected, instead of routing to the delete screen.
@@ -560,6 +579,21 @@ impl DashboardScreen {
                 ActionChoice::MergePullRequest,
             ));
         }
+        // Update Pull Request appears only when the branch is *behind*
+        // its base — either the PR's merge_status says so, or git's
+        // local ahead/behind count says so. Showing it on already
+        // up-to-date rows would just be a no-op trip.
+        if row
+            .pull_request
+            .as_ref()
+            .is_some_and(|pr| matches!(pr.state, PrState::Open))
+            && row_is_behind(row)
+        {
+            options.push(SelectOption::new(
+                "Update Pull Request",
+                ActionChoice::UpdatePullRequest,
+            ));
+        }
         SelectPrompt::new("Choose action:", options).without_hint()
     }
 
@@ -579,6 +613,7 @@ impl DashboardScreen {
                 let path = row.worktree.path.clone();
                 let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
                 let merge_request = build_merge_request(row);
+                let update_request = build_update_request(row);
                 self.mode = DashboardMode::Table;
                 self.action_select = None;
                 self.action_target = None;
@@ -592,6 +627,10 @@ impl DashboardScreen {
                     },
                     ActionChoice::MergePullRequest => match merge_request {
                         Some(request) => DashboardAction::MergePullRequest(Box::new(request)),
+                        None => DashboardAction::Continue,
+                    },
+                    ActionChoice::UpdatePullRequest => match update_request {
+                        Some(request) => DashboardAction::UpdatePullRequest(Box::new(request)),
                         None => DashboardAction::Continue,
                     },
                 }
@@ -1556,6 +1595,57 @@ impl PrState {
                 .add_modifier(Modifier::DIM),
         }
     }
+}
+
+/// True when the row's branch is behind its base — either the PR's
+/// `merge_status` reports `Behind`, or git's local ahead/behind shows
+/// `behind > 0`. Used both to gate the "Update Pull Request" menu entry
+/// and (via tests) to keep the visibility rule pinned.
+pub(crate) fn row_is_behind(row: &DashboardRow) -> bool {
+    let merge_says_behind = row
+        .pull_request
+        .as_ref()
+        .and_then(|pr| pr.merge_status)
+        .map(|status| matches!(status, MergeStatus::Behind))
+        .unwrap_or(false);
+    let git_says_behind = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .map(|s| s.behind > 0)
+        .unwrap_or(false);
+    merge_says_behind || git_says_behind
+}
+
+/// Assemble the payload the update confirmation screen needs. Returns
+/// `None` when the row's PR is missing/not Open or the branch isn't
+/// behind — mirrors the guard in `build_action_select`.
+fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    if !row_is_behind(row) {
+        return None;
+    }
+    let (ahead, behind) = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .map(|s| (s.ahead, s.behind))
+        .unwrap_or((0, 0));
+    Some(UpdatePullRequestRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+        ahead,
+        behind,
+        // App resolves the actual reachable base ref before mounting the
+        // screen; the dashboard never runs git itself.
+        base_ref: None,
+    })
 }
 
 /// Assemble the payload the merge confirmation screen needs from a row.

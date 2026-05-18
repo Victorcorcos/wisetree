@@ -5,8 +5,8 @@ use ratatui::Terminal;
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::messages::colors;
 use wisetree::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState,
-    PullRequest, ReviewStatus,
+    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
+    PrState, PullRequest, ReviewStatus,
 };
 use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 
@@ -1015,4 +1015,180 @@ fn action_menu_hides_merge_option_when_no_pr_present() {
     let dumped = open_action_menu_for_second_row(&mut screen);
     assert!(!dumped.contains("Merge Pull Request"));
     assert!(!dumped.contains("Open Pull Request"));
+}
+
+// ---- "Update Pull Request" visibility ----------------------------------
+// The option lives in the action menu only when the row carries an Open
+// PR *and* is behind its base — either `merge_status == Behind` or
+// `branch_status.behind > 0`. These tests pin both the positive and the
+// negative cases so the gate can't silently drift.
+
+fn behind_row_via_branch_status(path: &str, branch: &str) -> DashboardRow {
+    let mut row = row_with_pr_state(path, branch, true, PrState::Open);
+    row.worktree.branch_status = Some(BranchStatus {
+        ahead: 1,
+        behind: 3,
+        upstream_branch: Some("upstream/main".into()),
+    });
+    row
+}
+
+fn behind_row_via_merge_status(path: &str, branch: &str) -> DashboardRow {
+    let mut row = row_with_pr_state(path, branch, true, PrState::Open);
+    if let Some(pr) = row.pull_request.as_mut() {
+        pr.merge_status = Some(MergeStatus::Behind);
+    }
+    row
+}
+
+#[test]
+fn action_menu_shows_update_option_for_open_pr_behind_via_branch_status() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        behind_row_via_branch_status("/tmp/repo-bug", "bug"),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        dumped.contains("Update Pull Request"),
+        "expected `Update Pull Request` for Open+behind row: {dumped}"
+    );
+}
+
+#[test]
+fn action_menu_shows_update_option_for_open_pr_behind_via_merge_status() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        behind_row_via_merge_status("/tmp/repo-bug", "bug"),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        dumped.contains("Update Pull Request"),
+        "expected `Update Pull Request` when merge_status==Behind: {dumped}"
+    );
+}
+
+#[test]
+fn action_menu_hides_update_option_for_open_pr_when_up_to_date() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        // `row_with_pr_state` keeps merge_status=None and behind=0 — so the
+        // row is Open but not behind its base.
+        row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Open),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        !dumped.contains("Update Pull Request"),
+        "Update Pull Request must hide when branch is up to date: {dumped}"
+    );
+    // Merge Pull Request must still appear (Open and up to date is fine to merge).
+    assert!(dumped.contains("Merge Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_update_option_for_merged_pr_even_if_behind() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut behind_merged = behind_row_via_branch_status("/tmp/repo-bug", "bug");
+    if let Some(pr) = behind_merged.pull_request.as_mut() {
+        pr.state = PrState::Merged;
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), behind_merged]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Update Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_update_option_for_closed_pr() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut behind_closed = behind_row_via_branch_status("/tmp/repo-bug", "bug");
+    if let Some(pr) = behind_closed.pull_request.as_mut() {
+        pr.state = PrState::Closed;
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), behind_closed]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Update Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_update_option_for_draft_pr() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut behind_draft = behind_row_via_branch_status("/tmp/repo-bug", "bug");
+    if let Some(pr) = behind_draft.pull_request.as_mut() {
+        pr.state = PrState::Draft;
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), behind_draft]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Update Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_update_option_when_no_pr_present() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut behind_no_pr = row("/tmp/repo-bug", "bug", true);
+    behind_no_pr.worktree.branch_status = Some(BranchStatus {
+        ahead: 0,
+        behind: 5,
+        upstream_branch: Some("upstream/main".into()),
+    });
+    screen.set_rows(vec![row("/tmp/repo", "main", true), behind_no_pr]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Update Pull Request"));
 }

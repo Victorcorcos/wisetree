@@ -177,8 +177,8 @@ async fn confirm_flow_invokes_gh_pr_merge_with_live_title_and_body() {
         "log should record --squash; got {log:?}"
     );
     assert!(
-        log.contains(&format!("--subject {live_title}")),
-        "live title must reach gh verbatim; got {log:?}"
+        log.contains(&format!("--subject {live_title} (#7)")),
+        "live title must reach gh with `(#N)` PR reference appended; got {log:?}"
     );
     // Body is logged with newlines flattened to spaces by `printf '%s\n' "$*"`.
     assert!(

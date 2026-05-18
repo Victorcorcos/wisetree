@@ -129,8 +129,8 @@ impl ConfirmDialog {
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
-                Constraint::Length(3),
                 Constraint::Length(1),
+                Constraint::Length(3),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -152,7 +152,7 @@ impl ConfirmDialog {
         };
         frame.render_widget(Paragraph::new(message_lines), chunks[2]);
 
-        let buttons_area = chunks[3];
+        let buttons_area = chunks[4];
         let confirm_width = self.confirm_label.chars().count() as u16 + 4;
         let cancel_width = self.cancel_label.chars().count() as u16 + 4;
         let gap: u16 = 2;
