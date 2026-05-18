@@ -622,10 +622,7 @@ impl PatternListEditor {
 
     pub fn hidden_counts(&self, area_height: u16) -> (usize, usize) {
         let visible = self.visible_range(area_height);
-        (
-            visible.start,
-            self.lines.len().saturating_sub(visible.end),
-        )
+        (visible.start, self.lines.len().saturating_sub(visible.end))
     }
 
     pub fn values_to_save(&self) -> Vec<String> {
@@ -1385,9 +1382,9 @@ impl SettingsScreen {
         }
         match self.step {
             SettingsStep::Menu => self.handle_menu(key),
-            SettingsStep::CopyPatterns | SettingsStep::LinkPatterns | SettingsStep::IgnorePatterns => {
-                self.handle_pattern_list(key)
-            }
+            SettingsStep::CopyPatterns
+            | SettingsStep::LinkPatterns
+            | SettingsStep::IgnorePatterns => self.handle_pattern_list(key),
             SettingsStep::DeleteBranch => self.handle_delete_branch(key),
             SettingsStep::CopySettings => self.handle_copy_settings(key),
             SettingsStep::CheckUpdates => self.handle_check_updates(key),
@@ -1419,16 +1416,19 @@ impl SettingsScreen {
                         Some(PostCmdEditor::new(self.config.post_create_cmd.clone()));
                 }
                 if matches!(value, SettingsStep::CopyPatterns) {
-                    self.pattern_list_editor =
-                        Some(PatternListEditor::new(self.config.worktree_copy_patterns.clone()));
+                    self.pattern_list_editor = Some(PatternListEditor::new(
+                        self.config.worktree_copy_patterns.clone(),
+                    ));
                 }
                 if matches!(value, SettingsStep::IgnorePatterns) {
-                    self.pattern_list_editor =
-                        Some(PatternListEditor::new(self.config.worktree_copy_ignores.clone()));
+                    self.pattern_list_editor = Some(PatternListEditor::new(
+                        self.config.worktree_copy_ignores.clone(),
+                    ));
                 }
                 if matches!(value, SettingsStep::LinkPatterns) {
-                    self.pattern_list_editor =
-                        Some(PatternListEditor::new(self.config.worktree_link_patterns.clone()));
+                    self.pattern_list_editor = Some(PatternListEditor::new(
+                        self.config.worktree_link_patterns.clone(),
+                    ));
                 }
                 if matches!(value, SettingsStep::TerminalCmd) {
                     self.terminal_cmd_editor =
@@ -1514,9 +1514,15 @@ impl SettingsScreen {
                     SettingsAction::Continue
                 }
                 PatternListSelection::Save => match self.step {
-                    SettingsStep::CopyPatterns => SettingsAction::SaveCopyPatterns(editor.values_to_save()),
-                    SettingsStep::IgnorePatterns => SettingsAction::SaveIgnorePatterns(editor.values_to_save()),
-                    SettingsStep::LinkPatterns => SettingsAction::SaveLinkPatterns(editor.values_to_save()),
+                    SettingsStep::CopyPatterns => {
+                        SettingsAction::SaveCopyPatterns(editor.values_to_save())
+                    }
+                    SettingsStep::IgnorePatterns => {
+                        SettingsAction::SaveIgnorePatterns(editor.values_to_save())
+                    }
+                    SettingsStep::LinkPatterns => {
+                        SettingsAction::SaveLinkPatterns(editor.values_to_save())
+                    }
                     _ => SettingsAction::Continue,
                 },
             },
@@ -1529,7 +1535,9 @@ impl SettingsScreen {
             Some(editor) => editor,
             None => return SettingsAction::Continue,
         };
-        let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        let ctrl = key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(crossterm::event::KeyModifiers::ALT);
 
         let mutate = |editor: &mut PatternListEditor| {
@@ -2650,10 +2658,7 @@ impl SettingsScreen {
         } else {
             "Each line is one pattern. Empty lines are ignored when you save."
         };
-        frame.render_widget(
-            Paragraph::new(aux_text).style(dim_muted_style),
-            chunks[3],
-        );
+        frame.render_widget(Paragraph::new(aux_text).style(dim_muted_style), chunks[3]);
 
         self.render_pattern_list_save_button(frame, chunks[5], editor);
 
@@ -2759,15 +2764,9 @@ impl SettingsScreen {
         ]);
         frame.render_widget(Paragraph::new(hint_line), chunks[3]);
 
+        frame.render_widget(Paragraph::new(""), chunks[4]);
         frame.render_widget(
-            Paragraph::new(""),
-            chunks[4],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "Link Options",
-                info_style,
-            ))),
+            Paragraph::new(Line::from(branded_line("Link Options", info_style))),
             chunks[5],
         );
         frame.render_widget(
@@ -2914,10 +2913,7 @@ impl SettingsScreen {
         ]);
         frame.render_widget(Paragraph::new(hint_line), chunks[3]);
 
-        frame.render_widget(
-            Paragraph::new(""),
-            chunks[4],
-        );
+        frame.render_widget(Paragraph::new(""), chunks[4]);
         frame.render_widget(
             Paragraph::new(Line::from(branded_line("Why this exists:", info_style))),
             chunks[5],
@@ -4077,7 +4073,10 @@ fn render_pattern_list_block(
             .skip(visible_range.start)
             .take(visible_range.end.saturating_sub(visible_range.start))
             .map(|(idx, line)| {
-                let on_cursor_row = editor.editing_cursor().map(|c| c.row == idx).unwrap_or(false);
+                let on_cursor_row = editor
+                    .editing_cursor()
+                    .map(|c| c.row == idx)
+                    .unwrap_or(false);
                 if on_cursor_row {
                     pattern_list_cursor_line(line, editor.editing_cursor().unwrap().col)
                 } else if line.is_empty() && is_editing {
@@ -4098,7 +4097,10 @@ fn render_pattern_list_block(
         if let Some(first) = body.first_mut() {
             first.spans.insert(
                 0,
-                Span::styled(POST_CMD_SELECTION_MARKER, Style::default().fg(colors::ACCENT)),
+                Span::styled(
+                    POST_CMD_SELECTION_MARKER,
+                    Style::default().fg(colors::ACCENT),
+                ),
             );
         }
     }
@@ -4109,7 +4111,10 @@ fn render_pattern_list_block(
         .border_style(border_style)
         .padding(Padding::horizontal(1))
         .title(Span::styled(format!(" {field_name} "), info_style));
-    frame.render_widget(Paragraph::new(body).scroll((editor.scroll, 0)).block(block), area);
+    frame.render_widget(
+        Paragraph::new(body).scroll((editor.scroll, 0)).block(block),
+        area,
+    );
 }
 
 fn pattern_list_cursor_line(text: &str, col: usize) -> Line<'static> {

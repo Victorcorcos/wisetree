@@ -296,7 +296,11 @@ fn discover_all_ignores_generated_vite_cache_dirs() {
         "web/package.json",
         "{\"dependencies\": {\"react\": \"18\"}}",
     );
-    write(dir.path(), ".vite/deps/package.json", "{\"name\":\"vite-cache\"}");
+    write(
+        dir.path(),
+        ".vite/deps/package.json",
+        "{\"name\":\"vite-cache\"}",
+    );
 
     assert_eq!(discover_all(dir.path()), vec![PresetId::React]);
 }
@@ -310,12 +314,19 @@ fn discover_wise_does_not_include_generated_vite_cache_patterns() {
         "{\"dependencies\": {\"react\": \"18\"}}",
     );
     touch(dir.path(), "web/.env.local");
-    write(dir.path(), ".vite/deps/package.json", "{\"name\":\"vite-cache\"}");
+    write(
+        dir.path(),
+        ".vite/deps/package.json",
+        "{\"name\":\"vite-cache\"}",
+    );
 
     let wise = discover_wise(dir.path()).expect("wise preset");
 
     assert_eq!(wise.matched_ids, vec![PresetId::React]);
-    assert!(wise.link_patterns.iter().any(|value| value == "web/node_modules"));
+    assert!(wise
+        .link_patterns
+        .iter()
+        .any(|value| value == "web/node_modules"));
     assert!(!wise
         .link_patterns
         .iter()

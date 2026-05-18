@@ -2131,24 +2131,31 @@ impl App {
     }
 
     fn save_copy_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
-        self.save_pattern_list_setting(|config| config.worktree_copy_patterns = patterns.clone(), |settings| {
-            settings.mark_copy_patterns_saved(patterns.clone())
-        })
+        self.save_pattern_list_setting(
+            |config| config.worktree_copy_patterns = patterns.clone(),
+            |settings| settings.mark_copy_patterns_saved(patterns.clone()),
+        )
     }
 
     fn save_ignore_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
-        self.save_pattern_list_setting(|config| config.worktree_copy_ignores = patterns.clone(), |settings| {
-            settings.mark_ignore_patterns_saved(patterns.clone())
-        })
+        self.save_pattern_list_setting(
+            |config| config.worktree_copy_ignores = patterns.clone(),
+            |settings| settings.mark_ignore_patterns_saved(patterns.clone()),
+        )
     }
 
     fn save_link_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
-        self.save_pattern_list_setting(|config| config.worktree_link_patterns = patterns.clone(), |settings| {
-            settings.mark_link_patterns_saved(patterns.clone())
-        })
+        self.save_pattern_list_setting(
+            |config| config.worktree_link_patterns = patterns.clone(),
+            |settings| settings.mark_link_patterns_saved(patterns.clone()),
+        )
     }
 
-    fn save_pattern_list_setting<F, G>(&mut self, mut apply: F, mut mark_saved: G) -> Result<(), String>
+    fn save_pattern_list_setting<F, G>(
+        &mut self,
+        mut apply: F,
+        mut mark_saved: G,
+    ) -> Result<(), String>
     where
         F: FnMut(&mut WorktreeConfig),
         G: FnMut(&mut SettingsScreen),
@@ -3896,15 +3903,22 @@ mod tests {
             app.worktree_service = Some(service);
             app.git_root = Some(repo_root.display().to_string());
 
-            app.save_link_strategy(LinkStrategy::SeedFromSource).unwrap();
+            app.save_link_strategy(LinkStrategy::SeedFromSource)
+                .unwrap();
 
             let saved_local: WorktreeConfig =
                 serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
-            assert_eq!(saved_local.worktree_link_strategy, LinkStrategy::SeedFromSource);
+            assert_eq!(
+                saved_local.worktree_link_strategy,
+                LinkStrategy::SeedFromSource
+            );
 
             let saved_global: WorktreeConfig =
                 serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
-            assert_eq!(saved_global.worktree_link_strategy, LinkStrategy::CreateEmpty);
+            assert_eq!(
+                saved_global.worktree_link_strategy,
+                LinkStrategy::CreateEmpty
+            );
 
             assert_eq!(
                 app.current_config().unwrap().worktree_link_strategy,
@@ -3943,7 +3957,10 @@ mod tests {
 
             let saved_global: WorktreeConfig =
                 serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
-            assert_eq!(saved_global.worktree_link_strategy, LinkStrategy::SeedIfPresent);
+            assert_eq!(
+                saved_global.worktree_link_strategy,
+                LinkStrategy::SeedIfPresent
+            );
             assert_eq!(
                 app.current_config().unwrap().worktree_link_strategy,
                 LinkStrategy::SeedIfPresent
@@ -3991,7 +4008,10 @@ mod tests {
 
             let saved_global: WorktreeConfig =
                 serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
-            assert_eq!(saved_global.worktree_link_cache_dir, Some("/global/cache".into()));
+            assert_eq!(
+                saved_global.worktree_link_cache_dir,
+                Some("/global/cache".into())
+            );
 
             assert_eq!(
                 app.current_config().unwrap().worktree_link_cache_dir,

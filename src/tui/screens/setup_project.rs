@@ -1026,7 +1026,8 @@ impl SetupProjectScreen {
             editor.block_len(2),
             editor.block_len(3),
         ];
-        let [copy_h, ignore_h, link_h, post_h] = confirm_block_heights(lengths, detail_total_height);
+        let [copy_h, ignore_h, link_h, post_h] =
+            confirm_block_heights(lengths, detail_total_height);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

@@ -145,7 +145,10 @@ fn ready_with_patterns(copy_patterns: &[&str], ignore_patterns: &[&str]) -> Sett
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
-fn ready_with_link_settings(strategy: wisetree::config::schema::LinkStrategy, cache_dir: Option<&str>) -> SettingsScreen {
+fn ready_with_link_settings(
+    strategy: wisetree::config::schema::LinkStrategy,
+    cache_dir: Option<&str>,
+) -> SettingsScreen {
     let cfg = WorktreeConfig {
         worktree_link_strategy: strategy,
         worktree_link_cache_dir: cache_dir.map(|value| value.to_string()),
@@ -290,7 +293,10 @@ fn ignore_patterns_save_button_emits_save_action() {
     s.handle_key(key(KeyCode::Down));
 
     let action = s.handle_key(key(KeyCode::Enter));
-    assert_eq!(action, SettingsAction::SaveIgnorePatterns(vec!["storage/**".into()]));
+    assert_eq!(
+        action,
+        SettingsAction::SaveIgnorePatterns(vec!["storage/**".into()])
+    );
 }
 
 #[test]
@@ -341,7 +347,8 @@ fn enter_link_cache_dir(s: &mut SettingsScreen) {
 
 #[test]
 fn link_strategy_renders_editor_and_didactic_copy() {
-    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::SeedFromSource, None);
+    let mut s =
+        ready_with_link_settings(wisetree::config::schema::LinkStrategy::SeedFromSource, None);
     enter_link_strategy(&mut s);
 
     let dumped = dump(100, 18, |f| s.render(f, f.area()));
@@ -356,7 +363,8 @@ fn link_strategy_renders_editor_and_didactic_copy() {
 
 #[test]
 fn link_strategy_save_button_emits_enum_action() {
-    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::SeedFromSource, None);
+    let mut s =
+        ready_with_link_settings(wisetree::config::schema::LinkStrategy::SeedFromSource, None);
     enter_link_strategy(&mut s);
 
     let action = s.handle_key(key(KeyCode::Enter));
@@ -376,7 +384,10 @@ fn link_strategy_enter_on_rect_cycles_option_and_marks_modified() {
 
     let editor = s.link_strategy_editor().expect("editor present");
     assert_eq!(editor.value, "SeedFromSource");
-    assert_eq!(editor.status, wisetree::tui::screens::settings::LinkStrategyRectStatus::Modified);
+    assert_eq!(
+        editor.status,
+        wisetree::tui::screens::settings::LinkStrategyRectStatus::Modified
+    );
 }
 
 #[test]
@@ -397,10 +408,7 @@ fn link_cache_dir_renders_editor_and_didactic_copy() {
 
 #[test]
 fn link_cache_dir_blank_renders_none_placeholder() {
-    let mut s = ready_with_link_settings(
-        wisetree::config::schema::LinkStrategy::CreateEmpty,
-        None,
-    );
+    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::CreateEmpty, None);
     enter_link_cache_dir(&mut s);
 
     let buffer = render(100, 18, |f| s.render(f, f.area()));
@@ -424,7 +432,10 @@ fn link_cache_dir_save_button_emits_string_action() {
 
 #[test]
 fn link_cache_dir_save_blank_emits_empty_string() {
-    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::CreateEmpty, Some("   "));
+    let mut s = ready_with_link_settings(
+        wisetree::config::schema::LinkStrategy::CreateEmpty,
+        Some("   "),
+    );
     enter_link_cache_dir(&mut s);
 
     let action = s.handle_key(key(KeyCode::Enter));
