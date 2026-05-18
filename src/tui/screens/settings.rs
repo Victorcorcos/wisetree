@@ -2601,6 +2601,7 @@ impl SettingsScreen {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_pattern_list_page(
         &self,
         frame: &mut Frame,
