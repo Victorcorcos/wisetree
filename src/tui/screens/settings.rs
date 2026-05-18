@@ -102,7 +102,7 @@ pub enum PostCmdSelection {
     Save,
 }
 
-const POST_CMD_SELECTION_MARKER: &str = " ✎𓂃  ";
+const POST_CMD_SELECTION_MARKER: &str = " ✏️  ";
 
 /// State for the inline post-create commands editor surfaced when the user
 /// drills into the `Post-Create Commands` setting from the menu.

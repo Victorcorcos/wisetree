@@ -96,6 +96,18 @@ fn assert_text_fg(buffer: &Buffer, text: &str, fg: Color) {
     }
 }
 
+fn assert_cell_fg(buffer: &Buffer, symbol: &str, fg: Color) {
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            if buffer[(x, y)].symbol() == symbol {
+                assert_eq!(buffer[(x, y)].fg, fg, "unexpected fg for {symbol:?}");
+                return;
+            }
+        }
+    }
+    panic!("{symbol:?} not found");
+}
+
 fn surrounding_border_cells(buffer: &Buffer, text: &str) -> ((u16, u16), (u16, u16)) {
     let (x, y) = find_text_start(buffer, text).unwrap_or_else(|| panic!("{text:?} not found"));
 
@@ -517,7 +529,7 @@ fn post_cmd_selected_rectangle_keeps_status_border_and_shows_orange_marker() {
     s.handle_key(key(KeyCode::Up));
 
     let buffer = render(80, 14, |f| s.render(f, f.area()));
-    assert_text_fg(&buffer, "✎", colors::ACCENT);
+    assert_cell_fg(&buffer, "✏️", colors::ACCENT);
     assert_text_fg(&buffer, "bun install", colors::WHITE);
     assert_text_modifier(&buffer, "bun install", Modifier::BOLD);
 
@@ -540,7 +552,7 @@ fn post_cmd_selected_delete_mark_keeps_red_border() {
     s.handle_key(key(KeyCode::Backspace));
 
     let buffer = render(80, 14, |f| s.render(f, f.area()));
-    assert_text_fg(&buffer, "✎", colors::ACCENT);
+    assert_cell_fg(&buffer, "✏️", colors::ACCENT);
 
     let (left_border, right_border) = surrounding_border_cells(&buffer, "bun install");
     for (x, y) in [left_border, right_border] {
@@ -555,12 +567,12 @@ fn post_cmd_selection_marker_disappears_while_editing() {
     s.handle_key(key(KeyCode::Up));
 
     let selected = dump(80, 14, |f| s.render(f, f.area()));
-    assert!(selected.contains("✎𓂃"));
+    assert!(selected.contains("✏️"));
 
     s.handle_key(key(KeyCode::Enter));
 
     let editing = dump(80, 14, |f| s.render(f, f.area()));
-    assert!(!editing.contains("✎𓂃"));
+    assert!(!editing.contains("✏️"));
 }
 
 #[test]
@@ -1166,7 +1178,7 @@ fn terminal_cmd_selected_rectangle_shows_orange_marker_and_keeps_status_border()
     s.handle_key(key(KeyCode::Up));
 
     let buffer = render(80, 14, |f| s.render(f, f.area()));
-    assert_text_fg(&buffer, "✎", colors::ACCENT);
+    assert_cell_fg(&buffer, "✏️", colors::ACCENT);
     assert_text_fg(&buffer, "code $WORKTREE_PATH", colors::WHITE);
     assert_text_modifier(&buffer, "code $WORKTREE_PATH", Modifier::BOLD);
 
