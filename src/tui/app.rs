@@ -1322,9 +1322,7 @@ impl App {
                 self.apply_update_pr_progress(number, progress);
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
-            AppEvent::UpdateBranchFinished(result) => {
-                self.apply_update_branch_finished(result, tx)
-            }
+            AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
         }
     }
 
@@ -1364,10 +1362,9 @@ impl App {
                  was reachable to update from."
                     .to_string(),
             ),
-            Ok(UpdateBranchOutcome::FetchFailed(message)) => self.show_toast(
-                ToastVariant::Error,
-                format!("git fetch failed: {message}"),
-            ),
+            Ok(UpdateBranchOutcome::FetchFailed(message)) => {
+                self.show_toast(ToastVariant::Error, format!("git fetch failed: {message}"))
+            }
             Ok(UpdateBranchOutcome::MergeFailed { base_ref, message }) => self.show_toast(
                 ToastVariant::Error,
                 format!("git merge {base_ref} failed: {message}"),
