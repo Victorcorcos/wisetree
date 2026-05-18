@@ -148,7 +148,7 @@ fn ready_with_patterns(copy_patterns: &[&str], ignore_patterns: &[&str]) -> Sett
 #[test]
 fn menu_renders_with_config_path() {
     let s = ready();
-    let dumped = dump(80, 14, |f| s.render(f, f.area()));
+    let dumped = dump(80, 20, |f| s.render(f, f.area()));
     assert!(dumped.contains("Configuration file"));
     assert!(dumped.contains("/tmp/.wisetree.json"));
     assert!(dumped.contains("➤"));
@@ -168,9 +168,6 @@ fn esc_on_menu_returns_back() {
 #[test]
 fn selecting_copy_patterns_shows_detail_view() {
     let mut s = ready();
-    for _ in 0..6 {
-        s.handle_key(key(KeyCode::Down));
-    }
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::CopyPatterns);
     let dumped = dump(80, 12, |f| s.render(f, f.area()));
@@ -198,9 +195,6 @@ fn copy_patterns_view_grows_to_show_every_pattern() {
         &["**/node_modules/**"],
     );
 
-    for _ in 0..6 {
-        s.handle_key(key(KeyCode::Down));
-    }
     s.handle_key(key(KeyCode::Enter));
 
     let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
@@ -212,9 +206,6 @@ fn copy_patterns_view_grows_to_show_every_pattern() {
 fn copy_patterns_footer_renders_after_blank_line() {
     let mut s = ready_with_patterns(&["docker/.env-backuper"], &["**/node_modules/**"]);
 
-    for _ in 0..6 {
-        s.handle_key(key(KeyCode::Down));
-    }
     s.handle_key(key(KeyCode::Enter));
 
     let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
@@ -250,9 +241,7 @@ fn ignore_patterns_view_grows_to_show_every_pattern() {
         ],
     );
 
-    for _ in 0..7 {
-        s.handle_key(key(KeyCode::Down));
-    }
+    s.handle_key(key(KeyCode::Down));
     s.handle_key(key(KeyCode::Enter));
 
     let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
@@ -264,9 +253,7 @@ fn ignore_patterns_view_grows_to_show_every_pattern() {
 fn ignore_patterns_footer_renders_after_blank_line() {
     let mut s = ready_with_patterns(&[".env*"], &["storage/**"]);
 
-    for _ in 0..7 {
-        s.handle_key(key(KeyCode::Down));
-    }
+    s.handle_key(key(KeyCode::Down));
     s.handle_key(key(KeyCode::Enter));
 
     let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
@@ -285,9 +272,6 @@ fn ignore_patterns_footer_renders_after_blank_line() {
 #[test]
 fn any_key_in_detail_returns_to_menu() {
     let mut s = ready();
-    for _ in 0..6 {
-        s.handle_key(key(KeyCode::Down));
-    }
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::CopyPatterns);
     let action = s.handle_key(key(KeyCode::Char('x')));
@@ -298,9 +282,6 @@ fn any_key_in_detail_returns_to_menu() {
 #[test]
 fn enter_on_copy_patterns_emits_copy_settings_file_path_action() {
     let mut s = ready();
-    for _ in 0..6 {
-        s.handle_key(key(KeyCode::Down));
-    }
     s.handle_key(key(KeyCode::Enter));
 
     let action = s.handle_key(key(KeyCode::Enter));
@@ -311,9 +292,7 @@ fn enter_on_copy_patterns_emits_copy_settings_file_path_action() {
 #[test]
 fn enter_on_ignore_patterns_emits_copy_settings_file_path_action() {
     let mut s = ready();
-    for _ in 0..7 {
-        s.handle_key(key(KeyCode::Down));
-    }
+    s.handle_key(key(KeyCode::Down));
     s.handle_key(key(KeyCode::Enter));
 
     let action = s.handle_key(key(KeyCode::Enter));
@@ -324,7 +303,7 @@ fn enter_on_ignore_patterns_emits_copy_settings_file_path_action() {
 #[test]
 fn delete_branch_setting_renders_yes_no_toggle() {
     let mut s = ready();
-    for _ in 0..3 {
+    for _ in 0..7 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -340,7 +319,7 @@ fn delete_branch_setting_renders_yes_no_toggle() {
 #[test]
 fn delete_branch_setting_emits_true_when_yes_selected() {
     let mut s = ready();
-    for _ in 0..3 {
+    for _ in 0..7 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -352,7 +331,7 @@ fn delete_branch_setting_emits_true_when_yes_selected() {
 #[test]
 fn delete_branch_setting_emits_false_when_no_selected() {
     let mut s = ready();
-    for _ in 0..3 {
+    for _ in 0..7 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -555,12 +534,12 @@ fn post_cmd_selection_marker_disappears_while_editing() {
     s.handle_key(key(KeyCode::Up));
 
     let selected = dump(80, 14, |f| s.render(f, f.area()));
-    assert!(selected.contains("✎𓂃"));
+    assert!(selected.contains("✎﹏"));
 
     s.handle_key(key(KeyCode::Enter));
 
     let editing = dump(80, 14, |f| s.render(f, f.area()));
-    assert!(!editing.contains("✎𓂃"));
+    assert!(!editing.contains("✎﹏"));
 }
 
 #[test]
@@ -982,8 +961,8 @@ fn post_cmd_hint_contains_shift_k_j_reorder() {
 }
 
 fn enter_terminal_cmd(s: &mut SettingsScreen) {
-    // Menu order: Dashboard(0), TerminalCmd(1).
-    for _ in 0..1 {
+    // Menu order: CopyPatterns(0), IgnorePatterns(1), PostCmd(2), TerminalCmd(3).
+    for _ in 0..3 {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));

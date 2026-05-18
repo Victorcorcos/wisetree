@@ -12,6 +12,7 @@ pub enum Screen {
     MergePullRequest,
     Settings,
     Setup,
+    SetupProject,
 }
 
 impl Screen {
@@ -33,6 +34,7 @@ impl Screen {
             Self::MergePullRequest => "merge_pull_request",
             Self::Settings => "settings",
             Self::Setup => "setup",
+            Self::SetupProject => "setup_project",
         }
     }
 }

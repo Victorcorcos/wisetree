@@ -27,6 +27,7 @@ use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
+use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
@@ -44,8 +45,11 @@ use crate::tui::screens::delete::{
 };
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen};
-use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
+use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen, SettingsStep};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
+use crate::tui::screens::setup_project::{
+    SetupProjectAction, SetupProjectPresetValues, SetupProjectScreen, SetupProjectStep,
+};
 use crate::tui::selection::{
     clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
 };
@@ -77,6 +81,7 @@ enum AppEvent {
         success_message: String,
         error: Option<String>,
     },
+    WisePresetDiscovered(Result<WisePresetDiscovery, String>),
     MergePrDetailsLoaded(Result<MergePrDetailsPayload, String>),
     MergePrFinished(Result<u64, MergePrFailure>),
 }
@@ -110,6 +115,7 @@ pub struct App {
     delete: Option<DeleteScreen>,
     settings: Option<SettingsScreen>,
     setup: Option<SetupScreen>,
+    setup_project: Option<SetupProjectScreen>,
     merge_pr: Option<MergePullRequestScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
@@ -147,6 +153,7 @@ impl App {
             delete: None,
             settings: None,
             setup: None,
+            setup_project: None,
             merge_pr: None,
             shell_integration_status: None,
             toast: ToastState::default(),
@@ -308,11 +315,16 @@ impl App {
                 }
             }
             Screen::Settings => {
-                let h = self
-                    .settings
-                    .as_ref()
-                    .map_or(14, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                let panel = match self.settings.as_ref().map(|s| s.step()) {
+                    Some(SettingsStep::Menu) | None => self.render_framed_panel_fill(frame, area),
+                    Some(_) => {
+                        let h = self
+                            .settings
+                            .as_ref()
+                            .map_or(14, |s| s.preferred_content_height());
+                        self.render_framed_panel(frame, area, h)
+                    }
+                };
                 if let Some(settings) = self.settings.as_mut() {
                     settings.tick = self.tick;
                     settings.render(frame, panel);
@@ -338,6 +350,27 @@ impl App {
                 if let Some(merge_pr) = self.merge_pr.as_mut() {
                     merge_pr.tick = self.tick;
                     merge_pr.render(frame, panel);
+                }
+            }
+            Screen::SetupProject => {
+                let panel = match self.setup_project.as_ref().map(|s| s.step()) {
+                    // Preset list and confirm both benefit from the full panel:
+                    // the list can show more options, and the confirm step keeps
+                    // its Yes/No footer pinned below scrollable preset blocks.
+                    Some(SetupProjectStep::PresetList) | Some(SetupProjectStep::Confirm) | None => {
+                        self.render_framed_panel_fill(frame, area)
+                    }
+                    Some(SetupProjectStep::Discovering) => {
+                        let h = self
+                            .setup_project
+                            .as_ref()
+                            .map_or(12, |s| s.preferred_content_height());
+                        self.render_framed_panel(frame, area, h)
+                    }
+                };
+                if let Some(screen) = self.setup_project.as_mut() {
+                    screen.tick = self.tick;
+                    screen.render(frame, panel);
                 }
             }
         }
@@ -415,6 +448,19 @@ impl App {
             y: mouse.row,
         };
         let clamped = clamp_position(raw_position, snapshot.area);
+
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && matches!(self.phase, InitPhase::Ready)
+            && matches!(self.screen, Screen::SetupProject)
+            && self
+                .setup_project
+                .as_mut()
+                .is_some_and(|screen| screen.handle_mouse(mouse))
+        {
+            return;
+        }
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -499,6 +545,7 @@ impl App {
             Screen::Delete => self.handle_delete_key(key, tx),
             Screen::Settings => self.handle_settings_key(key, tx),
             Screen::Setup => self.handle_setup_key(key, tx),
+            Screen::SetupProject => self.handle_setup_project_key(key, tx),
             Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
         }
     }
@@ -544,6 +591,7 @@ impl App {
                 self.last_menu_index = idx;
                 match choice {
                     MenuChoice::Exit => self.quit_requested = true,
+                    MenuChoice::SetupProject => self.enter_screen(Screen::SetupProject, tx),
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                     MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
@@ -863,6 +911,114 @@ impl App {
         }
     }
 
+    fn handle_setup_project_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.setup_project.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+
+        match action {
+            SetupProjectAction::Continue => {}
+            SetupProjectAction::Cancelled => self.back_to_menu(),
+            SetupProjectAction::DiscoverWise => self.start_wise_preset_discovery(tx),
+            SetupProjectAction::Apply(preset) => self.apply_setup_project_preset(preset),
+        }
+    }
+
+    fn start_wise_preset_discovery(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if self.git_root.is_none() {
+            if let Some(screen) = self.setup_project.as_mut() {
+                screen.reset_after_wise_discovery_failure();
+            }
+            self.show_toast(
+                ToastVariant::Error,
+                "No git repository in scope for Wise Preset discovery.",
+            );
+            return;
+        }
+
+        self.show_toast(
+            ToastVariant::Info,
+            "Wise Preset is scanning the repository...",
+        );
+        kick_off_wise_preset_discovery(self.git_root.clone(), tx.clone());
+    }
+
+    fn apply_setup_project_preset(&mut self, preset: SetupProjectPresetValues) {
+        let applied_label = if preset.label == "Wise Preset" {
+            preset.label.clone()
+        } else {
+            format!("{} preset", preset.label)
+        };
+
+        let local_path = match self.local_config_path() {
+            Some(path) => path,
+            None => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    "No git repository in scope — cannot write .wisetree.json.",
+                );
+                return;
+            }
+        };
+
+        let mut config = self.current_config().cloned().unwrap_or_default();
+        config.worktree_copy_patterns = preset.copy_patterns;
+        config.worktree_copy_ignores = preset.copy_ignores;
+        config.post_create_cmd = preset.post_create_cmd;
+
+        let mut writer = ConfigService::new();
+        if let Err(err) = writer.save(&config, Some(&local_path)) {
+            self.show_toast(
+                ToastVariant::Error,
+                format!("Failed to write .wisetree.json: {err}"),
+            );
+            return;
+        }
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let _ = service.config_service_mut().load(local_path.parent());
+        }
+
+        self.show_toast(
+            ToastVariant::Success,
+            format!("Applied {applied_label} to .wisetree.json"),
+        );
+        self.back_to_menu();
+    }
+
+    fn apply_wise_preset_discovery(&mut self, result: Result<WisePresetDiscovery, String>) {
+        let Some(screen) = self.setup_project.as_mut() else {
+            return;
+        };
+
+        match result {
+            Ok(discovery) => {
+                let summary = summarize_wise_preset_matches(&discovery);
+                let used_generic_fallback = discovery.used_generic_fallback();
+                screen.complete_wise_discovery(discovery);
+                if used_generic_fallback {
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        "Wise Preset found no specific frameworks. Using Generic values.",
+                    );
+                } else {
+                    self.show_toast(
+                        ToastVariant::Success,
+                        format!("Wise Preset found {summary}. Review and apply."),
+                    );
+                }
+            }
+            Err(message) => {
+                screen.reset_after_wise_discovery_failure();
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Wise Preset discovery failed: {message}"),
+                );
+            }
+        }
+    }
+
     fn handle_app_event(&mut self, event: AppEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match event {
             AppEvent::Initialized(outcome) => self.apply_init_outcome(*outcome, tx),
@@ -968,6 +1124,7 @@ impl App {
                     self.show_toast(ToastVariant::Error, format!("Clipboard copy failed: {err}"))
                 }
             },
+            AppEvent::WisePresetDiscovered(result) => self.apply_wise_preset_discovery(result),
             AppEvent::MergePrDetailsLoaded(result) => self.apply_merge_pr_details(result, tx),
             AppEvent::MergePrFinished(result) => self.apply_merge_pr_finished(result, tx),
         }
@@ -1126,6 +1283,10 @@ impl App {
             Screen::Setup => {
                 self.setup = Some(SetupScreen::new(self.shell_integration_status.as_ref()));
             }
+            Screen::SetupProject => {
+                let root = self.git_root.as_ref().map(PathBuf::from);
+                self.setup_project = Some(SetupProjectScreen::new(root.as_deref()));
+            }
             Screen::MergePullRequest => {
                 // Entered explicitly from `DashboardAction::MergePullRequest`,
                 // which seeds `merge_pr` before flipping the screen. If we
@@ -1152,6 +1313,7 @@ impl App {
         self.delete = None;
         self.settings = None;
         self.setup = None;
+        self.setup_project = None;
         self.merge_pr = None;
         self.mouse_selection = None;
     }
@@ -1246,7 +1408,17 @@ impl App {
             self.shell_integration_status
                 .as_ref()
                 .map(|status| status.is_installed),
+            self.has_local_config(),
         )
+    }
+
+    /// True when the active project already has a `.wisetree.json`. The
+    /// menu uses this to decide whether to surface the one-keystroke
+    /// "Setup Project Config" entry.
+    fn has_local_config(&self) -> bool {
+        self.local_config_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     fn current_config(&self) -> Option<&WorktreeConfig> {
@@ -1636,6 +1808,26 @@ fn kick_off_delete_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppE
     });
 }
 
+fn kick_off_wise_preset_discovery(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEvent>) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::WisePresetDiscovered(Err(
+            "Could not resolve the current repository root.".to_string(),
+        )));
+        return;
+    };
+
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            crate::services::presets::discover_wise(&root)
+                .ok_or_else(|| "Could not scan the current repository.".to_string())
+        })
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|inner| inner);
+        let _ = tx.send(AppEvent::WisePresetDiscovered(result));
+    });
+}
+
 fn kick_off_create_worktree(
     git_root: Option<String>,
     options: WorktreeCreateOptions,
@@ -1778,6 +1970,24 @@ fn screen_delete_outcome(outcome: ServiceDeleteOutcome) -> ScreenDeleteOutcome {
         worktree_deleted: outcome.worktree_deleted,
         branch_deleted: outcome.branch_deleted,
         branch_name: outcome.branch_name,
+    }
+}
+
+fn summarize_wise_preset_matches(discovery: &WisePresetDiscovery) -> String {
+    let labels: Vec<&'static str> = discovery
+        .matched_ids
+        .iter()
+        .filter_map(|id| crate::services::presets::find_by_id(*id).map(|preset| preset.label))
+        .collect();
+
+    match labels.as_slice() {
+        [] => "no matches".to_string(),
+        [only] => only.to_string(),
+        [first, second] => format!("{first} and {second}"),
+        [first, second, third] => format!("{first}, {second}, and {third}"),
+        [first, second, third, rest @ ..] => {
+            format!("{first}, {second}, {third}, and {} more", rest.len())
+        }
     }
 }
 
@@ -1948,6 +2158,15 @@ mod tests {
         }
     }
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
@@ -1966,13 +2185,28 @@ mod tests {
         }
     }
 
+    fn write(root: &std::path::Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
     fn initialized_menu_app() -> App {
+        // A persistent tempdir with a stub `.wisetree.json` so
+        // `has_local_config()` is true and the "Setup Project Config"
+        // entry is hidden — keeping menu ordering stable for these tests.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.keep();
+        fs::write(repo_root.join(LOCAL_CONFIG_FILE_NAME), "{}").expect("write local config");
+
         let service = WorktreeService::new(None);
 
         let mut app = App::new(AppMode::Menu, false);
         app.phase = InitPhase::Ready;
         app.worktree_service = Some(service);
-        app.git_root = Some("/tmp/repo".into());
+        app.git_root = Some(repo_root.display().to_string());
         app.shell_integration_status = Some(ShellIntegrationStatus {
             is_installed: true,
             shell: Shell::Zsh,
@@ -1980,6 +2214,18 @@ mod tests {
             reason: None,
         });
         app.menu = Some(app.build_menu_screen());
+        app
+    }
+
+    fn initialized_setup_project_app(repo_root: &std::path::Path) -> App {
+        let service = WorktreeService::new(Some(repo_root.to_path_buf()));
+
+        let mut app = App::new(AppMode::Menu, false);
+        app.phase = InitPhase::Ready;
+        app.screen = Screen::SetupProject;
+        app.worktree_service = Some(service);
+        app.git_root = Some(repo_root.display().to_string());
+        app.setup_project = Some(SetupProjectScreen::new(Some(repo_root)));
         app
     }
 
@@ -2056,7 +2302,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..3 {
+            for _ in 0..7 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -2125,7 +2371,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..3 {
+            for _ in 0..7 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -2206,7 +2452,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..3 {
+            for _ in 0..7 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -2792,6 +3038,178 @@ mod tests {
                 assert!(app.dashboard.is_some());
             });
         });
+    }
+
+    #[test]
+    fn wise_preset_discovery_completion_moves_screen_to_confirm_and_shows_toast() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            write(&repo_root, "api/Gemfile", "");
+            write(&repo_root, "api/config/application.rb", "");
+            write(&repo_root, "api/config/master.key", "secret");
+            write(
+                &repo_root,
+                "web/package.json",
+                "{\"dependencies\": {\"react\": \"18\"}}",
+            );
+            write(&repo_root, "web/.env.local", "VITE_X=1");
+
+            let mut app = initialized_setup_project_app(&repo_root);
+            let discovery =
+                crate::services::presets::discover_wise(&repo_root).expect("wise preset");
+
+            app.apply_wise_preset_discovery(Ok(discovery));
+
+            assert_eq!(
+                app.setup_project.as_ref().unwrap().step(),
+                SetupProjectStep::Confirm
+            );
+            let toast = app.toast.current().expect("toast should be shown");
+            assert_eq!(toast.variant, ToastVariant::Success);
+            assert!(toast.message.contains("Ruby on Rails"));
+            assert!(toast.message.contains("React (CRA / Vite)"));
+        });
+    }
+
+    #[test]
+    fn wise_preset_generic_fallback_shows_warning_toast() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let mut app = initialized_setup_project_app(&repo_root);
+            let discovery =
+                crate::services::presets::discover_wise(&repo_root).expect("wise preset");
+
+            app.apply_wise_preset_discovery(Ok(discovery));
+
+            assert_eq!(
+                app.setup_project.as_ref().unwrap().step(),
+                SetupProjectStep::Confirm
+            );
+            let toast = app.toast.current().expect("toast should be shown");
+            assert_eq!(toast.variant, ToastVariant::Warning);
+            assert!(toast.message.contains("Generic"));
+        });
+    }
+
+    #[test]
+    fn wise_preset_apply_writes_local_config_and_preserves_other_values() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            write(&repo_root, "api/Gemfile", "");
+            write(&repo_root, "api/config/application.rb", "");
+            write(&repo_root, "api/config/master.key", "secret");
+            write(
+                &repo_root,
+                "web/package.json",
+                "{\"dependencies\": {\"react\": \"18\"}}",
+            );
+            write(&repo_root, "web/.env.local", "VITE_X=1");
+
+            let mut app = initialized_setup_project_app(&repo_root);
+            app.worktree_service
+                .as_mut()
+                .unwrap()
+                .config_service_mut()
+                .update(|config| {
+                    config.terminal_command = "code $WORKTREE_PATH".into();
+                    config.delete_branch_with_worktree = true;
+                    config.dashboard.show_pull_requests = true;
+                });
+
+            let discovery =
+                crate::services::presets::discover_wise(&repo_root).expect("wise preset");
+            app.apply_wise_preset_discovery(Ok(discovery));
+            app.handle_setup_project_key(key(KeyCode::Enter), &app_event_tx());
+
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let saved: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+
+            assert_eq!(app.screen, Screen::Menu);
+            assert_eq!(saved.terminal_command, "code $WORKTREE_PATH");
+            assert!(saved.delete_branch_with_worktree);
+            assert!(saved.dashboard.show_pull_requests);
+            assert!(saved
+                .worktree_copy_patterns
+                .iter()
+                .any(|pattern| pattern == "api/config/master.key"));
+            assert!(saved
+                .worktree_copy_patterns
+                .iter()
+                .any(|pattern| pattern == "web/.env.local"));
+            assert!(saved
+                .worktree_copy_ignores
+                .iter()
+                .any(|pattern| pattern == "api/**/vendor/bundle/**"));
+            assert!(saved
+                .worktree_copy_ignores
+                .iter()
+                .any(|pattern| pattern == "web/**/node_modules/**"));
+            assert!(saved.post_create_cmd.iter().any(|command| {
+                command == "(cd 'api' && bundle install --jobs 5 --verbose --retry 4)"
+            }));
+            assert!(saved
+                .post_create_cmd
+                .iter()
+                .any(|command| command == "(cd 'web' && npm install)"));
+
+            let toast = app.toast.current().expect("toast should be shown");
+            assert_eq!(toast.variant, ToastVariant::Success);
+            assert_eq!(toast.message, "Applied Wise Preset to .wisetree.json");
+        });
+    }
+
+    #[test]
+    fn mouse_wheel_scroll_routes_into_setup_project_confirm_blocks() {
+        let repo_root = tempfile::tempdir().unwrap().keep();
+        let mut app = initialized_setup_project_app(&repo_root);
+        app.setup_project.as_mut().unwrap().complete_wise_discovery(
+            crate::services::presets::WisePresetDiscovery {
+                matched_ids: vec![crate::services::presets::PresetId::Generic],
+                copy_patterns: vec![
+                    "copy-1".into(),
+                    "copy-2".into(),
+                    "copy-3".into(),
+                    "copy-4".into(),
+                    "copy-5".into(),
+                    "copy-6".into(),
+                ],
+                copy_ignores: vec!["ignore-1".into()],
+                post_create_cmd: vec!["cmd-1".into()],
+            },
+        );
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let completed = terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.last_rendered_buffer = Some(completed.buffer.clone());
+        let initial = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(initial.contains("copy-1"));
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 8), &app_event_tx());
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 8), &app_event_tx());
+
+        let completed = terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.last_rendered_buffer = Some(completed.buffer.clone());
+        let scrolled = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!scrolled.contains("copy-1"));
+        assert!(scrolled.contains("copy-4"));
+        assert!(scrolled.contains("Yes"));
+        assert!(scrolled.contains("No"));
     }
 
     #[test]

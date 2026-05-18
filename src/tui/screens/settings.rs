@@ -102,7 +102,7 @@ pub enum PostCmdSelection {
     Save,
 }
 
-const POST_CMD_SELECTION_MARKER: &str = " ✎𓂃  ";
+const POST_CMD_SELECTION_MARKER: &str = " ✎﹏ ";
 
 /// State for the inline post-create commands editor surfaced when the user
 /// drills into the `Post-Create Commands` setting from the menu.
@@ -759,11 +759,14 @@ impl SettingsScreen {
 
     fn build_menu(&self) -> SelectPrompt<SettingsStep> {
         let opts: Vec<SelectOption<SettingsStep>> = vec![
-            SelectOption::new("Dashboard", SettingsStep::Dashboard).with_description(format!(
-                "{}ms refresh, {} columns",
-                self.config.dashboard.refresh_interval_ms,
-                self.config.dashboard.columns.len()
-            )),
+            SelectOption::new("Copy Patterns", SettingsStep::CopyPatterns).with_description(
+                format!("{} patterns", self.config.worktree_copy_patterns.len()),
+            ),
+            SelectOption::new("Ignore Patterns", SettingsStep::IgnorePatterns).with_description(
+                format!("{} patterns", self.config.worktree_copy_ignores.len()),
+            ),
+            SelectOption::new("Post-Create Commands", SettingsStep::PostCmd)
+                .with_description(format!("{} commands", self.config.post_create_cmd.len())),
             SelectOption::new("Terminal Command", SettingsStep::TerminalCmd).with_description(
                 if self.config.terminal_command.is_empty() {
                     "(none)".to_string()
@@ -771,28 +774,27 @@ impl SettingsScreen {
                     self.config.terminal_command.clone()
                 },
             ),
-            SelectOption::new("Post-Create Commands", SettingsStep::PostCmd)
-                .with_description(format!("{} commands", self.config.post_create_cmd.len())),
+            SelectOption::new("Path Template", SettingsStep::PathTemplate)
+                .with_description(self.config.worktree_path_template.clone()),
+            SelectOption::new("Copy Settings", SettingsStep::CopySettings)
+                .with_description("Sync global and local config"),
+            SelectOption::new("Dashboard", SettingsStep::Dashboard).with_description(format!(
+                "{}ms refresh, {} columns",
+                self.config.dashboard.refresh_interval_ms,
+                self.config.dashboard.columns.len()
+            )),
             SelectOption::new("Delete Branch with Worktree", SettingsStep::DeleteBranch)
                 .with_description(if self.config.delete_branch_with_worktree {
                     "enabled"
                 } else {
                     "disabled"
                 }),
-            SelectOption::new("Path Template", SettingsStep::PathTemplate)
-                .with_description(self.config.worktree_path_template.clone()),
-            SelectOption::new("Copy Settings", SettingsStep::CopySettings)
-                .with_description("Sync global and local config"),
-            SelectOption::new("Copy Patterns", SettingsStep::CopyPatterns).with_description(
-                format!("{} patterns", self.config.worktree_copy_patterns.len()),
-            ),
-            SelectOption::new("Ignore Patterns", SettingsStep::IgnorePatterns).with_description(
-                format!("{} patterns", self.config.worktree_copy_ignores.len()),
-            ),
             SelectOption::new(UPDATE_CHECK_MENU, SettingsStep::CheckUpdates)
                 .with_description("Check npm for latest version"),
         ];
-        SelectPrompt::new("Select setting to view:", opts).with_footer_spacer()
+        SelectPrompt::new("Select setting to view:", opts)
+            .searchable()
+            .with_footer_spacer()
     }
 
     fn build_copy_settings_select(&self) -> SelectPrompt<CopyDirection> {
