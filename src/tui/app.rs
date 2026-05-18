@@ -31,8 +31,8 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult, UpdatePhase,
-    UpdateProgress,
+    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdateCheckResult, UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -53,6 +53,7 @@ use crate::tui::screens::setup::{SetupAction, SetupScreen};
 use crate::tui::screens::setup_project::{
     SetupProjectAction, SetupProjectPresetValues, SetupProjectScreen, SetupProjectStep,
 };
+use crate::tui::screens::update_branch::UpdateBranchScreen;
 use crate::tui::screens::update_pr::{UpdateAction, UpdatePullRequestScreen};
 use crate::tui::selection::{
     clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
@@ -108,6 +109,7 @@ enum AppEvent {
         progress: UpdateProgress,
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
+    UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
 }
 
 struct MergePrDetailsPayload {
@@ -154,6 +156,7 @@ pub struct App {
     setup_project: Option<SetupProjectScreen>,
     merge_pr: Option<MergePullRequestScreen>,
     update_pr: Option<UpdatePullRequestScreen>,
+    update_branch: Option<UpdateBranchScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
     last_rendered_buffer: Option<Buffer>,
@@ -194,6 +197,7 @@ impl App {
             setup_project: None,
             merge_pr: None,
             update_pr: None,
+            update_branch: None,
             shell_integration_status: None,
             toast: ToastState::default(),
             last_rendered_buffer: None,
@@ -434,6 +438,17 @@ impl App {
                     update_pr.render(frame, panel);
                 }
             }
+            Screen::UpdateBranch => {
+                let h = self
+                    .update_branch
+                    .as_ref()
+                    .map_or(3, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
+                if let Some(update_branch) = self.update_branch.as_mut() {
+                    update_branch.tick = self.tick;
+                    update_branch.render(frame, panel);
+                }
+            }
         }
     }
 
@@ -628,6 +643,11 @@ impl App {
             Screen::SetupProject => self.handle_setup_project_key(key, tx),
             Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
             Screen::UpdatePullRequest => self.handle_update_pr_key(key, tx),
+            Screen::UpdateBranch => {
+                if let Some(screen) = self.update_branch.as_mut() {
+                    screen.handle_key(key);
+                }
+            }
         }
     }
 
@@ -829,6 +849,9 @@ impl App {
             DashboardAction::UpdatePullRequest(request) => {
                 self.start_update_pr_flow(*request, tx);
             }
+            DashboardAction::UpdateBranch(path) => {
+                self.start_update_branch_flow(path, tx);
+            }
         }
     }
 
@@ -854,6 +877,20 @@ impl App {
                 kick_off_cache_entry_delete(self.git_root.clone(), relative_path, tx.clone());
             }
         }
+    }
+
+    /// Mount the loading splash synchronously so the user gets an
+    /// instant visual response, then kick off the background fetch +
+    /// merge. The flow ends in `apply_update_branch_finished`, which
+    /// returns to the dashboard and toasts the outcome.
+    fn start_update_branch_flow(
+        &mut self,
+        worktree_path: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.update_branch = Some(UpdateBranchScreen::new(worktree_path.clone()));
+        self.screen = Screen::UpdateBranch;
+        kick_off_update_branch(self.current_dashboard_config(), worktree_path, tx.clone());
     }
 
     fn start_merge_pr_flow(
@@ -1379,6 +1416,57 @@ impl App {
                 self.apply_update_pr_progress(number, progress);
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
+            AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
+        }
+    }
+
+    fn apply_update_branch_finished(
+        &mut self,
+        result: Result<UpdateBranchOutcome, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // Drop the loading splash and route back to the dashboard before
+        // toasting — the user must land on the screen where the toast
+        // appears, otherwise the result would flash on the splash for
+        // one frame and vanish.
+        self.update_branch = None;
+        if matches!(self.screen, Screen::UpdateBranch) {
+            self.enter_screen(Screen::Dashboard, tx);
+        }
+        self.show_update_branch_toast(result);
+    }
+
+    fn show_update_branch_toast(&mut self, result: Result<UpdateBranchOutcome, String>) {
+        match result {
+            Ok(UpdateBranchOutcome::AlreadyUpToDate { base_ref }) => self.show_toast(
+                ToastVariant::Info,
+                format!("Already up to date with {base_ref}."),
+            ),
+            Ok(UpdateBranchOutcome::FastForwarded { base_ref, summary }) => self.show_toast(
+                ToastVariant::Info,
+                format!("Fast-forwarded to {base_ref} ({summary})."),
+            ),
+            Ok(UpdateBranchOutcome::Merged { base_ref, summary }) => self.show_toast(
+                ToastVariant::Info,
+                format!("Merged {base_ref} ({summary})."),
+            ),
+            Ok(UpdateBranchOutcome::NoBaseRef) => self.show_toast(
+                ToastVariant::Warning,
+                "No upstream/main, upstream/master, origin/main, or origin/master ref \
+                 was reachable to update from."
+                    .to_string(),
+            ),
+            Ok(UpdateBranchOutcome::FetchFailed(message)) => {
+                self.show_toast(ToastVariant::Error, format!("git fetch failed: {message}"))
+            }
+            Ok(UpdateBranchOutcome::MergeFailed { base_ref, message }) => self.show_toast(
+                ToastVariant::Error,
+                format!("git merge {base_ref} failed: {message}"),
+            ),
+            Err(message) => self.show_toast(
+                ToastVariant::Error,
+                format!("Update branch failed: {message}"),
+            ),
         }
     }
 
@@ -1777,6 +1865,15 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::UpdateBranch => {
+                // Only reachable through `start_update_branch_flow`,
+                // which seeds `update_branch` before flipping the
+                // screen. Any other path means we lost the splash and
+                // would render an empty panel — bail back to the menu.
+                if self.update_branch.is_none() {
+                    self.back_to_menu();
+                }
+            }
         }
 
         if !matches!(screen, Screen::Delete) {
@@ -1799,6 +1896,7 @@ impl App {
         self.setup_project = None;
         self.merge_pr = None;
         self.update_pr = None;
+        self.update_branch = None;
         self.mouse_selection = None;
     }
 
@@ -2621,6 +2719,24 @@ fn kick_off_resolve_base_ref(
         let base_ref =
             crate::services::dashboard::resolve_base_ref(&PathBuf::from(&worktree_path)).await;
         let _ = tx.send(AppEvent::UpdatePrBaseRefResolved { number, base_ref });
+    });
+}
+
+fn kick_off_update_branch(
+    config: DashboardConfig,
+    worktree_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        // The mother worktree IS the git root, so reuse the path as the
+        // service root — there is no separate "git_root" to resolve from
+        // app state for this action.
+        let service = DashboardService::new(PathBuf::from(&worktree_path), config);
+        let event = match service.update_branch(&worktree_path).await {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::UpdateBranchFinished(event));
     });
 }
 

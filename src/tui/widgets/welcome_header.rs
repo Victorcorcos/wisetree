@@ -30,6 +30,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::Cache => Some("Cache"),
             Screen::MergePullRequest => Some("Merge Pull Request"),
             Screen::UpdatePullRequest => Some("Update Pull Request"),
+            Screen::UpdateBranch => Some("Update Branch"),
             Screen::Settings => Some("Settings"),
             Screen::Setup => Some("Setup"),
             Screen::SetupProject => Some("Setup Project Config"),

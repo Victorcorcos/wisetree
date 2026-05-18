@@ -133,6 +133,40 @@ pub struct PullRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub merge_status: Option<MergeStatus>,
+    /// Reviewers grouped by how they currently appear in GitHub's Reviewers
+    /// panel. Each list holds the bare `@login` (no leading `@`). Filled in
+    /// from the GraphQL response so the dashboard can attribute the review
+    /// status emoji to specific people.
+    #[serde(
+        rename = "reviewerSummary",
+        default,
+        skip_serializing_if = "ReviewerSummary::is_empty"
+    )]
+    pub reviewers: ReviewerSummary,
+}
+
+/// Lists of reviewers split by current status. Kept sorted so renders are
+/// deterministic and dedup'd so a reviewer who re-requested doesn't appear
+/// twice. Pending = was asked but hasn't reviewed yet (or was re-requested).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes_requested: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commented: Vec<String>,
+}
+
+impl ReviewerSummary {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+            && self.approved.is_empty()
+            && self.changes_requested.is_empty()
+            && self.commented.is_empty()
+    }
 }
 
 /// Title + body for a single pull request, fetched on demand by the merge
@@ -330,6 +364,33 @@ pub enum UpdatePullRequestOutcome {
     PushFailed(String),
     /// `git reset --hard HEAD~1` failed during discard. stderr included.
     DiscardFailed(String),
+}
+
+/// Outcome of the `update_branch` pipeline (fetch + merge on the mother
+/// worktree). The success variants split out what `git merge` actually
+/// did so the UI can show a toast that reflects reality (a no-op vs a
+/// fast-forward vs a real merge commit) instead of a generic "updated".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateBranchOutcome {
+    /// `git merge` printed "Already up to date." — the worktree was
+    /// already at or ahead of `base_ref`, nothing changed on disk.
+    AlreadyUpToDate { base_ref: String },
+    /// `git merge` advanced HEAD as a fast-forward (no merge commit).
+    /// `summary` is the first non-empty line of git's stdout, which
+    /// typically reads `Updating <old>..<new>` — useful for the toast.
+    FastForwarded { base_ref: String, summary: String },
+    /// `git merge` created a merge commit (divergent histories). The
+    /// commit message is git's default `Merge ...`. `summary` carries
+    /// the first non-empty line of git's stdout for the toast.
+    Merged { base_ref: String, summary: String },
+    /// None of the refs in `BASE_REF_PRIORITY` resolved against the
+    /// worktree, even after `git fetch`. Nothing to merge against.
+    NoBaseRef,
+    /// `git fetch --all --prune` failed (network, auth, ...). stderr included.
+    FetchFailed(String),
+    /// `git merge {base_ref}` failed for any reason (conflicts, dirty
+    /// tree, refusal). stderr included.
+    MergeFailed { base_ref: String, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -897,6 +958,43 @@ impl DashboardService {
         }
 
         Ok(UpdatePullRequestOutcome::MergedCleanly)
+    }
+
+    /// Fetch the remote and merge the worktree at `worktree_path` with
+    /// the first reachable ref in `BASE_REF_PRIORITY` (upstream/main →
+    /// upstream/master → origin/main → origin/master). Powers the
+    /// dashboard's "Update Branch" action on the mother worktree.
+    pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+
+        let fetch = time::timeout(
+            UPDATE_FETCH_TIMEOUT,
+            run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git fetch timed out after 60s"))?;
+        if let Err(err) = fetch {
+            return Ok(UpdateBranchOutcome::FetchFailed(err));
+        }
+
+        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd).await else {
+            return Ok(UpdateBranchOutcome::NoBaseRef);
+        };
+
+        let merge = time::timeout(
+            UPDATE_MERGE_TIMEOUT,
+            run_command(&self.git_binary, &["merge", &base_ref], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git merge timed out after 120s"))?;
+
+        match merge {
+            Ok(stdout) => Ok(classify_merge_output(base_ref, &stdout)),
+            Err(stderr) => Ok(UpdateBranchOutcome::MergeFailed {
+                base_ref,
+                message: stderr,
+            }),
+        }
     }
 
     /// Push the AI-resolved merge commit after the user reviewed it.
@@ -1659,7 +1757,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft mergeStateStatus reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft mergeStateStatus reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -1794,6 +1892,8 @@ fn parse_graphql_response(
                     &changes_requested_logins,
                     &requested_user_logins,
                 );
+                let reviewers =
+                    build_reviewer_summary(&requested_user_logins, &node.latest_reviews.nodes);
                 let merge_status = match node.merge_state_status.as_deref() {
                     Some("DRAFT") => Some(MergeStatus::Draft),
                     Some("DIRTY") => Some(MergeStatus::Dirty),
@@ -1813,6 +1913,7 @@ fn parse_graphql_response(
                     checks_status,
                     review_status,
                     merge_status,
+                    reviewers,
                 }
             });
         out.insert((*branch).to_string(), pr);
@@ -1888,6 +1989,18 @@ struct GhOpinionatedReviewNode {
     author: Option<GhReviewAuthor>,
 }
 #[derive(Deserialize, Default)]
+struct GhLatestReviews {
+    #[serde(default)]
+    nodes: Vec<GhLatestReviewNode>,
+}
+#[derive(Deserialize, Default)]
+struct GhLatestReviewNode {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    author: Option<GhReviewAuthor>,
+}
+#[derive(Deserialize, Default)]
 struct GhReviewAuthor {
     #[serde(default)]
     login: Option<String>,
@@ -1908,6 +2021,8 @@ struct GhNode {
     review_requests: GhReviewRequests,
     #[serde(rename = "latestOpinionatedReviews", default)]
     latest_opinionated_reviews: GhOpinionatedReviews,
+    #[serde(rename = "latestReviews", default)]
+    latest_reviews: GhLatestReviews,
     #[serde(default)]
     commits: GhCommits,
 }
@@ -2006,6 +2121,56 @@ fn check_priority(status: CheckStatus) -> u8 {
 /// checking whether every user who left CHANGES_REQUESTED is currently
 /// listed in the outstanding `reviewRequests`, and surface Pending so the
 /// dashboard matches what the GitHub UI shows in the Reviewers section.
+/// Build the per-reviewer breakdown the dashboard footer renders. The
+/// `requested_user_logins` set drives the Pending bucket: a user is pending
+/// whenever GitHub still lists them under `reviewRequests`, even if they
+/// previously left a review the author has since re-requested. The Pending
+/// bucket therefore wins over Approved / Changes-requested / Commented so
+/// the dashboard matches the Reviewers panel on github.com.
+fn build_reviewer_summary(
+    requested_user_logins: &HashSet<String>,
+    latest_review_nodes: &[GhLatestReviewNode],
+) -> ReviewerSummary {
+    let pending: HashSet<String> = requested_user_logins.clone();
+    let mut approved: HashSet<String> = HashSet::new();
+    let mut changes_requested: HashSet<String> = HashSet::new();
+    let mut commented: HashSet<String> = HashSet::new();
+
+    for review in latest_review_nodes {
+        let Some(login) = review.author.as_ref().and_then(|a| a.login.clone()) else {
+            continue;
+        };
+        if pending.contains(&login) {
+            continue;
+        }
+        match review.state.as_deref() {
+            Some("APPROVED") => {
+                approved.insert(login);
+            }
+            Some("CHANGES_REQUESTED") => {
+                changes_requested.insert(login);
+            }
+            Some("COMMENTED") => {
+                commented.insert(login);
+            }
+            _ => {}
+        }
+    }
+
+    let sorted = |set: HashSet<String>| {
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    };
+
+    ReviewerSummary {
+        pending: sorted(pending),
+        approved: sorted(approved),
+        changes_requested: sorted(changes_requested),
+        commented: sorted(commented),
+    }
+}
+
 fn derive_review_status(
     decision: Option<&str>,
     pending_requests: u64,
@@ -2034,6 +2199,33 @@ fn derive_review_status(
 ///   ` 28 files changed, 2815 insertions(+), 42 deletions(-)`
 ///   ` 1 file changed, 5 insertions(+)`
 ///   `` (no diff → both zero)
+/// Classify the stdout of `git merge <ref>` into the corresponding
+/// `UpdateBranchOutcome` variant so the dashboard toast can describe
+/// what actually happened. Git's output is stable enough to key on:
+/// - "Already up to date." for the no-op case,
+/// - a line containing "Fast-forward" for the fast-forward case,
+/// - everything else (including "Merge made by ...") is a merge commit.
+///
+/// `summary` is the first non-empty line of stdout — short enough for
+/// the toast and informative enough to anchor what just happened.
+fn classify_merge_output(base_ref: String, stdout: &str) -> UpdateBranchOutcome {
+    let trimmed = stdout.trim();
+    if trimmed.starts_with("Already up to date") || trimmed.starts_with("Already up-to-date") {
+        return UpdateBranchOutcome::AlreadyUpToDate { base_ref };
+    }
+    let summary = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if trimmed.lines().any(|line| line.trim() == "Fast-forward") {
+        UpdateBranchOutcome::FastForwarded { base_ref, summary }
+    } else {
+        UpdateBranchOutcome::Merged { base_ref, summary }
+    }
+}
+
 fn parse_shortstat(output: &str) -> (u64, u64) {
     let mut insertions = 0u64;
     let mut deletions = 0u64;
@@ -3370,6 +3562,55 @@ mod tests {
     }
 
     #[test]
+    fn classify_merge_output_recognizes_already_up_to_date() {
+        let outcome = classify_merge_output("upstream/main".into(), "Already up to date.\n");
+        assert_eq!(
+            outcome,
+            UpdateBranchOutcome::AlreadyUpToDate {
+                base_ref: "upstream/main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_merge_output_recognizes_hyphenated_already_up_to_date() {
+        // Older git versions print "Already up-to-date." with hyphens.
+        let outcome = classify_merge_output("origin/main".into(), "Already up-to-date.");
+        assert_eq!(
+            outcome,
+            UpdateBranchOutcome::AlreadyUpToDate {
+                base_ref: "origin/main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_merge_output_detects_fast_forward() {
+        let stdout = "Updating abc1234..def5678\nFast-forward\n README.md | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n";
+        let outcome = classify_merge_output("upstream/main".into(), stdout);
+        assert_eq!(
+            outcome,
+            UpdateBranchOutcome::FastForwarded {
+                base_ref: "upstream/main".into(),
+                summary: "Updating abc1234..def5678".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_merge_output_treats_real_merge_as_merged() {
+        let stdout = "Merge made by the 'ort' strategy.\n README.md | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n";
+        let outcome = classify_merge_output("origin/master".into(), stdout);
+        assert_eq!(
+            outcome,
+            UpdateBranchOutcome::Merged {
+                base_ref: "origin/master".into(),
+                summary: "Merge made by the 'ort' strategy.".into(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_pr_view_json_with_title_and_body() {
         let raw = r#"{"title":"Add merge action","body":"Closes #42.\n\nNotes."}"#;
         let parsed = parse_pr_view_json(raw).unwrap();
@@ -3679,7 +3920,95 @@ mod tests {
             q.contains("latestOpinionatedReviews"),
             "query must request latestOpinionatedReviews so we know who left CHANGES_REQUESTED: {q}"
         );
+        assert!(
+            q.contains("latestReviews"),
+            "query must request latestReviews so the footer can attribute COMMENTED reviewers: {q}"
+        );
         assert!(q.contains("totalCount"));
+    }
+
+    #[test]
+    fn build_reviewer_summary_buckets_each_state() {
+        let requested = logins(["pending_user"]);
+        let nodes = vec![
+            GhLatestReviewNode {
+                state: Some("APPROVED".into()),
+                author: Some(GhReviewAuthor {
+                    login: Some("alice".into()),
+                }),
+            },
+            GhLatestReviewNode {
+                state: Some("CHANGES_REQUESTED".into()),
+                author: Some(GhReviewAuthor {
+                    login: Some("bob".into()),
+                }),
+            },
+            GhLatestReviewNode {
+                state: Some("COMMENTED".into()),
+                author: Some(GhReviewAuthor {
+                    login: Some("carol".into()),
+                }),
+            },
+        ];
+        let summary = build_reviewer_summary(&requested, &nodes);
+        assert_eq!(summary.pending, vec!["pending_user".to_string()]);
+        assert_eq!(summary.approved, vec!["alice".to_string()]);
+        assert_eq!(summary.changes_requested, vec!["bob".to_string()]);
+        assert_eq!(summary.commented, vec!["carol".to_string()]);
+    }
+
+    #[test]
+    fn build_reviewer_summary_prefers_pending_over_past_review() {
+        // A reviewer who left CHANGES_REQUESTED and was then re-requested
+        // is back to "Pending" in the GitHub UI — the footer should match,
+        // not also list them under Rejected.
+        let requested = logins(["mrprey"]);
+        let nodes = vec![GhLatestReviewNode {
+            state: Some("CHANGES_REQUESTED".into()),
+            author: Some(GhReviewAuthor {
+                login: Some("mrprey".into()),
+            }),
+        }];
+        let summary = build_reviewer_summary(&requested, &nodes);
+        assert_eq!(summary.pending, vec!["mrprey".to_string()]);
+        assert!(summary.changes_requested.is_empty());
+    }
+
+    #[test]
+    fn parses_graphql_response_populates_reviewer_summary() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{
+                "number": 21,
+                "state": "OPEN",
+                "url": "u",
+                "title": "t",
+                "isDraft": false,
+                "reviewDecision": "APPROVED",
+                "reviewRequests": {
+                  "totalCount": 1,
+                  "nodes": [
+                    {"requestedReviewer": {"__typename": "User", "login": "dan"}}
+                  ]
+                },
+                "latestReviews": {
+                  "nodes": [
+                    {"state": "APPROVED", "author": {"login": "alice"}},
+                    {"state": "CHANGES_REQUESTED", "author": {"login": "bob"}},
+                    {"state": "COMMENTED", "author": {"login": "carol"}}
+                  ]
+                }
+              }]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.reviewers.pending, vec!["dan".to_string()]);
+        assert_eq!(pr.reviewers.approved, vec!["alice".to_string()]);
+        assert_eq!(pr.reviewers.changes_requested, vec!["bob".to_string()]);
+        assert_eq!(pr.reviewers.commented, vec!["carol".to_string()]);
     }
 
     fn logins<I: IntoIterator<Item = &'static str>>(values: I) -> HashSet<String> {

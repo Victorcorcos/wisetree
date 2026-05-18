@@ -6,7 +6,7 @@ use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::messages::colors;
 use wisetree::services::{
     CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
-    PrState, PullRequest, ReviewStatus,
+    PrState, PullRequest, ReviewStatus, ReviewerSummary,
 };
 use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 
@@ -90,6 +90,7 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
         checks_status: None,
         review_status: None,
         merge_status: None,
+        reviewers: Default::default(),
     });
     row
 }
@@ -556,6 +557,88 @@ fn opened_pr_with_passed_check_and_rejected_review_renders_thumbs_down() {
     assert!(
         drone_pos < review_pos,
         "Drone emoji must render to the LEFT of review emoji: {opened_row}"
+    );
+}
+
+#[test]
+fn opened_pr_with_reviewers_renders_each_group_in_footer() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut bug = row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open);
+    if let Some(pr) = bug.pull_request.as_mut() {
+        pr.reviewers = ReviewerSummary {
+            pending: vec!["dan".into()],
+            approved: vec!["alice".into()],
+            changes_requested: vec!["bob".into()],
+            commented: vec!["carol".into()],
+        };
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), bug]);
+    screen.handle_key(key(KeyCode::Down));
+
+    let dumped = dump_lines(140, 20, |f| screen.render(f, f.area()));
+    let reviewers_line = dumped
+        .lines()
+        .find(|line| line.starts_with("Reviewers:"))
+        .unwrap_or_else(|| panic!("reviewers line missing from footer: {dumped}"));
+    for snippet in [
+        "Pending @dan",
+        "Approved @alice",
+        "Rejected @bob",
+        "Commented @carol",
+    ] {
+        assert!(
+            reviewers_line.contains(snippet),
+            "expected `{snippet}` in reviewers line: {reviewers_line}"
+        );
+    }
+
+    let pr_line_no = dumped
+        .lines()
+        .position(|line| line.contains("PR #42 Open"))
+        .expect("PR info line missing");
+    let reviewers_line_no = dumped
+        .lines()
+        .position(|line| line.starts_with("Reviewers:"))
+        .unwrap();
+    assert!(
+        pr_line_no < reviewers_line_no,
+        "Reviewers line must appear below PR # info: pr={pr_line_no} reviewers={reviewers_line_no}"
+    );
+}
+
+#[test]
+fn merged_pr_with_reviewers_does_not_render_reviewers_line() {
+    // Reviewers info is only meaningful while the PR is Open; for merged or
+    // closed PRs the data is stale, so we suppress the line entirely.
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut merged = row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Merged);
+    if let Some(pr) = merged.pull_request.as_mut() {
+        pr.reviewers = ReviewerSummary {
+            approved: vec!["alice".into()],
+            ..Default::default()
+        };
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), merged]);
+    screen.handle_key(key(KeyCode::Down));
+
+    let dumped = dump_lines(140, 20, |f| screen.render(f, f.area()));
+    assert!(
+        !dumped.contains("Reviewers:"),
+        "Merged PR should suppress the reviewers footer line: {dumped}"
     );
 }
 
@@ -1191,4 +1274,59 @@ fn action_menu_hides_update_option_when_no_pr_present() {
 
     let dumped = open_action_menu_for_second_row(&mut screen);
     assert!(!dumped.contains("Update Pull Request"));
+}
+
+// ---- "Update Branch" visibility -----------------------------------------
+// The mother (main) worktree is the only row that exposes "Update Branch".
+// It's the dashboard's one-click way to pull the upstream tip into the
+// mother — irrelevant on derived worktrees that already track their own
+// PR base via "Update Pull Request".
+
+fn open_action_menu_for_first_row(screen: &mut DashboardScreen) -> String {
+    screen.handle_key(key(KeyCode::Enter));
+    dump(120, 14, |f| screen.render(f, f.area()))
+}
+
+#[test]
+fn action_menu_shows_update_branch_on_mother_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", true),
+    ]);
+
+    let dumped = open_action_menu_for_first_row(&mut screen);
+    assert!(
+        dumped.contains("Update Branch"),
+        "expected `Update Branch` on mother row: {dumped}"
+    );
+}
+
+#[test]
+fn action_menu_hides_update_branch_on_non_main_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", true),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        !dumped.contains("Update Branch"),
+        "Update Branch must not appear on non-main rows: {dumped}"
+    );
 }
