@@ -417,7 +417,7 @@ impl SetupProjectScreen {
         };
 
         let detail_total_height = area.height.saturating_sub(7);
-        let [copy_h, ignore_h, post_h] = split_detail_heights(detail_total_height);
+        let [copy_h, ignore_h, post_h] = confirm_block_heights(preset, detail_total_height);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -427,7 +427,7 @@ impl SetupProjectScreen {
                 Constraint::Length(copy_h),
                 Constraint::Length(ignore_h),
                 Constraint::Length(post_h),
-                Constraint::Length(1),
+                Constraint::Min(0),
                 Constraint::Length(3),
                 Constraint::Length(1),
             ])
@@ -584,6 +584,25 @@ fn split_detail_heights(total: u16) -> [u16; CONFIRM_BLOCK_COUNT] {
     heights
 }
 
+fn confirm_block_heights(preset: &SetupProjectPresetValues, total: u16) -> [u16; CONFIRM_BLOCK_COUNT] {
+    let caps = split_detail_heights(total);
+    let desired = [
+        block_height_for_line_count(preset.copy_patterns.len()),
+        block_height_for_line_count(preset.copy_ignores.len()),
+        block_height_for_line_count(preset.post_create_cmd.len()),
+    ];
+
+    [
+        desired[0].min(caps[0]),
+        desired[1].min(caps[1]),
+        desired[2].min(caps[2]),
+    ]
+}
+
+fn block_height_for_line_count(line_count: usize) -> u16 {
+    line_count.max(1) as u16 + 2
+}
+
 fn confirm_block_line_count(preset: &SetupProjectPresetValues, block_idx: usize) -> usize {
     match block_idx {
         0 => preset.copy_patterns.len().max(1),
@@ -670,4 +689,30 @@ fn render_yes_no(frame: &mut Frame, area: Rect, choice: ConfirmChoice) {
     );
     frame.render_widget(confirm_box, cols[1]);
     frame.render_widget(cancel_box, cols[3]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preset(copy: usize, ignore: usize, post: usize) -> SetupProjectPresetValues {
+        SetupProjectPresetValues {
+            label: "Wise Preset".into(),
+            copy_patterns: (0..copy).map(|idx| format!("copy-{idx}")).collect(),
+            copy_ignores: (0..ignore).map(|idx| format!("ignore-{idx}")).collect(),
+            post_create_cmd: (0..post).map(|idx| format!("cmd-{idx}")).collect(),
+        }
+    }
+
+    #[test]
+    fn confirm_block_heights_shrink_for_short_sections() {
+        let heights = confirm_block_heights(&preset(1, 1, 1), 15);
+        assert_eq!(heights, [3, 3, 3]);
+    }
+
+    #[test]
+    fn confirm_block_heights_cap_tall_sections() {
+        let heights = confirm_block_heights(&preset(20, 2, 2), 15);
+        assert_eq!(heights, [5, 4, 4]);
+    }
 }
