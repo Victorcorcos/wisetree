@@ -2071,6 +2071,40 @@ async fn run_command(
     }
 }
 
+/// Rejects a `write_file` call that would replace a still-conflicted file
+/// with a catastrophically smaller payload. The file is considered
+/// in-conflict when the on-disk content still has merge markers, and the
+/// new content is "catastrophically smaller" when it's under 10 % of the
+/// existing size (with a 200-byte floor so trivial files don't trip the
+/// guard). The returned error is fed back to the model as the tool
+/// response so it can retry within its remaining turns instead of the
+/// outer pipeline only catching the destruction post-hoc.
+fn guard_destructive_overwrite(existing: &str, new_content: &str) -> std::result::Result<(), String> {
+    let has_markers = existing.contains("<<<<<<<")
+        || existing.contains("=======")
+        || existing.contains(">>>>>>>");
+    if !has_markers {
+        return Ok(());
+    }
+    if existing.len() < 200 {
+        return Ok(());
+    }
+    if new_content.len() * 10 >= existing.len() {
+        return Ok(());
+    }
+    Err(format!(
+        "this file is in merge-conflict state (it still has conflict markers) \
+         and the proposed content ({} bytes) is catastrophically smaller than \
+         the existing file ({} bytes). A real merge must preserve content from \
+         both sides — read the file in full, combine both sides' intent, and \
+         write the merged result. If you cannot merge this file safely, do not \
+         call write_file on this path; leave the markers in place and explain \
+         in your final reply.",
+        new_content.len(),
+        existing.len()
+    ))
+}
+
 /// Returns the path of the first file that looks catastrophically truncated
 /// after AI conflict resolution. A file is considered truncated when its
 /// resolved size is less than 10 % of the larger pre-merge side, provided
@@ -2555,6 +2589,10 @@ async fn execute_direct_tool_call(
                 .map_err(|err| format!("invalid write_file arguments: {err}"))?;
             let path = resolve_repo_path(cwd, &args.path)?;
             let display = display_repo_path(cwd, &path);
+            let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+            if let Err(reason) = guard_destructive_overwrite(&existing, &args.content) {
+                return Err(format!("refusing to write {display}: {reason}"));
+            }
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
@@ -3281,6 +3319,48 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_rejects_placeholder_write_to_conflicted_file() {
+        let existing = format!(
+            "{}\n<<<<<<< HEAD\nfrom ours\n=======\nfrom theirs\n>>>>>>> base\n{}\n",
+            "x".repeat(500),
+            "y".repeat(500),
+        );
+        let err = guard_destructive_overwrite(&existing, "resolved")
+            .expect_err("placeholder must be rejected when conflict markers are present");
+        assert!(
+            err.contains("merge-conflict"),
+            "unexpected guard message: {err}"
+        );
+    }
+
+    #[test]
+    fn guard_allows_real_merge_to_conflicted_file() {
+        let existing = format!(
+            "{}\n<<<<<<< HEAD\nfrom ours\n=======\nfrom theirs\n>>>>>>> base\n{}\n",
+            "x".repeat(500),
+            "y".repeat(500),
+        );
+        let merged = format!("{}\nmerged body line\n{}\n", "x".repeat(500), "y".repeat(500));
+        assert!(guard_destructive_overwrite(&existing, &merged).is_ok());
+    }
+
+    #[test]
+    fn guard_allows_shrinking_write_when_no_conflict_markers() {
+        // No markers means the file isn't in a conflicted state — a deliberate
+        // truncation here is the model's call, not a destructive resolution.
+        let existing = "a".repeat(5_000);
+        assert!(guard_destructive_overwrite(&existing, "tiny").is_ok());
+    }
+
+    #[test]
+    fn guard_skips_tiny_conflicted_files() {
+        // Very small files (< 200 bytes baseline) skip the guard so the 10 %
+        // threshold doesn't fire on toy fixtures.
+        let existing = "<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> base\n";
+        assert!(guard_destructive_overwrite(existing, "z").is_ok());
+    }
 
     #[test]
     fn parses_pr_view_json_with_title_and_body() {

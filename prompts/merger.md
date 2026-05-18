@@ -26,7 +26,7 @@ Understand *why* both sides differ using read-only commands:
 3. **Propagate structural changes.** If one side renamed/reshaped a symbol, update any code the other side added to match.
 4. **Preserve language invariants** — imports resolve, interfaces are complete, exhaustive matches stay exhaustive, signatures agree across call sites.
 5. **Remove all markers.** No `<<<<<<<`, `=======`, or `>>>>>>>` may remain.
-6. **Never use a placeholder.** Writing "resolved" or "done" as the file body silently destroys content. If you can't merge safely, leave markers and stop.
+6. **Never write a placeholder, status string, or summary as the file content.** The `write_file` content must be the fully merged source, with no conflict markers. If you cannot merge a file safely, **do not call `write_file` on that path** — leave its conflict markers untouched and explain the situation in your final text reply. The pipeline will surface unresolved files to the user.
 7. **Stage each file by explicit path:** `git add <file>`. Never use `git add .` or `git add -A` — they pick up temp files.
 
 ## File-type defaults
