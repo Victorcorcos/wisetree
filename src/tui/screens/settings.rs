@@ -1,4 +1,4 @@
-//! Settings screen — mostly read-only view of the global `WorktreeConfig`
+//! Settings screen — mostly read-only view of the active `WorktreeConfig`
 //! plus a writable `Delete Branch with Worktree` toggle and a
 //! "Check for Updates" entry. Mirrors upstream `SettingsMenu` (steps:
 //! `Menu`, five read-only field detail views, the toggle view, and
@@ -18,7 +18,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 use std::ops::Range;
 
-use crate::config::schema::{LinkStrategy, WorktreeConfig};
+use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
+use crate::constants::global_config_file;
 use crate::messages::{
     colors, UPDATE_CHECKING, UPDATE_CHECK_MENU, UPDATE_FAILED, UPDATE_INSTALL_CMD,
     UPDATE_UP_TO_DATE,
@@ -38,6 +39,7 @@ pub enum SettingsStep {
     LinkCacheDir,
     IgnorePatterns,
     PathTemplate,
+    Dashboard,
     PostCmd,
     TerminalCmd,
     DeleteBranch,
@@ -59,6 +61,7 @@ pub enum CopyDirection {
 pub enum SettingsAction {
     Continue,
     Back,
+    CopySettingsFilePath,
     CheckUpdates,
     SetDeleteBranchWithWorktree(bool),
     Reset,
@@ -66,13 +69,17 @@ pub enum SettingsAction {
     /// `.wisetree.json`. Empty entries and deletion-marked rectangles are
     /// filtered out by the caller before they reach disk.
     SavePostCreateCommands(Vec<String>),
-    /// Persist the supplied terminal command to the project-local
-    /// `.wisetree.json`. An empty string clears the configured command.
+    /// Persist the supplied terminal command to the active config file.
+    /// An empty string clears the configured command.
     SaveTerminalCommand(String),
-    /// Persist the supplied worktree path template to the project-local
-    /// `.wisetree.json`. An empty string falls back to the default template
-    /// on next load via the schema default.
+    /// Persist the supplied worktree path template to the active config file.
+    /// An empty string falls back to the default template on next load via
+    /// the schema default.
     SavePathTemplate(String),
+    /// Persist the dashboard settings (refresh interval, show pull requests,
+    /// columns) to the active config file. Invalid numbers or unknown columns
+    /// are normalized by the caller.
+    SaveDashboard(DashboardConfig),
     /// Copy the active config from one location to the other.
     CopySettings(CopyDirection),
 }
@@ -98,7 +105,7 @@ pub enum PostCmdSelection {
     Save,
 }
 
-const POST_CMD_SELECTION_MARKER: &str = " ✎𓂃  ";
+const POST_CMD_SELECTION_MARKER: &str = " ✎﹏ ";
 
 /// State for the inline post-create commands editor surfaced when the user
 /// drills into the `Post-Create Commands` setting from the menu.
@@ -109,19 +116,53 @@ pub struct PostCmdEditor {
     last_rect_selection: Option<usize>,
     /// Snapshot taken when the user enters edit mode, used to restore on Esc.
     edit_backup: Option<(String, PostCmdRectStatus)>,
+    /// For each rectangle, the tick at which a swap-flash animation started.
+    /// `None` means no active animation. Parallel to `commands` / `statuses`.
+    swap_highlights: Vec<Option<usize>>,
+}
+
+/// Duration of the post-swap flash animation, in ticks (≈100ms each ⇒ 2s).
+const SWAP_ANIM_TICKS: usize = 20;
+
+fn lerp_rgb(
+    from: ratatui::style::Color,
+    to: ratatui::style::Color,
+    t: f32,
+) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    let t = t.clamp(0.0, 1.0);
+    match (from, to) {
+        (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) => {
+            let r = (fr as f32 + (tr as f32 - fr as f32) * t).round() as u8;
+            let g = (fg as f32 + (tg as f32 - fg as f32) * t).round() as u8;
+            let b = (fb as f32 + (tb as f32 - fb as f32) * t).round() as u8;
+            Color::Rgb(r, g, b)
+        }
+        _ => to,
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
 impl PostCmdEditor {
     pub fn new(commands: Vec<String>) -> Self {
         let has_commands = !commands.is_empty();
         let statuses = vec![PostCmdRectStatus::Saved; commands.len()];
+        let swap_highlights = vec![None; commands.len()];
         Self {
             commands,
             statuses,
             selection: PostCmdSelection::Create,
             last_rect_selection: if has_commands { Some(0) } else { None },
             edit_backup: None,
+            swap_highlights,
         }
+    }
+
+    pub fn swap_highlight_start(&self, idx: usize) -> Option<usize> {
+        self.swap_highlights.get(idx).copied().flatten()
     }
 
     pub fn editing_index(&self) -> Option<usize> {
@@ -181,6 +222,54 @@ impl PostCmdEditor {
             PostCmdSelection::Create | PostCmdSelection::Save => self.selection,
         };
         self.set_selection(next);
+    }
+
+    pub fn move_selected_up(&mut self, current_tick: usize) {
+        if self.editing_index().is_some() {
+            return;
+        }
+        let PostCmdSelection::Rect(i) = self.selection else {
+            return;
+        };
+        if i == 0 {
+            return;
+        }
+        self.commands.swap(i, i - 1);
+        self.statuses.swap(i, i - 1);
+        self.swap_highlights.swap(i, i - 1);
+        self.statuses[i] = Self::mark_modified(self.statuses[i]);
+        self.statuses[i - 1] = Self::mark_modified(self.statuses[i - 1]);
+        self.swap_highlights[i] = Some(current_tick);
+        self.swap_highlights[i - 1] = Some(current_tick);
+        self.set_selection(PostCmdSelection::Rect(i - 1));
+    }
+
+    pub fn move_selected_down(&mut self, current_tick: usize) {
+        if self.editing_index().is_some() {
+            return;
+        }
+        let PostCmdSelection::Rect(i) = self.selection else {
+            return;
+        };
+        if i + 1 >= self.commands.len() {
+            return;
+        }
+        self.commands.swap(i, i + 1);
+        self.statuses.swap(i, i + 1);
+        self.swap_highlights.swap(i, i + 1);
+        self.statuses[i] = Self::mark_modified(self.statuses[i]);
+        self.statuses[i + 1] = Self::mark_modified(self.statuses[i + 1]);
+        self.swap_highlights[i] = Some(current_tick);
+        self.swap_highlights[i + 1] = Some(current_tick);
+        self.set_selection(PostCmdSelection::Rect(i + 1));
+    }
+
+    fn mark_modified(status: PostCmdRectStatus) -> PostCmdRectStatus {
+        if status == PostCmdRectStatus::MarkedForDeletion {
+            PostCmdRectStatus::MarkedForDeletion
+        } else {
+            PostCmdRectStatus::Modified
+        }
     }
 
     fn toggle_buttons(&mut self) {
@@ -345,10 +434,151 @@ impl PathTemplateEditor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardRectStatus {
+    Unchanged,
+    Editing,
+    Modified,
+    Saved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardField {
+    RefreshIntervalMs,
+    ShowPullRequests,
+    Columns,
+}
+
+impl DashboardField {
+    pub const ALL: [DashboardField; 3] = [
+        DashboardField::RefreshIntervalMs,
+        DashboardField::ShowPullRequests,
+        DashboardField::Columns,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DashboardField::RefreshIntervalMs => "refreshIntervalMs",
+            DashboardField::ShowPullRequests => "showPullRequests",
+            DashboardField::Columns => "columns",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            DashboardField::RefreshIntervalMs => "5000..60000 (ms)",
+            DashboardField::ShowPullRequests => "Press Enter to toggle",
+            DashboardField::Columns => {
+                "Comma-separated: branch, status, ahead_behind, last_commit, pull_request"
+            }
+        }
+    }
+
+    pub fn is_toggle(self) -> bool {
+        matches!(self, DashboardField::ShowPullRequests)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardSelection {
+    Rect(usize),
+    Save,
+}
+
+/// State for the inline dashboard settings editor surfaced when the user
+/// drills into the `Dashboard` setting from the menu. Mirrors `PostCmdEditor`
+/// but has a fixed list of rectangles (one per dashboard field) and no
+/// Create/Delete affordances — the schema is closed.
+pub struct DashboardEditor {
+    pub values: Vec<String>,
+    pub statuses: Vec<DashboardRectStatus>,
+    pub selection: DashboardSelection,
+    edit_backup: Option<(String, DashboardRectStatus)>,
+}
+
+impl DashboardEditor {
+    pub fn new(config: &DashboardConfig) -> Self {
+        let values = vec![
+            config.refresh_interval_ms.to_string(),
+            config.show_pull_requests.to_string(),
+            config.columns.join(", "),
+        ];
+        let statuses = vec![DashboardRectStatus::Saved; values.len()];
+        Self {
+            values,
+            statuses,
+            selection: DashboardSelection::Rect(0),
+            edit_backup: None,
+        }
+    }
+
+    pub fn field(&self, idx: usize) -> DashboardField {
+        DashboardField::ALL[idx]
+    }
+
+    pub fn editing_index(&self) -> Option<usize> {
+        self.statuses
+            .iter()
+            .position(|&s| s == DashboardRectStatus::Editing)
+    }
+
+    fn move_up(&mut self) {
+        self.selection = match self.selection {
+            DashboardSelection::Rect(0) => DashboardSelection::Rect(0),
+            DashboardSelection::Rect(i) => DashboardSelection::Rect(i - 1),
+            DashboardSelection::Save => DashboardSelection::Rect(self.values.len() - 1),
+        };
+    }
+
+    fn move_down(&mut self) {
+        self.selection = match self.selection {
+            DashboardSelection::Rect(i) if i + 1 < self.values.len() => {
+                DashboardSelection::Rect(i + 1)
+            }
+            DashboardSelection::Rect(_) => DashboardSelection::Save,
+            DashboardSelection::Save => DashboardSelection::Save,
+        };
+    }
+
+    /// Build the `DashboardConfig` from current editor values. Numeric and
+    /// column normalization happens here so invalid input falls back to the
+    /// schema defaults rather than rejecting the save.
+    pub fn build_config(&self) -> DashboardConfig {
+        use crate::config::schema::{
+            clamp_dashboard_refresh_interval, default_refresh_ms, normalize_dashboard_columns,
+        };
+
+        let refresh_interval_ms = self.values[0]
+            .trim()
+            .parse::<u64>()
+            .map(clamp_dashboard_refresh_interval)
+            .unwrap_or_else(|_| default_refresh_ms());
+
+        let show_pull_requests = matches!(
+            self.values[1].trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "on"
+        );
+
+        let raw_columns: Vec<String> = self.values[2]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let (columns, _warnings) = normalize_dashboard_columns(&raw_columns);
+
+        DashboardConfig {
+            refresh_interval_ms,
+            show_pull_requests,
+            columns,
+        }
+    }
+}
+
 pub struct SettingsScreen {
     step: SettingsStep,
     config: WorktreeConfig,
     config_path: String,
+    global_config_path: Option<String>,
     /// Optional path of the project-local config the post-create commands
     /// editor will write to. Shown to the user while they edit.
     local_config_path: Option<String>,
@@ -361,6 +591,8 @@ pub struct SettingsScreen {
     terminal_cmd_input: Option<InputPrompt>,
     path_template_editor: Option<PathTemplateEditor>,
     path_template_input: Option<InputPrompt>,
+    dashboard_editor: Option<DashboardEditor>,
+    dashboard_input: Option<InputPrompt>,
     copy_settings_select: Option<SelectPrompt<CopyDirection>>,
     update_result: Option<UpdateCheckResult>,
     checking_updates: bool,
@@ -373,6 +605,7 @@ impl SettingsScreen {
             step: SettingsStep::Menu,
             config,
             config_path,
+            global_config_path: None,
             local_config_path: None,
             error: None,
             select: None,
@@ -383,6 +616,8 @@ impl SettingsScreen {
             terminal_cmd_input: None,
             path_template_editor: None,
             path_template_input: None,
+            dashboard_editor: None,
+            dashboard_input: None,
             copy_settings_select: None,
             update_result: None,
             checking_updates: false,
@@ -396,6 +631,11 @@ impl SettingsScreen {
     /// Stored verbatim and surfaced in the editor footer.
     pub fn with_local_config_path(mut self, path: Option<String>) -> Self {
         self.local_config_path = path;
+        self
+    }
+
+    pub fn with_global_config_path(mut self, path: String) -> Self {
+        self.global_config_path = Some(path);
         self
     }
 
@@ -415,6 +655,10 @@ impl SettingsScreen {
         self.path_template_editor.as_ref()
     }
 
+    pub fn dashboard_editor(&self) -> Option<&DashboardEditor> {
+        self.dashboard_editor.as_ref()
+    }
+
     pub fn step(&self) -> SettingsStep {
         self.step
     }
@@ -425,6 +669,15 @@ impl SettingsScreen {
 
     pub fn config_path(&self) -> &str {
         &self.config_path
+    }
+
+    fn config_source_label(&self) -> String {
+        let global = global_config_file().display().to_string();
+        if self.config_path == global {
+            format!("{} (global)", self.config_path)
+        } else {
+            format!("{} (local)", self.config_path)
+        }
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -455,6 +708,8 @@ impl SettingsScreen {
         self.terminal_cmd_input = None;
         self.path_template_editor = None;
         self.path_template_input = None;
+        self.dashboard_editor = None;
+        self.dashboard_input = None;
         self.copy_settings_select = None;
         self.error = None;
     }
@@ -483,6 +738,15 @@ impl SettingsScreen {
         self.select = Some(self.build_menu());
         self.path_template_editor = None;
         self.path_template_input = None;
+        self.step = SettingsStep::Menu;
+    }
+
+    /// Mirror a successful dashboard save back into the settings menu.
+    pub fn mark_dashboard_saved(&mut self, dashboard: DashboardConfig) {
+        self.config.dashboard = dashboard;
+        self.select = Some(self.build_menu());
+        self.dashboard_editor = None;
+        self.dashboard_input = None;
         self.step = SettingsStep::Menu;
     }
 
@@ -515,8 +779,6 @@ impl SettingsScreen {
             SelectOption::new("Ignore Patterns", SettingsStep::IgnorePatterns).with_description(
                 format!("{} patterns", self.config.worktree_copy_ignores.len()),
             ),
-            SelectOption::new("Path Template", SettingsStep::PathTemplate)
-                .with_description(self.config.worktree_path_template.clone()),
             SelectOption::new("Post-Create Commands", SettingsStep::PostCmd)
                 .with_description(format!("{} commands", self.config.post_create_cmd.len())),
             SelectOption::new("Terminal Command", SettingsStep::TerminalCmd).with_description(
@@ -526,18 +788,27 @@ impl SettingsScreen {
                     self.config.terminal_command.clone()
                 },
             ),
+            SelectOption::new("Path Template", SettingsStep::PathTemplate)
+                .with_description(self.config.worktree_path_template.clone()),
+            SelectOption::new("Copy Settings", SettingsStep::CopySettings)
+                .with_description("Sync global and local config"),
+            SelectOption::new("Dashboard", SettingsStep::Dashboard).with_description(format!(
+                "{}ms refresh, {} columns",
+                self.config.dashboard.refresh_interval_ms,
+                self.config.dashboard.columns.len()
+            )),
             SelectOption::new("Delete Branch with Worktree", SettingsStep::DeleteBranch)
                 .with_description(if self.config.delete_branch_with_worktree {
                     "enabled"
                 } else {
                     "disabled"
                 }),
-            SelectOption::new("Copy Settings", SettingsStep::CopySettings)
-                .with_description("Sync global and local config"),
             SelectOption::new(UPDATE_CHECK_MENU, SettingsStep::CheckUpdates)
                 .with_description("Check npm for latest version"),
         ];
         SelectPrompt::new("Select setting to view:", opts)
+            .searchable()
+            .with_footer_spacer()
     }
 
     fn build_copy_settings_select(&self) -> SelectPrompt<CopyDirection> {
@@ -550,6 +821,7 @@ impl SettingsScreen {
                     .with_description("Overwrite/create the global config from local"),
             ],
         )
+        .with_footer_spacer()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsAction {
@@ -565,22 +837,20 @@ impl SettingsScreen {
         }
         match self.step {
             SettingsStep::Menu => self.handle_menu(key),
+            SettingsStep::CopyPatterns
+            | SettingsStep::LinkPatterns
+            | SettingsStep::LinkStrategy
+            | SettingsStep::LinkCacheDir
+            | SettingsStep::IgnorePatterns => {
+                self.handle_copyable_detail(key)
+            }
             SettingsStep::DeleteBranch => self.handle_delete_branch(key),
             SettingsStep::CopySettings => self.handle_copy_settings(key),
             SettingsStep::CheckUpdates => self.handle_check_updates(key),
             SettingsStep::PostCmd => self.handle_post_cmd(key),
             SettingsStep::TerminalCmd => self.handle_terminal_cmd(key),
             SettingsStep::PathTemplate => self.handle_path_template(key),
-            _ => match key.code {
-                KeyCode::Esc => {
-                    self.step = SettingsStep::Menu;
-                    SettingsAction::Continue
-                }
-                _ => {
-                    self.step = SettingsStep::Menu;
-                    SettingsAction::Continue
-                }
-            },
+            SettingsStep::Dashboard => self.handle_dashboard(key),
         }
     }
 
@@ -611,6 +881,9 @@ impl SettingsScreen {
                         self.config.worktree_path_template.clone(),
                     ));
                 }
+                if matches!(value, SettingsStep::Dashboard) {
+                    self.dashboard_editor = Some(DashboardEditor::new(&self.config.dashboard));
+                }
                 if matches!(value, SettingsStep::CopySettings) {
                     self.copy_settings_select = Some(self.build_copy_settings_select());
                 }
@@ -638,6 +911,16 @@ impl SettingsScreen {
                 SettingsAction::Continue
             }
             SelectOutcome::Pending => SettingsAction::Continue,
+        }
+    }
+
+    fn handle_copyable_detail(&mut self, key: KeyEvent) -> SettingsAction {
+        match key.code {
+            KeyCode::Enter => SettingsAction::CopySettingsFilePath,
+            _ => {
+                self.step = SettingsStep::Menu;
+                SettingsAction::Continue
+            }
         }
     }
 
@@ -674,6 +957,14 @@ impl SettingsScreen {
                 editor.move_down();
                 SettingsAction::Continue
             }
+            KeyCode::Char('K') => {
+                editor.move_selected_up(self.tick);
+                SettingsAction::Continue
+            }
+            KeyCode::Char('J') => {
+                editor.move_selected_down(self.tick);
+                SettingsAction::Continue
+            }
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                 editor.toggle_buttons();
                 SettingsAction::Continue
@@ -686,6 +977,7 @@ impl SettingsScreen {
                 PostCmdSelection::Create => {
                     editor.commands.push(String::new());
                     editor.statuses.push(PostCmdRectStatus::Unchanged);
+                    editor.swap_highlights.push(None);
                     let idx = editor.commands.len() - 1;
                     editor.set_selection(PostCmdSelection::Rect(idx));
                     start_editing = Some(idx);
@@ -1042,6 +1334,153 @@ impl SettingsScreen {
         }
     }
 
+    fn handle_dashboard(&mut self, key: KeyEvent) -> SettingsAction {
+        let editing_idx = self
+            .dashboard_editor
+            .as_ref()
+            .and_then(DashboardEditor::editing_index);
+        if let Some(idx) = editing_idx {
+            return self.handle_dashboard_editing(idx, key);
+        }
+
+        let editor = match self.dashboard_editor.as_mut() {
+            Some(e) => e,
+            None => {
+                self.step = SettingsStep::Menu;
+                return SettingsAction::Continue;
+            }
+        };
+
+        let mut start_editing = None;
+        let mut toggle_idx = None;
+        let action = match key.code {
+            KeyCode::Esc => {
+                self.dashboard_editor = None;
+                self.dashboard_input = None;
+                self.step = SettingsStep::Menu;
+                SettingsAction::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                editor.move_up();
+                SettingsAction::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                editor.move_down();
+                SettingsAction::Continue
+            }
+            KeyCode::Enter => match editor.selection {
+                DashboardSelection::Rect(i) => {
+                    if editor.field(i).is_toggle() {
+                        toggle_idx = Some(i);
+                    } else {
+                        start_editing = Some(i);
+                    }
+                    SettingsAction::Continue
+                }
+                DashboardSelection::Save => SettingsAction::SaveDashboard(editor.build_config()),
+            },
+            _ => SettingsAction::Continue,
+        };
+
+        if let Some(idx) = toggle_idx {
+            self.toggle_dashboard_bool(idx);
+        }
+        if let Some(idx) = start_editing {
+            self.start_dashboard_editing(idx);
+        }
+
+        action
+    }
+
+    fn toggle_dashboard_bool(&mut self, idx: usize) {
+        let editor = match self.dashboard_editor.as_mut() {
+            Some(editor) => editor,
+            None => return,
+        };
+        let current = matches!(
+            editor.values[idx].trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "on"
+        );
+        let next = (!current).to_string();
+        editor.values[idx] = next;
+        editor.statuses[idx] = DashboardRectStatus::Modified;
+    }
+
+    fn start_dashboard_editing(&mut self, idx: usize) {
+        let editor = match self.dashboard_editor.as_mut() {
+            Some(editor) => editor,
+            None => return,
+        };
+        editor.selection = DashboardSelection::Rect(idx);
+        editor.edit_backup = Some((editor.values[idx].clone(), editor.statuses[idx]));
+        editor.statuses[idx] = DashboardRectStatus::Editing;
+        let field = editor.field(idx);
+        self.dashboard_input = Some(build_dashboard_input(field, &editor.values[idx]));
+    }
+
+    fn handle_dashboard_editing(&mut self, idx: usize, key: KeyEvent) -> SettingsAction {
+        let (outcome, current_value) = match self.dashboard_input.as_mut() {
+            Some(prompt) => {
+                let outcome = prompt.handle_key(key);
+                let current_value = prompt.value.clone();
+                (outcome, current_value)
+            }
+            None => {
+                if let Some(editor) = self.dashboard_editor.as_mut() {
+                    editor.statuses[idx] = DashboardRectStatus::Unchanged;
+                    editor.edit_backup = None;
+                }
+                return SettingsAction::Continue;
+            }
+        };
+
+        match outcome {
+            InputOutcome::Cancelled => {
+                let editor = match self.dashboard_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
+                if let Some((value, prior)) = editor.edit_backup.take() {
+                    editor.values[idx] = value;
+                    editor.statuses[idx] = prior;
+                } else {
+                    editor.statuses[idx] = DashboardRectStatus::Unchanged;
+                }
+                self.dashboard_input = None;
+                SettingsAction::Continue
+            }
+            InputOutcome::Submitted(value) => {
+                let editor = match self.dashboard_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
+                let next_status = editor
+                    .edit_backup
+                    .take()
+                    .map(|(original, prior)| {
+                        if value == original {
+                            prior
+                        } else {
+                            DashboardRectStatus::Modified
+                        }
+                    })
+                    .unwrap_or(DashboardRectStatus::Modified);
+                editor.values[idx] = value;
+                editor.statuses[idx] = next_status;
+                self.dashboard_input = None;
+                SettingsAction::Continue
+            }
+            InputOutcome::Pending => {
+                let editor = match self.dashboard_editor.as_mut() {
+                    Some(editor) => editor,
+                    None => return SettingsAction::Continue,
+                };
+                editor.values[idx] = current_value;
+                SettingsAction::Continue
+            }
+        }
+    }
+
     fn handle_delete_branch(&mut self, key: KeyEvent) -> SettingsAction {
         if self.delete_branch_dialog.is_none() {
             self.delete_branch_dialog = Some(self.build_delete_branch_dialog());
@@ -1092,44 +1531,62 @@ impl SettingsScreen {
             return 6;
         }
         match self.step {
-            // Settings menu select prompt: ~7 entries + label + spacer + hint.
-            SettingsStep::Menu => 18,
+            SettingsStep::Menu => 22,
             SettingsStep::CheckUpdates => 6,
-            // Detail panes: header + value lines + hint.
-            SettingsStep::CopyPatterns
-            | SettingsStep::LinkPatterns
-            | SettingsStep::LinkStrategy
-            | SettingsStep::LinkCacheDir
-            | SettingsStep::IgnorePatterns => 12,
+            SettingsStep::CopyPatterns => {
+                self.field_preferred_height(self.config.worktree_copy_patterns.len(), true)
+            }
+            SettingsStep::LinkPatterns => {
+                self.field_preferred_height(self.config.worktree_link_patterns.len().max(1), true)
+            }
+            SettingsStep::LinkStrategy => self.field_preferred_height(1, true),
+            SettingsStep::LinkCacheDir => self.field_preferred_height(1, true),
+            SettingsStep::IgnorePatterns => {
+                self.field_preferred_height(self.config.worktree_copy_ignores.len(), true)
+            }
+            SettingsStep::Dashboard => self.dashboard_preferred_height(),
             SettingsStep::PathTemplate => self.path_template_preferred_height(),
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
             SettingsStep::PostCmd => self.post_cmd_preferred_height(),
             SettingsStep::DeleteBranch => 16,
-            SettingsStep::CopySettings => 12,
+            SettingsStep::CopySettings => 13,
         }
     }
 
+    fn field_preferred_height(&self, item_count: usize, spacer_before_footer: bool) -> u16 {
+        let footer_lines = if spacer_before_footer { 3 } else { 2 };
+        item_count.saturating_add(2 + footer_lines).max(12usize) as u16
+    }
+
     fn post_cmd_preferred_height(&self) -> u16 {
-        // Title + description + N rectangles (3 rows each) + spacer + buttons
-        // (3 rows) + footer hint + saving-to line.
+        // Title + description + N rectangles (3 rows each + 1 hint row each)
+        // + spacer + buttons (3 rows) + footer hint + saving-to line.
         let n = self
             .post_cmd_editor
             .as_ref()
             .map(|e| e.commands.len() as u16)
             .unwrap_or(0);
-        2 + n.saturating_mul(3) + 1 + 3 + 2
+        2 + n.saturating_mul(4) + 1 + 3 + 2
     }
 
     fn terminal_cmd_preferred_height(&self) -> u16 {
-        // Title + description + 1 rectangle (3 rows) + spacer + Save button
-        // (3 rows) + saving-to line + footer hint.
-        2 + 3 + 1 + 3 + 2
+        // Title + description + 1 rectangle (3 rows) + per-field hint +
+        // spacer + Save button (3 rows) + saving-to line + footer hint.
+        2 + 3 + 1 + 1 + 3 + 2
+    }
+
+    fn dashboard_preferred_height(&self) -> u16 {
+        // Title + description + 3 rectangles (3 rows each) + 3 hint rows
+        // + spacer + Save button (3 rows) + saving-to line + footer hint.
+        let rects = DashboardField::ALL.len() as u16;
+        2 + rects * 3 + rects + 1 + 3 + 2
     }
 
     fn path_template_preferred_height(&self) -> u16 {
-        // Title + description + 1 rectangle (3 rows) + 3 variable hints
-        // + spacer + Save button (3 rows) + saving-to line + footer hint.
-        2 + 3 + 3 + 1 + 3 + 2
+        // Title + description + 1 rectangle (3 rows) + per-field hint
+        // + 3 variable hints + spacer + Save button (3 rows) + saving-to
+        // line + footer hint.
+        2 + 3 + 1 + 3 + 1 + 3 + 2
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -1145,6 +1602,7 @@ impl SettingsScreen {
             SettingsStep::LinkCacheDir => self.render_link_cache_dir(frame, area),
             SettingsStep::IgnorePatterns => self.render_ignore_patterns(frame, area),
             SettingsStep::PathTemplate => self.render_path_template(frame, area),
+            SettingsStep::Dashboard => self.render_dashboard(frame, area),
             SettingsStep::PostCmd => self.render_post_cmd(frame, area),
             SettingsStep::TerminalCmd => self.render_terminal_cmd(frame, area),
             SettingsStep::DeleteBranch => self.render_delete_branch(frame, area),
@@ -1208,8 +1666,15 @@ impl SettingsScreen {
         }
     }
 
-    fn render_field<I, S>(&self, frame: &mut Frame, area: Rect, title: &str, hint: &str, items: I)
-    where
+    fn render_field<I, S>(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        hint: &str,
+        items: I,
+        spacer_before_footer: bool,
+    ) where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
@@ -1218,6 +1683,31 @@ impl SettingsScreen {
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+        let source_label = self.config_source_label();
+        let footer_lines = if spacer_before_footer {
+            vec![
+                Line::default(),
+                Line::from(branded_line(
+                    &format!("Edit in {}.", source_label),
+                    dim_muted_style,
+                )),
+                Line::from(branded_line(
+                    "Press Enter to copy the path, any other key to go back.",
+                    dim_muted_style,
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(branded_line(
+                    &format!("Edit in {}.", source_label),
+                    dim_muted_style,
+                )),
+                Line::from(branded_line(
+                    "Press Enter to copy the path, any other key to go back.",
+                    dim_muted_style,
+                )),
+            ]
+        };
         let lines: Vec<Line> = std::iter::once(Line::from(branded_line(title, title_style)))
             .chain(std::iter::once(Line::from(branded_line(hint, muted_style))))
             .chain(items.into_iter().map(|s| {
@@ -1225,10 +1715,7 @@ impl SettingsScreen {
                 spans.extend(branded_line(&s.into(), Style::default()));
                 Line::from(spans)
             }))
-            .chain(std::iter::once(Line::from(branded_line(
-                &format!("Edit in {}. Press any key to go back.", self.config_path),
-                dim_muted_style,
-            ))))
+            .chain(footer_lines)
             .collect();
         frame.render_widget(Paragraph::new(lines), area);
     }
@@ -1240,6 +1727,7 @@ impl SettingsScreen {
             "Copy Patterns",
             "Files/patterns copied to new worktrees:",
             self.config.worktree_copy_patterns.clone(),
+            true,
         );
     }
 
@@ -1250,6 +1738,7 @@ impl SettingsScreen {
             "Ignore Patterns",
             "Files/patterns excluded from copying:",
             self.config.worktree_copy_ignores.clone(),
+            true,
         );
     }
 
@@ -1260,6 +1749,7 @@ impl SettingsScreen {
             "Link Patterns",
             "Directories/patterns shared through the repo cache:",
             self.config.worktree_link_patterns.clone(),
+            true,
         );
     }
 
@@ -1270,6 +1760,7 @@ impl SettingsScreen {
             "Link Strategy",
             "How missing source directories are handled before linking:",
             [link_strategy_label(self.config.worktree_link_strategy)],
+            true,
         );
     }
 
@@ -1284,7 +1775,187 @@ impl SettingsScreen {
                 .worktree_link_cache_dir
                 .clone()
                 .unwrap_or_else(|| "(default) ~/.wisetree/cache/<repo-id>".to_string())],
+            true,
         );
+    }
+
+    fn render_dashboard(&self, frame: &mut Frame, area: Rect) {
+        let editor = match &self.dashboard_editor {
+            Some(e) => e,
+            None => return,
+        };
+
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(colors::MUTED);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+
+        let rects = DashboardField::ALL.len();
+        let mut constraints: Vec<Constraint> = vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ];
+        for _ in 0..rects {
+            constraints.push(Constraint::Length(3));
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(0));
+        constraints.push(Constraint::Length(3));
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line("Dashboard", title_style))),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(
+                "Live dashboard settings (edit each field):",
+                muted_style,
+            ))),
+            chunks[1],
+        );
+
+        let editing_idx = editor.editing_index();
+        for i in 0..rects {
+            let rect_chunk = chunks[2 + i * 2];
+            let hint_chunk = chunks[2 + i * 2 + 1];
+            self.render_dashboard_rectangle(frame, rect_chunk, hint_chunk, editor, i, editing_idx);
+        }
+
+        let save_chunk = chunks[2 + rects * 2 + 1];
+        self.render_dashboard_save_button(frame, save_chunk, editor);
+
+        let target = self.config_path.clone();
+        let saving_line = Line::from(vec![
+            Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
+            Span::styled(target, Style::default().fg(colors::EMPHASIS)),
+        ]);
+        frame.render_widget(Paragraph::new(saving_line), chunks[2 + rects * 2 + 2]);
+
+        let hint = if editing_idx.is_some() {
+            "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
+        } else {
+            "↑↓ to move • Enter to edit/toggle/Save • Esc to go back"
+        };
+        frame.render_widget(
+            Paragraph::new(hint).style(dim_muted_style),
+            chunks[2 + rects * 2 + 3],
+        );
+    }
+
+    fn render_dashboard_rectangle(
+        &self,
+        frame: &mut Frame,
+        rect_area: Rect,
+        hint_area: Rect,
+        editor: &DashboardEditor,
+        idx: usize,
+        editing_idx: Option<usize>,
+    ) {
+        let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
+
+        let value = &editor.values[idx];
+        let status = editor.statuses[idx];
+        let field = editor.field(idx);
+        let is_selected = matches!(editor.selection, DashboardSelection::Rect(j) if j == idx);
+        let is_editing = editing_idx == Some(idx);
+        let is_focused = is_selected || is_editing;
+        let border_color = match status {
+            DashboardRectStatus::Unchanged => colors::WHITE,
+            DashboardRectStatus::Editing => colors::WARNING,
+            DashboardRectStatus::Modified => colors::ACCENT,
+            DashboardRectStatus::Saved => colors::SUCCESS,
+        };
+        let show_selection_marker = is_selected && !is_editing;
+        let content_style = if is_focused {
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let border_style = Style::default().fg(border_color);
+        let mut inner_line = if is_editing {
+            self.dashboard_input
+                .as_ref()
+                .map(|prompt| prompt.inline_line())
+                .unwrap_or_else(|| Line::from(Span::raw(value.clone())))
+        } else if value.is_empty() {
+            let placeholder = Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM);
+            Line::from(Span::styled("(empty — press Enter to edit)", placeholder))
+        } else {
+            Line::from(Span::raw(value.clone()))
+        };
+        if show_selection_marker {
+            inner_line.spans.insert(
+                0,
+                Span::styled(
+                    POST_CMD_SELECTION_MARKER,
+                    Style::default().fg(colors::ACCENT),
+                ),
+            );
+        }
+        inner_line.style = content_style;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(border_style)
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(format!(" {} ", field.label()), info_style));
+        frame.render_widget(Paragraph::new(inner_line).block(block), rect_area);
+
+        let hint_line = Line::from(vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled(field.hint(), muted_style),
+        ]);
+        frame.render_widget(Paragraph::new(hint_line), hint_area);
+    }
+
+    fn render_dashboard_save_button(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        editor: &DashboardEditor,
+    ) {
+        let save_label = "Save";
+        let save_width = save_label.chars().count() as u16 + 4;
+        let side = area.width.saturating_sub(save_width) / 2;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(side),
+                Constraint::Length(save_width),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        let save_selected = editor.selection == DashboardSelection::Save;
+        let save_text_style = if save_selected {
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(colors::MUTED)
+        };
+        let save_border = Style::default().fg(colors::SUCCESS);
+
+        let save_box = Paragraph::new(Line::from(Span::styled(save_label, save_text_style))).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(save_border)
+                .padding(Padding::horizontal(1)),
+        );
+        frame.render_widget(save_box, cols[1]);
     }
 
     fn render_path_template(&self, frame: &mut Frame, area: Rect) {
@@ -1303,16 +1974,17 @@ impl SettingsScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(1), // title
+                Constraint::Length(1), // description
+                Constraint::Length(3), // rectangle
+                Constraint::Length(1), // per-field hint
+                Constraint::Length(1), // variables label
+                Constraint::Length(1), // variable line 1
+                Constraint::Length(1), // variable lines
+                Constraint::Min(0),    // spacer
+                Constraint::Length(3), // save button
+                Constraint::Length(1), // saving-to
+                Constraint::Length(1), // footer hint
             ])
             .split(area);
         frame.render_widget(
@@ -1375,19 +2047,29 @@ impl SettingsScreen {
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
-            .padding(Padding::horizontal(1));
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(" worktreePathTemplate ", info_style));
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
+
+        let hint_line = Line::from(vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled(
+                "Directory path for new worktrees (variables below)",
+                muted_style,
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
 
         frame.render_widget(
             Paragraph::new(Line::from(branded_line("Available variables:", info_style))),
-            chunks[3],
+            chunks[4],
         );
         frame.render_widget(
             Paragraph::new(Line::from(branded_line(
                 "  • $BASE_PATH - Repository name",
                 muted_style,
             ))),
-            chunks[4],
+            chunks[5],
         );
         frame.render_widget(
             Paragraph::new(vec![
@@ -1400,27 +2082,24 @@ impl SettingsScreen {
                     muted_style,
                 )),
             ]),
-            chunks[5],
+            chunks[6],
         );
 
-        self.render_path_template_save_button(frame, chunks[7], editor);
+        self.render_path_template_save_button(frame, chunks[8], editor);
 
-        let target = self
-            .local_config_path
-            .clone()
-            .unwrap_or_else(|| ".wisetree.json (project local)".to_string());
+        let target = self.config_path.clone();
         let saving_line = Line::from(vec![
             Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
             Span::styled(target, Style::default().fg(colors::EMPHASIS)),
         ]);
-        frame.render_widget(Paragraph::new(saving_line), chunks[8]);
+        frame.render_widget(Paragraph::new(saving_line), chunks[9]);
 
         let hint = if is_editing {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else {
             "↑↓ to move • Enter to edit/Save • Esc to go back"
         };
-        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[9]);
+        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[10]);
     }
 
     fn render_path_template_save_button(
@@ -1467,6 +2146,10 @@ impl SettingsScreen {
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
         let emphasis_style = Style::default().fg(colors::EMPHASIS);
+        let global_path = self
+            .global_config_path
+            .clone()
+            .unwrap_or_else(|| self.config_path.clone());
         let local_path = self
             .local_config_path
             .clone()
@@ -1477,6 +2160,7 @@ impl SettingsScreen {
             .constraints([
                 Constraint::Length(2),
                 Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Min(1),
             ])
             .split(area);
@@ -1496,7 +2180,7 @@ impl SettingsScreen {
             Paragraph::new(vec![
                 Line::from(vec![
                     Span::styled("Global: ", muted_style),
-                    Span::styled(self.config_path.clone(), emphasis_style),
+                    Span::styled(global_path, emphasis_style),
                 ]),
                 Line::from(vec![
                     Span::styled("Local:  ", muted_style),
@@ -1507,7 +2191,7 @@ impl SettingsScreen {
         );
 
         if let Some(select) = &self.copy_settings_select {
-            select.render(frame, chunks[2]);
+            select.render(frame, chunks[3]);
         }
     }
 
@@ -1521,6 +2205,7 @@ impl SettingsScreen {
             .fg(colors::INFO)
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
         let chunks = Layout::default()
@@ -1552,32 +2237,52 @@ impl SettingsScreen {
 
         let editing_idx = editor.editing_index();
         let command_area = chunks[2];
-        let visible_range = editor.visible_range((command_area.height / 3) as usize);
+        let visible_range = editor.visible_range((command_area.height / 4) as usize);
         let hidden_above = visible_range.start;
         let hidden_below = editor.commands.len().saturating_sub(visible_range.end);
         let is_scrollable = hidden_above > 0 || hidden_below > 0;
-        let command_chunks: Vec<Rect> = (0..visible_range.len())
-            .map(|i| Rect {
-                x: command_area.x,
-                y: command_area.y + (i as u16) * 3,
-                width: command_area.width,
-                height: 3,
+        let command_chunks: Vec<(Rect, Rect)> = (0..visible_range.len())
+            .map(|i| {
+                let base_y = command_area.y + (i as u16) * 4;
+                let rect = Rect {
+                    x: command_area.x,
+                    y: base_y,
+                    width: command_area.width,
+                    height: 3,
+                };
+                let hint = Rect {
+                    x: command_area.x,
+                    y: base_y + 3,
+                    width: command_area.width,
+                    height: 1,
+                };
+                (rect, hint)
             })
             .collect();
 
-        for (chunk, i) in command_chunks.into_iter().zip(visible_range.clone()) {
+        for ((chunk, hint_chunk), i) in command_chunks.into_iter().zip(visible_range.clone()) {
             let cmd = &editor.commands[i];
             let status = editor.statuses[i];
             let is_selected = matches!(editor.selection, PostCmdSelection::Rect(j) if j == i);
             let is_editing = editing_idx == Some(i);
             let is_focused = is_selected || is_editing;
-            let border_color = match status {
+            let base_border_color = match status {
                 PostCmdRectStatus::Unchanged => colors::WHITE,
                 PostCmdRectStatus::Editing => colors::WARNING,
                 PostCmdRectStatus::Modified => colors::ACCENT,
                 PostCmdRectStatus::MarkedForDeletion => colors::ERROR,
                 PostCmdRectStatus::Saved => colors::SUCCESS,
             };
+            let (border_color, animating) = editor
+                .swap_highlight_start(i)
+                .map(|start| (start, self.tick.saturating_sub(start)))
+                .filter(|(_, elapsed)| *elapsed < SWAP_ANIM_TICKS)
+                .map(|(_, elapsed)| {
+                    let progress = elapsed as f32 / SWAP_ANIM_TICKS as f32;
+                    let eased = ease_out_cubic(progress);
+                    (lerp_rgb(colors::TEAL, base_border_color, eased), true)
+                })
+                .unwrap_or((base_border_color, false));
             let show_selection_marker = is_selected && !is_editing;
             let content_style = if is_focused {
                 Style::default()
@@ -1586,7 +2291,13 @@ impl SettingsScreen {
             } else {
                 Style::default()
             };
-            let border_style = Style::default().fg(border_color);
+            let border_style = if animating {
+                Style::default()
+                    .fg(border_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(border_color)
+            };
             let mut inner_line = if is_editing {
                 self.post_cmd_input
                     .as_ref()
@@ -1614,8 +2325,18 @@ impl SettingsScreen {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
                 .border_style(border_style)
-                .padding(Padding::horizontal(1));
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(format!(" postCreateCmd[{}] ", i), info_style));
             frame.render_widget(Paragraph::new(inner_line).block(block), chunk);
+
+            let hint_line = Line::from(vec![
+                Span::styled("  ↳ ", muted_style),
+                Span::styled(
+                    "Shell command • $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",
+                    muted_style,
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(hint_line), hint_chunk);
         }
 
         if is_scrollable {
@@ -1638,9 +2359,9 @@ impl SettingsScreen {
         let hint = if editing_idx.is_some() {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else if is_scrollable {
-            "▲/▼ scroll commands • Enter to edit/Create/Save • Backspace toggles delete mark • ←→ between buttons • Esc to go back"
+            "▲/▼ scroll • Shift+K reorder up • Shift+J reorder down • Enter edit/Create/Save • Backspace toggles delete • ←→ between buttons • Esc back"
         } else {
-            "↑↓ to move • Enter to edit/Create/Save • Backspace toggles delete mark • ←→ between buttons • Esc to go back"
+            "↑↓ move • Shift+K reorder up • Shift+J reorder down • Enter edit/Create/Save • Backspace toggles delete • ←→ between buttons • Esc back"
         };
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[6]);
     }
@@ -1757,18 +2478,20 @@ impl SettingsScreen {
             .fg(colors::INFO)
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(1), // title
+                Constraint::Length(1), // description
+                Constraint::Length(3), // rectangle
+                Constraint::Length(1), // per-field hint
+                Constraint::Min(0),    // spacer
+                Constraint::Length(3), // save button
+                Constraint::Length(1), // saving-to
+                Constraint::Length(1), // footer hint
             ])
             .split(area);
         frame.render_widget(
@@ -1828,27 +2551,34 @@ impl SettingsScreen {
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
-            .padding(Padding::horizontal(1));
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(" terminalCommand ", info_style));
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
 
-        self.render_terminal_cmd_save_button(frame, chunks[4], editor);
+        let hint_line = Line::from(vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled(
+                "Shell command (e.g., 'code $WORKTREE_PATH') — leave empty to disable",
+                muted_style,
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
 
-        let target = self
-            .local_config_path
-            .clone()
-            .unwrap_or_else(|| ".wisetree.json (project local)".to_string());
+        self.render_terminal_cmd_save_button(frame, chunks[5], editor);
+
+        let target = self.config_path.clone();
         let saving_line = Line::from(vec![
             Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
             Span::styled(target, Style::default().fg(colors::EMPHASIS)),
         ]);
-        frame.render_widget(Paragraph::new(saving_line), chunks[5]);
+        frame.render_widget(Paragraph::new(saving_line), chunks[6]);
 
         let hint = if is_editing {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else {
             "↑↓ to move • Enter to edit/Save • Esc to go back"
         };
-        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[6]);
+        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
     }
 
     fn render_terminal_cmd_save_button(
@@ -1985,6 +2715,7 @@ Safety features:\n\
                 Style::default().fg(colors::SUCCESS),
             )));
         }
+        lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "Press any key to go back.",
             Style::default()
@@ -2018,5 +2749,16 @@ fn build_terminal_cmd_input(value: &str) -> InputPrompt {
 fn build_path_template_input(value: &str) -> InputPrompt {
     InputPrompt::new("")
         .with_placeholder("Type template (e.g. $BASE_PATH.worktree)")
+        .with_default(value.to_string())
+}
+
+fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
+    let placeholder = match field {
+        DashboardField::RefreshIntervalMs => "Refresh interval in ms (5000..60000)",
+        DashboardField::ShowPullRequests => "true or false",
+        DashboardField::Columns => "branch, status, ahead_behind, last_commit, pull_request",
+    };
+    InputPrompt::new("")
+        .with_placeholder(placeholder)
         .with_default(value.to_string())
 }

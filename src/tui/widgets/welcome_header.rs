@@ -25,11 +25,14 @@ impl<'a> WelcomeHeader<'a> {
         match self.screen {
             Screen::Menu => None,
             Screen::Create => Some("Create"),
-            Screen::List => Some("List"),
+            Screen::Dashboard => Some("Dashboard"),
             Screen::Delete => Some("Delete"),
             Screen::Cache => Some("Cache"),
+            Screen::MergePullRequest => Some("Merge Pull Request"),
+            Screen::UpdatePullRequest => Some("Update Pull Request"),
             Screen::Settings => Some("Settings"),
             Screen::Setup => Some("Setup"),
+            Screen::SetupProject => Some("Setup Project Config"),
         }
     }
 

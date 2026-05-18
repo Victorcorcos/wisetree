@@ -7,11 +7,14 @@ use crate::cli::AppMode;
 pub enum Screen {
     Menu,
     Create,
-    List,
+    Dashboard,
     Delete,
     Cache,
+    MergePullRequest,
+    UpdatePullRequest,
     Settings,
     Setup,
+    SetupProject,
 }
 
 impl Screen {
@@ -19,8 +22,7 @@ impl Screen {
         match mode {
             AppMode::Menu => Self::Menu,
             AppMode::Create => Self::Create,
-            AppMode::List => Self::List,
-            AppMode::Delete => Self::Delete,
+            AppMode::Dashboard => Self::Dashboard,
             AppMode::Cache => Self::Cache,
             AppMode::Settings => Self::Settings,
         }
@@ -30,11 +32,14 @@ impl Screen {
         match self {
             Self::Menu => "menu",
             Self::Create => "create",
-            Self::List => "list",
+            Self::Dashboard => "dashboard",
             Self::Delete => "delete",
             Self::Cache => "cache",
+            Self::MergePullRequest => "merge_pull_request",
+            Self::UpdatePullRequest => "update_pull_request",
             Self::Settings => "settings",
             Self::Setup => "setup",
+            Self::SetupProject => "setup_project",
         }
     }
 }

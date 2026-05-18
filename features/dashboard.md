@@ -15,7 +15,7 @@ A new menu entry **`Dashboard`** sits between `MENU_LIST` and `MENU_DELETE` in `
 - New `DashboardService` (in `src/services/`) that owns the polling loop and exposes a `WatchHandle` of `Vec<DashboardRow>`.
 - Per-row enrichments: `git status --porcelain=v2 --branch` for dirty/ahead/behind, `git log -1 --format=...` for last commit summary, optional `gh pr list --json` for PR state (gated behind a config flag and a `gh` binary check).
 - Menu/router wiring, CLI flag (`wisetree dashboard` and `--mode dashboard`).
-- Config additions for refresh interval, optional PR enrichment, agent-detection rules.
+- Config additions for refresh interval and optional PR enrichment.
 - Tests: state-machine tests in `tests/tui_dashboard.rs`, service tests in `tests/dashboard_service.rs`, render snapshots, refresh debouncing.
 
 **Out of scope (explicitly defer)**
@@ -53,19 +53,13 @@ pub struct DashboardConfig {
 
     /// Columns to display, in order. Unknown values are dropped at load
     /// with a warning surfaced in the footer. Default:
-    /// ["branch", "status", "ahead_behind", "last_commit", "agent"].
+    /// ["branch", "status", "ahead_behind", "last_commit"].
     #[serde(rename = "columns", default = "default_columns")]
     pub columns: Vec<String>,
-
-    /// Heuristic rules for the "agent" column. Each entry is `{ name, file }`
-    /// — when `file` exists inside the worktree, the dashboard tags the row
-    /// with `name`. Default ships with Claude Code, Codex, Aider, Cursor.
-    #[serde(rename = "agentDetectors", default = "default_agent_detectors")]
-    pub agent_detectors: Vec<AgentDetector>,
 }
 ```
 
-Add `AgentDetector { name: String, file: String }` with the same derives. Provide `default_*` functions matching `default_copy_patterns` style. Update `tests/config.rs` to cover serialization round-trips, `deny_unknown_fields` for the new shape, and clamp behavior on `refresh_interval_ms`.
+Provide `default_*` functions matching `default_copy_patterns` style. Update `tests/config.rs` to cover serialization round-trips, `deny_unknown_fields` for the new shape, and clamp behavior on `refresh_interval_ms`.
 
 The `Settings` screen (`src/tui/screens/settings.rs`) gains a new read-only "Dashboard" detail view in `SettingsStep` that lists the resolved values. Editing remains out of scope for v1 — users edit `.wisetree.json` directly.
 
@@ -80,7 +74,6 @@ pub struct DashboardRow {
     pub worktree: GitWorktree,                 // reused from src/git/types.rs
     pub last_commit: Option<CommitSummary>,    // sha7, summary, relative time, author
     pub pull_request: Option<PullRequest>,     // number, state, url, title
-    pub agent: Option<DetectedAgent>,          // matched name + which file matched
     pub error: Option<String>,                 // per-row enrichment error
 }
 
@@ -96,11 +89,6 @@ pub struct PullRequest {
     pub state: PrState, // Open, Merged, Closed, Draft
     pub url: String,
     pub title: String,
-}
-
-pub struct DetectedAgent {
-    pub name: String,
-    pub matched_file: PathBuf,
 }
 ```
 
@@ -131,7 +119,6 @@ pub struct DashboardWatch {
 - Reuse `GitService::list_worktrees` for the base list. Per-worktree enrichments run in a `JoinSet` so a slow worktree never blocks the rest. Each enrichment has a 1-second per-call timeout via `tokio::time::timeout`.
 - `git status --porcelain=v2 --branch` gives both dirty status and ahead/behind in one call — use it instead of two round-trips.
 - `gh` enrichment runs only if `show_pull_requests = true` *and* `which gh` succeeds at service construction. Cache the binary's availability; don't probe per tick.
-- Agent detection is filesystem-only: `tokio::fs::metadata(worktree.path.join(detector.file)).await.is_ok()`. No process scanning — that's brittle and platform-specific.
 - Coalesce rapid ticks: if a tick is still running when the next interval fires, skip the next one. This prevents a slow `gh` call from queueing work indefinitely.
 
 ---
@@ -213,7 +200,6 @@ Add the following test files. Keep parity with the style of `tests/tui_list.rs` 
   - Color: a dirty row uses the WARNING palette token (assert via `Buffer::cell` style).
 - `tests/dashboard_service.rs`
   - `snapshot()` returns one row per worktree from a fixture repo (use `tempfile::tempdir` + `git init` + a couple of `git worktree add` calls — see `tests/git_write.rs` for the existing fixture pattern).
-  - Agent detection: dropping `.claude/` into a worktree tags it with `Claude Code`.
   - `gh` is called only when `show_pull_requests = true`. Mock it by injecting an executable path or a closure (define a small trait for the PR fetcher to keep the test hermetic).
   - Slow enrichment: a deliberately blocking command times out at 1s and the row gets an `error` rather than hanging the snapshot.
   - Coalescing: with `refresh_interval_ms = 50` and a 200ms tick body, no more than one enrichment run is in flight at any time.
@@ -234,7 +220,7 @@ Run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo t
 
 ## 8. Acceptance criteria
 
-1. Running `wisetree dashboard` in any git repo with ≥1 worktree opens a TUI screen that renders all worktrees with branch, dirty status, ahead/behind, last commit summary, agent tag (if any), and (when enabled) PR state.
+1. Running `wisetree dashboard` in any git repo with ≥1 worktree opens a TUI screen that renders all worktrees with branch, dirty status, ahead/behind, last commit summary, and (when enabled) PR state.
 2. The screen self-refreshes at the configured cadence without user input. Pressing `r` triggers an immediate refresh; `Esc` returns to the menu.
 3. With `gh` missing or `showPullRequests: false`, the PR column is hidden and no `gh` invocations occur.
 4. The CLI surfaces `wisetree dashboard`, `wisetree dashboard --json`, and `wisetree dashboard --watch`.

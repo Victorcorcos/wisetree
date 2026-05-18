@@ -2,6 +2,7 @@
 *.pem
 
 .claude/
+.aider/
 *.tsbuildinfo
 
 /target
@@ -11,3 +12,7 @@ Cargo.lock.bak
 # Generated artifacts
 .idea/
 .vscode/
+
+# AI related
+local/
+.wisetree.json

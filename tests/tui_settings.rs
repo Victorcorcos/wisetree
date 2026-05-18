@@ -127,12 +127,31 @@ fn ready_with_commands(commands: &[&str]) -> SettingsScreen {
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
-const PATH_TEMPLATE_INDEX: usize = 5;
-const POST_CMD_INDEX: usize = 6;
-const TERMINAL_CMD_INDEX: usize = 7;
-const DELETE_BRANCH_INDEX: usize = 8;
-const COPY_SETTINGS_INDEX: usize = 9;
-const CHECK_UPDATES_INDEX: usize = 10;
+fn ready_with_patterns(copy_patterns: &[&str], ignore_patterns: &[&str]) -> SettingsScreen {
+    let cfg = WorktreeConfig {
+        worktree_copy_patterns: copy_patterns
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+        worktree_copy_ignores: ignore_patterns
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+        post_create_cmd: vec!["bun install".into()],
+        terminal_command: "code $WORKTREE_PATH".into(),
+        delete_branch_with_worktree: true,
+        ..Default::default()
+    };
+    SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
+}
+
+const IGNORE_PATTERNS_INDEX: usize = 4;
+const POST_CMD_INDEX: usize = 5;
+const TERMINAL_CMD_INDEX: usize = 6;
+const PATH_TEMPLATE_INDEX: usize = 7;
+const COPY_SETTINGS_INDEX: usize = 8;
+const DELETE_BRANCH_INDEX: usize = 10;
+const CHECK_UPDATES_INDEX: usize = 11;
 
 #[test]
 fn menu_renders_with_config_path() {
@@ -144,6 +163,9 @@ fn menu_renders_with_config_path() {
     assert!(dumped.contains("Copy Patterns"));
     assert!(dumped.contains("Link Patterns"));
     assert!(dumped.contains("Link Strategy"));
+    assert!(dumped.contains("Copy Settings"));
+    assert!(dumped.contains("Check for Updates"));
+    assert!(dumped.contains("Dashboard"));
 }
 
 #[test]
@@ -164,6 +186,104 @@ fn selecting_copy_patterns_shows_detail_view() {
 }
 
 #[test]
+fn copy_patterns_view_grows_to_show_every_pattern() {
+    let mut s = ready_with_patterns(
+        &[
+            ".env",
+            "**/.env*",
+            "**/config.yml",
+            "**/config/application.yml",
+            "**/config/credentials.yml.enc",
+            "**/config/credentials/*.key",
+            "**/config/secrets.yml",
+            "**/config/master.key",
+            "android/local.properties",
+            "docker/pms-env.conf",
+            "docker/.env-backuper",
+            ".vscode/**",
+        ],
+        &["**/node_modules/**"],
+    );
+
+    s.handle_key(key(KeyCode::Enter));
+
+    let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
+    assert!(dumped.contains("docker/.env-backuper"));
+    assert!(dumped.contains(".vscode/**"));
+}
+
+#[test]
+fn copy_patterns_footer_renders_after_blank_line() {
+    let mut s = ready_with_patterns(&["docker/.env-backuper"], &["**/node_modules/**"]);
+
+    s.handle_key(key(KeyCode::Enter));
+
+    let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
+    let (_, item_y) = find_text_start(&buffer, "docker/.env-backuper").unwrap();
+    let (_, edit_y) = find_text_start(&buffer, "Edit in /tmp/.wisetree.json (local).").unwrap();
+    let (_, hint_y) = find_text_start(
+        &buffer,
+        "Press Enter to copy the path, any other key to go back.",
+    )
+    .unwrap();
+
+    assert_eq!(edit_y, item_y + 2);
+    assert_eq!(hint_y, item_y + 3);
+}
+
+#[test]
+fn ignore_patterns_view_grows_to_show_every_pattern() {
+    let mut s = ready_with_patterns(
+        &[".env*"],
+        &[
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/.git/**",
+            "**/Thumbs.db",
+            "**/.DS_Store",
+            "coverage/**",
+            "tmp/**",
+            ".idea/**",
+            ".cache/**",
+            "vendor/bundle/**",
+            "log/**",
+            "storage/**",
+        ],
+    );
+
+    for _ in 0..IGNORE_PATTERNS_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+
+    let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
+    assert!(dumped.contains("vendor/bundle/**"));
+    assert!(dumped.contains("storage/**"));
+}
+
+#[test]
+fn ignore_patterns_footer_renders_after_blank_line() {
+    let mut s = ready_with_patterns(&[".env*"], &["storage/**"]);
+
+    for _ in 0..IGNORE_PATTERNS_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+
+    let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
+    let (_, item_y) = find_text_start(&buffer, "storage/**").unwrap();
+    let (_, edit_y) = find_text_start(&buffer, "Edit in /tmp/.wisetree.json (local).").unwrap();
+    let (_, hint_y) = find_text_start(
+        &buffer,
+        "Press Enter to copy the path, any other key to go back.",
+    )
+    .unwrap();
+
+    assert_eq!(edit_y, item_y + 2);
+    assert_eq!(hint_y, item_y + 3);
+}
+
+#[test]
 fn any_key_in_detail_returns_to_menu() {
     let mut s = ready();
     s.handle_key(key(KeyCode::Enter));
@@ -171,6 +291,29 @@ fn any_key_in_detail_returns_to_menu() {
     let action = s.handle_key(key(KeyCode::Char('x')));
     assert_eq!(action, SettingsAction::Continue);
     assert_eq!(s.step(), SettingsStep::Menu);
+}
+
+#[test]
+fn enter_on_copy_patterns_emits_copy_settings_file_path_action() {
+    let mut s = ready();
+    s.handle_key(key(KeyCode::Enter));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::CopySettingsFilePath);
+    assert_eq!(s.step(), SettingsStep::CopyPatterns);
+}
+
+#[test]
+fn enter_on_ignore_patterns_emits_copy_settings_file_path_action() {
+    let mut s = ready();
+    for _ in 0..IGNORE_PATTERNS_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::CopySettingsFilePath);
+    assert_eq!(s.step(), SettingsStep::IgnorePatterns);
 }
 
 #[test]
@@ -326,7 +469,7 @@ fn check_updates_up_to_date_message() {
 #[test]
 fn check_updates_error_shows_failure_message() {
     let mut s = ready();
-    for _ in 0..7 {
+    for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -405,12 +548,12 @@ fn post_cmd_selection_marker_disappears_while_editing() {
     s.handle_key(key(KeyCode::Up));
 
     let selected = dump(80, 14, |f| s.render(f, f.area()));
-    assert!(selected.contains("✎𓂃"));
+    assert!(selected.contains("✎﹏"));
 
     s.handle_key(key(KeyCode::Enter));
 
     let editing = dump(80, 14, |f| s.render(f, f.area()));
-    assert!(!editing.contains("✎𓂃"));
+    assert!(!editing.contains("✎﹏"));
 }
 
 #[test]
@@ -427,7 +570,7 @@ fn post_cmd_overflow_keeps_button_labels_visible() {
     assert!(dumped.contains("Create"));
     assert!(dumped.contains("Save"));
     assert!(dumped.contains("▲/▼ to scroll"));
-    assert!(dumped.contains("▼ 1 below"));
+    assert!(dumped.contains("▼ 2 below"));
 }
 
 #[test]
@@ -446,7 +589,7 @@ fn post_cmd_overflow_keeps_last_selected_rectangle_in_view() {
     let dumped = dump(80, 18, |f| s.render(f, f.area()));
     assert!(dumped.contains("mkdir eu_abri4"));
     assert!(dumped.contains("Create"));
-    assert!(dumped.contains("▲ 1 above"));
+    assert!(dumped.contains("▲ 2 above"));
     assert!(dumped.contains("▼ bottom"));
 }
 
@@ -709,6 +852,126 @@ fn post_cmd_backspace_toggles_delete_mark() {
     s.handle_key(key(KeyCode::Backspace));
     let editor = s.post_cmd_editor().unwrap();
     assert_eq!(editor.statuses, vec![PostCmdRectStatus::MarkedForDeletion]);
+}
+
+#[test]
+fn post_cmd_shift_k_swaps_selected_with_above() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    // Navigate to Rect(2)
+    s.handle_key(key(KeyCode::Up)); // Rect(2)
+    s.handle_key(key(KeyCode::Up)); // Rect(1)
+    s.handle_key(key(KeyCode::Up)); // Rect(0)
+    s.handle_key(key(KeyCode::Down)); // Rect(1)
+    s.handle_key(key(KeyCode::Down)); // Rect(2)
+
+    s.handle_key(key(KeyCode::Char('K')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["A", "C", "B"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(1));
+    assert_eq!(editor.statuses[1], PostCmdRectStatus::Modified);
+    assert_eq!(editor.statuses[2], PostCmdRectStatus::Modified);
+}
+
+#[test]
+fn post_cmd_shift_j_swaps_selected_with_below() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    // Navigate to Rect(0)
+    s.handle_key(key(KeyCode::Up)); // Rect(2)
+    s.handle_key(key(KeyCode::Up)); // Rect(1)
+    s.handle_key(key(KeyCode::Up)); // Rect(0)
+
+    s.handle_key(key(KeyCode::Char('J')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["B", "A", "C"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(1));
+    assert_eq!(editor.statuses[1], PostCmdRectStatus::Modified);
+    assert_eq!(editor.statuses[0], PostCmdRectStatus::Modified);
+}
+
+#[test]
+fn post_cmd_shift_k_on_first_rect_is_noop() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    s.handle_key(key(KeyCode::Up)); // Rect(2)
+    s.handle_key(key(KeyCode::Up)); // Rect(1)
+    s.handle_key(key(KeyCode::Up)); // Rect(0)
+
+    s.handle_key(key(KeyCode::Char('K')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["A", "B", "C"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(0));
+}
+
+#[test]
+fn post_cmd_shift_j_on_last_rect_is_noop() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    s.handle_key(key(KeyCode::Up)); // Rect(2)
+
+    s.handle_key(key(KeyCode::Char('J')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["A", "B", "C"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(2));
+}
+
+#[test]
+fn post_cmd_shift_k_on_create_selection_is_noop() {
+    let mut s = ready_with_commands(&["A", "B", "C"]);
+    enter_post_cmd(&mut s);
+    assert_eq!(
+        s.post_cmd_editor().unwrap().selection,
+        PostCmdSelection::Create
+    );
+
+    s.handle_key(key(KeyCode::Char('K')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["A", "B", "C"]);
+    assert_eq!(editor.selection, PostCmdSelection::Create);
+}
+
+#[test]
+fn post_cmd_shift_swap_preserves_marked_for_deletion_status() {
+    let mut s = ready_with_commands(&["A", "B"]);
+    enter_post_cmd(&mut s);
+    // Navigate to Rect(0) and mark for deletion
+    s.handle_key(key(KeyCode::Up)); // Rect(1)
+    s.handle_key(key(KeyCode::Up)); // Rect(0)
+    s.handle_key(key(KeyCode::Backspace)); // mark Rect(0) as MarkedForDeletion
+
+    s.handle_key(key(KeyCode::Char('J')));
+
+    let editor = s.post_cmd_editor().unwrap();
+    assert_eq!(editor.commands, vec!["B", "A"]);
+    assert_eq!(editor.selection, PostCmdSelection::Rect(1));
+    assert_eq!(editor.statuses[1], PostCmdRectStatus::MarkedForDeletion);
+    assert_eq!(editor.statuses[0], PostCmdRectStatus::Modified);
+}
+
+#[test]
+fn post_cmd_hint_contains_shift_k_j_reorder() {
+    let mut s = ready_with_commands(&["A", "B"]);
+    enter_post_cmd(&mut s);
+
+    let dumped = dump(160, 16, |f| s.render(f, f.area()));
+    assert!(
+        dumped.contains("Shift+K"),
+        "hint should mention Shift+K: {dumped}"
+    );
+    assert!(
+        dumped.contains("Shift+J"),
+        "hint should mention Shift+J: {dumped}"
+    );
+    assert!(
+        dumped.contains("reorder"),
+        "hint should mention reorder: {dumped}"
+    );
 }
 
 fn enter_terminal_cmd(s: &mut SettingsScreen) {

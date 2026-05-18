@@ -4,6 +4,7 @@
 //! drawn directly from the caller's state.
 
 pub mod border;
+pub mod bulk_confirm_dialog;
 pub mod command_list_progress;
 pub mod command_progress;
 pub mod confirm_dialog;
@@ -11,10 +12,14 @@ pub mod input_prompt;
 pub mod select_prompt;
 pub mod spinner;
 pub mod status_indicator;
+pub mod toast;
 pub mod update_banner;
 pub mod welcome_header;
 
 pub use border::BorderState;
+pub use bulk_confirm_dialog::{
+    BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome,
+};
 pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
 pub use confirm_dialog::{ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant};
@@ -25,5 +30,6 @@ pub use select_prompt::{
 };
 pub use spinner::{spinner_frame, Spinner, SPINNER_FRAMES};
 pub use status_indicator::{Status, StatusIndicator};
+pub use toast::{render_toast, ToastSnapshot, ToastState, ToastVariant};
 pub use update_banner::UpdateBanner;
 pub use welcome_header::WelcomeHeader;

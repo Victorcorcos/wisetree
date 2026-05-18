@@ -127,12 +127,24 @@ fn create_unknown_source_branch_errors() {
 }
 
 #[test]
-fn list_json_outputs_array() {
+fn dashboard_json_outputs_array_with_expected_length() {
     let fx = repo_with_commit();
     let home = isolated_home();
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat-dashboard",
+            "../repo-dashboard",
+            "main",
+        ],
+    );
+
     let output = Command::cargo_bin("wisetree")
         .unwrap()
-        .args(["list", "--json"])
+        .args(["dashboard", "--json"])
         .current_dir(&fx.repo)
         .env("HOME", home.path())
         .assert()
@@ -140,46 +152,10 @@ fn list_json_outputs_array() {
         .get_output()
         .stdout
         .clone();
+
     let parsed: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
-    assert!(parsed.is_array(), "expected JSON array, got {parsed:?}");
-}
-
-#[test]
-fn delete_missing_args_errors() {
-    let fx = repo_with_commit();
-    let home = isolated_home();
-    Command::cargo_bin("wisetree")
-        .unwrap()
-        .args(["delete", "-f"])
-        .current_dir(&fx.repo)
-        .env("HOME", home.path())
-        .assert()
-        .failure()
-        .stderr(contains(
-            "Missing required argument: --path (-p) or --name (-n)",
-        ));
-}
-
-#[test]
-fn create_then_delete_round_trip() {
-    let fx = repo_with_commit();
-    let home = isolated_home();
-    Command::cargo_bin("wisetree")
-        .unwrap()
-        .args(["create", "-n", "feat-rt", "-s", "main"])
-        .current_dir(&fx.repo)
-        .env("HOME", home.path())
-        .assert()
-        .success();
-
-    Command::cargo_bin("wisetree")
-        .unwrap()
-        .args(["delete", "-n", "feat-rt"])
-        .current_dir(&fx.repo)
-        .env("HOME", home.path())
-        .assert()
-        .success()
-        .stdout(contains("Worktree deleted:"));
+    let rows = parsed.as_array().expect("dashboard array");
+    assert_eq!(rows.len(), 2);
 }
 
 #[test]

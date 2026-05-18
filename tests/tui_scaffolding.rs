@@ -13,8 +13,8 @@ use wisetree::tui::screens::{error as error_screen, loading as loading_screen};
 fn screen_from_mode_maps_every_variant() {
     assert_eq!(Screen::from_mode(AppMode::Menu), Screen::Menu);
     assert_eq!(Screen::from_mode(AppMode::Create), Screen::Create);
-    assert_eq!(Screen::from_mode(AppMode::List), Screen::List);
-    assert_eq!(Screen::from_mode(AppMode::Delete), Screen::Delete);
+    assert_eq!(Screen::from_mode(AppMode::Dashboard), Screen::Dashboard);
+    assert_eq!(Screen::from_mode(AppMode::Cache), Screen::Cache);
     assert_eq!(Screen::from_mode(AppMode::Settings), Screen::Settings);
 }
 
@@ -23,8 +23,8 @@ fn screen_as_str_round_trip_for_known_modes() {
     for s in [
         Screen::Menu,
         Screen::Create,
-        Screen::List,
-        Screen::Delete,
+        Screen::Dashboard,
+        Screen::Cache,
         Screen::Settings,
     ] {
         let parsed = AppMode::parse(s.as_str()).expect("valid mode");
@@ -33,6 +33,9 @@ fn screen_as_str_round_trip_for_known_modes() {
     // Setup is reachable only via the menu, so AppMode has no entry.
     assert_eq!(Screen::Setup.as_str(), "setup");
     assert!(AppMode::parse("setup").is_none());
+    // Delete is now internal-only (dashboard), so AppMode has no entry.
+    assert_eq!(Screen::Delete.as_str(), "delete");
+    assert!(AppMode::parse("delete").is_none());
 }
 
 #[test]
@@ -107,7 +110,7 @@ fn menu_placeholder_renders_welcome_and_prompt() {
     let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|f| MenuScreen::new(0, None, None, false).render(f, f.area()))
+        .draw(|f| MenuScreen::new(0, None, None, true, true).render(f, f.area()))
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
     let dump = buffer

@@ -24,7 +24,9 @@ use crate::tui::widgets::{
     ConfirmVariant, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status,
     StatusIndicator,
 };
-use crate::utils::validation::{validate_branch_name, validate_directory_name};
+use crate::utils::validation::{
+    normalize_branch_name, validate_branch_name, validate_directory_name,
+};
 
 const CUSTOM_REF_VALUE: &str = "__CUSTOM_REF__";
 
@@ -278,14 +280,17 @@ impl CreateScreen {
     }
 
     fn validate_new_branch(branches: Arc<Vec<GitBranch>>, name: &str) -> Option<String> {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
+        let normalized = normalize_branch_name(name);
+        if normalized.is_empty() {
             return None;
         }
-        if let Some(e) = validate_branch_name(trimmed) {
+        if let Some(e) = validate_branch_name(&normalized) {
             return Some(e.to_string());
         }
-        if branches.iter().any(|b| b.name == trimmed && !b.is_remote) {
+        if branches
+            .iter()
+            .any(|b| b.name == normalized && !b.is_remote)
+        {
             return Some("Branch already exists".to_string());
         }
         None
@@ -331,7 +336,9 @@ impl CreateScreen {
 
     fn build_source_select(&self) -> SelectPrompt<String> {
         let opts = self.branch_options();
-        SelectPrompt::new(CREATE_SOURCE_BRANCH_PROMPT, opts).searchable()
+        SelectPrompt::new(CREATE_SOURCE_BRANCH_PROMPT, opts)
+            .searchable()
+            .with_footer_spacer()
     }
 
     fn handle_source_branch(&mut self, key: KeyEvent) -> CreateAction {
@@ -390,8 +397,8 @@ impl CreateScreen {
         let prompt = self.new_branch_input.as_mut().expect("set above");
         match prompt.handle_key(key) {
             InputOutcome::Submitted(value) => {
-                let trimmed = value.trim().to_string();
-                if trimmed.is_empty() {
+                let normalized = normalize_branch_name(&value);
+                if normalized.is_empty() {
                     let derived = self
                         .branches
                         .iter()
@@ -403,9 +410,9 @@ impl CreateScreen {
                                 .unwrap_or_else(|| b.name.clone())
                         })
                         .unwrap_or_else(|| self.source_branch.clone());
-                    self.new_branch = derived;
+                    self.new_branch = normalize_branch_name(&derived);
                 } else {
-                    self.new_branch = trimmed;
+                    self.new_branch = normalized;
                 }
                 self.new_branch_input = None;
                 self.confirm_dialog = Some(self.build_confirm());
@@ -490,8 +497,9 @@ impl CreateScreen {
             return 4;
         }
         match self.step {
-            CreateStep::Directory | CreateStep::CustomRef | CreateStep::NewBranch => 6,
-            CreateStep::SourceBranch => 14,
+            CreateStep::Directory => 7,
+            CreateStep::CustomRef | CreateStep::NewBranch => 6,
+            CreateStep::SourceBranch => (6 + (self.branches.len() + 1).max(1) as u16).min(15),
             CreateStep::Confirm | CreateStep::NavigateConfirm => 10,
             CreateStep::Creating => 3,
             CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
@@ -632,6 +640,7 @@ fn prioritize_branches(branches: Vec<GitBranch>) -> Vec<GitBranch> {
 fn directory_input() -> InputPrompt {
     InputPrompt::new(CREATE_DIRECTORY_PROMPT)
         .with_placeholder(CREATE_DIRECTORY_PLACEHOLDER)
+        .with_footer_spacer()
         .with_validator(|v| validate_directory_name(v).map(|e| e.to_string()))
 }
 

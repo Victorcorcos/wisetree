@@ -298,12 +298,12 @@ fn generate_bash_completions(command_name: &str) -> String {
     format!(
         "_wisetree_completions() {{\n\
          \x20\x20local cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n\
-         \x20\x20local commands=\"create list delete settings\"\n\
+         \x20\x20local commands=\"create dashboard settings\"\n\
          \x20\x20local flags=\"--help --version --mode --from-wrapper\"\n\
          \x20\x20if [[ ${{COMP_CWORD}} -eq 1 ]]; then\n\
          \x20\x20\x20\x20COMPREPLY=($(compgen -W \"${{commands}} ${{flags}}\" -- \"${{cur}}\"))\n\
          \x20\x20elif [[ \"${{COMP_WORDS[1]}}\" == \"--mode\" || \"${{COMP_WORDS[1]}}\" == \"-m\" ]]; then\n\
-         \x20\x20\x20\x20COMPREPLY=($(compgen -W \"menu create list delete settings\" -- \"${{cur}}\"))\n\
+         \x20\x20\x20\x20COMPREPLY=($(compgen -W \"menu create dashboard settings\" -- \"${{cur}}\"))\n\
          \x20\x20fi\n\
          }}\n\
          complete -F _wisetree_completions {command_name}"
@@ -316,14 +316,13 @@ fn generate_zsh_completions(command_name: &str) -> String {
          \x20\x20local -a commands\n\
          \x20\x20commands=(\n\
          \x20\x20\x20\x20'create:Create a new worktree'\n\
-         \x20\x20\x20\x20'list:List all worktrees'\n\
-         \x20\x20\x20\x20'delete:Delete a worktree'\n\
+         \x20\x20\x20\x20'dashboard:Live worktree dashboard'\n\
          \x20\x20\x20\x20'settings:Manage configuration'\n\
          \x20\x20)\n\
          \x20\x20_arguments -C \\\n\
          \x20\x20\x20\x20'(-h --help){{-h,--help}}[Show help]' \\\n\
          \x20\x20\x20\x20'(-v --version){{-v,--version}}[Show version]' \\\n\
-         \x20\x20\x20\x20'(-m --mode){{-m,--mode}}[Set mode]:mode:(menu create list delete settings)' \\\n\
+         \x20\x20\x20\x20'(-m --mode){{-m,--mode}}[Set mode]:mode:(menu create dashboard settings)' \\\n\
          \x20\x20\x20\x20'--from-wrapper[Called from shell wrapper]' \\\n\
          \x20\x20\x20\x20'1:command:->command'\n\
          \x20\x20case \"$state\" in\n\

@@ -1,7 +1,7 @@
 //! Vertical list selector. Mirrors upstream `SelectPrompt` including the
-//! optional searchable mode, j/k aliases, numeric 1-9 jumps, the
-//! 10-row visible window with `↑ N more above` / `↓ N more below` indicators,
-//! and the empty-state message when filters eliminate every option.
+//! optional searchable mode, j/k aliases, numeric 1-9 jumps, a viewport-sized
+//! visible window with `↑ N more above` / `↓ N more below` indicators, and
+//! the empty-state message when filters eliminate every option.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -12,16 +12,23 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 
-const MAX_VISIBLE: usize = 10;
 pub const SELECT_CURSOR: &str = "➤ ";
 const BOXED_SELECT_CURSOR: &str = " ➤ ";
 const BOXED_BLANK_CURSOR: &str = "   ";
+
+struct SelectViewport {
+    start: usize,
+    end: usize,
+    show_above_overflow: bool,
+    show_below_overflow: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct SelectOption<T> {
     pub label: String,
     pub value: T,
     pub description: Option<String>,
+    pub description_color: Option<Color>,
     pub disabled: bool,
     pub color: Option<Color>,
 }
@@ -32,6 +39,7 @@ impl<T> SelectOption<T> {
             label: label.into(),
             value,
             description: None,
+            description_color: None,
             disabled: false,
             color: None,
         }
@@ -39,6 +47,11 @@ impl<T> SelectOption<T> {
 
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    pub fn with_description_color(mut self, color: Color) -> Self {
+        self.description_color = Some(color);
         self
     }
 
@@ -78,6 +91,7 @@ pub struct SelectPrompt<T: Clone> {
     pub searchable: bool,
     pub style: SelectStyle,
     pub show_hint: bool,
+    pub footer_spacer: bool,
 }
 
 impl<T: Clone> SelectPrompt<T> {
@@ -90,6 +104,7 @@ impl<T: Clone> SelectPrompt<T> {
             searchable: false,
             style: SelectStyle::Plain,
             show_hint: true,
+            footer_spacer: false,
         }
     }
 
@@ -115,15 +130,31 @@ impl<T: Clone> SelectPrompt<T> {
         self
     }
 
+    pub fn with_footer_spacer(mut self) -> Self {
+        self.footer_spacer = true;
+        self
+    }
+
     fn filtered_indices(&self) -> Vec<usize> {
         if !self.searchable || self.query.is_empty() {
             return (0..self.options.len()).collect();
         }
         let q = self.query.to_lowercase();
+        let number_idx: Option<usize> = q.trim().parse::<usize>().ok().and_then(|n| {
+            if n >= 1 && n <= self.options.len() {
+                Some(n - 1)
+            } else {
+                None
+            }
+        });
         self.options
             .iter()
             .enumerate()
-            .filter_map(|(i, o)| o.label.to_lowercase().contains(&q).then_some(i))
+            .filter_map(|(i, o)| {
+                let label_match = o.label.to_lowercase().contains(&q);
+                let number_match = number_idx == Some(i);
+                (label_match || number_match).then_some(i)
+            })
             .collect()
     }
 
@@ -220,22 +251,58 @@ impl<T: Clone> SelectPrompt<T> {
         SelectOutcome::Pending
     }
 
-    fn visible_window(&self, total: usize) -> (usize, usize) {
-        if total <= MAX_VISIBLE {
+    fn visible_window(&self, total: usize, max_visible: usize) -> (usize, usize) {
+        if total <= max_visible {
             return (0, total);
         }
-        let half = MAX_VISIBLE / 2;
+        let half = max_visible / 2;
         let mut start = self.selected.saturating_sub(half);
-        let mut end = self.selected + half + (MAX_VISIBLE % 2);
+        let mut end = self.selected + half + (max_visible % 2);
         if end > total {
             end = total;
-            start = total - MAX_VISIBLE;
+            start = total - max_visible;
         }
         if start > total {
             start = 0;
         }
         end = end.min(total);
         (start, end)
+    }
+
+    fn viewport(&self, total: usize, height: u16) -> SelectViewport {
+        let static_rows =
+            2usize + if self.searchable { 2 } else { 0 } + if self.show_hint { 1 } else { 0 };
+        let available_slots = usize::from(height).saturating_sub(static_rows).max(1);
+
+        if total <= available_slots {
+            return SelectViewport {
+                start: 0,
+                end: total,
+                show_above_overflow: false,
+                show_below_overflow: false,
+            };
+        }
+
+        let mut overflow_rows = 1usize;
+        loop {
+            let visible_rows = available_slots.saturating_sub(overflow_rows).max(1);
+            let (start, end) = self.visible_window(total, visible_rows);
+            let show_above_overflow = start > 0;
+            let show_below_overflow = end < total;
+            let needed_overflow_rows =
+                usize::from(show_above_overflow) + usize::from(show_below_overflow);
+
+            if needed_overflow_rows == overflow_rows {
+                return SelectViewport {
+                    start,
+                    end,
+                    show_above_overflow,
+                    show_below_overflow,
+                };
+            }
+
+            overflow_rows = needed_overflow_rows;
+        }
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -274,9 +341,11 @@ impl<T: Clone> SelectPrompt<T> {
     fn render_themed_body(&self, frame: &mut Frame, area: Rect, inset: bool) {
         let panel_style = Style::default().bg(colors::MENU_BG);
         let filtered = self.filtered_indices();
-        let (start, end) = self.visible_window(filtered.len());
-        let has_more_above = start > 0;
-        let has_more_below = end < filtered.len();
+        let viewport = self.viewport(filtered.len(), area.height);
+        let start = viewport.start;
+        let end = viewport.end;
+        let has_more_above = viewport.show_above_overflow;
+        let has_more_below = viewport.show_below_overflow;
 
         let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
         if self.searchable {
@@ -294,6 +363,9 @@ impl<T: Clone> SelectPrompt<T> {
             }
         }
         if has_more_below {
+            constraints.push(Constraint::Length(1));
+        }
+        if self.show_hint && self.footer_spacer {
             constraints.push(Constraint::Length(1));
         }
         if self.show_hint {
@@ -417,12 +489,13 @@ impl<T: Clone> SelectPrompt<T> {
                     spans.push(Span::styled(option.label.clone(), row_style));
                 }
                 if let Some(desc) = &option.description {
+                    let desc_fg = option.description_color.unwrap_or(colors::MUTED);
                     spans.push(Span::styled(
                         format!(" ({desc})"),
                         Style::default()
-                            .fg(colors::MUTED)
+                            .fg(desc_fg)
                             .bg(row_bg)
-                            .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                            .add_modifier(Modifier::ITALIC),
                     ));
                 }
 
@@ -443,6 +516,9 @@ impl<T: Clone> SelectPrompt<T> {
         }
 
         if self.show_hint {
+            if self.footer_spacer {
+                idx += 1;
+            }
             let hint = if self.searchable {
                 "Use ↑↓ arrows to navigate, Enter to select, Esc to clear search/cancel"
             } else {

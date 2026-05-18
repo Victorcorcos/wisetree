@@ -17,6 +17,20 @@ pub const APP_STATE_FILE_NAME: &str = "state.json";
 /// Subdirectory under `~/.wisetree/` that stores per-repository shared caches.
 pub const CACHE_DIR_NAME: &str = "cache";
 
+/// Filename of the dashboard pull-request cache.
+pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
+
+/// Commit message written when the "Update Pull Request" flow committed
+/// the result of an AI-assisted conflict resolution. Kept as a constant
+/// so downstream tooling (release notes, blame heuristics) can recognise
+/// the synthetic commit.
+pub const UPDATE_MERGE_COMMIT_MESSAGE: &str = "Merging and solving conflicts";
+
+/// The Gemini model that resolves merge conflicts. Surfaced in both the
+/// CLI invocation and the UI toasts so user-facing copy stays in sync
+/// with what actually runs.
+pub const UPDATE_GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
+
 /// Resolve the global config directory (`~/.wisetree/`).
 ///
 /// Mirrors the upstream behaviour of synthesising the path from `$HOME`. We
@@ -46,4 +60,9 @@ pub fn app_state_file() -> PathBuf {
 /// Path to the cache root (`~/.wisetree/cache/`).
 pub fn global_cache_dir() -> PathBuf {
     global_config_dir().join(CACHE_DIR_NAME)
+}
+
+/// Path to the dashboard PR cache (`~/.wisetree/dashboard_pr_cache.json`).
+pub fn dashboard_pr_cache_file() -> PathBuf {
+    global_config_dir().join(DASHBOARD_PR_CACHE_FILE_NAME)
 }

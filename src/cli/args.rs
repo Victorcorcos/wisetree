@@ -14,8 +14,7 @@ use crate::messages::WELCOME;
 pub enum AppMode {
     Menu,
     Create,
-    List,
-    Delete,
+    Dashboard,
     Cache,
     Settings,
 }
@@ -25,8 +24,7 @@ impl AppMode {
         match self {
             Self::Menu => "menu",
             Self::Create => "create",
-            Self::List => "list",
-            Self::Delete => "delete",
+            Self::Dashboard => "dashboard",
             Self::Cache => "cache",
             Self::Settings => "settings",
         }
@@ -36,8 +34,7 @@ impl AppMode {
         match s {
             "menu" => Some(Self::Menu),
             "create" => Some(Self::Create),
-            "list" => Some(Self::List),
-            "delete" => Some(Self::Delete),
+            "dashboard" => Some(Self::Dashboard),
             "cache" => Some(Self::Cache),
             "settings" => Some(Self::Settings),
             _ => None,
@@ -66,26 +63,24 @@ impl CacheAction {
 }
 
 /// Subcommand selected for non-interactive CLI execution.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
     Create,
-    #[default]
-    List,
-    Delete,
+    Dashboard,
     Cache {
         action: CacheAction,
     },
 }
 
 /// Flags supplied alongside a non-interactive subcommand.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct CliArgs {
     pub command: CliCommand,
     pub name: Option<String>,
     pub source: Option<String>,
     pub branch: Option<String>,
-    pub path: Option<String>,
     pub json: bool,
+    pub watch: bool,
     pub force: bool,
 }
 
@@ -127,8 +122,8 @@ where
     let mut name: Option<String> = None;
     let mut source: Option<String> = None;
     let mut branch: Option<String> = None;
-    let mut path: Option<String> = None;
     let mut json = false;
+    let mut watch = false;
     let mut force = false;
     let mut positional: Vec<String> = Vec::new();
 
@@ -140,6 +135,7 @@ where
             "-v" | "--version" => version = true,
             "--from-wrapper" => from_wrapper = true,
             "--json" => json = true,
+            "-w" | "--watch" => watch = true,
             "-f" | "--force" => force = true,
             "-m" | "--mode" => {
                 mode_arg = Some(take_value(&raw, &mut i, token)?);
@@ -153,9 +149,6 @@ where
             "-b" | "--branch" => {
                 branch = Some(take_value(&raw, &mut i, token)?);
             }
-            "-p" | "--path" => {
-                path = Some(take_value(&raw, &mut i, token)?);
-            }
             t if t.starts_with("--mode=") => {
                 mode_arg = Some(t["--mode=".len()..].to_string());
             }
@@ -167,9 +160,6 @@ where
             }
             t if t.starts_with("--branch=") => {
                 branch = Some(t["--branch=".len()..].to_string());
-            }
-            t if t.starts_with("--path=") => {
-                path = Some(t["--path=".len()..].to_string());
             }
             t if t.starts_with("--") || (t.starts_with('-') && t.len() > 1) => {
                 return Err(ArgError::Unknown(t.to_string()));
@@ -217,28 +207,27 @@ where
     // Detect non-interactive CLI subcommand.
     let cli_command = match mode {
         AppMode::Create => Some(CliCommand::Create),
-        AppMode::List => Some(CliCommand::List),
-        AppMode::Delete => Some(CliCommand::Delete),
+        AppMode::Dashboard => Some(CliCommand::Dashboard),
         AppMode::Cache => cache_action.map(|action| CliCommand::Cache { action }),
         _ => None,
     };
     let has_cli_flags = name.is_some()
         || source.is_some()
         || branch.is_some()
-        || path.is_some()
-        || force
         || json
+        || watch
+        || force
         || cache_action.is_some();
 
     let cli_args = match mode {
-        AppMode::Create | AppMode::List | AppMode::Delete => match (cli_command, has_cli_flags) {
+        AppMode::Create | AppMode::Dashboard => match (cli_command, has_cli_flags) {
             (Some(cmd), true) => Some(CliArgs {
                 command: cmd,
                 name,
                 source,
                 branch,
-                path,
                 json,
+                watch,
                 force,
             }),
             _ => None,
@@ -248,8 +237,8 @@ where
             name,
             source,
             branch,
-            path,
             json,
+            watch,
             force,
         }),
         _ => None,
@@ -281,8 +270,7 @@ pub fn help_text() -> String {
 Usage:\n  wisetree [command] [options]\n\n\
 Commands:\n  \
 create     Create a new worktree\n  \
-list       List all worktrees\n  \
-delete     Delete a worktree\n  \
+dashboard  Live worktree dashboard\n  \
 cache      Inspect or clean the shared dependency cache\n  \
 settings   Manage configuration\n  \
 (no command) Start interactive menu\n\n\
@@ -292,12 +280,12 @@ Interactive Options:\n  \
 -m, --mode     Set initial mode\n  \
 --from-wrapper Called from shell wrapper (outputs path to stdout)\n\n\
 Non-Interactive Options:\n  \
--n, --name <name>      Worktree directory name (create, delete)\n  \
+-n, --name <name>      Worktree directory name (create)\n  \
 -s, --source <branch>  Source branch (create)\n  \
 -b, --branch <branch>  New branch name; defaults to source (create)\n  \
--p, --path <path>      Worktree path (delete)\n  \
--f, --force            Force delete even with uncommitted changes (delete), or skip prompt for cache clear\n  \
---json                 Output as JSON (list, cache list)\n\n\
+-f, --force            Skip confirmation for cache clear\n  \
+--json                 Output as JSON (dashboard)\n  \
+-w, --watch            Stream JSON Lines (dashboard)\n\n\
 Cache Subcommands:\n  \
 wisetree cache list    Show cache entries and users\n  \
 wisetree cache prune   Remove orphaned cache entries older than 14 days\n  \
@@ -306,17 +294,17 @@ wisetree cache path    Print the cache root path\n\n\
 Interactive Examples:\n  \
 wisetree                # Start interactive menu\n  \
 wisetree create         # Go directly to create worktree flow\n  \
-wisetree list           # List all worktrees interactively\n  \
+wisetree dashboard      # Open the live dashboard\n  \
 wisetree --from-wrapper # Used by shell wrapper to enable directory switching\n  \
-wisetree delete         # Go directly to delete worktree flow\n  \
 wisetree cache          # Open the shared cache screen\n  \
 wisetree settings       # Open settings menu\n\n\
 Non-Interactive Examples:\n  \
 wisetree create -n my-feature -s main              # Create worktree from main\n  \
 wisetree create -n my-feature -s main -b feat/foo  # Create with new branch\n  \
-wisetree list --json                               # List worktrees as JSON\n  \
-wisetree delete -n my-feature                      # Delete worktree by name\n  \
-wisetree delete -p /path/to/worktree -f            # Force delete by path\n  \
+wisetree cache list --json                         # Show cache details as JSON\n  \
+wisetree cache clear --force                       # Remove this repo's shared cache\n\n\
+wisetree dashboard --json                          # Snapshot dashboard as JSON\n  \
+wisetree dashboard --watch                         # Stream dashboard snapshots\n\n\
 wisetree cache list --json                         # Show cache details as JSON\n  \
 wisetree cache clear --force                       # Remove this repo's shared cache\n\n\
 Shell Integration:\n  \
