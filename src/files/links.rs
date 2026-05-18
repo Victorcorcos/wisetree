@@ -1,7 +1,7 @@
 //! Shared dependency cache management via symlinked directories.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use globset::Glob;
@@ -268,7 +268,9 @@ pub async fn touch_worktree_entry_last_seen(
             continue;
         }
 
-        let cache_entry = cache_entry_path(cache_dir, &pattern);
+        let Some(cache_entry) = cache_entry_path(cache_dir, &pattern) else {
+            continue;
+        };
         if link_points_to(&link_path, &cache_entry)? {
             metadata.record_pattern_seen(&pattern, seen_at);
         }
@@ -307,7 +309,9 @@ pub async fn list_cache(cache_dir: &Path) -> Result<CacheOverview> {
     patterns.dedup();
 
     for pattern in patterns {
-        let entry_path = cache_entry_path(cache_dir, &pattern);
+        let Some(entry_path) = cache_entry_path(cache_dir, &pattern) else {
+            continue;
+        };
         if !entry_path.exists() {
             continue;
         }
@@ -369,7 +373,10 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
     let mut retained_patterns = Vec::new();
 
     for pattern in patterns {
-        let entry_path = cache_entry_path(cache_dir, &pattern);
+        let Some(entry_path) = cache_entry_path(cache_dir, &pattern) else {
+            metadata.remove_pattern(&pattern);
+            continue;
+        };
         if !entry_path.exists() {
             metadata.remove_pattern(&pattern);
             continue;
@@ -419,7 +426,11 @@ pub async fn clear_cache(cache_dir: &Path) -> Result<()> {
 }
 
 pub async fn remove_cache_entry(cache_dir: &Path, relative_path: &str) -> Result<()> {
-    let entry_path = cache_entry_path(cache_dir, relative_path);
+    let Some(entry_path) = cache_entry_path(cache_dir, relative_path) else {
+        return Err(WisetreeError::other(format!(
+            "Invalid cache entry pattern: '{relative_path}'"
+        )));
+    };
     if entry_path.exists() {
         validate_cache_entry(&entry_path, relative_path)?;
         tokio::fs::remove_dir_all(&entry_path).await?;
@@ -450,7 +461,14 @@ async fn process_pattern(
     report: &mut LinkReport,
 ) -> ProcessPatternResult {
     let source_path = source_dir.join(pattern);
-    let cache_path = cache_entry_path(cache_dir, pattern);
+    let Some(cache_path) = cache_entry_path(cache_dir, pattern) else {
+        report.errors.push(format!(
+            "{pattern}: invalid pattern (must be a relative path without '..')"
+        ));
+        return ProcessPatternResult {
+            materialized: false,
+        };
+    };
     let link_path = target_dir.join(pattern);
 
     if let Ok(source_metadata) = tokio::fs::symlink_metadata(&source_path).await {
@@ -667,12 +685,34 @@ fn cache_entries_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join(ENTRIES_DIR_NAME)
 }
 
-fn cache_entry_path(cache_dir: &Path, pattern: &str) -> PathBuf {
-    cache_entries_dir(cache_dir).join(clean_relative_pattern(pattern))
+fn cache_entry_path(cache_dir: &Path, pattern: &str) -> Option<PathBuf> {
+    let cleaned = clean_relative_pattern(pattern);
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cache_entries_dir(cache_dir).join(cleaned))
 }
 
 fn clean_relative_pattern(pattern: &str) -> String {
-    pattern.trim().trim_matches('/').replace('\\', "/")
+    let normalized = pattern.trim().trim_matches('/').replace('\\', "/");
+    if normalized.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::Normal(segment) => parts.push(segment.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            // Reject absolute paths, drive prefixes, and parent-dir traversal so
+            // patterns can never escape the cache, source, or target roots.
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return String::new();
+            }
+        }
+    }
+
+    parts.join("/")
 }
 
 fn is_glob_pattern(pattern: &str) -> bool {
@@ -826,7 +866,9 @@ fn active_users_for_entry(
     pattern: &str,
     users: &[CacheUser],
 ) -> Result<Vec<CacheUser>> {
-    let cache_entry = cache_entry_path(cache_dir, pattern);
+    let Some(cache_entry) = cache_entry_path(cache_dir, pattern) else {
+        return Ok(Vec::new());
+    };
     let mut entry_users = Vec::new();
     for user in users {
         if worktree_uses_cache_entry(Path::new(&user.worktree_path), pattern, &cache_entry)? {
