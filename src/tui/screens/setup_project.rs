@@ -608,9 +608,9 @@ impl SetupProjectScreen {
     }
 
     pub fn complete_wise_discovery(&mut self, discovery: WisePresetDiscovery) {
-        self.confirm = Some(ConfirmEditor::from_values(
-            SetupProjectPresetValues::wise(discovery),
-        ));
+        self.confirm = Some(ConfirmEditor::from_values(SetupProjectPresetValues::wise(
+            discovery,
+        )));
         self.step = SetupProjectStep::Confirm;
     }
 
@@ -1120,17 +1120,15 @@ fn render_editable_block(
     cursor: Option<EditCursor>,
 ) {
     let editing = cursor.is_some();
-    let border_color = if editing {
-        colors::WARNING
-    } else {
-        accent
-    };
+    let border_color = if editing { colors::WARNING } else { accent };
     let border_modifier = if selected || editing {
         Modifier::BOLD
     } else {
         Modifier::empty()
     };
-    let border_style = Style::default().fg(border_color).add_modifier(border_modifier);
+    let border_style = Style::default()
+        .fg(border_color)
+        .add_modifier(border_modifier);
     let title_style = Style::default()
         .fg(border_color)
         .add_modifier(Modifier::BOLD);
@@ -1411,7 +1409,10 @@ mod tests {
         editor.blocks[0] = vec!["hello world".into()];
         editor.editing = Some(EditCursor { row: 0, col: 5 });
         editor.insert_newline();
-        assert_eq!(editor.blocks[0], vec!["hello".to_string(), " world".to_string()]);
+        assert_eq!(
+            editor.blocks[0],
+            vec!["hello".to_string(), " world".to_string()]
+        );
         assert_eq!(editor.editing, Some(EditCursor { row: 1, col: 0 }));
     }
 
