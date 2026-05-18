@@ -792,7 +792,9 @@ impl SettingsScreen {
             SelectOption::new(UPDATE_CHECK_MENU, SettingsStep::CheckUpdates)
                 .with_description("Check npm for latest version"),
         ];
-        SelectPrompt::new("Select setting to view:", opts).with_footer_spacer()
+        SelectPrompt::new("Select setting to view:", opts)
+            .searchable()
+            .with_footer_spacer()
     }
 
     fn build_copy_settings_select(&self) -> SelectPrompt<CopyDirection> {

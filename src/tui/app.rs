@@ -44,7 +44,7 @@ use crate::tui::screens::delete::{
 };
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen};
-use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen};
+use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen, SettingsStep};
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
 use crate::tui::screens::setup_project::{
     SetupProjectAction, SetupProjectScreen, SetupProjectStep,
@@ -313,11 +313,18 @@ impl App {
                 }
             }
             Screen::Settings => {
-                let h = self
-                    .settings
-                    .as_ref()
-                    .map_or(14, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                let panel = match self.settings.as_ref().map(|s| s.step()) {
+                    Some(SettingsStep::Menu) | None => {
+                        self.render_framed_panel_fill(frame, area)
+                    }
+                    Some(_) => {
+                        let h = self
+                            .settings
+                            .as_ref()
+                            .map_or(14, |s| s.preferred_content_height());
+                        self.render_framed_panel(frame, area, h)
+                    }
+                };
                 if let Some(settings) = self.settings.as_mut() {
                     settings.tick = self.tick;
                     settings.render(frame, panel);
