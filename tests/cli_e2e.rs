@@ -8,6 +8,7 @@ use std::process::Command as StdCommand;
 use assert_cmd::Command;
 use predicates::str::contains;
 use tempfile::TempDir;
+use wisetree::config::{LinkStrategy, WorktreeConfig};
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = StdCommand::new("git")
@@ -155,6 +156,46 @@ fn dashboard_json_outputs_array_with_expected_length() {
     let parsed: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
     let rows = parsed.as_array().expect("dashboard array");
     assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn cache_list_json_outputs_object() {
+    let fx = repo_with_commit();
+    let home = isolated_home();
+
+    std::fs::write(
+        fx.repo.join(".wisetree.json"),
+        serde_json::to_string_pretty(&WorktreeConfig {
+            worktree_copy_patterns: Vec::new(),
+            worktree_link_patterns: vec!["node_modules".into()],
+            worktree_link_strategy: LinkStrategy::CreateEmpty,
+            ..WorktreeConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("wisetree")
+        .unwrap()
+        .args(["create", "-n", "feat-cache", "-s", "main"])
+        .current_dir(&fx.repo)
+        .env("HOME", home.path())
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("wisetree")
+        .unwrap()
+        .args(["cache", "list", "--json"])
+        .current_dir(&fx.repo)
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
+    assert!(parsed.is_object(), "expected JSON object, got {parsed:?}");
+    assert!(parsed["entries"].is_array());
 }
 
 #[test]

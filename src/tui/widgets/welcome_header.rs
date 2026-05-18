@@ -27,6 +27,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::Create => Some("Create"),
             Screen::Dashboard => Some("Dashboard"),
             Screen::Delete => Some("Delete"),
+            Screen::Cache => Some("Cache"),
             Screen::MergePullRequest => Some("Merge Pull Request"),
             Screen::UpdatePullRequest => Some("Update Pull Request"),
             Screen::UpdateBranch => Some("Update Branch"),

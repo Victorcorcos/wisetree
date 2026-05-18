@@ -11,8 +11,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::messages::{
-    colors, MENU_CREATE, MENU_DASHBOARD, MENU_EXIT, MENU_SETTINGS, MENU_SETUP, MENU_SETUP_PROJECT,
-    MENU_TITLE,
+    colors, MENU_CACHE, MENU_CREATE, MENU_DASHBOARD, MENU_EXIT, MENU_SETTINGS, MENU_SETUP,
+    MENU_SETUP_PROJECT, MENU_TITLE,
 };
 use crate::tui::router::Screen;
 use crate::tui::widgets::welcome_header::{fold_home, WelcomeHeader};
@@ -23,6 +23,7 @@ pub enum MenuChoice {
     SetupProject,
     Setup,
     Create,
+    Cache,
     Dashboard,
     Settings,
     Exit,
@@ -48,12 +49,13 @@ impl MenuScreen {
     /// `has_local_config` controls the new "Setup Project Config" entry: it
     /// renders as the first option only when the project lacks a local
     /// `.wisetree.json` and we know which repository we're in (so the user
-    /// can bootstrap their three preset lists with a single keystroke).
+    /// can bootstrap their preset lists with a single keystroke).
     pub fn new(
         default_index: usize,
         git_root: Option<String>,
         shell_installed: Option<bool>,
         has_local_config: bool,
+        has_cache_entry: bool,
     ) -> Self {
         let has_setup_project_entry = git_root.is_some() && !has_local_config;
         let has_setup_entry = matches!(shell_installed, Some(false));
@@ -74,6 +76,9 @@ impl MenuScreen {
         }
         options.push(SelectOption::new(MENU_CREATE, MenuChoice::Create));
         options.push(SelectOption::new(MENU_DASHBOARD, MenuChoice::Dashboard));
+        if has_cache_entry {
+            options.push(SelectOption::new(MENU_CACHE, MenuChoice::Cache));
+        }
         options.push(SelectOption::new(MENU_SETTINGS, MenuChoice::Settings));
         options.push(SelectOption::new(MENU_EXIT, MenuChoice::Exit));
 

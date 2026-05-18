@@ -267,7 +267,7 @@ fn start_creating_then_running_then_complete_renders_each_step() {
     assert!(dumped.contains("bun install"));
 
     s.post_create_progress("bun build", 1);
-    s.mark_complete();
+    s.mark_complete(Vec::new());
     let dumped = dump(60, 4, |f| s.render(f, f.area()));
     assert!(dumped.contains("Worktree created successfully"));
 }
@@ -275,7 +275,7 @@ fn start_creating_then_running_then_complete_renders_each_step() {
 #[test]
 fn success_step_done_action_on_enter() {
     let mut s = ready_screen();
-    s.mark_complete();
+    s.mark_complete(Vec::new());
     let action = s.handle_key(key(KeyCode::Enter));
     assert_eq!(action, CreateAction::Done);
 }

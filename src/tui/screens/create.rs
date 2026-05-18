@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -69,6 +69,46 @@ pub enum CreateAction {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+    Emphasis,
+    Muted,
+}
+
+impl SummaryTone {
+    fn style(self) -> Style {
+        match self {
+            Self::Info => Style::default()
+                .fg(colors::INFO)
+                .add_modifier(Modifier::BOLD),
+            Self::Success => Style::default().fg(colors::SUCCESS),
+            Self::Warning => Style::default().fg(colors::WARNING),
+            Self::Error => Style::default().fg(colors::ERROR),
+            Self::Emphasis => Style::default().fg(colors::EMPHASIS),
+            Self::Muted => Style::default().fg(colors::MUTED),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryLine {
+    pub text: String,
+    pub tone: SummaryTone,
+}
+
+impl SummaryLine {
+    pub fn new(text: impl Into<String>, tone: SummaryTone) -> Self {
+        Self {
+            text: text.into(),
+            tone,
+        }
+    }
+}
+
 pub struct CreateScreen {
     step: CreateStep,
     pub directory_name: String,
@@ -101,6 +141,7 @@ pub struct CreateScreen {
     pub completed_commands: Vec<String>,
     pub failed_commands: Vec<String>,
     pub current_command_index: usize,
+    summary_lines: Vec<SummaryLine>,
 
     pub tick: usize,
 }
@@ -127,6 +168,7 @@ impl CreateScreen {
             completed_commands: Vec::new(),
             failed_commands: Vec::new(),
             current_command_index: 0,
+            summary_lines: Vec::new(),
             tick: 0,
         }
     }
@@ -198,7 +240,7 @@ impl CreateScreen {
         self.created_worktree_path.as_deref()
     }
 
-    pub fn mark_complete(&mut self) {
+    pub fn mark_complete(&mut self, summary_lines: Vec<SummaryLine>) {
         // Mark the last running command as completed if not already.
         if let Some(cmd) = self
             .post_create_commands
@@ -209,6 +251,7 @@ impl CreateScreen {
                 self.completed_commands.push(cmd);
             }
         }
+        self.summary_lines = summary_lines;
         self.step = CreateStep::Success;
     }
 
@@ -460,7 +503,7 @@ impl CreateScreen {
             CreateStep::Confirm | CreateStep::NavigateConfirm => 10,
             CreateStep::Creating => 3,
             CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
-            CreateStep::Success => 3,
+            CreateStep::Success => 5 + (self.summary_lines.len() as u16).min(12),
         }
     }
 
@@ -533,9 +576,35 @@ impl CreateScreen {
                     .render(frame, area);
             }
             CreateStep::Success => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ])
+                    .split(area);
                 StatusIndicator::new(Status::Success, CREATE_SUCCESS)
                     .without_spinner()
-                    .render(frame, area);
+                    .render(frame, chunks[0]);
+
+                if !self.summary_lines.is_empty() {
+                    let lines: Vec<Line> = self
+                        .summary_lines
+                        .iter()
+                        .map(|line| Line::from(branded_line(&line.text, line.tone.style())))
+                        .collect();
+                    frame.render_widget(Paragraph::new(lines), chunks[1]);
+                }
+
+                frame.render_widget(
+                    Paragraph::new("Press any key to continue").style(
+                        Style::default()
+                            .fg(colors::MUTED)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                    chunks[2],
+                );
             }
         }
     }
