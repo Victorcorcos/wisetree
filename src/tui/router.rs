@@ -10,8 +10,11 @@ pub enum Screen {
     Dashboard,
     Delete,
     MergePullRequest,
+    UpdatePullRequest,
+    UpdateBranch,
     Settings,
     Setup,
+    SetupProject,
 }
 
 impl Screen {
@@ -31,8 +34,11 @@ impl Screen {
             Self::Dashboard => "dashboard",
             Self::Delete => "delete",
             Self::MergePullRequest => "merge_pull_request",
+            Self::UpdatePullRequest => "update_pull_request",
+            Self::UpdateBranch => "update_branch",
             Self::Settings => "settings",
             Self::Setup => "setup",
+            Self::SetupProject => "setup_project",
         }
     }
 }

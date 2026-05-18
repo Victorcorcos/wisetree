@@ -1,5 +1,6 @@
 //! Live dashboard screen.
 
+use std::path::Path;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -11,14 +12,22 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState,
-    ReviewStatus, PR_CACHE_TTL_MS,
+    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
+    PrState, ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
 
 const SELECT_MARKER: &str = " ➤ ";
 const BLANK_SELECT_MARKER: &str = "   ";
+
+fn worktree_display_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| fold_home(path))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardMode {
@@ -33,6 +42,8 @@ enum ActionChoice {
     CopyPath,
     OpenPullRequest,
     MergePullRequest,
+    UpdatePullRequest,
+    UpdateBranch,
 }
 
 /// Payload the dashboard hands to the merge confirmation screen.
@@ -50,30 +61,62 @@ pub struct MergePullRequestRequest {
     pub last_commit: Option<CommitSummary>,
 }
 
+/// Payload the dashboard hands to the "Update Pull Request" confirmation
+/// screen. `base_ref` is filled in by the app layer once the actual
+/// reachable remote ref has been resolved (the dashboard hands `None`
+/// through the action; resolving requires running `git` inside the
+/// worktree which is async work owned by `App`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePullRequestRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub ahead: u64,
+    pub behind: u64,
+    pub base_ref: Option<String>,
+}
+
 /// Status filter for the bulk-delete buttons row rendered above the
-/// footer. Matches the labels produced by `status_label_and_style`.
+/// footer. `button_label` can differ from the row label when a shorter
+/// footer caption keeps narrow layouts readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkDeleteStatus {
     Merged,
     Opened,
+    Closed,
     Clean,
     Dirty,
 }
 
 impl BulkDeleteStatus {
-    pub const ALL: [BulkDeleteStatus; 4] = [
+    pub const ALL: [BulkDeleteStatus; 5] = [
         BulkDeleteStatus::Merged,
+        BulkDeleteStatus::Closed,
         BulkDeleteStatus::Opened,
         BulkDeleteStatus::Clean,
         BulkDeleteStatus::Dirty,
     ];
 
     pub fn label(self) -> &'static str {
+        self.row_label()
+    }
+
+    pub fn button_label(self) -> &'static str {
         match self {
             BulkDeleteStatus::Merged => "Merged",
-            BulkDeleteStatus::Opened => "Opened",
+            BulkDeleteStatus::Opened => "Open",
+            BulkDeleteStatus::Closed => "Closed",
             BulkDeleteStatus::Clean => "Clean",
             BulkDeleteStatus::Dirty => "Dirty",
+        }
+    }
+
+    fn row_label(self) -> &'static str {
+        match self {
+            BulkDeleteStatus::Opened => "Opened",
+            _ => self.button_label(),
         }
     }
 
@@ -81,6 +124,7 @@ impl BulkDeleteStatus {
         match self {
             BulkDeleteStatus::Merged => colors::SUCCESS,
             BulkDeleteStatus::Opened => colors::INFO,
+            BulkDeleteStatus::Closed => colors::GRAY_LIGHT,
             BulkDeleteStatus::Clean => colors::ACCENT,
             BulkDeleteStatus::Dirty => colors::ERROR,
         }
@@ -99,6 +143,12 @@ pub enum DashboardAction {
     CopyPath(String),
     OpenPullRequest(String),
     MergePullRequest(Box<MergePullRequestRequest>),
+    UpdatePullRequest(Box<UpdatePullRequestRequest>),
+    /// Fetch the remote and merge the mother branch with the first
+    /// reachable ref in `BASE_REF_PRIORITY` (upstream/main →
+    /// upstream/master → origin/main → origin/master). Only offered on
+    /// the main worktree row.
+    UpdateBranch(String),
     /// The user tried to delete the mother (main) worktree. The app
     /// layer should surface a toast explaining that this worktree is
     /// protected, instead of routing to the delete screen.
@@ -156,9 +206,8 @@ pub struct DashboardScreen {
     warnings: Vec<String>,
     notice: Option<DashboardNotice>,
     refreshed_at: Option<Instant>,
-    gh_refreshed_at: Option<Instant>,
+    next_pr_fetch_at: Option<Instant>,
     pr_enrichment_enabled: bool,
-    refresh_interval_ms: u64,
     /// `Some` while the bulk-delete buttons row owns the keyboard focus.
     /// Tab moves through buttons in `BulkDeleteStatus::ALL` order; Esc
     /// returns focus to the table.
@@ -177,7 +226,6 @@ impl DashboardScreen {
         columns: Vec<String>,
         warnings: Vec<String>,
         pr_enrichment_enabled: bool,
-        refresh_interval_ms: u64,
     ) -> Self {
         Self {
             rows: Vec::new(),
@@ -198,9 +246,8 @@ impl DashboardScreen {
             warnings,
             notice: None,
             refreshed_at: None,
-            gh_refreshed_at: None,
+            next_pr_fetch_at: None,
             pr_enrichment_enabled,
-            refresh_interval_ms,
             bulk_focus: None,
             bulk_button_rects: Vec::new(),
             tick: 0,
@@ -221,8 +268,8 @@ impl DashboardScreen {
         }
     }
 
-    pub fn mark_gh_refreshed(&mut self) {
-        self.gh_refreshed_at = Some(Instant::now());
+    pub fn set_next_pr_fetch_at(&mut self, next_pr_fetch_at: Option<Instant>) {
+        self.next_pr_fetch_at = next_pr_fetch_at;
     }
 
     pub fn set_notice(&mut self, notice: DashboardNotice) {
@@ -249,8 +296,9 @@ impl DashboardScreen {
             return 11;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
-        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows + 8 footer.
-        13 + table_rows
+        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows
+        // + footer (10 lines, +1 when the highlighted PR has reviewers to show).
+        14 + table_rows + self.reviewers_footer_height()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -393,15 +441,16 @@ impl DashboardScreen {
             return;
         }
 
+        let footer_height = 10u16 + self.reviewers_footer_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // status banner
-                Constraint::Length(1), // spacer above search
-                Constraint::Length(1), // search line
-                Constraint::Length(1), // spacer below search
-                Constraint::Min(4),    // table
-                Constraint::Length(9), // footer (notice + 3-row buttons + 5 legend lines)
+                Constraint::Length(1),             // status banner
+                Constraint::Length(1),             // spacer above search
+                Constraint::Length(1),             // search line
+                Constraint::Length(1),             // spacer below search
+                Constraint::Min(4),                // table
+                Constraint::Length(footer_height), // footer (notice [+ reviewers] + 3-row buttons + 6 legend lines)
             ])
             .split(area);
 
@@ -538,6 +587,31 @@ impl DashboardScreen {
                 ActionChoice::MergePullRequest,
             ));
         }
+        // Update Pull Request appears only when the branch is *behind*
+        // its base — either the PR's merge_status says so, or git's
+        // local ahead/behind count says so. Showing it on already
+        // up-to-date rows would just be a no-op trip.
+        if row
+            .pull_request
+            .as_ref()
+            .is_some_and(|pr| matches!(pr.state, PrState::Open))
+            && row_is_behind(row)
+        {
+            options.push(SelectOption::new(
+                "Update Pull Request",
+                ActionChoice::UpdatePullRequest,
+            ));
+        }
+        // The mother (main) worktree has no PR of its own, but we still
+        // want a one-click way to pull the upstream tip into it. Fetches
+        // the remote and merges the first reachable ref from
+        // `BASE_REF_PRIORITY`.
+        if row.worktree.is_main {
+            options.push(SelectOption::new(
+                "Update Branch",
+                ActionChoice::UpdateBranch,
+            ));
+        }
         SelectPrompt::new("Choose action:", options).without_hint()
     }
 
@@ -557,6 +631,7 @@ impl DashboardScreen {
                 let path = row.worktree.path.clone();
                 let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
                 let merge_request = build_merge_request(row);
+                let update_request = build_update_request(row);
                 self.mode = DashboardMode::Table;
                 self.action_select = None;
                 self.action_target = None;
@@ -572,6 +647,11 @@ impl DashboardScreen {
                         Some(request) => DashboardAction::MergePullRequest(Box::new(request)),
                         None => DashboardAction::Continue,
                     },
+                    ActionChoice::UpdatePullRequest => match update_request {
+                        Some(request) => DashboardAction::UpdatePullRequest(Box::new(request)),
+                        None => DashboardAction::Continue,
+                    },
+                    ActionChoice::UpdateBranch => DashboardAction::UpdateBranch(path),
                 }
             }
             SelectOutcome::Cancelled => {
@@ -800,43 +880,23 @@ impl DashboardScreen {
     }
 
     fn status_header_cell(&self) -> Cell<'static> {
-        // Anchor the countdown to whichever interval gates the next *real*
-        // GraphQL refetch: the dashboard tick or the PR cache TTL, whichever
-        // is longer. `gh_refreshed_at` is only updated when an actual fetch
-        // succeeds (not on cached ticks), so this honestly represents when
-        // the displayed Status will next change.
-        let countdown_ms = self.refresh_interval_ms.max(PR_CACHE_TTL_MS);
-        let countdown_secs = (countdown_ms / 1000).max(1);
-        match self.gh_refreshed_at {
-            None => Cell::from("Status"),
-            Some(instant) => {
-                let elapsed = instant.elapsed().as_secs();
-                if elapsed == 0 {
-                    Cell::from(Line::from(vec![Span::styled(
-                        "Status (✔)",
-                        Style::default()
-                            .fg(colors::SUCCESS)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                } else {
-                    let remaining = countdown_secs.saturating_sub(elapsed);
-                    let label = if remaining == 0 {
-                        "Status (✔)".to_string()
-                    } else {
-                        format!("Status ({remaining}s)")
-                    };
-                    let color = if remaining == 0 {
-                        colors::SUCCESS
-                    } else {
-                        colors::MUTED
-                    };
-                    Cell::from(Line::from(vec![Span::styled(
-                        label,
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    )]))
-                }
-            }
-        }
+        let Some(due) = self.next_pr_fetch_at else {
+            return Cell::from("Status");
+        };
+        // Round up so the countdown reads "(1s)" right until the deadline,
+        // then flips to "(✔)" exactly at the deadline. With truncation,
+        // "(✔)" would show up to a second early.
+        let remaining_ms = due.saturating_duration_since(Instant::now()).as_millis();
+        let remaining = remaining_ms.div_ceil(1000) as u64;
+        let (label, color) = if remaining == 0 {
+            ("Status (✔)".to_string(), colors::SUCCESS)
+        } else {
+            (format!("Status ({remaining}s)"), colors::MUTED)
+        };
+        Cell::from(Line::from(vec![Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )]))
     }
 
     fn row_cells(
@@ -854,7 +914,7 @@ impl DashboardScreen {
             Span::raw(marker),
             Span::styled(
                 truncate(
-                    &fold_home(&row.worktree.path),
+                    &worktree_display_name(&row.worktree.path),
                     layout
                         .worktree_width
                         .saturating_sub(marker.chars().count() as u16) as usize,
@@ -891,29 +951,53 @@ impl DashboardScreen {
         table_width: u16,
         layout: &DashboardTableLayout,
     ) {
+        let reviewers_height = self.reviewers_footer_height();
+
+        // Build constraints conditionally so the layout has exactly the
+        // number of rows it actually needs — ratatui's solver can drop a
+        // neighbour's row when a zero-length constraint sits inside an
+        // already-saturated column.
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(9);
+        constraints.push(Constraint::Length(1)); // notice / row warning / detail
+        if reviewers_height > 0 {
+            constraints.push(Constraint::Length(reviewers_height));
+        }
+        constraints.push(Constraint::Length(3)); // bulk delete buttons row (bordered)
+        constraints.push(Constraint::Length(1)); // navigate / shortcuts
+        constraints.push(Constraint::Length(1)); // status legend
+        constraints.push(Constraint::Length(1)); // checks legend
+        constraints.push(Constraint::Length(1)); // reviews legend
+        constraints.push(Constraint::Length(1)); // merges legend
+        constraints.push(Constraint::Length(1)); // ahead/behind legend
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // notice / row warning / detail
-                Constraint::Length(3), // bulk delete buttons row (bordered)
-                Constraint::Length(1), // navigate / shortcuts
-                Constraint::Length(1), // status legend
-                Constraint::Length(1), // checks legend
-                Constraint::Length(1), // reviews legend (between checks and ahead/behind)
-                Constraint::Length(1), // ahead/behind legend
-            ])
+            .constraints(constraints)
             .split(area);
 
+        let mut idx = 0;
         frame.render_widget(
             Paragraph::new(self.notice_line(table_width, layout)),
-            chunks[0],
+            chunks[idx],
         );
-        self.render_bulk_delete_buttons(frame, chunks[1]);
-        frame.render_widget(Paragraph::new(self.shortcuts_line()), chunks[2]);
-        frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[3]);
-        frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[4]);
-        frame.render_widget(Paragraph::new(self.reviews_legend_line()), chunks[5]);
-        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[6]);
+        idx += 1;
+        if reviewers_height > 0 {
+            frame.render_widget(Paragraph::new(self.reviewers_line()), chunks[idx]);
+            idx += 1;
+        }
+        self.render_bulk_delete_buttons(frame, chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.shortcuts_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.reviews_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.merges_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[idx]);
     }
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
@@ -949,6 +1033,82 @@ impl DashboardScreen {
         Line::from("")
     }
 
+    /// `1` when the highlighted row has reviewer data to surface, `0`
+    /// otherwise. Lets the outer layout collapse the row instead of leaving
+    /// a blank gap above the bulk-delete buttons.
+    fn reviewers_footer_height(&self) -> u16 {
+        let Some(row) = self.selected_row() else {
+            return 0;
+        };
+        let Some(pr) = &row.pull_request else {
+            return 0;
+        };
+        if !matches!(pr.state, PrState::Open) {
+            return 0;
+        }
+        if pr.reviewers.is_empty() {
+            return 0;
+        }
+        1
+    }
+
+    /// Footer line that lists the reviewers of the highlighted Opened PR
+    /// grouped by status. Rendered only for PRs in the Open state so we
+    /// don't bloat the footer with stale data for merged / closed PRs.
+    fn reviewers_line(&self) -> Line<'static> {
+        let Some(row) = self.selected_row() else {
+            return Line::from("");
+        };
+        let Some(pr) = &row.pull_request else {
+            return Line::from("");
+        };
+        if !matches!(pr.state, PrState::Open) {
+            return Line::from("");
+        }
+        if pr.reviewers.is_empty() {
+            return Line::from("");
+        }
+
+        let muted = Style::default().fg(colors::MUTED);
+        let mut spans: Vec<Span<'static>> = vec![Span::styled("Reviewers: ", muted)];
+
+        let mut first = true;
+        let mut push_group = |label: &str, color: ratatui::style::Color, logins: &[String]| {
+            if logins.is_empty() {
+                return;
+            }
+            if !first {
+                spans.push(Span::styled("  ", muted));
+            }
+            first = false;
+            spans.push(Span::styled(
+                label.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" ", muted));
+            for (i, login) in logins.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(", ", muted));
+                }
+                spans.push(Span::styled(
+                    format!("@{login}"),
+                    Style::default().fg(color),
+                ));
+            }
+        };
+
+        push_group("✋ Pending", colors::WARNING, &pr.reviewers.pending);
+        push_group("👍 Approved", colors::SUCCESS, &pr.reviewers.approved);
+        push_group(
+            "👎 Rejected",
+            colors::ERROR,
+            &pr.reviewers.changes_requested,
+        );
+        push_group("💬 Commented", colors::ACCENT, &pr.reviewers.commented);
+
+        Line::from(spans)
+    }
+
     fn shortcuts_line(&self) -> Line<'static> {
         Line::from(Span::styled(
             "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
@@ -973,7 +1133,9 @@ impl DashboardScreen {
             Span::styled("Opened", Style::default().fg(colors::INFO)),
             Span::styled(" = PR open  ", muted_dim),
             Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" = PR merged", muted_dim),
+            Span::styled(" = PR merged  ", muted_dim),
+            Span::styled("Closed", Style::default().fg(colors::GRAY_LIGHT)),
+            Span::styled(" = PR closed", muted_dim),
         ])
     }
 
@@ -983,11 +1145,11 @@ impl DashboardScreen {
             .add_modifier(Modifier::DIM);
         Line::from(vec![
             Span::styled("PR Checks: ", muted_dim),
-            Span::styled("⚪(Pending)", muted_dim),
-            Span::styled("  🟡(Running)", muted_dim),
-            Span::styled("  🟢(Passed)", muted_dim),
-            Span::styled("  🔴(Failed)", muted_dim),
-            Span::styled("  ⚠️(Errored)", muted_dim),
+            Span::styled("⚪ (Pending)", muted_dim),
+            Span::styled("  🟡 (Running)", muted_dim),
+            Span::styled("  ⚠️ (Errored)", muted_dim),
+            Span::styled("  🔴 (Failed)", muted_dim),
+            Span::styled("  🟢 (Passed)", muted_dim),
         ])
     }
 
@@ -997,9 +1159,26 @@ impl DashboardScreen {
             .add_modifier(Modifier::DIM);
         Line::from(vec![
             Span::styled("PR Reviews: ", muted_dim),
-            Span::styled("✋(Pending)", muted_dim),
-            Span::styled("  👍(Approved)", muted_dim),
-            Span::styled("  👎(Changes Requested)", muted_dim),
+            Span::styled("✋ (Pending)", muted_dim),
+            Span::styled("  👎 (Changes Requested)", muted_dim),
+            Span::styled("  👍 (Approved)", muted_dim),
+        ])
+    }
+
+    fn merges_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("PR Merges: ", muted_dim),
+            Span::styled("📝 (Draft)", muted_dim),
+            Span::styled("  ❌ (Dirty)", muted_dim),
+            Span::styled("  🚫 (Blocked)", muted_dim),
+            Span::styled("  ❓ (Unknown)", muted_dim),
+            Span::styled("  🍂 (Behind)", muted_dim),
+            Span::styled("  ⏳ (Has Hooks)", muted_dim),
+            Span::styled("  🏚️ (Unstable)", muted_dim),
+            Span::styled("  ✅ (Clean)", muted_dim),
         ])
     }
 
@@ -1031,14 +1210,35 @@ impl DashboardScreen {
         // half-char of leftover space on one side.
         let gap: u16 = 2;
 
-        let mut constraints: Vec<Constraint> =
-            Vec::with_capacity(BulkDeleteStatus::ALL.len() * 2 + 2);
+        let mut visible_statuses = Vec::with_capacity(BulkDeleteStatus::ALL.len());
+        let mut used_width = prefix_width;
+        for status in BulkDeleteStatus::ALL {
+            let button_width = status.button_label().chars().count() as u16 + 4;
+            let required_width = if visible_statuses.is_empty() {
+                button_width
+            } else {
+                gap + button_width
+            };
+            if used_width.saturating_add(required_width) > area.width {
+                break;
+            }
+            visible_statuses.push(status);
+            used_width = used_width.saturating_add(required_width);
+        }
+
+        if let Some(focused) = self.bulk_focus {
+            if !visible_statuses.contains(&focused) {
+                self.bulk_focus = visible_statuses.last().copied();
+            }
+        }
+
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_statuses.len() * 2 + 2);
         constraints.push(Constraint::Length(prefix_width));
-        for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
+        for (index, status) in visible_statuses.iter().enumerate() {
             if index > 0 {
                 constraints.push(Constraint::Length(gap));
             }
-            let button_width = status.label().chars().count() as u16 + 4;
+            let button_width = status.button_label().chars().count() as u16 + 4;
             constraints.push(Constraint::Length(button_width));
         }
         constraints.push(Constraint::Min(0));
@@ -1063,7 +1263,7 @@ impl DashboardScreen {
             );
         }
 
-        for (index, status) in BulkDeleteStatus::ALL.iter().enumerate() {
+        for (index, status) in visible_statuses.iter().enumerate() {
             // Column layout: prefix at 0, then alternating gap/button. The
             // first button is at index 1, subsequent buttons at index 1 + 2k.
             let col_index = 1 + index * 2;
@@ -1087,15 +1287,16 @@ impl DashboardScreen {
             };
             let border_style = Style::default().fg(status.color());
 
-            let button = Paragraph::new(Line::from(Span::styled(status.label(), text_style)))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .border_style(border_style)
-                        .padding(Padding::horizontal(1)),
-                );
+            let button =
+                Paragraph::new(Line::from(Span::styled(status.button_label(), text_style)))
+                    .alignment(Alignment::Center)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Plain)
+                            .border_style(border_style)
+                            .padding(Padding::horizontal(1)),
+                    );
             frame.render_widget(button, rect);
             self.bulk_button_rects.push((*status, rect));
         }
@@ -1164,7 +1365,7 @@ impl DashboardScreen {
         let longest_path = self
             .rows
             .iter()
-            .map(|row| fold_home(&row.worktree.path).chars().count() as u16)
+            .map(|row| worktree_display_name(&row.worktree.path).chars().count() as u16)
             .max()
             .unwrap_or(0);
         let header_min = "Worktree".chars().count() as u16;
@@ -1364,11 +1565,12 @@ impl DashboardColumn {
                 }
             }
             Self::Status => {
-                // Wide enough to render "Opened 🟡 👍" without truncating
-                // either emoji. Emoji codepoints are 1 grapheme but
+                // Wide enough to render "Opened 🟡 👍 🍂" without truncating
+                // any emoji. Emoji codepoints are 1 grapheme but
                 // ratatui counts them as 2 columns wide, so we budget
                 // label (6) + space (1) + check emoji (2) + space (1)
-                // + review emoji (2) = 12, plus a margin of safety.
+                // + review emoji (2) + space (1) + merge emoji (2) = 15,
+                // plus a margin of safety.
                 if compact {
                     13
                 } else {
@@ -1408,11 +1610,16 @@ impl DashboardColumn {
             Self::Status => {
                 let (text, style) = status_label_and_style(row);
                 let mut spans: Vec<Span<'static>> = vec![Span::styled(text, style)];
-                if let Some(emoji) = opened_check_emoji(row) {
-                    spans.push(Span::raw(format!(" {emoji}")));
-                }
-                if let Some(emoji) = opened_review_emoji(row) {
-                    spans.push(Span::raw(format!(" {emoji}")));
+                let emojis: Vec<&'static str> = [
+                    opened_check_emoji(row),
+                    opened_review_emoji(row),
+                    opened_merge_emoji(row),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if !emojis.is_empty() {
+                    spans.push(Span::raw(format!(" {}", emojis.join(""))));
                 }
                 Cell::from(Line::from(spans))
             }
@@ -1507,6 +1714,57 @@ impl PrState {
     }
 }
 
+/// True when the row's branch is behind its base — either the PR's
+/// `merge_status` reports `Behind`, or git's local ahead/behind shows
+/// `behind > 0`. Used both to gate the "Update Pull Request" menu entry
+/// and (via tests) to keep the visibility rule pinned.
+pub(crate) fn row_is_behind(row: &DashboardRow) -> bool {
+    let merge_says_behind = row
+        .pull_request
+        .as_ref()
+        .and_then(|pr| pr.merge_status)
+        .map(|status| matches!(status, MergeStatus::Behind))
+        .unwrap_or(false);
+    let git_says_behind = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .map(|s| s.behind > 0)
+        .unwrap_or(false);
+    merge_says_behind || git_says_behind
+}
+
+/// Assemble the payload the update confirmation screen needs. Returns
+/// `None` when the row's PR is missing/not Open or the branch isn't
+/// behind — mirrors the guard in `build_action_select`.
+fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    if !row_is_behind(row) {
+        return None;
+    }
+    let (ahead, behind) = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .map(|s| (s.ahead, s.behind))
+        .unwrap_or((0, 0));
+    Some(UpdatePullRequestRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+        ahead,
+        behind,
+        // App resolves the actual reachable base ref before mounting the
+        // screen; the dashboard never runs git itself.
+        base_ref: None,
+    })
+}
+
 /// Assemble the payload the merge confirmation screen needs from a row.
 /// Returns `None` when the row's PR is missing or not in the `Open` state —
 /// matches the guard in `build_action_select` so the menu and the dispatch
@@ -1544,6 +1802,7 @@ fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
     match row.pull_request.as_ref().map(|pr| pr.state) {
         Some(PrState::Merged) => ("Merged", Style::default().fg(colors::SUCCESS)),
         Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),
+        Some(PrState::Closed) => ("Closed", Style::default().fg(colors::GRAY_LIGHT)),
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),
     }
@@ -1595,9 +1854,32 @@ fn opened_review_emoji(row: &DashboardRow) -> Option<&'static str> {
     pr.review_status.map(review_status_emoji)
 }
 
+fn merge_status_emoji(status: MergeStatus) -> &'static str {
+    match status {
+        MergeStatus::Draft => "📝",
+        MergeStatus::Dirty => "❌",
+        MergeStatus::Blocked => "🚫",
+        MergeStatus::Unknown => "❓",
+        MergeStatus::Behind => "🍂",
+        MergeStatus::HasHooks => "⏳",
+        MergeStatus::Unstable => "🏚️",
+        MergeStatus::Clean => "✅",
+    }
+}
+
+/// Returns the optional merge emoji suffix for a row's Status cell.
+/// Only Open PRs with a resolved `merge_status` surface an emoji.
+fn opened_merge_emoji(row: &DashboardRow) -> Option<&'static str> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    pr.merge_status.map(merge_status_emoji)
+}
+
 fn row_matches_bulk_status(row: &DashboardRow, status: BulkDeleteStatus) -> bool {
     let (label, _) = status_label_and_style(row);
-    label == status.label()
+    label == status.row_label()
 }
 
 /// Returns the next focused bulk-delete button, or `None` to land back

@@ -5,8 +5,8 @@ use ratatui::Terminal;
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::messages::colors;
 use wisetree::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, PrState,
-    PullRequest, ReviewStatus,
+    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
+    PrState, PullRequest, ReviewStatus, ReviewerSummary,
 };
 use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 
@@ -89,6 +89,8 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
         title: "Improve dashboard footer details for live workflows".into(),
         checks_status: None,
         review_status: None,
+        merge_status: None,
+        reviewers: Default::default(),
     });
     row
 }
@@ -145,7 +147,6 @@ fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
         ],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -157,30 +158,16 @@ fn ready_screen(is_from_wrapper: bool) -> DashboardScreen {
 
 #[test]
 fn loading_render_shows_loading_message() {
-    let mut screen = DashboardScreen::new(
-        true,
-        true,
-        true,
-        vec!["branch".into()],
-        Vec::new(),
-        false,
-        5000,
-    );
+    let mut screen =
+        DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false);
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
     assert!(dumped.contains("Loading dashboard"));
 }
 
 #[test]
 fn empty_state_renders_no_worktrees_found() {
-    let mut screen = DashboardScreen::new(
-        true,
-        true,
-        true,
-        vec!["branch".into()],
-        Vec::new(),
-        false,
-        5000,
-    );
+    let mut screen =
+        DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false);
     screen.set_rows(vec![]);
     let dumped = dump(80, 8, |f| screen.render(f, f.area()));
     assert!(dumped.contains("No worktrees found"));
@@ -293,7 +280,6 @@ fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     plain.set_rows(vec![row("/tmp/repo", "main", true)]);
     plain.handle_key(key(KeyCode::Enter));
@@ -355,7 +341,7 @@ fn selected_worktree_row_shows_selection_marker() {
     screen.handle_key(key(KeyCode::Down));
 
     let dumped = dump(120, 12, |f| screen.render(f, f.area()));
-    assert!(dumped.contains(" ➤ /tmp/repo-bug"));
+    assert!(dumped.contains(" ➤ repo-bug"));
 }
 
 #[test]
@@ -399,7 +385,6 @@ fn opened_pr_row_renders_opened_status_in_info_palette() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -431,7 +416,6 @@ fn merged_pr_row_renders_merged_status_in_success_palette() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -463,7 +447,6 @@ fn opened_pr_with_running_checks_renders_yellow_circle() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -485,7 +468,6 @@ fn opened_pr_with_pending_review_renders_raised_hand() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -511,7 +493,6 @@ fn opened_pr_with_running_check_and_approved_review_renders_both_emojis() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -551,7 +532,6 @@ fn opened_pr_with_passed_check_and_rejected_review_renders_thumbs_down() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -581,6 +561,88 @@ fn opened_pr_with_passed_check_and_rejected_review_renders_thumbs_down() {
 }
 
 #[test]
+fn opened_pr_with_reviewers_renders_each_group_in_footer() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut bug = row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open);
+    if let Some(pr) = bug.pull_request.as_mut() {
+        pr.reviewers = ReviewerSummary {
+            pending: vec!["dan".into()],
+            approved: vec!["alice".into()],
+            changes_requested: vec!["bob".into()],
+            commented: vec!["carol".into()],
+        };
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), bug]);
+    screen.handle_key(key(KeyCode::Down));
+
+    let dumped = dump_lines(140, 20, |f| screen.render(f, f.area()));
+    let reviewers_line = dumped
+        .lines()
+        .find(|line| line.starts_with("Reviewers:"))
+        .unwrap_or_else(|| panic!("reviewers line missing from footer: {dumped}"));
+    for snippet in [
+        "Pending @dan",
+        "Approved @alice",
+        "Rejected @bob",
+        "Commented @carol",
+    ] {
+        assert!(
+            reviewers_line.contains(snippet),
+            "expected `{snippet}` in reviewers line: {reviewers_line}"
+        );
+    }
+
+    let pr_line_no = dumped
+        .lines()
+        .position(|line| line.contains("PR #42 Open"))
+        .expect("PR info line missing");
+    let reviewers_line_no = dumped
+        .lines()
+        .position(|line| line.starts_with("Reviewers:"))
+        .unwrap();
+    assert!(
+        pr_line_no < reviewers_line_no,
+        "Reviewers line must appear below PR # info: pr={pr_line_no} reviewers={reviewers_line_no}"
+    );
+}
+
+#[test]
+fn merged_pr_with_reviewers_does_not_render_reviewers_line() {
+    // Reviewers info is only meaningful while the PR is Open; for merged or
+    // closed PRs the data is stale, so we suppress the line entirely.
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut merged = row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Merged);
+    if let Some(pr) = merged.pull_request.as_mut() {
+        pr.reviewers = ReviewerSummary {
+            approved: vec!["alice".into()],
+            ..Default::default()
+        };
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), merged]);
+    screen.handle_key(key(KeyCode::Down));
+
+    let dumped = dump_lines(140, 20, |f| screen.render(f, f.area()));
+    assert!(
+        !dumped.contains("Reviewers:"),
+        "Merged PR should suppress the reviewers footer line: {dumped}"
+    );
+}
+
+#[test]
 fn merged_pr_with_review_status_still_renders_plain_label() {
     // Review emoji must only surface for Open PRs. Stale review data on a
     // merged PR (e.g. left over from before the merge) should never show
@@ -592,7 +654,6 @@ fn merged_pr_with_review_status_still_renders_plain_label() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     let mut merged = row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Merged);
     if let Some(pr) = merged.pull_request.as_mut() {
@@ -621,7 +682,6 @@ fn opened_pr_with_failed_checks_renders_red_circle() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -643,7 +703,6 @@ fn opened_pr_without_checks_keeps_plain_label() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -674,7 +733,6 @@ fn search_matches_opened_for_rows_with_check_circles() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -696,7 +754,6 @@ fn search_matches_opened_status_text() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -719,7 +776,6 @@ fn table_uses_available_height_before_scrolling() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     let rows: Vec<DashboardRow> = (0..12)
         .map(|index| {
@@ -733,8 +789,9 @@ fn table_uses_available_height_before_scrolling() {
     screen.set_rows(rows);
 
     // Height must fit exactly: 4 (banner/search) + 13 (header + 12 rows)
-    // + 9 (9-line footer with bordered bulk-delete buttons row + checks/reviews legends).
-    let dumped = dump(120, 26, |f| screen.render(f, f.area()));
+    // + 10 (10-line footer with bordered bulk-delete buttons row and all legends,
+    // including PR merges).
+    let dumped = dump(120, 27, |f| screen.render(f, f.area()));
     assert!(dumped.contains("repo-11"));
     assert!(!dumped.contains("more above"));
     assert!(!dumped.contains("more below"));
@@ -749,7 +806,6 @@ fn overflow_rows_show_more_above_and_below_indicators() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     let rows: Vec<DashboardRow> = (0..15)
         .map(|index| {
@@ -839,7 +895,6 @@ fn selected_row_warning_is_rendered_in_footer() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     let mut broken = row("/tmp/repo-bug", "bug", false);
     broken.error = Some("status timed out".into());
@@ -860,7 +915,6 @@ fn dashboard_notice_renders_in_footer_detail_slot() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -893,7 +947,6 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
         ],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -922,7 +975,6 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
         ],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -952,7 +1004,6 @@ fn action_menu_shows_merge_option_for_open_pr_row() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -976,7 +1027,6 @@ fn action_menu_hides_merge_option_for_merged_pr_row() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -1001,7 +1051,6 @@ fn action_menu_hides_merge_option_for_closed_pr_row() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -1021,7 +1070,6 @@ fn action_menu_hides_merge_option_for_draft_pr_row() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -1041,7 +1089,6 @@ fn action_menu_hides_merge_option_when_no_pr_present() {
         vec!["branch".into(), "status".into()],
         Vec::new(),
         false,
-        5000,
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
@@ -1051,4 +1098,235 @@ fn action_menu_hides_merge_option_when_no_pr_present() {
     let dumped = open_action_menu_for_second_row(&mut screen);
     assert!(!dumped.contains("Merge Pull Request"));
     assert!(!dumped.contains("Open Pull Request"));
+}
+
+// ---- "Update Pull Request" visibility ----------------------------------
+// The option lives in the action menu only when the row carries an Open
+// PR *and* is behind its base — either `merge_status == Behind` or
+// `branch_status.behind > 0`. These tests pin both the positive and the
+// negative cases so the gate can't silently drift.
+
+fn behind_row_via_branch_status(path: &str, branch: &str) -> DashboardRow {
+    let mut row = row_with_pr_state(path, branch, true, PrState::Open);
+    row.worktree.branch_status = Some(BranchStatus {
+        ahead: 1,
+        behind: 3,
+        upstream_branch: Some("upstream/main".into()),
+    });
+    row
+}
+
+fn behind_row_via_merge_status(path: &str, branch: &str) -> DashboardRow {
+    let mut row = row_with_pr_state(path, branch, true, PrState::Open);
+    if let Some(pr) = row.pull_request.as_mut() {
+        pr.merge_status = Some(MergeStatus::Behind);
+    }
+    row
+}
+
+#[test]
+fn action_menu_shows_update_option_for_open_pr_behind_via_branch_status() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        behind_row_via_branch_status("/tmp/repo-bug", "bug"),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        dumped.contains("Update Pull Request"),
+        "expected `Update Pull Request` for Open+behind row: {dumped}"
+    );
+}
+
+#[test]
+fn action_menu_shows_update_option_for_open_pr_behind_via_merge_status() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        behind_row_via_merge_status("/tmp/repo-bug", "bug"),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        dumped.contains("Update Pull Request"),
+        "expected `Update Pull Request` when merge_status==Behind: {dumped}"
+    );
+}
+
+#[test]
+fn action_menu_hides_update_option_for_open_pr_when_up_to_date() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        // `row_with_pr_state` keeps merge_status=None and behind=0 — so the
+        // row is Open but not behind its base.
+        row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Open),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        !dumped.contains("Update Pull Request"),
+        "Update Pull Request must hide when branch is up to date: {dumped}"
+    );
+    // Merge Pull Request must still appear (Open and up to date is fine to merge).
+    assert!(dumped.contains("Merge Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_update_option_for_merged_pr_even_if_behind() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut behind_merged = behind_row_via_branch_status("/tmp/repo-bug", "bug");
+    if let Some(pr) = behind_merged.pull_request.as_mut() {
+        pr.state = PrState::Merged;
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), behind_merged]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Update Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_update_option_for_closed_pr() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut behind_closed = behind_row_via_branch_status("/tmp/repo-bug", "bug");
+    if let Some(pr) = behind_closed.pull_request.as_mut() {
+        pr.state = PrState::Closed;
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), behind_closed]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Update Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_update_option_for_draft_pr() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut behind_draft = behind_row_via_branch_status("/tmp/repo-bug", "bug");
+    if let Some(pr) = behind_draft.pull_request.as_mut() {
+        pr.state = PrState::Draft;
+    }
+    screen.set_rows(vec![row("/tmp/repo", "main", true), behind_draft]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Update Pull Request"));
+}
+
+#[test]
+fn action_menu_hides_update_option_when_no_pr_present() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    let mut behind_no_pr = row("/tmp/repo-bug", "bug", true);
+    behind_no_pr.worktree.branch_status = Some(BranchStatus {
+        ahead: 0,
+        behind: 5,
+        upstream_branch: Some("upstream/main".into()),
+    });
+    screen.set_rows(vec![row("/tmp/repo", "main", true), behind_no_pr]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(!dumped.contains("Update Pull Request"));
+}
+
+// ---- "Update Branch" visibility -----------------------------------------
+// The mother (main) worktree is the only row that exposes "Update Branch".
+// It's the dashboard's one-click way to pull the upstream tip into the
+// mother — irrelevant on derived worktrees that already track their own
+// PR base via "Update Pull Request".
+
+fn open_action_menu_for_first_row(screen: &mut DashboardScreen) -> String {
+    screen.handle_key(key(KeyCode::Enter));
+    dump(120, 14, |f| screen.render(f, f.area()))
+}
+
+#[test]
+fn action_menu_shows_update_branch_on_mother_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", true),
+    ]);
+
+    let dumped = open_action_menu_for_first_row(&mut screen);
+    assert!(
+        dumped.contains("Update Branch"),
+        "expected `Update Branch` on mother row: {dumped}"
+    );
+}
+
+#[test]
+fn action_menu_hides_update_branch_on_non_main_row() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", true),
+    ]);
+
+    let dumped = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        !dumped.contains("Update Branch"),
+        "Update Branch must not appear on non-main rows: {dumped}"
+    );
 }

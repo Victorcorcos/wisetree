@@ -1,7 +1,7 @@
 //! Yes / No prompt over a checkbox-driven list of items.
 //!
 //! Used by the bulk-delete flow on the Delete screen: the dashboard's
-//! status filter (Merged / Opened / Clean / Dirty) feeds a list of
+//! status filter (Merged / Closed / Open / Clean / Dirty) feeds a list of
 //! worktree paths in; the user can then deselect any rows they'd rather
 //! keep before pressing Yes. By default every row is checked, so a user
 //! who wants to delete them must first move focus down to the buttons,

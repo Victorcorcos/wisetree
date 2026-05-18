@@ -1,22 +1,23 @@
 ---
 source: tests/tui_dashboard.rs
+assertion_line: 902
 expression: "dump_lines(72, 18, |f| screen.render(f, f.area()))"
 ---
 Refreshed just now - 3 worktrees, 0 dirty, 1 PR open
 
 Search: type to filter...
 
-Worktree           Branch        Status         A/B
-   /tmp/repo       main          Mother         =0
- ➤ /tmp/repo-bug   bug           Opened         +1 -0
-   /tmp/repo-feat  feat          Clean          =0
-
+Worktree        Branch        Status         A/B
+   repo         main          Mother         =0
+ ➤ repo-bug     bug           Opened         +1 -0
+   repo-feat    feat          Clean          =0
 Narrow view: 2 hidden  •  PR #42 Open: Improve dashboard...  •  Commit d
-                              ┌────────┐  ┌──────┐  ┌───────┐  ┌───────┐
-Delete worktrees with status: │ Merged │  │ Open │  │ Clean │  │ Dirty │
-                              └────────┘  └──────┘  └───────┘  └───────┘
+                              ┌────────┐  ┌────────┐  ┌──────┐
+Delete worktrees with status: │ Merged │  │ Closed │  │ Open │
+                              └────────┘  └────────┘  └──────┘
 ↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type t
 Status: Mother = main worktree (protected)  Dirty = has uncommitted chan
-PR Checks: ⚪ (Pending)  🟡 (Running)  🟢 (Passed)  🔴 (Failed)  ⚠️ (Errored)
-PR Reviews: ✋ (Pending)  👍 (Approved)  👎 (Changes Requested)
+PR Checks: ⚪  (Pending)  🟡  (Running)  ⚠️  (Errored)  🔴  (Failed)  🟢  (Pa
+PR Reviews: ✋  (Pending)  👎  (Changes Requested)  👍  (Approved)
+PR Merges: 📝  (Draft)  ❌  (Dirty)  🚫  (Blocked)  ❓  (Unknown)  🍂  (Behin
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls b

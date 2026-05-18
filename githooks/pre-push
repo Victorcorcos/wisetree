@@ -48,4 +48,7 @@ if ! git diff --quiet; then
   printf 'pre-push: committing auto-formatted changes\n'
   git add -u
   git commit -m "chore: auto-format and fix (cargo fmt + clippy)"
+  printf 'pre-push: re-pushing with auto-formatted commit included\n'
+  git push --no-verify "$1" HEAD
+  exit $?
 fi
