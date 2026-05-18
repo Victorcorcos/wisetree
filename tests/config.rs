@@ -5,8 +5,7 @@ use once_cell::sync::Lazy;
 use tempfile::TempDir;
 use wisetree::config::schema::{
     clamp_dashboard_refresh_interval, default_copy_ignores, default_copy_patterns,
-    default_path_template,
-    LinkStrategy,
+    default_path_template, LinkStrategy,
 };
 use wisetree::config::{ConfigService, WorktreeConfig};
 

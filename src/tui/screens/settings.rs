@@ -841,9 +841,7 @@ impl SettingsScreen {
             | SettingsStep::LinkPatterns
             | SettingsStep::LinkStrategy
             | SettingsStep::LinkCacheDir
-            | SettingsStep::IgnorePatterns => {
-                self.handle_copyable_detail(key)
-            }
+            | SettingsStep::IgnorePatterns => self.handle_copyable_detail(key),
             SettingsStep::DeleteBranch => self.handle_delete_branch(key),
             SettingsStep::CopySettings => self.handle_copy_settings(key),
             SettingsStep::CheckUpdates => self.handle_check_updates(key),
@@ -1792,10 +1790,7 @@ impl SettingsScreen {
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
         let rects = DashboardField::ALL.len();
-        let mut constraints: Vec<Constraint> = vec![
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ];
+        let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
         for _ in 0..rects {
             constraints.push(Constraint::Length(3));
             constraints.push(Constraint::Length(1));

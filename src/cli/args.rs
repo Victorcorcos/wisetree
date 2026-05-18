@@ -67,9 +67,7 @@ impl CacheAction {
 pub enum CliCommand {
     Create,
     Dashboard,
-    Cache {
-        action: CacheAction,
-    },
+    Cache { action: CacheAction },
 }
 
 /// Flags supplied alongside a non-interactive subcommand.
