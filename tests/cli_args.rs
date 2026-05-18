@@ -1,4 +1,4 @@
-use wisetree::cli::args::{parse_args, AppMode, CliCommand};
+use wisetree::cli::args::{parse_args, AppMode, CacheAction, CliCommand};
 
 #[test]
 fn no_args_defaults_to_menu_no_help_no_cli() {
@@ -136,4 +136,36 @@ fn equal_sign_value_form_is_supported() {
     let args = p.cli_args.expect("must be cli");
     assert_eq!(args.name.as_deref(), Some("foo"));
     assert_eq!(args.source.as_deref(), Some("main"));
+}
+
+#[test]
+fn cache_command_without_action_opens_cache_mode() {
+    let p = parse_args::<Vec<String>>(vec!["cache".into()]).unwrap();
+    assert_eq!(p.mode, AppMode::Cache);
+    assert!(p.cli_args.is_none());
+}
+
+#[test]
+fn cache_subcommands_parse_as_non_interactive() {
+    let p =
+        parse_args::<Vec<String>>(vec!["cache".into(), "list".into(), "--json".into()]).unwrap();
+    let args = p.cli_args.expect("must be cli");
+    assert_eq!(
+        args.command,
+        CliCommand::Cache {
+            action: CacheAction::List
+        }
+    );
+    assert!(args.json);
+
+    let p =
+        parse_args::<Vec<String>>(vec!["cache".into(), "clear".into(), "--force".into()]).unwrap();
+    let args = p.cli_args.expect("must be cli");
+    assert_eq!(
+        args.command,
+        CliCommand::Cache {
+            action: CacheAction::Clear
+        }
+    );
+    assert!(args.force);
 }

@@ -18,7 +18,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::cli::AppMode;
-use crate::config::schema::{DashboardConfig, WorktreeConfig};
+use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
@@ -31,13 +31,14 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateCheckResult, UpdatePhase,
-    UpdateProgress,
+    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdateCheckResult, UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
-use crate::tui::screens::create::{CreateAction, CreateScreen};
+use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
+use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryLine, SummaryTone};
 use crate::tui::screens::dashboard::{
     BulkDeleteStatus, DashboardAction, DashboardScreen, MergePullRequestRequest,
     UpdatePullRequestRequest,
@@ -52,13 +53,16 @@ use crate::tui::screens::setup::{SetupAction, SetupScreen};
 use crate::tui::screens::setup_project::{
     SetupProjectAction, SetupProjectPresetValues, SetupProjectScreen, SetupProjectStep,
 };
+use crate::tui::screens::update_branch::UpdateBranchScreen;
 use crate::tui::screens::update_pr::{UpdateAction, UpdatePullRequestScreen};
 use crate::tui::selection::{
     clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
 };
 use crate::tui::terminal;
 use crate::tui::widgets::{render_toast, ToastState, ToastVariant, WelcomeHeader};
-use crate::worktree::service::DeleteOutcome as ServiceDeleteOutcome;
+use crate::worktree::service::{
+    CreateOutcome as ServiceCreateOutcome, DeleteOutcome as ServiceDeleteOutcome,
+};
 use crate::worktree::WorktreeService;
 use crate::VERSION;
 
@@ -78,8 +82,10 @@ enum InitPhase {
 
 enum AppEvent {
     Initialized(Box<InitOutcome>),
+    CacheLoaded(Result<crate::files::CacheOverview, String>),
+    CacheEntryDeleted(Result<crate::files::CacheOverview, String>),
     CreateBranchesLoaded(Result<Vec<GitBranch>, String>),
-    CreateFinished(Result<PathBuf, String>),
+    CreateFinished(Result<ServiceCreateOutcome, String>),
     DeleteLoaded(Result<Vec<GitWorktree>, String>),
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
     SettingsUpdateChecked(UpdateCheckResult),
@@ -103,6 +109,7 @@ enum AppEvent {
         progress: UpdateProgress,
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
+    UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
 }
 
 struct MergePrDetailsPayload {
@@ -141,6 +148,7 @@ pub struct App {
     menu: Option<MenuScreen>,
     dashboard: Option<DashboardScreen>,
     dashboard_watch: Option<DashboardWatch>,
+    cache: Option<CacheScreen>,
     create: Option<CreateScreen>,
     delete: Option<DeleteScreen>,
     settings: Option<SettingsScreen>,
@@ -148,6 +156,7 @@ pub struct App {
     setup_project: Option<SetupProjectScreen>,
     merge_pr: Option<MergePullRequestScreen>,
     update_pr: Option<UpdatePullRequestScreen>,
+    update_branch: Option<UpdateBranchScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
     last_rendered_buffer: Option<Buffer>,
@@ -180,6 +189,7 @@ impl App {
             menu: None,
             dashboard: None,
             dashboard_watch: None,
+            cache: None,
             create: None,
             delete: None,
             settings: None,
@@ -187,6 +197,7 @@ impl App {
             setup_project: None,
             merge_pr: None,
             update_pr: None,
+            update_branch: None,
             shell_integration_status: None,
             toast: ToastState::default(),
             last_rendered_buffer: None,
@@ -324,6 +335,17 @@ impl App {
                     dashboard.render(frame, panel);
                 }
             }
+            Screen::Cache => {
+                let h = self
+                    .cache
+                    .as_ref()
+                    .map_or(8, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
+                if let Some(cache) = self.cache.as_mut() {
+                    cache.tick = self.tick;
+                    cache.render(frame, panel);
+                }
+            }
             Screen::Create => {
                 let h = self
                     .create
@@ -414,6 +436,17 @@ impl App {
                 if let Some(update_pr) = self.update_pr.as_mut() {
                     update_pr.tick = self.tick;
                     update_pr.render(frame, panel);
+                }
+            }
+            Screen::UpdateBranch => {
+                let h = self
+                    .update_branch
+                    .as_ref()
+                    .map_or(3, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
+                if let Some(update_branch) = self.update_branch.as_mut() {
+                    update_branch.tick = self.tick;
+                    update_branch.render(frame, panel);
                 }
             }
         }
@@ -602,6 +635,7 @@ impl App {
         match self.screen {
             Screen::Menu => self.handle_menu_key(key, tx),
             Screen::Dashboard => self.handle_dashboard_key(key, tx),
+            Screen::Cache => self.handle_cache_key(key, tx),
             Screen::Create => self.handle_create_key(key, tx),
             Screen::Delete => self.handle_delete_key(key, tx),
             Screen::Settings => self.handle_settings_key(key, tx),
@@ -609,6 +643,11 @@ impl App {
             Screen::SetupProject => self.handle_setup_project_key(key, tx),
             Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
             Screen::UpdatePullRequest => self.handle_update_pr_key(key, tx),
+            Screen::UpdateBranch => {
+                if let Some(screen) = self.update_branch.as_mut() {
+                    screen.handle_key(key);
+                }
+            }
         }
     }
 
@@ -728,6 +767,7 @@ impl App {
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                     MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
+                    MenuChoice::Cache => self.enter_screen(Screen::Cache, tx),
                     MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
                 }
             }
@@ -809,7 +849,48 @@ impl App {
             DashboardAction::UpdatePullRequest(request) => {
                 self.start_update_pr_flow(*request, tx);
             }
+            DashboardAction::UpdateBranch(path) => {
+                self.start_update_branch_flow(path, tx);
+            }
         }
+    }
+
+    fn handle_cache_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.cache.as_mut() {
+            Some(cache) => cache.handle_key(key),
+            None => return,
+        };
+
+        match action {
+            CacheScreenAction::Continue => {}
+            CacheScreenAction::Back => self.back_to_menu(),
+            CacheScreenAction::Refresh => {
+                if let Some(cache) = self.cache.as_mut() {
+                    cache.start_loading();
+                }
+                kick_off_cache_load(self.git_root.clone(), tx.clone());
+            }
+            CacheScreenAction::DeleteEntry(relative_path) => {
+                if let Some(cache) = self.cache.as_mut() {
+                    cache.start_loading();
+                }
+                kick_off_cache_entry_delete(self.git_root.clone(), relative_path, tx.clone());
+            }
+        }
+    }
+
+    /// Mount the loading splash synchronously so the user gets an
+    /// instant visual response, then kick off the background fetch +
+    /// merge. The flow ends in `apply_update_branch_finished`, which
+    /// returns to the dashboard and toasts the outcome.
+    fn start_update_branch_flow(
+        &mut self,
+        worktree_path: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.update_branch = Some(UpdateBranchScreen::new(worktree_path.clone()));
+        self.screen = Screen::UpdateBranch;
+        kick_off_update_branch(self.current_dashboard_config(), worktree_path, tx.clone());
     }
 
     fn start_merge_pr_flow(
@@ -1005,6 +1086,27 @@ impl App {
                     }
                 }
             }
+            SettingsAction::SaveCopyPatterns(patterns) => {
+                if let Err(err) = self.save_copy_patterns(patterns) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save copy patterns: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveIgnorePatterns(patterns) => {
+                if let Err(err) = self.save_ignore_patterns(patterns) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save ignore patterns: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveLinkPatterns(patterns) => {
+                if let Err(err) = self.save_link_patterns(patterns) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save link patterns: {err}"));
+                    }
+                }
+            }
             SettingsAction::CopySettings(direction) => {
                 if let Err(err) = self.copy_settings(direction) {
                     if let Some(settings) = self.settings.as_mut() {
@@ -1030,6 +1132,20 @@ impl App {
                 if let Err(err) = self.save_path_template(template) {
                     if let Some(settings) = self.settings.as_mut() {
                         settings.set_error(format!("Failed to save path template: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveLinkStrategy(strategy) => {
+                if let Err(err) = self.save_link_strategy(strategy) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save link strategy: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveLinkCacheDir(cache_dir) => {
+                if let Err(err) = self.save_link_cache_dir(cache_dir) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save link cache dir: {err}"));
                     }
                 }
             }
@@ -1116,6 +1232,12 @@ impl App {
         let mut config = self.current_config().cloned().unwrap_or_default();
         config.worktree_copy_patterns = preset.copy_patterns;
         config.worktree_copy_ignores = preset.copy_ignores;
+        config.worktree_link_patterns = preset.link_patterns;
+        config.worktree_link_strategy = if config.worktree_link_patterns.is_empty() {
+            LinkStrategy::CreateEmpty
+        } else {
+            LinkStrategy::SeedFromSource
+        };
         config.post_create_cmd = preset.post_create_cmd;
 
         let mut writer = ConfigService::new();
@@ -1173,6 +1295,14 @@ impl App {
     fn handle_app_event(&mut self, event: AppEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match event {
             AppEvent::Initialized(outcome) => self.apply_init_outcome(*outcome, tx),
+            AppEvent::CacheLoaded(result) | AppEvent::CacheEntryDeleted(result) => {
+                if let Some(cache) = self.cache.as_mut() {
+                    match result {
+                        Ok(overview) => cache.set_overview(overview),
+                        Err(message) => cache.set_error(message),
+                    }
+                }
+            }
             AppEvent::CreateBranchesLoaded(result) => {
                 if let Some(create) = self.create.as_mut() {
                     match result {
@@ -1185,8 +1315,9 @@ impl App {
                 if let Some(create) = self.create.as_mut() {
                     match result {
                         Ok(path) => {
-                            create.set_created_worktree_path(path);
-                            self.finish_create_success();
+                            let summary = create_summary_lines(&path);
+                            create.set_created_worktree_path(path.worktree_path.clone());
+                            create.mark_complete(summary);
                         }
                         Err(message) => create.set_error(message),
                     }
@@ -1285,6 +1416,57 @@ impl App {
                 self.apply_update_pr_progress(number, progress);
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
+            AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
+        }
+    }
+
+    fn apply_update_branch_finished(
+        &mut self,
+        result: Result<UpdateBranchOutcome, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // Drop the loading splash and route back to the dashboard before
+        // toasting — the user must land on the screen where the toast
+        // appears, otherwise the result would flash on the splash for
+        // one frame and vanish.
+        self.update_branch = None;
+        if matches!(self.screen, Screen::UpdateBranch) {
+            self.enter_screen(Screen::Dashboard, tx);
+        }
+        self.show_update_branch_toast(result);
+    }
+
+    fn show_update_branch_toast(&mut self, result: Result<UpdateBranchOutcome, String>) {
+        match result {
+            Ok(UpdateBranchOutcome::AlreadyUpToDate { base_ref }) => self.show_toast(
+                ToastVariant::Info,
+                format!("Already up to date with {base_ref}."),
+            ),
+            Ok(UpdateBranchOutcome::FastForwarded { base_ref, summary }) => self.show_toast(
+                ToastVariant::Info,
+                format!("Fast-forwarded to {base_ref} ({summary})."),
+            ),
+            Ok(UpdateBranchOutcome::Merged { base_ref, summary }) => self.show_toast(
+                ToastVariant::Info,
+                format!("Merged {base_ref} ({summary})."),
+            ),
+            Ok(UpdateBranchOutcome::NoBaseRef) => self.show_toast(
+                ToastVariant::Warning,
+                "No upstream/main, upstream/master, origin/main, or origin/master ref \
+                 was reachable to update from."
+                    .to_string(),
+            ),
+            Ok(UpdateBranchOutcome::FetchFailed(message)) => {
+                self.show_toast(ToastVariant::Error, format!("git fetch failed: {message}"))
+            }
+            Ok(UpdateBranchOutcome::MergeFailed { base_ref, message }) => self.show_toast(
+                ToastVariant::Error,
+                format!("git merge {base_ref} failed: {message}"),
+            ),
+            Err(message) => self.show_toast(
+                ToastVariant::Error,
+                format!("Update branch failed: {message}"),
+            ),
         }
     }
 
@@ -1623,6 +1805,10 @@ impl App {
                 ));
                 self.dashboard_watch = Some(service.watch());
             }
+            Screen::Cache => {
+                self.cache = Some(CacheScreen::new());
+                kick_off_cache_load(self.git_root.clone(), tx.clone());
+            }
             Screen::Create => {
                 self.create = Some(CreateScreen::new());
                 kick_off_create_branch_load(self.git_root.clone(), tx.clone());
@@ -1679,6 +1865,15 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::UpdateBranch => {
+                // Only reachable through `start_update_branch_flow`,
+                // which seeds `update_branch` before flipping the
+                // screen. Any other path means we lost the splash and
+                // would render an empty panel — bail back to the menu.
+                if self.update_branch.is_none() {
+                    self.back_to_menu();
+                }
+            }
         }
 
         if !matches!(screen, Screen::Delete) {
@@ -1690,8 +1885,10 @@ impl App {
 
     fn clear_screen_state(&mut self) {
         self.menu = None;
+        self.cache = None;
         self.dashboard = None;
         self.dashboard_watch = None;
+        self.cache = None;
         self.create = None;
         self.delete = None;
         self.settings = None;
@@ -1699,6 +1896,7 @@ impl App {
         self.setup_project = None;
         self.merge_pr = None;
         self.update_pr = None;
+        self.update_branch = None;
         self.mouse_selection = None;
     }
 
@@ -1793,6 +1991,9 @@ impl App {
                 .as_ref()
                 .map(|status| status.is_installed),
             self.has_local_config(),
+            self.current_config()
+                .map(|config| !config.worktree_link_patterns.is_empty())
+                .unwrap_or(false),
         )
     }
 
@@ -1929,6 +2130,71 @@ impl App {
         Ok(())
     }
 
+    fn save_copy_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
+        self.save_pattern_list_setting(
+            |config| config.worktree_copy_patterns = patterns.clone(),
+            |settings| settings.mark_copy_patterns_saved(patterns.clone()),
+        )
+    }
+
+    fn save_ignore_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
+        self.save_pattern_list_setting(
+            |config| config.worktree_copy_ignores = patterns.clone(),
+            |settings| settings.mark_ignore_patterns_saved(patterns.clone()),
+        )
+    }
+
+    fn save_link_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
+        self.save_pattern_list_setting(
+            |config| config.worktree_link_patterns = patterns.clone(),
+            |settings| settings.mark_link_patterns_saved(patterns.clone()),
+        )
+    }
+
+    fn save_pattern_list_setting<F, G>(
+        &mut self,
+        mut apply: F,
+        mut mark_saved: G,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut WorktreeConfig),
+        G: FnMut(&mut SettingsScreen),
+    {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        apply(&mut config);
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            mark_saved(settings);
+        }
+        Ok(())
+    }
+
     fn save_terminal_command(&mut self, command: String) -> Result<(), String> {
         let local_path = self.local_config_path();
         let target_path = match local_path.as_ref().filter(|p| p.exists()) {
@@ -1997,6 +2263,83 @@ impl App {
 
         if let Some(settings) = self.settings.as_mut() {
             settings.mark_path_template_saved(template);
+        }
+        Ok(())
+    }
+
+    fn save_link_strategy(&mut self, strategy: LinkStrategy) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        config.worktree_link_strategy = strategy;
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_link_strategy_saved(strategy);
+        }
+        Ok(())
+    }
+
+    fn save_link_cache_dir(&mut self, cache_dir: String) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        let trimmed = cache_dir.trim().to_string();
+        config.worktree_link_cache_dir = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.clone())
+        };
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_link_cache_dir_saved(config.worktree_link_cache_dir.clone());
         }
         Ok(())
     }
@@ -2170,6 +2513,47 @@ fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
     });
 }
 
+fn kick_off_cache_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let mut service = WorktreeService::new(git_root.map(PathBuf::from));
+        if let Err(err) = service.initialize().await {
+            let _ = tx.send(AppEvent::CacheLoaded(Err(user_friendly_message(&err))));
+            return;
+        }
+
+        let result = service
+            .cache_overview()
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::CacheLoaded(result));
+    });
+}
+
+fn kick_off_cache_entry_delete(
+    git_root: Option<String>,
+    relative_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let mut service = WorktreeService::new(git_root.map(PathBuf::from));
+        if let Err(err) = service.initialize().await {
+            let _ = tx.send(AppEvent::CacheEntryDeleted(Err(user_friendly_message(
+                &err,
+            ))));
+            return;
+        }
+
+        let result = match service.remove_repo_cache_entry(&relative_path).await {
+            Ok(()) => service
+                .cache_overview()
+                .await
+                .map_err(|err| user_friendly_message(&err)),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::CacheEntryDeleted(result));
+    });
+}
+
 fn kick_off_create_branch_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let service = GitService::new(git_root.map(PathBuf::from));
@@ -2227,7 +2611,6 @@ fn kick_off_create_worktree(
         let result = service
             .create_worktree(&options, None)
             .await
-            .map(|outcome| outcome.worktree_path)
             .map_err(|e| user_friendly_message(&e));
         let _ = tx.send(AppEvent::CreateFinished(result));
     });
@@ -2343,6 +2726,24 @@ fn kick_off_resolve_base_ref(
         let base_ref =
             crate::services::dashboard::resolve_base_ref(&PathBuf::from(&worktree_path)).await;
         let _ = tx.send(AppEvent::UpdatePrBaseRefResolved { number, base_ref });
+    });
+}
+
+fn kick_off_update_branch(
+    config: DashboardConfig,
+    worktree_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        // The mother worktree IS the git root, so reuse the path as the
+        // service root — there is no separate "git_root" to resolve from
+        // app state for this action.
+        let service = DashboardService::new(PathBuf::from(&worktree_path), config);
+        let event = match service.update_branch(&worktree_path).await {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::UpdateBranchFinished(event));
     });
 }
 
@@ -2504,6 +2905,131 @@ fn screen_delete_outcome(outcome: ServiceDeleteOutcome) -> ScreenDeleteOutcome {
         worktree_deleted: outcome.worktree_deleted,
         branch_deleted: outcome.branch_deleted,
         branch_name: outcome.branch_name,
+    }
+}
+
+fn create_summary_lines(outcome: &ServiceCreateOutcome) -> Vec<SummaryLine> {
+    let mut lines = vec![SummaryLine::new(
+        format!("Worktree path: {}", outcome.worktree_path.display()),
+        SummaryTone::Emphasis,
+    )];
+
+    if let Some(report) = &outcome.copy_report {
+        append_section_header(&mut lines, "Copy Report");
+        append_summary_values(
+            &mut lines,
+            report.copied.iter().map(|path| format!("Copied {path}")),
+            SummaryTone::Success,
+            3,
+        );
+        append_summary_values(
+            &mut lines,
+            report.skipped.iter().map(|path| format!("Skipped {path}")),
+            SummaryTone::Warning,
+            2,
+        );
+        append_summary_values(
+            &mut lines,
+            report.errors.iter().cloned(),
+            SummaryTone::Error,
+            2,
+        );
+    }
+
+    if let Some(report) = &outcome.link_report {
+        append_section_header(&mut lines, "Shared Cache Links");
+        append_summary_values(
+            &mut lines,
+            report.linked.iter().map(|entry| {
+                if entry.seeded {
+                    format!("Linked {} (seeded from source)", entry.pattern)
+                } else {
+                    format!("Linked {} (using shared cache)", entry.pattern)
+                }
+            }),
+            SummaryTone::Success,
+            4,
+        );
+        append_summary_values(
+            &mut lines,
+            report.skipped.iter().cloned(),
+            SummaryTone::Warning,
+            3,
+        );
+        append_summary_values(
+            &mut lines,
+            report.errors.iter().cloned(),
+            SummaryTone::Error,
+            3,
+        );
+    }
+
+    if !outcome.command_runs.is_empty() {
+        append_section_header(&mut lines, "Post-Create Commands");
+        let successful = outcome
+            .command_runs
+            .iter()
+            .filter(|run| run.success)
+            .count();
+        lines.push(SummaryLine::new(
+            format!(
+                "Completed {successful}/{} command(s)",
+                outcome.command_runs.len()
+            ),
+            if successful == outcome.command_runs.len() {
+                SummaryTone::Success
+            } else {
+                SummaryTone::Warning
+            },
+        ));
+        append_summary_values(
+            &mut lines,
+            outcome
+                .command_runs
+                .iter()
+                .filter(|run| !run.success)
+                .map(|run| format!("Command failed: {}", run.command)),
+            SummaryTone::Error,
+            2,
+        );
+    }
+
+    if lines.len() == 1 {
+        lines.push(SummaryLine::new(
+            "No copy, shared cache link, or post-create steps were configured.",
+            SummaryTone::Muted,
+        ));
+    }
+
+    lines
+}
+
+fn append_section_header(lines: &mut Vec<SummaryLine>, title: &str) {
+    lines.push(SummaryLine::new(title, SummaryTone::Info));
+}
+
+fn append_summary_values<I>(
+    lines: &mut Vec<SummaryLine>,
+    values: I,
+    tone: SummaryTone,
+    limit: usize,
+) where
+    I: IntoIterator<Item = String>,
+{
+    let collected: Vec<String> = values.into_iter().collect();
+    if collected.is_empty() {
+        return;
+    }
+
+    for value in collected.iter().take(limit) {
+        lines.push(SummaryLine::new(format!("  • {value}"), tone));
+    }
+
+    if collected.len() > limit {
+        lines.push(SummaryLine::new(
+            format!("  • {} more", collected.len() - limit),
+            SummaryTone::Muted,
+        ));
     }
 }
 
@@ -2855,8 +3381,7 @@ mod tests {
 
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
-
-            for _ in 0..7 {
+            for _ in 0..10 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -2925,7 +3450,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..7 {
+            for _ in 0..10 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -3006,7 +3531,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..7 {
+            for _ in 0..10 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -3097,7 +3622,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..5 {
+            for _ in 0..8 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -3157,7 +3682,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..5 {
+            for _ in 0..8 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -3350,6 +3875,187 @@ mod tests {
     }
 
     #[test]
+    fn save_link_strategy_writes_to_local_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_link_strategy: LinkStrategy::CreateEmpty,
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                worktree_link_strategy: LinkStrategy::SeedIfPresent,
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_link_strategy(LinkStrategy::SeedFromSource)
+                .unwrap();
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert_eq!(
+                saved_local.worktree_link_strategy,
+                LinkStrategy::SeedFromSource
+            );
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(
+                saved_global.worktree_link_strategy,
+                LinkStrategy::CreateEmpty
+            );
+
+            assert_eq!(
+                app.current_config().unwrap().worktree_link_strategy,
+                LinkStrategy::SeedFromSource
+            );
+        });
+    }
+
+    #[test]
+    fn save_link_strategy_writes_to_global_when_local_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_link_strategy: LinkStrategy::CreateEmpty,
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_link_strategy(LinkStrategy::SeedIfPresent).unwrap();
+
+            assert!(!local_path.exists(), "local config must not be created");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(
+                saved_global.worktree_link_strategy,
+                LinkStrategy::SeedIfPresent
+            );
+            assert_eq!(
+                app.current_config().unwrap().worktree_link_strategy,
+                LinkStrategy::SeedIfPresent
+            );
+        });
+    }
+
+    #[test]
+    fn save_link_cache_dir_writes_to_local_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_link_cache_dir: Some("/global/cache".into()),
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                worktree_link_cache_dir: Some("/local/old-cache".into()),
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_link_cache_dir("/local/new-cache".into()).unwrap();
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert_eq!(
+                saved_local.worktree_link_cache_dir,
+                Some("/local/new-cache".into())
+            );
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(
+                saved_global.worktree_link_cache_dir,
+                Some("/global/cache".into())
+            );
+
+            assert_eq!(
+                app.current_config().unwrap().worktree_link_cache_dir,
+                Some("/local/new-cache".into())
+            );
+        });
+    }
+
+    #[test]
+    fn save_link_cache_dir_writes_to_global_when_local_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_link_cache_dir: Some("/global/old-cache".into()),
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_link_cache_dir(String::new()).unwrap();
+
+            assert!(!local_path.exists(), "local config must not be created");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.worktree_link_cache_dir, None);
+            assert_eq!(app.current_config().unwrap().worktree_link_cache_dir, None);
+        });
+    }
+
+    #[test]
     fn save_dashboard_writes_to_local_when_local_exists() {
         with_home(|home| {
             let repo_root = home.path().join("repo");
@@ -3473,20 +4179,20 @@ mod tests {
         app.menu = None;
         app.create = Some(CreateScreen::new());
         if let Some(create) = app.create.as_mut() {
+            create.set_branches(Vec::new());
             create.navigate_after_create = false;
         }
 
         app.handle_app_event(
-            AppEvent::CreateFinished(Ok(PathBuf::from("/tmp/repo/feat-x"))),
+            AppEvent::CreateFinished(Ok(ServiceCreateOutcome {
+                worktree_path: PathBuf::from("/tmp/repo/feat-x"),
+                ..ServiceCreateOutcome::default()
+            })),
             &app_event_tx(),
         );
 
-        assert_eq!(app.screen, Screen::Menu);
-        assert!(app.create.is_none());
-
-        let toast = app.toast.current().expect("toast should be shown");
-        assert_eq!(toast.variant, ToastVariant::Success);
-        assert_eq!(toast.message, CREATE_SUCCESS);
+        assert_eq!(app.screen, Screen::Create);
+        assert!(app.toast.current().is_none());
 
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3499,7 +4205,16 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(dumped.contains("Choose wisely"));
+        assert!(dumped.contains("Worktree created successfully"));
+        assert!(dumped.contains("Worktree path: /tmp/repo/feat-x"));
+
+        app.handle_key(key(KeyCode::Enter), &app_event_tx());
+
+        assert_eq!(app.screen, Screen::Menu);
+        assert!(app.create.is_none());
+
+        let toast = app.toast.current().expect("toast should be shown");
+        assert_eq!(toast.variant, ToastVariant::Success);
         assert!(dumped.contains(CREATE_SUCCESS));
     }
 
@@ -3512,11 +4227,19 @@ mod tests {
         app.worktree_service = Some(service);
         app.git_root = Some("/tmp/repo".into());
         app.create = Some(CreateScreen::new());
+        if let Some(create) = app.create.as_mut() {
+            create.set_branches(Vec::new());
+        }
 
         app.handle_app_event(
-            AppEvent::CreateFinished(Ok(PathBuf::from("/tmp/repo/feat-x"))),
+            AppEvent::CreateFinished(Ok(ServiceCreateOutcome {
+                worktree_path: PathBuf::from("/tmp/repo/feat-x"),
+                ..ServiceCreateOutcome::default()
+            })),
             &app_event_tx(),
         );
+
+        app.handle_key(key(KeyCode::Enter), &app_event_tx());
 
         assert!(app.quit_requested);
         assert_eq!(app.selected_path(), Some("/tmp/repo/feat-x"));
@@ -3701,6 +4424,15 @@ mod tests {
                 .worktree_copy_ignores
                 .iter()
                 .any(|pattern| pattern == "web/**/node_modules/**"));
+            assert!(saved
+                .worktree_link_patterns
+                .iter()
+                .any(|pattern| pattern == "api/vendor/bundle"));
+            assert!(saved
+                .worktree_link_patterns
+                .iter()
+                .any(|pattern| pattern == "web/node_modules"));
+            assert_eq!(saved.worktree_link_strategy, LinkStrategy::SeedFromSource);
             assert!(saved.post_create_cmd.iter().any(|command| {
                 command == "(cd 'api' && bundle install --jobs 5 --verbose --retry 4)"
             }));
@@ -3731,6 +4463,7 @@ mod tests {
                     "copy-6".into(),
                 ],
                 copy_ignores: vec!["ignore-1".into()],
+                link_patterns: vec!["links-1".into()],
                 post_create_cmd: vec!["cmd-1".into()],
             },
         );
@@ -3761,7 +4494,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!scrolled.contains("copy-1"));
-        assert!(scrolled.contains("copy-4"));
+        assert!(scrolled.contains("copy-3"));
         assert!(scrolled.contains("Yes"));
         assert!(scrolled.contains("No"));
     }

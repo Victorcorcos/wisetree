@@ -805,6 +805,7 @@ fn row_with(merge_status: Option<MergeStatus>, behind: Option<u64>) -> Dashboard
             checks_status: Some(CheckStatus::Passed),
             review_status: None,
             merge_status: Some(status),
+            reviewers: Default::default(),
         }),
         error: None,
     }

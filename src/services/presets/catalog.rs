@@ -1,9 +1,9 @@
 //! Static catalog of language/framework setup presets.
 //!
-//! Each [`Preset`] bundles the three knobs the user wants pre-filled when
+//! Each [`Preset`] bundles the four knobs the user wants pre-filled when
 //! bootstrapping a new project: `worktreeCopyPatterns`, `worktreeCopyIgnores`,
-//! and `postCreateCmd`. Detection signatures live alongside each entry so the
-//! menu can pre-select the right preset.
+//! `worktreeLinkPatterns`, and `postCreateCmd`. Detection signatures live
+//! alongside each entry so the menu can pre-select the right preset.
 
 use std::path::Path;
 
@@ -71,7 +71,7 @@ impl PresetId {
     }
 }
 
-/// A preset bundles UI metadata, detection rules, and the three lists that
+/// A preset bundles UI metadata, detection rules, and the four lists that
 /// will be written into `.wisetree.json` when the user confirms.
 #[derive(Debug, Clone)]
 pub struct Preset {
@@ -80,6 +80,7 @@ pub struct Preset {
     pub description: &'static str,
     pub copy_patterns: Vec<&'static str>,
     pub copy_ignores: Vec<&'static str>,
+    pub link_patterns: Vec<&'static str>,
     pub post_create_cmd: Vec<&'static str>,
     pub signature: Signature,
 }
@@ -98,9 +99,53 @@ impl Preset {
         self.copy_ignores.iter().map(|s| s.to_string()).collect()
     }
 
+    pub fn link_patterns_owned(&self) -> Vec<String> {
+        self.link_patterns.iter().map(|s| s.to_string()).collect()
+    }
+
     pub fn post_create_cmd_owned(&self) -> Vec<String> {
         self.post_create_cmd.iter().map(|s| s.to_string()).collect()
     }
+}
+
+fn no_link_patterns() -> Vec<&'static str> {
+    Vec::new()
+}
+
+fn node_link_patterns() -> Vec<&'static str> {
+    vec!["node_modules"]
+}
+
+fn rails_link_patterns() -> Vec<&'static str> {
+    vec!["vendor/bundle", "node_modules"]
+}
+
+fn python_link_patterns() -> Vec<&'static str> {
+    vec![".venv"]
+}
+
+fn flutter_link_patterns() -> Vec<&'static str> {
+    vec![".dart_tool", "ios/Pods", "ios/.symlinks"]
+}
+
+fn gradle_link_patterns() -> Vec<&'static str> {
+    vec![".gradle"]
+}
+
+fn ios_link_patterns() -> Vec<&'static str> {
+    vec!["Pods", ".swiftpm", "Carthage/Build", "Carthage/Checkouts"]
+}
+
+fn rust_link_patterns() -> Vec<&'static str> {
+    vec!["target"]
+}
+
+fn laravel_link_patterns() -> Vec<&'static str> {
+    vec!["vendor", "node_modules"]
+}
+
+fn phoenix_link_patterns() -> Vec<&'static str> {
+    vec!["deps", "_build"]
 }
 
 /// Returns the full preset catalog in the order they are listed in `PLAN.md`.
@@ -137,6 +182,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.git/**",
                 "**/.DS_Store",
             ],
+            link_patterns: rails_link_patterns(),
             post_create_cmd: vec![
                 "bundle install --jobs 5 --verbose --retry 4",
                 "yarn install",
@@ -174,6 +220,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.mypy_cache/**",
                 "**/.git/**",
             ],
+            link_patterns: python_link_patterns(),
             post_create_cmd: vec![
                 "python -m venv .venv",
                 ".venv/bin/pip install -r requirements.txt",
@@ -209,6 +256,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/htmlcov/**",
                 "**/.git/**",
             ],
+            link_patterns: python_link_patterns(),
             post_create_cmd: vec![
                 "python -m venv .venv",
                 ".venv/bin/pip install -r requirements.txt",
@@ -240,6 +288,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.mypy_cache/**",
                 "**/.git/**",
             ],
+            link_patterns: python_link_patterns(),
             post_create_cmd: vec![
                 "python -m venv .venv",
                 ".venv/bin/pip install -r requirements.txt",
@@ -266,6 +315,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.eslintcache",
                 "**/.DS_Store",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::any_of(&[
                 Signature::file_exists("next.config.js"),
@@ -293,6 +343,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.cache/**",
                 "**/coverage/**",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::any_of(&[
                 Signature::file_exists("remix.config.js"),
@@ -317,6 +368,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.eslintcache",
                 "**/pids/**",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::file_exists("nest-cli.json"),
         },
@@ -335,6 +387,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/build/**",
                 "**/coverage/**",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::any_of(&[
                 Signature::file_exists("nuxt.config.js"),
@@ -357,6 +410,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.nx/**",
                 "**/coverage/**",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::file_exists("angular.json"),
         },
@@ -373,6 +427,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/dist/**",
                 "**/build/**",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::any_of(&[
                 Signature::file_exists("svelte.config.js"),
@@ -397,6 +452,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.netlify/**",
                 "**/dist/**",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::any_of(&[
                 Signature::file_exists("astro.config.mjs"),
@@ -419,6 +475,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/storybook-static/**",
                 "**/.eslintcache",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::file_contains("package.json", "\"react\""),
         },
@@ -441,6 +498,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/*.pid",
                 "**/*.seed",
             ],
+            link_patterns: node_link_patterns(),
             post_create_cmd: vec!["npm install"],
             signature: Signature::file_exists("package.json"),
         },
@@ -470,6 +528,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/ios/Flutter/Generated.xcconfig",
                 "**/ios/Pods/**",
             ],
+            link_patterns: flutter_link_patterns(),
             post_create_cmd: vec![
                 "flutter pub get",
                 "(cd ios && pod install --silent) || true",
@@ -507,6 +566,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.project",
                 "**/.classpath",
             ],
+            link_patterns: no_link_patterns(),
             post_create_cmd: vec!["./mvnw -DskipTests package"],
             signature: Signature::file_contains("pom.xml", "spring-boot"),
         },
@@ -535,6 +595,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/.project",
                 "**/.classpath",
             ],
+            link_patterns: gradle_link_patterns(),
             post_create_cmd: vec!["./gradlew build -x test"],
             signature: Signature::any_of(&[
                 Signature::file_contains("build.gradle", "spring-boot"),
@@ -566,6 +627,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/release/**",
                 "**/.cxx/**",
             ],
+            link_patterns: gradle_link_patterns(),
             post_create_cmd: vec!["./gradlew assembleDebug"],
             signature: Signature::all_of(&[
                 Signature::any_of(&[
@@ -606,6 +668,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/fastlane/screenshots/**",
                 "**/fastlane/test_output/**",
             ],
+            link_patterns: ios_link_patterns(),
             post_create_cmd: vec![
                 "pod install --silent || true",
                 "xcodebuild -resolvePackageDependencies -quiet || true",
@@ -640,6 +703,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/artifacts/**",
                 "**/coverage/**",
             ],
+            link_patterns: no_link_patterns(),
             post_create_cmd: vec![
                 "dotnet restore",
                 "dotnet dev-certs https --check --trust >/dev/null 2>&1 || true",
@@ -670,6 +734,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/*.cover",
                 "**/*.coverprofile",
             ],
+            link_patterns: no_link_patterns(),
             post_create_cmd: vec!["go mod download", "go work sync || true"],
             signature: Signature::file_exists("go.mod"),
         },
@@ -686,6 +751,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/perf.data",
                 "**/perf.data.old",
             ],
+            link_patterns: rust_link_patterns(),
             post_create_cmd: vec!["cargo fetch"],
             signature: Signature::file_exists("Cargo.toml"),
         },
@@ -704,6 +770,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/public/hot",
                 "**/coverage/**",
             ],
+            link_patterns: laravel_link_patterns(),
             post_create_cmd: vec![
                 "composer install",
                 "php artisan key:generate",
@@ -727,6 +794,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/priv/static/**",
                 "**/erl_crash.dump",
             ],
+            link_patterns: phoenix_link_patterns(),
             post_create_cmd: vec!["mix deps.get", "mix ecto.setup"],
             signature: Signature::file_contains("mix.exs", ":phoenix"),
         },
@@ -744,6 +812,7 @@ pub fn catalog() -> Vec<Preset> {
                 "**/Thumbs.db",
                 "**/.DS_Store",
             ],
+            link_patterns: no_link_patterns(),
             post_create_cmd: vec![],
             signature: Signature::never(),
         },

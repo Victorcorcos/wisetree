@@ -12,6 +12,7 @@ pub const MENU_SETUP_PROJECT: &str = "Setup Project Config";
 pub const MENU_SETUP: &str = "Setup Shell Integration";
 pub const MENU_CREATE: &str = "Create";
 pub const MENU_DASHBOARD: &str = "Dashboard";
+pub const MENU_CACHE: &str = "Shared cache";
 pub const MENU_SETTINGS: &str = "Settings";
 pub const MENU_EXIT: &str = "Exit";
 

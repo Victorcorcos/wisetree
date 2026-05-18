@@ -7,11 +7,11 @@
 //!    catalog. A root-level match is still tagged `detected`; otherwise Wise is
 //!    the default choice.
 //! 2. `Discovering` — spinner while `App` performs the deep Wise scan.
-//! 3. `Confirm`     — three editable rectangle blocks (Copy Patterns / Ignore
-//!    Patterns / Post-Create Commands) seeded from the chosen preset, plus a
-//!    Yes/No row with Yes pre-selected. Each line inside a block is one entry
-//!    in the corresponding `.wisetree.json` list; pressing Enter inside a
-//!    block adds a new entry.
+//! 3. `Confirm`     — four editable rectangle blocks (Copy Patterns / Ignore
+//!    Patterns / Shared Cache Links / Post-Create Commands) seeded from the
+//!    chosen preset, plus a Yes/No row with Yes pre-selected. Each line inside
+//!    a block is one entry in the corresponding `.wisetree.json` list;
+//!    pressing Enter inside a block adds a new entry.
 //!
 //! `Esc` walks back one step (Confirm → PresetList; PresetList → menu).
 //! `App` owns Wise discovery + persistence and consumes
@@ -35,7 +35,7 @@ use crate::tui::widgets::{
 
 const WISE_PRESET_LIST_LABEL: &str = "Wise Preset";
 const WISE_PRESET_CONFIRM_LABEL: &str = "Wise Preset";
-const CONFIRM_BLOCK_COUNT: usize = 3;
+const CONFIRM_BLOCK_COUNT: usize = 4;
 /// Selection marker shown on the focused-but-not-editing block. Mirrors the
 /// `POST_CMD_SELECTION_MARKER` used by the Post-Create Commands editor.
 const SELECTION_MARKER: &str = " ✎﹏ ";
@@ -58,6 +58,7 @@ pub struct SetupProjectPresetValues {
     pub label: String,
     pub copy_patterns: Vec<String>,
     pub copy_ignores: Vec<String>,
+    pub link_patterns: Vec<String>,
     pub post_create_cmd: Vec<String>,
 }
 
@@ -67,6 +68,7 @@ impl SetupProjectPresetValues {
             label: preset.label.to_string(),
             copy_patterns: preset.copy_patterns_owned(),
             copy_ignores: preset.copy_ignores_owned(),
+            link_patterns: preset.link_patterns_owned(),
             post_create_cmd: preset.post_create_cmd_owned(),
         }
     }
@@ -76,6 +78,7 @@ impl SetupProjectPresetValues {
             label: WISE_PRESET_CONFIRM_LABEL.to_string(),
             copy_patterns: discovery.copy_patterns,
             copy_ignores: discovery.copy_ignores,
+            link_patterns: discovery.link_patterns,
             post_create_cmd: discovery.post_create_cmd,
         }
     }
@@ -96,8 +99,8 @@ pub enum SetupProjectAction {
 /// Which item on the Confirm step is currently focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmSelection {
-    /// One of the three editable rectangles (0=Copy Patterns,
-    /// 1=Copy Ignores, 2=Post-Create Cmd).
+    /// One of the four editable rectangles (0=Copy Patterns,
+    /// 1=Copy Ignores, 2=Shared Cache Links, 3=Post-Create Cmd).
     Block(usize),
     Yes,
     No,
@@ -110,7 +113,7 @@ struct EditCursor {
     col: usize,
 }
 
-/// Editable state backing the Confirm step. Holds three independent
+/// Editable state backing the Confirm step. Holds four independent
 /// `Vec<String>` buffers (one per `.wisetree.json` list field) plus the
 /// current selection and an optional edit cursor.
 pub struct ConfirmEditor {
@@ -128,6 +131,7 @@ impl ConfirmEditor {
             blocks: [
                 values.copy_patterns,
                 values.copy_ignores,
+                values.link_patterns,
                 values.post_create_cmd,
             ],
             selection: ConfirmSelection::Yes,
@@ -167,7 +171,8 @@ impl ConfirmEditor {
             label: self.label.clone(),
             copy_patterns: normalize(&self.blocks[0]),
             copy_ignores: normalize(&self.blocks[1]),
-            post_create_cmd: normalize(&self.blocks[2]),
+            link_patterns: normalize(&self.blocks[2]),
+            post_create_cmd: normalize(&self.blocks[3]),
         }
     }
 
@@ -888,13 +893,13 @@ impl SetupProjectScreen {
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
             // Intro line + spacer + select prompt (label + spacer + N rows
-            // + footer) + footer description (2 lines).
+            // + footer) + footer description (3 lines).
             SetupProjectStep::PresetList => {
                 let rows = self.select.options.len().min(12) as u16;
-                3 + rows + 4
+                3 + rows + 5
             }
             SetupProjectStep::Discovering => 3,
-            SetupProjectStep::Confirm => 18,
+            SetupProjectStep::Confirm => 20,
         }
     }
 
@@ -914,7 +919,7 @@ impl SetupProjectScreen {
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(1),
-                Constraint::Length(2),
+                Constraint::Length(3),
             ])
             .split(area);
 
@@ -941,6 +946,13 @@ impl SetupProjectScreen {
                     .fg(colors::ERROR)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(", ", info),
+            Span::styled(
+                "Shared Cache Links",
+                Style::default()
+                    .fg(colors::BRAND)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(", and ", info),
             Span::styled(
                 "Post-Create Commands",
@@ -956,7 +968,11 @@ impl SetupProjectScreen {
 
         let footer_lines = vec![
             Line::from(Span::styled(
-                "Confirming will replace Copy Patterns, Ignore Patterns, and Post-Create Commands in .wisetree.json with the chosen preset.",
+                "Confirming will replace Copy Patterns, Ignore Patterns, Shared Cache Links, and Post-Create Commands in .wisetree.json with the chosen preset.",
+                Style::default().fg(colors::MUTED),
+            )),
+            Line::from(Span::styled(
+                "Shared cache links default to SeedFromSource so an installed source checkout can seed later worktrees.",
                 Style::default().fg(colors::MUTED),
             )),
             Line::from(Span::styled(
@@ -1003,13 +1019,15 @@ impl SetupProjectScreen {
             return;
         };
 
-        let detail_total_height = area.height.saturating_sub(7);
+        let detail_total_height = area.height.saturating_sub(8);
         let lengths = [
             editor.block_len(0),
             editor.block_len(1),
             editor.block_len(2),
+            editor.block_len(3),
         ];
-        let [copy_h, ignore_h, post_h] = confirm_block_heights(lengths, detail_total_height);
+        let [copy_h, ignore_h, link_h, post_h] =
+            confirm_block_heights(lengths, detail_total_height);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1018,6 +1036,7 @@ impl SetupProjectScreen {
                 Constraint::Length(1),
                 Constraint::Length(copy_h),
                 Constraint::Length(ignore_h),
+                Constraint::Length(link_h),
                 Constraint::Length(post_h),
                 Constraint::Min(0),
                 Constraint::Length(3),
@@ -1059,14 +1078,23 @@ impl SetupProjectScreen {
         ]);
         frame.render_widget(Paragraph::new(title), chunks[0]);
 
+        frame.render_widget(
+            Paragraph::new(
+                "Shared cache links will set worktreeLinkStrategy to SeedFromSource, reusing installed dependency directories across worktrees.",
+            )
+            .style(Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
+            chunks[1],
+        );
+
         self.confirm_block_rects
-            .set([chunks[2], chunks[3], chunks[4]]);
+            .set([chunks[2], chunks[3], chunks[4], chunks[5]]);
 
         let editing = editor.editing_cursor();
         let specs = [
             ("worktreeCopyPatterns", colors::SUCCESS, chunks[2], 0),
             ("worktreeCopyIgnores", colors::ERROR, chunks[3], 1),
-            ("postCreateCmd", colors::ACCENT, chunks[4], 2),
+            ("worktreeLinkPatterns", colors::BRAND, chunks[4], 2),
+            ("postCreateCmd", colors::ACCENT, chunks[5], 3),
         ];
         for (title, accent, rect, idx) in specs {
             let is_selected = matches!(editor.selection, ConfirmSelection::Block(i) if i == idx);
@@ -1083,7 +1111,7 @@ impl SetupProjectScreen {
             );
         }
 
-        render_yes_no(frame, chunks[6], editor.selection);
+        render_yes_no(frame, chunks[7], editor.selection);
 
         let hint_text = if editor.editing.is_some() {
             "Enter newline • Ctrl+←→ word • Ctrl+W/Alt+D del word • Ctrl+U/K kill line • Ctrl+A/E start/end • Esc finish"
@@ -1097,7 +1125,7 @@ impl SetupProjectScreen {
                     .add_modifier(Modifier::DIM),
             )
             .alignment(Alignment::Center);
-        frame.render_widget(hint, chunks[7]);
+        frame.render_widget(hint, chunks[8]);
     }
 
     fn confirm_block_index_at(&self, position: Position) -> Option<usize> {
@@ -1230,17 +1258,7 @@ fn confirm_block_heights(
     total: u16,
 ) -> [u16; CONFIRM_BLOCK_COUNT] {
     let caps = split_detail_heights(total);
-    let desired = [
-        block_height_for_line_count(line_counts[0]),
-        block_height_for_line_count(line_counts[1]),
-        block_height_for_line_count(line_counts[2]),
-    ];
-
-    [
-        desired[0].min(caps[0]),
-        desired[1].min(caps[1]),
-        desired[2].min(caps[2]),
-    ]
+    std::array::from_fn(|idx| block_height_for_line_count(line_counts[idx]).min(caps[idx]))
 }
 
 fn block_height_for_line_count(line_count: usize) -> u16 {
@@ -1343,17 +1361,18 @@ pub fn confirm_choice_for(selection: ConfirmSelection) -> ConfirmChoice {
 mod tests {
     use super::*;
 
-    fn values(copy: usize, ignore: usize, post: usize) -> SetupProjectPresetValues {
+    fn values(copy: usize, ignore: usize, links: usize, post: usize) -> SetupProjectPresetValues {
         SetupProjectPresetValues {
             label: "Wise Preset".into(),
             copy_patterns: (0..copy).map(|idx| format!("copy-{idx}")).collect(),
             copy_ignores: (0..ignore).map(|idx| format!("ignore-{idx}")).collect(),
+            link_patterns: (0..links).map(|idx| format!("link-{idx}")).collect(),
             post_create_cmd: (0..post).map(|idx| format!("cmd-{idx}")).collect(),
         }
     }
 
-    fn editor_from(copy: usize, ignore: usize, post: usize) -> ConfirmEditor {
-        ConfirmEditor::from_values(values(copy, ignore, post))
+    fn editor_from(copy: usize, ignore: usize, links: usize, post: usize) -> ConfirmEditor {
+        ConfirmEditor::from_values(values(copy, ignore, links, post))
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1362,25 +1381,25 @@ mod tests {
 
     #[test]
     fn confirm_block_heights_shrink_for_short_sections() {
-        let heights = confirm_block_heights([1, 1, 1], 15);
-        assert_eq!(heights, [3, 3, 3]);
+        let heights = confirm_block_heights([1, 1, 1, 1], 20);
+        assert_eq!(heights, [3, 3, 3, 3]);
     }
 
     #[test]
     fn confirm_block_heights_cap_tall_sections() {
-        let heights = confirm_block_heights([20, 2, 2], 15);
-        assert_eq!(heights, [5, 4, 4]);
+        let heights = confirm_block_heights([20, 2, 2, 2], 20);
+        assert_eq!(heights, [5, 4, 4, 4]);
     }
 
     #[test]
     fn editor_default_selection_is_yes() {
-        let editor = editor_from(2, 1, 1);
+        let editor = editor_from(2, 1, 1, 1);
         assert_eq!(editor.selection(), ConfirmSelection::Yes);
     }
 
     #[test]
     fn editor_to_values_filters_empty_lines() {
-        let mut editor = editor_from(0, 0, 0);
+        let mut editor = editor_from(0, 0, 0, 0);
         editor.blocks[0] = vec!["a".into(), "".into(), "  ".into(), "b".into()];
         let values = editor.to_values();
         assert_eq!(values.copy_patterns, vec!["a", "b"]);
@@ -1388,23 +1407,25 @@ mod tests {
 
     #[test]
     fn editor_move_navigation_cycles_blocks_and_buttons() {
-        let mut editor = editor_from(1, 1, 1);
+        let mut editor = editor_from(1, 1, 1, 1);
         editor.selection = ConfirmSelection::Block(0);
         editor.move_down();
         assert_eq!(editor.selection(), ConfirmSelection::Block(1));
         editor.move_down();
         assert_eq!(editor.selection(), ConfirmSelection::Block(2));
         editor.move_down();
+        assert_eq!(editor.selection(), ConfirmSelection::Block(3));
+        editor.move_down();
         assert_eq!(editor.selection(), ConfirmSelection::Yes);
         editor.toggle_yes_no();
         assert_eq!(editor.selection(), ConfirmSelection::No);
         editor.move_up();
-        assert_eq!(editor.selection(), ConfirmSelection::Block(2));
+        assert_eq!(editor.selection(), ConfirmSelection::Block(3));
     }
 
     #[test]
     fn enter_splits_line_into_new_entry() {
-        let mut editor = editor_from(0, 0, 0);
+        let mut editor = editor_from(0, 0, 0, 0);
         editor.selection = ConfirmSelection::Block(0);
         editor.blocks[0] = vec!["hello world".into()];
         editor.editing = Some(EditCursor { row: 0, col: 5 });
@@ -1418,7 +1439,7 @@ mod tests {
 
     #[test]
     fn backspace_at_col_zero_merges_with_previous_line() {
-        let mut editor = editor_from(0, 0, 0);
+        let mut editor = editor_from(0, 0, 0, 0);
         editor.selection = ConfirmSelection::Block(0);
         editor.blocks[0] = vec!["foo".into(), "bar".into()];
         editor.editing = Some(EditCursor { row: 1, col: 0 });
@@ -1430,13 +1451,14 @@ mod tests {
     #[test]
     fn screen_enter_apply_yields_filtered_values() {
         let mut screen = SetupProjectScreen::new(None);
-        screen.confirm = Some(editor_from(2, 1, 1));
+        screen.confirm = Some(editor_from(2, 1, 1, 1));
         screen.step = SetupProjectStep::Confirm;
         let action = screen.handle_key(key(KeyCode::Enter));
         match action {
             SetupProjectAction::Apply(values) => {
                 assert_eq!(values.copy_patterns.len(), 2);
                 assert_eq!(values.copy_ignores.len(), 1);
+                assert_eq!(values.link_patterns.len(), 1);
                 assert_eq!(values.post_create_cmd.len(), 1);
             }
             other => panic!("expected Apply, got {other:?}"),
@@ -1446,7 +1468,7 @@ mod tests {
     #[test]
     fn screen_enter_on_block_starts_editing() {
         let mut screen = SetupProjectScreen::new(None);
-        screen.confirm = Some(editor_from(2, 1, 1));
+        screen.confirm = Some(editor_from(2, 1, 1, 1));
         screen.step = SetupProjectStep::Confirm;
         screen.confirm.as_mut().unwrap().selection = ConfirmSelection::Block(0);
         screen.handle_key(key(KeyCode::Enter));
@@ -1455,7 +1477,7 @@ mod tests {
 
     #[test]
     fn ctrl_w_deletes_previous_word() {
-        let mut editor = editor_from(0, 0, 0);
+        let mut editor = editor_from(0, 0, 0, 0);
         editor.selection = ConfirmSelection::Block(0);
         editor.blocks[0] = vec!["foo bar baz".into()];
         editor.editing = Some(EditCursor { row: 0, col: 11 });
@@ -1466,7 +1488,7 @@ mod tests {
 
     #[test]
     fn ctrl_u_kills_to_line_start() {
-        let mut editor = editor_from(0, 0, 0);
+        let mut editor = editor_from(0, 0, 0, 0);
         editor.selection = ConfirmSelection::Block(0);
         editor.blocks[0] = vec!["foo bar".into()];
         editor.editing = Some(EditCursor { row: 0, col: 4 });
@@ -1477,7 +1499,7 @@ mod tests {
 
     #[test]
     fn ctrl_k_kills_to_line_end() {
-        let mut editor = editor_from(0, 0, 0);
+        let mut editor = editor_from(0, 0, 0, 0);
         editor.selection = ConfirmSelection::Block(0);
         editor.blocks[0] = vec!["foo bar".into()];
         editor.editing = Some(EditCursor { row: 0, col: 3 });
@@ -1488,7 +1510,7 @@ mod tests {
 
     #[test]
     fn move_word_right_wraps_to_next_line_at_end() {
-        let mut editor = editor_from(0, 0, 0);
+        let mut editor = editor_from(0, 0, 0, 0);
         editor.selection = ConfirmSelection::Block(0);
         editor.blocks[0] = vec!["foo".into(), "bar".into()];
         editor.editing = Some(EditCursor { row: 0, col: 3 });
@@ -1498,7 +1520,7 @@ mod tests {
 
     #[test]
     fn alt_d_deletes_next_word() {
-        let mut editor = editor_from(0, 0, 0);
+        let mut editor = editor_from(0, 0, 0, 0);
         editor.selection = ConfirmSelection::Block(0);
         editor.blocks[0] = vec!["foo bar baz".into()];
         editor.editing = Some(EditCursor { row: 0, col: 4 });
@@ -1510,7 +1532,7 @@ mod tests {
     #[test]
     fn ctrl_w_via_handle_key_routes_to_delete_word_left() {
         let mut screen = SetupProjectScreen::new(None);
-        screen.confirm = Some(editor_from(0, 0, 0));
+        screen.confirm = Some(editor_from(0, 0, 0, 0));
         screen.step = SetupProjectStep::Confirm;
         let editor = screen.confirm.as_mut().unwrap();
         editor.selection = ConfirmSelection::Block(0);
@@ -1524,7 +1546,7 @@ mod tests {
     #[test]
     fn screen_esc_during_edit_returns_to_navigation() {
         let mut screen = SetupProjectScreen::new(None);
-        screen.confirm = Some(editor_from(1, 1, 1));
+        screen.confirm = Some(editor_from(1, 1, 1, 1));
         screen.step = SetupProjectStep::Confirm;
         screen.confirm.as_mut().unwrap().selection = ConfirmSelection::Block(0);
         screen.handle_key(key(KeyCode::Enter));
