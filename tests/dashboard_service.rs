@@ -676,8 +676,8 @@ async fn merge_pull_request_invokes_gh_with_squash_flag_and_passthrough_message(
         "merge must use --squash; log was {log:?}"
     );
     assert!(
-        log.contains("--subject Add merge action"),
-        "subject must reach gh verbatim; log was {log:?}"
+        log.contains("--subject Add merge action (#7)"),
+        "subject must reach gh with `(#N)` PR reference appended; log was {log:?}"
     );
     assert!(
         log.contains("--body Closes #42 with notes."),

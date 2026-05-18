@@ -657,7 +657,10 @@ impl DashboardService {
 
     /// Squash-merge a pull request, passing the supplied subject and body
     /// straight through to `gh pr merge` so the resulting commit message is
-    /// byte-for-byte the PR's title + description.
+    /// byte-for-byte the PR's title + description, with a trailing
+    /// ` (#N)` reference appended to the subject to match GitHub's
+    /// default squash-merge convention (the `#N` is auto-linked to the
+    /// PR by GitHub's web UI).
     pub async fn merge_pull_request(&self, number: u64, subject: &str, body: &str) -> Result<()> {
         if !self.gh_available {
             return Err(WisetreeError::other(
@@ -665,6 +668,7 @@ impl DashboardService {
             ));
         }
         let number_arg = number.to_string();
+        let subject_with_ref = subject_with_pr_reference(subject, number);
         time::timeout(
             PR_MERGE_TIMEOUT,
             run_command(
@@ -675,7 +679,7 @@ impl DashboardService {
                     &number_arg,
                     "--squash",
                     "--subject",
-                    subject,
+                    &subject_with_ref,
                     "--body",
                     body,
                 ],
@@ -1677,6 +1681,20 @@ fn escape_graphql_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Append ` (#N)` to a squash-merge subject, idempotently. GitHub's
+/// default squash-merge commit title is `"<PR title> (#<PR number>)"`
+/// — when we hand `gh pr merge` an explicit `--subject` it uses it
+/// verbatim, so we reproduce the suffix here. The `#N` is plain text;
+/// GitHub's web UI auto-links it back to the PR.
+fn subject_with_pr_reference(subject: &str, number: u64) -> String {
+    let trimmed = subject.trim_end();
+    let suffix = format!("(#{number})");
+    if trimmed.ends_with(&suffix) {
+        return trimmed.to_string();
+    }
+    format!("{trimmed} {suffix}")
 }
 
 /// Parse the JSON `gh pr view <N> --json title,body` returns. Missing
@@ -3978,6 +3996,40 @@ mod tests {
         assert_eq!(
             selected_gemini_cli_auth_type(&settings).as_deref(),
             Some("oauth-personal")
+        );
+    }
+
+    #[test]
+    fn subject_with_pr_reference_appends_pr_number() {
+        assert_eq!(
+            subject_with_pr_reference("Improve dashboard footer details", 42),
+            "Improve dashboard footer details (#42)"
+        );
+    }
+
+    #[test]
+    fn subject_with_pr_reference_is_idempotent_when_already_present() {
+        assert_eq!(
+            subject_with_pr_reference("Improve dashboard footer details (#42)", 42),
+            "Improve dashboard footer details (#42)"
+        );
+    }
+
+    #[test]
+    fn subject_with_pr_reference_trims_trailing_whitespace_before_appending() {
+        assert_eq!(
+            subject_with_pr_reference("Add merge action   ", 7),
+            "Add merge action (#7)"
+        );
+    }
+
+    #[test]
+    fn subject_with_pr_reference_does_not_dedupe_different_numbers() {
+        // A stale `(#99)` baked into a PR title should not stop us from
+        // appending the *correct* `(#7)` reference for the PR we're merging.
+        assert_eq!(
+            subject_with_pr_reference("Add merge action (#99)", 7),
+            "Add merge action (#99) (#7)"
         );
     }
 }
