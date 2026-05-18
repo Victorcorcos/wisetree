@@ -1,5 +1,6 @@
 //! Project setup presets — pre-cooked Copy Patterns / Ignore Patterns /
-//! Post-Create Commands for the most common languages and frameworks.
+//! Shared Cache Links / Post-Create Commands for the most common languages
+//! and frameworks.
 //!
 //! The catalog lives in [`catalog`]; the per-preset signature matcher used by
 //! the menu's auto-detection logic lives in [`detect`].

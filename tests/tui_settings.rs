@@ -145,7 +145,21 @@ fn ready_with_patterns(copy_patterns: &[&str], ignore_patterns: &[&str]) -> Sett
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
-const IGNORE_PATTERNS_INDEX: usize = 4;
+fn ready_with_link_settings(strategy: wisetree::config::schema::LinkStrategy, cache_dir: Option<&str>) -> SettingsScreen {
+    let cfg = WorktreeConfig {
+        worktree_link_strategy: strategy,
+        worktree_link_cache_dir: cache_dir.map(|value| value.to_string()),
+        post_create_cmd: vec!["bun install".into()],
+        terminal_command: "code $WORKTREE_PATH".into(),
+        delete_branch_with_worktree: true,
+        ..Default::default()
+    };
+    SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
+}
+
+const IGNORE_PATTERNS_INDEX: usize = 1;
+const LINK_STRATEGY_INDEX: usize = 3;
+const LINK_CACHE_DIR_INDEX: usize = 4;
 const POST_CMD_INDEX: usize = 5;
 const TERMINAL_CMD_INDEX: usize = 6;
 const PATH_TEMPLATE_INDEX: usize = 7;
@@ -176,13 +190,28 @@ fn esc_on_menu_returns_back() {
 }
 
 #[test]
-fn selecting_copy_patterns_shows_detail_view() {
+fn selecting_copy_patterns_shows_editor_view() {
     let mut s = ready();
+    enter_copy_patterns(&mut s);
+    assert_eq!(s.step(), SettingsStep::CopyPatterns);
+    let dumped = dump(90, 16, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Copy Patterns"));
+    assert!(dumped.contains("worktreeCopyPatterns"));
+    assert!(dumped.contains("Save"));
+    assert!(dumped.contains(".env*"));
+}
+
+fn enter_copy_patterns(s: &mut SettingsScreen) {
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::CopyPatterns);
-    let dumped = dump(80, 12, |f| s.render(f, f.area()));
-    assert!(dumped.contains("Copy Patterns"));
-    assert!(dumped.contains(".env*"));
+}
+
+fn enter_ignore_patterns(s: &mut SettingsScreen) {
+    for _ in 0..IGNORE_PATTERNS_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::IgnorePatterns);
 }
 
 #[test]
@@ -205,7 +234,7 @@ fn copy_patterns_view_grows_to_show_every_pattern() {
         &["**/node_modules/**"],
     );
 
-    s.handle_key(key(KeyCode::Enter));
+    enter_copy_patterns(&mut s);
 
     let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
     assert!(dumped.contains("docker/.env-backuper"));
@@ -213,22 +242,17 @@ fn copy_patterns_view_grows_to_show_every_pattern() {
 }
 
 #[test]
-fn copy_patterns_footer_renders_after_blank_line() {
+fn copy_patterns_save_button_emits_save_action() {
     let mut s = ready_with_patterns(&["docker/.env-backuper"], &["**/node_modules/**"]);
 
-    s.handle_key(key(KeyCode::Enter));
+    enter_copy_patterns(&mut s);
+    s.handle_key(key(KeyCode::Down));
 
-    let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
-    let (_, item_y) = find_text_start(&buffer, "docker/.env-backuper").unwrap();
-    let (_, edit_y) = find_text_start(&buffer, "Edit in /tmp/.wisetree.json (local).").unwrap();
-    let (_, hint_y) = find_text_start(
-        &buffer,
-        "Press Enter to copy the path, any other key to go back.",
-    )
-    .unwrap();
-
-    assert_eq!(edit_y, item_y + 2);
-    assert_eq!(hint_y, item_y + 3);
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::SaveCopyPatterns(vec!["docker/.env-backuper".into()])
+    );
 }
 
 #[test]
@@ -251,10 +275,7 @@ fn ignore_patterns_view_grows_to_show_every_pattern() {
         ],
     );
 
-    for _ in 0..IGNORE_PATTERNS_INDEX {
-        s.handle_key(key(KeyCode::Down));
-    }
-    s.handle_key(key(KeyCode::Enter));
+    enter_ignore_patterns(&mut s);
 
     let dumped = dump(100, s.preferred_content_height(), |f| s.render(f, f.area()));
     assert!(dumped.contains("vendor/bundle/**"));
@@ -262,58 +283,152 @@ fn ignore_patterns_view_grows_to_show_every_pattern() {
 }
 
 #[test]
-fn ignore_patterns_footer_renders_after_blank_line() {
+fn ignore_patterns_save_button_emits_save_action() {
     let mut s = ready_with_patterns(&[".env*"], &["storage/**"]);
 
-    for _ in 0..IGNORE_PATTERNS_INDEX {
-        s.handle_key(key(KeyCode::Down));
-    }
-    s.handle_key(key(KeyCode::Enter));
+    enter_ignore_patterns(&mut s);
+    s.handle_key(key(KeyCode::Down));
 
-    let buffer = render(100, s.preferred_content_height(), |f| s.render(f, f.area()));
-    let (_, item_y) = find_text_start(&buffer, "storage/**").unwrap();
-    let (_, edit_y) = find_text_start(&buffer, "Edit in /tmp/.wisetree.json (local).").unwrap();
-    let (_, hint_y) = find_text_start(
-        &buffer,
-        "Press Enter to copy the path, any other key to go back.",
-    )
-    .unwrap();
-
-    assert_eq!(edit_y, item_y + 2);
-    assert_eq!(hint_y, item_y + 3);
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::SaveIgnorePatterns(vec!["storage/**".into()]));
 }
 
 #[test]
-fn any_key_in_detail_returns_to_menu() {
+fn esc_on_copy_patterns_page_returns_to_menu() {
     let mut s = ready();
-    s.handle_key(key(KeyCode::Enter));
+    enter_copy_patterns(&mut s);
     assert_eq!(s.step(), SettingsStep::CopyPatterns);
-    let action = s.handle_key(key(KeyCode::Char('x')));
+    let action = s.handle_key(key(KeyCode::Esc));
     assert_eq!(action, SettingsAction::Continue);
     assert_eq!(s.step(), SettingsStep::Menu);
 }
 
 #[test]
-fn enter_on_copy_patterns_emits_copy_settings_file_path_action() {
+fn copy_patterns_enter_on_rect_starts_editing() {
     let mut s = ready();
-    s.handle_key(key(KeyCode::Enter));
+    enter_copy_patterns(&mut s);
 
     let action = s.handle_key(key(KeyCode::Enter));
-    assert_eq!(action, SettingsAction::CopySettingsFilePath);
-    assert_eq!(s.step(), SettingsStep::CopyPatterns);
+    assert_eq!(action, SettingsAction::Continue);
+    assert!(s.pattern_list_editor().unwrap().editing());
 }
 
 #[test]
-fn enter_on_ignore_patterns_emits_copy_settings_file_path_action() {
+fn ignore_patterns_enter_on_rect_starts_editing() {
     let mut s = ready();
-    for _ in 0..IGNORE_PATTERNS_INDEX {
+    enter_ignore_patterns(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::Continue);
+    assert!(s.pattern_list_editor().unwrap().editing());
+}
+
+fn enter_link_strategy(s: &mut SettingsScreen) {
+    for _ in 0..LINK_STRATEGY_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::LinkStrategy);
+}
+
+fn enter_link_cache_dir(s: &mut SettingsScreen) {
+    for _ in 0..LINK_CACHE_DIR_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::LinkCacheDir);
+}
+
+#[test]
+fn link_strategy_renders_editor_and_didactic_copy() {
+    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::SeedFromSource, None);
+    enter_link_strategy(&mut s);
+
+    let dumped = dump(100, 18, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Link Strategy"));
+    assert!(dumped.contains("Save"));
+    assert!(dumped.contains("SeedFromSource"));
+    assert!(dumped.contains("Link Options"));
+    assert!(dumped.contains("CreateEmpty"));
+    assert!(dumped.contains("SeedIfPresent"));
+    assert!(dumped.contains("Shared links let heavy dependency folders be installed once"));
+}
+
+#[test]
+fn link_strategy_save_button_emits_enum_action() {
+    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::SeedFromSource, None);
+    enter_link_strategy(&mut s);
 
     let action = s.handle_key(key(KeyCode::Enter));
-    assert_eq!(action, SettingsAction::CopySettingsFilePath);
-    assert_eq!(s.step(), SettingsStep::IgnorePatterns);
+    assert_eq!(
+        action,
+        SettingsAction::SaveLinkStrategy(wisetree::config::schema::LinkStrategy::SeedFromSource)
+    );
+}
+
+#[test]
+fn link_strategy_enter_on_rect_cycles_option_and_marks_modified() {
+    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::CreateEmpty, None);
+    enter_link_strategy(&mut s);
+
+    s.handle_key(key(KeyCode::Up));
+    s.handle_key(key(KeyCode::Enter));
+
+    let editor = s.link_strategy_editor().expect("editor present");
+    assert_eq!(editor.value, "SeedFromSource");
+    assert_eq!(editor.status, wisetree::tui::screens::settings::LinkStrategyRectStatus::Modified);
+}
+
+#[test]
+fn link_cache_dir_renders_editor_and_didactic_copy() {
+    let mut s = ready_with_link_settings(
+        wisetree::config::schema::LinkStrategy::CreateEmpty,
+        Some("/Volumes/cache/wisetree"),
+    );
+    enter_link_cache_dir(&mut s);
+
+    let dumped = dump(110, 20, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Link Cache Dir"));
+    assert!(dumped.contains("Save"));
+    assert!(dumped.contains("/Volumes/cache/wisetree"));
+    assert!(dumped.contains("faster disk or larger volume"));
+    assert!(dumped.contains("$BASE_PATH"));
+}
+
+#[test]
+fn link_cache_dir_blank_renders_none_placeholder() {
+    let mut s = ready_with_link_settings(
+        wisetree::config::schema::LinkStrategy::CreateEmpty,
+        None,
+    );
+    enter_link_cache_dir(&mut s);
+
+    let buffer = render(100, 18, |f| s.render(f, f.area()));
+    assert_text_fg(&buffer, "(none)", colors::MUTED);
+}
+
+#[test]
+fn link_cache_dir_save_button_emits_string_action() {
+    let mut s = ready_with_link_settings(
+        wisetree::config::schema::LinkStrategy::CreateEmpty,
+        Some("/Volumes/cache/wisetree"),
+    );
+    enter_link_cache_dir(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::SaveLinkCacheDir("/Volumes/cache/wisetree".into())
+    );
+}
+
+#[test]
+fn link_cache_dir_save_blank_emits_empty_string() {
+    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::CreateEmpty, Some("   "));
+    enter_link_cache_dir(&mut s);
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::SaveLinkCacheDir(String::new()));
 }
 
 #[test]

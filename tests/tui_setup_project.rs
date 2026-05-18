@@ -38,6 +38,7 @@ fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 fn wise_preset(
     copy_patterns: &[&str],
     copy_ignores: &[&str],
+    link_patterns: &[&str],
     post_create_cmd: &[&str],
 ) -> WisePresetDiscovery {
     WisePresetDiscovery {
@@ -47,6 +48,10 @@ fn wise_preset(
             .map(|value| (*value).to_string())
             .collect(),
         copy_ignores: copy_ignores
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        link_patterns: link_patterns
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
@@ -76,10 +81,11 @@ where
 #[test]
 fn preset_list_renders_intro_and_didactic_footer() {
     let screen = SetupProjectScreen::new(None);
-    let dumped = dump(120, 30, |frame| screen.render(frame, frame.area()));
+    let dumped = dump(120, 40, |frame| screen.render(frame, frame.area()));
     assert!(dumped.contains("Pick a project preset"));
     assert!(dumped.contains(".wisetree.json"));
     assert!(dumped.contains("Confirming will replace"));
+    assert!(dumped.contains("Shared Cache Links"));
     assert!(dumped.contains("Type to filter"));
     assert!(dumped.contains("Esc to clear"));
 }
@@ -148,7 +154,7 @@ fn enter_on_catalog_preset_advances_to_confirm() {
 }
 
 #[test]
-fn wise_discovery_completion_renders_three_blocks_and_yes_no() {
+fn wise_discovery_completion_renders_four_blocks_and_yes_no() {
     let tmp = tempdir().unwrap();
     fs::create_dir_all(tmp.path().join("api")).unwrap();
     fs::write(tmp.path().join("api/Gemfile"), "").unwrap();
@@ -174,9 +180,12 @@ fn wise_discovery_completion_renders_three_blocks_and_yes_no() {
     assert!(dumped.contains("Apply Wise Preset to .wisetree.json?"));
     assert!(dumped.contains("worktreeCopyPatterns"));
     assert!(dumped.contains("worktreeCopyIgnores"));
+    assert!(dumped.contains("worktreeLinkPatterns"));
     assert!(dumped.contains("postCreateCmd"));
     assert!(dumped.contains("api/config/master.key"));
     assert!(dumped.contains("web/.env.local"));
+    assert!(dumped.contains("api/vendor/bundle"));
+    assert!(dumped.contains("web/node_modules"));
     assert!(dumped.contains("(cd 'api' && bundle install"));
     assert!(dumped.contains("(cd 'web' && npm install)"));
     assert!(dumped.contains("Yes"));
@@ -191,6 +200,7 @@ fn wise_confirm_keeps_yes_no_visible_with_long_preset_values() {
             "copy-1", "copy-2", "copy-3", "copy-4", "copy-5", "copy-6", "copy-7", "copy-8",
         ],
         &["ignore-1", "ignore-2", "ignore-3", "ignore-4", "ignore-5"],
+        &["link-1", "link-2", "link-3"],
         &["cmd-1", "cmd-2", "cmd-3", "cmd-4"],
     ));
 
@@ -205,6 +215,7 @@ fn mouse_scroll_inside_confirm_block_scrolls_that_block() {
     screen.complete_wise_discovery(wise_preset(
         &["copy-1", "copy-2", "copy-3", "copy-4", "copy-5", "copy-6"],
         &["ignore-1"],
+        &["link-1"],
         &["cmd-1"],
     ));
 
@@ -217,7 +228,7 @@ fn mouse_scroll_inside_confirm_block_scrolls_that_block() {
 
     let scrolled = dump(90, 18, |frame| screen.render(frame, frame.area()));
     assert!(!scrolled.contains("copy-1"));
-    assert!(scrolled.contains("copy-4"));
+    assert!(scrolled.contains("copy-3"));
     assert!(scrolled.contains("Yes"));
     assert!(scrolled.contains("No"));
 }
@@ -327,6 +338,7 @@ fn end_to_end_apply_writes_local_config_with_wise_values() {
     let config = WorktreeConfig {
         worktree_copy_patterns: values.copy_patterns,
         worktree_copy_ignores: values.copy_ignores,
+        worktree_link_patterns: values.link_patterns,
         post_create_cmd: values.post_create_cmd,
         ..WorktreeConfig::default()
     };
@@ -353,6 +365,14 @@ fn end_to_end_apply_writes_local_config_with_wise_values() {
         .worktree_copy_ignores
         .iter()
         .any(|pattern| pattern == "web/**/node_modules/**"));
+    assert!(written
+        .worktree_link_patterns
+        .iter()
+        .any(|pattern| pattern == "api/vendor/bundle"));
+    assert!(written
+        .worktree_link_patterns
+        .iter()
+        .any(|pattern| pattern == "web/node_modules"));
     assert!(written
         .post_create_cmd
         .iter()

@@ -49,7 +49,7 @@ impl MenuScreen {
     /// `has_local_config` controls the new "Setup Project Config" entry: it
     /// renders as the first option only when the project lacks a local
     /// `.wisetree.json` and we know which repository we're in (so the user
-    /// can bootstrap their three preset lists with a single keystroke).
+    /// can bootstrap their preset lists with a single keystroke).
     pub fn new(
         default_index: usize,
         git_root: Option<String>,

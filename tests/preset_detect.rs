@@ -289,6 +289,44 @@ fn discover_all_dedupes_duplicate_nested_frameworks() {
 }
 
 #[test]
+fn discover_all_ignores_generated_vite_cache_dirs() {
+    let dir = fixture();
+    write(
+        dir.path(),
+        "web/package.json",
+        "{\"dependencies\": {\"react\": \"18\"}}",
+    );
+    write(dir.path(), ".vite/deps/package.json", "{\"name\":\"vite-cache\"}");
+
+    assert_eq!(discover_all(dir.path()), vec![PresetId::React]);
+}
+
+#[test]
+fn discover_wise_does_not_include_generated_vite_cache_patterns() {
+    let dir = fixture();
+    write(
+        dir.path(),
+        "web/package.json",
+        "{\"dependencies\": {\"react\": \"18\"}}",
+    );
+    touch(dir.path(), "web/.env.local");
+    write(dir.path(), ".vite/deps/package.json", "{\"name\":\"vite-cache\"}");
+
+    let wise = discover_wise(dir.path()).expect("wise preset");
+
+    assert_eq!(wise.matched_ids, vec![PresetId::React]);
+    assert!(wise.link_patterns.iter().any(|value| value == "web/node_modules"));
+    assert!(!wise
+        .link_patterns
+        .iter()
+        .any(|value| value.starts_with(".vite/")));
+    assert!(!wise
+        .copy_ignores
+        .iter()
+        .any(|value| value.starts_with(".vite/")));
+}
+
+#[test]
 fn discover_wise_merges_values_in_stable_order() {
     let dir = fixture();
     touch(dir.path(), "api/Gemfile");
@@ -323,6 +361,14 @@ fn discover_wise_merges_values_in_stable_order() {
         .copy_ignores
         .iter()
         .any(|value| value == "web/**/node_modules/**"));
+    assert!(wise
+        .link_patterns
+        .iter()
+        .any(|value| value == "api/vendor/bundle"));
+    assert!(wise
+        .link_patterns
+        .iter()
+        .any(|value| value == "web/node_modules"));
     assert_eq!(
         wise.post_create_cmd,
         vec![
@@ -343,6 +389,7 @@ fn discover_wise_falls_back_to_generic_when_no_specific_preset_matches() {
     assert_eq!(wise.matched_ids, vec![PresetId::Generic]);
     assert!(wise.used_generic_fallback());
     assert!(wise.copy_patterns.is_empty());
+    assert!(wise.link_patterns.is_empty());
     assert!(wise
         .copy_ignores
         .iter()
@@ -374,6 +421,14 @@ fn discover_wise_keeps_same_framework_commands_for_multiple_roots() {
         .copy_patterns
         .iter()
         .any(|value| value == "web/.env.local"));
+    assert!(wise
+        .link_patterns
+        .iter()
+        .any(|value| value == "admin/node_modules"));
+    assert!(wise
+        .link_patterns
+        .iter()
+        .any(|value| value == "web/node_modules"));
     assert!(wise
         .post_create_cmd
         .iter()

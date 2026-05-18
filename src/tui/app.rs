@@ -18,7 +18,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::cli::AppMode;
-use crate::config::schema::{DashboardConfig, WorktreeConfig};
+use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
@@ -1049,6 +1049,27 @@ impl App {
                     }
                 }
             }
+            SettingsAction::SaveCopyPatterns(patterns) => {
+                if let Err(err) = self.save_copy_patterns(patterns) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save copy patterns: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveIgnorePatterns(patterns) => {
+                if let Err(err) = self.save_ignore_patterns(patterns) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save ignore patterns: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveLinkPatterns(patterns) => {
+                if let Err(err) = self.save_link_patterns(patterns) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save link patterns: {err}"));
+                    }
+                }
+            }
             SettingsAction::CopySettings(direction) => {
                 if let Err(err) = self.copy_settings(direction) {
                     if let Some(settings) = self.settings.as_mut() {
@@ -1074,6 +1095,20 @@ impl App {
                 if let Err(err) = self.save_path_template(template) {
                     if let Some(settings) = self.settings.as_mut() {
                         settings.set_error(format!("Failed to save path template: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveLinkStrategy(strategy) => {
+                if let Err(err) = self.save_link_strategy(strategy) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save link strategy: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveLinkCacheDir(cache_dir) => {
+                if let Err(err) = self.save_link_cache_dir(cache_dir) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save link cache dir: {err}"));
                     }
                 }
             }
@@ -1160,6 +1195,12 @@ impl App {
         let mut config = self.current_config().cloned().unwrap_or_default();
         config.worktree_copy_patterns = preset.copy_patterns;
         config.worktree_copy_ignores = preset.copy_ignores;
+        config.worktree_link_patterns = preset.link_patterns;
+        config.worktree_link_strategy = if config.worktree_link_patterns.is_empty() {
+            LinkStrategy::CreateEmpty
+        } else {
+            LinkStrategy::SeedFromSource
+        };
         config.post_create_cmd = preset.post_create_cmd;
 
         let mut writer = ConfigService::new();
@@ -1991,6 +2032,64 @@ impl App {
         Ok(())
     }
 
+    fn save_copy_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
+        self.save_pattern_list_setting(|config| config.worktree_copy_patterns = patterns.clone(), |settings| {
+            settings.mark_copy_patterns_saved(patterns.clone())
+        })
+    }
+
+    fn save_ignore_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
+        self.save_pattern_list_setting(|config| config.worktree_copy_ignores = patterns.clone(), |settings| {
+            settings.mark_ignore_patterns_saved(patterns.clone())
+        })
+    }
+
+    fn save_link_patterns(&mut self, patterns: Vec<String>) -> Result<(), String> {
+        self.save_pattern_list_setting(|config| config.worktree_link_patterns = patterns.clone(), |settings| {
+            settings.mark_link_patterns_saved(patterns.clone())
+        })
+    }
+
+    fn save_pattern_list_setting<F, G>(&mut self, mut apply: F, mut mark_saved: G) -> Result<(), String>
+    where
+        F: FnMut(&mut WorktreeConfig),
+        G: FnMut(&mut SettingsScreen),
+    {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        apply(&mut config);
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            mark_saved(settings);
+        }
+        Ok(())
+    }
+
     fn save_terminal_command(&mut self, command: String) -> Result<(), String> {
         let local_path = self.local_config_path();
         let target_path = match local_path.as_ref().filter(|p| p.exists()) {
@@ -2059,6 +2158,83 @@ impl App {
 
         if let Some(settings) = self.settings.as_mut() {
             settings.mark_path_template_saved(template);
+        }
+        Ok(())
+    }
+
+    fn save_link_strategy(&mut self, strategy: LinkStrategy) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        config.worktree_link_strategy = strategy;
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_link_strategy_saved(strategy);
+        }
+        Ok(())
+    }
+
+    fn save_link_cache_dir(&mut self, cache_dir: String) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        let trimmed = cache_dir.trim().to_string();
+        config.worktree_link_cache_dir = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.clone())
+        };
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_link_cache_dir_saved(config.worktree_link_cache_dir.clone());
         }
         Ok(())
     }
@@ -3576,6 +3752,174 @@ mod tests {
     }
 
     #[test]
+    fn save_link_strategy_writes_to_local_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_link_strategy: LinkStrategy::CreateEmpty,
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                worktree_link_strategy: LinkStrategy::SeedIfPresent,
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_link_strategy(LinkStrategy::SeedFromSource).unwrap();
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert_eq!(saved_local.worktree_link_strategy, LinkStrategy::SeedFromSource);
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.worktree_link_strategy, LinkStrategy::CreateEmpty);
+
+            assert_eq!(
+                app.current_config().unwrap().worktree_link_strategy,
+                LinkStrategy::SeedFromSource
+            );
+        });
+    }
+
+    #[test]
+    fn save_link_strategy_writes_to_global_when_local_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_link_strategy: LinkStrategy::CreateEmpty,
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_link_strategy(LinkStrategy::SeedIfPresent).unwrap();
+
+            assert!(!local_path.exists(), "local config must not be created");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.worktree_link_strategy, LinkStrategy::SeedIfPresent);
+            assert_eq!(
+                app.current_config().unwrap().worktree_link_strategy,
+                LinkStrategy::SeedIfPresent
+            );
+        });
+    }
+
+    #[test]
+    fn save_link_cache_dir_writes_to_local_when_local_exists() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_link_cache_dir: Some("/global/cache".into()),
+                ..WorktreeConfig::default()
+            };
+            let local = WorktreeConfig {
+                worktree_link_cache_dir: Some("/local/old-cache".into()),
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+            writer.save(&local, Some(&local_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_link_cache_dir("/local/new-cache".into()).unwrap();
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert_eq!(
+                saved_local.worktree_link_cache_dir,
+                Some("/local/new-cache".into())
+            );
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.worktree_link_cache_dir, Some("/global/cache".into()));
+
+            assert_eq!(
+                app.current_config().unwrap().worktree_link_cache_dir,
+                Some("/local/new-cache".into())
+            );
+        });
+    }
+
+    #[test]
+    fn save_link_cache_dir_writes_to_global_when_local_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                worktree_link_cache_dir: Some("/global/old-cache".into()),
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            app.save_link_cache_dir(String::new()).unwrap();
+
+            assert!(!local_path.exists(), "local config must not be created");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.worktree_link_cache_dir, None);
+            assert_eq!(app.current_config().unwrap().worktree_link_cache_dir, None);
+        });
+    }
+
+    #[test]
     fn save_dashboard_writes_to_local_when_local_exists() {
         with_home(|home| {
             let repo_root = home.path().join("repo");
@@ -3944,6 +4288,15 @@ mod tests {
                 .worktree_copy_ignores
                 .iter()
                 .any(|pattern| pattern == "web/**/node_modules/**"));
+            assert!(saved
+                .worktree_link_patterns
+                .iter()
+                .any(|pattern| pattern == "api/vendor/bundle"));
+            assert!(saved
+                .worktree_link_patterns
+                .iter()
+                .any(|pattern| pattern == "web/node_modules"));
+            assert_eq!(saved.worktree_link_strategy, LinkStrategy::SeedFromSource);
             assert!(saved.post_create_cmd.iter().any(|command| {
                 command == "(cd 'api' && bundle install --jobs 5 --verbose --retry 4)"
             }));
@@ -3974,6 +4327,7 @@ mod tests {
                     "copy-6".into(),
                 ],
                 copy_ignores: vec!["ignore-1".into()],
+                link_patterns: vec!["links-1".into()],
                 post_create_cmd: vec!["cmd-1".into()],
             },
         );
@@ -4004,7 +4358,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!scrolled.contains("copy-1"));
-        assert!(scrolled.contains("copy-4"));
+        assert!(scrolled.contains("copy-3"));
         assert!(scrolled.contains("Yes"));
         assert!(scrolled.contains("No"));
     }
