@@ -42,6 +42,23 @@ fn build_schema() -> Value {
                 "type": "array",
                 "items": { "type": "string" }
             },
+            "worktreeLinkPatterns": {
+                "description": "Directory patterns to symlink into new worktrees from the per-repository shared cache",
+                "default": [],
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "worktreeLinkStrategy": {
+                "description": "Strategy for handling missing source directories before linking",
+                "default": "CreateEmpty",
+                "type": "string",
+                "enum": ["CreateEmpty", "SeedFromSource", "SeedIfPresent"]
+            },
+            "worktreeLinkCacheDir": {
+                "description": "Optional override for the shared cache root. Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",
+                "default": null,
+                "type": ["string", "null"]
+            },
             "terminalCommand": {
                 "description": "Command to open terminal in new worktree directory (e.g., 'code $WORKTREE_PATH')",
                 "default": "",

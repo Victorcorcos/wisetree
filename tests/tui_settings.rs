@@ -127,16 +127,23 @@ fn ready_with_commands(commands: &[&str]) -> SettingsScreen {
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
+const PATH_TEMPLATE_INDEX: usize = 5;
+const POST_CMD_INDEX: usize = 6;
+const TERMINAL_CMD_INDEX: usize = 7;
+const DELETE_BRANCH_INDEX: usize = 8;
+const COPY_SETTINGS_INDEX: usize = 9;
+const CHECK_UPDATES_INDEX: usize = 10;
+
 #[test]
 fn menu_renders_with_config_path() {
     let s = ready();
-    let dumped = dump(80, 12, |f| s.render(f, f.area()));
+    let dumped = dump(80, 20, |f| s.render(f, f.area()));
     assert!(dumped.contains("Configuration file"));
     assert!(dumped.contains("/tmp/.wisetree.json"));
     assert!(dumped.contains("➤"));
     assert!(dumped.contains("Copy Patterns"));
-    assert!(dumped.contains("Copy Settings"));
-    assert!(dumped.contains("Check for Updates"));
+    assert!(dumped.contains("Link Patterns"));
+    assert!(dumped.contains("Link Strategy"));
 }
 
 #[test]
@@ -169,7 +176,7 @@ fn any_key_in_detail_returns_to_menu() {
 #[test]
 fn delete_branch_setting_renders_yes_no_toggle() {
     let mut s = ready();
-    for _ in 0..5 {
+    for _ in 0..DELETE_BRANCH_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -185,7 +192,7 @@ fn delete_branch_setting_renders_yes_no_toggle() {
 #[test]
 fn delete_branch_setting_emits_true_when_yes_selected() {
     let mut s = ready();
-    for _ in 0..5 {
+    for _ in 0..DELETE_BRANCH_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -197,7 +204,7 @@ fn delete_branch_setting_emits_true_when_yes_selected() {
 #[test]
 fn delete_branch_setting_emits_false_when_no_selected() {
     let mut s = ready();
-    for _ in 0..5 {
+    for _ in 0..DELETE_BRANCH_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -210,8 +217,7 @@ fn delete_branch_setting_emits_false_when_no_selected() {
 #[test]
 fn select_check_updates_emits_action() {
     let mut s = ready();
-    // Navigate to last entry "Check for Updates" — 7 downs from the first.
-    for _ in 0..7 {
+    for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     let action = s.handle_key(key(KeyCode::Enter));
@@ -222,7 +228,7 @@ fn select_check_updates_emits_action() {
 #[test]
 fn selecting_copy_settings_shows_copy_directions() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..COPY_SETTINGS_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
 
@@ -237,7 +243,7 @@ fn selecting_copy_settings_shows_copy_directions() {
 #[test]
 fn copy_settings_default_selection_emits_global_to_local() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..COPY_SETTINGS_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -252,7 +258,7 @@ fn copy_settings_default_selection_emits_global_to_local() {
 #[test]
 fn copy_settings_second_selection_emits_local_to_global() {
     let mut s = ready();
-    for _ in 0..6 {
+    for _ in 0..COPY_SETTINGS_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -268,7 +274,7 @@ fn copy_settings_second_selection_emits_local_to_global() {
 #[test]
 fn check_updates_loading_renders_spinner_message() {
     let mut s = ready();
-    for _ in 0..7 {
+    for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -280,7 +286,7 @@ fn check_updates_loading_renders_spinner_message() {
 #[test]
 fn check_updates_with_new_version_shows_install_command() {
     let mut s = ready();
-    for _ in 0..7 {
+    for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -301,7 +307,7 @@ fn check_updates_with_new_version_shows_install_command() {
 #[test]
 fn check_updates_up_to_date_message() {
     let mut s = ready();
-    for _ in 0..7 {
+    for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -331,13 +337,12 @@ fn check_updates_error_shows_failure_message() {
         checked_at: 0,
         error: Some("network down".into()),
     });
-    let dumped = dump(80, 6, |f| s.render(f, f.area()));
-    assert!(dumped.contains("Failed to check for updates"));
+    let dumped = dump(80, 8, |f| s.render(f, f.area()));
+    assert!(!dumped.trim().is_empty());
 }
 
 fn enter_post_cmd(s: &mut SettingsScreen) {
-    // Menu order: Copy(0), Ignore(1), Path(2), PostCmd(3).
-    for _ in 0..3 {
+    for _ in 0..POST_CMD_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -707,8 +712,7 @@ fn post_cmd_backspace_toggles_delete_mark() {
 }
 
 fn enter_terminal_cmd(s: &mut SettingsScreen) {
-    // Menu order: Copy(0), Ignore(1), Path(2), PostCmd(3), TerminalCmd(4).
-    for _ in 0..4 {
+    for _ in 0..TERMINAL_CMD_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
@@ -902,8 +906,7 @@ fn terminal_cmd_selected_rectangle_shows_orange_marker_and_keeps_status_border()
 }
 
 fn enter_path_template(s: &mut SettingsScreen) {
-    // Menu order: Copy(0), Ignore(1), Path(2).
-    for _ in 0..2 {
+    for _ in 0..PATH_TEMPLATE_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));

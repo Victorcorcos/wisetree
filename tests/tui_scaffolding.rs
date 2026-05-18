@@ -107,7 +107,7 @@ fn menu_placeholder_renders_welcome_and_prompt() {
     let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|f| MenuScreen::new(0, None, None).render(f, f.area()))
+        .draw(|f| MenuScreen::new(0, None, None, false).render(f, f.area()))
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
     let dump = buffer

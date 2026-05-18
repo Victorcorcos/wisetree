@@ -1,6 +1,7 @@
 //! Screen-level renderers. Each screen module is a pure draw function plus,
 //! eventually, a small piece of state owned by `App`.
 
+pub mod cache;
 pub mod create;
 pub mod delete;
 pub mod error;

@@ -47,6 +47,32 @@
       },
       "type": "array"
     },
+    "worktreeLinkCacheDir": {
+      "default": null,
+      "description": "Optional override for the shared cache root. Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "worktreeLinkPatterns": {
+      "default": [],
+      "description": "Directory patterns to symlink into new worktrees from the per-repository shared cache",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "worktreeLinkStrategy": {
+      "default": "CreateEmpty",
+      "description": "Strategy for handling missing source directories before linking",
+      "enum": [
+        "CreateEmpty",
+        "SeedFromSource",
+        "SeedIfPresent"
+      ],
+      "type": "string"
+    },
     "worktreePathTemplate": {
       "default": "$BASE_PATH.worktree",
       "description": "Template for worktree directory names. Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",

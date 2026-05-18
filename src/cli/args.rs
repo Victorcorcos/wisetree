@@ -16,6 +16,7 @@ pub enum AppMode {
     Create,
     List,
     Delete,
+    Cache,
     Settings,
 }
 
@@ -26,6 +27,7 @@ impl AppMode {
             Self::Create => "create",
             Self::List => "list",
             Self::Delete => "delete",
+            Self::Cache => "cache",
             Self::Settings => "settings",
         }
     }
@@ -36,19 +38,43 @@ impl AppMode {
             "create" => Some(Self::Create),
             "list" => Some(Self::List),
             "delete" => Some(Self::Delete),
+            "cache" => Some(Self::Cache),
             "settings" => Some(Self::Settings),
             _ => None,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAction {
+    List,
+    Prune,
+    Clear,
+    Path,
+}
+
+impl CacheAction {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "list" => Some(Self::List),
+            "prune" => Some(Self::Prune),
+            "clear" => Some(Self::Clear),
+            "path" => Some(Self::Path),
+            _ => None,
+        }
+    }
+}
+
 /// Subcommand selected for non-interactive CLI execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CliCommand {
     Create,
     #[default]
     List,
     Delete,
+    Cache {
+        action: CacheAction,
+    },
 }
 
 /// Flags supplied alongside a non-interactive subcommand.
@@ -184,18 +210,40 @@ where
         }
     }
 
+    let cache_action = positional
+        .get(1)
+        .and_then(|value| CacheAction::parse(value));
+
     // Detect non-interactive CLI subcommand.
     let cli_command = match mode {
         AppMode::Create => Some(CliCommand::Create),
         AppMode::List => Some(CliCommand::List),
         AppMode::Delete => Some(CliCommand::Delete),
+        AppMode::Cache => cache_action.map(|action| CliCommand::Cache { action }),
         _ => None,
     };
-    let has_cli_flags =
-        name.is_some() || source.is_some() || branch.is_some() || path.is_some() || force || json;
+    let has_cli_flags = name.is_some()
+        || source.is_some()
+        || branch.is_some()
+        || path.is_some()
+        || force
+        || json
+        || cache_action.is_some();
 
-    let cli_args = match (cli_command, has_cli_flags) {
-        (Some(cmd), true) => Some(CliArgs {
+    let cli_args = match mode {
+        AppMode::Create | AppMode::List | AppMode::Delete => match (cli_command, has_cli_flags) {
+            (Some(cmd), true) => Some(CliArgs {
+                command: cmd,
+                name,
+                source,
+                branch,
+                path,
+                json,
+                force,
+            }),
+            _ => None,
+        },
+        AppMode::Cache => cli_command.map(|cmd| CliArgs {
             command: cmd,
             name,
             source,
@@ -235,6 +283,7 @@ Commands:\n  \
 create     Create a new worktree\n  \
 list       List all worktrees\n  \
 delete     Delete a worktree\n  \
+cache      Inspect or clean the shared dependency cache\n  \
 settings   Manage configuration\n  \
 (no command) Start interactive menu\n\n\
 Interactive Options:\n  \
@@ -247,21 +296,29 @@ Non-Interactive Options:\n  \
 -s, --source <branch>  Source branch (create)\n  \
 -b, --branch <branch>  New branch name; defaults to source (create)\n  \
 -p, --path <path>      Worktree path (delete)\n  \
--f, --force            Force delete even with uncommitted changes (delete)\n  \
---json                 Output as JSON (list)\n\n\
+-f, --force            Force delete even with uncommitted changes (delete), or skip prompt for cache clear\n  \
+--json                 Output as JSON (list, cache list)\n\n\
+Cache Subcommands:\n  \
+wisetree cache list    Show cache entries and users\n  \
+wisetree cache prune   Remove orphaned cache entries older than 14 days\n  \
+wisetree cache clear   Delete the entire cache for this repo (requires --force)\n  \
+wisetree cache path    Print the cache root path\n\n\
 Interactive Examples:\n  \
 wisetree                # Start interactive menu\n  \
 wisetree create         # Go directly to create worktree flow\n  \
 wisetree list           # List all worktrees interactively\n  \
 wisetree --from-wrapper # Used by shell wrapper to enable directory switching\n  \
 wisetree delete         # Go directly to delete worktree flow\n  \
+wisetree cache          # Open the shared cache screen\n  \
 wisetree settings       # Open settings menu\n\n\
 Non-Interactive Examples:\n  \
 wisetree create -n my-feature -s main              # Create worktree from main\n  \
 wisetree create -n my-feature -s main -b feat/foo  # Create with new branch\n  \
 wisetree list --json                               # List worktrees as JSON\n  \
 wisetree delete -n my-feature                      # Delete worktree by name\n  \
-wisetree delete -p /path/to/worktree -f            # Force delete by path\n\n\
+wisetree delete -p /path/to/worktree -f            # Force delete by path\n  \
+wisetree cache list --json                         # Show cache details as JSON\n  \
+wisetree cache clear --force                       # Remove this repo's shared cache\n\n\
 Shell Integration:\n  \
 Run 'wisetree' and select \"Setup Shell Integration\" to enable quick directory switching.\n  \
 After setup, just run 'wisetree' to quickly change to any worktree directory.\n\n\

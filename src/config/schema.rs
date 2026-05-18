@@ -7,6 +7,17 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub enum LinkStrategy {
+    /// Create an empty cache directory and link to it.
+    #[default]
+    CreateEmpty,
+    /// Seed the cache from the source worktree when present.
+    SeedFromSource,
+    /// Seed only when the source directory already exists.
+    SeedIfPresent,
+}
+
 /// Default `worktreeCopyPatterns`.
 pub fn default_copy_patterns() -> Vec<String> {
     vec![".env*".to_string(), ".vscode/**".to_string()]
@@ -53,6 +64,18 @@ pub struct WorktreeConfig {
     #[serde(rename = "postCreateCmd", default)]
     pub post_create_cmd: Vec<String>,
 
+    /// Directory patterns to symlink into new worktrees from the shared cache.
+    #[serde(rename = "worktreeLinkPatterns", default)]
+    pub worktree_link_patterns: Vec<String>,
+
+    /// Strategy used when a link pattern is missing in the source worktree.
+    #[serde(rename = "worktreeLinkStrategy", default)]
+    pub worktree_link_strategy: LinkStrategy,
+
+    /// Optional override for the shared cache root.
+    #[serde(rename = "worktreeLinkCacheDir", default)]
+    pub worktree_link_cache_dir: Option<String>,
+
     /// Command to open terminal in new worktree directory (e.g., 'code $WORKTREE_PATH').
     #[serde(rename = "terminalCommand", default)]
     pub terminal_command: String,
@@ -69,6 +92,9 @@ impl Default for WorktreeConfig {
             worktree_copy_ignores: default_copy_ignores(),
             worktree_path_template: default_path_template(),
             post_create_cmd: Vec::new(),
+            worktree_link_patterns: Vec::new(),
+            worktree_link_strategy: LinkStrategy::default(),
+            worktree_link_cache_dir: None,
             terminal_command: String::new(),
             delete_branch_with_worktree: false,
         }

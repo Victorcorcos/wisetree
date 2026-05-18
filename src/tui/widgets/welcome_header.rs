@@ -27,6 +27,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::Create => Some("Create"),
             Screen::List => Some("List"),
             Screen::Delete => Some("Delete"),
+            Screen::Cache => Some("Cache"),
             Screen::Settings => Some("Settings"),
             Screen::Setup => Some("Setup"),
         }

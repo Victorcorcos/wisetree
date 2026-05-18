@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 use std::ops::Range;
 
-use crate::config::schema::WorktreeConfig;
+use crate::config::schema::{LinkStrategy, WorktreeConfig};
 use crate::messages::{
     colors, UPDATE_CHECKING, UPDATE_CHECK_MENU, UPDATE_FAILED, UPDATE_INSTALL_CMD,
     UPDATE_UP_TO_DATE,
@@ -33,6 +33,9 @@ use crate::tui::widgets::{
 pub enum SettingsStep {
     Menu,
     CopyPatterns,
+    LinkPatterns,
+    LinkStrategy,
+    LinkCacheDir,
     IgnorePatterns,
     PathTemplate,
     PostCmd,
@@ -497,6 +500,17 @@ impl SettingsScreen {
         let opts: Vec<SelectOption<SettingsStep>> = vec![
             SelectOption::new("Copy Patterns", SettingsStep::CopyPatterns).with_description(
                 format!("{} patterns", self.config.worktree_copy_patterns.len()),
+            ),
+            SelectOption::new("Link Patterns", SettingsStep::LinkPatterns).with_description(
+                format!("{} patterns", self.config.worktree_link_patterns.len()),
+            ),
+            SelectOption::new("Link Strategy", SettingsStep::LinkStrategy)
+                .with_description(link_strategy_label(self.config.worktree_link_strategy)),
+            SelectOption::new("Link Cache Dir", SettingsStep::LinkCacheDir).with_description(
+                self.config
+                    .worktree_link_cache_dir
+                    .clone()
+                    .unwrap_or_else(|| "(default)".to_string()),
             ),
             SelectOption::new("Ignore Patterns", SettingsStep::IgnorePatterns).with_description(
                 format!("{} patterns", self.config.worktree_copy_ignores.len()),
@@ -1079,10 +1093,14 @@ impl SettingsScreen {
         }
         match self.step {
             // Settings menu select prompt: ~7 entries + label + spacer + hint.
-            SettingsStep::Menu => 14,
+            SettingsStep::Menu => 18,
             SettingsStep::CheckUpdates => 6,
             // Detail panes: header + value lines + hint.
-            SettingsStep::CopyPatterns | SettingsStep::IgnorePatterns => 12,
+            SettingsStep::CopyPatterns
+            | SettingsStep::LinkPatterns
+            | SettingsStep::LinkStrategy
+            | SettingsStep::LinkCacheDir
+            | SettingsStep::IgnorePatterns => 12,
             SettingsStep::PathTemplate => self.path_template_preferred_height(),
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
             SettingsStep::PostCmd => self.post_cmd_preferred_height(),
@@ -1122,6 +1140,9 @@ impl SettingsScreen {
         match self.step {
             SettingsStep::Menu => self.render_menu(frame, area),
             SettingsStep::CopyPatterns => self.render_copy_patterns(frame, area),
+            SettingsStep::LinkPatterns => self.render_link_patterns(frame, area),
+            SettingsStep::LinkStrategy => self.render_link_strategy(frame, area),
+            SettingsStep::LinkCacheDir => self.render_link_cache_dir(frame, area),
             SettingsStep::IgnorePatterns => self.render_ignore_patterns(frame, area),
             SettingsStep::PathTemplate => self.render_path_template(frame, area),
             SettingsStep::PostCmd => self.render_post_cmd(frame, area),
@@ -1229,6 +1250,40 @@ impl SettingsScreen {
             "Ignore Patterns",
             "Files/patterns excluded from copying:",
             self.config.worktree_copy_ignores.clone(),
+        );
+    }
+
+    fn render_link_patterns(&self, frame: &mut Frame, area: Rect) {
+        self.render_field(
+            frame,
+            area,
+            "Link Patterns",
+            "Directories/patterns shared through the repo cache:",
+            self.config.worktree_link_patterns.clone(),
+        );
+    }
+
+    fn render_link_strategy(&self, frame: &mut Frame, area: Rect) {
+        self.render_field(
+            frame,
+            area,
+            "Link Strategy",
+            "How missing source directories are handled before linking:",
+            [link_strategy_label(self.config.worktree_link_strategy)],
+        );
+    }
+
+    fn render_link_cache_dir(&self, frame: &mut Frame, area: Rect) {
+        self.render_field(
+            frame,
+            area,
+            "Link Cache Dir",
+            "Override for the shared cache root (or default per-repo cache path):",
+            [self
+                .config
+                .worktree_link_cache_dir
+                .clone()
+                .unwrap_or_else(|| "(default) ~/.wisetree/cache/<repo-id>".to_string())],
         );
     }
 
@@ -1937,6 +1992,14 @@ Safety features:\n\
                 .add_modifier(Modifier::DIM),
         )));
         frame.render_widget(Paragraph::new(lines), area);
+    }
+}
+
+fn link_strategy_label(strategy: LinkStrategy) -> &'static str {
+    match strategy {
+        LinkStrategy::CreateEmpty => "CreateEmpty",
+        LinkStrategy::SeedFromSource => "SeedFromSource",
+        LinkStrategy::SeedIfPresent => "SeedIfPresent",
     }
 }
 

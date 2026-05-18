@@ -5,7 +5,7 @@ use std::process::Command;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tempfile::TempDir;
-use wisetree::config::WorktreeConfig;
+use wisetree::config::{LinkStrategy, WorktreeConfig};
 use wisetree::git::types::WorktreeCreateOptions;
 use wisetree::worktree::WorktreeService;
 
@@ -150,6 +150,44 @@ async fn create_worktree_runs_post_create_commands_with_progress() {
             assert_eq!(snap.len(), 1);
             assert_eq!(snap[0].1, 1);
             assert_eq!(snap[0].2, 1);
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(body);
+    });
+}
+
+#[tokio::test]
+async fn create_worktree_populates_link_report_when_link_patterns_enabled() {
+    with_isolated_home(|| {
+        let body = async {
+            let fx = build_fixture();
+            let mut svc = WorktreeService::new(Some(fx.repo.clone()));
+            svc.initialize().await.expect("init");
+            svc.config_service_mut().update(|c| {
+                c.worktree_copy_patterns = Vec::new();
+                c.worktree_link_patterns = vec!["node_modules".to_string()];
+                c.worktree_link_strategy = LinkStrategy::CreateEmpty;
+            });
+
+            let opts = WorktreeCreateOptions {
+                name: "feat-link".into(),
+                source_branch: "main".into(),
+                new_branch: "feat-link".into(),
+                base_path: String::new(),
+            };
+            let outcome = svc.create_worktree(&opts, None).await.expect("create");
+
+            let report = outcome.link_report.expect("link report present");
+            assert_eq!(report.linked.len(), 1);
+            let metadata = std::fs::symlink_metadata(outcome.worktree_path.join("node_modules"))
+                .expect("linked path metadata");
+            #[cfg(not(windows))]
+            assert!(metadata.file_type().is_symlink());
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                assert!(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
+            }
         };
         tokio::runtime::Runtime::new().unwrap().block_on(body);
     });

@@ -73,7 +73,7 @@ fn assert_text_style(buffer: &Buffer, text: &str, fg: Color, bg: Color) {
 
 #[test]
 fn menu_default_shows_five_entries_when_shell_status_unknown() {
-    let menu = MenuScreen::new(0, None, None);
+    let menu = MenuScreen::new(0, None, None, false);
     assert!(!menu.has_setup_entry());
     let dumped = dump(80, 18, |f| menu.render(f, f.area()));
     assert!(dumped.contains("Create new worktree"));
@@ -86,7 +86,7 @@ fn menu_default_shows_five_entries_when_shell_status_unknown() {
 
 #[test]
 fn menu_shows_setup_entry_when_shell_not_installed() {
-    let menu = MenuScreen::new(0, None, Some(false));
+    let menu = MenuScreen::new(0, None, Some(false), false);
     assert!(menu.has_setup_entry());
     let dumped = dump(80, 20, |f| menu.render(f, f.area()));
     assert!(dumped.contains("Setup Shell Integration"));
@@ -95,7 +95,7 @@ fn menu_shows_setup_entry_when_shell_not_installed() {
 
 #[test]
 fn menu_hides_setup_when_shell_already_installed() {
-    let menu = MenuScreen::new(0, None, Some(true));
+    let menu = MenuScreen::new(0, None, Some(true), false);
     assert!(!menu.has_setup_entry());
     let dumped = dump(80, 20, |f| menu.render(f, f.area()));
     assert!(!dumped.contains("Setup Shell Integration"));
@@ -103,7 +103,7 @@ fn menu_hides_setup_when_shell_already_installed() {
 
 #[test]
 fn menu_enter_dispatches_choice_for_create() {
-    let mut menu = MenuScreen::new(0, None, None);
+    let mut menu = MenuScreen::new(0, None, None, false);
     match menu.handle_key(key(KeyCode::Enter)) {
         MenuOutcome::Selected(MenuChoice::Create, idx) => assert_eq!(idx, 0),
         _ => panic!("expected Create"),
@@ -112,7 +112,7 @@ fn menu_enter_dispatches_choice_for_create() {
 
 #[test]
 fn menu_arrow_navigation_then_enter_picks_settings() {
-    let mut menu = MenuScreen::new(0, None, None);
+    let mut menu = MenuScreen::new(0, None, None, false);
     menu.handle_key(key(KeyCode::Down));
     menu.handle_key(key(KeyCode::Down));
     menu.handle_key(key(KeyCode::Down));
@@ -131,13 +131,13 @@ fn as_choice(o: MenuOutcome) -> Option<MenuChoice> {
 
 #[test]
 fn menu_esc_cancels_to_quit() {
-    let mut menu = MenuScreen::new(0, None, None);
+    let mut menu = MenuScreen::new(0, None, None, false);
     matches!(menu.handle_key(key(KeyCode::Esc)), MenuOutcome::Cancelled);
 }
 
 #[test]
 fn menu_setup_entry_is_first_when_present() {
-    let mut menu = MenuScreen::new(0, None, Some(false));
+    let mut menu = MenuScreen::new(0, None, Some(false), false);
     match menu.handle_key(key(KeyCode::Enter)) {
         MenuOutcome::Selected(MenuChoice::Setup, idx) => assert_eq!(idx, 0),
         _ => panic!("expected Setup"),
@@ -146,13 +146,13 @@ fn menu_setup_entry_is_first_when_present() {
 
 #[test]
 fn menu_default_index_clamped_when_no_setup() {
-    let menu = MenuScreen::new(99, None, None);
+    let menu = MenuScreen::new(99, None, None, false);
     assert!(menu.selected_index() < 5);
 }
 
 #[test]
 fn menu_render_includes_welcome_header_and_cwd() {
-    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None);
+    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None, false);
     let dumped = dump(80, 16, |f| menu.render(f, f.area()));
     assert!(dumped.contains("Welcome to"));
     assert!(dumped.contains("Wisetree"));
@@ -161,7 +161,7 @@ fn menu_render_includes_welcome_header_and_cwd() {
 
 #[test]
 fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
-    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None);
+    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None, false);
     let buffer = render(80, 20, |f| menu.render(f, f.area()));
 
     // "Welcome to " stays in the header title color, but "Wisetree" must
@@ -197,7 +197,7 @@ fn menu_render_applies_mockup_palette_to_header_menu_and_footer() {
 
 #[test]
 fn menu_render_indents_current_repository_line_inside_header() {
-    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None);
+    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None, false);
     let buffer = render(80, 20, |f| menu.render(f, f.area()));
     let (x, y) =
         find_text_start(&buffer, "Current Repository").expect("current repository line present");
@@ -208,7 +208,7 @@ fn menu_render_indents_current_repository_line_inside_header() {
 
 #[test]
 fn menu_render_uses_rounded_selected_row_with_arrow_cursor() {
-    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None);
+    let menu = MenuScreen::new(0, Some("/tmp/repo".into()), None, false);
     let dumped = dump(80, 20, |f| menu.render(f, f.area()));
 
     assert!(dumped.contains("➤"));

@@ -50,14 +50,14 @@ fn run_tui(parsed: ParsedArgs) -> Result<ExitCode, anyhow::Error> {
     if !std::io::stdin().is_terminal() {
         eprintln!(
             "Error: wisetree requires a TTY for interactive mode. \
-             Run a subcommand (create/list/delete) for non-interactive use."
+             Run a subcommand (create/list/delete/cache) for non-interactive use."
         );
         return Ok(ExitCode::from(1));
     }
     if !parsed.is_from_wrapper && !std::io::stdout().is_terminal() {
         eprintln!(
             "Error: wisetree requires a TTY for interactive mode. \
-             Run a subcommand (create/list/delete) for non-interactive use."
+             Run a subcommand (create/list/delete/cache) for non-interactive use."
         );
         return Ok(ExitCode::from(1));
     }
@@ -120,6 +120,7 @@ fn run_cli(args: CliArgs) -> Result<ExitCode, anyhow::Error> {
             CliCommand::Create => commands::create::run(args, &service).await,
             CliCommand::List => commands::list::run(&service).await,
             CliCommand::Delete => commands::delete::run(args, &service).await,
+            CliCommand::Cache { .. } => commands::cache::run(args, &service).await,
         }
     });
 

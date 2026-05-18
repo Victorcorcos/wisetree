@@ -9,6 +9,7 @@ pub enum Screen {
     Create,
     List,
     Delete,
+    Cache,
     Settings,
     Setup,
 }
@@ -20,6 +21,7 @@ impl Screen {
             AppMode::Create => Self::Create,
             AppMode::List => Self::List,
             AppMode::Delete => Self::Delete,
+            AppMode::Cache => Self::Cache,
             AppMode::Settings => Self::Settings,
         }
     }
@@ -30,6 +32,7 @@ impl Screen {
             Self::Create => "create",
             Self::List => "list",
             Self::Delete => "delete",
+            Self::Cache => "cache",
             Self::Settings => "settings",
             Self::Setup => "setup",
         }

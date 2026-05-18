@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use tempfile::TempDir;
 use wisetree::config::schema::{
-    default_copy_ignores, default_copy_patterns, default_path_template,
+    default_copy_ignores, default_copy_patterns, default_path_template, LinkStrategy,
 };
 use wisetree::config::{ConfigService, WorktreeConfig};
 
@@ -32,8 +32,25 @@ fn defaults_match_upstream() {
     assert_eq!(cfg.worktree_copy_ignores, default_copy_ignores());
     assert_eq!(cfg.worktree_path_template, default_path_template());
     assert!(cfg.post_create_cmd.is_empty());
+    assert!(cfg.worktree_link_patterns.is_empty());
+    assert_eq!(cfg.worktree_link_strategy, LinkStrategy::CreateEmpty);
+    assert_eq!(cfg.worktree_link_cache_dir, None);
     assert_eq!(cfg.terminal_command, "");
     assert!(!cfg.delete_branch_with_worktree);
+}
+
+#[test]
+fn link_fields_round_trip() {
+    let cfg = WorktreeConfig {
+        worktree_link_patterns: vec!["node_modules".into(), "target".into()],
+        worktree_link_strategy: LinkStrategy::SeedIfPresent,
+        worktree_link_cache_dir: Some("$BASE_PATH/.cache/wisetree".into()),
+        ..WorktreeConfig::default()
+    };
+
+    let raw = serde_json::to_string(&cfg).unwrap();
+    let round_trip: WorktreeConfig = serde_json::from_str(&raw).unwrap();
+    assert_eq!(round_trip, cfg);
 }
 
 #[test]

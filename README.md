@@ -32,6 +32,7 @@ The two features that make it especially powerful for AI-assisted development ar
 | Feature | What it does | Why it matters for AI agents |
 | --- | --- | --- |
 | **Copy Patterns** (`worktreeCopyPatterns` / `worktreeCopyIgnores`) | Glob-based file copying from the source repo into the freshly created worktree, with an explicit ignore list. | Untracked-but-required files (`.env*`, `.vscode/**`, local credentials, editor settings) land in the new worktree automatically, so the agent can run, test, and inspect the code without any manual seeding step. |
+| **Shared Cache Links** (`worktreeLinkPatterns` / `worktreeLinkStrategy` / `worktreeLinkCacheDir`) | Symlinks heavyweight dependency directories like `node_modules/`, `target/`, `vendor/`, and `.venv/` into a per-repository cache. | The first worktree pays the install/build cost once, and every later worktree reuses the populated cache instead of downloading or compiling the same dependencies again. |
 | **Post-Create Commands** (`postCreateCmd`) | An ordered list of shell commands executed inside the new worktree right after it is created, with progress reporting in the TUI. | Bootstraps the environment with commands like `bundle install`, `npm install`, `docker compose up -d`, `rails db:prepare`, and `make seed`, so by the time you hand control over to the agent, the project is already runnable. |
 
 Combined with the optional **`terminalCommand`** (e.g. `code $WORKTREE_PATH`, `cursor $WORKTREE_PATH`, `idea $WORKTREE_PATH`) and the **shell integration** (which `cd`s your current shell into the selected worktree the moment you confirm), the loop becomes:
@@ -152,6 +153,7 @@ You land on the main menu, where the available actions are:
 | **Create new worktree** | Guided flow: pick a source branch, name the directory, optionally name a new branch, confirm. Copy patterns, post-create commands, and terminal launch run automatically afterwards. |
 | **List worktrees** | Live list of every worktree attached to the current repository, with the main checkout and any dirty trees called out. |
 | **Delete worktree** | Pick a worktree, confirm, and it is gone. Optionally deletes the matching branch (`deleteBranchWithWorktree`). Falls back to manual cleanup for corrupted worktrees. |
+| **Shared cache** | Inspect the repo-local dependency cache, see size and active users, and delete individual cache entries when they are no longer useful. |
 | **Settings** | Inspect and edit the active configuration (project-local or global), reset to defaults, and toggle integration. |
 | **Exit** | Close the TUI without changing anything. |
 
@@ -184,6 +186,9 @@ A complete configuration example:
     "yarn install",
     "bin/rails db:prepare"
   ],
+  "worktreeLinkPatterns": ["node_modules", "target"],
+  "worktreeLinkStrategy": "CreateEmpty",
+  "worktreeLinkCacheDir": null,
   "terminalCommand": "code $WORKTREE_PATH",
   "deleteBranchWithWorktree": true
 }
@@ -197,8 +202,29 @@ The variables `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, and `$SOURCE_BRANC
 | `worktreeCopyIgnores` | `string[]` | `["**/node_modules/**", "**/dist/**", "**/.git/**", "**/Thumbs.db", "**/.DS_Store"]` | Glob patterns to skip during the copy step. |
 | `worktreePathTemplate` | `string` | `"$BASE_PATH.worktree"` | Template that decides where new worktrees live on disk, relative to the repo's parent directory. |
 | `postCreateCmd` | `string[]` | `[]` | Ordered list of shell commands executed inside the new worktree, with live progress in the TUI. |
+| `worktreeLinkPatterns` | `string[]` | `[]` | Directory paths or globs to link from the shared per-repo cache into each new worktree. |
+| `worktreeLinkStrategy` | `"CreateEmpty" \| "SeedFromSource" \| "SeedIfPresent"` | `"CreateEmpty"` | Controls whether missing link directories are created empty or seeded from the source checkout on first use. |
+| `worktreeLinkCacheDir` | `string \| null` | `null` | Optional override for the cache root. By default Wisetree uses `~/.wisetree/cache/<repo-id>`. |
 | `terminalCommand` | `string` | `""` | Optional command spawned right after creation (e.g. `code $WORKTREE_PATH`) to open an editor or terminal. |
 | `deleteBranchWithWorktree` | `boolean` | `false` | When `true`, deleting a worktree also deletes its associated branch. |
+
+### Shared dependency cache example
+
+For a Node project, this config shares `node_modules/` across every worktree:
+
+```json
+{
+  "worktreeLinkPatterns": ["node_modules"],
+  "worktreeLinkStrategy": "CreateEmpty",
+  "postCreateCmd": ["npm install"]
+}
+```
+
+The first `npm install` populates `~/.wisetree/cache/<repo-id>/entries/node_modules/`. Every later worktree gets `node_modules` as a link into that cache, which can save hundreds of MB per worktree and cut setup time from minutes to seconds.
+
+If you use `pnpm`, prefer `node-linker=hoisted` before sharing `node_modules`, since pnpm's default store layout can reject a symlinked worktree-level `node_modules` directory.
+
+On Windows, Wisetree automatically falls back to directory junctions when standard directory symlinks require privileges that are not available.
 
 # 📟 Wisetree CLI
 
@@ -218,6 +244,7 @@ wisetree [command] [options]
 | `create` | Create a new worktree (interactive unless flags are supplied). |
 | `list` | List all worktrees attached to the current repository. |
 | `delete` | Delete an existing worktree (interactive unless flags are supplied). |
+| `cache` | Inspect, prune, clear, or print the shared dependency cache for the current repository. |
 | `settings` | Open the settings screen to inspect and edit configuration. |
 
 ### Global / interactive options
@@ -226,7 +253,7 @@ wisetree [command] [options]
 | --- | --- | --- |
 | `--help` | `-h` | Show the built-in help screen. |
 | `--version` | `-v` | Print the installed version. |
-| `--mode <mode>` | `-m` | Land directly on a specific screen (`menu`, `create`, `list`, `delete`, `settings`). |
+| `--mode <mode>` | `-m` | Land directly on a specific screen (`menu`, `create`, `list`, `delete`, `cache`, `settings`). |
 | `--from-wrapper` | `None` | Used internally by the shell wrapper so `wisetree` can print the selected path on stdout for the parent shell to `cd` into. |
 
 ### Non-interactive options
@@ -237,8 +264,17 @@ wisetree [command] [options]
 | `--source <branch>` | `-s` | `create` | Source branch to fork the new worktree from. |
 | `--branch <branch>` | `-b` | `create` | New branch name; defaults to the directory name. |
 | `--path <path>` | `-p` | `delete` | Worktree path (alternative to `--name`). |
-| `--force` | `-f` | `delete` | Force-delete even when the worktree has uncommitted changes. |
-| `--json` | `None` | `list` | Emit the worktree list as JSON, suitable for piping into `jq`. |
+| `--force` | `-f` | `delete`, `cache clear` | Force-delete even when the worktree has uncommitted changes, or clear the entire cache without an interactive confirmation. |
+| `--json` | `None` | `list`, `cache list` | Emit machine-readable JSON, suitable for piping into `jq`. |
+
+### Cache subcommands
+
+| Command | Description |
+| --- | --- |
+| `wisetree cache list` | Show cache entries, size, age, and active worktree users. |
+| `wisetree cache prune` | Remove orphaned cache entries that have no active users and are older than 14 days. |
+| `wisetree cache clear --force` | Delete the entire cache for the current repository. |
+| `wisetree cache path` | Print the absolute cache root path. |
 
 ### Interactive examples
 
@@ -247,6 +283,7 @@ wisetree                # Open the main menu
 wisetree create         # Jump straight into the create flow
 wisetree list           # Browse worktrees interactively
 wisetree delete         # Jump straight into the delete flow
+wisetree cache          # Open the shared cache screen
 wisetree settings       # Open the settings screen
 ```
 
@@ -258,6 +295,8 @@ wisetree create -n my-feature -s main -b feat/payments # Create with an explicit
 wisetree list --json                                   # Emit JSON for scripting
 wisetree delete -n my-feature                          # Delete by directory name
 wisetree delete -p /path/to/worktree -f                # Force-delete by full path
+wisetree cache list --json                             # Inspect the shared cache as JSON
+wisetree cache clear --force                           # Remove this repo's cache
 ```
 
 ### Update checks

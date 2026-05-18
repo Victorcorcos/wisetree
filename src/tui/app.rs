@@ -32,7 +32,8 @@ use crate::services::{
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
-use crate::tui::screens::create::{CreateAction, CreateScreen};
+use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
+use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryLine, SummaryTone};
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
 };
@@ -42,7 +43,9 @@ use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScree
 use crate::tui::screens::setup::{SetupAction, SetupScreen};
 use crate::tui::terminal;
 use crate::tui::widgets::WelcomeHeader;
-use crate::worktree::service::DeleteOutcome as ServiceDeleteOutcome;
+use crate::worktree::service::{
+    CreateOutcome as ServiceCreateOutcome, DeleteOutcome as ServiceDeleteOutcome,
+};
 use crate::worktree::WorktreeService;
 use crate::VERSION;
 
@@ -56,8 +59,10 @@ enum InitPhase {
 enum AppEvent {
     Initialized(InitOutcome),
     ListLoaded(Result<Vec<GitWorktree>, String>),
+    CacheLoaded(Result<crate::files::CacheOverview, String>),
+    CacheEntryDeleted(Result<crate::files::CacheOverview, String>),
     CreateBranchesLoaded(Result<Vec<GitBranch>, String>),
-    CreateFinished(Result<PathBuf, String>),
+    CreateFinished(Result<ServiceCreateOutcome, String>),
     DeleteLoaded(Result<Vec<GitWorktree>, String>),
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
     SettingsUpdateChecked(UpdateCheckResult),
@@ -78,6 +83,7 @@ pub struct App {
     quit_requested: bool,
     menu: Option<MenuScreen>,
     list: Option<ListScreen>,
+    cache: Option<CacheScreen>,
     create: Option<CreateScreen>,
     delete: Option<DeleteScreen>,
     settings: Option<SettingsScreen>,
@@ -103,6 +109,7 @@ impl App {
             quit_requested: false,
             menu: None,
             list: None,
+            cache: None,
             create: None,
             delete: None,
             settings: None,
@@ -225,6 +232,17 @@ impl App {
                 if let Some(list) = self.list.as_mut() {
                     list.tick = self.tick;
                     list.render(frame, panel);
+                }
+            }
+            Screen::Cache => {
+                let h = self
+                    .cache
+                    .as_ref()
+                    .map_or(8, |s| s.preferred_content_height());
+                let panel = self.render_framed_panel(frame, area, h);
+                if let Some(cache) = self.cache.as_mut() {
+                    cache.tick = self.tick;
+                    cache.render(frame, panel);
                 }
             }
             Screen::Create => {
@@ -358,6 +376,7 @@ impl App {
         match self.screen {
             Screen::Menu => self.handle_menu_key(key, tx),
             Screen::List => self.handle_list_key(key),
+            Screen::Cache => self.handle_cache_key(key, tx),
             Screen::Create => self.handle_create_key(key, tx),
             Screen::Delete => self.handle_delete_key(key, tx),
             Screen::Settings => self.handle_settings_key(key, tx),
@@ -379,6 +398,7 @@ impl App {
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                     MenuChoice::List => self.enter_screen(Screen::List, tx),
                     MenuChoice::Delete => self.enter_screen(Screen::Delete, tx),
+                    MenuChoice::Cache => self.enter_screen(Screen::Cache, tx),
                     MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
                 }
             }
@@ -405,6 +425,30 @@ impl App {
                     let _ = open_terminal(&config.terminal_command, &path);
                 }
                 self.back_to_menu();
+            }
+        }
+    }
+
+    fn handle_cache_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.cache.as_mut() {
+            Some(cache) => cache.handle_key(key),
+            None => return,
+        };
+
+        match action {
+            CacheScreenAction::Continue => {}
+            CacheScreenAction::Back => self.back_to_menu(),
+            CacheScreenAction::Refresh => {
+                if let Some(cache) = self.cache.as_mut() {
+                    cache.start_loading();
+                }
+                kick_off_cache_load(self.git_root.clone(), tx.clone());
+            }
+            CacheScreenAction::DeleteEntry(relative_path) => {
+                if let Some(cache) = self.cache.as_mut() {
+                    cache.start_loading();
+                }
+                kick_off_cache_entry_delete(self.git_root.clone(), relative_path, tx.clone());
             }
         }
     }
@@ -573,6 +617,14 @@ impl App {
                     }
                 }
             }
+            AppEvent::CacheLoaded(result) | AppEvent::CacheEntryDeleted(result) => {
+                if let Some(cache) = self.cache.as_mut() {
+                    match result {
+                        Ok(overview) => cache.set_overview(overview),
+                        Err(message) => cache.set_error(message),
+                    }
+                }
+            }
             AppEvent::CreateBranchesLoaded(result) => {
                 if let Some(create) = self.create.as_mut() {
                     match result {
@@ -585,8 +637,9 @@ impl App {
                 if let Some(create) = self.create.as_mut() {
                     match result {
                         Ok(path) => {
-                            create.set_created_worktree_path(path);
-                            create.mark_complete();
+                            let summary = create_summary_lines(&path);
+                            create.set_created_worktree_path(path.worktree_path.clone());
+                            create.mark_complete(summary);
                         }
                         Err(message) => create.set_error(message),
                     }
@@ -661,6 +714,10 @@ impl App {
                 self.list = Some(ListScreen::new(self.is_from_wrapper, has_terminal_command));
                 kick_off_list_load(self.git_root.clone(), tx.clone());
             }
+            Screen::Cache => {
+                self.cache = Some(CacheScreen::new());
+                kick_off_cache_load(self.git_root.clone(), tx.clone());
+            }
             Screen::Create => {
                 self.create = Some(CreateScreen::new());
                 kick_off_create_branch_load(self.git_root.clone(), tx.clone());
@@ -677,6 +734,14 @@ impl App {
                 let local_path = self.local_config_path_str();
                 let active_post_create =
                     self.current_config().map(|cfg| cfg.post_create_cmd.clone());
+                let active_link_patterns = self
+                    .current_config()
+                    .map(|cfg| cfg.worktree_link_patterns.clone());
+                let active_link_strategy =
+                    self.current_config().map(|cfg| cfg.worktree_link_strategy);
+                let active_link_cache_dir = self
+                    .current_config()
+                    .map(|cfg| cfg.worktree_link_cache_dir.clone());
                 let active_terminal_command = self
                     .current_config()
                     .map(|cfg| cfg.terminal_command.clone());
@@ -687,6 +752,15 @@ impl App {
                     Ok((mut config, config_path)) => {
                         if let Some(commands) = active_post_create {
                             config.post_create_cmd = commands;
+                        }
+                        if let Some(patterns) = active_link_patterns {
+                            config.worktree_link_patterns = patterns;
+                        }
+                        if let Some(strategy) = active_link_strategy {
+                            config.worktree_link_strategy = strategy;
+                        }
+                        if let Some(cache_dir) = active_link_cache_dir {
+                            config.worktree_link_cache_dir = cache_dir;
                         }
                         if let Some(command) = active_terminal_command {
                             config.terminal_command = command;
@@ -717,6 +791,7 @@ impl App {
     fn clear_screen_state(&mut self) {
         self.menu = None;
         self.list = None;
+        self.cache = None;
         self.create = None;
         self.delete = None;
         self.settings = None;
@@ -736,6 +811,9 @@ impl App {
             self.shell_integration_status
                 .as_ref()
                 .map(|status| status.is_installed),
+            self.current_config()
+                .map(|config| !config.worktree_link_patterns.is_empty())
+                .unwrap_or(false),
         )
     }
 
@@ -954,9 +1032,25 @@ impl App {
 
     fn refresh_settings_screen(&mut self) -> Result<(), String> {
         let active_post_create = self.current_config().map(|cfg| cfg.post_create_cmd.clone());
+        let active_link_patterns = self
+            .current_config()
+            .map(|cfg| cfg.worktree_link_patterns.clone());
+        let active_link_strategy = self.current_config().map(|cfg| cfg.worktree_link_strategy);
+        let active_link_cache_dir = self
+            .current_config()
+            .map(|cfg| cfg.worktree_link_cache_dir.clone());
         let (mut config, path) = self.global_settings_snapshot()?;
         if let Some(commands) = active_post_create {
             config.post_create_cmd = commands;
+        }
+        if let Some(patterns) = active_link_patterns {
+            config.worktree_link_patterns = patterns;
+        }
+        if let Some(strategy) = active_link_strategy {
+            config.worktree_link_strategy = strategy;
+        }
+        if let Some(cache_dir) = active_link_cache_dir {
+            config.worktree_link_cache_dir = cache_dir;
         }
 
         if let Some(settings) = self.settings.as_mut() {
@@ -1052,6 +1146,47 @@ fn kick_off_list_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEve
     });
 }
 
+fn kick_off_cache_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let mut service = WorktreeService::new(git_root.map(PathBuf::from));
+        if let Err(err) = service.initialize().await {
+            let _ = tx.send(AppEvent::CacheLoaded(Err(user_friendly_message(&err))));
+            return;
+        }
+
+        let result = service
+            .cache_overview()
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::CacheLoaded(result));
+    });
+}
+
+fn kick_off_cache_entry_delete(
+    git_root: Option<String>,
+    relative_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let mut service = WorktreeService::new(git_root.map(PathBuf::from));
+        if let Err(err) = service.initialize().await {
+            let _ = tx.send(AppEvent::CacheEntryDeleted(Err(user_friendly_message(
+                &err,
+            ))));
+            return;
+        }
+
+        let result = match service.remove_repo_cache_entry(&relative_path).await {
+            Ok(()) => service
+                .cache_overview()
+                .await
+                .map_err(|err| user_friendly_message(&err)),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::CacheEntryDeleted(result));
+    });
+}
+
 fn kick_off_create_branch_load(git_root: Option<String>, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let service = GitService::new(git_root.map(PathBuf::from));
@@ -1089,7 +1224,6 @@ fn kick_off_create_worktree(
         let result = service
             .create_worktree(&options, None)
             .await
-            .map(|outcome| outcome.worktree_path)
             .map_err(|e| user_friendly_message(&e));
         let _ = tx.send(AppEvent::CreateFinished(result));
     });
@@ -1145,6 +1279,131 @@ fn screen_delete_outcome(outcome: ServiceDeleteOutcome) -> ScreenDeleteOutcome {
         worktree_deleted: outcome.worktree_deleted,
         branch_deleted: outcome.branch_deleted,
         branch_name: outcome.branch_name,
+    }
+}
+
+fn create_summary_lines(outcome: &ServiceCreateOutcome) -> Vec<SummaryLine> {
+    let mut lines = vec![SummaryLine::new(
+        format!("Worktree path: {}", outcome.worktree_path.display()),
+        SummaryTone::Emphasis,
+    )];
+
+    if let Some(report) = &outcome.copy_report {
+        append_section_header(&mut lines, "Copy Report");
+        append_summary_values(
+            &mut lines,
+            report.copied.iter().map(|path| format!("Copied {path}")),
+            SummaryTone::Success,
+            3,
+        );
+        append_summary_values(
+            &mut lines,
+            report.skipped.iter().map(|path| format!("Skipped {path}")),
+            SummaryTone::Warning,
+            2,
+        );
+        append_summary_values(
+            &mut lines,
+            report.errors.iter().cloned(),
+            SummaryTone::Error,
+            2,
+        );
+    }
+
+    if let Some(report) = &outcome.link_report {
+        append_section_header(&mut lines, "Shared Cache Links");
+        append_summary_values(
+            &mut lines,
+            report.linked.iter().map(|entry| {
+                if entry.seeded {
+                    format!("Linked {} (seeded from source)", entry.pattern)
+                } else {
+                    format!("Linked {} (using shared cache)", entry.pattern)
+                }
+            }),
+            SummaryTone::Success,
+            4,
+        );
+        append_summary_values(
+            &mut lines,
+            report.skipped.iter().cloned(),
+            SummaryTone::Warning,
+            3,
+        );
+        append_summary_values(
+            &mut lines,
+            report.errors.iter().cloned(),
+            SummaryTone::Error,
+            3,
+        );
+    }
+
+    if !outcome.command_runs.is_empty() {
+        append_section_header(&mut lines, "Post-Create Commands");
+        let successful = outcome
+            .command_runs
+            .iter()
+            .filter(|run| run.success)
+            .count();
+        lines.push(SummaryLine::new(
+            format!(
+                "Completed {successful}/{} command(s)",
+                outcome.command_runs.len()
+            ),
+            if successful == outcome.command_runs.len() {
+                SummaryTone::Success
+            } else {
+                SummaryTone::Warning
+            },
+        ));
+        append_summary_values(
+            &mut lines,
+            outcome
+                .command_runs
+                .iter()
+                .filter(|run| !run.success)
+                .map(|run| format!("Command failed: {}", run.command)),
+            SummaryTone::Error,
+            2,
+        );
+    }
+
+    if lines.len() == 1 {
+        lines.push(SummaryLine::new(
+            "No copy, shared cache link, or post-create steps were configured.",
+            SummaryTone::Muted,
+        ));
+    }
+
+    lines
+}
+
+fn append_section_header(lines: &mut Vec<SummaryLine>, title: &str) {
+    lines.push(SummaryLine::new(title, SummaryTone::Info));
+}
+
+fn append_summary_values<I>(
+    lines: &mut Vec<SummaryLine>,
+    values: I,
+    tone: SummaryTone,
+    limit: usize,
+) where
+    I: IntoIterator<Item = String>,
+{
+    let collected: Vec<String> = values.into_iter().collect();
+    if collected.is_empty() {
+        return;
+    }
+
+    for value in collected.iter().take(limit) {
+        lines.push(SummaryLine::new(format!("  • {value}"), tone));
+    }
+
+    if collected.len() > limit {
+        lines.push(SummaryLine::new(
+            format!("  • {} more", collected.len() - limit),
+            SummaryTone::Muted,
+        ));
     }
 }
 
@@ -1318,7 +1577,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..5 {
+            for _ in 0..8 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -1376,7 +1635,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..6 {
+            for _ in 0..9 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -1436,7 +1695,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..6 {
+            for _ in 0..9 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
