@@ -4,7 +4,11 @@ use std::process::Command;
 
 use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
-use wisetree::services::{DashboardNoticeLevel, DashboardService};
+use wisetree::git::types::{BranchStatus, GitWorktree};
+use wisetree::services::{
+    is_behind, resolve_base_ref, CheckStatus, DashboardNoticeLevel, DashboardRow, DashboardService,
+    MergeStatus, PrState, PullRequest,
+};
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
 /// enabled — otherwise the service short-circuits before calling gh.
@@ -667,8 +671,8 @@ async fn merge_pull_request_invokes_gh_with_squash_flag_and_passthrough_message(
         "merge must use --squash; log was {log:?}"
     );
     assert!(
-        log.contains("--subject Add merge action"),
-        "subject must reach gh verbatim; log was {log:?}"
+        log.contains("--subject Add merge action (#7)"),
+        "subject must reach gh with `(#N)` PR reference appended; log was {log:?}"
     );
     assert!(
         log.contains("--body Closes #42 with notes."),
@@ -712,4 +716,128 @@ async fn merge_pull_request_errors_clearly_when_gh_missing() {
         .await
         .expect_err("merge should fail without gh");
     assert!(format!("{err}").contains("gh CLI not found"));
+}
+
+// -----------------------------------------------------------------------
+// Section 2 — resolve_base_ref / is_behind
+// -----------------------------------------------------------------------
+
+/// Build a tiny throwaway repo with a base commit and seed pseudo-remote
+/// refs at `<remote>/<branch>` using `git update-ref`. Returns the path.
+fn repo_with_remote_refs(refs: &[&str]) -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("repo");
+    fs::create_dir_all(&path).unwrap();
+    git(&path, &["init", "-q", "-b", "main"]);
+    git(&path, &["config", "user.email", "test@example.com"]);
+    git(&path, &["config", "user.name", "Test"]);
+    fs::write(path.join("README.md"), "x\n").unwrap();
+    git(&path, &["add", "README.md"]);
+    git(&path, &["commit", "-q", "-m", "init"]);
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&path)
+        .output()
+        .expect("rev-parse");
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    for r in refs {
+        git(&path, &["update-ref", &format!("refs/remotes/{r}"), &sha]);
+    }
+    (dir, path)
+}
+
+#[tokio::test]
+async fn resolve_base_ref_picks_upstream_main_when_all_four_present() {
+    let (_dir, repo) = repo_with_remote_refs(&[
+        "upstream/main",
+        "upstream/master",
+        "origin/main",
+        "origin/master",
+    ]);
+    let chosen = resolve_base_ref(&repo).await;
+    assert_eq!(chosen.as_deref(), Some("upstream/main"));
+}
+
+#[tokio::test]
+async fn resolve_base_ref_falls_through_to_origin_master() {
+    let (_dir, repo) = repo_with_remote_refs(&["origin/master"]);
+    let chosen = resolve_base_ref(&repo).await;
+    assert_eq!(chosen.as_deref(), Some("origin/master"));
+}
+
+#[tokio::test]
+async fn resolve_base_ref_returns_none_when_no_remote_refs_exist() {
+    let (_dir, repo) = repo_with_remote_refs(&[]);
+    let chosen = resolve_base_ref(&repo).await;
+    assert!(
+        chosen.is_none(),
+        "expected None when no remote refs exist, got {chosen:?}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_base_ref_priority_skips_missing_upstream_to_origin_main() {
+    let (_dir, repo) = repo_with_remote_refs(&["origin/main", "origin/master"]);
+    let chosen = resolve_base_ref(&repo).await;
+    assert_eq!(chosen.as_deref(), Some("origin/main"));
+}
+
+fn row_with(merge_status: Option<MergeStatus>, behind: Option<u64>) -> DashboardRow {
+    DashboardRow {
+        worktree: GitWorktree {
+            path: "/tmp/repo-feat".into(),
+            branch: "feat".into(),
+            commit: "deadbeef".into(),
+            is_main: false,
+            is_clean: true,
+            branch_status: behind.map(|b| BranchStatus {
+                ahead: 0,
+                behind: b,
+                upstream_branch: Some("upstream/main".into()),
+            }),
+        },
+        last_commit: None,
+        pull_request: merge_status.map(|status| PullRequest {
+            number: 21,
+            state: PrState::Open,
+            url: "u".into(),
+            title: "t".into(),
+            checks_status: Some(CheckStatus::Passed),
+            review_status: None,
+            merge_status: Some(status),
+        }),
+        error: None,
+    }
+}
+
+#[test]
+fn is_behind_true_when_merge_status_says_behind_only() {
+    let row = row_with(Some(MergeStatus::Behind), Some(0));
+    assert!(is_behind(&row));
+}
+
+#[test]
+fn is_behind_true_when_branch_status_behind_positive_only() {
+    let row = row_with(Some(MergeStatus::Clean), Some(3));
+    assert!(is_behind(&row));
+}
+
+#[test]
+fn is_behind_false_when_clean_and_zero_behind() {
+    let row = row_with(Some(MergeStatus::Clean), Some(0));
+    assert!(!is_behind(&row));
+}
+
+#[test]
+fn is_behind_false_when_no_pr_and_no_branch_status() {
+    let row = row_with(None, None);
+    assert!(!is_behind(&row));
+}
+
+#[test]
+fn is_behind_true_when_merge_status_behind_with_zero_count() {
+    // Rare race: GitHub knows the branch is behind, but the local diff
+    // hasn't been refreshed yet. We still surface the option.
+    let row = row_with(Some(MergeStatus::Behind), Some(0));
+    assert!(is_behind(&row));
 }

@@ -10,3 +10,5 @@ pub mod menu;
 pub mod merge_pr;
 pub mod settings;
 pub mod setup;
+pub mod setup_project;
+pub mod update_pr;

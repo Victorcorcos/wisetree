@@ -28,6 +28,7 @@ pub struct SelectOption<T> {
     pub label: String,
     pub value: T,
     pub description: Option<String>,
+    pub description_color: Option<Color>,
     pub disabled: bool,
     pub color: Option<Color>,
 }
@@ -38,6 +39,7 @@ impl<T> SelectOption<T> {
             label: label.into(),
             value,
             description: None,
+            description_color: None,
             disabled: false,
             color: None,
         }
@@ -45,6 +47,11 @@ impl<T> SelectOption<T> {
 
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    pub fn with_description_color(mut self, color: Color) -> Self {
+        self.description_color = Some(color);
         self
     }
 
@@ -133,10 +140,21 @@ impl<T: Clone> SelectPrompt<T> {
             return (0..self.options.len()).collect();
         }
         let q = self.query.to_lowercase();
+        let number_idx: Option<usize> = q.trim().parse::<usize>().ok().and_then(|n| {
+            if n >= 1 && n <= self.options.len() {
+                Some(n - 1)
+            } else {
+                None
+            }
+        });
         self.options
             .iter()
             .enumerate()
-            .filter_map(|(i, o)| o.label.to_lowercase().contains(&q).then_some(i))
+            .filter_map(|(i, o)| {
+                let label_match = o.label.to_lowercase().contains(&q);
+                let number_match = number_idx == Some(i);
+                (label_match || number_match).then_some(i)
+            })
             .collect()
     }
 
@@ -471,12 +489,13 @@ impl<T: Clone> SelectPrompt<T> {
                     spans.push(Span::styled(option.label.clone(), row_style));
                 }
                 if let Some(desc) = &option.description {
+                    let desc_fg = option.description_color.unwrap_or(colors::MUTED);
                     spans.push(Span::styled(
                         format!(" ({desc})"),
                         Style::default()
-                            .fg(colors::MUTED)
+                            .fg(desc_fg)
                             .bg(row_bg)
-                            .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                            .add_modifier(Modifier::ITALIC),
                     ));
                 }
 
