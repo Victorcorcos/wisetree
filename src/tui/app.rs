@@ -266,8 +266,12 @@ impl App {
 
         let mut events = EventLoop::new(Duration::from_millis(50));
         let signal_quit = install_termination_listener();
+        let orphan_quit = install_orphan_watchdog();
 
-        while !self.quit_requested && !signal_quit.load(Ordering::Relaxed) {
+        while !self.quit_requested
+            && !signal_quit.load(Ordering::Relaxed)
+            && !orphan_quit.load(Ordering::Relaxed)
+        {
             while let Ok(event) = rx.try_recv() {
                 self.handle_app_event(event, &tx);
             }
@@ -281,6 +285,11 @@ impl App {
                 Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
                 Event::Tick => self.tick = self.tick.wrapping_add(1),
                 Event::Resize(_, _) => {}
+                // The input fd is in POLLHUP — the terminal tab is gone.
+                // Calling crossterm again would wedge us at 100% CPU
+                // inside its `try_read` loop. Break out so the cleanup
+                // path runs and the process exits.
+                Event::TtyDisconnected => break,
             }
         }
         Ok(())
@@ -2469,11 +2478,15 @@ struct InitOutcome {
     result: Result<WorktreeService, String>,
 }
 
-/// Route SIGHUP (terminal tab closed) and SIGTERM through the normal
-/// shutdown path so `restore()` runs and the tty doesn't get stranded in
-/// raw mode. Without this, closing the tab with Cmd+W kills the process
-/// before cleanup, leaving the parent shell's `dir=$(...)` capture stuck on
-/// a tty with ICANON/ECHO disabled.
+/// Route asynchronous termination signals (SIGHUP/SIGTERM/SIGINT/SIGQUIT)
+/// through the normal shutdown path so `restore()` runs and the tty doesn't
+/// get stranded in raw mode. Without this, closing the tab with Cmd+W kills
+/// the process before cleanup, leaving the parent shell's `dir=$(...)`
+/// capture stuck on a tty with ICANON/ECHO disabled.
+///
+/// SIGINT is included for parity even though the keyboard Ctrl+C path is
+/// handled separately in raw mode — anything that delivers SIGINT externally
+/// (e.g. `kill -INT`) should still tear down cleanly. SIGQUIT covers Ctrl+\.
 fn install_termination_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
@@ -2487,14 +2500,123 @@ fn install_termination_listener() -> Arc<AtomicBool> {
             let Ok(mut term) = signal(SignalKind::terminate()) else {
                 return;
             };
+            let Ok(mut int) = signal(SignalKind::interrupt()) else {
+                return;
+            };
+            let Ok(mut quit) = signal(SignalKind::quit()) else {
+                return;
+            };
             tokio::select! {
                 _ = hup.recv() => {}
                 _ = term.recv() => {}
+                _ = int.recv() => {}
+                _ = quit.recv() => {}
             }
             flag.store(true, Ordering::Relaxed);
         });
     }
     flag
+}
+
+/// Orphan / dead-terminal watchdog. This is the second line of defense for
+/// the scenario that left two `wisetree` processes pegged at 100% CPU in
+/// Activity Monitor:
+///
+///   1. User runs `wisetree` via the shell wrapper
+///      (`dir=$(... wisetree --from-wrapper)`).
+///   2. User closes the terminal tab / quits the terminal app abruptly.
+///   3. The kernel delivers SIGHUP to the foreground process group — but
+///      the wrapper subshell may exit first without forwarding the signal
+///      to wisetree, so [`install_termination_listener`] never fires.
+///   4. wisetree is reparented to launchd (PID 1) and loses its controlling
+///      terminal. `/dev/tty` reads start returning POLLHUP immediately,
+///      which would let the TUI loop busy-spin at 100% CPU forever.
+///
+/// We defend against this by polling two cheap, reliable signals every
+/// 500ms:
+///
+/// * `getppid()` — if the original parent pid changed (typically to 1),
+///   our parent died. The TUI loop cannot continue safely without a
+///   controlling tty.
+/// * `open("/dev/tty")` — if opening the controlling terminal fails, the
+///   tty has been torn down. crossterm reads will spin instead of block;
+///   the only correct action is to bail out.
+///
+/// When the original parent is already `1` (e.g. launched directly from
+/// launchd, or run inside an exotic init system), the ppid heuristic is
+/// not applicable and we rely solely on the `/dev/tty` probe.
+fn install_orphan_watchdog() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        let original_ppid = unsafe { libc::getppid() };
+        let flag = flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if original_ppid > 1 {
+                    let current_ppid = unsafe { libc::getppid() };
+                    if current_ppid != original_ppid {
+                        flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                if !controlling_tty_alive() {
+                    flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            // Hard exit fallback. Once we've decided wisetree should
+            // exit (orphaned / dead tty), the event loop and terminal
+            // cleanup each need a moment to unwind. But if any cleanup
+            // step blocks on a write to the dead tty, or the event loop
+            // is wedged inside a syscall we can't interrupt, the process
+            // would linger at 100% CPU in Activity Monitor — which is
+            // exactly the bug this watchdog exists to prevent.
+            //
+            // Give the cooperative shutdown ~1s to complete and then
+            // force-exit. 1s is long enough for `terminal::restore_*`
+            // and the runtime shutdown to finish under normal conditions
+            // and short enough that the user doesn't notice the delay.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            std::process::exit(0);
+        });
+    }
+    flag
+}
+
+#[cfg(unix)]
+fn controlling_tty_alive() -> bool {
+    // Two failure modes to detect:
+    //
+    // 1. The kernel revoked our controlling terminal (session leader
+    //    exited after SIGHUP processing). `open("/dev/tty")` fails with
+    //    ENXIO.
+    //
+    // 2. The pty's master end closed but the session's controlling-tty
+    //    pointer is still set. `open` succeeds, but the fd is in
+    //    POLLHUP — calling crossterm on a fd in this state busy-spins
+    //    at 100% CPU. We need to actually `poll()` the fd to see this.
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/tty")
+    else {
+        return false;
+    };
+
+    let mut fds = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // 0 timeout = snapshot of the current ready/HUP state.
+    let result = unsafe { libc::poll(&mut fds, 1, 0) };
+    if result < 0 {
+        return false;
+    }
+    fds.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0
 }
 
 fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
