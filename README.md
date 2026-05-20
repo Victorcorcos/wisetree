@@ -286,11 +286,11 @@ Dashboard sub-fields:
 | `dashboard.refreshIntervalMs` | `number` | `3000` | Poll interval in milliseconds, clamped to `500..60000` when loaded. |
 | `dashboard.showPullRequests` | `boolean` | `false` | Enables `gh pr list` enrichment when the GitHub CLI is installed. |
 | `dashboard.columns` | `string[]` | `["branch", "status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. |
-| `dashboard.useAi.model` | `string` | `"opencode/minimax-m2.5-free"` | AI backend used to resolve merge conflicts during **Update Pull Request**. Currently only **MiniMax M2.5 Free** (provider `opencode`) is exposed; unknown ids are reset to the default on load. |
+| `dashboard.useAi.model` | `string` | `"opencode/qwen3.6-plus-free"` | AI backend used to resolve merge conflicts during **Update Pull Request**. The cycle is auto-populated from `opencode models opencode --verbose` (entries with `cost.input == 0 && cost.output == 0`). Unknown ids are snapped to the first free model on load. |
 
 ### AI Merge Conflict Resolution (Optional)
 
-When the **Update Pull Request** flow detects merge conflicts, Wisetree hands the resolution off to the [opencode](https://opencode.ai) CLI running a configurable model. The default backend is the free **MiniMax M2.5** model from OpenCode Zen — no API key, no credit card. The merge prompt and tool instructions live in `prompts/merger.md`.
+When the **Update Pull Request** flow detects merge conflicts, Wisetree hands the resolution off to the [opencode](https://opencode.ai) CLI running a configurable model. Wisetree auto-discovers the free models opencode currently exposes (e.g. **Big Pickle**, **DeepSeek V4 Flash Free**, **Nemotron 3 Super Free**, **Qwen3.6 Plus Free**) — no API key, no credit card. The merge prompt and tool instructions live in `prompts/merger.md`.
 
 **1. Install opencode**
 
@@ -308,22 +308,23 @@ npm install -g opencode-ai@latest
 opencode auth login
 ```
 
-Pick **OpenCode Zen** from the provider list. A short signup grants free access to MiniMax M2.5; the credentials persist at `~/.local/share/opencode/auth.json` and never expire under normal use.
+Pick **OpenCode Zen** from the provider list. A short signup grants free access; the credentials persist at `~/.local/share/opencode/auth.json` and never expire under normal use.
 
 **3. Verify**
 
 ```bash
 opencode --version
-opencode run --model opencode/minimax-m2.5-free "say hi"
+opencode models opencode            # list every model exposed by opencode-zen
+opencode run --model opencode/qwen3.6-plus-free "say hi"
 ```
 
 **4. Switch models (optional)**
 
-Edit `dashboard.useAi.model` in `~/.wisetree/settings.json` or in the per-repo `.wisetree.json`. The settings screen also lets you cycle the available models with `Enter`.
+Edit `dashboard.useAi.model` in `~/.wisetree/settings.json` or in the per-repo `.wisetree.json`. The settings screen also lets you cycle the auto-discovered free models with `Enter`. When opencode adds (or retires) a free model, the cycle picks it up automatically on the next run — no wisetree release required.
 
 **Failure behaviour**
 
-If `opencode` isn't on `$PATH` or the user is not signed in, Wisetree aborts the in-progress merge, restores the worktree to a clean state, and surfaces an `opencode CLI not found — run 'opencode auth login' and try again.` toast. No half-applied merges ever land on disk.
+If `opencode` isn't on `$PATH` or the user is not signed in, Wisetree aborts the in-progress merge, restores the worktree to a clean state, and surfaces an `opencode CLI not found — run 'opencode auth login' and try again.` toast. If opencode runs but rejects the chosen model (e.g. the model was retired), Wisetree names the model in the toast, suggests a concrete next step (`Switch the model in Settings → Dashboard → useAi`), and writes the full transcript — including opencode's `error.data.message` — to `~/.wisetree/logs/ai-activity-<branch>-<unix-ts>.log`. No half-applied merges ever land on disk.
 
 # 📟 Wisetree CLI
 

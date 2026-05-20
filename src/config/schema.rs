@@ -7,7 +7,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::constants::{DEFAULT_AI_MODEL_ID, DEFAULT_AI_MODEL_LABEL};
+use crate::constants::DEFAULT_AI_MODEL_ID;
+use crate::services::opencode_models::{free_models, OpencodeModel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 pub enum LinkStrategy {
@@ -98,8 +99,9 @@ pub struct DashboardConfig {
     pub columns: Vec<String>,
 
     /// AI backend used to resolve merge conflicts when the
-    /// "Update Pull Request" flow detects them. Defaults to the
-    /// free MiniMax M2.5 model exposed through the opencode CLI.
+    /// "Update Pull Request" flow detects them. Defaults to the first
+    /// free model exposed by the opencode CLI; the list is discovered at
+    /// runtime via `crate::services::opencode_models::free_models()`.
     #[serde(rename = "useAi", default)]
     pub use_ai: UseAiConfig,
 }
@@ -138,9 +140,10 @@ pub fn default_use_ai_model() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UseAiConfig {
-    /// Opencode model id (e.g. `opencode/minimax-m2.5-free`). Must match
-    /// an entry in `UseAiConfig::AVAILABLE_MODELS`; unknown ids are
-    /// reset to the default during `clamp`.
+    /// Opencode model id (e.g. `opencode/big-pickle`). Must match an
+    /// entry surfaced by the opencode `models` listing for the
+    /// `opencode` provider; unknown ids are reset to the first available
+    /// free model during `clamp`.
     #[serde(rename = "model", default = "default_use_ai_model")]
     pub model: String,
 }
@@ -154,40 +157,45 @@ impl Default for UseAiConfig {
 }
 
 impl UseAiConfig {
-    /// Models surfaced in the settings UI. Single entry today; the array
-    /// shape is preserved so a future "switch to GPT-5" or "use Claude"
-    /// option drops in without touching the renderer.
-    pub const AVAILABLE_MODELS: &'static [(&'static str, &'static str)] =
-        &[(DEFAULT_AI_MODEL_ID, DEFAULT_AI_MODEL_LABEL)];
+    /// Live list of free opencode models available on this machine. Used
+    /// by the settings cycle, the JSON clamp, and the label lookup so a
+    /// new free model exposed by `opencode models` shows up in the UI
+    /// without a wisetree release.
+    pub fn available_models() -> &'static [OpencodeModel] {
+        free_models()
+    }
 
-    /// Snap unknown ids back to the default so a hand-edited config can't
-    /// land the merge pipeline on a non-existent model.
+    /// Snap unknown ids back to the first available free model so a
+    /// hand-edited config (or a model that opencode silently retired)
+    /// can't land the merge pipeline on a non-existent backend.
     pub fn clamp(&mut self) {
-        if !Self::AVAILABLE_MODELS
-            .iter()
-            .any(|(id, _)| *id == self.model)
-        {
-            self.model = default_use_ai_model();
+        let models = Self::available_models();
+        if models.iter().any(|m| m.id == self.model) {
+            return;
         }
+        self.model = models
+            .first()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(default_use_ai_model);
     }
 
     /// Human-readable label for the currently selected model. Falls back
     /// to the raw id when the model is unknown so the UI never blanks.
     pub fn label(&self) -> &str {
-        Self::AVAILABLE_MODELS
+        Self::available_models()
             .iter()
-            .find(|(id, _)| *id == self.model)
-            .map(|(_, label)| *label)
+            .find(|m| m.id == self.model)
+            .map(|m| m.label.as_str())
             .unwrap_or(self.model.as_str())
     }
 
-    /// Index of the current model in `AVAILABLE_MODELS`, or 0 when the
+    /// Index of the current model in `available_models()`, or 0 when the
     /// model id isn't recognised — keeps "cycle to next" arithmetic
     /// total even if a hand-edited config drifts.
     pub fn index(&self) -> usize {
-        Self::AVAILABLE_MODELS
+        Self::available_models()
             .iter()
-            .position(|(id, _)| *id == self.model)
+            .position(|m| m.id == self.model)
             .unwrap_or(0)
     }
 }
@@ -264,20 +272,45 @@ mod use_ai_tests {
     use super::*;
 
     #[test]
-    fn default_model_is_minimax_free() {
+    fn default_model_is_in_free_list() {
         let cfg = UseAiConfig::default();
-        assert_eq!(cfg.model, DEFAULT_AI_MODEL_ID);
-        assert_eq!(cfg.label(), DEFAULT_AI_MODEL_LABEL);
-        assert_eq!(cfg.index(), 0);
+        let known: Vec<&str> = UseAiConfig::available_models()
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert!(
+            known.contains(&cfg.model.as_str()),
+            "default model `{}` should be in the free model list: {:?}",
+            cfg.model,
+            known,
+        );
+        // `label()` must produce a non-empty string for any default config
+        // so the settings rect never renders blank.
+        assert!(!cfg.label().is_empty());
     }
 
     #[test]
-    fn clamp_resets_unknown_model_to_default() {
+    fn clamp_resets_unknown_model_to_first_available_free() {
         let mut cfg = UseAiConfig {
             model: "made-up/model".to_string(),
         };
         cfg.clamp();
-        assert_eq!(cfg.model, DEFAULT_AI_MODEL_ID);
+        let expected = UseAiConfig::available_models()
+            .first()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| DEFAULT_AI_MODEL_ID.to_string());
+        assert_eq!(cfg.model, expected);
+    }
+
+    #[test]
+    fn clamp_preserves_known_model() {
+        if let Some(model) = UseAiConfig::available_models().last() {
+            let mut cfg = UseAiConfig {
+                model: model.id.clone(),
+            };
+            cfg.clamp();
+            assert_eq!(cfg.model, model.id);
+        }
     }
 
     #[test]

@@ -969,7 +969,7 @@ impl DashboardField {
                 "Comma-separated: branch, status, ahead_behind, last_commit, pull_request"
             }
             DashboardField::UseAi => {
-                "Press Enter to cycle AI model (MiniMax M2.5 Free is the only free option for now)"
+                "Press Enter to cycle free opencode models (auto-discovered from `opencode models`)"
             }
         }
     }
@@ -1050,20 +1050,22 @@ impl DashboardEditor {
         };
     }
 
-    /// Advance `useAi.model` to the next entry in `AVAILABLE_MODELS`. With a
-    /// single entry today this is a no-op, but the wiring lets future
-    /// additions become live without renderer changes.
+    /// Advance `useAi.model` to the next entry in the auto-discovered free
+    /// model list (`UseAiConfig::available_models()`). With a single entry
+    /// this is a no-op; with multiple entries it rotates and updates the
+    /// label shown in the rect so the change is visible without a redraw
+    /// hop through `build_config`.
     pub fn cycle_ai_model(&mut self, idx: usize) {
         use crate::config::schema::UseAiConfig;
-        let models = UseAiConfig::AVAILABLE_MODELS;
+        let models = UseAiConfig::available_models();
         if models.is_empty() {
             return;
         }
         let current = self.use_ai.index();
         let next = (current + 1) % models.len();
-        let (id, label) = models[next];
-        self.use_ai.model = id.to_string();
-        self.values[idx] = label.to_string();
+        let model = &models[next];
+        self.use_ai.model = model.id.clone();
+        self.values[idx] = model.label.clone();
         self.statuses[idx] = DashboardRectStatus::Modified;
     }
 

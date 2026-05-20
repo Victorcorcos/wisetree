@@ -29,12 +29,15 @@ pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 /// the synthetic commit.
 pub const UPDATE_MERGE_COMMIT_MESSAGE: &str = "Merging and solving conflicts";
 
-/// Default opencode model used for merge-conflict resolution. The model
-/// id is what the opencode CLI accepts on `--model`; the label is what
-/// the settings screen shows. Both stay in lock-step with
-/// `UseAiConfig::AVAILABLE_MODELS` so the toast and the CLI always agree.
-pub const DEFAULT_AI_MODEL_ID: &str = "opencode/minimax-m2.5-free";
-pub const DEFAULT_AI_MODEL_LABEL: &str = "MiniMax M2.5 Free";
+/// Default opencode model used for merge-conflict resolution when nothing
+/// has been configured (or the configured id no longer exists in opencode's
+/// model catalog). The id is what the opencode CLI accepts on `--model`;
+/// the label is what the settings screen shows. The live list of free
+/// models the cycle picks from is built by
+/// `crate::services::opencode_models::free_models()` — this constant is
+/// only the seed used when discovery hasn't run yet.
+pub const DEFAULT_AI_MODEL_ID: &str = "opencode/qwen3.6-plus-free";
+pub const DEFAULT_AI_MODEL_LABEL: &str = "Qwen3.6 Plus Free";
 
 /// Resolve the global config directory (`~/.wisetree/`).
 ///

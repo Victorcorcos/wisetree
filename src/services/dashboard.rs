@@ -352,6 +352,19 @@ pub enum UpdatePullRequestOutcome {
     /// is back to a clean state. The list of conflicted files is included
     /// so the toast can show how many files need attention.
     AiUnavailable { conflicts: Vec<String> },
+    /// Merge produced conflicts, the AI backend was reachable, but the
+    /// opencode invocation itself failed (model retired, auth expired,
+    /// free credits exhausted, network blip, …). The half-applied merge
+    /// was aborted so the worktree is clean. `model_label` is the
+    /// human-friendly name we asked opencode to use (so the toast can say
+    /// "X could not resolve …") and `error` is the most informative
+    /// detail we recovered from opencode's output — typically the
+    /// `error.data.message` field of the JSON stream.
+    AiResolutionFailed {
+        conflicts: Vec<String>,
+        model_label: String,
+        error: String,
+    },
     /// `git fetch` failed (network, auth, …). stderr included.
     FetchFailed(String),
     /// `git merge` failed for a non-conflict reason (e.g. dirty tree), or
@@ -863,7 +876,11 @@ impl DashboardService {
                         UpdatePullRequestOutcome::AiUnavailable { conflicts }
                     }
                     AiConflictResolutionError::Failed(err) => {
-                        UpdatePullRequestOutcome::MergeFailed(format!("AI failed: {err}"))
+                        UpdatePullRequestOutcome::AiResolutionFailed {
+                            conflicts,
+                            model_label,
+                            error: err,
+                        }
                     }
                 });
             }
@@ -2234,11 +2251,48 @@ async fn run_command_streamed(
 
     if status.success() {
         Ok(stdout_str)
-    } else if stderr_str.is_empty() {
-        Err(format!("exit status: {status}"))
     } else {
-        Err(stderr_str)
+        // Opencode's `--format json` mode writes every event — including
+        // fatal errors — to stdout, not stderr. When the CLI exits non-zero
+        // we mine the streamed JSON for an `{"type":"error",...}` line and
+        // pull the human-readable `error.data.message` out so the caller's
+        // toast/log says "Model not found: …" instead of "exit status: 1".
+        let stdout_reason = extract_opencode_stream_error(&stdout_str);
+        let detail = match (stderr_str.is_empty(), stdout_reason) {
+            (true, Some(reason)) => reason,
+            (false, Some(reason)) => format!("{stderr_str}; {reason}"),
+            (false, None) => stderr_str,
+            (true, None) => format!("exit status: {status}"),
+        };
+        Err(detail)
     }
+}
+
+/// Walk an opencode stdout buffer and return the first informative
+/// `error.data.message` carried by a `{"type":"error",...}` JSON line. Used
+/// to translate "exit status: 1" failures into the actionable text the user
+/// actually needs (e.g. "Model not found: opencode/foo. Did you mean: …").
+fn extract_opencode_stream_error(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.contains("\"type\":\"error\"") {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let msg = json_str(&value, &["error", "data", "message"])
+            .or_else(|| json_str(&value, &["error", "message"]))
+            .or_else(|| json_str(&value, &["message"]));
+        if let Some(msg) = msg {
+            let trimmed = msg.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Read `reader` line-by-line, append each (raw) line to `buf`, and
@@ -3519,5 +3573,29 @@ mod tests {
             subject_with_pr_reference("Add merge action (#99)", 7),
             "Add merge action (#99) (#7)"
         );
+    }
+
+    #[test]
+    fn extract_opencode_stream_error_recovers_model_not_found_message() {
+        let stdout = "{\"type\":\"step_start\",\"part\":{}}\n\
+            {\"type\":\"error\",\"timestamp\":1,\"error\":{\"name\":\"UnknownError\",\
+            \"data\":{\"message\":\"Model not found: opencode/minimax-m2.5-free. Did you mean: deepseek-v4-flash-free?\"}}}\n";
+        let reason = extract_opencode_stream_error(stdout).expect("error message recovered");
+        assert!(
+            reason.starts_with("Model not found: opencode/minimax-m2.5-free"),
+            "got: {reason}"
+        );
+    }
+
+    #[test]
+    fn extract_opencode_stream_error_falls_back_to_top_level_message_field() {
+        let stdout = "{\"type\":\"error\",\"message\":\"boom\"}\n";
+        assert_eq!(extract_opencode_stream_error(stdout).as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn extract_opencode_stream_error_returns_none_without_error_event() {
+        let stdout = "{\"type\":\"text\",\"part\":{\"text\":\"hi\"}}\n";
+        assert!(extract_opencode_stream_error(stdout).is_none());
     }
 }

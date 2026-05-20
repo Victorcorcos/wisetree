@@ -2,6 +2,7 @@
 
 pub mod app_state;
 pub mod dashboard;
+pub mod opencode_models;
 pub mod presets;
 pub mod shell_integration;
 pub mod update;

@@ -1636,6 +1636,14 @@ impl App {
                 return;
             }
         }
+        // Persist the AI Activity transcript BEFORE building the toast so
+        // failure messages can reference the on-disk log path. The status
+        // string captured here lands in the log header verbatim so a future
+        // grep over `~/.wisetree/logs/` can recover the original failure.
+        let log_status = log_status_for_update_pr_result(&result);
+        if let Some(screen) = self.update_pr.as_mut() {
+            screen.save_ai_log_to_disk(&log_status);
+        }
         match result {
             Ok(UpdatePrSuccess {
                 number,
@@ -1687,6 +1695,29 @@ impl App {
                         ),
                     );
                 }
+                UpdatePullRequestOutcome::AiResolutionFailed {
+                    conflicts,
+                    model_label,
+                    error,
+                } => {
+                    let count = conflicts.len();
+                    let hint = ai_failure_hint(&error);
+                    let log_hint = self
+                        .update_pr
+                        .as_ref()
+                        .and_then(|s| s.ai_log_path())
+                        .map(|p| format!(" Full transcript: {p}."))
+                        .unwrap_or_default();
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "{model_label} could not resolve {count} conflict(s) on PR #{number}. \
+                             {hint} Switch the model in Settings → Dashboard → useAi. \
+                             Detail: {}.{log_hint}",
+                            truncate_error(&error)
+                        ),
+                    );
+                }
                 UpdatePullRequestOutcome::FetchFailed(detail) => {
                     self.show_toast(
                         ToastVariant::Error,
@@ -1735,15 +1766,6 @@ impl App {
                     ),
                 );
             }
-        }
-        // Best-effort persistence of the AI Activity transcript before we
-        // tear the screen down — when the AI was engaged but the run
-        // ended without a review prompt (failed merge, AiUnavailable,
-        // discard, push failure), this is the user's only chance to keep
-        // the transcript. `save_ai_log_to_disk` is a no-op if the log
-        // was already written or never populated.
-        if let Some(screen) = self.update_pr.as_mut() {
-            screen.save_ai_log_to_disk("Terminal");
         }
         self.update_pr = None;
         self.enter_screen(Screen::Dashboard, tx);
@@ -3172,6 +3194,83 @@ fn fold_path(path: &str) -> String {
     crate::tui::widgets::welcome_header::fold_home(path)
 }
 
+/// One-line label describing how the update-PR pipeline ended. Written to
+/// the AI Activity log header so a grep over `~/.wisetree/logs/` can
+/// recover the original failure mode without re-running the pipeline.
+fn log_status_for_update_pr_result(
+    result: &Result<UpdatePrSuccess, UpdatePrFailure>,
+) -> String {
+    use crate::services::UpdatePullRequestOutcome;
+    match result {
+        Ok(s) => match &s.outcome {
+            UpdatePullRequestOutcome::AlreadyUpToDate => "AlreadyUpToDate".to_string(),
+            UpdatePullRequestOutcome::MergedCleanly => "MergedCleanly".to_string(),
+            UpdatePullRequestOutcome::MergedAwaitingReview { .. } => {
+                "MergedAwaitingReview".to_string()
+            }
+            UpdatePullRequestOutcome::MergedWithAiResolution { model_label } => {
+                format!("MergedWithAiResolution ({model_label})")
+            }
+            UpdatePullRequestOutcome::DiscardedAfterReview => {
+                "DiscardedAfterReview".to_string()
+            }
+            UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
+                format!("AiUnavailable ({} conflict(s))", conflicts.len())
+            }
+            UpdatePullRequestOutcome::AiResolutionFailed {
+                model_label,
+                error,
+                conflicts,
+            } => format!(
+                "AiResolutionFailed ({}, {} conflict(s)): {}",
+                model_label,
+                conflicts.len(),
+                error
+            ),
+            UpdatePullRequestOutcome::FetchFailed(detail) => format!("FetchFailed: {detail}"),
+            UpdatePullRequestOutcome::MergeFailed(detail) => format!("MergeFailed: {detail}"),
+            UpdatePullRequestOutcome::PushFailed(detail) => format!("PushFailed: {detail}"),
+            UpdatePullRequestOutcome::DiscardFailed(detail) => format!("DiscardFailed: {detail}"),
+        },
+        Err(f) => format!("PipelineError: {}", f.message),
+    }
+}
+
+/// Map a raw opencode failure string to a short, actionable nudge. We
+/// inspect known signatures (`Model not found`, auth 4xx, credit limits,
+/// rate limit) instead of dumping the raw blob — the user usually only
+/// needs to know *which* of those classes hit them. Anything we don't
+/// recognise falls through to a generic "try another free model" hint
+/// since switching is the cheapest recovery in the free-tier flow.
+fn ai_failure_hint(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("model not found") || lower.contains("unknown model") {
+        return "That model is no longer offered by opencode.";
+    }
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("not authenticated")
+        || lower.contains("auth")
+    {
+        return "Re-authenticate with `opencode auth login` and try again.";
+    }
+    if lower.contains("402")
+        || lower.contains("payment required")
+        || lower.contains("insufficient credit")
+        || lower.contains("quota")
+        || lower.contains("free tier")
+    {
+        return "Free tier exhausted — wait for the quota reset or pick another free model.";
+    }
+    if lower.contains("rate limit") || lower.contains("429") {
+        return "Rate-limited by opencode — wait a minute or pick another free model.";
+    }
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return "Opencode timed out — try again or pick another free model.";
+    }
+    "Pick another free model and retry."
+}
+
 /// Cap a captured stderr/stdout snippet to a single readable line so it
 /// fits in a toast. Joins all lines on a single space and adds an ellipsis
 /// when the text exceeds the limit.
@@ -4560,5 +4659,64 @@ mod tests {
             .collect::<String>();
         assert!(dumped.contains("Choose wisely"));
         assert!(dumped.contains("Copied to clipboard"));
+    }
+
+    #[test]
+    fn ai_failure_hint_picks_model_not_found_branch() {
+        let hint = ai_failure_hint(
+            "Model not found: opencode/minimax-m2.5-free. Did you mean: deepseek-v4-flash-free?",
+        );
+        assert!(
+            hint.contains("no longer offered"),
+            "expected retirement hint, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn ai_failure_hint_picks_auth_branch_on_401() {
+        let hint = ai_failure_hint("401 Unauthorized");
+        assert!(hint.contains("opencode auth login"), "got: {hint}");
+    }
+
+    #[test]
+    fn ai_failure_hint_picks_quota_branch_on_402() {
+        let hint = ai_failure_hint("402 payment required: free tier limit reached");
+        assert!(hint.contains("Free tier"), "got: {hint}");
+    }
+
+    #[test]
+    fn ai_failure_hint_falls_back_to_generic_switch_suggestion() {
+        let hint = ai_failure_hint("something exploded internally");
+        assert!(
+            hint.contains("Pick another free model"),
+            "got: {hint}"
+        );
+    }
+
+    #[test]
+    fn log_status_includes_error_for_ai_resolution_failed() {
+        use crate::services::UpdatePullRequestOutcome;
+        let result = Ok::<UpdatePrSuccess, UpdatePrFailure>(UpdatePrSuccess {
+            number: 7,
+            base_ref: "upstream/main".to_string(),
+            outcome: UpdatePullRequestOutcome::AiResolutionFailed {
+                conflicts: vec!["README.md".into()],
+                model_label: "Big Pickle — Free".into(),
+                error: "Model not found: opencode/big-pickle".into(),
+            },
+        });
+        let status = log_status_for_update_pr_result(&result);
+        assert!(
+            status.contains("AiResolutionFailed"),
+            "missing variant tag: {status}"
+        );
+        assert!(
+            status.contains("Big Pickle — Free"),
+            "missing model label: {status}"
+        );
+        assert!(
+            status.contains("Model not found"),
+            "missing error detail: {status}"
+        );
     }
 }
