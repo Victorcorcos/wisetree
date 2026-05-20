@@ -19,12 +19,8 @@ use ratatui::Frame;
 use std::ops::Range;
 
 use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
-use crate::constants::global_config_file;
-use crate::messages::{
-    colors, UPDATE_CHECKING, UPDATE_CHECK_MENU, UPDATE_FAILED, UPDATE_INSTALL_CMD,
-    UPDATE_UP_TO_DATE,
-};
-use crate::services::{MultiSourceUpdateResult, UpdateCheckResult, UpdateSource};
+use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
+use crate::services::{MultiSourceUpdateResult, UpdateSource};
 use crate::tui::widgets::{
     branded_line, ConfirmChoice, ConfirmDialog, ConfirmVariant, InputOutcome, InputPrompt,
     SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
