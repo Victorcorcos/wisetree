@@ -7,6 +7,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::constants::{DEFAULT_AI_MODEL_ID, DEFAULT_AI_MODEL_LABEL};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 pub enum LinkStrategy {
     /// Create an empty cache directory and link to it.
@@ -94,6 +96,12 @@ pub struct DashboardConfig {
 
     #[serde(rename = "columns", default = "default_columns")]
     pub columns: Vec<String>,
+
+    /// AI backend used to resolve merge conflicts when the
+    /// "Update Pull Request" flow detects them. Defaults to the
+    /// free MiniMax M2.5 model exposed through the opencode CLI.
+    #[serde(rename = "useAi", default)]
+    pub use_ai: UseAiConfig,
 }
 
 impl Default for DashboardConfig {
@@ -102,6 +110,7 @@ impl Default for DashboardConfig {
             refresh_interval_ms: default_refresh_ms(),
             show_pull_requests: false,
             columns: default_columns(),
+            use_ai: UseAiConfig::default(),
         }
     }
 }
@@ -109,12 +118,77 @@ impl Default for DashboardConfig {
 impl DashboardConfig {
     pub fn clamp(&mut self) {
         self.refresh_interval_ms = clamp_dashboard_refresh_interval(self.refresh_interval_ms);
+        self.use_ai.clamp();
     }
 
     pub fn normalize_columns(&mut self) -> Vec<String> {
         let (columns, warnings) = normalize_dashboard_columns(&self.columns);
         self.columns = columns;
         warnings
+    }
+}
+
+pub fn default_use_ai_model() -> String {
+    DEFAULT_AI_MODEL_ID.to_string()
+}
+
+/// AI backend selection for the merge-conflict resolver. The shape is a
+/// nested object so we can grow it (api keys, fallback models, …) without
+/// breaking the existing JSON schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UseAiConfig {
+    /// Opencode model id (e.g. `opencode/minimax-m2.5-free`). Must match
+    /// an entry in `UseAiConfig::AVAILABLE_MODELS`; unknown ids are
+    /// reset to the default during `clamp`.
+    #[serde(rename = "model", default = "default_use_ai_model")]
+    pub model: String,
+}
+
+impl Default for UseAiConfig {
+    fn default() -> Self {
+        Self {
+            model: default_use_ai_model(),
+        }
+    }
+}
+
+impl UseAiConfig {
+    /// Models surfaced in the settings UI. Single entry today; the array
+    /// shape is preserved so a future "switch to GPT-5" or "use Claude"
+    /// option drops in without touching the renderer.
+    pub const AVAILABLE_MODELS: &'static [(&'static str, &'static str)] =
+        &[(DEFAULT_AI_MODEL_ID, DEFAULT_AI_MODEL_LABEL)];
+
+    /// Snap unknown ids back to the default so a hand-edited config can't
+    /// land the merge pipeline on a non-existent model.
+    pub fn clamp(&mut self) {
+        if !Self::AVAILABLE_MODELS
+            .iter()
+            .any(|(id, _)| *id == self.model)
+        {
+            self.model = default_use_ai_model();
+        }
+    }
+
+    /// Human-readable label for the currently selected model. Falls back
+    /// to the raw id when the model is unknown so the UI never blanks.
+    pub fn label(&self) -> &str {
+        Self::AVAILABLE_MODELS
+            .iter()
+            .find(|(id, _)| *id == self.model)
+            .map(|(_, label)| *label)
+            .unwrap_or(self.model.as_str())
+    }
+
+    /// Index of the current model in `AVAILABLE_MODELS`, or 0 when the
+    /// model id isn't recognised — keeps "cycle to next" arithmetic
+    /// total even if a hand-edited config drifts.
+    pub fn index(&self) -> usize {
+        Self::AVAILABLE_MODELS
+            .iter()
+            .position(|(id, _)| *id == self.model)
+            .unwrap_or(0)
     }
 }
 
@@ -182,6 +256,37 @@ impl Default for WorktreeConfig {
             delete_branch_with_worktree: false,
             dashboard: DashboardConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod use_ai_tests {
+    use super::*;
+
+    #[test]
+    fn default_model_is_minimax_free() {
+        let cfg = UseAiConfig::default();
+        assert_eq!(cfg.model, DEFAULT_AI_MODEL_ID);
+        assert_eq!(cfg.label(), DEFAULT_AI_MODEL_LABEL);
+        assert_eq!(cfg.index(), 0);
+    }
+
+    #[test]
+    fn clamp_resets_unknown_model_to_default() {
+        let mut cfg = UseAiConfig {
+            model: "made-up/model".to_string(),
+        };
+        cfg.clamp();
+        assert_eq!(cfg.model, DEFAULT_AI_MODEL_ID);
+    }
+
+    #[test]
+    fn dashboard_config_round_trips_use_ai() {
+        let mut cfg = DashboardConfig::default();
+        cfg.use_ai.model = DEFAULT_AI_MODEL_ID.to_string();
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let parsed: DashboardConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.use_ai.model, DEFAULT_AI_MODEL_ID);
     }
 }
 

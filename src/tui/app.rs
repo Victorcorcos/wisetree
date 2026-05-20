@@ -428,11 +428,23 @@ impl App {
                 }
             }
             Screen::UpdatePullRequest => {
-                let h = self
+                // Once the AI panel is live we want it to consume nearly the
+                // entire screen — opencode-style transcripts are huge — so
+                // bypass the fixed-height frame and render into the fill
+                // panel. Other steps keep their compact framed layout.
+                let panel = if self
                     .update_pr
                     .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                    .is_some_and(|s| s.is_ai_panel_live())
+                {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .update_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
                 if let Some(update_pr) = self.update_pr.as_mut() {
                     update_pr.tick = self.tick;
                     update_pr.render(frame, panel);
@@ -707,15 +719,23 @@ impl App {
                 );
             }
             UpdateAction::PushReviewed => {
+                let fallback_label = self.current_dashboard_config().use_ai.label().to_string();
+                let dashboard_config = self.current_dashboard_config();
+                let git_root = self.git_root.clone();
                 let Some(screen) = self.update_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
+                let model_label = screen
+                    .review_model_label()
+                    .map(str::to_string)
+                    .unwrap_or(fallback_label);
                 screen.start_post_review(true);
                 kick_off_push_after_review(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
+                    git_root,
+                    dashboard_config,
                     request,
+                    model_label,
                     tx.clone(),
                 );
             }
@@ -1601,12 +1621,18 @@ impl App {
                     commit_sha,
                     stat,
                     diff,
+                    model_label,
                 },
             ..
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                screen.present_review(commit_sha.clone(), stat.clone(), diff.clone());
+                screen.present_review(
+                    commit_sha.clone(),
+                    stat.clone(),
+                    diff.clone(),
+                    model_label.clone(),
+                );
                 return;
             }
         }
@@ -1628,11 +1654,11 @@ impl App {
                         format!("Pull Request #{number} updated with `{base_ref}` and pushed."),
                     );
                 }
-                UpdatePullRequestOutcome::MergedWithAiResolution => {
+                UpdatePullRequestOutcome::MergedWithAiResolution { model_label } => {
                     self.show_toast(
                         ToastVariant::Success,
                         format!(
-                            "Pull Request #{number} updated (Gemini-resolved, reviewed) \
+                            "Pull Request #{number} updated ({model_label}-resolved, reviewed) \
                              and pushed."
                         ),
                     );
@@ -1650,13 +1676,13 @@ impl App {
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::GeminiMissing { conflicts } => {
+                UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
                     let count = conflicts.len();
                     self.show_toast(
                         ToastVariant::Error,
                         format!(
                             "Merge has {count} conflicted file(s). \
-                             Gemini is unavailable — sign in with Gemini CLI or set `GEMINI_API_KEY` / `GOOGLE_API_KEY`, then retry. \
+                             opencode CLI not found — run `opencode auth login` and try again. \
                              Pull Request #{number} was NOT updated."
                         ),
                     );
@@ -2751,6 +2777,7 @@ fn kick_off_push_after_review(
     git_root: Option<String>,
     config: DashboardConfig,
     request: UpdatePullRequestRequest,
+    model_label: String,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let number = request.number;
@@ -2767,7 +2794,9 @@ fn kick_off_push_after_review(
         .unwrap_or_else(|| "(unknown)".to_string());
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service.push_after_review(&request.worktree_path).await;
+        let result = service
+            .push_after_review(&request.worktree_path, &model_label)
+            .await;
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
@@ -4069,6 +4098,7 @@ mod tests {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
                     columns: vec!["branch".into(), "status".into()],
+                    use_ai: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4077,6 +4107,7 @@ mod tests {
                     refresh_interval_ms: 6000,
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
+                    use_ai: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4096,6 +4127,7 @@ mod tests {
                 refresh_interval_ms: 7000,
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into(), "pull_request".into()],
+                use_ai: Default::default(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -4125,6 +4157,7 @@ mod tests {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
+                    use_ai: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4143,6 +4176,7 @@ mod tests {
                 refresh_interval_ms: 8000,
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into()],
+                use_ai: Default::default(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 

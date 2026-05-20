@@ -10,7 +10,7 @@
 //!   (driven by `set_phase_message` as the pipeline progresses), plus a
 //!   bordered "AI Activity" panel below that streams the AI subprocess's
 //!   stdout/stderr lines as they arrive (auto-scrolled to the latest).
-//! - `AwaitingReview`: shown after Gemini resolved conflicts. Renders
+//! - `AwaitingReview`: shown after the AI resolved conflicts. Renders
 //!   the merge commit SHA on top, the full `git diff HEAD~1 HEAD` in a
 //!   scrollable colorized panel (Up/Down/PgUp/PgDn/Home/End), and the
 //!   Push/Discard `ConfirmDialog` at the bottom (Left/Right toggle,
@@ -39,11 +39,17 @@ const UPDATE_RUNNING_MESSAGE: &str = "Updating pull request...";
 const UPDATE_PUSHING_MESSAGE: &str = "Pushing reviewed merge...";
 const UPDATE_DISCARDING_MESSAGE: &str = "Discarding merge commit...";
 
-/// Hard cap on the number of AI activity lines retained in memory. A
-/// long Gemini run can emit thousands of rows (tool calls, file edits,
+/// Hard cap on the number of AI activity events retained in memory. A
+/// long opencode run can emit thousands of rows (tool calls, file edits,
 /// progress dots); we only ever render the bottom slice that fits the
 /// activity panel, so anything older is pure memory pressure.
-const AI_LOG_MAX_LINES: usize = 1024;
+const AI_LOG_MAX_LINES: usize = 2048;
+
+/// Maximum number of `Line`s a single AI event is allowed to expand to
+/// after markdown / multi-line rendering. A pathological assistant
+/// response that pastes a giant log could otherwise drown the whole
+/// panel; this lets earlier events still show through.
+const AI_EVENT_MAX_LINES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateStep {
@@ -78,6 +84,11 @@ pub struct UpdatePullRequestScreen {
     /// Visible scroll offset (in diff lines) for the review panel.
     /// Clamped against the rendered diff height every frame.
     review_scroll: u16,
+    /// Human-friendly model label captured when the pipeline returns
+    /// `MergedAwaitingReview` (e.g. `MiniMax M2.5 Free`). Used by the
+    /// review confirm prompt and the post-push success toast so the AI
+    /// is never named with a hard-coded vendor.
+    review_model_label: Option<String>,
     /// Scroll offset from the bottom of the AI activity log. `0` means
     /// "follow the latest output". When the user wheels upward we increase
     /// this offset and preserve it as new lines arrive so the viewport stays
@@ -121,6 +132,7 @@ impl UpdatePullRequestScreen {
             review_stat: None,
             review_diff: None,
             review_scroll: 0,
+            review_model_label: None,
             ai_scroll: 0,
             post_review_message: None,
             phase_message: UPDATE_RUNNING_MESSAGE.to_string(),
@@ -182,6 +194,14 @@ impl UpdatePullRequestScreen {
 
     pub fn is_updating(&self) -> bool {
         matches!(self.step, UpdateStep::Updating | UpdateStep::PostReview)
+    }
+
+    /// True while the AI Activity panel is the dominant content (the
+    /// merge pipeline has entered the AI step). The TUI uses this to
+    /// expand the panel to fill the available area instead of using
+    /// the compact fixed-height layout.
+    pub fn is_ai_panel_live(&self) -> bool {
+        matches!(self.step, UpdateStep::Updating) && self.ai_active
     }
 
     /// Update the spinner label during `Updating` so the user knows what
@@ -250,13 +270,27 @@ impl UpdatePullRequestScreen {
     /// Push/Discard dialog with **Discard** as the default. `diff` is
     /// the full `git diff HEAD~1 HEAD` output; the review panel renders
     /// it line by line with `+` / `-` coloring.
-    pub fn present_review(&mut self, commit_sha: String, stat: String, diff: String) {
+    pub fn present_review(
+        &mut self,
+        commit_sha: String,
+        stat: String,
+        diff: String,
+        model_label: String,
+    ) {
         self.review_commit_sha = Some(commit_sha);
         self.review_stat = Some(stat);
         self.review_diff = Some(diff);
         self.review_scroll = 0;
-        self.review_confirm = Some(build_review_confirm(&self.request));
+        self.review_confirm = Some(build_review_confirm(&self.request, &model_label));
+        self.review_model_label = Some(model_label);
         self.step = UpdateStep::AwaitingReview;
+    }
+
+    /// Model label remembered from the most recent `MergedAwaitingReview`
+    /// outcome. The App uses this when kicking off `push_after_review` so
+    /// the success toast can name the AI that did the work.
+    pub fn review_model_label(&self) -> Option<&str> {
+        self.review_model_label.as_deref()
     }
 
     /// App calls this when it has spawned the post-review push or discard
@@ -527,9 +561,9 @@ fn build_confirm(request: &UpdatePullRequestRequest) -> ConfirmDialog {
         .with_default(ConfirmChoice::Cancel)
 }
 
-fn build_review_confirm(request: &UpdatePullRequestRequest) -> ConfirmDialog {
+fn build_review_confirm(request: &UpdatePullRequestRequest, model_label: &str) -> ConfirmDialog {
     let prompt = format!(
-        "Gemini resolved the conflicts and created a merge commit on `{}`. \
+        "{model_label} resolved the conflicts and created a merge commit on `{}`. \
          Push this commit to origin, or discard it locally?",
         request.branch
     );
@@ -571,20 +605,22 @@ impl UpdatePullRequestScreen {
     }
 
     fn render_ai_activity(&self, frame: &mut Frame, area: Rect) {
-        let title = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                "AI Activity",
-                Style::default()
-                    .fg(colors::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-        ]);
+        let title = Line::from(vec![Span::styled(
+            " AI Activity ",
+            Style::default()
+                .fg(colors::opencode::CYAN)
+                .add_modifier(Modifier::BOLD),
+        )]);
+        let panel_bg = Style::default().bg(colors::opencode::BG);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::INFO))
+            .border_style(
+                Style::default()
+                    .fg(colors::opencode::BORDER_ACTIVE)
+                    .bg(colors::opencode::BG),
+            )
+            .style(panel_bg)
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -595,22 +631,26 @@ impl UpdatePullRequestScreen {
         }
         let lines: Vec<Line<'static>> = if self.ai_log.is_empty() {
             vec![Line::from(Span::styled(
-                "Waiting for AI to start working on the conflicts...",
+                "Waiting for opencode to start working on the conflicts...",
                 Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
+                    .fg(colors::opencode::COMMENT)
+                    .add_modifier(Modifier::ITALIC),
             ))]
         } else {
-            let max_scroll = self.ai_log.len().saturating_sub(visible_rows) as u16;
-            let scroll = self.ai_scroll.min(max_scroll) as usize;
-            let end = self.ai_log.len().saturating_sub(scroll);
-            let start = end.saturating_sub(visible_rows);
-            self.ai_log[start..end]
+            let mut expanded: Vec<Line<'static>> = self
+                .ai_log
                 .iter()
-                .map(ai_activity_event_to_line)
-                .collect()
+                .flat_map(ai_activity_event_to_lines)
+                .collect();
+            let max_scroll = expanded.len().saturating_sub(visible_rows) as u16;
+            let scroll = self.ai_scroll.min(max_scroll) as usize;
+            let end = expanded.len().saturating_sub(scroll);
+            let start = end.saturating_sub(visible_rows);
+            expanded.drain(end..);
+            expanded.drain(0..start);
+            expanded
         };
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(Paragraph::new(lines).style(panel_bg), inner);
     }
 
     fn render_review(&self, frame: &mut Frame, area: Rect) {
@@ -752,100 +792,96 @@ fn diff_line_to_styled(line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), style))
 }
 
-fn ai_activity_event_to_line(event: &AiActivityEvent) -> Line<'static> {
-    match event {
-        AiActivityEvent::SessionStart { model } => Line::from(vec![
-            Span::styled("[session started] ".to_string(), muted_bold()),
-            Span::styled("model".to_string(), muted_dim()),
-            Span::styled(": ".to_string(), muted_dim()),
+fn ai_activity_event_to_lines(event: &AiActivityEvent) -> Vec<Line<'static>> {
+    let lines = match event {
+        AiActivityEvent::SessionStart { model } => vec![Line::from(vec![
+            Span::styled(
+                "@ ".to_string(),
+                Style::default()
+                    .fg(colors::opencode::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "session ".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ),
             Span::styled(
                 model.clone(),
                 Style::default()
-                    .fg(colors::ACCENT)
+                    .fg(colors::opencode::GREEN)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]),
-        AiActivityEvent::AssistantText { content } => Line::from(vec![
-            Span::styled(
-                "AI".to_string(),
-                Style::default()
-                    .fg(colors::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(": ".to_string(), muted_dim()),
-            Span::styled(content.clone(), Style::default().fg(colors::WHITE)),
-        ]),
-        AiActivityEvent::Thinking { content } => Line::from(vec![
-            Span::styled(
-                "Thinking".to_string(),
-                Style::default()
-                    .fg(colors::INFO)
-                    .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-            ),
-            Span::styled(": ".to_string(), muted_dim()),
-            Span::styled(
-                content.clone(),
-                Style::default()
-                    .fg(colors::GRAY_LIGHT)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]),
+        ])],
+        AiActivityEvent::AssistantText { content } => render_assistant_text(content),
+        AiActivityEvent::Thinking { content } => render_thinking_text(content),
         AiActivityEvent::ToolCall { tool_name, summary } => {
+            let icon = tool_icon(tool_name);
             let mut spans = vec![
-                Span::styled("> ".to_string(), Style::default().fg(colors::INFO)),
+                Span::styled(
+                    "* ".to_string(),
+                    Style::default()
+                        .fg(colors::opencode::CYAN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{icon} "),
+                    Style::default().fg(colors::opencode::CYAN),
+                ),
                 Span::styled(
                     tool_name.clone(),
                     Style::default()
-                        .fg(colors::SUCCESS)
+                        .fg(colors::opencode::GREEN)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("(".to_string(), muted_dim()),
+                Span::styled(
+                    "(".to_string(),
+                    Style::default().fg(colors::opencode::COMMENT),
+                ),
             ];
             push_highlighted_fragment(&mut spans, summary);
-            spans.push(Span::styled(")".to_string(), muted_dim()));
-            Line::from(spans)
+            spans.push(Span::styled(
+                ")".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ));
+            vec![Line::from(spans)]
         }
         AiActivityEvent::ToolResult {
             tool_name,
             status,
             detail,
         } => {
-            let (label, label_style) = match status {
-                AiToolResultStatus::Success => (
-                    "ok",
-                    Style::default()
-                        .fg(colors::SUCCESS)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                AiToolResultStatus::Error => (
-                    "error",
-                    Style::default()
-                        .fg(colors::ERROR)
-                        .add_modifier(Modifier::BOLD),
-                ),
+            let (label, accent_color) = match status {
+                AiToolResultStatus::Success => ("✓", colors::opencode::GREEN),
+                AiToolResultStatus::Error => ("✗", colors::opencode::PINK),
             };
-            let mut spans = vec![Span::styled(
-                "< ".to_string(),
-                Style::default().fg(match status {
-                    AiToolResultStatus::Success => colors::SUCCESS,
-                    AiToolResultStatus::Error => colors::ERROR,
-                }),
-            )];
+            let mut spans = vec![
+                Span::styled(
+                    "  ".to_string(),
+                    Style::default().fg(colors::opencode::COMMENT),
+                ),
+                Span::styled(
+                    format!("{label} "),
+                    Style::default()
+                        .fg(accent_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
             if let Some(tool_name) = tool_name {
                 spans.push(Span::styled(
                     tool_name.clone(),
                     Style::default()
-                        .fg(colors::INFO)
+                        .fg(colors::opencode::CYAN)
                         .add_modifier(Modifier::BOLD),
                 ));
-                spans.push(Span::raw(" ".to_string()));
+                spans.push(Span::styled(
+                    " ".to_string(),
+                    Style::default().fg(colors::opencode::COMMENT),
+                ));
             }
-            spans.push(Span::styled(label.to_string(), label_style));
-            spans.push(Span::styled(": ".to_string(), muted_dim()));
             push_highlighted_fragment(&mut spans, detail);
-            Line::from(spans)
+            vec![Line::from(spans)]
         }
-        AiActivityEvent::Notice { severity, message } => Line::from(vec![
+        AiActivityEvent::Notice { severity, message } => vec![Line::from(vec![
             Span::styled(
                 match severity {
                     AiActivitySeverity::Info => "info",
@@ -855,51 +891,461 @@ fn ai_activity_event_to_line(event: &AiActivityEvent) -> Line<'static> {
                 .to_string(),
                 Style::default()
                     .fg(match severity {
-                        AiActivitySeverity::Info => colors::INFO,
-                        AiActivitySeverity::Warning => colors::WARNING,
-                        AiActivitySeverity::Error => colors::ERROR,
+                        AiActivitySeverity::Info => colors::opencode::ORANGE,
+                        AiActivitySeverity::Warning => colors::opencode::YELLOW,
+                        AiActivitySeverity::Error => colors::opencode::PINK,
                     })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(": ".to_string(), muted_dim()),
+            Span::styled(
+                ": ".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ),
             Span::styled(
                 message.clone(),
                 Style::default().fg(match severity {
-                    AiActivitySeverity::Info => colors::WHITE,
-                    AiActivitySeverity::Warning => colors::WARNING,
-                    AiActivitySeverity::Error => colors::ERROR,
+                    AiActivitySeverity::Info => colors::opencode::FG,
+                    AiActivitySeverity::Warning => colors::opencode::YELLOW,
+                    AiActivitySeverity::Error => colors::opencode::PINK,
                 }),
             ),
-        ]),
+        ])],
         AiActivityEvent::Summary {
             tool_calls,
             duration_ms,
             total_tokens,
-        } => Line::from(vec![
+        } => vec![Line::from(vec![
             Span::styled(
-                "[done] ".to_string(),
+                "[".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ),
+            Span::styled(
+                "done".to_string(),
                 Style::default()
-                    .fg(colors::SUCCESS)
+                    .fg(colors::opencode::GREEN)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(tool_calls.to_string(), Style::default().fg(colors::ACCENT)),
-            Span::styled(" tools · ".to_string(), muted_dim()),
+            Span::styled(
+                "] ".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ),
+            Span::styled(
+                tool_calls.to_string(),
+                Style::default().fg(colors::opencode::ORANGE),
+            ),
+            Span::styled(
+                " tools · ".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ),
             Span::styled(
                 format!("{:.1}s", *duration_ms as f64 / 1000.0),
-                Style::default().fg(colors::ACCENT),
+                Style::default().fg(colors::opencode::ORANGE),
             ),
-            Span::styled(" · ".to_string(), muted_dim()),
+            Span::styled(
+                " · ".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ),
             Span::styled(
                 total_tokens.to_string(),
-                Style::default().fg(colors::ACCENT),
+                Style::default().fg(colors::opencode::ORANGE),
             ),
-            Span::styled(" tokens".to_string(), muted_dim()),
-        ]),
-        AiActivityEvent::Raw { text } => Line::from(Span::styled(
+            Span::styled(
+                " tokens".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ),
+        ])],
+        AiActivityEvent::Raw { text } => vec![Line::from(Span::styled(
             text.clone(),
-            Style::default().fg(colors::GRAY_LIGHT),
-        )),
+            Style::default().fg(colors::opencode::FG),
+        ))],
+    };
+    cap_event_lines(lines)
+}
+
+/// Map an opencode tool name to the single-character glyph opencode itself
+/// prints in its terminal transcript (`packages/tui/.../tool.go`).
+fn tool_icon(tool_name: &str) -> &'static str {
+    match tool_name {
+        "read" => "→",
+        "write" | "edit" | "patch" | "multiedit" => "←",
+        "bash" => "$",
+        "glob" | "grep" | "list" => "✱",
+        "todoread" | "todowrite" | "batch" => "#",
+        "webfetch" => "%",
+        "websearch" => "◈",
+        _ => "•",
     }
+}
+
+fn cap_event_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if lines.len() > AI_EVENT_MAX_LINES {
+        lines.truncate(AI_EVENT_MAX_LINES.saturating_sub(1));
+        lines.push(Line::from(Span::styled(
+            "    … (output truncated)".to_string(),
+            Style::default()
+                .fg(colors::opencode::COMMENT)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines
+}
+
+/// Render an assistant text payload as one or more `Line`s.
+///
+/// Markdown is rendered with the Opencode Monokai palette
+/// (`design/opencode.md`): headings pink+bold, **bold** orange, *italic*
+/// yellow, inline `code` green, list bullets cyan, enumerated lists
+/// purple. Fenced code blocks (` ```lang ... ``` `) flow through
+/// `syntect`'s Monokai highlighter so the spans line up with the rest
+/// of the syntax palette.
+fn render_assistant_text(content: &str) -> Vec<Line<'static>> {
+    let chevron = Span::styled(
+        "> ".to_string(),
+        Style::default()
+            .fg(colors::opencode::GREEN)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut first_line = true;
+    let mut in_code = false;
+    let mut code_lang: Option<String> = None;
+    let mut code_buf: Vec<String> = Vec::new();
+
+    let flush_code =
+        |out: &mut Vec<Line<'static>>, buf: &mut Vec<String>, lang: &mut Option<String>| {
+            if !buf.is_empty() {
+                for highlighted in highlight_code_block(&buf.join("\n"), lang.as_deref()) {
+                    out.push(indent_with_prefix(highlighted, "    "));
+                }
+            }
+            buf.clear();
+            *lang = None;
+        };
+
+    for raw_line in content.split('\n') {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_code {
+                flush_code(&mut out, &mut code_buf, &mut code_lang);
+                in_code = false;
+            } else {
+                let lang = trimmed.trim_start_matches("```").trim().to_string();
+                code_lang = if lang.is_empty() { None } else { Some(lang) };
+                in_code = true;
+            }
+            continue;
+        }
+        if in_code {
+            code_buf.push(raw_line.to_string());
+            continue;
+        }
+        let line = render_markdown_block_line(raw_line, first_line.then(|| chevron.clone()));
+        out.push(line);
+        first_line = false;
+    }
+
+    if in_code && !code_buf.is_empty() {
+        flush_code(&mut out, &mut code_buf, &mut code_lang);
+    }
+
+    if out.is_empty() {
+        out.push(Line::from(chevron));
+    }
+    out
+}
+
+/// Render a single non-code-block markdown line, applying block-level
+/// styling (headings, lists, blockquotes, horizontal rules) on top of
+/// the inline pass. `prefix` is the optional chevron prepended to the
+/// very first body line of the assistant turn.
+fn render_markdown_block_line(raw_line: &str, prefix: Option<Span<'static>>) -> Line<'static> {
+    let trimmed = raw_line.trim_start();
+
+    // Horizontal rule (`---`, `***`, `___`).
+    if trimmed.len() >= 3 && trimmed.chars().all(|c| matches!(c, '-' | '*' | '_')) {
+        let mut spans = Vec::new();
+        if let Some(p) = prefix {
+            spans.push(p);
+        }
+        spans.push(Span::styled(
+            "─".repeat(trimmed.len()),
+            Style::default().fg(colors::opencode::COMMENT),
+        ));
+        return Line::from(spans);
+    }
+
+    // Headings.
+    if let Some(rest) = trimmed.strip_prefix("# ") {
+        return heading_line(rest, 1, prefix);
+    }
+    if let Some(rest) = trimmed.strip_prefix("## ") {
+        return heading_line(rest, 2, prefix);
+    }
+    if let Some(rest) = trimmed.strip_prefix("### ") {
+        return heading_line(rest, 3, prefix);
+    }
+    if let Some(rest) = trimmed.strip_prefix("#### ") {
+        return heading_line(rest, 4, prefix);
+    }
+
+    // Blockquote.
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        let mut spans = Vec::new();
+        if let Some(p) = prefix {
+            spans.push(p);
+        }
+        spans.push(Span::styled(
+            "│ ".to_string(),
+            Style::default().fg(colors::opencode::COMMENT),
+        ));
+        spans.append(&mut render_inline_markdown(rest));
+        return Line::from(spans);
+    }
+
+    // Unordered list bullet.
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        let mut spans = Vec::new();
+        if let Some(p) = prefix {
+            spans.push(p);
+        }
+        spans.push(Span::styled(
+            "• ".to_string(),
+            Style::default()
+                .fg(colors::opencode::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.append(&mut render_inline_markdown(rest));
+        return Line::from(spans);
+    }
+
+    // Enumerated list (`1.`, `42.`).
+    if let Some((num, rest)) = split_enumeration(trimmed) {
+        let mut spans = Vec::new();
+        if let Some(p) = prefix {
+            spans.push(p);
+        }
+        spans.push(Span::styled(
+            format!("{num}. "),
+            Style::default()
+                .fg(colors::opencode::PURPLE)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.append(&mut render_inline_markdown(rest));
+        return Line::from(spans);
+    }
+
+    let mut spans = Vec::new();
+    if let Some(p) = prefix {
+        spans.push(p);
+    }
+    spans.append(&mut render_inline_markdown(raw_line));
+    Line::from(spans)
+}
+
+fn heading_line(text: &str, level: u8, prefix: Option<Span<'static>>) -> Line<'static> {
+    let style = Style::default()
+        .fg(colors::opencode::PINK)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    if let Some(p) = prefix {
+        spans.push(p);
+    }
+    let bar = "#".repeat(level as usize);
+    spans.push(Span::styled(format!("{bar} "), style));
+    spans.push(Span::styled(text.to_string(), style));
+    Line::from(spans)
+}
+
+fn split_enumeration(input: &str) -> Option<(u32, &str)> {
+    let mut iter = input.char_indices();
+    let mut end = 0;
+    for (idx, ch) in iter.by_ref() {
+        if ch.is_ascii_digit() {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let after = &input[end..];
+    let rest = after.strip_prefix(". ")?;
+    let num: u32 = input[..end].parse().ok()?;
+    Some((num, rest))
+}
+
+fn render_thinking_text(content: &str) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let body_style = Style::default()
+        .fg(colors::opencode::COMMENT)
+        .add_modifier(Modifier::ITALIC);
+    let label = Span::styled(
+        "Thinking".to_string(),
+        Style::default()
+            .fg(colors::opencode::CYAN)
+            .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+    );
+    let sep = Span::styled(
+        ": ".to_string(),
+        Style::default().fg(colors::opencode::COMMENT),
+    );
+    let mut first = true;
+    for raw_line in content.split('\n') {
+        if first {
+            out.push(Line::from(vec![
+                label.clone(),
+                sep.clone(),
+                Span::styled(raw_line.to_string(), body_style),
+            ]));
+            first = false;
+        } else {
+            out.push(Line::from(Span::styled(
+                format!("    {raw_line}"),
+                body_style,
+            )));
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(vec![label, sep]));
+    }
+    out
+}
+
+/// Inline markdown for assistant text using the Opencode Monokai palette
+/// (`design/opencode.md`): inline `code` is green, `**bold**` is orange
+/// bold, `*italic*` is yellow italic. Falls back to plain `FG` text when
+/// the input contains no markdown markers.
+fn render_inline_markdown(input: &str) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut buf = String::new();
+
+    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>| {
+        if !buf.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(buf),
+                Style::default().fg(colors::opencode::FG),
+            ));
+        }
+    };
+
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '`' {
+            if let Some(end) = input[i + 1..].find('`') {
+                flush(&mut buf, &mut spans);
+                let code = &input[i + 1..i + 1 + end];
+                spans.push(Span::styled(
+                    code.to_string(),
+                    Style::default().fg(colors::opencode::MD_CODE),
+                ));
+                i += end + 2;
+                continue;
+            }
+        } else if ch == '*' {
+            let double = i + 1 < bytes.len() && bytes[i + 1] == b'*';
+            let marker = if double { "**" } else { "*" };
+            let search_from = i + marker.len();
+            if let Some(end) = input[search_from..].find(marker) {
+                flush(&mut buf, &mut spans);
+                let inner = &input[search_from..search_from + end];
+                let (color, modifier) = if double {
+                    (colors::opencode::MD_STRONG, Modifier::BOLD)
+                } else {
+                    (colors::opencode::MD_EMPH, Modifier::ITALIC)
+                };
+                spans.push(Span::styled(
+                    inner.to_string(),
+                    Style::default().fg(color).add_modifier(modifier),
+                ));
+                i = search_from + end + marker.len();
+                continue;
+            }
+        }
+        buf.push(ch);
+        i += 1;
+    }
+    flush(&mut buf, &mut spans);
+    spans
+}
+
+fn indent_with_prefix(line: Line<'static>, indent: &str) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::styled(
+        indent.to_string(),
+        Style::default().fg(colors::opencode::COMMENT),
+    ));
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+/// Highlight a fenced code block using `syntect` with the Monokai theme.
+/// Falls back to plain dimmed text when the language can't be detected.
+fn highlight_code_block(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+    use std::sync::OnceLock;
+    use syntect::easy::HighlightLines;
+    use syntect::highlighting::{Style as SynStyle, Theme, ThemeSet};
+    use syntect::parsing::SyntaxSet;
+    use syntect::util::LinesWithEndings;
+
+    static ASSETS: OnceLock<(SyntaxSet, Theme)> = OnceLock::new();
+    let (syntax_set, theme) = ASSETS.get_or_init(|| {
+        let ss = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let theme = ts
+            .themes
+            .get("base16-mocha.dark")
+            .or_else(|| ts.themes.get("base16-eighties.dark"))
+            .or_else(|| ts.themes.values().next())
+            .cloned()
+            .unwrap_or_default();
+        (ss, theme)
+    });
+
+    let syntax = lang
+        .and_then(|l| syntax_set.find_syntax_by_token(l))
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let mut highlighter = HighlightLines::new(syntax, theme);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in LinesWithEndings::from(code) {
+        let ranges: Vec<(SynStyle, &str)> = highlighter
+            .highlight_line(line, syntax_set)
+            .unwrap_or_default();
+        let spans: Vec<Span<'static>> = ranges
+            .into_iter()
+            .filter_map(|(style, text)| {
+                let text = text.trim_end_matches('\n');
+                if text.is_empty() {
+                    return None;
+                }
+                let color = ratatui::style::Color::Rgb(
+                    style.foreground.r,
+                    style.foreground.g,
+                    style.foreground.b,
+                );
+                Some(Span::styled(text.to_string(), Style::default().fg(color)))
+            })
+            .collect();
+        if spans.is_empty() {
+            out.push(Line::from(Span::raw(String::new())));
+        } else {
+            out.push(Line::from(spans));
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(
+            code.to_string(),
+            Style::default().fg(colors::opencode::MD_CODE_BLOCK),
+        )));
+    }
+    out
 }
 
 fn push_highlighted_fragment(spans: &mut Vec<Span<'static>>, fragment: &str) {
@@ -950,12 +1396,15 @@ fn push_highlighted_token(spans: &mut Vec<Span<'static>>, token: &str, first_tok
             spans.push(Span::styled(
                 lhs.to_string(),
                 if lhs.starts_with('-') {
-                    Style::default().fg(colors::BRAND)
+                    Style::default().fg(colors::opencode::PURPLE)
                 } else {
-                    Style::default().fg(colors::INFO)
+                    Style::default().fg(colors::opencode::CYAN)
                 },
             ));
-            spans.push(Span::styled("=".to_string(), muted_dim()));
+            spans.push(Span::styled(
+                "=".to_string(),
+                Style::default().fg(colors::opencode::COMMENT),
+            ));
             if !rhs.is_empty() {
                 spans.push(Span::styled(
                     rhs.to_string(),
@@ -976,31 +1425,31 @@ fn push_highlighted_token(spans: &mut Vec<Span<'static>>, token: &str, first_tok
 
 fn classify_token_style(token: &str, first_token: bool) -> Style {
     if is_shell_operator(token) {
-        return Style::default().fg(colors::INFO);
+        return Style::default().fg(colors::opencode::PINK);
     }
     if token.starts_with("--") || (token.starts_with('-') && token.len() > 1) {
-        return Style::default().fg(colors::BRAND);
+        return Style::default().fg(colors::opencode::PURPLE);
     }
     if is_quoted(token) || is_placeholder(token) {
-        return Style::default().fg(colors::WARNING);
+        return Style::default().fg(colors::opencode::YELLOW);
     }
     if looks_like_url(token) {
         return Style::default()
-            .fg(colors::INFO)
+            .fg(colors::opencode::CYAN)
             .add_modifier(Modifier::UNDERLINED);
     }
     if looks_like_path(token) {
-        return Style::default().fg(colors::EMPHASIS);
+        return Style::default().fg(colors::opencode::FG);
     }
     if looks_like_number(token) {
-        return Style::default().fg(colors::ACCENT);
+        return Style::default().fg(colors::opencode::PURPLE);
     }
     if first_token {
         return Style::default()
-            .fg(colors::SUCCESS)
+            .fg(colors::opencode::GREEN)
             .add_modifier(Modifier::BOLD);
     }
-    Style::default().fg(colors::WHITE)
+    Style::default().fg(colors::opencode::FG)
 }
 
 fn is_assignment_like(token: &str) -> bool {
@@ -1051,18 +1500,6 @@ fn looks_like_number(token: &str) -> bool {
         && token.chars().all(|ch| {
             ch.is_ascii_digit() || matches!(ch, '.' | '%' | ':' | '+' | '-' | '_' | 's' | 'm')
         })
-}
-
-fn muted_dim() -> Style {
-    Style::default()
-        .fg(colors::MUTED)
-        .add_modifier(Modifier::DIM)
-}
-
-fn muted_bold() -> Style {
-    Style::default()
-        .fg(colors::MUTED)
-        .add_modifier(Modifier::BOLD)
 }
 
 fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> {
@@ -1181,7 +1618,7 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
             Span::styled(
-                "on conflict: direct Gemini API stream + local tools → commit".to_string(),
+                "on conflict: opencode AI → resolved files → commit".to_string(),
                 bullet_style,
             ),
         ]),
@@ -1322,6 +1759,7 @@ mod tests {
             "deadbee".to_string(),
             "README.md | 2 +-\n".to_string(),
             "diff --git a/README.md b/README.md\n+added\n-removed\n".to_string(),
+            "MiniMax M2.5 Free".to_string(),
         );
         assert_eq!(screen.step(), UpdateStep::AwaitingReview);
         let dialog = screen
@@ -1341,6 +1779,7 @@ mod tests {
             "deadbee".to_string(),
             "stat".to_string(),
             "diff".to_string(),
+            "MiniMax M2.5 Free".to_string(),
         );
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(enter), UpdateAction::DiscardReviewed);
@@ -1354,6 +1793,7 @@ mod tests {
             "deadbee".to_string(),
             "stat".to_string(),
             "diff".to_string(),
+            "MiniMax M2.5 Free".to_string(),
         );
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
@@ -1369,6 +1809,7 @@ mod tests {
             "deadbee".to_string(),
             "stat".to_string(),
             "diff".to_string(),
+            "MiniMax M2.5 Free".to_string(),
         );
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(esc), UpdateAction::ReviewBackedOut);
@@ -1403,28 +1844,53 @@ mod tests {
 
     #[test]
     fn tool_call_activity_uses_monokai_style_roles() {
-        let line = ai_activity_event_to_line(&AiActivityEvent::ToolCall {
+        let lines = ai_activity_event_to_lines(&AiActivityEvent::ToolCall {
             tool_name: "run_shell_command".to_string(),
             summary: "git diff -- src/main.rs --color=never".to_string(),
         });
+        let line = lines.first().expect("at least one line");
 
         assert!(
             line.spans
                 .iter()
-                .any(|span| span.style.fg == Some(colors::SUCCESS)),
-            "expected command token highlighting: {line:?}"
+                .any(|span| span.style.fg == Some(colors::opencode::GREEN)),
+            "expected command/tool-name highlighting in opencode green: {line:?}"
         );
         assert!(
             line.spans
                 .iter()
-                .any(|span| span.style.fg == Some(colors::BRAND)),
-            "expected flag highlighting: {line:?}"
+                .any(|span| span.style.fg == Some(colors::opencode::PURPLE)),
+            "expected flag highlighting in opencode purple: {line:?}"
         );
         assert!(
             line.spans
                 .iter()
-                .any(|span| span.style.fg == Some(colors::EMPHASIS)),
-            "expected path highlighting: {line:?}"
+                .any(|span| span.style.fg == Some(colors::opencode::FG)),
+            "expected path/value text in opencode foreground: {line:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_text_with_fenced_code_emits_multiple_lines() {
+        let lines = ai_activity_event_to_lines(&AiActivityEvent::AssistantText {
+            content: "Here is the patch:\n```rust\nfn main() {}\nlet x = 1;\n```".to_string(),
+        });
+        assert!(
+            lines.len() >= 3,
+            "expected multi-line output for fenced code, got {} line(s): {lines:?}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn thinking_text_wraps_across_newlines() {
+        let lines = ai_activity_event_to_lines(&AiActivityEvent::Thinking {
+            content: "Step one\nStep two".to_string(),
+        });
+        assert_eq!(
+            lines.len(),
+            2,
+            "thinking should produce one line per newline"
         );
     }
 
@@ -1433,18 +1899,20 @@ mod tests {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
-        screen.set_phase_message("Conflict found — Gemini resolving...");
-        assert_eq!(
-            screen.phase_message(),
-            "Conflict found — Gemini resolving..."
-        );
+        screen.set_phase_message("Conflict found — AI resolving...");
+        assert_eq!(screen.phase_message(), "Conflict found — AI resolving...");
     }
 
     #[test]
     fn mouse_wheel_scrolls_review_diff() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
+        screen.present_review(
+            "deadbee".into(),
+            "stat".into(),
+            "+a\n-b\n+c\n".into(),
+            "MiniMax M2.5 Free".into(),
+        );
         assert_eq!(screen.review_scroll(), 0);
         assert!(screen.handle_mouse_scroll_down(3));
         assert_eq!(screen.review_scroll(), 3);
@@ -1507,7 +1975,12 @@ mod tests {
     fn mouse_wheel_does_not_toggle_push_discard() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
+        screen.present_review(
+            "deadbee".into(),
+            "stat".into(),
+            "+a\n-b\n+c\n".into(),
+            "MiniMax M2.5 Free".into(),
+        );
         screen.handle_mouse_scroll_down(3);
         let dialog = screen.review_confirm.as_ref().unwrap();
         assert_eq!(dialog.selected, ConfirmChoice::Cancel);
@@ -1517,7 +1990,12 @@ mod tests {
     fn scroll_keys_during_review_do_not_toggle_push_discard() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
+        screen.present_review(
+            "deadbee".into(),
+            "stat".into(),
+            "+a\n-b\n+c\n".into(),
+            "MiniMax M2.5 Free".into(),
+        );
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(down), UpdateAction::Continue);
         let dialog = screen.review_confirm.as_ref().unwrap();
@@ -1597,6 +2075,7 @@ mod tests {
             "deadbee".to_string(),
             "1 file changed, 2 insertions(+)".to_string(),
             "diff --git a/README.md b/README.md\n+added\n".to_string(),
+            "MiniMax M2.5 Free".to_string(),
         );
 
         let dumped = render_dump(&screen, 100, 28);

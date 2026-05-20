@@ -1,15 +1,12 @@
 //! Live dashboard polling service.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -35,11 +32,8 @@ const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_MERGE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
-const UPDATE_GEMINI_TIMEOUT: Duration = Duration::from_secs(600);
-const AI_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
-const AI_TOOL_OUTPUT_LIMIT: usize = 32_000;
-const AI_TOOL_LOOP_LIMIT: usize = 24;
-const GEMINI_CLI_BINARY: &str = "gemini";
+const UPDATE_AI_TIMEOUT: Duration = Duration::from_secs(600);
+const OPENCODE_CLI_BINARY: &str = "opencode";
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -197,9 +191,10 @@ pub enum AiToolResultStatus {
     Error,
 }
 
-/// Structured event emitted by the streamed Gemini subprocess adapter.
-/// Keeping semantic fields intact lets the TUI apply syntax-aware coloring
-/// instead of flattening everything into plain white text.
+/// Structured event emitted by the streamed AI subprocess adapter
+/// (currently opencode). Keeping semantic fields intact lets the TUI apply
+/// syntax-aware coloring instead of flattening everything into plain white
+/// text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AiActivityEvent {
     SessionStart {
@@ -208,9 +203,8 @@ pub enum AiActivityEvent {
     AssistantText {
         content: String,
     },
-    /// Gemini CLI's interactive UI exposes thought summaries; its current
-    /// `stream-json` formatter drops them, but we keep the variant so the
-    /// TUI is ready if upstream starts emitting them.
+    /// Reasoning / thought summaries emitted by opencode when `--thinking`
+    /// is set. Rendered as italic dim text in the AI Activity panel.
     Thinking {
         content: String,
     },
@@ -331,33 +325,37 @@ pub enum UpdatePullRequestOutcome {
     AlreadyUpToDate,
     /// `git merge` succeeded with no conflicts; the result has been pushed.
     MergedCleanly,
-    /// Gemini resolved at least one conflict and the merge commit was
+    /// The AI resolved at least one conflict and the merge commit was
     /// created with the standard message. The push has NOT been run yet —
     /// the UI must present the diff for review and let the user choose to
     /// push or discard. `diff` is the full `git diff HEAD~1 HEAD` so the
     /// review screen can render added/removed lines, not just per-file
-    /// counts.
+    /// counts. `model_label` is the human-friendly model name (e.g.
+    /// `MiniMax M2.5 Free`) so the review prompt and success toast can
+    /// say which AI did the work.
     MergedAwaitingReview {
         commit_sha: String,
         stat: String,
         diff: String,
+        model_label: String,
     },
     /// Reviewed AI merge was pushed successfully. Only returned by
-    /// `push_after_review`.
-    MergedWithAiResolution,
+    /// `push_after_review`. Carries the model label so the success toast
+    /// can name the AI that resolved the conflicts.
+    MergedWithAiResolution { model_label: String },
     /// User chose to discard the AI merge and the reset succeeded. Only
     /// returned by `discard_after_review`.
     DiscardedAfterReview,
-    /// Merge produced conflicts but Gemini was unavailable (for example no API
-    /// key was configured for the direct client, or a test stub script was
-    /// missing). The half-applied merge was aborted; the worktree is back to a
-    /// clean state. The list of conflicted files is included so the toast can
-    /// show how many files need attention.
-    GeminiMissing { conflicts: Vec<String> },
+    /// Merge produced conflicts but the AI backend was unavailable (the
+    /// `opencode` CLI is not installed or not authenticated, or a test stub
+    /// script was missing). The half-applied merge was aborted; the worktree
+    /// is back to a clean state. The list of conflicted files is included
+    /// so the toast can show how many files need attention.
+    AiUnavailable { conflicts: Vec<String> },
     /// `git fetch` failed (network, auth, …). stderr included.
     FetchFailed(String),
     /// `git merge` failed for a non-conflict reason (e.g. dirty tree), or
-    /// gemini ran but conflicts remained, or `git add`/`git commit` failed
+    /// AI ran but conflicts remained, or `git add`/`git commit` failed
     /// during AI resolution. stderr/details included.
     MergeFailed(String),
     /// `git push origin HEAD` failed. stderr included.
@@ -498,10 +496,9 @@ type DiskCache = HashMap<String, HashMap<String, PrCacheEntry>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AiConflictResolver {
-    /// Production path: talk directly to Gemini's streaming API.
-    Direct,
-    /// Test seam: execute a deterministic local script in place of the API.
-    Script(PathBuf),
+    /// Production path: invoke the opencode CLI with the configured model.
+    /// Tests can swap `binary` with a deterministic local script.
+    Cli { binary: PathBuf, model: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,8 +524,8 @@ pub struct DashboardService {
     gh_available: bool,
     git_binary: PathBuf,
     gh_binary: PathBuf,
-    /// Conflict-resolution backend. Production uses a direct Gemini API
-    /// stream; tests can swap in a deterministic local script.
+    /// Conflict-resolution backend. Production calls the opencode CLI with
+    /// the configured model; tests can swap in a deterministic local script.
     ai_resolver: AiConflictResolver,
     cache_path: Option<PathBuf>,
     pr_state: Arc<Mutex<PrCacheState>>,
@@ -540,13 +537,17 @@ impl DashboardService {
         let git_binary = PathBuf::from("git");
         let gh_binary = PathBuf::from("gh");
         let gh_available = binary_available(&gh_binary);
+        let model = config.use_ai.model.clone();
         Self {
             git_root,
             config,
             gh_available,
             git_binary,
             gh_binary,
-            ai_resolver: AiConflictResolver::Direct,
+            ai_resolver: AiConflictResolver::Cli {
+                binary: PathBuf::from(OPENCODE_CLI_BINARY),
+                model,
+            },
             cache_path: Some(dashboard_pr_cache_file()),
             pr_state: Arc::new(Mutex::new(PrCacheState::default())),
         }
@@ -564,9 +565,13 @@ impl DashboardService {
     }
 
     /// Override the AI conflict-resolution backend with a deterministic local
-    /// script. Used by tests to avoid live Gemini API calls.
-    pub fn with_gemini_binary(mut self, gemini_binary: PathBuf) -> Self {
-        self.ai_resolver = AiConflictResolver::Script(gemini_binary);
+    /// script. Used by tests to avoid live opencode CLI calls.
+    pub fn with_ai_binary(mut self, ai_binary: PathBuf) -> Self {
+        let model = self.config.use_ai.model.clone();
+        self.ai_resolver = AiConflictResolver::Cli {
+            binary: ai_binary,
+            model,
+        };
         self
     }
 
@@ -759,9 +764,9 @@ impl DashboardService {
     /// 2. Recheck behind count against `base_ref`; if zero → `AlreadyUpToDate`.
     /// 3. `git merge <base_ref>`.
     ///    - Exit 0 → push and return `MergedCleanly`.
-    ///    - Non-zero → look for conflicts. If Gemini is unavailable,
-    ///      abort the merge and return `GeminiMissing { conflicts }`.
-    ///      Otherwise hand the worktree to the direct Gemini API client,
+    ///    - Non-zero → look for conflicts. If the AI backend is unavailable,
+    ///      abort the merge and return `AiUnavailable { conflicts }`.
+    ///      Otherwise hand the worktree to the opencode CLI,
     ///      `git add -A`, `git commit -m "Merging and solving conflicts"`,
     ///      then capture commit SHA + stat and return
     ///      `MergedAwaitingReview { commit_sha, stat }` — the push is
@@ -837,34 +842,28 @@ impl DashboardService {
         };
 
         if let Some(conflicts) = ai_conflicts {
-            let model = crate::constants::UPDATE_GEMINI_MODEL.to_string();
+            let model_label = self.config.use_ai.label().to_string();
             send_phase(UpdatePhase::ConflictsDetected {
                 count: conflicts.len(),
-                model: model.clone(),
+                model: model_label.clone(),
             });
             send_phase(UpdatePhase::AiResolving {
-                model: model.clone(),
+                model: model_label.clone(),
             });
-            let gemini_result = time::timeout(
-                UPDATE_GEMINI_TIMEOUT,
-                self.resolve_conflicts_with_ai(
-                    &cwd,
-                    &model,
-                    base_ref,
-                    &conflicts,
-                    progress.clone(),
-                ),
+            let ai_result = time::timeout(
+                UPDATE_AI_TIMEOUT,
+                self.resolve_conflicts_with_ai(&cwd, base_ref, &conflicts, progress.clone()),
             )
             .await
-            .map_err(|_| WisetreeError::other("gemini timed out after 10m"))?;
-            if let Err(err) = gemini_result {
+            .map_err(|_| WisetreeError::other("AI timed out after 10m"))?;
+            if let Err(err) = ai_result {
                 let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
                 return Ok(match err {
                     AiConflictResolutionError::Unavailable => {
-                        UpdatePullRequestOutcome::GeminiMissing { conflicts }
+                        UpdatePullRequestOutcome::AiUnavailable { conflicts }
                     }
                     AiConflictResolutionError::Failed(err) => {
-                        UpdatePullRequestOutcome::MergeFailed(format!("gemini failed: {err}"))
+                        UpdatePullRequestOutcome::MergeFailed(format!("AI failed: {err}"))
                     }
                 });
             }
@@ -874,19 +873,19 @@ impl DashboardService {
             if !remaining.is_empty() {
                 let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
                 return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
-                    "conflicts unresolved after gemini: {}",
+                    "conflicts unresolved after AI: {}",
                     remaining.join(", ")
                 )));
             }
 
-            // Guard against catastrophic truncation (e.g. Gemini writing the
+            // Guard against catastrophic truncation (e.g. the AI writing the
             // single word "resolved" to a file instead of merging it).
             if let Some(bad_file) =
                 catastrophically_truncated(&self.git_binary, &cwd, &conflicts).await
             {
                 let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
                 return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
-                    "gemini replaced '{bad_file}' with near-empty content; \
+                    "AI replaced '{bad_file}' with near-empty content; \
                      refusing to commit a destructive resolution"
                 )));
             }
@@ -941,19 +940,14 @@ impl DashboardService {
                 commit_sha,
                 stat,
                 diff,
+                model_label,
             });
         }
 
         // 4. push (clean merge path only — AI merges return above for review)
         send_phase(UpdatePhase::NoConflicts);
         send_phase(UpdatePhase::Pushing);
-        let push = time::timeout(
-            UPDATE_PUSH_TIMEOUT,
-            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
-        if let Err(err) = push {
+        if let Err(err) = push_origin_head_with_retry(&self.git_binary, &cwd).await {
             return Ok(UpdatePullRequestOutcome::PushFailed(err));
         }
 
@@ -999,16 +993,16 @@ impl DashboardService {
 
     /// Push the AI-resolved merge commit after the user reviewed it.
     /// Wraps `git push origin HEAD` and maps result → outcome.
-    pub async fn push_after_review(&self, worktree_path: &str) -> Result<UpdatePullRequestOutcome> {
+    pub async fn push_after_review(
+        &self,
+        worktree_path: &str,
+        model_label: &str,
+    ) -> Result<UpdatePullRequestOutcome> {
         let cwd = PathBuf::from(worktree_path);
-        let push = time::timeout(
-            UPDATE_PUSH_TIMEOUT,
-            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
-        match push {
-            Ok(_) => Ok(UpdatePullRequestOutcome::MergedWithAiResolution),
+        match push_origin_head_with_retry(&self.git_binary, &cwd).await {
+            Ok(_) => Ok(UpdatePullRequestOutcome::MergedWithAiResolution {
+                model_label: model_label.to_string(),
+            }),
             Err(err) => Ok(UpdatePullRequestOutcome::PushFailed(err)),
         }
     }
@@ -1027,52 +1021,44 @@ impl DashboardService {
         }
     }
 
+    /// Invoke the opencode CLI to resolve every conflict on disk. The
+    /// subprocess streams JSON Lines on stdout (`text`, `reasoning`,
+    /// `tool_use`, `step_finish`, …); `run_command_streamed` forwards each
+    /// line to `format_stream_event` which translates it into an
+    /// `AiActivityEvent` for the UI. The CLI ends with status 0 once it
+    /// finishes; any non-zero exit becomes a `Failed` error.
     async fn resolve_conflicts_with_ai(
         &self,
         cwd: &Path,
-        model: &str,
         base_ref: &str,
         conflicts: &[String],
         progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
     ) -> std::result::Result<(), AiConflictResolutionError> {
-        match &self.ai_resolver {
-            AiConflictResolver::Direct => {
-                self.resolve_conflicts_direct(cwd, model, base_ref, conflicts, progress)
-                    .await
-            }
-            AiConflictResolver::Script(binary) => {
-                self.resolve_conflicts_with_script(
-                    binary, cwd, model, base_ref, conflicts, progress,
-                )
-                .await
-            }
-        }
-    }
+        let AiConflictResolver::Cli { binary, model } = &self.ai_resolver;
 
-    async fn resolve_conflicts_with_script(
-        &self,
-        binary: &Path,
-        cwd: &Path,
-        model: &str,
-        base_ref: &str,
-        conflicts: &[String],
-        progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
-    ) -> std::result::Result<(), AiConflictResolutionError> {
         if !binary_available(binary) {
             return Err(AiConflictResolutionError::Unavailable);
         }
 
-        let prompt_arg = format!("--prompt={}", build_merge_prompt(base_ref, conflicts));
+        send_ai_activity(
+            progress.as_ref(),
+            AiActivityEvent::SessionStart {
+                model: model.clone(),
+            },
+        );
+
+        let prompt = build_merge_prompt(base_ref, conflicts);
         run_command_streamed(
             binary,
             &[
-                "--skip-trust",
-                "--yolo",
-                "-m",
+                "run",
+                "--format",
+                "json",
+                "--model",
                 model,
-                "-o",
-                "stream-json",
-                &prompt_arg,
+                "--thinking",
+                "--dangerously-skip-permissions",
+                &prompt,
             ],
             Some(cwd),
             progress,
@@ -1080,184 +1066,6 @@ impl DashboardService {
         .await
         .map(|_| ())
         .map_err(AiConflictResolutionError::Failed)
-    }
-
-    async fn resolve_conflicts_direct(
-        &self,
-        cwd: &Path,
-        model: &str,
-        base_ref: &str,
-        conflicts: &[String],
-        progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
-    ) -> std::result::Result<(), AiConflictResolutionError> {
-        let client = Client::builder()
-            .build()
-            .map_err(|err| AiConflictResolutionError::Failed(err.to_string()))?;
-        let Some(auth) = gemini_auth() else {
-            return self
-                .fallback_to_gemini_cli(cwd, model, base_ref, conflicts, progress)
-                .await;
-        };
-
-        send_ai_activity(
-            progress.as_ref(),
-            AiActivityEvent::SessionStart {
-                model: model.to_string(),
-            },
-        );
-
-        let system_instruction = build_direct_merge_system_instruction();
-        let mut contents = vec![json!({
-            "role": "user",
-            "parts": [{"text": build_merge_prompt(base_ref, conflicts)}],
-        })];
-        let mut turn = 0usize;
-
-        loop {
-            if turn >= AI_TOOL_LOOP_LIMIT {
-                return Err(AiConflictResolutionError::Failed(
-                    "Gemini exceeded the conflict-resolution tool loop limit".to_string(),
-                ));
-            }
-            turn += 1;
-
-            let request = build_gemini_request(model, &system_instruction, &contents);
-            let turn_started = Instant::now();
-            let mut request_builder = client
-                .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse"
-                ));
-            request_builder = match &auth {
-                GeminiAuth::ApiKey(api_key) => request_builder.header("x-goog-api-key", api_key),
-            };
-            let response = request_builder
-                .json(&request)
-                .send()
-                .await
-                .map_err(|err| AiConflictResolutionError::Failed(err.to_string()))?;
-
-            let status = response.status();
-            let response = if status.is_success() {
-                response
-            } else {
-                let body = response.text().await.unwrap_or_default();
-                return Err(AiConflictResolutionError::Failed(format!(
-                    "Gemini API request failed ({status}): {}",
-                    extract_gemini_error_message(&body)
-                )));
-            };
-
-            let stream_result = consume_gemini_stream(response, progress.as_ref(), turn_started)
-                .await
-                .map_err(AiConflictResolutionError::Failed)?;
-
-            if !stream_result.model_parts.is_empty() {
-                contents.push(json!({
-                    "role": "model",
-                    "parts": stream_result.model_parts,
-                }));
-            }
-
-            if stream_result.tool_calls.is_empty() {
-                return match stream_result.finish_reason.as_deref() {
-                    Some("STOP") | None => Ok(()),
-                    Some("MAX_TOKENS") => Err(AiConflictResolutionError::Failed(
-                        "Gemini truncated its response before finishing conflict resolution"
-                            .to_string(),
-                    )),
-                    Some(reason) => Err(AiConflictResolutionError::Failed(format!(
-                        "Gemini stopped with finish reason {reason}"
-                    ))),
-                };
-            }
-
-            let tool_response_parts = self
-                .execute_direct_tool_calls(cwd, &stream_result.tool_calls, progress.as_ref())
-                .await;
-            contents.push(json!({
-                "role": "user",
-                "parts": tool_response_parts,
-            }));
-        }
-    }
-
-    async fn execute_direct_tool_calls(
-        &self,
-        cwd: &Path,
-        calls: &[GeminiFunctionCall],
-        progress: Option<&mpsc::UnboundedSender<UpdateProgress>>,
-    ) -> Vec<Value> {
-        let mut responses = Vec::with_capacity(calls.len());
-        for call in calls {
-            send_ai_activity(
-                progress,
-                AiActivityEvent::ToolCall {
-                    tool_name: call.name.clone(),
-                    summary: summarize_direct_tool_call(call),
-                },
-            );
-
-            let result = execute_direct_tool_call(cwd, call).await;
-            let (status, content) = match result {
-                Ok(output) => {
-                    send_ai_activity(
-                        progress,
-                        AiActivityEvent::ToolResult {
-                            tool_name: Some(call.name.clone()),
-                            status: AiToolResultStatus::Success,
-                            detail: clip_activity_text(&output.summary),
-                        },
-                    );
-                    (json!(true), output.model_response)
-                }
-                Err(err) => {
-                    send_ai_activity(
-                        progress,
-                        AiActivityEvent::ToolResult {
-                            tool_name: Some(call.name.clone()),
-                            status: AiToolResultStatus::Error,
-                            detail: clip_activity_text(&err),
-                        },
-                    );
-                    (json!(false), err)
-                }
-            };
-
-            responses.push(json!({
-                "functionResponse": {
-                    "name": call.name,
-                    "response": {
-                        "name": call.name,
-                        "ok": status,
-                        "content": content,
-                    }
-                }
-            }));
-        }
-        responses
-    }
-
-    async fn fallback_to_gemini_cli(
-        &self,
-        cwd: &Path,
-        model: &str,
-        base_ref: &str,
-        conflicts: &[String],
-        progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
-    ) -> std::result::Result<(), AiConflictResolutionError> {
-        let binary = Path::new(GEMINI_CLI_BINARY);
-        if !binary_available(binary) {
-            return Err(AiConflictResolutionError::Unavailable);
-        }
-        send_ai_activity(
-            progress.as_ref(),
-            AiActivityEvent::Notice {
-                severity: AiActivitySeverity::Info,
-                message: "No direct Gemini auth found; falling back to gemini CLI.".to_string(),
-            },
-        );
-        self.resolve_conflicts_with_script(binary, cwd, model, base_ref, conflicts, progress)
-            .await
     }
 
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
@@ -1708,8 +1516,10 @@ impl DashboardService {
 }
 
 fn binary_available(binary: &Path) -> bool {
+    let temp_cwd = std::env::temp_dir();
     std::process::Command::new(binary)
         .arg("--version")
+        .current_dir(temp_cwd)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -2263,41 +2073,63 @@ async fn run_command(
     }
 }
 
-/// Rejects a `write_file` call that would replace a still-conflicted file
-/// with a catastrophically smaller payload. The file is considered
-/// in-conflict when the on-disk content still has merge markers, and the
-/// new content is "catastrophically smaller" when it's under 10 % of the
-/// existing size (with a 200-byte floor so trivial files don't trip the
-/// guard). The returned error is fed back to the model as the tool
-/// response so it can retry within its remaining turns instead of the
-/// outer pipeline only catching the destruction post-hoc.
-fn guard_destructive_overwrite(
-    existing: &str,
-    new_content: &str,
+/// Push `origin/HEAD`, retrying once when a repo-local `pre-push` hook
+/// advances `HEAD` by creating an auto-fix commit. In that case the first
+/// push is computed against the pre-hook SHA and can fail even though the
+/// local branch is now in the correct state for an immediate retry.
+async fn push_origin_head_with_retry(
+    git_binary: &Path,
+    cwd: &Path,
 ) -> std::result::Result<(), String> {
-    let has_markers = existing.contains("<<<<<<<")
-        || existing.contains("=======")
-        || existing.contains(">>>>>>>");
-    if !has_markers {
-        return Ok(());
+    let head_before = current_head(git_binary, cwd).await;
+    match push_origin_head_once(git_binary, cwd).await {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            let head_after = current_head(git_binary, cwd).await;
+            let should_retry = matches!((&head_before, &head_after), (Some(before), Some(after)) if before != after)
+                && push_failure_looks_like_pre_push_autocommit(&first_err);
+            if !should_retry {
+                return Err(first_err);
+            }
+
+            match push_origin_head_once(git_binary, cwd).await {
+                Ok(()) => Ok(()),
+                Err(retry_err) => Err(format!(
+                    "git push failed after a pre-push hook advanced HEAD from {} to {}.\n\nFirst attempt:\n{}\n\nRetry attempt:\n{}",
+                    head_before.as_deref().unwrap_or("unknown"),
+                    head_after.as_deref().unwrap_or("unknown"),
+                    first_err,
+                    retry_err,
+                )),
+            }
+        }
     }
-    if existing.len() < 200 {
-        return Ok(());
-    }
-    if new_content.len() * 10 >= existing.len() {
-        return Ok(());
-    }
-    Err(format!(
-        "this file is in merge-conflict state (it still has conflict markers) \
-         and the proposed content ({} bytes) is catastrophically smaller than \
-         the existing file ({} bytes). A real merge must preserve content from \
-         both sides — read the file in full, combine both sides' intent, and \
-         write the merged result. If you cannot merge this file safely, do not \
-         call write_file on this path; leave the markers in place and explain \
-         in your final reply.",
-        new_content.len(),
-        existing.len()
-    ))
+}
+
+async fn push_origin_head_once(git_binary: &Path, cwd: &Path) -> std::result::Result<(), String> {
+    let push = time::timeout(
+        UPDATE_PUSH_TIMEOUT,
+        run_command(git_binary, &["push", "origin", "HEAD"], Some(cwd)),
+    )
+    .await
+    .map_err(|_| "git push timed out after 60s".to_string())?;
+    push.map(|_| ())
+}
+
+async fn current_head(git_binary: &Path, cwd: &Path) -> Option<String> {
+    run_command(git_binary, &["rev-parse", "HEAD"], Some(cwd))
+        .await
+        .ok()
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+}
+
+fn push_failure_looks_like_pre_push_autocommit(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("cannot lock ref")
+        || detail.contains("pre-push:")
+        || detail.contains("push again")
+        || detail.contains("auto-format and fix")
 }
 
 /// Returns the path of the first file that looks catastrophically truncated
@@ -2335,176 +2167,6 @@ async fn catastrophically_truncated(
     None
 }
 
-#[derive(Debug, Default)]
-struct GeminiTurnResult {
-    model_parts: Vec<Value>,
-    tool_calls: Vec<GeminiFunctionCall>,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GeminiFunctionCall {
-    name: String,
-    #[serde(default)]
-    args: Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeminiUsageMetadata {
-    #[serde(rename = "totalTokenCount")]
-    total_token_count: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeminiResponsePart {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    thought: Option<bool>,
-    #[serde(rename = "functionCall", default)]
-    function_call: Option<GeminiFunctionCall>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeminiCandidateContent {
-    #[serde(default)]
-    parts: Vec<GeminiResponsePart>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeminiCandidate {
-    #[serde(default)]
-    content: Option<GeminiCandidateContent>,
-    #[serde(rename = "finishReason", default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeminiStreamChunk {
-    #[serde(default)]
-    candidates: Option<Vec<GeminiCandidate>>,
-    #[serde(rename = "usageMetadata", default)]
-    usage_metadata: Option<GeminiUsageMetadata>,
-}
-
-#[derive(Debug)]
-struct DirectToolOutput {
-    summary: String,
-    model_response: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GeminiAuth {
-    ApiKey(String),
-}
-
-#[derive(Debug, Deserialize)]
-struct GeminiCliSettingsFile {
-    #[serde(default)]
-    security: Option<GeminiCliSecurity>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeminiCliSecurity {
-    #[serde(default)]
-    auth: Option<GeminiCliSecurityAuth>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeminiCliSecurityAuth {
-    #[serde(rename = "selectedType", default)]
-    selected_type: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReadFileArgs {
-    path: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WriteFileArgs {
-    path: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct StageFileArgs {
-    path: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShellCommandArgs {
-    command: String,
-}
-
-fn gemini_api_key() -> Option<String> {
-    ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
-        .into_iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-}
-
-fn gemini_cli_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            return PathBuf::from(home).join(".gemini");
-        }
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".gemini")
-}
-
-fn gemini_cli_settings_path() -> PathBuf {
-    gemini_cli_dir().join("settings.json")
-}
-
-fn gemini_cli_oauth_creds_path() -> PathBuf {
-    gemini_cli_dir().join("oauth_creds.json")
-}
-
-fn gemini_auth() -> Option<GeminiAuth> {
-    if let Some(api_key) = gemini_api_key() {
-        return Some(GeminiAuth::ApiKey(api_key));
-    }
-
-    let settings = load_gemini_cli_settings().ok()?;
-    let selected_type = selected_gemini_cli_auth_type(&settings).unwrap_or_default();
-    if selected_type == "oauth-personal" && gemini_cli_oauth_creds_path().exists() {
-        return None;
-    }
-    None
-}
-
-fn selected_gemini_cli_auth_type(settings: &GeminiCliSettingsFile) -> Option<String> {
-    settings
-        .security
-        .as_ref()
-        .and_then(|security| security.auth.as_ref())
-        .and_then(|auth| auth.selected_type.clone())
-}
-
-fn load_gemini_cli_settings() -> std::result::Result<GeminiCliSettingsFile, String> {
-    let raw = fs::read_to_string(gemini_cli_settings_path()).map_err(|err| err.to_string())?;
-    serde_json::from_str(&raw).map_err(|err| err.to_string())
-}
-
-fn extract_gemini_error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| clip_activity_text(body))
-}
-
 fn send_ai_activity(
     progress: Option<&mpsc::UnboundedSender<UpdateProgress>>,
     event: AiActivityEvent,
@@ -2514,464 +2176,13 @@ fn send_ai_activity(
     }
 }
 
-fn build_direct_merge_system_instruction() -> String {
-    [
-        "You are operating inside an automated merge-conflict resolver.",
-        "Available tools:",
-        "- read_file(path): read a UTF-8 file from the repository.",
-        "- write_file(path, content): overwrite a UTF-8 file with exact content.",
-        "- stage_file(path): stage exactly one file with git add -- <path>.",
-        "- run_shell_command(command): run a non-interactive shell command in the repository root.",
-        "Prefer read_file + write_file for code changes. Use run_shell_command for git inspection, fast checks, grep-like search, and targeted tests.",
-        "Forbidden git state commands (fetch, pull, merge, reset, checkout, commit, push) will be rejected by the harness.",
-        "The outer pipeline will do the final git add/commit after you finish, so never ask for confirmation.",
-    ]
-    .join("\n")
-}
-
-fn build_gemini_request(model: &str, system_instruction: &str, contents: &[Value]) -> Value {
-    let thinking_config = if model.starts_with("gemini-2.5") {
-        json!({
-            "includeThoughts": true,
-            "thinkingBudget": 8192,
-        })
-    } else {
-        json!({
-            "includeThoughts": true,
-            "thinkingLevel": "HIGH",
-        })
-    };
-
-    json!({
-        "systemInstruction": {
-            "parts": [{"text": system_instruction}],
-        },
-        "contents": contents,
-        "tools": [{
-            "functionDeclarations": [
-                {
-                    "name": "read_file",
-                    "description": "Read a UTF-8 file from the repository.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Repository-relative file path."}
-                        },
-                        "required": ["path"]
-                    }
-                },
-                {
-                    "name": "write_file",
-                    "description": "Overwrite a UTF-8 file in the repository with exact content.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Repository-relative file path."},
-                            "content": {"type": "string", "description": "Full replacement file content."}
-                        },
-                        "required": ["path", "content"]
-                    }
-                },
-                {
-                    "name": "stage_file",
-                    "description": "Stage exactly one file with git add -- <path>.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Repository-relative file path to stage."}
-                        },
-                        "required": ["path"]
-                    }
-                },
-                {
-                    "name": "run_shell_command",
-                    "description": "Run a non-interactive shell command in the repository root. Useful for git inspection, search, and targeted tests.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string", "description": "Shell command to run."}
-                        },
-                        "required": ["command"]
-                    }
-                }
-            ]
-        }],
-        "toolConfig": {
-            "functionCallingConfig": {
-                "mode": "AUTO"
-            }
-        },
-        "generationConfig": {
-            "temperature": 0,
-            "topP": 1,
-            "maxOutputTokens": 32768,
-            "thinkingConfig": thinking_config,
-        }
-    })
-}
-
-async fn consume_gemini_stream(
-    mut response: reqwest::Response,
-    progress: Option<&mpsc::UnboundedSender<UpdateProgress>>,
-    started_at: Instant,
-) -> std::result::Result<GeminiTurnResult, String> {
-    let mut turn = GeminiTurnResult::default();
-    let mut buffer = String::new();
-
-    while let Some(chunk) = response.chunk().await.map_err(|err| err.to_string())? {
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(index) = buffer.find("\n\n") {
-            let event = buffer[..index].to_string();
-            buffer.drain(..index + 2);
-            apply_gemini_sse_event(&event, &mut turn, progress, started_at)?;
-        }
-    }
-
-    if !buffer.trim().is_empty() {
-        apply_gemini_sse_event(buffer.trim_end(), &mut turn, progress, started_at)?;
-    }
-
-    Ok(turn)
-}
-
-fn apply_gemini_sse_event(
-    event: &str,
-    turn: &mut GeminiTurnResult,
-    progress: Option<&mpsc::UnboundedSender<UpdateProgress>>,
-    started_at: Instant,
-) -> std::result::Result<(), String> {
-    let data = event
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if data.is_empty() || data == "[DONE]" {
-        return Ok(());
-    }
-
-    let chunk: GeminiStreamChunk = serde_json::from_str(&data)
-        .map_err(|err| format!("invalid Gemini stream event: {err}: {data}"))?;
-    let candidate = chunk
-        .candidates
-        .as_ref()
-        .and_then(|candidates| candidates.first());
-
-    if let Some(candidate) = candidate {
-        if let Some(content) = candidate.content.as_ref() {
-            for part in &content.parts {
-                if let Some(function_call) = part.function_call.as_ref() {
-                    turn.tool_calls.push(function_call.clone());
-                    turn.model_parts.push(json!({
-                        "functionCall": {
-                            "name": function_call.name,
-                            "args": function_call.args,
-                        }
-                    }));
-                    continue;
-                }
-
-                let Some(text) = part.text.as_deref() else {
-                    continue;
-                };
-                if text.is_empty() {
-                    continue;
-                }
-
-                if part.thought.unwrap_or(false) {
-                    send_ai_activity(
-                        progress,
-                        AiActivityEvent::Thinking {
-                            content: text.to_string(),
-                        },
-                    );
-                } else {
-                    send_ai_activity(
-                        progress,
-                        AiActivityEvent::AssistantText {
-                            content: text.to_string(),
-                        },
-                    );
-                }
-                append_model_text_part(&mut turn.model_parts, text, part.thought.unwrap_or(false));
-            }
-        }
-
-        if let Some(reason) = candidate.finish_reason.as_deref() {
-            turn.finish_reason = Some(reason.to_string());
-            if let Some(usage) = chunk.usage_metadata.as_ref() {
-                send_ai_activity(
-                    progress,
-                    AiActivityEvent::Summary {
-                        tool_calls: turn.tool_calls.len() as u64,
-                        duration_ms: started_at.elapsed().as_millis() as u64,
-                        total_tokens: usage.total_token_count.unwrap_or(0),
-                    },
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn append_model_text_part(parts: &mut Vec<Value>, text: &str, thought: bool) {
-    if let Some(last) = parts.last_mut() {
-        if last.get("functionCall").is_none() {
-            let same_thought = last
-                .get("thought")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-                == thought;
-            if same_thought {
-                if let Some(existing_value) = last.get_mut("text") {
-                    let existing_text = existing_value.as_str().unwrap_or_default();
-                    let merged = format!("{existing_text}{text}");
-                    *existing_value = Value::String(merged);
-                    return;
-                }
-            }
-        }
-    }
-
-    if thought {
-        parts.push(json!({"text": text, "thought": true}));
-    } else {
-        parts.push(json!({"text": text}));
-    }
-}
-
-fn summarize_direct_tool_call(call: &GeminiFunctionCall) -> String {
-    match call.name.as_str() {
-        "read_file" | "write_file" | "stage_file" => call
-            .args
-            .get("path")
-            .and_then(|value| value.as_str())
-            .map(clip_activity_text)
-            .unwrap_or_default(),
-        "run_shell_command" => call
-            .args
-            .get("command")
-            .and_then(|value| value.as_str())
-            .map(clip_activity_text)
-            .unwrap_or_default(),
-        _ => clip_activity_text(&call.args.to_string()),
-    }
-}
-
-async fn execute_direct_tool_call(
-    cwd: &Path,
-    call: &GeminiFunctionCall,
-) -> std::result::Result<DirectToolOutput, String> {
-    match call.name.as_str() {
-        "read_file" => {
-            let args: ReadFileArgs = serde_json::from_value(call.args.clone())
-                .map_err(|err| format!("invalid read_file arguments: {err}"))?;
-            let path = resolve_repo_path(cwd, &args.path)?;
-            let display = display_repo_path(cwd, &path);
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|err| format!("failed to read {display}: {err}"))?;
-            Ok(DirectToolOutput {
-                summary: format!("{} bytes", content.len()),
-                model_response: truncate_tool_output_for_model(&format!(
-                    "FILE: {display}\n{content}"
-                )),
-            })
-        }
-        "write_file" => {
-            let args: WriteFileArgs = serde_json::from_value(call.args.clone())
-                .map_err(|err| format!("invalid write_file arguments: {err}"))?;
-            let path = resolve_repo_path(cwd, &args.path)?;
-            let display = display_repo_path(cwd, &path);
-            let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-            if let Err(reason) = guard_destructive_overwrite(&existing, &args.content) {
-                return Err(format!("refusing to write {display}: {reason}"));
-            }
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|err| format!("failed to prepare {display}: {err}"))?;
-            }
-            tokio::fs::write(&path, args.content.as_bytes())
-                .await
-                .map_err(|err| format!("failed to write {display}: {err}"))?;
-            Ok(DirectToolOutput {
-                summary: format!("wrote {display}"),
-                model_response: format!("WROTE: {display}"),
-            })
-        }
-        "stage_file" => {
-            let args: StageFileArgs = serde_json::from_value(call.args.clone())
-                .map_err(|err| format!("invalid stage_file arguments: {err}"))?;
-            let path = resolve_repo_path(cwd, &args.path)?;
-            let display = display_repo_path(cwd, &path);
-            run_command(Path::new("git"), &["add", "--", &display], Some(cwd))
-                .await
-                .map_err(|err| format!("failed to stage {display}: {err}"))?;
-            Ok(DirectToolOutput {
-                summary: format!("staged {display}"),
-                model_response: format!("STAGED: {display}"),
-            })
-        }
-        "run_shell_command" => {
-            let args: ShellCommandArgs = serde_json::from_value(call.args.clone())
-                .map_err(|err| format!("invalid run_shell_command arguments: {err}"))?;
-            validate_shell_command(&args.command)?;
-            run_shell_command_tool(cwd, &args.command).await
-        }
-        other => Err(format!("unknown Gemini tool `{other}`")),
-    }
-}
-
-fn resolve_repo_path(cwd: &Path, raw: &str) -> std::result::Result<PathBuf, String> {
-    let candidate = if Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
-    } else {
-        cwd.join(raw)
-    };
-    let normalized = normalize_path(&candidate);
-    if !normalized.starts_with(cwd) {
-        return Err(format!("path escapes repository: {raw}"));
-    }
-    if normalized
-        .components()
-        .any(|component| component.as_os_str() == ".git")
-    {
-        return Err(format!("refusing to touch .git internals: {raw}"));
-    }
-    Ok(normalized)
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
-}
-
-fn display_repo_path(cwd: &Path, path: &Path) -> String {
-    path.strip_prefix(cwd)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
-}
-
-fn truncate_tool_output_for_model(output: &str) -> String {
-    if output.len() <= AI_TOOL_OUTPUT_LIMIT {
-        return output.to_string();
-    }
-    let mut clipped = output
-        .chars()
-        .take(AI_TOOL_OUTPUT_LIMIT)
-        .collect::<String>();
-    clipped.push_str("\n\n[truncated by wisetree]");
-    clipped
-}
-
-fn validate_shell_command(command: &str) -> std::result::Result<(), String> {
-    let tokens = command
-        .split_whitespace()
-        .map(|token| token.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        if token != "git" {
-            continue;
-        }
-        let Some(subcommand) = tokens.get(index + 1) else {
-            continue;
-        };
-        match subcommand.as_str() {
-            "fetch" | "pull" | "merge" | "reset" | "checkout" | "commit" | "push" => {
-                return Err(format!(
-                    "forbidden command in run_shell_command: git {subcommand}"
-                ));
-            }
-            "add" => {
-                if let Some(arg) = tokens.get(index + 2) {
-                    if matches!(arg.as_str(), "." | "-a" | "-A" | "--all") {
-                        return Err(
-                            "forbidden command in run_shell_command: git add must target an explicit file"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if command.contains("/.git") || command.contains(".git/") {
-        return Err("forbidden path in run_shell_command: .git internals".to_string());
-    }
-    Ok(())
-}
-
-async fn run_shell_command_tool(
-    cwd: &Path,
-    command: &str,
-) -> std::result::Result<DirectToolOutput, String> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-lc")
-        .arg(command)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = time::timeout(AI_TOOL_TIMEOUT, cmd.output())
-        .await
-        .map_err(|_| format!("command timed out after {}s", AI_TOOL_TIMEOUT.as_secs()))?
-        .map_err(|err| err.to_string())?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let rendered = format_shell_result(command, output.status.code(), &stdout, &stderr);
-    if output.status.success() {
-        Ok(DirectToolOutput {
-            summary: first_non_empty_line(&stdout)
-                .or_else(|| first_non_empty_line(&stderr))
-                .unwrap_or_else(|| "command succeeded".to_string()),
-            model_response: truncate_tool_output_for_model(&rendered),
-        })
-    } else {
-        Err(truncate_tool_output_for_model(&rendered))
-    }
-}
-
-fn format_shell_result(command: &str, code: Option<i32>, stdout: &str, stderr: &str) -> String {
-    let mut sections = vec![format!("COMMAND: {command}")];
-    if let Some(code) = code {
-        sections.push(format!("EXIT CODE: {code}"));
-    }
-    if !stdout.is_empty() {
-        sections.push(format!("STDOUT:\n{stdout}"));
-    }
-    if !stderr.is_empty() {
-        sections.push(format!("STDERR:\n{stderr}"));
-    }
-    sections.join("\n\n")
-}
-
-fn first_non_empty_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
-}
-
 /// Spawn a subprocess and forward every stdout/stderr line through
 /// `progress` (as `UpdateProgress::AiOutput`) as it arrives. Returns the
 /// same `Ok(stdout) / Err(stderr)` shape as `run_command` once the
 /// process exits so callers can keep their post-processing logic unchanged.
-/// Used to give the user a live view of the Gemini CLI's streamed activity
-/// during conflict resolution (tool calls, assistant text, warnings, and any
-/// future thinking events upstream chooses to expose).
+/// Used to give the user a live view of the opencode CLI's streamed JSON
+/// activity during conflict resolution (text, reasoning/thinking, tool calls,
+/// step boundaries, and errors).
 async fn run_command_streamed(
     binary: &Path,
     args: &[&str],
@@ -3034,11 +2245,11 @@ async fn run_command_streamed(
 /// forward an ANSI-stripped copy through `progress`. Lines without a
 /// trailing newline (the final partial line) are flushed when EOF hits.
 ///
-/// Gemini's `-o stream-json` mode emits one NDJSON event per line
-/// (`init` / `message` / `tool_use` / `tool_result` / `error` / `result`);
-/// those are translated into structured UI events. Non-JSON lines (the four
-/// startup warnings Gemini prints on stderr before switching to structured
-/// output) pass through verbatim so the user still sees them.
+/// Opencode's `--format json` mode emits one JSON object per line
+/// (`text` / `reasoning` / `tool_use` / `step_start` / `step_finish` /
+/// `error`); those are translated into structured UI events. Non-JSON
+/// lines pass through verbatim so any startup warnings still reach the
+/// user.
 async fn forward_stream<R>(
     mut reader: BufReader<R>,
     buf: Arc<Mutex<String>>,
@@ -3067,10 +2278,12 @@ async fn forward_stream<R>(
     }
 }
 
-/// Translate a single line of Gemini stdout/stderr into a structured event for
-/// the AI Activity panel. Returns `None` for lines we deliberately hide
-/// (empties, the user-prompt echo). Lines that don't parse as a known NDJSON
-/// event are surfaced as raw text so startup warnings still reach the user.
+/// Translate a single line of opencode stdout/stderr into a structured event
+/// for the AI Activity panel. Opencode emits one JSON object per line with a
+/// top-level `type` discriminator and a nested `part` payload. Returns `None`
+/// for events we deliberately hide (empty payloads, step boundaries). Lines
+/// that don't parse as JSON are surfaced as raw text so startup warnings
+/// still reach the user.
 fn format_stream_event(line: &str) -> Option<AiActivityEvent> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -3086,137 +2299,60 @@ fn format_stream_event(line: &str) -> Option<AiActivityEvent> {
     };
     let event_type = value.get("type").and_then(|v| v.as_str())?;
     match event_type {
-        "init" => {
-            let model = value.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-            Some(AiActivityEvent::SessionStart {
-                model: model.to_string(),
-            })
-        }
-        "message" => {
-            let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role != "assistant" {
-                return None;
-            }
-            let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if content.is_empty() {
+        "text" => {
+            let text = json_str(&value, &["part", "text"]).unwrap_or("");
+            if text.is_empty() {
                 return None;
             }
             Some(AiActivityEvent::AssistantText {
-                content: flatten_stream_chunk(content),
+                content: text.to_string(),
             })
         }
-        "thought" | "thinking" => {
-            let content = json_str(&value, &["content"])
-                .or_else(|| json_str(&value, &["text"]))
-                .or_else(|| json_str(&value, &["thought"]))
-                .or_else(|| json_str(&value, &["summary"]))
-                .or_else(|| json_str(&value, &["subject"]))
-                .unwrap_or("");
-            if content.is_empty() {
+        "reasoning" => {
+            let text = json_str(&value, &["part", "text"]).unwrap_or("");
+            if text.is_empty() {
                 return None;
             }
             Some(AiActivityEvent::Thinking {
-                content: flatten_stream_chunk(content),
+                content: text.to_string(),
             })
         }
-        "tool_use" => {
-            let tool = value
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let summary = summarize_tool_params(value.get("parameters"));
-            Some(AiActivityEvent::ToolCall {
-                tool_name: tool.to_string(),
-                summary,
-            })
-        }
-        "tool_result" => {
-            let status = value
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("success");
-            let tool_name = value
-                .get("tool_id")
-                .and_then(|v| v.as_str())
-                .and_then(tool_name_from_tool_id);
-            let detail = summarize_tool_result_detail(&value);
-            if status == "success" {
-                return detail.map(|detail| AiActivityEvent::ToolResult {
-                    tool_name,
-                    status: AiToolResultStatus::Success,
-                    detail,
-                });
+        "tool_use" => format_opencode_tool_use(&value),
+        "step_start" => None,
+        "step_finish" => {
+            let tokens = value.get("part").and_then(|p| p.get("tokens"));
+            let input = tokens
+                .and_then(|t| t.get("input"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output = tokens
+                .and_then(|t| t.get("output"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total = input + output;
+            if total == 0 {
+                return None;
             }
-            Some(AiActivityEvent::ToolResult {
-                tool_name,
-                status: AiToolResultStatus::Error,
-                detail: detail.unwrap_or_else(|| "failed".to_string()),
+            Some(AiActivityEvent::Summary {
+                tool_calls: 0,
+                duration_ms: 0,
+                total_tokens: total,
             })
         }
         "error" => {
-            let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let message = json_str(&value, &["error", "data", "message"])
+                .or_else(|| json_str(&value, &["error", "message"]))
+                .or_else(|| value.get("message").and_then(|v| v.as_str()))
+                .unwrap_or("");
             if message.is_empty() {
                 return None;
             }
-            let severity = match value
-                .get("severity")
-                .and_then(|v| v.as_str())
-                .unwrap_or("error")
-            {
-                "warning" => AiActivitySeverity::Warning,
-                "info" => AiActivitySeverity::Info,
-                _ => AiActivitySeverity::Error,
-            };
             Some(AiActivityEvent::Notice {
-                severity,
+                severity: AiActivitySeverity::Error,
                 message: clip_activity_text(message),
             })
         }
-        "result" => {
-            let status = value
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("success");
-            if status == "error" {
-                let message = json_str(&value, &["error", "message"])
-                    .or_else(|| value.get("message").and_then(|v| v.as_str()))
-                    .unwrap_or("request failed");
-                return Some(AiActivityEvent::Notice {
-                    severity: AiActivitySeverity::Error,
-                    message: clip_activity_text(message),
-                });
-            }
-            let stats = value.get("stats");
-            let tool_calls = stats
-                .and_then(|s| s.get("tool_calls"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let duration_ms = stats
-                .and_then(|s| s.get("duration_ms"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let tokens = stats
-                .and_then(|s| s.get("total_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            Some(AiActivityEvent::Summary {
-                tool_calls,
-                duration_ms,
-                total_tokens: tokens,
-            })
-        }
         other => {
-            if other.contains("thought") || other.contains("thinking") {
-                let content = json_str(&value, &["content"])
-                    .or_else(|| json_str(&value, &["text"]))
-                    .or_else(|| json_str(&value, &["summary"]))
-                    .unwrap_or("");
-                if !content.is_empty() {
-                    return Some(AiActivityEvent::Thinking {
-                        content: flatten_stream_chunk(content),
-                    });
-                }
-            }
             let text = value
                 .get("message")
                 .and_then(|v| v.as_str())
@@ -3234,19 +2370,63 @@ fn format_stream_event(line: &str) -> Option<AiActivityEvent> {
     }
 }
 
+/// Translate an opencode `tool_use` event into either a single `ToolCall`
+/// event (when the tool is still running) or a `ToolCall` + `ToolResult`
+/// pair (when `state.status` is `completed` / `error`). Opencode nests the
+/// tool name and call state under `part`.
+fn format_opencode_tool_use(value: &serde_json::Value) -> Option<AiActivityEvent> {
+    let part = value.get("part")?;
+    let tool_name = part
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tool")
+        .to_string();
+    let state = part.get("state")?;
+    let status = state
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
+
+    match status {
+        "completed" => {
+            let detail = state
+                .get("output")
+                .and_then(|v| v.as_str())
+                .map(clip_activity_text)
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "ok".to_string());
+            Some(AiActivityEvent::ToolResult {
+                tool_name: Some(tool_name),
+                status: AiToolResultStatus::Success,
+                detail,
+            })
+        }
+        "error" => {
+            let detail = state
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(clip_activity_text)
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "failed".to_string());
+            Some(AiActivityEvent::ToolResult {
+                tool_name: Some(tool_name),
+                status: AiToolResultStatus::Error,
+                detail,
+            })
+        }
+        _ => {
+            let summary = summarize_tool_params(state.get("input"));
+            Some(AiActivityEvent::ToolCall { tool_name, summary })
+        }
+    }
+}
+
 fn json_str<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
     let mut current = value;
     for segment in path {
         current = current.get(*segment)?;
     }
     current.as_str()
-}
-
-fn flatten_stream_chunk(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| if matches!(ch, '\r' | '\n') { ' ' } else { ch })
-        .collect()
 }
 
 fn collapse_activity_whitespace(input: &str) -> String {
@@ -3264,33 +2444,18 @@ fn clip_activity_text(input: &str) -> String {
     format!("{prefix}...")
 }
 
-fn summarize_tool_result_detail(value: &serde_json::Value) -> Option<String> {
-    json_str(value, &["error", "message"])
-        .or_else(|| value.get("output").and_then(|v| v.as_str()))
-        .map(clip_activity_text)
-        .filter(|detail| !detail.is_empty())
-}
-
-fn tool_name_from_tool_id(tool_id: &str) -> Option<String> {
-    let tool_name = tool_id.split("__").next().unwrap_or(tool_id).trim();
-    if tool_name.is_empty() {
-        None
-    } else {
-        Some(tool_name.to_string())
-    }
-}
-
 /// Pick the single most informative key in a tool-call parameter blob.
-/// Gemini's tools all carry one obvious "what is this about" field
-/// (`file_path` for read/edit, `command` for shell, `pattern` for
-/// grep, …); rendering just that keeps the activity row short. Falls
-/// back to the first key=value pair when nothing recognisable is
-/// found.
+/// Opencode's tools all carry one obvious "what is this about" field
+/// (`filePath` for read/edit, `command` for shell, `pattern` for grep,
+/// `query` for web, …); rendering just that keeps the activity row
+/// short. Falls back to the first key=value pair when nothing
+/// recognisable is found.
 fn summarize_tool_params(params: Option<&serde_json::Value>) -> String {
     let Some(obj) = params.and_then(|v| v.as_object()) else {
         return String::new();
     };
     const PREFERRED: &[&str] = &[
+        "filePath",
         "file_path",
         "path",
         "absolute_path",
@@ -3298,7 +2463,7 @@ fn summarize_tool_params(params: Option<&serde_json::Value>) -> String {
         "pattern",
         "query",
         "url",
-        "strategic_intent",
+        "prompt",
     ];
     for key in PREFERRED {
         if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
@@ -3452,7 +2617,7 @@ async fn conflicted_files(git_binary: &Path, cwd: &Path) -> Vec<String> {
     }
 }
 
-/// The task prompt fed to Gemini when resolving merge conflicts. The body of
+/// The task prompt fed to the AI when resolving merge conflicts. The body of
 /// `prompts/merger.md` is embedded at compile time so the binary has no runtime
 /// dependency on the prompt file.
 /// `MERGE_REF` is substituted with the resolved base ref; `CONFLICTED_FILES`
@@ -3460,7 +2625,7 @@ async fn conflicted_files(git_binary: &Path, cwd: &Path) -> Vec<String> {
 /// `git diff --name-only --diff-filter=U`.
 ///
 /// The prompt deliberately ships **without** YAML frontmatter so it stays a
-/// plain instruction body no matter which Gemini harness executes it.
+/// plain instruction body no matter which CLI harness executes it.
 fn build_merge_prompt(base_ref: &str, conflicts: &[String]) -> String {
     const MERGER_PROMPT: &str = include_str!("../../prompts/merger.md");
     let bulleted = if conflicts.is_empty() {
@@ -3514,52 +2679,6 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn guard_rejects_placeholder_write_to_conflicted_file() {
-        let existing = format!(
-            "{}\n<<<<<<< HEAD\nfrom ours\n=======\nfrom theirs\n>>>>>>> base\n{}\n",
-            "x".repeat(500),
-            "y".repeat(500),
-        );
-        let err = guard_destructive_overwrite(&existing, "resolved")
-            .expect_err("placeholder must be rejected when conflict markers are present");
-        assert!(
-            err.contains("merge-conflict"),
-            "unexpected guard message: {err}"
-        );
-    }
-
-    #[test]
-    fn guard_allows_real_merge_to_conflicted_file() {
-        let existing = format!(
-            "{}\n<<<<<<< HEAD\nfrom ours\n=======\nfrom theirs\n>>>>>>> base\n{}\n",
-            "x".repeat(500),
-            "y".repeat(500),
-        );
-        let merged = format!(
-            "{}\nmerged body line\n{}\n",
-            "x".repeat(500),
-            "y".repeat(500)
-        );
-        assert!(guard_destructive_overwrite(&existing, &merged).is_ok());
-    }
-
-    #[test]
-    fn guard_allows_shrinking_write_when_no_conflict_markers() {
-        // No markers means the file isn't in a conflicted state — a deliberate
-        // truncation here is the model's call, not a destructive resolution.
-        let existing = "a".repeat(5_000);
-        assert!(guard_destructive_overwrite(&existing, "tiny").is_ok());
-    }
-
-    #[test]
-    fn guard_skips_tiny_conflicted_files() {
-        // Very small files (< 200 bytes baseline) skip the guard so the 10 %
-        // threshold doesn't fire on toy fixtures.
-        let existing = "<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> base\n";
-        assert!(guard_destructive_overwrite(existing, "z").is_ok());
-    }
 
     #[test]
     fn classify_merge_output_recognizes_already_up_to_date() {
@@ -4245,9 +3364,9 @@ mod tests {
 
     #[test]
     fn build_merge_prompt_has_no_yaml_frontmatter() {
-        // Regression guard: a leading `--- name: X ---` block would make
-        // Gemini's CLI treat the prompt as a skill manifest and package it
-        // into a `.skill` archive instead of resolving conflicts.
+        // Regression guard: a leading `--- name: X ---` block could make
+        // the AI CLI treat the prompt as a skill/agent manifest and package
+        // it as an artifact instead of resolving conflicts.
         let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()]);
         assert!(
             !prompt.trim_start().starts_with("---"),
@@ -4272,78 +3391,39 @@ mod tests {
     }
 
     #[test]
-    fn build_merge_prompt_forbids_skill_creation_and_pipeline_git_ops() {
+    fn build_merge_prompt_forbids_pipeline_git_ops_and_unrelated_cleanup() {
         let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()]);
-        // The prompt must tell Gemini to stay out of pipeline-managed git ops
-        // and not to package itself as a skill — both are concrete failure
-        // modes we've already observed in production.
+        // The prompt must tell the AI to stay out of pipeline-managed git
+        // ops and to stick to the conflicts at hand — both are concrete
+        // failure modes we've already observed in production.
         assert!(prompt.contains("git commit"));
         assert!(prompt.contains("git push"));
-        assert!(prompt.to_lowercase().contains("skill"));
+        assert!(
+            prompt.to_lowercase().contains("never invent unrelated"),
+            "merge prompt should keep the AI focused on conflicts"
+        );
     }
 
     #[test]
-    fn format_stream_event_preserves_assistant_delta_spacing() {
+    fn format_stream_event_parses_opencode_text_event() {
         let event = format_stream_event(
-            r#"{"type":"message","role":"assistant","content":" hello","delta":true}"#,
+            r#"{"type":"text","sessionID":"s1","part":{"type":"text","text":"Resolving foo.rs","time":{"end":42}}}"#,
         )
         .unwrap();
         assert_eq!(
             event,
             AiActivityEvent::AssistantText {
-                content: " hello".to_string(),
+                content: "Resolving foo.rs".to_string(),
             }
         );
     }
 
     #[test]
-    fn format_stream_event_parses_successful_tool_results() {
+    fn format_stream_event_parses_opencode_reasoning_event() {
         let event = format_stream_event(
-            r#"{"type":"tool_result","tool_id":"run_shell_command__123","status":"success","output":"modified src/main.rs\n1 file changed"}"#,
+            r#"{"type":"reasoning","sessionID":"s1","part":{"type":"reasoning","text":"Scanning both sides"}}"#,
         )
         .unwrap();
-        assert_eq!(
-            event,
-            AiActivityEvent::ToolResult {
-                tool_name: Some("run_shell_command".to_string()),
-                status: AiToolResultStatus::Success,
-                detail: "modified src/main.rs 1 file changed".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn format_stream_event_parses_structured_errors() {
-        let warning = format_stream_event(
-            r#"{"type":"error","severity":"warning","message":"Quota getting low"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            warning,
-            AiActivityEvent::Notice {
-                severity: AiActivitySeverity::Warning,
-                message: "Quota getting low".to_string(),
-            }
-        );
-
-        let tool_error = format_stream_event(
-            r#"{"type":"tool_result","tool_id":"read_file__456","status":"error","error":{"type":"TOOL_EXECUTION_ERROR","message":"ENOENT: missing file"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            tool_error,
-            AiActivityEvent::ToolResult {
-                tool_name: Some("read_file".to_string()),
-                status: AiToolResultStatus::Error,
-                detail: "ENOENT: missing file".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn format_stream_event_is_ready_for_future_thinking_events() {
-        let event =
-            format_stream_event(r#"{"type":"thinking","content":"Scanning both sides"}"#).unwrap();
         assert_eq!(
             event,
             AiActivityEvent::Thinking {
@@ -4353,65 +3433,56 @@ mod tests {
     }
 
     #[test]
-    fn build_gemini_request_enables_tools_and_thinking() {
-        let request = build_gemini_request(
-            "gemini-3.1-pro-preview",
-            "system",
-            &[json!({"role": "user", "parts": [{"text": "hello"}]})],
-        );
-
+    fn format_stream_event_parses_opencode_completed_tool_use() {
+        let event = format_stream_event(
+            r#"{"type":"tool_use","part":{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"file contents"}}}"#,
+        )
+        .unwrap();
         assert_eq!(
-            request["generationConfig"]["thinkingConfig"]["includeThoughts"],
-            json!(true)
-        );
-        assert_eq!(
-            request["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            json!("HIGH")
-        );
-        assert_eq!(
-            request["tools"][0]["functionDeclarations"]
-                .as_array()
-                .unwrap()
-                .len(),
-            4
+            event,
+            AiActivityEvent::ToolResult {
+                tool_name: Some("read".to_string()),
+                status: AiToolResultStatus::Success,
+                detail: "file contents".to_string(),
+            }
         );
     }
 
     #[test]
-    fn apply_gemini_sse_event_collects_thoughts_and_function_calls() {
-        let event = r#"data: {"candidates":[{"content":{"parts":[{"text":"scan first","thought":true},{"functionCall":{"name":"read_file","args":{"path":"README.md"}}}]},"finishReason":"STOP"}],"usageMetadata":{"totalTokenCount":123}}"#;
-        let mut turn = GeminiTurnResult::default();
-
-        apply_gemini_sse_event(event, &mut turn, None, Instant::now()).unwrap();
-
-        assert_eq!(turn.finish_reason.as_deref(), Some("STOP"));
-        assert_eq!(turn.tool_calls.len(), 1);
-        assert_eq!(turn.tool_calls[0].name, "read_file");
-        assert_eq!(turn.tool_calls[0].args["path"], json!("README.md"));
-        assert_eq!(turn.model_parts[0]["text"], json!("scan first"));
-        assert_eq!(turn.model_parts[0]["thought"], json!(true));
+    fn format_stream_event_parses_opencode_tool_use_error() {
+        let event = format_stream_event(
+            r#"{"type":"tool_use","part":{"type":"tool","tool":"read","state":{"status":"error","input":{"filePath":"missing.rs"},"error":"ENOENT: missing file"}}}"#,
+        )
+        .unwrap();
         assert_eq!(
-            turn.model_parts[1]["functionCall"]["name"],
-            json!("read_file")
+            event,
+            AiActivityEvent::ToolResult {
+                tool_name: Some("read".to_string()),
+                status: AiToolResultStatus::Error,
+                detail: "ENOENT: missing file".to_string(),
+            }
         );
     }
 
     #[test]
-    fn validate_shell_command_rejects_stateful_git_ops_and_bulk_add() {
-        assert!(validate_shell_command("git status && git merge origin/main").is_err());
-        assert!(validate_shell_command("git add -A").is_err());
-        assert!(validate_shell_command("git add README.md && git diff --cached").is_ok());
-        assert!(validate_shell_command("git merge-base HEAD origin/main").is_ok());
+    fn format_stream_event_parses_opencode_error_event() {
+        let event = format_stream_event(
+            r#"{"type":"error","error":{"name":"AuthError","data":{"message":"Not authenticated"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            AiActivityEvent::Notice {
+                severity: AiActivitySeverity::Error,
+                message: "Not authenticated".to_string(),
+            }
+        );
     }
 
     #[test]
-    fn selected_gemini_cli_auth_type_reads_oauth_personal() {
-        let settings: GeminiCliSettingsFile =
-            serde_json::from_str(r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#)
-                .unwrap();
-        assert_eq!(
-            selected_gemini_cli_auth_type(&settings).as_deref(),
-            Some("oauth-personal")
+    fn format_stream_event_skips_step_start_events() {
+        assert!(
+            format_stream_event(r#"{"type":"step_start","part":{"type":"step-start"}}"#).is_none()
         );
     }
 

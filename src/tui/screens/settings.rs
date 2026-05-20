@@ -941,13 +941,15 @@ pub enum DashboardField {
     RefreshIntervalMs,
     ShowPullRequests,
     Columns,
+    UseAi,
 }
 
 impl DashboardField {
-    pub const ALL: [DashboardField; 3] = [
+    pub const ALL: [DashboardField; 4] = [
         DashboardField::RefreshIntervalMs,
         DashboardField::ShowPullRequests,
         DashboardField::Columns,
+        DashboardField::UseAi,
     ];
 
     pub fn label(self) -> &'static str {
@@ -955,6 +957,7 @@ impl DashboardField {
             DashboardField::RefreshIntervalMs => "refreshIntervalMs",
             DashboardField::ShowPullRequests => "showPullRequests",
             DashboardField::Columns => "columns",
+            DashboardField::UseAi => "useAi",
         }
     }
 
@@ -965,11 +968,21 @@ impl DashboardField {
             DashboardField::Columns => {
                 "Comma-separated: branch, status, ahead_behind, last_commit, pull_request"
             }
+            DashboardField::UseAi => {
+                "Press Enter to cycle AI model (MiniMax M2.5 Free is the only free option for now)"
+            }
         }
     }
 
     pub fn is_toggle(self) -> bool {
         matches!(self, DashboardField::ShowPullRequests)
+    }
+
+    /// True for fields whose value is chosen from a fixed list of options
+    /// instead of typed in (currently only `useAi`). The Enter key cycles
+    /// to the next option in place.
+    pub fn is_cycle(self) -> bool {
+        matches!(self, DashboardField::UseAi)
     }
 }
 
@@ -988,6 +1001,7 @@ pub struct DashboardEditor {
     pub statuses: Vec<DashboardRectStatus>,
     pub selection: DashboardSelection,
     edit_backup: Option<(String, DashboardRectStatus)>,
+    use_ai: crate::config::schema::UseAiConfig,
 }
 
 impl DashboardEditor {
@@ -996,6 +1010,7 @@ impl DashboardEditor {
             config.refresh_interval_ms.to_string(),
             config.show_pull_requests.to_string(),
             config.columns.join(", "),
+            config.use_ai.label().to_string(),
         ];
         let statuses = vec![DashboardRectStatus::Saved; values.len()];
         Self {
@@ -1003,6 +1018,7 @@ impl DashboardEditor {
             statuses,
             selection: DashboardSelection::Rect(0),
             edit_backup: None,
+            use_ai: config.use_ai.clone(),
         }
     }
 
@@ -1032,6 +1048,23 @@ impl DashboardEditor {
             DashboardSelection::Rect(_) => DashboardSelection::Save,
             DashboardSelection::Save => DashboardSelection::Save,
         };
+    }
+
+    /// Advance `useAi.model` to the next entry in `AVAILABLE_MODELS`. With a
+    /// single entry today this is a no-op, but the wiring lets future
+    /// additions become live without renderer changes.
+    pub fn cycle_ai_model(&mut self, idx: usize) {
+        use crate::config::schema::UseAiConfig;
+        let models = UseAiConfig::AVAILABLE_MODELS;
+        if models.is_empty() {
+            return;
+        }
+        let current = self.use_ai.index();
+        let next = (current + 1) % models.len();
+        let (id, label) = models[next];
+        self.use_ai.model = id.to_string();
+        self.values[idx] = label.to_string();
+        self.statuses[idx] = DashboardRectStatus::Modified;
     }
 
     /// Build the `DashboardConfig` from current editor values. Numeric and
@@ -1064,6 +1097,7 @@ impl DashboardEditor {
             refresh_interval_ms,
             show_pull_requests,
             columns,
+            use_ai: self.use_ai.clone(),
         }
     }
 }
@@ -2239,6 +2273,7 @@ impl SettingsScreen {
 
         let mut start_editing = None;
         let mut toggle_idx = None;
+        let mut cycle_idx = None;
         let action = match key.code {
             KeyCode::Esc => {
                 self.dashboard_editor = None;
@@ -2256,8 +2291,11 @@ impl SettingsScreen {
             }
             KeyCode::Enter => match editor.selection {
                 DashboardSelection::Rect(i) => {
-                    if editor.field(i).is_toggle() {
+                    let field = editor.field(i);
+                    if field.is_toggle() {
                         toggle_idx = Some(i);
+                    } else if field.is_cycle() {
+                        cycle_idx = Some(i);
                     } else {
                         start_editing = Some(i);
                     }
@@ -2270,6 +2308,11 @@ impl SettingsScreen {
 
         if let Some(idx) = toggle_idx {
             self.toggle_dashboard_bool(idx);
+        }
+        if let Some(idx) = cycle_idx {
+            if let Some(editor) = self.dashboard_editor.as_mut() {
+                editor.cycle_ai_model(idx);
+            }
         }
         if let Some(idx) = start_editing {
             self.start_dashboard_editing(idx);
@@ -4197,6 +4240,7 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
         DashboardField::RefreshIntervalMs => "Refresh interval in ms (5000..60000)",
         DashboardField::ShowPullRequests => "true or false",
         DashboardField::Columns => "branch, status, ahead_behind, last_commit, pull_request",
+        DashboardField::UseAi => "Press Enter on the rect to cycle (not editable)",
     };
     InputPrompt::new("")
         .with_placeholder(placeholder)

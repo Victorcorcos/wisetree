@@ -26,10 +26,12 @@ pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 /// the synthetic commit.
 pub const UPDATE_MERGE_COMMIT_MESSAGE: &str = "Merging and solving conflicts";
 
-/// The Gemini model that resolves merge conflicts. Surfaced in both the
-/// CLI invocation and the UI toasts so user-facing copy stays in sync
-/// with what actually runs.
-pub const UPDATE_GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
+/// Default opencode model used for merge-conflict resolution. The model
+/// id is what the opencode CLI accepts on `--model`; the label is what
+/// the settings screen shows. Both stay in lock-step with
+/// `UseAiConfig::AVAILABLE_MODELS` so the toast and the CLI always agree.
+pub const DEFAULT_AI_MODEL_ID: &str = "opencode/minimax-m2.5-free";
+pub const DEFAULT_AI_MODEL_LABEL: &str = "MiniMax M2.5 Free";
 
 /// Resolve the global config directory (`~/.wisetree/`).
 ///
