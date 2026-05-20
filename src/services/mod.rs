@@ -1,8 +1,8 @@
 //! Cross-cutting services (app state, update check, shell integration).
 
 pub mod app_state;
-pub mod dashboard;
 pub mod presets;
+pub mod dashboard;
 pub mod shell_integration;
 pub mod update;
 
