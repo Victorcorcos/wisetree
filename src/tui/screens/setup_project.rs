@@ -1161,7 +1161,7 @@ fn render_editable_block(
         .fg(border_color)
         .add_modifier(Modifier::BOLD);
 
-    let mut body: Vec<Line<'static>> = if lines.is_empty() && !editing {
+    let body: Vec<Line<'static>> = if lines.is_empty() && !editing {
         vec![Line::from(Span::styled(
             "(none — Enter to edit)",
             Style::default()
@@ -1193,21 +1193,21 @@ fn render_editable_block(
             .collect()
     };
 
-    if selected && !editing {
-        if let Some(first) = body.first_mut() {
-            first.spans.insert(
-                0,
-                Span::styled(SELECTION_MARKER, Style::default().fg(colors::ACCENT)),
-            );
-        }
-    }
+    let title_line = if selected && !editing {
+        Line::from(vec![
+            Span::styled(SELECTION_MARKER, Style::default().fg(colors::ACCENT)),
+            Span::styled(format!("{title} "), title_style),
+        ])
+    } else {
+        Line::from(Span::styled(format!(" {title} "), title_style))
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(border_style)
         .padding(Padding::horizontal(1))
-        .title(Span::styled(format!(" {title} "), title_style));
+        .title(title_line);
     frame.render_widget(Paragraph::new(body).scroll((scroll, 0)).block(block), area);
 }
 
