@@ -24,7 +24,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use crate::messages::colors;
@@ -89,6 +91,10 @@ pub struct UpdatePullRequestScreen {
     /// review confirm prompt and the post-push success toast so the AI
     /// is never named with a hard-coded vendor.
     review_model_label: Option<String>,
+    /// Path of the AI Activity log file persisted to `~/.wisetree/logs/`
+    /// once the AI session finishes (success or failure). Surfaced in
+    /// the review/error UI so the user can re-open the transcript.
+    ai_log_path: Option<String>,
     /// Scroll offset from the bottom of the AI activity log. `0` means
     /// "follow the latest output". When the user wheels upward we increase
     /// this offset and preserve it as new lines arrive so the viewport stays
@@ -133,6 +139,7 @@ impl UpdatePullRequestScreen {
             review_diff: None,
             review_scroll: 0,
             review_model_label: None,
+            ai_log_path: None,
             ai_scroll: 0,
             post_review_message: None,
             phase_message: UPDATE_RUNNING_MESSAGE.to_string(),
@@ -178,6 +185,7 @@ impl UpdatePullRequestScreen {
         self.ai_log.clear();
         self.ai_scroll = 0;
         self.ai_active = false;
+        self.ai_log_path = None;
     }
 
     /// Flip on the AI Activity panel. Called by the App once the pipeline
@@ -260,6 +268,32 @@ impl UpdatePullRequestScreen {
             .collect()
     }
 
+    /// Path of the AI Activity log file written for the current run, if
+    /// `save_ai_log_to_disk` has already been called.
+    pub fn ai_log_path(&self) -> Option<&str> {
+        self.ai_log_path.as_deref()
+    }
+
+    /// Persist the streamed AI Activity transcript to
+    /// `~/.wisetree/logs/ai-activity-<branch>-<unix-ts>.log` and remember
+    /// the path so the UI can surface it in the review / failure footer.
+    /// No-op if the AI was never engaged for this run (empty log) or
+    /// the file system refuses to create the directory.
+    pub fn save_ai_log_to_disk(&mut self, status: &str) {
+        if self.ai_log_path.is_some() || self.ai_log.is_empty() {
+            return;
+        }
+        let path = write_ai_activity_log(
+            &self.ai_log,
+            &self.request,
+            self.review_model_label.as_deref(),
+            status,
+        );
+        if let Some(path) = path {
+            self.ai_log_path = Some(path.to_string_lossy().into_owned());
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn phase_message(&self) -> &str {
         &self.phase_message
@@ -284,6 +318,7 @@ impl UpdatePullRequestScreen {
         self.review_confirm = Some(build_review_confirm(&self.request, &model_label));
         self.review_model_label = Some(model_label);
         self.step = UpdateStep::AwaitingReview;
+        self.save_ai_log_to_disk("MergedAwaitingReview");
     }
 
     /// Model label remembered from the most recent `MergedAwaitingReview`
@@ -349,7 +384,40 @@ impl UpdatePullRequestScreen {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
-        if matches!(self.step, UpdateStep::Updating | UpdateStep::PostReview) {
+        if matches!(self.step, UpdateStep::PostReview) {
+            return UpdateAction::Continue;
+        }
+        // While the AI is actively working, arrow keys scroll the activity log.
+        if matches!(self.step, UpdateStep::Updating) {
+            if self.ai_active {
+                match key.code {
+                    KeyCode::Up => {
+                        self.ai_scroll = self.ai_scroll.saturating_add(1);
+                        return UpdateAction::Continue;
+                    }
+                    KeyCode::Down => {
+                        self.ai_scroll = self.ai_scroll.saturating_sub(1);
+                        return UpdateAction::Continue;
+                    }
+                    KeyCode::PageUp => {
+                        self.ai_scroll = self.ai_scroll.saturating_add(10);
+                        return UpdateAction::Continue;
+                    }
+                    KeyCode::PageDown => {
+                        self.ai_scroll = self.ai_scroll.saturating_sub(10);
+                        return UpdateAction::Continue;
+                    }
+                    KeyCode::Home => {
+                        self.ai_scroll = u16::MAX;
+                        return UpdateAction::Continue;
+                    }
+                    KeyCode::End => {
+                        self.ai_scroll = 0;
+                        return UpdateAction::Continue;
+                    }
+                    _ => {}
+                }
+            }
             return UpdateAction::Continue;
         }
         if self.error.is_some() {
@@ -611,6 +679,13 @@ impl UpdatePullRequestScreen {
                 .fg(colors::opencode::CYAN)
                 .add_modifier(Modifier::BOLD),
         )]);
+        let hint = Line::from(Span::styled(
+            " ↑/↓ · PgUp/PgDn · Home/End · wheel ",
+            Style::default()
+                .fg(colors::opencode::COMMENT)
+                .add_modifier(Modifier::DIM),
+        ))
+        .right_aligned();
         let panel_bg = Style::default().bg(colors::opencode::BG);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -621,7 +696,8 @@ impl UpdatePullRequestScreen {
                     .bg(colors::opencode::BG),
             )
             .style(panel_bg)
-            .title(title);
+            .title(title)
+            .title_bottom(hint);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -629,28 +705,51 @@ impl UpdatePullRequestScreen {
         if visible_rows == 0 {
             return;
         }
-        let lines: Vec<Line<'static>> = if self.ai_log.is_empty() {
-            vec![Line::from(Span::styled(
-                "Waiting for opencode to start working on the conflicts...",
-                Style::default()
-                    .fg(colors::opencode::COMMENT)
-                    .add_modifier(Modifier::ITALIC),
-            ))]
-        } else {
-            let mut expanded: Vec<Line<'static>> = self
-                .ai_log
-                .iter()
-                .flat_map(ai_activity_event_to_lines)
-                .collect();
-            let max_scroll = expanded.len().saturating_sub(visible_rows) as u16;
-            let scroll = self.ai_scroll.min(max_scroll) as usize;
-            let end = expanded.len().saturating_sub(scroll);
-            let start = end.saturating_sub(visible_rows);
-            expanded.drain(end..);
-            expanded.drain(0..start);
-            expanded
+        let (lines, total_lines, scroll_from_top): (Vec<Line<'static>>, usize, usize) =
+            if self.ai_log.is_empty() {
+                (
+                    vec![Line::from(Span::styled(
+                        "Waiting for opencode to start working on the conflicts...",
+                        Style::default()
+                            .fg(colors::opencode::COMMENT)
+                            .add_modifier(Modifier::ITALIC),
+                    ))],
+                    0,
+                    0,
+                )
+            } else {
+                let mut expanded = render_ai_activity_log(&self.ai_log);
+                let total = expanded.len();
+                let max_scroll = total.saturating_sub(visible_rows) as u16;
+                let scroll_up = self.ai_scroll.min(max_scroll) as usize;
+                let end = total.saturating_sub(scroll_up);
+                let start = end.saturating_sub(visible_rows);
+                let scroll_from_top = total.saturating_sub(visible_rows).saturating_sub(scroll_up);
+                expanded.drain(end..);
+                expanded.drain(0..start);
+                (expanded, total, scroll_from_top)
+            };
+
+        // Reserve the rightmost inner column for the scrollbar so text
+        // never sits underneath the thumb. The scrollbar is drawn into
+        // the outer `area` so it visually replaces the right border.
+        let text_area = Rect {
+            width: inner.width.saturating_sub(1),
+            ..inner
         };
-        frame.render_widget(Paragraph::new(lines).style(panel_bg), inner);
+        frame.render_widget(Paragraph::new(lines).style(panel_bg), text_area);
+
+        if total_lines > visible_rows {
+            let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_rows))
+                .position(scroll_from_top);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area,
+                &mut scrollbar_state,
+            );
+        }
     }
 
     fn render_review(&self, frame: &mut Frame, area: Rect) {
@@ -689,6 +788,7 @@ impl UpdatePullRequestScreen {
                 .add_modifier(Modifier::DIM),
         ));
 
+        let log_height: u16 = if self.ai_log_path.is_some() { 1 } else { 0 };
         let confirm_height: u16 = 8;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -697,6 +797,7 @@ impl UpdatePullRequestScreen {
                 Constraint::Length(1),              // blank
                 Constraint::Length(1),              // sha line
                 Constraint::Length(1),              // hint line
+                Constraint::Length(log_height),     // optional AI log path
                 Constraint::Length(1),              // blank
                 Constraint::Min(3),                 // scrollable diff panel
                 Constraint::Length(1),              // blank
@@ -707,9 +808,23 @@ impl UpdatePullRequestScreen {
         frame.render_widget(Paragraph::new(title), chunks[0]);
         frame.render_widget(Paragraph::new(sha_line), chunks[2]);
         frame.render_widget(Paragraph::new(hint_line), chunks[3]);
-        self.render_diff_panel(frame, chunks[5]);
+        if let Some(path) = self.ai_log_path.as_deref() {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "AI Activity log: ",
+                        Style::default()
+                            .fg(colors::MUTED)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                    Span::styled(path.to_string(), Style::default().fg(colors::MUTED)),
+                ])),
+                chunks[4],
+            );
+        }
+        self.render_diff_panel(frame, chunks[6]);
         if let Some(dialog) = self.review_confirm.as_ref() {
-            dialog.render(frame, chunks[7]);
+            dialog.render(frame, chunks[8]);
         }
     }
 
@@ -790,6 +905,65 @@ fn diff_line_to_styled(line: &str) -> Line<'static> {
         Style::default().fg(colors::WHITE)
     };
     Line::from(Span::styled(line.to_string(), style))
+}
+
+/// Persist the streamed AI Activity transcript to disk so the user can
+/// re-open the conversation after the panel scrolls away. Writes to
+/// `~/.wisetree/logs/ai-activity-<branch>-<ts>.log`. Returns the path
+/// on success; silently returns `None` if the directory or write fails.
+fn write_ai_activity_log(
+    events: &[AiActivityEvent],
+    request: &UpdatePullRequestRequest,
+    model_label: Option<&str>,
+    status: &str,
+) -> Option<std::path::PathBuf> {
+    use std::fmt::Write as _;
+
+    let logs_dir = crate::constants::logs_dir();
+    if std::fs::create_dir_all(&logs_dir).is_err() {
+        return None;
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let branch_slug: String = request
+        .branch
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let log_path = logs_dir.join(format!("ai-activity-{branch_slug}-{timestamp}.log"));
+
+    let mut content = String::new();
+    let _ = writeln!(content, "AI Activity Log");
+    let _ = writeln!(content, "===============");
+    let _ = writeln!(content, "PR #{}", request.number);
+    if !request.title.is_empty() {
+        let _ = writeln!(content, "Title:  {}", request.title);
+    }
+    let _ = writeln!(content, "Branch: {}", request.branch);
+    if let Some(base) = &request.base_ref {
+        let _ = writeln!(content, "Base:   {base}");
+    }
+    if let Some(model) = model_label {
+        let _ = writeln!(content, "Model:  {model}");
+    }
+    let _ = writeln!(content, "Status: {status}");
+    let _ = writeln!(content);
+
+    for event in events {
+        let text = event.plain_text();
+        for line in text.split('\n') {
+            let _ = writeln!(content, "{line}");
+        }
+    }
+
+    if std::fs::write(&log_path, content).is_ok() {
+        Some(log_path)
+    } else {
+        None
+    }
 }
 
 fn ai_activity_event_to_lines(event: &AiActivityEvent) -> Vec<Line<'static>> {
@@ -914,46 +1088,49 @@ fn ai_activity_event_to_lines(event: &AiActivityEvent) -> Vec<Line<'static>> {
             tool_calls,
             duration_ms,
             total_tokens,
-        } => vec![Line::from(vec![
-            Span::styled(
-                "[".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ),
-            Span::styled(
-                "done".to_string(),
-                Style::default()
-                    .fg(colors::opencode::GREEN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "] ".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ),
-            Span::styled(
-                tool_calls.to_string(),
-                Style::default().fg(colors::opencode::ORANGE),
-            ),
-            Span::styled(
-                " tools · ".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ),
-            Span::styled(
-                format!("{:.1}s", *duration_ms as f64 / 1000.0),
-                Style::default().fg(colors::opencode::ORANGE),
-            ),
-            Span::styled(
-                " · ".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ),
-            Span::styled(
-                total_tokens.to_string(),
-                Style::default().fg(colors::opencode::ORANGE),
-            ),
-            Span::styled(
-                " tokens".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ),
-        ])],
+        } => vec![
+            Line::from(vec![
+                Span::styled(
+                    "[".to_string(),
+                    Style::default().fg(colors::opencode::COMMENT),
+                ),
+                Span::styled(
+                    "done".to_string(),
+                    Style::default()
+                        .fg(colors::opencode::GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "] ".to_string(),
+                    Style::default().fg(colors::opencode::COMMENT),
+                ),
+                Span::styled(
+                    tool_calls.to_string(),
+                    Style::default().fg(colors::opencode::ORANGE),
+                ),
+                Span::styled(
+                    " tools · ".to_string(),
+                    Style::default().fg(colors::opencode::COMMENT),
+                ),
+                Span::styled(
+                    format!("{:.1}s", *duration_ms as f64 / 1000.0),
+                    Style::default().fg(colors::opencode::ORANGE),
+                ),
+                Span::styled(
+                    " · ".to_string(),
+                    Style::default().fg(colors::opencode::COMMENT),
+                ),
+                Span::styled(
+                    total_tokens.to_string(),
+                    Style::default().fg(colors::opencode::ORANGE),
+                ),
+                Span::styled(
+                    " tokens".to_string(),
+                    Style::default().fg(colors::opencode::COMMENT),
+                ),
+            ]),
+            Line::default(),
+        ],
         AiActivityEvent::Raw { text } => vec![Line::from(Span::styled(
             text.clone(),
             Style::default().fg(colors::opencode::FG),
@@ -988,6 +1165,75 @@ fn cap_event_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiActivityLayoutKind {
+    SessionMeta,
+    Reasoning,
+    Text,
+    Tool,
+    Summary,
+    Notice,
+    Raw,
+}
+
+fn render_ai_activity_log(events: &[AiActivityEvent]) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut previous_kind = None;
+
+    for event in events {
+        let kind = ai_activity_layout_kind(event);
+        let mut lines = ai_activity_event_to_lines(event);
+        if lines.is_empty() {
+            continue;
+        }
+
+        if should_insert_blank_line(previous_kind, kind)
+            && !out
+                .last()
+                .is_some_and(|line: &Line<'static>| line.spans.is_empty())
+        {
+            out.push(Line::default());
+        }
+
+        out.append(&mut lines);
+        previous_kind = Some(kind);
+    }
+
+    out
+}
+
+fn ai_activity_layout_kind(event: &AiActivityEvent) -> AiActivityLayoutKind {
+    match event {
+        AiActivityEvent::SessionStart { .. } => AiActivityLayoutKind::SessionMeta,
+        AiActivityEvent::AssistantText { .. } => AiActivityLayoutKind::Text,
+        AiActivityEvent::Thinking { .. } => AiActivityLayoutKind::Reasoning,
+        AiActivityEvent::ToolCall { .. } | AiActivityEvent::ToolResult { .. } => {
+            AiActivityLayoutKind::Tool
+        }
+        AiActivityEvent::Summary { .. } => AiActivityLayoutKind::Summary,
+        AiActivityEvent::Notice { .. } => AiActivityLayoutKind::Notice,
+        AiActivityEvent::Raw { .. } => AiActivityLayoutKind::Raw,
+    }
+}
+
+fn should_insert_blank_line(
+    previous: Option<AiActivityLayoutKind>,
+    current: AiActivityLayoutKind,
+) -> bool {
+    match previous {
+        None | Some(AiActivityLayoutKind::SessionMeta) => false,
+        Some(AiActivityLayoutKind::Tool)
+            if matches!(
+                current,
+                AiActivityLayoutKind::Tool | AiActivityLayoutKind::Summary
+            ) =>
+        {
+            false
+        }
+        _ => true,
+    }
 }
 
 /// Render an assistant text payload as one or more `Line`s.
@@ -1185,7 +1431,7 @@ fn render_thinking_text(content: &str) -> Vec<Line<'static>> {
         .fg(colors::opencode::COMMENT)
         .add_modifier(Modifier::ITALIC);
     let label = Span::styled(
-        "Thinking".to_string(),
+        "Thinking 🧠".to_string(),
         Style::default()
             .fg(colors::opencode::CYAN)
             .add_modifier(Modifier::BOLD | Modifier::ITALIC),
@@ -1891,6 +2137,55 @@ mod tests {
             lines.len(),
             2,
             "thinking should produce one line per newline"
+        );
+        assert!(
+            lines[0].spans[0].content.contains("🧠"),
+            "thinking label should include the requested brain emoji: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn ai_activity_log_inserts_opencode_like_blank_lines_between_groups() {
+        let lines = render_ai_activity_log(&[
+            AiActivityEvent::SessionStart {
+                model: "opencode/minimax-m2.5-free".to_string(),
+            },
+            AiActivityEvent::Thinking {
+                content: "Investigating the repository.".to_string(),
+            },
+            AiActivityEvent::AssistantText {
+                content: "I will inspect the README.".to_string(),
+            },
+            AiActivityEvent::ToolCall {
+                tool_name: "read".to_string(),
+                summary: "README.md".to_string(),
+            },
+            AiActivityEvent::ToolResult {
+                tool_name: Some("read".to_string()),
+                status: AiToolResultStatus::Success,
+                detail: "ok".to_string(),
+            },
+            AiActivityEvent::Summary {
+                tool_calls: 1,
+                duration_ms: 9500,
+                total_tokens: 42,
+            },
+            AiActivityEvent::Thinking {
+                content: "Now I can summarize it.".to_string(),
+            },
+        ]);
+
+        assert!(
+            lines[2].spans.is_empty(),
+            "expected blank after reasoning: {lines:?}"
+        );
+        assert!(
+            lines[4].spans.is_empty(),
+            "expected blank before tool group: {lines:?}"
+        );
+        assert!(
+            lines[8].spans.is_empty(),
+            "expected blank after [done] summary: {lines:?}"
         );
     }
 

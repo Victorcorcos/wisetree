@@ -17,6 +17,9 @@ pub const APP_STATE_FILE_NAME: &str = "state.json";
 /// Subdirectory under `~/.wisetree/` that stores per-repository shared caches.
 pub const CACHE_DIR_NAME: &str = "cache";
 
+/// Subdirectory under `~/.wisetree/` that stores AI Activity / worktree logs.
+pub const LOGS_DIR_NAME: &str = "logs";
+
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 
@@ -62,6 +65,11 @@ pub fn app_state_file() -> PathBuf {
 /// Path to the cache root (`~/.wisetree/cache/`).
 pub fn global_cache_dir() -> PathBuf {
     global_config_dir().join(CACHE_DIR_NAME)
+}
+
+/// Path to the logs directory (`~/.wisetree/logs/`).
+pub fn logs_dir() -> PathBuf {
+    global_config_dir().join(LOGS_DIR_NAME)
 }
 
 /// Path to the dashboard PR cache (`~/.wisetree/dashboard_pr_cache.json`).

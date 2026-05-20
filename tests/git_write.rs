@@ -1,24 +1,18 @@
 use std::path::Path;
-use std::process::Command;
 
 use tempfile::TempDir;
 use wisetree::errors::GitErrorCode;
 use wisetree::git::types::{WorktreeCreateOptions, WorktreeDeleteOptions};
 use wisetree::git::GitService;
 
-fn git(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .status()
-        .expect("git invocation");
-    assert!(status.success(), "git {args:?} failed in {cwd:?}");
-}
+mod support;
+
+use support::{git, init_repo_with_main};
 
 fn init_repo() -> TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path();
-    git(path, &["init", "-q", "-b", "main"]);
+    init_repo_with_main(path);
     git(path, &["config", "user.email", "test@example.com"]);
     git(path, &["config", "user.name", "Test"]);
     git(path, &["commit", "-q", "--allow-empty", "-m", "init"]);

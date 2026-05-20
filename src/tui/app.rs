@@ -1736,6 +1736,15 @@ impl App {
                 );
             }
         }
+        // Best-effort persistence of the AI Activity transcript before we
+        // tear the screen down — when the AI was engaged but the run
+        // ended without a review prompt (failed merge, AiUnavailable,
+        // discard, push failure), this is the user's only chance to keep
+        // the transcript. `save_ai_log_to_disk` is a no-op if the log
+        // was already written or never populated.
+        if let Some(screen) = self.update_pr.as_mut() {
+            screen.save_ai_log_to_disk("Terminal");
+        }
         self.update_pr = None;
         self.enter_screen(Screen::Dashboard, tx);
     }
