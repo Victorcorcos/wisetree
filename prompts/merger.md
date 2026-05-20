@@ -17,7 +17,7 @@ Understand *why* both sides differ using read-only commands:
 - Prefer structured file tools for code edits when available.
 - Use shell commands for git inspection, targeted tests, and repo-wide search.
 - The outer pipeline handles the final bulk stage + commit after you finish, but you may still stage individual files explicitly when your local checks need it.
-- Never create, package, or modify any Gemini skill/skill manifest artifacts.
+- Stay focused on the merge: never invent unrelated cleanup tasks (technical debt, bug, feature, etc).
 
 ## Resolution rules
 

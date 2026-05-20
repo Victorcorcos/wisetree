@@ -1,6 +1,4 @@
 use std::fs;
-use std::path::Path;
-use std::process::Command;
 
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -11,14 +9,9 @@ use wisetree::worktree::WorktreeService;
 
 static HOME_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-fn git(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .status()
-        .expect("git invocation");
-    assert!(status.success(), "git {args:?} failed in {cwd:?}");
-}
+mod support;
+
+use support::{git, init_repo_with_main};
 
 /// Build a fresh git repo inside a temporary directory whose layout matches
 /// the upstream fixture: a parent dir with `repo/` inside, so worktree
@@ -33,7 +26,7 @@ fn build_fixture() -> Fixture {
     let parent = tempfile::tempdir().expect("parent tempdir");
     let repo = parent.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
+    init_repo_with_main(&repo);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test"]);
     fs::write(repo.join("README.md"), "# repo").unwrap();
