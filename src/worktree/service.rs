@@ -7,9 +7,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::service::ConfigService;
 use crate::errors::{GitErrorCode, Result, WisetreeError};
-use crate::files::service::{
-    copy_files, execute_post_create_commands, open_terminal, CommandRun, CopyReport,
-    ProgressCallback, TerminalLaunch,
+use crate::files::service::ProgressCallback;
+use crate::files::{
+    clear_cache, copy_files, execute_post_create_commands, link_patterns, list_cache,
+    open_terminal, prune_cache, remove_cache_entry, resolve_cache_dir,
+    touch_worktree_entry_last_seen, unlink_patterns, unregister_worktree_user, CacheOverview,
+    CachePruneReport, CommandRun, CopyReport, LinkReport, TerminalLaunch,
 };
 use crate::git::exec::execute_git_command;
 use crate::git::service::GitService;
@@ -24,6 +27,7 @@ use crate::utils::path::{
 pub struct CreateOutcome {
     pub worktree_path: PathBuf,
     pub copy_report: Option<CopyReport>,
+    pub link_report: Option<LinkReport>,
     pub command_runs: Vec<CommandRun>,
     pub terminal_launch: Option<TerminalLaunch>,
 }
@@ -146,6 +150,16 @@ impl WorktreeService {
             outcome.copy_report = Some(report);
         }
 
+        if !config.worktree_link_patterns.is_empty() {
+            let cache_dir = self.cache_dir_for(
+                Some(&options.new_branch),
+                Some(&options.source_branch),
+                Some(&worktree_path),
+            )?;
+            let report = link_patterns(&git_root, &worktree_path, &cache_dir, &config).await;
+            outcome.link_report = Some(report);
+        }
+
         if !config.post_create_cmd.is_empty() {
             let variables = TemplateVariables {
                 base_path: repository_base_name(&git_root),
@@ -197,6 +211,26 @@ impl WorktreeService {
             force,
         };
 
+        let cache_dir = if config.worktree_link_patterns.is_empty() {
+            None
+        } else {
+            Some(self.cache_dir_for(None, None, Some(Path::new(worktree_path)))?)
+        };
+
+        if !config.worktree_link_patterns.is_empty() {
+            if let Some(cache_dir) = cache_dir.as_deref() {
+                if let Err(err) =
+                    touch_worktree_entry_last_seen(cache_dir, Path::new(worktree_path), &config)
+                        .await
+                {
+                    eprintln!(
+                        "Failed to update cache last-seen metadata for '{worktree_path}': {err}"
+                    );
+                }
+            }
+            unlink_patterns(Path::new(worktree_path), &config).await?;
+        }
+
         match self.git_service.delete_worktree(&delete_options).await {
             Ok(()) => {}
             Err(err) => {
@@ -205,6 +239,12 @@ impl WorktreeService {
                 } else {
                     return Err(err);
                 }
+            }
+        }
+
+        if let Some(cache_dir) = cache_dir.as_deref() {
+            if let Err(err) = unregister_worktree_user(cache_dir, Path::new(worktree_path)).await {
+                eprintln!("Failed to update cache user metadata for '{worktree_path}': {err}");
             }
         }
 
@@ -264,5 +304,46 @@ impl WorktreeService {
     /// `terminalCommand` without exposing internals.
     pub fn render_template(&self, template: &str, vars: &TemplateVariables) -> String {
         resolve_template(template, vars)
+    }
+
+    pub fn cache_dir(&self) -> Result<PathBuf> {
+        self.cache_dir_for(None, None, None)
+    }
+
+    pub async fn cache_overview(&self) -> Result<CacheOverview> {
+        let cache_dir = self.cache_dir()?;
+        list_cache(&cache_dir).await
+    }
+
+    pub async fn prune_repo_cache(&self) -> Result<CachePruneReport> {
+        let cache_dir = self.cache_dir()?;
+        prune_cache(&cache_dir).await
+    }
+
+    pub async fn clear_repo_cache(&self) -> Result<()> {
+        let cache_dir = self.cache_dir()?;
+        clear_cache(&cache_dir).await
+    }
+
+    pub async fn remove_repo_cache_entry(&self, relative_path: &str) -> Result<()> {
+        let cache_dir = self.cache_dir()?;
+        remove_cache_entry(&cache_dir, relative_path).await
+    }
+
+    fn cache_dir_for(
+        &self,
+        branch_name: Option<&str>,
+        source_branch: Option<&str>,
+        worktree_path: Option<&Path>,
+    ) -> Result<PathBuf> {
+        let git_root = self.effective_git_root();
+        let worktree_path = worktree_path.unwrap_or(git_root.as_path());
+        let variables = TemplateVariables {
+            base_path: repository_base_name(&git_root),
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            branch_name: branch_name.unwrap_or("").to_string(),
+            source_branch: source_branch.unwrap_or("").to_string(),
+        };
+        resolve_cache_dir(&git_root, self.config_service.config(), &variables)
     }
 }

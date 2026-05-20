@@ -9,6 +9,7 @@ pub enum Screen {
     Create,
     Dashboard,
     Delete,
+    Cache,
     MergePullRequest,
     UpdatePullRequest,
     UpdateBranch,
@@ -23,6 +24,7 @@ impl Screen {
             AppMode::Menu => Self::Menu,
             AppMode::Create => Self::Create,
             AppMode::Dashboard => Self::Dashboard,
+            AppMode::Cache => Self::Cache,
             AppMode::Settings => Self::Settings,
         }
     }
@@ -33,6 +35,7 @@ impl Screen {
             Self::Create => "create",
             Self::Dashboard => "dashboard",
             Self::Delete => "delete",
+            Self::Cache => "cache",
             Self::MergePullRequest => "merge_pull_request",
             Self::UpdatePullRequest => "update_pull_request",
             Self::UpdateBranch => "update_branch",

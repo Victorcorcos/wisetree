@@ -14,6 +14,7 @@ fn screen_from_mode_maps_every_variant() {
     assert_eq!(Screen::from_mode(AppMode::Menu), Screen::Menu);
     assert_eq!(Screen::from_mode(AppMode::Create), Screen::Create);
     assert_eq!(Screen::from_mode(AppMode::Dashboard), Screen::Dashboard);
+    assert_eq!(Screen::from_mode(AppMode::Cache), Screen::Cache);
     assert_eq!(Screen::from_mode(AppMode::Settings), Screen::Settings);
 }
 
@@ -23,6 +24,7 @@ fn screen_as_str_round_trip_for_known_modes() {
         Screen::Menu,
         Screen::Create,
         Screen::Dashboard,
+        Screen::Cache,
         Screen::Settings,
     ] {
         let parsed = AppMode::parse(s.as_str()).expect("valid mode");
@@ -108,7 +110,7 @@ fn menu_placeholder_renders_welcome_and_prompt() {
     let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|f| MenuScreen::new(0, None, None, true).render(f, f.area()))
+        .draw(|f| MenuScreen::new(0, None, None, true, true).render(f, f.area()))
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
     let dump = buffer

@@ -13,8 +13,34 @@ use walkdir::{DirEntry, WalkDir};
 use crate::files::match_files;
 use crate::services::presets::catalog::{catalog, find_by_id, PresetId};
 
+/// Directory basenames that should never be treated as candidate app roots
+/// during recursive Wise discovery. These are generated dependency caches,
+/// tool state folders, build outputs, or editor metadata that can contain
+/// files like `package.json` and accidentally look like real projects.
 const DISCOVERY_SKIP_DIRS: &[&str] = &[
     ".git",
+    ".vite",
+    ".turbo",
+    ".cache",
+    ".astro",
+    ".angular",
+    ".output",
+    ".nitro",
+    ".data",
+    ".wrangler",
+    ".vercel",
+    ".netlify",
+    ".parcel-cache",
+    ".pnpm-store",
+    ".yarn",
+    ".nx",
+    ".vs",
+    ".pub-cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".elixir_ls",
+    ".swiftpm",
     "node_modules",
     "vendor",
     "coverage",
@@ -30,6 +56,9 @@ const DISCOVERY_SKIP_DIRS: &[&str] = &[
     ".gradle",
     "Pods",
     "DerivedData",
+    "Carthage",
+    "deps",
+    "_build",
     "__pycache__",
     ".venv",
     "venv",
@@ -40,6 +69,7 @@ pub struct WisePresetDiscovery {
     pub matched_ids: Vec<PresetId>,
     pub copy_patterns: Vec<String>,
     pub copy_ignores: Vec<String>,
+    pub link_patterns: Vec<String>,
     pub post_create_cmd: Vec<String>,
 }
 
@@ -268,6 +298,8 @@ pub fn discover_wise(root: &Path) -> Option<WisePresetDiscovery> {
     let mut copy_patterns_seen = HashSet::new();
     let mut copy_ignores = Vec::new();
     let mut copy_ignores_seen = HashSet::new();
+    let mut link_patterns = Vec::new();
+    let mut link_patterns_seen = HashSet::new();
     let mut post_create_cmd = Vec::new();
     let mut post_create_cmd_seen = HashSet::new();
 
@@ -287,6 +319,14 @@ pub fn discover_wise(root: &Path) -> Option<WisePresetDiscovery> {
                 .map(|pattern| scope_pattern(&discovered.relative_root, pattern)),
         );
         extend_unique(
+            &mut link_patterns,
+            &mut link_patterns_seen,
+            preset
+                .link_patterns
+                .iter()
+                .map(|pattern| scope_pattern(&discovered.relative_root, pattern)),
+        );
+        extend_unique(
             &mut post_create_cmd,
             &mut post_create_cmd_seen,
             preset
@@ -300,6 +340,7 @@ pub fn discover_wise(root: &Path) -> Option<WisePresetDiscovery> {
         matched_ids,
         copy_patterns,
         copy_ignores,
+        link_patterns,
         post_create_cmd,
     })
 }
