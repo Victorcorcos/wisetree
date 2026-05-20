@@ -279,17 +279,7 @@ impl App {
         kick_off_initialize(tx.clone());
 
         let mut events = EventLoop::new(Duration::from_millis(50));
-        // In `--from-wrapper` mode the shell drives us through command
-        // substitution (`dir=$(... wisetree --from-wrapper)`). On macOS that
-        // launch path can surface an early SIGHUP before the first frame, which
-        // makes the wrapper exit immediately after enabling mouse capture.
-        // Wrapper mode already has two independent shutdown paths for real tab
-        // closes: the dead-tty event guard and the orphan watchdog.
-        let signal_quit = if self.is_from_wrapper {
-            Arc::new(AtomicBool::new(false))
-        } else {
-            install_termination_listener()
-        };
+        let signal_quit = install_termination_listener();
         let orphan_quit = install_orphan_watchdog();
 
         while !self.quit_requested
@@ -2515,25 +2505,30 @@ struct InitOutcome {
     result: Result<WorktreeService, String>,
 }
 
-/// Route asynchronous termination signals (SIGHUP/SIGTERM/SIGINT/SIGQUIT)
-/// through the normal shutdown path so `restore()` runs and the tty doesn't
-/// get stranded in raw mode. Without this, closing the tab with Cmd+W kills
-/// the process before cleanup, leaving the parent shell's `dir=$(...)`
-/// capture stuck on a tty with ICANON/ECHO disabled.
+/// Route asynchronous termination signals through the shutdown path.
 ///
-/// SIGINT is included for parity even though the keyboard Ctrl+C path is
-/// handled separately in raw mode — anything that delivers SIGINT externally
-/// (e.g. `kill -INT`) should still tear down cleanly. SIGQUIT covers Ctrl+\.
+/// SIGHUP gets a *raw* sigaction handler that calls `_exit(0)` directly,
+/// bypassing every layer of Rust/tokio cleanup. This is intentional: SIGHUP
+/// arrives exactly when the terminal is being torn down (user closed the
+/// tab), so the controlling tty is already dead. Routing SIGHUP through
+/// tokio's cooperative signal stream means the flag is only consulted on
+/// the next iteration of the main loop — and if the main loop is wedged in
+/// a `write()` to the dead pty slave, that iteration never happens, leaving
+/// `wisetree` pegged as an orphan reparented to launchd.
+///
+/// SIGTERM/SIGINT/SIGQUIT still go through the tokio-driven cooperative
+/// shutdown so external `kill -TERM` / `kill -INT` calls trigger normal
+/// terminal restoration. Those signals arrive while the tty is still alive,
+/// so cleanup has a chance to succeed.
 fn install_termination_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
+        install_raw_sighup_exit();
+
         let flag = flag.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
-            let Ok(mut hup) = signal(SignalKind::hangup()) else {
-                return;
-            };
             let Ok(mut term) = signal(SignalKind::terminate()) else {
                 return;
             };
@@ -2544,7 +2539,6 @@ fn install_termination_listener() -> Arc<AtomicBool> {
                 return;
             };
             tokio::select! {
-                _ = hup.recv() => {}
                 _ = term.recv() => {}
                 _ = int.recv() => {}
                 _ = quit.recv() => {}
@@ -2553,6 +2547,28 @@ fn install_termination_listener() -> Arc<AtomicBool> {
         });
     }
     flag
+}
+
+/// Install a raw `sigaction` handler for SIGHUP that immediately calls
+/// `_exit(0)`. Idempotent: safe to call multiple times.
+///
+/// We use a real signal handler (not tokio's cooperative stream) because the
+/// failure mode we're guarding against is "main thread is wedged inside a
+/// syscall that never returns" — exactly the state where flag-based
+/// shutdown can't run. `_exit` is async-signal-safe and terminates the
+/// process synchronously inside the handler.
+#[cfg(unix)]
+fn install_raw_sighup_exit() {
+    extern "C" fn sighup_exit(_sig: libc::c_int) {
+        unsafe { libc::_exit(0) }
+    }
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = sighup_exit as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
+    }
 }
 
 /// Orphan / dead-terminal watchdog. Defends against the scenario that left
