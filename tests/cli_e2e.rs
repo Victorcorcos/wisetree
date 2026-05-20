@@ -2,22 +2,14 @@
 //! non-interactive subcommands. Exercises the full process boundary so the
 //! wire format (stdout JSON, stderr error wording, exit codes) stays stable.
 
-use std::path::Path;
-use std::process::Command as StdCommand;
-
 use assert_cmd::Command;
 use predicates::str::contains;
 use tempfile::TempDir;
 use wisetree::config::{LinkStrategy, WorktreeConfig};
 
-fn git(cwd: &Path, args: &[&str]) {
-    let status = StdCommand::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .status()
-        .expect("git invocation");
-    assert!(status.success(), "git {args:?} failed in {cwd:?}");
-}
+mod support;
+
+use support::{git, init_repo_with_main};
 
 struct Fixture {
     _parent: TempDir,
@@ -28,7 +20,7 @@ fn repo_with_commit() -> Fixture {
     let parent = tempfile::tempdir().expect("parent tempdir");
     let repo = parent.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
+    init_repo_with_main(&repo);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test"]);
     std::fs::write(repo.join("README.md"), "# repo").unwrap();

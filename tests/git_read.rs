@@ -1,24 +1,14 @@
-use std::path::Path;
-use std::process::Command;
-
 use tempfile::TempDir;
 use wisetree::git::{exec, GitService};
 
-/// Run `git <args>` synchronously in `cwd`. Used by the test fixture; the
-/// runtime path uses tokio.
-fn git(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .status()
-        .expect("git invocation");
-    assert!(status.success(), "git {args:?} failed in {cwd:?}");
-}
+mod support;
+
+use support::{git, init_repo_with_main};
 
 fn init_repo() -> TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path();
-    git(path, &["init", "-q", "-b", "main"]);
+    init_repo_with_main(path);
     git(path, &["config", "user.email", "test@example.com"]);
     git(path, &["config", "user.name", "Test"]);
     git(path, &["commit", "-q", "--allow-empty", "-m", "init"]);

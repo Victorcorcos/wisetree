@@ -2806,22 +2806,24 @@ impl SettingsScreen {
             Style::default().fg(colors::WHITE)
         };
         let border_style = Style::default().fg(border_color);
-        let mut inner_line = Line::from(Span::styled(editor.value.clone(), content_style));
-        if show_selection_marker {
-            inner_line.spans.insert(
-                0,
+        let inner_line = Line::from(Span::styled(editor.value.clone(), content_style));
+        let title_line = if show_selection_marker {
+            Line::from(vec![
                 Span::styled(
                     POST_CMD_SELECTION_MARKER,
                     Style::default().fg(colors::ACCENT),
                 ),
-            );
-        }
+                Span::styled("worktreeLinkStrategy ", info_style),
+            ])
+        } else {
+            Line::from(Span::styled(" worktreeLinkStrategy ", info_style))
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
             .padding(Padding::horizontal(1))
-            .title(Span::styled(" worktreeLinkStrategy ", info_style));
+            .title(title_line);
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
 
         let hint_line = Line::from(vec![
@@ -2943,7 +2945,7 @@ impl SettingsScreen {
             Style::default().fg(colors::WHITE)
         };
         let border_style = Style::default().fg(border_color);
-        let mut inner_line = if is_editing {
+        let inner_line = if is_editing {
             self.link_cache_dir_input
                 .as_ref()
                 .map(|prompt| prompt.inline_line())
@@ -2956,21 +2958,23 @@ impl SettingsScreen {
         } else {
             Line::from(Span::styled(editor.value.clone(), content_style))
         };
-        if show_selection_marker {
-            inner_line.spans.insert(
-                0,
+        let title_line = if show_selection_marker {
+            Line::from(vec![
                 Span::styled(
                     POST_CMD_SELECTION_MARKER,
                     Style::default().fg(colors::ACCENT),
                 ),
-            );
-        }
+                Span::styled("worktreeLinkCacheDir ", info_style),
+            ])
+        } else {
+            Line::from(Span::styled(" worktreeLinkCacheDir ", info_style))
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
             .padding(Padding::horizontal(1))
-            .title(Span::styled(" worktreeLinkCacheDir ", info_style));
+            .title(title_line);
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
 
         let hint_line = Line::from(vec![
@@ -3260,22 +3264,24 @@ impl SettingsScreen {
         } else {
             Line::from(Span::raw(value.clone()))
         };
-        if show_selection_marker {
-            inner_line.spans.insert(
-                0,
+        inner_line.style = content_style;
+        let title_line = if show_selection_marker {
+            Line::from(vec![
                 Span::styled(
                     POST_CMD_SELECTION_MARKER,
                     Style::default().fg(colors::ACCENT),
                 ),
-            );
-        }
-        inner_line.style = content_style;
+                Span::styled(format!("{} ", field.label()), info_style),
+            ])
+        } else {
+            Line::from(Span::styled(format!(" {} ", field.label()), info_style))
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
             .padding(Padding::horizontal(1))
-            .title(Span::styled(format!(" {} ", field.label()), info_style));
+            .title(title_line);
         frame.render_widget(Paragraph::new(inner_line).block(block), rect_area);
 
         let hint_line = Line::from(vec![
@@ -3398,22 +3404,24 @@ impl SettingsScreen {
         } else {
             Line::from(Span::raw(editor.template.clone()))
         };
-        if show_selection_marker {
-            inner_line.spans.insert(
-                0,
+        inner_line.style = content_style;
+        let title_line = if show_selection_marker {
+            Line::from(vec![
                 Span::styled(
                     POST_CMD_SELECTION_MARKER,
                     Style::default().fg(colors::ACCENT),
                 ),
-            );
-        }
-        inner_line.style = content_style;
+                Span::styled("worktreePathTemplate ", info_style),
+            ])
+        } else {
+            Line::from(Span::styled(" worktreePathTemplate ", info_style))
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
             .padding(Padding::horizontal(1))
-            .title(Span::styled(" worktreePathTemplate ", info_style));
+            .title(title_line);
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
 
         let hint_line = Line::from(vec![
@@ -3676,22 +3684,24 @@ impl SettingsScreen {
             } else {
                 Line::from(Span::raw(cmd.clone()))
             };
-            if show_selection_marker {
-                inner_line.spans.insert(
-                    0,
+            inner_line.style = content_style;
+            let title_line = if show_selection_marker {
+                Line::from(vec![
                     Span::styled(
                         POST_CMD_SELECTION_MARKER,
                         Style::default().fg(colors::ACCENT),
                     ),
-                );
-            }
-            inner_line.style = content_style;
+                    Span::styled(format!("postCreateCmd[{}] ", i), info_style),
+                ])
+            } else {
+                Line::from(Span::styled(format!(" postCreateCmd[{}] ", i), info_style))
+            };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
                 .border_style(border_style)
                 .padding(Padding::horizontal(1))
-                .title(Span::styled(format!(" postCreateCmd[{}] ", i), info_style));
+                .title(title_line);
             frame.render_widget(Paragraph::new(inner_line).block(block), chunk);
 
             let hint_line = Line::from(vec![
@@ -3902,22 +3912,24 @@ impl SettingsScreen {
         } else {
             Line::from(Span::raw(editor.command.clone()))
         };
-        if show_selection_marker {
-            inner_line.spans.insert(
-                0,
+        inner_line.style = content_style;
+        let title_line = if show_selection_marker {
+            Line::from(vec![
                 Span::styled(
                     POST_CMD_SELECTION_MARKER,
                     Style::default().fg(colors::ACCENT),
                 ),
-            );
-        }
-        inner_line.style = content_style;
+                Span::styled("terminalCommand ", info_style),
+            ])
+        } else {
+            Line::from(Span::styled(" terminalCommand ", info_style))
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(border_style)
             .padding(Padding::horizontal(1))
-            .title(Span::styled(" terminalCommand ", info_style));
+            .title(title_line);
         frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
 
         let hint_line = Line::from(vec![
@@ -4229,7 +4241,7 @@ fn render_pattern_list_block(
     let border_style = Style::default().fg(border_color);
 
     let visible_range = editor.visible_range(area.height);
-    let mut body: Vec<Line<'static>> = if editor.lines.is_empty() && !is_editing {
+    let body: Vec<Line<'static>> = if editor.lines.is_empty() && !is_editing {
         vec![Line::from(Span::styled(
             "(none — Enter to edit)",
             Style::default()
@@ -4264,24 +4276,24 @@ fn render_pattern_list_block(
             .collect()
     };
 
-    if show_selection_marker {
-        if let Some(first) = body.first_mut() {
-            first.spans.insert(
-                0,
-                Span::styled(
-                    POST_CMD_SELECTION_MARKER,
-                    Style::default().fg(colors::ACCENT),
-                ),
-            );
-        }
-    }
+    let title_line = if show_selection_marker {
+        Line::from(vec![
+            Span::styled(
+                POST_CMD_SELECTION_MARKER,
+                Style::default().fg(colors::ACCENT),
+            ),
+            Span::styled(format!("{field_name} "), info_style),
+        ])
+    } else {
+        Line::from(Span::styled(format!(" {field_name} "), info_style))
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(border_style)
         .padding(Padding::horizontal(1))
-        .title(Span::styled(format!(" {field_name} "), info_style));
+        .title(title_line);
     frame.render_widget(
         Paragraph::new(body).scroll((editor.scroll, 0)).block(block),
         area,

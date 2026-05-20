@@ -1,0 +1,6 @@
+# rust-objcopy (LLVM's objcopy) misinterprets '%' in paths as a format
+# specifier, causing strip to fail when the worktree path contains '%CPU'.
+# Disable Cargo's post-link strip here; distribution builds run from CI
+# with clean paths and are unaffected.
+[profile.release]
+strip = false
