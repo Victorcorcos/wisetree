@@ -3391,13 +3391,14 @@ mod tests {
     }
 
     #[test]
-    fn build_merge_prompt_forbids_pipeline_git_ops_and_unrelated_cleanup() {
+    fn build_merge_prompt_forbids_unrelated_work_and_pipeline_git_ops() {
         let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()]);
-        // The prompt must tell the AI to stay out of pipeline-managed git
-        // ops and to stick to the conflicts at hand — both are concrete
-        // failure modes we've already observed in production.
+        // The prompt must tell the AI to stay out of pipeline-managed git ops
+        // and not to drift into unrelated cleanup — both are concrete failure
+        // modes we've already observed in production.
         assert!(prompt.contains("git commit"));
         assert!(prompt.contains("git push"));
+        assert!(prompt.to_lowercase().contains("stay focused on the merge"));
         assert!(
             prompt.to_lowercase().contains("never invent unrelated"),
             "merge prompt should keep the AI focused on conflicts"
