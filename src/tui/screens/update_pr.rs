@@ -21,7 +21,7 @@
 //! state machine.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -967,93 +967,31 @@ fn write_ai_activity_log(
 }
 
 fn ai_activity_event_to_lines(event: &AiActivityEvent) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(colors::opencode::COMMENT);
     let lines = match event {
         AiActivityEvent::SessionStart { model } => vec![Line::from(vec![
-            Span::styled(
-                "@ ".to_string(),
-                Style::default()
-                    .fg(colors::opencode::CYAN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "session ".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ),
-            Span::styled(
-                model.clone(),
-                Style::default()
-                    .fg(colors::opencode::GREEN)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("@ ".to_string(), muted),
+            Span::styled("session ".to_string(), muted),
+            Span::styled(model.clone(), Style::default().fg(colors::opencode::FG)),
         ])],
         AiActivityEvent::AssistantText { content } => render_assistant_text(content),
         AiActivityEvent::Thinking { content } => render_thinking_text(content),
         AiActivityEvent::ToolCall { tool_name, summary } => {
-            let icon = tool_icon(tool_name);
-            let mut spans = vec![
-                Span::styled(
-                    "* ".to_string(),
-                    Style::default()
-                        .fg(colors::opencode::CYAN)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{icon} "),
-                    Style::default().fg(colors::opencode::CYAN),
-                ),
-                Span::styled(
-                    tool_name.clone(),
-                    Style::default()
-                        .fg(colors::opencode::GREEN)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "(".to_string(),
-                    Style::default().fg(colors::opencode::COMMENT),
-                ),
-            ];
-            push_highlighted_fragment(&mut spans, summary);
-            spans.push(Span::styled(
-                ")".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ));
-            vec![Line::from(spans)]
+            vec![render_tool_line(tool_name, summary, muted, None)]
         }
         AiActivityEvent::ToolResult {
             tool_name,
             status,
             detail,
         } => {
-            let (label, accent_color) = match status {
-                AiToolResultStatus::Success => ("✓", colors::opencode::GREEN),
-                AiToolResultStatus::Error => ("✗", colors::opencode::PINK),
+            let name = tool_name.as_deref().unwrap_or("tool");
+            let (icon_override, line_style) = match status {
+                AiToolResultStatus::Success => (None, muted),
+                AiToolResultStatus::Error => {
+                    (Some("✗"), Style::default().fg(colors::opencode::PINK))
+                }
             };
-            let mut spans = vec![
-                Span::styled(
-                    "  ".to_string(),
-                    Style::default().fg(colors::opencode::COMMENT),
-                ),
-                Span::styled(
-                    format!("{label} "),
-                    Style::default()
-                        .fg(accent_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ];
-            if let Some(tool_name) = tool_name {
-                spans.push(Span::styled(
-                    tool_name.clone(),
-                    Style::default()
-                        .fg(colors::opencode::CYAN)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                spans.push(Span::styled(
-                    " ".to_string(),
-                    Style::default().fg(colors::opencode::COMMENT),
-                ));
-            }
-            push_highlighted_fragment(&mut spans, detail);
-            vec![Line::from(spans)]
+            vec![render_tool_line(name, detail, line_style, icon_override)]
         }
         AiActivityEvent::Notice { severity, message } => vec![Line::from(vec![
             Span::styled(
@@ -1071,10 +1009,7 @@ fn ai_activity_event_to_lines(event: &AiActivityEvent) -> Vec<Line<'static>> {
                     })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                ": ".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ),
+            Span::styled(": ".to_string(), muted),
             Span::styled(
                 message.clone(),
                 Style::default().fg(match severity {
@@ -1085,49 +1020,16 @@ fn ai_activity_event_to_lines(event: &AiActivityEvent) -> Vec<Line<'static>> {
             ),
         ])],
         AiActivityEvent::Summary {
-            tool_calls,
+            tool_calls: _,
             duration_ms,
             total_tokens,
         } => vec![
             Line::from(vec![
-                Span::styled(
-                    "[".to_string(),
-                    Style::default().fg(colors::opencode::COMMENT),
-                ),
-                Span::styled(
-                    "done".to_string(),
-                    Style::default()
-                        .fg(colors::opencode::GREEN)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "] ".to_string(),
-                    Style::default().fg(colors::opencode::COMMENT),
-                ),
-                Span::styled(
-                    tool_calls.to_string(),
-                    Style::default().fg(colors::opencode::ORANGE),
-                ),
-                Span::styled(
-                    " tools · ".to_string(),
-                    Style::default().fg(colors::opencode::COMMENT),
-                ),
-                Span::styled(
-                    format!("{:.1}s", *duration_ms as f64 / 1000.0),
-                    Style::default().fg(colors::opencode::ORANGE),
-                ),
-                Span::styled(
-                    " · ".to_string(),
-                    Style::default().fg(colors::opencode::COMMENT),
-                ),
-                Span::styled(
-                    total_tokens.to_string(),
-                    Style::default().fg(colors::opencode::ORANGE),
-                ),
-                Span::styled(
-                    " tokens".to_string(),
-                    Style::default().fg(colors::opencode::COMMENT),
-                ),
+                Span::styled("▣ ".to_string(), muted),
+                Span::styled(format!("{:.1}s", *duration_ms as f64 / 1000.0), muted),
+                Span::styled(" · ".to_string(), muted),
+                Span::styled(total_tokens.to_string(), muted),
+                Span::styled(" tokens".to_string(), muted),
             ]),
             Line::default(),
         ],
@@ -1137,6 +1039,54 @@ fn ai_activity_event_to_lines(event: &AiActivityEvent) -> Vec<Line<'static>> {
         ))],
     };
     cap_event_lines(lines)
+}
+
+/// Render a single-line `<icon> <ToolName> <args>` tool entry in
+/// opencode's muted style. `icon_override` lets the error variant of
+/// `ToolResult` swap the icon for `✗`. The row is rendered with the
+/// `BG_ALT` (#1e1f1c) backdrop so it visually reads as a code block, in
+/// line with opencode's TUI.
+fn render_tool_line(
+    tool_name: &str,
+    args: &str,
+    style: Style,
+    icon_override: Option<&'static str>,
+) -> Line<'static> {
+    let icon = icon_override.unwrap_or_else(|| tool_icon(tool_name));
+    let style = style.bg(colors::opencode::BG_ALT);
+    let mut spans = vec![
+        Span::styled(format!("{icon} "), style),
+        Span::styled(tool_display_name(tool_name), style),
+    ];
+    let trimmed_args = args.trim();
+    if !trimmed_args.is_empty() {
+        spans.push(Span::styled(" ".to_string(), style));
+        spans.push(Span::styled(trimmed_args.to_string(), style));
+    }
+    Line::from(spans)
+}
+
+/// Title-case the tool name to match opencode's `Read`, `Grep`,
+/// `Skill`, `Bash`, … convention. `bash` is a special case because
+/// opencode renders shell calls with just the icon (`$ command`) — we
+/// keep the word for clarity in the wisetree transcript but still
+/// capitalize.
+fn tool_display_name(tool_name: &str) -> String {
+    let cleaned = tool_name.replace('_', " ");
+    let mut out = String::with_capacity(cleaned.len());
+    let mut capitalize_next = true;
+    for ch in cleaned.chars() {
+        if ch.is_whitespace() {
+            out.push(ch);
+            capitalize_next = true;
+        } else if capitalize_next {
+            out.extend(ch.to_uppercase());
+            capitalize_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Map an opencode tool name to the single-character glyph opencode itself
@@ -1201,6 +1151,16 @@ fn render_ai_activity_log(events: &[AiActivityEvent]) -> Vec<Line<'static>> {
         previous_kind = Some(kind);
     }
 
+    for line in &mut out {
+        if line.spans.is_empty() {
+            continue;
+        }
+        line.spans.insert(
+            0,
+            Span::styled("  ".to_string(), Style::default().fg(colors::opencode::FG)),
+        );
+    }
+
     out
 }
 
@@ -1244,16 +1204,12 @@ fn should_insert_blank_line(
 /// purple. Fenced code blocks (` ```lang ... ``` `) flow through
 /// `syntect`'s Monokai highlighter so the spans line up with the rest
 /// of the syntax palette.
+/// Render an assistant text part using the opencode Monokai palette.
+/// Plain `fg = foreground` (`#f8f8f2`) rendered as markdown — no leading
+/// chevron or icon. Mirrors `TextPart` in opencode's
+/// `routes/session/index.tsx`.
 fn render_assistant_text(content: &str) -> Vec<Line<'static>> {
-    let chevron = Span::styled(
-        "> ".to_string(),
-        Style::default()
-            .fg(colors::opencode::GREEN)
-            .add_modifier(Modifier::BOLD),
-    );
-
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut first_line = true;
     let mut in_code = false;
     let mut code_lang: Option<String> = None;
     let mut code_buf: Vec<String> = Vec::new();
@@ -1286,18 +1242,13 @@ fn render_assistant_text(content: &str) -> Vec<Line<'static>> {
             code_buf.push(raw_line.to_string());
             continue;
         }
-        let line = render_markdown_block_line(raw_line, first_line.then(|| chevron.clone()));
-        out.push(line);
-        first_line = false;
+        out.push(render_markdown_block_line(raw_line, None));
     }
 
     if in_code && !code_buf.is_empty() {
         flush_code(&mut out, &mut code_buf, &mut code_lang);
     }
 
-    if out.is_empty() {
-        out.push(Line::from(chevron));
-    }
     out
 }
 
@@ -1425,41 +1376,146 @@ fn split_enumeration(input: &str) -> Option<(u32, &str)> {
     Some((num, rest))
 }
 
+/// Render a thinking / reasoning block in the opencode Monokai style.
+///
+/// Opencode prepends `_Thinking:_ ` to the body and renders the whole
+/// block as markdown with `fg = textMuted` (`#75715e`) — see
+/// `design/opencode.md`. The label is italic by markdown convention,
+/// the body uses regular markdown styling on top of the muted base
+/// (so `**bold**` titles still appear in orange, `*italic*` in yellow,
+/// `` `code` `` in green). No emoji.
 fn render_thinking_text(content: &str) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let body_style = Style::default()
-        .fg(colors::opencode::COMMENT)
-        .add_modifier(Modifier::ITALIC);
     let label = Span::styled(
-        "Thinking 🧠".to_string(),
+        "Thinking:".to_string(),
         Style::default()
-            .fg(colors::opencode::CYAN)
-            .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            .fg(colors::opencode::MD_EMPH)
+            .add_modifier(Modifier::ITALIC),
     );
-    let sep = Span::styled(
-        ": ".to_string(),
-        Style::default().fg(colors::opencode::COMMENT),
-    );
+    let space = Span::styled(" ".to_string(), Style::default().fg(colors::opencode::FG));
+
+    let mut out: Vec<Line<'static>> = Vec::new();
     let mut first = true;
     for raw_line in content.split('\n') {
-        if first {
-            out.push(Line::from(vec![
-                label.clone(),
-                sep.clone(),
-                Span::styled(raw_line.to_string(), body_style),
-            ]));
+        if raw_line.trim().is_empty() {
+            out.push(Line::default().alignment(Alignment::Center));
             first = false;
-        } else {
-            out.push(Line::from(Span::styled(
-                format!("    {raw_line}"),
-                body_style,
-            )));
+            continue;
         }
+        let (prefix, is_title) = if first {
+            first = false;
+            (Some(vec![label.clone(), space.clone()]), true)
+        } else {
+            (None, false)
+        };
+        out.push(
+            render_thinking_markdown_line(raw_line, prefix, is_title).alignment(Alignment::Center),
+        );
     }
     if out.is_empty() {
-        out.push(Line::from(vec![label, sep]));
+        out.push(Line::from(label).alignment(Alignment::Center));
     }
     out
+}
+
+/// Markdown-render a single thinking-block line. The first content line
+/// (the one carrying the `Thinking:` prefix) is treated as a title and
+/// rendered bold orange (`MD_STRONG`) — matching opencode's reasoning
+/// header. Subsequent lines render as inline markdown over white text.
+fn render_thinking_markdown_line(
+    raw_line: &str,
+    prefix: Option<Vec<Span<'static>>>,
+    is_title: bool,
+) -> Line<'static> {
+    let trimmed = raw_line.trim_start();
+    let stripped_bold = trimmed
+        .strip_prefix("**")
+        .and_then(|s| s.strip_suffix("**"));
+
+    if is_title {
+        let title_text = stripped_bold.unwrap_or(trimmed).to_string();
+        let mut spans = prefix.unwrap_or_default();
+        spans.push(Span::styled(
+            title_text,
+            Style::default()
+                .fg(colors::opencode::MD_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ));
+        return Line::from(spans);
+    }
+
+    if let Some(stripped) = stripped_bold {
+        let mut spans = prefix.unwrap_or_default();
+        spans.push(Span::styled(
+            stripped.to_string(),
+            Style::default()
+                .fg(colors::opencode::MD_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ));
+        return Line::from(spans);
+    }
+
+    let mut spans = prefix.unwrap_or_default();
+    spans.append(&mut render_inline_thinking_markdown(raw_line));
+    Line::from(spans)
+}
+
+/// Inline markdown for the thinking block — same grammar as
+/// [`render_inline_markdown`]. Plain text resolves to `FG` (white) so the
+/// body matches opencode's reasoning body color; inline bold / italic /
+/// code keep their markdown role colors.
+fn render_inline_thinking_markdown(input: &str) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut buf = String::new();
+
+    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>| {
+        if !buf.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(buf),
+                Style::default().fg(colors::opencode::FG),
+            ));
+        }
+    };
+
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '`' {
+            if let Some(end) = input[i + 1..].find('`') {
+                flush(&mut buf, &mut spans);
+                let code = &input[i + 1..i + 1 + end];
+                spans.push(Span::styled(
+                    code.to_string(),
+                    Style::default().fg(colors::opencode::MD_CODE),
+                ));
+                i += end + 2;
+                continue;
+            }
+        } else if ch == '*' {
+            let double = i + 1 < bytes.len() && bytes[i + 1] == b'*';
+            let marker = if double { "**" } else { "*" };
+            let search_from = i + marker.len();
+            if let Some(end) = input[search_from..].find(marker) {
+                flush(&mut buf, &mut spans);
+                let inner = &input[search_from..search_from + end];
+                let (color, modifier) = if double {
+                    (colors::opencode::MD_STRONG, Modifier::BOLD)
+                } else {
+                    (colors::opencode::MD_EMPH, Modifier::ITALIC)
+                };
+                spans.push(Span::styled(
+                    inner.to_string(),
+                    Style::default().fg(color).add_modifier(modifier),
+                ));
+                i = search_from + end + marker.len();
+                continue;
+            }
+        }
+        buf.push(ch);
+        i += 1;
+    }
+    flush(&mut buf, &mut spans);
+    spans
 }
 
 /// Inline markdown for assistant text using the Opencode Monokai palette
@@ -1592,160 +1648,6 @@ fn highlight_code_block(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
         )));
     }
     out
-}
-
-fn push_highlighted_fragment(spans: &mut Vec<Span<'static>>, fragment: &str) {
-    let mut chars = fragment.chars().peekable();
-    let mut first_token = true;
-    while let Some(ch) = chars.peek().copied() {
-        if ch.is_whitespace() {
-            let mut ws = String::new();
-            while let Some(next) = chars.peek().copied() {
-                if !next.is_whitespace() {
-                    break;
-                }
-                ws.push(next);
-                chars.next();
-            }
-            spans.push(Span::raw(ws));
-            continue;
-        }
-
-        let mut token = String::new();
-        let mut quote: Option<char> = None;
-        while let Some(next) = chars.peek().copied() {
-            if let Some(active_quote) = quote {
-                token.push(next);
-                chars.next();
-                if next == active_quote {
-                    quote = None;
-                }
-                continue;
-            }
-            if next.is_whitespace() {
-                break;
-            }
-            if matches!(next, '"' | '\'' | '`') {
-                quote = Some(next);
-            }
-            token.push(next);
-            chars.next();
-        }
-
-        push_highlighted_token(spans, &token, &mut first_token);
-    }
-}
-
-fn push_highlighted_token(spans: &mut Vec<Span<'static>>, token: &str, first_token: &mut bool) {
-    if let Some((lhs, rhs)) = token.split_once('=') {
-        if is_assignment_like(lhs) {
-            spans.push(Span::styled(
-                lhs.to_string(),
-                if lhs.starts_with('-') {
-                    Style::default().fg(colors::opencode::PURPLE)
-                } else {
-                    Style::default().fg(colors::opencode::CYAN)
-                },
-            ));
-            spans.push(Span::styled(
-                "=".to_string(),
-                Style::default().fg(colors::opencode::COMMENT),
-            ));
-            if !rhs.is_empty() {
-                spans.push(Span::styled(
-                    rhs.to_string(),
-                    classify_token_style(rhs, false),
-                ));
-            }
-            *first_token = false;
-            return;
-        }
-    }
-
-    spans.push(Span::styled(
-        token.to_string(),
-        classify_token_style(token, *first_token),
-    ));
-    *first_token = false;
-}
-
-fn classify_token_style(token: &str, first_token: bool) -> Style {
-    if is_shell_operator(token) {
-        return Style::default().fg(colors::opencode::PINK);
-    }
-    if token.starts_with("--") || (token.starts_with('-') && token.len() > 1) {
-        return Style::default().fg(colors::opencode::PURPLE);
-    }
-    if is_quoted(token) || is_placeholder(token) {
-        return Style::default().fg(colors::opencode::YELLOW);
-    }
-    if looks_like_url(token) {
-        return Style::default()
-            .fg(colors::opencode::CYAN)
-            .add_modifier(Modifier::UNDERLINED);
-    }
-    if looks_like_path(token) {
-        return Style::default().fg(colors::opencode::FG);
-    }
-    if looks_like_number(token) {
-        return Style::default().fg(colors::opencode::PURPLE);
-    }
-    if first_token {
-        return Style::default()
-            .fg(colors::opencode::GREEN)
-            .add_modifier(Modifier::BOLD);
-    }
-    Style::default().fg(colors::opencode::FG)
-}
-
-fn is_assignment_like(token: &str) -> bool {
-    token.starts_with('-')
-        || token
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-}
-
-fn is_shell_operator(token: &str) -> bool {
-    matches!(token, "&&" | "||" | "|" | ";" | "->" | "=>")
-}
-
-fn is_quoted(token: &str) -> bool {
-    token.len() >= 2
-        && ((token.starts_with('"') && token.ends_with('"'))
-            || (token.starts_with('\'') && token.ends_with('\''))
-            || (token.starts_with('`') && token.ends_with('`')))
-}
-
-fn is_placeholder(token: &str) -> bool {
-    token.starts_with('<') && token.ends_with('>')
-}
-
-fn looks_like_url(token: &str) -> bool {
-    token.starts_with("http://") || token.starts_with("https://")
-}
-
-fn looks_like_path(token: &str) -> bool {
-    let trimmed = token
-        .trim_matches(|ch: char| matches!(ch, ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'));
-    trimmed.starts_with("~/")
-        || trimmed.starts_with("./")
-        || trimmed.starts_with("../")
-        || trimmed.starts_with('/')
-        || trimmed.contains('/')
-        || trimmed.ends_with(".rs")
-        || trimmed.ends_with(".rb")
-        || trimmed.ends_with(".ts")
-        || trimmed.ends_with(".tsx")
-        || trimmed.ends_with(".js")
-        || trimmed.ends_with(".json")
-        || trimmed.ends_with(".md")
-}
-
-fn looks_like_number(token: &str) -> bool {
-    token.chars().any(|ch| ch.is_ascii_digit())
-        && token.chars().all(|ch| {
-            ch.is_ascii_digit() || matches!(ch, '.' | '%' | ':' | '+' | '-' | '_' | 's' | 'm')
-        })
 }
 
 fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> {
@@ -2089,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_activity_uses_monokai_style_roles() {
+    fn tool_call_activity_uses_opencode_muted_style() {
         let lines = ai_activity_event_to_lines(&AiActivityEvent::ToolCall {
             tool_name: "run_shell_command".to_string(),
             summary: "git diff -- src/main.rs --color=never".to_string(),
@@ -2099,21 +2001,50 @@ mod tests {
         assert!(
             line.spans
                 .iter()
-                .any(|span| span.style.fg == Some(colors::opencode::GREEN)),
-            "expected command/tool-name highlighting in opencode green: {line:?}"
+                .all(|span| span.style.fg == Some(colors::opencode::COMMENT)),
+            "opencode renders tool calls entirely in textMuted (#75715e): {line:?}"
         );
         assert!(
             line.spans
                 .iter()
-                .any(|span| span.style.fg == Some(colors::opencode::PURPLE)),
-            "expected flag highlighting in opencode purple: {line:?}"
+                .all(|span| span.style.bg == Some(colors::opencode::BG_ALT)),
+            "tool calls sit on the BG_ALT (#1e1f1c) code-block surface: {line:?}"
         );
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            rendered.starts_with("• Run Shell Command"),
+            "tool name should be title-cased without parens: {rendered}"
+        );
+        assert!(
+            !rendered.contains('('),
+            "opencode tool calls don't wrap args in parens: {rendered}"
+        );
+    }
+
+    #[test]
+    fn tool_result_error_uses_pink_cross_icon() {
+        let lines = ai_activity_event_to_lines(&AiActivityEvent::ToolResult {
+            tool_name: Some("read".to_string()),
+            status: AiToolResultStatus::Error,
+            detail: "file not found".to_string(),
+        });
+        let line = lines.first().expect("error tool result line");
         assert!(
             line.spans
                 .iter()
-                .any(|span| span.style.fg == Some(colors::opencode::FG)),
-            "expected path/value text in opencode foreground: {line:?}"
+                .all(|span| span.style.fg == Some(colors::opencode::PINK)),
+            "error tool result should be pink throughout: {line:?}"
         );
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.starts_with("✗ Read"), "got {rendered}");
     }
 
     #[test]
@@ -2138,9 +2069,25 @@ mod tests {
             2,
             "thinking should produce one line per newline"
         );
+        assert_eq!(
+            lines[0].spans[0].content, "Thinking:",
+            "opencode uses a plain italic `Thinking:` label — no emoji"
+        );
         assert!(
-            lines[0].spans[0].content.contains("🧠"),
-            "thinking label should include the requested brain emoji: {lines:?}"
+            lines[0].spans[0].style.fg == Some(colors::opencode::MD_EMPH),
+            "thinking label is yellow (markdownEmph #e6db74)"
+        );
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC),
+            "thinking label is italic"
+        );
+        assert_eq!(
+            lines[0].alignment,
+            Some(Alignment::Center),
+            "thinking lines render centered in the AI Activity panel"
         );
     }
 

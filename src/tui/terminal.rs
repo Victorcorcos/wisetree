@@ -330,6 +330,42 @@ pub fn clear_wrapper_for_shell(terminal: &mut WrapperTerminal) -> io::Result<()>
     clear_terminal_for_app(terminal)
 }
 
+/// Drop raw mode and best-effort disable mouse capture without blocking.
+///
+/// Used when the terminal *may* have disappeared but we still want to leave it
+/// in a sane state if it's actually alive. Mouse capture sequences left on by
+/// a `_exit(0)` watchdog or a non-Clean exit branch cause the parent shell to
+/// spew SGR mouse coordinates for every cursor movement. We use a non-blocking
+/// open on `/dev/tty` so a truly dead pty can't wedge us inside `write()`.
+pub fn leave_raw_mode_only() -> io::Result<()> {
+    let _ = disable_raw_mode();
+    disable_mouse_capture_best_effort();
+    Ok(())
+}
+
+/// Write the `DisableMouseCapture` sequence to `/dev/tty` (Unix) using a
+/// non-blocking open so a dead pty can't trap us. Falls back to `stdout` on
+/// Windows or when `/dev/tty` can't be opened. Errors are intentionally
+/// swallowed — this runs on shutdown paths where there's nothing useful to do
+/// with them.
+pub fn disable_mouse_capture_best_effort() {
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+
+        let path = std::ffi::CString::new(TTY_PATH).expect("static path has no NUL");
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if fd >= 0 {
+            let mut tty = unsafe { File::from_raw_fd(fd) };
+            let _ = crossterm::execute!(&mut tty, DisableMouseCapture);
+            // `File` Drop closes the fd.
+            return;
+        }
+    }
+    let mut stdout = io::stdout();
+    let _ = crossterm::execute!(&mut stdout, DisableMouseCapture);
+}
+
 /// Best-effort cleanup. Safe to call even if `enter` was never invoked.
 pub fn restore() -> io::Result<()> {
     let _ = disable_raw_mode();

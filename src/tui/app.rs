@@ -2554,6 +2554,353 @@ fn install_termination_listener() -> Arc<AtomicBool> {
     flag
 }
 
+/// Install a raw `sigaction` handler for SIGHUP that immediately calls
+/// `_exit(0)`. Idempotent: safe to call multiple times.
+///
+/// We use a real signal handler (not tokio's cooperative stream) because the
+/// failure mode we're guarding against is "main thread is wedged inside a
+/// syscall that never returns" — exactly the state where flag-based
+/// shutdown can't run. `_exit` is async-signal-safe and terminates the
+/// process synchronously inside the handler.
+///
+/// When `WISETREE_DEBUG_WATCHDOG=1` is set we also `write(2)` a fixed marker
+/// to `/tmp/wisetree_watchdog.log` *before* exiting. That lets us tell
+/// post-mortem whether SIGHUP ever reached the process — if the log has
+/// "sighup-received" but the process is still alive, something between
+/// delivery and `_exit` is broken; if there's no marker, SIGHUP was never
+/// delivered in the first place.
+#[cfg(unix)]
+static SIGHUP_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+fn install_raw_sighup_exit() {
+    if std::env::var_os("WISETREE_DEBUG_WATCHDOG").is_some() {
+        let path =
+            std::ffi::CString::new("/tmp/wisetree_watchdog.log").expect("static path has no NUL");
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                0o644,
+            )
+        };
+        if fd >= 0 {
+            SIGHUP_LOG_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    extern "C" fn sighup_exit(_sig: libc::c_int) {
+        let fd = SIGHUP_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
+        if fd >= 0 {
+            let msg = b"sighup-received\n";
+            // `write(2)` is async-signal-safe. We can't format the pid in
+            // here without violating that, so the watchdog logs the pid at
+            // startup; the user can correlate via timestamps.
+            unsafe {
+                let _ = libc::write(fd, msg.as_ptr().cast::<libc::c_void>(), msg.len());
+            }
+        }
+        unsafe { libc::_exit(0) }
+    }
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = sighup_exit as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
+    }
+}
+
+/// Orphan / dead-terminal watchdog. Defends against the scenario that left
+/// `wisetree` processes pegged at 100% CPU after the user closed the
+/// terminal tab (the original bug report).
+///
+/// Real-world scenario, end-to-end:
+///
+///   1. User runs `wisetree` via the shell wrapper
+///      (`dir=$(... wisetree --from-wrapper)`), which forks a bash subshell
+///      that then execs wisetree.
+///   2. User closes the terminal tab. Terminal.app sends SIGHUP to the
+///      session leader (the interactive shell), then closes the master pty.
+///   3. The interactive shell exits — but the `$()` subshell is a separate
+///      process that may stay alive (reparented to launchd) waiting for
+///      wisetree's stdout, so `getppid()` does NOT necessarily change.
+///   4. Terminal.app *may* keep the master fd open while waiting for child
+///      processes to finish draining the slave, so `POLLHUP` on stdin/stderr
+///      doesn't fire either.
+///
+/// One of the following IS reliable, though: when the session leader exits,
+/// the kernel disassociates the session from its controlling terminal. From
+/// any other process in that session:
+///
+///   * `tcgetpgrp(stdin)` returns `-1` with `ENOTTY` — the fd is still a
+///     character device but it's no longer the *controlling* tty.
+///   * `open("/dev/tty", ...)` fails with `ENXIO` for the same reason.
+///
+/// We poll all four signals every 200ms (was 500ms) so the watchdog reacts
+/// within ~½ second of any failure mode, then `_exit(0)` after a short
+/// grace period to bypass the libc atexit handlers (which would flush
+/// stdio onto the dead pty slave and re-wedge the process).
+fn install_orphan_watchdog() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        let original_ppid = unsafe { libc::getppid() };
+        let debug = std::env::var_os("WISETREE_DEBUG_WATCHDOG").is_some();
+        let tokio_flag = flag.clone();
+        tokio::spawn(async move {
+            let mut log = WatchdogLog::open(debug, "tokio");
+            log.write(format_args!(
+                "start pid={} ppid={original_ppid} sid={} pgrp={}",
+                std::process::id(),
+                unsafe { libc::getsid(0) },
+                unsafe { libc::getpgrp() }
+            ));
+
+            let mut tick = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                tick += 1;
+                let probe = TtyProbe::sample(original_ppid);
+                if debug {
+                    log.write(format_args!("tick {tick}: {probe:?}"));
+                }
+                if probe.dead_reason().is_some() {
+                    log.write(format_args!(
+                        "tripped on tick {tick}: {:?}",
+                        probe.dead_reason()
+                    ));
+                    tokio_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            // Hard exit fallback. The cooperative shutdown needs a beat to
+            // unwind, but if the main thread is wedged in a `write()` to the
+            // dead pty slave, that path never completes. After 500ms we call
+            // `_exit(0)` directly: `std::process::exit` / `libc::exit` would
+            // run atexit handlers that flush stdio (= write to the dead pty),
+            // which re-wedges us for ~60s until the kernel times the slave out.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Best-effort: if the tty is actually alive (e.g. parent_changed
+            // tripped on a transient reparent), restore raw mode + mouse
+            // capture so the parent shell isn't left receiving SGR mouse
+            // coordinates as input on every cursor movement.
+            let _ = terminal::leave_raw_mode_only();
+            log.write(format_args!("hard _exit(0)"));
+            unsafe { libc::_exit(0) };
+        });
+
+        // Belt-and-suspenders: an OS-thread watchdog that runs the same
+        // probes outside of tokio. The tokio task can be starved if the
+        // runtime ends up wedged (no worker available, blocking task
+        // monopolizing the executor, etc.). A bare std::thread runs on its
+        // own kernel-scheduled thread and is independent of tokio's state.
+        // First watchdog to detect death wins.
+        let os_flag = flag.clone();
+        std::thread::Builder::new()
+            .name("wisetree-watchdog".into())
+            .spawn(move || {
+                let mut log = WatchdogLog::open(debug, "os");
+                log.write(format_args!(
+                    "start pid={} ppid={original_ppid}",
+                    std::process::id()
+                ));
+                let mut tick = 0u32;
+                loop {
+                    std::thread::sleep(Duration::from_millis(200));
+                    tick += 1;
+                    let probe = TtyProbe::sample(original_ppid);
+                    if debug {
+                        log.write(format_args!("tick {tick}: {probe:?}"));
+                    }
+                    if probe.dead_reason().is_some() {
+                        log.write(format_args!(
+                            "tripped on tick {tick}: {:?}",
+                            probe.dead_reason()
+                        ));
+                        os_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                let _ = terminal::leave_raw_mode_only();
+                log.write(format_args!("hard _exit(0)"));
+                unsafe { libc::_exit(0) };
+            })
+            .expect("spawning the OS watchdog thread should not fail");
+    }
+    flag
+}
+
+/// Snapshot of every signal we know how to test for "the terminal that
+/// owned us is gone." Each field captures whether one independent probe
+/// thinks the tty is dead.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct TtyProbe {
+    /// Original parent pid changed (subshell or shell died).
+    parent_changed: bool,
+    /// Stdin fd has `POLLHUP`/`POLLERR`/`POLLNVAL`.
+    stdin_pollhup: bool,
+    /// `open("/dev/tty")` failed — session lost its controlling tty.
+    devtty_unavailable: bool,
+    /// `tcgetpgrp(stdin)` failed — fd is no longer a controlling tty.
+    /// We accept `ENOTTY`/`ENXIO`/`EBADF` as evidence of death; transient
+    /// `EINTR` or unrelated errors do not count.
+    stdin_no_pgrp: bool,
+}
+
+#[cfg(unix)]
+impl TtyProbe {
+    fn sample(original_ppid: libc::pid_t) -> Self {
+        let parent_changed = original_ppid > 1 && unsafe { libc::getppid() } != original_ppid;
+        let stdin_pollhup =
+            unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 && fd_is_dead(libc::STDIN_FILENO);
+        let devtty_unavailable = !devtty_open_succeeds();
+        let stdin_no_pgrp = stdin_pgrp_unavailable();
+        Self {
+            parent_changed,
+            stdin_pollhup,
+            devtty_unavailable,
+            stdin_no_pgrp,
+        }
+    }
+
+    fn dead_reason(&self) -> Option<&'static str> {
+        if self.parent_changed {
+            return Some("parent_changed");
+        }
+        if self.stdin_pollhup {
+            return Some("stdin_pollhup");
+        }
+        if self.devtty_unavailable {
+            return Some("devtty_unavailable");
+        }
+        if self.stdin_no_pgrp {
+            return Some("stdin_no_pgrp");
+        }
+        None
+    }
+}
+
+/// Best-effort logger that writes to `/tmp/wisetree_watchdog.log` only when
+/// `WISETREE_DEBUG_WATCHDOG=1` is set. No-ops otherwise so production runs
+/// don't touch the filesystem.
+#[cfg(unix)]
+struct WatchdogLog {
+    file: Option<std::fs::File>,
+    tag: &'static str,
+}
+
+#[cfg(unix)]
+impl WatchdogLog {
+    fn open(enabled: bool, tag: &'static str) -> Self {
+        let file = if enabled {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/wisetree_watchdog.log")
+                .ok()
+        } else {
+            None
+        };
+        Self { file, tag }
+    }
+
+    fn write(&mut self, args: std::fmt::Arguments) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        use std::io::Write;
+        let _ = writeln!(file, "[{} {}] {args}", std::process::id(), self.tag);
+        let _ = file.flush();
+    }
+}
+
+/// True when `controlling_tty_alive()` and friends should treat the tty as
+/// already dead. Used by render/cleanup paths that need a single boolean.
+///
+/// Note: only uses the probes that are safe to call mid-render — we skip
+/// `parent_changed` (the render path can outrace orphan reparenting on
+/// macOS, causing a spurious detach during startup) and rely on the
+/// watchdog's 200ms tick for that signal.
+#[cfg(unix)]
+fn controlling_tty_alive() -> bool {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 && fd_is_dead(libc::STDIN_FILENO) {
+        return false;
+    }
+    if stdin_pgrp_unavailable() {
+        return false;
+    }
+    if !devtty_open_succeeds() {
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+fn devtty_open_succeeds() -> bool {
+    let path = std::ffi::CString::new("/dev/tty").expect("static path has no NUL");
+    // `O_NONBLOCK` is critical: a blocking `open("/dev/tty")` can wedge
+    // inside the kernel after the session loses its controlling tty,
+    // which would disarm the watchdog by stalling its 200ms tick.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // ENXIO = session has no controlling terminal. That's the only
+        // "real" death signal. Other errors (EACCES, EINTR, EMFILE) are
+        // transient or environmental and should NOT trip the watchdog.
+        return e != libc::ENXIO;
+    }
+    // NOTE: don't poll the resulting fd. macOS rejects `poll()` on
+    // `/dev/tty` with `POLLNVAL` even when the device is healthy, which
+    // would false-positive into "tty is dead." The open() call itself is
+    // the reliable signal — if we got here the session still has a
+    // controlling terminal.
+    unsafe {
+        libc::close(fd);
+    }
+    true
+}
+
+/// True when `tcgetpgrp(STDIN_FILENO)` returns a documented "fd is no longer
+/// a controlling terminal" error. Other failures (e.g. transient `EINTR`)
+/// fall through as "still alive" so we don't false-positive.
+#[cfg(unix)]
+fn stdin_pgrp_unavailable() -> bool {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        // Not a tty in the first place — this probe has nothing to say.
+        // Other probes will catch the broken case.
+        return false;
+    }
+    let pgrp = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+    if pgrp >= 0 {
+        return false;
+    }
+    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    matches!(err, libc::ENOTTY | libc::ENXIO | libc::EBADF)
+}
+
+#[cfg(unix)]
+fn fd_is_dead(fd: libc::c_int) -> bool {
+    let mut fds = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // 0 timeout = snapshot of the current ready/HUP state.
+    let result = unsafe { libc::poll(&mut fds, 1, 0) };
+    if result < 0 {
+        return true;
+    }
+    fds.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+#[cfg(not(unix))]
+fn controlling_tty_alive() -> bool {
+    true
+}
+
+
 fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let git_root = get_git_root(None).await;

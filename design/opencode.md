@@ -1,97 +1,80 @@
-# Opencode Monokai Palette
+# Opencode Monokai Palette & Rendering Conventions
 
-This palette mirrors the Monokai theme shipped with the
-[`opencode`](https://opencode.ai) CLI/TUI
-(`packages/opencode/src/cli/cmd/tui/context/theme/monokai.json`). It is the
-source of truth for every color rendered inside wisetree's **AI Activity**
-panel during the *Update Pull Request* flow so the transcript looks identical
-to what opencode itself prints in its TUI.
+This file is the source of truth for how the **AI Activity** panel renders
+during the *Update Pull Request* flow. The goal is visual parity with the
+[`opencode`](https://opencode.ai) CLI/TUI running its Monokai theme so the
+transcript reads as if it were emitted by opencode itself.
 
-Use the regular `wisetree` palette
-([`design/pallete.md`](./pallete.md)) for the rest of the app — this file only
-governs the AI Activity surface.
+Two upstream sources back this document:
+
+- `packages/opencode/src/cli/cmd/tui/context/theme/monokai.json` — the raw
+  color tokens.
+- `packages/opencode/src/cli/cmd/tui/routes/session/index.tsx` — the
+  `TextPart`, `ReasoningPart`, `InlineTool`, `BlockTool`, and
+  `AssistantMessage` components that decide how each part is laid out.
+
+Use the regular `wisetree` palette ([`design/pallete.md`](./pallete.md)) for
+the rest of the app — this file only governs the AI Activity surface.
 
 ---
 
 ## Base palette (`defs`)
 
-The raw color tokens opencode composes the theme from. All values are sRGB
-hex strings — translate to `Color::Rgb(r, g, b)` at the ratatui call site.
+| Token             | Hex       | Usage                                                  |
+| ----------------- | --------- | ------------------------------------------------------ |
+| `background`      | `#272822` | Main panel canvas.                                     |
+| `backgroundAlt`   | `#1e1f1c` | Code-block / alternate backdrop.                       |
+| `backgroundPanel` | `#3e3d32` | Elevated rows, thinking-block left border.             |
+| `foreground`      | `#f8f8f2` | Primary text: assistant body, default markdown.        |
+| `comment`         | `#75715e` | Muted text: thinking blocks, completed tools, dots.    |
+| `red` / `pink`    | `#f92672` | Errors, markdown headings, keywords.                   |
+| `orange`          | `#fd971f` | Info accent, **bold** markdown emphasis.               |
+| `yellow`          | `#e6db74` | Warnings, strings, *italic* markdown emphasis.         |
+| `green`           | `#a6e22e` | Success, functions, inline `code`, diff additions.     |
+| `cyan` (= `blue`) | `#66d9ef` | Primary accent: borders, types, list bullets, links.   |
+| `purple`          | `#ae81ff` | Secondary accent: numbers, link text, enumerations.    |
 
-| Token             | Hex       | Usage                                                    |
-| ----------------- | --------- | -------------------------------------------------------- |
-| `background`      | `#272822` | Main panel background (the canvas the transcript sits on). |
-| `backgroundAlt`   | `#1e1f1c` | Subtle / secondary panel background, code-block backdrop. |
-| `backgroundPanel` | `#3e3d32` | Elevated panel background (selected rows, status strips). |
-| `foreground`      | `#f8f8f2` | Primary text — assistant body, default code-block text.   |
-| `comment`         | `#75715e` | Muted text — thinking blocks, hunk headers, list dots.    |
-| `red` / `pink`    | `#f92672` | Errors, markdown headings, syntax keywords/operators.     |
-| `orange`          | `#fd971f` | Info accents, **bold** markdown emphasis.                 |
-| `lightOrange`     | `#e69f66` | Soft orange highlight (rare).                             |
-| `yellow`          | `#e6db74` | Warnings, *italic* markdown emphasis, string literals.    |
-| `green`           | `#a6e22e` | Success, function names, inline `code`, diff additions.   |
-| `cyan` (= `blue`) | `#66d9ef` | Primary accent — borders, types, list bullets, links.     |
-| `purple`          | `#ae81ff` | Secondary accent — numbers, link text, enumerations.      |
-
-> Opencode aliases `pink = red` and `blue = cyan` in its `defs` block. We keep
-> the same aliases so semantic intent (`heading` ↔ pink, `link` ↔ cyan) reads
-> cleanly in the renderer.
+> Opencode aliases `pink = red` and `blue = cyan` in `defs`. We keep both
+> names so semantic intent (`heading` ↔ pink, `link` ↔ cyan) reads cleanly.
 
 ---
 
-## Semantic theme roles
+## Semantic theme roles (markdown / status / surfaces)
 
-These are the keys the opencode TUI binds to every surface; wisetree's AI
-Activity panel re-uses them verbatim.
+| Role               | Color     |
+| ------------------ | --------- |
+| `primary`          | `#66d9ef` |
+| `secondary`        | `#ae81ff` |
+| `accent`           | `#a6e22e` |
+| `success`          | `#a6e22e` |
+| `info`             | `#fd971f` |
+| `warning`          | `#e6db74` |
+| `error`            | `#f92672` |
+| `text`             | `#f8f8f2` |
+| `textMuted`        | `#75715e` |
+| `border`           | `#3e3d32` |
+| `borderActive`     | `#66d9ef` |
+| `borderSubtle`     | `#1e1f1c` |
+| `backgroundElement`| `#3e3d32` |
 
-### Surfaces
+Markdown bindings (mirrors `glamour`'s dark Monokai preset):
 
-| Role               | Color     | Notes                                                |
-| ------------------ | --------- | ---------------------------------------------------- |
-| `background`       | `#272822` | Panel canvas.                                        |
-| `backgroundPanel`  | `#1e1f1c` | Header / status strip backdrop.                      |
-| `backgroundElement`| `#3e3d32` | Selected rows, code-block backdrop, focused element. |
-| `border`           | `#3e3d32` | Default panel border.                                |
-| `borderActive`     | `#66d9ef` | Active / focused border (cyan).                      |
-| `borderSubtle`     | `#1e1f1c` | Inner dividers.                                      |
+| Element                    | Color     | Style       |
+| -------------------------- | --------- | ----------- |
+| `markdownText`             | `#f8f8f2` | normal      |
+| `markdownHeading`          | `#f92672` | bold        |
+| `markdownStrong`           | `#fd971f` | bold        |
+| `markdownEmph`             | `#e6db74` | italic      |
+| `markdownCode` (inline)    | `#a6e22e` | normal      |
+| `markdownCodeBlock`        | `#f8f8f2` | on `#1e1f1c`|
+| `markdownLink`             | `#66d9ef` | underline   |
+| `markdownLinkText`         | `#ae81ff` | normal      |
+| `markdownListItem`         | `#66d9ef` | bullet      |
+| `markdownListEnumeration`  | `#ae81ff` | enumeration |
+| `markdownBlockQuote`       | `#75715e` | italic      |
+| `markdownHorizontalRule`   | `#75715e` | dim         |
 
-### Status
-
-| Role         | Color     |
-| ------------ | --------- |
-| `primary`    | `#66d9ef` |
-| `secondary`  | `#ae81ff` |
-| `accent`     | `#a6e22e` |
-| `success`    | `#a6e22e` |
-| `info`       | `#fd971f` |
-| `warning`    | `#e6db74` |
-| `error`      | `#f92672` |
-| `text`       | `#f8f8f2` |
-| `textMuted`  | `#75715e` |
-
-### Markdown
-
-Opencode renders assistant text with these mappings (matches `glamour`'s
-dark Monokai preset):
-
-| Element                | Color     | Style                          |
-| ---------------------- | --------- | ------------------------------ |
-| `markdownText`         | `#f8f8f2` | normal                         |
-| `markdownHeading`      | `#f92672` | bold                           |
-| `markdownStrong`       | `#fd971f` | bold                           |
-| `markdownEmph`         | `#e6db74` | italic                         |
-| `markdownCode` (inline)| `#a6e22e` | normal                         |
-| `markdownCodeBlock`    | `#f8f8f2` | normal, on `#1e1f1c` backdrop  |
-| `markdownLink`         | `#66d9ef` | underline                      |
-| `markdownLinkText`     | `#ae81ff` | normal                         |
-| `markdownImage`        | `#66d9ef` | normal                         |
-| `markdownImageText`    | `#ae81ff` | normal                         |
-| `markdownListItem`     | `#66d9ef` | bullet glyph color             |
-| `markdownListEnumeration` | `#ae81ff` | enumeration glyph color     |
-| `markdownBlockQuote`   | `#75715e` | italic                         |
-| `markdownHorizontalRule`| `#75715e`| dim                            |
-
-### Code syntax (used by `syntect` Monokai theme)
+Syntax tokens used by `syntect`'s Monokai theme:
 
 | Token              | Color     |
 | ------------------ | --------- |
@@ -105,47 +88,129 @@ dark Monokai preset):
 | `syntaxOperator`   | `#f92672` |
 | `syntaxPunctuation`| `#f8f8f2` |
 
-### Diff
+Diff:
 
-| Token                  | Color     | Notes                                    |
-| ---------------------- | --------- | ---------------------------------------- |
-| `diffAdded`            | `#a6e22e` | `+` lines text                           |
-| `diffAddedBg`          | `#1a3a1a` | `+` lines background                     |
-| `diffRemoved`          | `#f92672` | `-` lines text                           |
-| `diffRemovedBg`        | `#3a1a1a` | `-` lines background                     |
-| `diffContext`          | `#75715e` | unchanged-line text                      |
-| `diffContextBg`        | `#1e1f1c` | unchanged-line background                |
-| `diffHunkHeader`       | `#75715e` | `@@ ... @@` lines                        |
-| `diffLineNumber`       | `#9b9b95` | gutter line numbers                      |
-| `diffAddedLineNumberBg`| `#1a3a1a` | gutter background for added lines        |
-| `diffRemovedLineNumberBg`| `#3a1a1a`| gutter background for removed lines     |
+| Token              | Color     | Notes                              |
+| ------------------ | --------- | ---------------------------------- |
+| `diffAdded`        | `#a6e22e` | `+` lines text                     |
+| `diffAddedBg`      | `#1a3a1a` | `+` lines background               |
+| `diffRemoved`      | `#f92672` | `-` lines text                     |
+| `diffRemovedBg`    | `#3a1a1a` | `-` lines background               |
+| `diffContext`      | `#75715e` | unchanged-line text                |
+| `diffHunkHeader`   | `#75715e` | `@@ ... @@` lines                  |
+| `diffLineNumber`   | `#9b9b95` | gutter line numbers                |
 
 ---
 
 ## Display conventions
 
-Beyond raw colors, the AI Activity panel reproduces opencode's terminal
-formatting so the output reads as a familiar opencode transcript:
+These rules come directly from `routes/session/index.tsx`. The renderer
+in `src/tui/screens/update_pr.rs::render_ai_activity_log` matches them.
 
-- **Thinking blocks** — prefix `Thinking:` in italic muted comment color, body
-  italic + dim foreground.
-- **Assistant text** — markdown is rendered with the table above; trailing
-  whitespace stripped, no truncation cap so multi-line answers flow.
-- **Tool calls** — single line `* <icon> <tool>(<short args>)` with the `*`
-  bullet in cyan, the tool name in green, arguments in muted comment.
-- **Tool results** — `→ <tool> <ok|error> <detail>`, the arrow green on
-  success and pink on error.
-- **Tool icons** — match opencode's `TOOL_RULES`: `→` read, `←` write/edit,
-  `
+### Thinking / reasoning blocks (`ReasoningPart`, `index.tsx:1492`)
 
- bash, `✱` glob/grep, `#` batch/todo, `%` webfetch, `◈` websearch.
-- **Code fences** — rendered with `syntect`'s bundled Monokai theme so spans
-  align with `syntax*` colors above; backdrop is `backgroundAlt` (`#1e1f1c`).
-- **Diff output** — additions on `diffAddedBg`, removals on `diffRemovedBg`,
-  hunk headers in comment grey, line numbers in `#9b9b95`.
-- **Summary line** — `[done] N tools · X.Xs · Y tokens`, `done` rendered bold
-  green; the rest in muted comment color.
+- Opencode prepends `_Thinking:_ ` to the body and renders the whole block
+  as markdown, with the wrapping element's `fg = textMuted` (`#75715e`).
+- The `_Thinking:_` prefix is italic by markdown convention.
+- No emoji (🧠 / 💭 / etc.). The label is literally `Thinking:`.
+- A subtle left border in `backgroundElement` (`#3e3d32`) gutters the
+  block; in the wisetree panel we approximate that with a small indent
+  rather than a real left border so the AI Activity frame stays clean.
+- Inline markdown inside the block (bold, italic, inline code) still
+  resolves to its markdown role color even though the base color is
+  muted — `**bold**` is orange, `*italic*` is yellow, `` `code` `` is
+  green, etc.
+- Bodies often start with a **bold mini-title** (e.g. `**Investigating
+  repo setup**`); that line therefore renders bold orange via
+  `markdownStrong`. We do not synthesize a separate "title" field.
+
+### Assistant text (`TextPart`, `index.tsx:1525`)
+
+- Plain `fg = foreground` (`#f8f8f2`), rendered as markdown.
+- **No chevron, no `> ` prefix, no leading icon.** The text simply starts
+  at the left margin of the body column.
+- Inline markdown follows the table above.
+
+### Tool calls (`InlineTool`, `index.tsx:1691`)
+
+Format: `{icon} {ToolName} {short args}` — single line.
+
+- Color: `fg = textMuted` (`#75715e`) once the call has completed, which
+  is the dominant state in the transcript. Active calls flash in `text`
+  until they finish.
+- The icon and the text share the same muted color — opencode does **not**
+  syntax-highlight tool arguments inline. Quoted strings, flags, paths,
+  and numbers all read in muted gray. (This is intentional: the tool
+  output renders separately when expanded.)
+- Tool name appears in **title case** (e.g. `Read`, `Grep`, `Skill`,
+  `Bash`) — never lowercase, never with parentheses.
+- The argument fragment uses a tool-specific shape (also from opencode):
+  - `Bash`: just the command after `$ ` (no `Bash` word).
+  - `Read`: `→ Read <path> [offset=0, limit=200]` — path then bracketed
+    keyword args.
+  - `Glob` / `Grep` / `List`: `✱ Grep "<pattern>" in <path>` followed by
+    a paren'd match count once the call resolves.
+  - `Write` / `Edit` / `Patch`: `← Edit <path>`.
+  - `WebFetch` / `WebSearch`: `% WebFetch <url>` / `◈ WebSearch "<query>"`.
+  - `Skill`: `→ Skill "<name>"`.
+  - `Todo*` / `Batch`: `# <verb> todos`.
+
+Icon table (matches opencode's `TOOL_RULES`):
+
+| Tool                                  | Icon |
+| ------------------------------------- | ---- |
+| `bash`                                | `$`  |
+| `read`                                | `→`  |
+| `write` / `edit` / `patch` / `multiedit` | `←` |
+| `glob` / `grep` / `list`              | `✱`  |
+| `todoread` / `todowrite` / `batch`    | `#`  |
+| `webfetch`                            | `%`  |
+| `websearch`                           | `◈`  |
+| anything else                         | `•`  |
+
+### Tool results (`BlockTool`, `index.tsx:1645–1688`)
+
+- Opencode hides the result body unless the tool is configured to show
+  it inline. The transcript stays clean — only the *call* row is shown
+  for the routine `Read`, `Glob`, `Grep`, etc.
+- When a result is surfaced we render a single muted summary line
+  matching the call's tool name: `→ <tool> <detail>` for success and
+  `✗ <tool> <detail>` for errors. Success arrow stays in `textMuted`;
+  failure cross uses `error` (`#f92672`) so it pops.
+- No `[done] N tools · X.Xs · Y tokens` line per call — opencode does not
+  print one and neither does the AI Activity panel.
+
+### Errors / notices
+
+- `error: <message>` in `error` (`#f92672`) bold.
+- `warning: <message>` in `warning` (`#e6db74`) bold.
+- `info: <message>` in `info` (`#fd971f`) bold.
+
+### Session header
+
+- `@ session <model>` in `textMuted` for `@ session ` and `text` for the
+  model name. Opencode itself doesn't print a literal "session" line,
+  but wisetree needs a visible header for the chosen model — we keep it
+  minimal, single line, muted leading glyph.
+
+### Footer (`AssistantMessage`, `index.tsx:1457–1481`)
+
+- Opencode prints **one** footer at the very end of a turn:
+  `▣ <mode> · <model> · <duration>`.
+- Wisetree's `Summary` event surfaces total tokens streamed in a
+  step_finish; we render it the same way — one muted line:
+  `▣ <duration> · <tokens> tokens`. No `[done] N tools` framing,
+  no bold green badge. The line color is `textMuted` throughout, with
+  the leading `▣` glyph also in `textMuted`.
+
+### Spacing rules
+
+- A single blank line separates a Thinking block, a Text block, and a
+  Tool group.
+- Inside a Tool group consecutive tool calls/results are stacked with
+  no blank lines.
+- A blank line follows the closing footer so the next turn breathes.
 
 All of the constants here are mirrored as Rust `Color` consts in
-`src/messages.rs::colors::opencode` and `::colors::monokai`, so renderer code
-should pull from those modules instead of hard-coding RGB literals.
+`src/messages.rs::colors::opencode`, so renderer code pulls from that
+module instead of hard-coding RGB literals.
