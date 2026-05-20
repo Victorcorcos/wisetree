@@ -285,6 +285,37 @@ mod unix_shutdown {
     /// Reproducing that path here ensures the prompt-exit behavior holds
     /// even when wisetree is not the session leader and even when no
     /// SIGHUP propagates down the process chain.
+    /// Returns the pid of any `wisetree --from-wrapper` process matching
+    /// `binary`. We restrict to *this* test binary to avoid catching unrelated
+    /// wisetree invocations the dev might have running.
+    fn pgrep_wisetree(binary: &std::path::Path) -> Vec<i32> {
+        let needle = binary.to_string_lossy().to_string();
+        let output = Command::new("pgrep")
+            .arg("-f")
+            .arg(format!("{}.*--from-wrapper", needle))
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<i32>().ok())
+            .collect()
+    }
+
+    /// Wait for every wisetree process spawned for the given binary to exit.
+    /// Returns the leftover pids that didn't die within `timeout`.
+    fn wait_for_wisetree_orphans_to_die(binary: &std::path::Path, timeout: Duration) -> Vec<i32> {
+        let started = Instant::now();
+        loop {
+            let pids = pgrep_wisetree(binary);
+            if pids.is_empty() || started.elapsed() >= timeout {
+                return pids;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn spawn_wrapper_via_bash() -> io::Result<WrapperProcess> {
         let binary = cargo_bin("wisetree");
         let script = format!(
@@ -318,6 +349,7 @@ mod unix_shutdown {
 
     #[test]
     fn wrapper_under_bash_subshell_exits_promptly_after_terminal_close() -> io::Result<()> {
+        let binary = cargo_bin("wisetree");
         let mut session = spawn_wrapper_via_bash()?;
         // The wisetree menu renders into the bash session's tty. Wait for
         // it to appear so we know the binary actually started.
@@ -347,6 +379,44 @@ mod unix_shutdown {
             "bash-wrapped wisetree lingered too long after terminal close: {:?}",
             started.elapsed()
         );
+
+        // Bash dying isn't enough — the *wisetree* process must also exit.
+        // The user-visible bug is wisetree orphans alive at 1% CPU after
+        // the terminal closes, even when bash itself is gone. pgrep gives
+        // us the ground truth about leftover wisetree processes.
+        let leftover = wait_for_wisetree_orphans_to_die(&binary, Duration::from_secs(3));
+        assert!(
+            leftover.is_empty(),
+            "wisetree orphan(s) survived bash exit: {leftover:?}"
+        );
+        Ok(())
+    }
+
+    /// Two back-to-back bash-wrapped invocations, mirroring the user's
+    /// reproduction (Cmd+W after the first run, then `wisetree` again, then
+    /// Cmd+W again). Each iteration must leave zero orphans behind.
+    #[test]
+    fn back_to_back_bash_wrapped_invocations_leave_no_orphans() -> io::Result<()> {
+        let binary = cargo_bin("wisetree");
+        for iteration in 0..2 {
+            let mut session = spawn_wrapper_via_bash()?;
+            let _ = wait_for_tty_bytes(&mut session, b"Dashboard", Duration::from_secs(5))?;
+            let _ = unsafe {
+                libc::write(
+                    session.master.as_raw_fd(),
+                    b"\x1b[B\r".as_ptr().cast::<libc::c_void>(),
+                    4,
+                )
+            };
+            thread::sleep(Duration::from_millis(300));
+            drop(session.master);
+            let _ = wait_for_exit(&mut session.child, Duration::from_secs(5))?;
+            let leftover = wait_for_wisetree_orphans_to_die(&binary, Duration::from_secs(3));
+            assert!(
+                leftover.is_empty(),
+                "iteration {iteration}: wisetree orphan(s) survived: {leftover:?}"
+            );
+        }
         Ok(())
     }
 }

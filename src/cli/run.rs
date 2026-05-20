@@ -71,10 +71,18 @@ fn run_tui(parsed: ParsedArgs) -> Result<ExitCode, anyhow::Error> {
 
     let runtime = build_tui_runtime()?;
 
-    let selected_path = runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let app = App::new(parsed.mode, parsed.is_from_wrapper);
         app.run().await
-    })?;
+    });
+
+    // Always shut the runtime down with a bounded timeout — even on error.
+    // `Runtime::drop` waits indefinitely for spawn_blocking tasks, so an
+    // unfinished filesystem/clipboard job on the error path could wedge us
+    // here forever.
+    shutdown_tui_runtime(runtime);
+
+    let selected_path = result?;
 
     if parsed.is_from_wrapper {
         if let Some(path) = selected_path {
@@ -87,8 +95,6 @@ fn run_tui(parsed: ParsedArgs) -> Result<ExitCode, anyhow::Error> {
             let _ = out.flush();
         }
     }
-
-    shutdown_tui_runtime(runtime);
 
     Ok(ExitCode::SUCCESS)
 }

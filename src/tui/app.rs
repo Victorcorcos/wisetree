@@ -2557,9 +2557,43 @@ fn install_termination_listener() -> Arc<AtomicBool> {
 /// syscall that never returns" — exactly the state where flag-based
 /// shutdown can't run. `_exit` is async-signal-safe and terminates the
 /// process synchronously inside the handler.
+///
+/// When `WISETREE_DEBUG_WATCHDOG=1` is set we also `write(2)` a fixed marker
+/// to `/tmp/wisetree_watchdog.log` *before* exiting. That lets us tell
+/// post-mortem whether SIGHUP ever reached the process — if the log has
+/// "sighup-received" but the process is still alive, something between
+/// delivery and `_exit` is broken; if there's no marker, SIGHUP was never
+/// delivered in the first place.
+#[cfg(unix)]
+static SIGHUP_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 #[cfg(unix)]
 fn install_raw_sighup_exit() {
+    if std::env::var_os("WISETREE_DEBUG_WATCHDOG").is_some() {
+        let path =
+            std::ffi::CString::new("/tmp/wisetree_watchdog.log").expect("static path has no NUL");
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                0o644,
+            )
+        };
+        if fd >= 0 {
+            SIGHUP_LOG_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     extern "C" fn sighup_exit(_sig: libc::c_int) {
+        let fd = SIGHUP_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
+        if fd >= 0 {
+            let msg = b"sighup-received\n";
+            // `write(2)` is async-signal-safe. We can't format the pid in
+            // here without violating that, so the watchdog logs the pid at
+            // startup; the user can correlate via timestamps.
+            unsafe {
+                let _ = libc::write(fd, msg.as_ptr().cast::<libc::c_void>(), msg.len());
+            }
+        }
         unsafe { libc::_exit(0) }
     }
     unsafe {
@@ -2607,9 +2641,9 @@ fn install_orphan_watchdog() -> Arc<AtomicBool> {
     {
         let original_ppid = unsafe { libc::getppid() };
         let debug = std::env::var_os("WISETREE_DEBUG_WATCHDOG").is_some();
-        let flag = flag.clone();
+        let tokio_flag = flag.clone();
         tokio::spawn(async move {
-            let mut log = WatchdogLog::open(debug);
+            let mut log = WatchdogLog::open(debug, "tokio");
             log.write(format_args!(
                 "start pid={} ppid={original_ppid} sid={} pgrp={}",
                 std::process::id(),
@@ -2630,7 +2664,7 @@ fn install_orphan_watchdog() -> Arc<AtomicBool> {
                         "tripped on tick {tick}: {:?}",
                         probe.dead_reason()
                     ));
-                    flag.store(true, Ordering::Relaxed);
+                    tokio_flag.store(true, Ordering::Relaxed);
                     break;
                 }
             }
@@ -2644,6 +2678,44 @@ fn install_orphan_watchdog() -> Arc<AtomicBool> {
             log.write(format_args!("hard _exit(0)"));
             unsafe { libc::_exit(0) };
         });
+
+        // Belt-and-suspenders: an OS-thread watchdog that runs the same
+        // probes outside of tokio. The tokio task can be starved if the
+        // runtime ends up wedged (no worker available, blocking task
+        // monopolizing the executor, etc.). A bare std::thread runs on its
+        // own kernel-scheduled thread and is independent of tokio's state.
+        // First watchdog to detect death wins.
+        let os_flag = flag.clone();
+        std::thread::Builder::new()
+            .name("wisetree-watchdog".into())
+            .spawn(move || {
+                let mut log = WatchdogLog::open(debug, "os");
+                log.write(format_args!(
+                    "start pid={} ppid={original_ppid}",
+                    std::process::id()
+                ));
+                let mut tick = 0u32;
+                loop {
+                    std::thread::sleep(Duration::from_millis(200));
+                    tick += 1;
+                    let probe = TtyProbe::sample(original_ppid);
+                    if debug {
+                        log.write(format_args!("tick {tick}: {probe:?}"));
+                    }
+                    if probe.dead_reason().is_some() {
+                        log.write(format_args!(
+                            "tripped on tick {tick}: {:?}",
+                            probe.dead_reason()
+                        ));
+                        os_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                log.write(format_args!("hard _exit(0)"));
+                unsafe { libc::_exit(0) };
+            })
+            .expect("spawning the OS watchdog thread should not fail");
     }
     flag
 }
@@ -2705,11 +2777,12 @@ impl TtyProbe {
 #[cfg(unix)]
 struct WatchdogLog {
     file: Option<std::fs::File>,
+    tag: &'static str,
 }
 
 #[cfg(unix)]
 impl WatchdogLog {
-    fn open(enabled: bool) -> Self {
+    fn open(enabled: bool, tag: &'static str) -> Self {
         let file = if enabled {
             std::fs::OpenOptions::new()
                 .create(true)
@@ -2719,7 +2792,7 @@ impl WatchdogLog {
         } else {
             None
         };
-        Self { file }
+        Self { file, tag }
     }
 
     fn write(&mut self, args: std::fmt::Arguments) {
@@ -2727,7 +2800,7 @@ impl WatchdogLog {
             return;
         };
         use std::io::Write;
-        let _ = writeln!(file, "[{}] {args}", std::process::id());
+        let _ = writeln!(file, "[{} {}] {args}", std::process::id(), self.tag);
         let _ = file.flush();
     }
 }
