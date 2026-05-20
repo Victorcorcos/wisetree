@@ -3197,9 +3197,7 @@ fn fold_path(path: &str) -> String {
 /// One-line label describing how the update-PR pipeline ended. Written to
 /// the AI Activity log header so a grep over `~/.wisetree/logs/` can
 /// recover the original failure mode without re-running the pipeline.
-fn log_status_for_update_pr_result(
-    result: &Result<UpdatePrSuccess, UpdatePrFailure>,
-) -> String {
+fn log_status_for_update_pr_result(result: &Result<UpdatePrSuccess, UpdatePrFailure>) -> String {
     use crate::services::UpdatePullRequestOutcome;
     match result {
         Ok(s) => match &s.outcome {
@@ -3211,9 +3209,7 @@ fn log_status_for_update_pr_result(
             UpdatePullRequestOutcome::MergedWithAiResolution { model_label } => {
                 format!("MergedWithAiResolution ({model_label})")
             }
-            UpdatePullRequestOutcome::DiscardedAfterReview => {
-                "DiscardedAfterReview".to_string()
-            }
+            UpdatePullRequestOutcome::DiscardedAfterReview => "DiscardedAfterReview".to_string(),
             UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
                 format!("AiUnavailable ({} conflict(s))", conflicts.len())
             }
@@ -4687,10 +4683,7 @@ mod tests {
     #[test]
     fn ai_failure_hint_falls_back_to_generic_switch_suggestion() {
         let hint = ai_failure_hint("something exploded internally");
-        assert!(
-            hint.contains("Pick another free model"),
-            "got: {hint}"
-        );
+        assert!(hint.contains("Pick another free model"), "got: {hint}");
     }
 
     #[test]

@@ -3590,7 +3590,10 @@ mod tests {
     #[test]
     fn extract_opencode_stream_error_falls_back_to_top_level_message_field() {
         let stdout = "{\"type\":\"error\",\"message\":\"boom\"}\n";
-        assert_eq!(extract_opencode_stream_error(stdout).as_deref(), Some("boom"));
+        assert_eq!(
+            extract_opencode_stream_error(stdout).as_deref(),
+            Some("boom")
+        );
     }
 
     #[test]
