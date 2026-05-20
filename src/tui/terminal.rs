@@ -330,9 +330,18 @@ pub fn clear_wrapper_for_shell(terminal: &mut WrapperTerminal) -> io::Result<()>
     clear_terminal_for_app(terminal)
 }
 
+/// Drop raw mode without sending any terminal escape sequences.
+///
+/// Used when the terminal already disappeared: writing cleanup sequences to a
+/// dead tty can block long enough for Terminal.app to feel frozen.
+pub fn leave_raw_mode_only() -> io::Result<()> {
+    let _ = disable_raw_mode();
+    Ok(())
+}
+
 /// Best-effort cleanup. Safe to call even if `enter` was never invoked.
 pub fn restore() -> io::Result<()> {
-    let _ = disable_raw_mode();
+    let _ = leave_raw_mode_only();
     let mut stdout = io::stdout();
     let _ = crossterm::execute!(&mut stdout, DisableMouseCapture);
     let mut backend = AdaptiveBackend::new(io::stdout());
@@ -344,7 +353,7 @@ pub fn restore() -> io::Result<()> {
 
 /// Best-effort cleanup for wrapper mode.
 pub fn restore_wrapper_tty() -> io::Result<()> {
-    let _ = disable_raw_mode();
+    let _ = leave_raw_mode_only();
     if let Ok(mut tty) = OpenOptions::new().write(true).open(TTY_PATH) {
         let _ = crossterm::execute!(&mut tty, DisableMouseCapture);
     }
