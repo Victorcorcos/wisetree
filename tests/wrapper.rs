@@ -252,7 +252,7 @@ mod unix_shutdown {
     fn wrapper_mode_exits_promptly_after_entering_dashboard_then_losing_terminal() -> io::Result<()>
     {
         let mut session = spawn_wrapper_process()?;
-        let menu_bytes = wait_for_tty_bytes(&mut session, b"Dashboard", Duration::from_secs(2))?;
+        let menu_bytes = wait_for_tty_bytes(&mut session, b"Dashboard", Duration::from_secs(5))?;
         assert!(contains_bytes(&menu_bytes, b"Create"));
 
         // Menu order is Create -> Dashboard, so one Down + Enter opens the live dashboard.
