@@ -2251,6 +2251,10 @@ async fn run_command(
 ) -> std::result::Result<String, String> {
     let mut cmd = Command::new(binary);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Tie child lifetime to ours: dashboard PR refreshes fire `gh` / `git`
+    // on a 30s loop. If wisetree gets torn down between iterations we don't
+    // want the in-flight subprocess to outlive us as a zombie.
+    cmd.kill_on_drop(true);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -2921,6 +2925,7 @@ async fn run_shell_command_tool(
     cmd.arg("-lc")
         .arg(command)
         .current_dir(cwd)
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -2979,7 +2984,10 @@ async fn run_command_streamed(
     progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
 ) -> std::result::Result<String, String> {
     let mut cmd = Command::new(binary);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
