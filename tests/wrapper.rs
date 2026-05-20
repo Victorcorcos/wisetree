@@ -83,7 +83,7 @@ mod unix_shutdown {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut winsize,
+                &winsize,
             )
         };
         if result != 0 {
@@ -110,7 +110,7 @@ mod unix_shutdown {
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) == -1 {
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -336,7 +336,7 @@ mod unix_shutdown {
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) == -1 {
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
