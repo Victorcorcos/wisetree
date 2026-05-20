@@ -2834,7 +2834,7 @@ fn devtty_open_succeeds() -> bool {
     // which would disarm the watchdog by stalling its 200ms tick.
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
     if fd < 0 {
-        let e = unsafe { *libc::__error() };
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         // ENXIO = session has no controlling terminal. That's the only
         // "real" death signal. Other errors (EACCES, EINTR, EMFILE) are
         // transient or environmental and should NOT trip the watchdog.
@@ -2865,7 +2865,7 @@ fn stdin_pgrp_unavailable() -> bool {
     if pgrp >= 0 {
         return false;
     }
-    let err = unsafe { *libc::__error() };
+    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     matches!(err, libc::ENOTTY | libc::ENXIO | libc::EBADF)
 }
 
