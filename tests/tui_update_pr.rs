@@ -63,15 +63,10 @@ fn configure_identity(cwd: &Path) {
     git(cwd, &["config", "user.name", "Wisetree Test"]);
 }
 
-<<<<<<< HEAD
 fn install_pre_push_hook(cwd: &Path, body: &str) {
     let hook = cwd.join(".git").join("hooks").join("pre-push");
     fs::write(&hook, body).unwrap();
     make_executable(&hook);
-=======
-fn sh_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
->>>>>>> upstream/main
 }
 
 /// Build the standard fixture:
@@ -175,13 +170,6 @@ impl Fixture {
         stub
     }
 
-    fn write_resolved_readme_stub(&self) -> PathBuf {
-        let repo = sh_quote(&self.src);
-        self.write_gemini_stub(&format!(
-            "#!/bin/sh\nset -e\nrepo={repo}\nprintf 'resolved\\n' > \"$repo/README.md\"\ngit -C \"$repo\" add -- README.md\n",
-        ))
-    }
-
     fn service(&self) -> DashboardService {
         DashboardService::new(self.src.clone(), DashboardConfig::default()).with_cache_path(None)
     }
@@ -281,16 +269,10 @@ async fn pipeline_returns_merged_awaiting_review_when_ai_writes_a_fix() {
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
 
-<<<<<<< HEAD
     // Stub opencode: write a resolved file and stage it.
     let stub = fx
         .write_ai_stub("#!/bin/sh\nset -e\nif [ \"$1\" = \"--version\" ]; then echo \"opencode-stub 1.0.0\"; exit 0; fi\nprintf 'resolved\\n' > README.md\ngit add README.md\n");
     let service = fx.service().with_ai_binary(stub);
-=======
-    // Stub gemini: write a resolved file and stage it.
-    let stub = fx.write_resolved_readme_stub();
-    let service = fx.service().with_gemini_binary(stub);
->>>>>>> upstream/main
 
     let outcome = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
@@ -350,14 +332,9 @@ async fn push_after_review_pushes_the_merge_commit_and_returns_merged_with_ai_re
     git(&fx.src, &["commit", "-q", "-m", "feat edit"]);
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
-<<<<<<< HEAD
     let stub = fx
         .write_ai_stub("#!/bin/sh\nset -e\nif [ \"$1\" = \"--version\" ]; then echo \"opencode-stub 1.0.0\"; exit 0; fi\nprintf 'resolved\\n' > README.md\ngit add README.md\n");
     let service = fx.service().with_ai_binary(stub);
-=======
-    let stub = fx.write_resolved_readme_stub();
-    let service = fx.service().with_gemini_binary(stub);
->>>>>>> upstream/main
     let _initial = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
         .await
@@ -443,14 +420,9 @@ async fn discard_after_review_resets_to_pre_merge_state() {
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     let pre_merge_head = git_output(&fx.src, &["rev-parse", "HEAD"]);
     fx.advance_main("README.md", "main side\n");
-<<<<<<< HEAD
     let stub = fx
         .write_ai_stub("#!/bin/sh\nset -e\nif [ \"$1\" = \"--version\" ]; then echo \"opencode-stub 1.0.0\"; exit 0; fi\nprintf 'resolved\\n' > README.md\ngit add README.md\n");
     let service = fx.service().with_ai_binary(stub);
-=======
-    let stub = fx.write_resolved_readme_stub();
-    let service = fx.service().with_gemini_binary(stub);
->>>>>>> upstream/main
     let _initial = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
         .await
