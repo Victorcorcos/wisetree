@@ -286,6 +286,44 @@ Dashboard sub-fields:
 | `dashboard.refreshIntervalMs` | `number` | `3000` | Poll interval in milliseconds, clamped to `500..60000` when loaded. |
 | `dashboard.showPullRequests` | `boolean` | `false` | Enables `gh pr list` enrichment when the GitHub CLI is installed. |
 | `dashboard.columns` | `string[]` | `["branch", "status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. |
+| `dashboard.useAi.model` | `string` | `"opencode/minimax-m2.5-free"` | AI backend used to resolve merge conflicts during **Update Pull Request**. Currently only **MiniMax M2.5 Free** (provider `opencode`) is exposed; unknown ids are reset to the default on load. |
+
+### AI Merge Conflict Resolution (Optional)
+
+When the **Update Pull Request** flow detects merge conflicts, Wisetree hands the resolution off to the [opencode](https://opencode.ai) CLI running a configurable model. The default backend is the free **MiniMax M2.5** model from OpenCode Zen — no API key, no credit card. The merge prompt and tool instructions live in `prompts/merger.md`.
+
+**1. Install opencode**
+
+```bash
+# macOS / Linux
+curl -fsSL https://opencode.ai/install | bash
+
+# or via npm
+npm install -g opencode-ai@latest
+```
+
+**2. Sign in once**
+
+```bash
+opencode auth login
+```
+
+Pick **OpenCode Zen** from the provider list. A short signup grants free access to MiniMax M2.5; the credentials persist at `~/.local/share/opencode/auth.json` and never expire under normal use.
+
+**3. Verify**
+
+```bash
+opencode --version
+opencode run --model opencode/minimax-m2.5-free "say hi"
+```
+
+**4. Switch models (optional)**
+
+Edit `dashboard.useAi.model` in `~/.wisetree/settings.json` or in the per-repo `.wisetree.json`. The settings screen also lets you cycle the available models with `Enter`.
+
+**Failure behaviour**
+
+If `opencode` isn't on `$PATH` or the user is not signed in, Wisetree aborts the in-progress merge, restores the worktree to a clean state, and surfaces an `opencode CLI not found — run 'opencode auth login' and try again.` toast. No half-applied merges ever land on disk.
 
 # 📟 Wisetree CLI
 
