@@ -2696,6 +2696,12 @@ fn install_raw_sighup_exit() {
                 let _ = libc::write(fd, msg.as_ptr().cast::<libc::c_void>(), msg.len());
             }
         }
+        // Best-effort terminal restoration from inside a signal handler.
+        // Only async-signal-safe syscalls — no crossterm, no mutexes.
+        // Even if the terminal is gone these calls fail silently. When the
+        // terminal is alive (SIGHUP was delivered by something other than
+        // the tab closing) this is what keeps mouse-tracking from leaking.
+        restore_terminal_async_signal_safe();
         unsafe { libc::_exit(0) }
     }
     unsafe {
@@ -2754,6 +2760,7 @@ fn install_orphan_watchdog() -> Arc<AtomicBool> {
             ));
 
             let mut tick = 0u32;
+            let mut consecutive_trips = 0u32;
             loop {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 tick += 1;
@@ -2762,12 +2769,31 @@ fn install_orphan_watchdog() -> Arc<AtomicBool> {
                     log.write(format_args!("tick {tick}: {probe:?}"));
                 }
                 if probe.dead_reason().is_some() {
+                    consecutive_trips += 1;
+                    // Require two consecutive failed ticks before we commit
+                    // to shutdown. Single-tick blips happen when a child
+                    // process (e.g. opencode forking out to git or to its
+                    // own model client) briefly perturbs our process tree
+                    // or contends for the controlling terminal. Two ticks
+                    // = ~400ms of confirmed badness, which is still well
+                    // under the original closed-terminal recovery target.
+                    if consecutive_trips < 2 {
+                        if debug {
+                            log.write(format_args!(
+                                "transient trip on tick {tick}: {:?} (waiting for confirmation)",
+                                probe.dead_reason()
+                            ));
+                        }
+                        continue;
+                    }
                     log.write(format_args!(
                         "tripped on tick {tick}: {:?}",
                         probe.dead_reason()
                     ));
                     tokio_flag.store(true, Ordering::Relaxed);
                     break;
+                } else {
+                    consecutive_trips = 0;
                 }
             }
             // Hard exit fallback. The cooperative shutdown needs a beat to
@@ -2776,8 +2802,15 @@ fn install_orphan_watchdog() -> Arc<AtomicBool> {
             // `_exit(0)` directly: `std::process::exit` / `libc::exit` would
             // run atexit handlers that flush stdio (= write to the dead pty),
             // which re-wedges us for ~60s until the kernel times the slave out.
+            //
+            // Right before `_exit`, restore the terminal so the user's shell
+            // isn't left in raw mode + SGR mouse tracking. Without this, a
+            // watchdog trip during opencode (or any other false-positive)
+            // leaves the parent terminal spewing `<ESC>[<button;col;row>M`
+            // on every mouse move and unable to echo input properly.
             tokio::time::sleep(Duration::from_millis(500)).await;
             log.write(format_args!("hard _exit(0)"));
+            restore_terminal_async_signal_safe();
             unsafe { libc::_exit(0) };
         });
 
@@ -2797,6 +2830,7 @@ fn install_orphan_watchdog() -> Arc<AtomicBool> {
                     std::process::id()
                 ));
                 let mut tick = 0u32;
+                let mut consecutive_trips = 0u32;
                 loop {
                     std::thread::sleep(Duration::from_millis(200));
                     tick += 1;
@@ -2805,22 +2839,107 @@ fn install_orphan_watchdog() -> Arc<AtomicBool> {
                         log.write(format_args!("tick {tick}: {probe:?}"));
                     }
                     if probe.dead_reason().is_some() {
+                        consecutive_trips += 1;
+                        if consecutive_trips < 2 {
+                            if debug {
+                                log.write(format_args!(
+                                    "transient trip on tick {tick}: {:?} (waiting for confirmation)",
+                                    probe.dead_reason()
+                                ));
+                            }
+                            continue;
+                        }
                         log.write(format_args!(
                             "tripped on tick {tick}: {:?}",
                             probe.dead_reason()
                         ));
                         os_flag.store(true, Ordering::Relaxed);
                         break;
+                    } else {
+                        consecutive_trips = 0;
                     }
                 }
                 std::thread::sleep(Duration::from_millis(500));
                 log.write(format_args!("hard _exit(0)"));
+                restore_terminal_async_signal_safe();
                 unsafe { libc::_exit(0) };
             })
             .expect("spawning the OS watchdog thread should not fail");
     }
     flag
 }
+
+/// Best-effort terminal restoration that bypasses crossterm and any other
+/// machinery that might touch a Mutex, the heap, or stdio.
+///
+/// Used right before `libc::_exit(0)` in the watchdog paths and from the
+/// SIGHUP signal handler. Every call here is async-signal-safe per POSIX
+/// (`open`, `write`, `close`, `tcgetattr`, `tcsetattr`, `ioctl`) so the
+/// signal-handler path is reentrancy-safe.
+///
+/// Why this matters: `_exit(2)` skips libc atexit handlers, which means
+/// crossterm's `DisableMouseCapture` + `disable_raw_mode` calls in our
+/// normal cleanup never run. Without this helper, every watchdog-driven
+/// exit leaves the parent terminal in SGR mouse-tracking mode (`?1006`)
+/// — the user sees `<ESC>[<button;col;row>M` coordinates leaking onto
+/// their prompt on every mouse move, and the terminal becomes unusable
+/// until they close the tab.
+///
+/// What we restore:
+///   - `?1006l` SGR mouse mode off
+///   - `?1003l` any-event mouse off
+///   - `?1002l` button-event mouse off
+///   - `?1000l` basic mouse off
+///   - `?25h`   show cursor
+///   - `\x1b[0m` reset SGR attributes
+///   - `tcsetattr` with ICANON|ECHO|ISIG set, raw flags cleared — so the
+///     user's shell prompt echoes input again.
+///
+/// All writes go to `/dev/tty` directly (opened O_WRONLY|O_NONBLOCK) so
+/// we never block on a dead pty slave. If `/dev/tty` itself is gone
+/// (the terminal really did disappear) the writes fail silently — that's
+/// fine, the terminal can't be restored anyway.
+#[cfg(unix)]
+fn restore_terminal_async_signal_safe() {
+    // Disable mouse tracking + show cursor + reset attrs. SGR `?1006` is
+    // the form Terminal.app / iTerm2 / Ghostty advertise on every mouse
+    // move when raw + mouse capture is on; clearing all of `1000/1002/
+    // 1003/1006` covers every flavor we may have enabled.
+    const RESTORE_SEQ: &[u8] =
+        b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m";
+    let path = c"/dev/tty";
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+    if fd >= 0 {
+        unsafe {
+            let _ = libc::write(
+                fd,
+                RESTORE_SEQ.as_ptr().cast::<libc::c_void>(),
+                RESTORE_SEQ.len(),
+            );
+            let _ = libc::close(fd);
+        }
+    }
+
+    // Best-effort cooked-mode restore directly on STDIN_FILENO. We don't
+    // have access to the original termios crossterm stored (and reading
+    // from its OnceLock from a signal handler would be unsafe), so we
+    // reconstruct a sensible cooked state from the *current* termios:
+    // re-enable canonical mode, echo, signal generation, output post-
+    // processing, and CR/NL translation — the flags `enable_raw_mode`
+    // turns off.
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0 {
+            termios.c_iflag |= libc::ICRNL | libc::IXON | libc::BRKINT;
+            termios.c_oflag |= libc::OPOST;
+            termios.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
+            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_terminal_async_signal_safe() {}
 
 /// Snapshot of every signal we know how to test for "the terminal that
 /// owned us is gone." Each field captures whether one independent probe
