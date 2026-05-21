@@ -2,8 +2,8 @@
 //!
 //! Every test stands up its own temp git repository — and, where the
 //! pipeline needs to push, a sibling bare repo that serves as `origin`
-//! and (sometimes) `upstream`. The `gemini` binary is also stubbed via
-//! `with_gemini_binary` so each test has full control over how the AI
+//! and (sometimes) `upstream`. The `opencode` binary is stubbed via
+//! `with_opencode_binary` so each test has full control over how the AI
 //! resolution step behaves.
 
 use std::fs;
@@ -67,13 +67,19 @@ fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
+fn ai_config() -> DashboardConfig {
+    let mut cfg = DashboardConfig::default();
+    cfg.use_ai = "anthropic/claude-sonnet-4-5".to_string();
+    cfg
+}
+
 /// Build the standard fixture:
 ///
 /// ```text
 /// parent/
 ///   origin.git        bare repo with one commit on `main`
 ///   src/              worktree cloned from origin
-///   bin/gemini        (optional) stub gemini binary
+///   bin/opencode      (optional) stub opencode binary
 /// ```
 struct Fixture {
     _parent: TempDir,
@@ -161,8 +167,8 @@ impl Fixture {
         git_output(&scratch, &["rev-parse", "HEAD"])
     }
 
-    fn write_gemini_stub(&self, body: &str) -> PathBuf {
-        let stub = self.bin.join("gemini");
+    fn write_opencode_stub(&self, body: &str) -> PathBuf {
+        let stub = self.bin.join("opencode");
         fs::write(&stub, body).unwrap();
         make_executable(&stub);
         stub
@@ -170,13 +176,17 @@ impl Fixture {
 
     fn write_resolved_readme_stub(&self) -> PathBuf {
         let repo = sh_quote(&self.src);
-        self.write_gemini_stub(&format!(
+        self.write_opencode_stub(&format!(
             "#!/bin/sh\nset -e\nrepo={repo}\nprintf 'resolved\\n' > \"$repo/README.md\"\ngit -C \"$repo\" add -- README.md\n",
         ))
     }
 
     fn service(&self) -> DashboardService {
         DashboardService::new(self.src.clone(), DashboardConfig::default()).with_cache_path(None)
+    }
+
+    fn ai_service(&self) -> DashboardService {
+        DashboardService::new(self.src.clone(), ai_config()).with_cache_path(None)
     }
 }
 
@@ -185,11 +195,11 @@ impl Fixture {
 #[tokio::test]
 async fn pipeline_returns_already_up_to_date_when_branch_matches_base() {
     let fx = Fixture::new();
-    // Point `gemini` at a stub that exists so we don't fall through to
+    // Point `opencode` at a stub that exists so we don't fall through to
     // the host PATH if anything goes wrong; but it should never run on
     // the up-to-date path.
-    let stub = fx.write_gemini_stub("#!/bin/sh\nexit 0\n");
-    let service = fx.service().with_gemini_binary(stub);
+    let stub = fx.write_opencode_stub("#!/bin/sh\nexit 0\n");
+    let service = fx.ai_service().with_opencode_binary(stub);
 
     let outcome = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
@@ -208,8 +218,8 @@ async fn pipeline_returns_already_up_to_date_when_branch_matches_base() {
 async fn pipeline_returns_merged_cleanly_when_no_conflicts() {
     let fx = Fixture::new();
     fx.advance_main("FEATURE.md", "doc\n");
-    let stub = fx.write_gemini_stub("#!/bin/sh\nexit 0\n");
-    let service = fx.service().with_gemini_binary(stub);
+    let stub = fx.write_opencode_stub("#!/bin/sh\nexit 0\n");
+    let service = fx.ai_service().with_opencode_binary(stub);
 
     let outcome = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
@@ -227,7 +237,43 @@ async fn pipeline_returns_merged_cleanly_when_no_conflicts() {
 }
 
 #[tokio::test]
-async fn pipeline_returns_gemini_missing_when_binary_is_unavailable() {
+async fn pipeline_returns_conflicts_require_ai_when_use_ai_is_blank() {
+    let fx = Fixture::new();
+    // Conflict: same file edited on both sides.
+    fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
+    git(&fx.src, &["add", "README.md"]);
+    git(&fx.src, &["commit", "-q", "-m", "feat edit"]);
+    git(&fx.src, &["push", "-q", "origin", "feat"]);
+    fx.advance_main("README.md", "main side\n");
+
+    // No opencode override needed: use_ai is blank, so opencode is never
+    // invoked.
+    let service = fx.service();
+
+    let outcome = service
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .await
+        .expect("update should succeed");
+
+    match outcome {
+        UpdatePullRequestOutcome::ConflictsRequireAi { conflicts } => {
+            assert!(
+                conflicts.iter().any(|f| f == "README.md"),
+                "expected README.md among {conflicts:?}"
+            );
+        }
+        other => panic!("expected ConflictsRequireAi, got {other:?}"),
+    }
+
+    let status = git_output(&fx.src, &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "expected clean tree after abort, got: {status}"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_returns_ai_unavailable_when_opencode_binary_is_missing() {
     let fx = Fixture::new();
     // Create a conflict: same file edited on both sides.
     fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
@@ -236,9 +282,9 @@ async fn pipeline_returns_gemini_missing_when_binary_is_unavailable() {
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
 
-    // Point gemini at a path that doesn't exist.
-    let nope = fx.bin.join("gemini-not-here");
-    let service = fx.service().with_gemini_binary(nope);
+    // Point opencode at a path that doesn't exist.
+    let nope = fx.bin.join("opencode-not-here");
+    let service = fx.ai_service().with_opencode_binary(nope);
 
     let outcome = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
@@ -246,13 +292,13 @@ async fn pipeline_returns_gemini_missing_when_binary_is_unavailable() {
         .expect("update should succeed");
 
     match outcome {
-        UpdatePullRequestOutcome::GeminiMissing { conflicts } => {
+        UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
             assert!(
                 conflicts.iter().any(|f| f == "README.md"),
                 "expected README.md among {conflicts:?}"
             );
         }
-        other => panic!("expected GeminiMissing, got {other:?}"),
+        other => panic!("expected AiUnavailable, got {other:?}"),
     }
 
     // The merge should have been aborted — worktree is clean again.
@@ -264,7 +310,7 @@ async fn pipeline_returns_gemini_missing_when_binary_is_unavailable() {
 }
 
 #[tokio::test]
-async fn pipeline_returns_merged_awaiting_review_when_gemini_writes_a_fix() {
+async fn pipeline_returns_ai_resolution_complete_when_opencode_writes_a_fix() {
     let fx = Fixture::new();
     let repo_readme = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
     let repo_readme_before = fs::read_to_string(&repo_readme).unwrap();
@@ -274,57 +320,40 @@ async fn pipeline_returns_merged_awaiting_review_when_gemini_writes_a_fix() {
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
 
-    // Stub gemini: write a resolved file and stage it.
+    // Stub opencode: write a resolved file and stage it.
     let stub = fx.write_resolved_readme_stub();
-    let service = fx.service().with_gemini_binary(stub);
+    let service = fx.ai_service().with_opencode_binary(stub);
 
     let outcome = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
         .await
         .expect("update should succeed");
 
-    match outcome {
-        UpdatePullRequestOutcome::MergedAwaitingReview {
-            commit_sha,
-            stat,
-            diff,
-        } => {
-            assert!(
-                !commit_sha.is_empty() && commit_sha != "HEAD",
-                "expected real SHA, got `{commit_sha}`"
-            );
-            assert!(
-                stat.contains("README.md"),
-                "expected README.md in stat, got: {stat}"
-            );
-            assert!(
-                diff.contains("README.md"),
-                "expected README.md in full diff, got: {diff}"
-            );
-        }
-        other => panic!("expected MergedAwaitingReview, got {other:?}"),
-    }
-    // Tree must be clean after commit; push must NOT have happened yet.
-    let status = git_output(&fx.src, &["status", "--porcelain"]);
-    assert!(status.is_empty(), "expected clean tree, got: {status}");
+    assert_eq!(outcome, UpdatePullRequestOutcome::AiResolutionComplete);
+
+    // Tree must still show the staged/in-progress merge — opencode resolved
+    // the conflict but commit hasn't been issued yet.
     let head_msg = git_output(&fx.src, &["log", "-1", "--pretty=%s"]);
-    assert_eq!(head_msg, "Merging and solving conflicts");
-    // origin/feat should NOT include the merge commit yet.
+    assert_eq!(
+        head_msg, "feat edit",
+        "HEAD must still be the feat-edit commit; the merge commit comes from commit_and_push_ai_merge"
+    );
+    // origin/feat should NOT include any merge commit yet.
     let local_head = git_output(&fx.src, &["rev-parse", "HEAD"]);
     let remote_head = git_output(&fx.src, &["rev-parse", "origin/feat"]);
-    assert_ne!(
+    assert_eq!(
         local_head, remote_head,
-        "push must not have run yet; local and origin/feat must differ"
+        "push must not have run yet; local and origin/feat must match"
     );
     let repo_readme_after = fs::read_to_string(&repo_readme).unwrap();
     assert_eq!(
         repo_readme_after, repo_readme_before,
-        "Gemini stub must not touch the repository README"
+        "opencode stub must not touch the repository README"
     );
 }
 
 #[tokio::test]
-async fn push_after_review_pushes_the_merge_commit_and_returns_merged_with_ai_resolution() {
+async fn commit_and_push_ai_merge_pushes_and_returns_merged_with_ai_resolution() {
     let fx = Fixture::new();
     fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
     git(&fx.src, &["add", "README.md"]);
@@ -332,28 +361,32 @@ async fn push_after_review_pushes_the_merge_commit_and_returns_merged_with_ai_re
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
     let stub = fx.write_resolved_readme_stub();
-    let service = fx.service().with_gemini_binary(stub);
+    let service = fx.ai_service().with_opencode_binary(stub);
     let _initial = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
         .await
         .expect("update should succeed");
 
     let outcome = service
-        .push_after_review(fx.src.to_str().unwrap())
+        .commit_and_push_ai_merge(
+            fx.src.to_str().unwrap(),
+            "origin/main",
+            "anthropic/claude-sonnet-4-5",
+        )
         .await
-        .expect("push_after_review should succeed");
+        .expect("commit_and_push_ai_merge should succeed");
     assert_eq!(outcome, UpdatePullRequestOutcome::MergedWithAiResolution);
 
     let local_head = git_output(&fx.src, &["rev-parse", "HEAD"]);
     let remote_head = git_output(&fx.src, &["rev-parse", "origin/feat"]);
     assert_eq!(
         local_head, remote_head,
-        "push_after_review must advance origin/feat to local HEAD"
+        "commit_and_push_ai_merge must advance origin/feat to local HEAD"
     );
 }
 
 #[tokio::test]
-async fn discard_after_review_resets_to_pre_merge_state() {
+async fn abort_ai_merge_resets_to_pre_merge_state() {
     let fx = Fixture::new();
     fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
     git(&fx.src, &["add", "README.md"]);
@@ -362,32 +395,32 @@ async fn discard_after_review_resets_to_pre_merge_state() {
     let pre_merge_head = git_output(&fx.src, &["rev-parse", "HEAD"]);
     fx.advance_main("README.md", "main side\n");
     let stub = fx.write_resolved_readme_stub();
-    let service = fx.service().with_gemini_binary(stub);
+    let service = fx.ai_service().with_opencode_binary(stub);
     let _initial = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
         .await
         .expect("update should succeed");
 
     let outcome = service
-        .discard_after_review(fx.src.to_str().unwrap())
+        .abort_ai_merge(fx.src.to_str().unwrap())
         .await
-        .expect("discard_after_review should succeed");
-    assert_eq!(outcome, UpdatePullRequestOutcome::DiscardedAfterReview);
+        .expect("abort_ai_merge should succeed");
+    assert_eq!(outcome, UpdatePullRequestOutcome::DiscardedAiMerge);
 
     let now_head = git_output(&fx.src, &["rev-parse", "HEAD"]);
     assert_eq!(
         now_head, pre_merge_head,
-        "discard must reset HEAD back to the pre-merge commit"
+        "abort must reset HEAD back to the pre-merge commit"
     );
     let status = git_output(&fx.src, &["status", "--porcelain"]);
     assert!(
         status.is_empty(),
-        "discard must leave a clean tree, got: {status}"
+        "abort must leave a clean tree, got: {status}"
     );
 }
 
 #[tokio::test]
-async fn pipeline_returns_merge_failed_when_gemini_leaves_conflicts_unresolved() {
+async fn pipeline_returns_merge_failed_when_opencode_exits_non_zero() {
     let fx = Fixture::new();
     fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
     git(&fx.src, &["add", "README.md"]);
@@ -395,9 +428,15 @@ async fn pipeline_returns_merge_failed_when_gemini_leaves_conflicts_unresolved()
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
 
-    // Stub gemini that exits 0 but doesn't touch the conflicted file.
-    let stub = fx.write_gemini_stub("#!/bin/sh\nexit 0\n");
-    let service = fx.service().with_gemini_binary(stub);
+    // Stub opencode that fails. The pipeline must surface this as
+    // `MergeFailed` (with an "opencode failed" prefix) and abort the
+    // merge cleanly so the worktree isn't left in a half-merged state.
+    // `--version` (used by the availability check) must succeed; only
+    // the `run` subcommand fails so we exercise the opencode-error path.
+    let stub = fx.write_opencode_stub(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '0.0.0-stub'; exit 0; fi\necho 'AI rate-limited' >&2\nexit 1\n",
+    );
+    let service = fx.ai_service().with_opencode_binary(stub);
 
     let outcome = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
@@ -407,8 +446,8 @@ async fn pipeline_returns_merge_failed_when_gemini_leaves_conflicts_unresolved()
     match outcome {
         UpdatePullRequestOutcome::MergeFailed(msg) => {
             assert!(
-                msg.contains("unresolved"),
-                "expected unresolved message, got: {msg}"
+                msg.contains("opencode"),
+                "expected opencode-failure message, got: {msg}"
             );
         }
         other => panic!("expected MergeFailed, got {other:?}"),
@@ -425,7 +464,7 @@ async fn pipeline_returns_merge_failed_when_gemini_leaves_conflicts_unresolved()
 async fn pipeline_returns_push_failed_when_remote_is_unwritable() {
     let fx = Fixture::new();
     fx.advance_main("FEATURE.md", "doc\n");
-    let stub = fx.write_gemini_stub("#!/bin/sh\nexit 0\n");
+    let stub = fx.write_opencode_stub("#!/bin/sh\nexit 0\n");
 
     // Repoint `origin` to a non-existent URL so the push fails with a
     // clear stderr while fetch can still try (it'll also fail then —
@@ -443,7 +482,7 @@ async fn pipeline_returns_push_failed_when_remote_is_unwritable() {
         &["remote", "set-url", "origin", "/var/empty/nope.git"],
     );
 
-    let service = fx.service().with_gemini_binary(stub);
+    let service = fx.ai_service().with_opencode_binary(stub);
     let outcome = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
         .await

@@ -742,49 +742,37 @@ impl App {
                     tx.clone(),
                 );
             }
-            UpdateAction::PushReviewed => {
+            UpdateAction::AiComplete => {
+                let dashboard_config = self.current_dashboard_config();
+                let git_root = self.git_root.clone();
                 let Some(screen) = self.update_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
-                screen.start_post_review(true);
-                kick_off_push_after_review(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
+                let use_ai = dashboard_config.use_ai.clone();
+                let base_ref = request
+                    .base_ref
+                    .clone()
+                    .unwrap_or_else(|| "upstream/main".to_string());
+                screen.set_phase_message("Committing and pushing AI resolution...");
+                kick_off_commit_and_push(
+                    git_root,
+                    dashboard_config,
                     request,
+                    use_ai,
+                    base_ref,
                     tx.clone(),
                 );
             }
-            UpdateAction::DiscardReviewed => {
+            UpdateAction::AiCancel => {
+                let dashboard_config = self.current_dashboard_config();
+                let git_root = self.git_root.clone();
                 let Some(screen) = self.update_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
-                screen.start_post_review(false);
-                kick_off_discard_after_review(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
-                    request,
-                    tx.clone(),
-                );
-            }
-            UpdateAction::ReviewBackedOut => {
-                // Surface the SHA in a Warning toast so the user has a
-                // concrete handle for cleaning up the local commit later.
-                let sha = self
-                    .update_pr
-                    .as_ref()
-                    .and_then(|s| s.review_commit_sha().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "HEAD".to_string());
-                self.show_toast(
-                    ToastVariant::Warning,
-                    format!(
-                        "Merge commit `{sha}` is still local on this branch. \
-                         Push it or run `git reset --hard HEAD~1` to discard."
-                    ),
-                );
-                self.update_pr = None;
-                self.enter_screen(Screen::Dashboard, tx);
+                screen.set_phase_message("Aborting merge and discarding AI changes...");
+                kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
             }
         }
     }
@@ -1552,10 +1540,12 @@ impl App {
                 );
                 self.set_update_pr_phase_label("Pushing merge to origin...");
             }
-            UpdatePhase::ConflictsDetected { count, model } => {
+            UpdatePhase::ConflictsDetected { count } => {
                 self.show_toast(
                     ToastVariant::Warning,
-                    format!("PR #{number}: {count} conflicted file(s) — handing off to {model}."),
+                    format!(
+                        "PR #{number}: {count} conflicted file(s) — handing off to opencode."
+                    ),
                 );
                 if let Some(screen) = self.update_pr.as_mut() {
                     screen.mark_ai_active();
@@ -1629,20 +1619,16 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         use crate::services::UpdatePullRequestOutcome;
-        // `MergedAwaitingReview` does NOT close the screen — it transitions
-        // it into the review step. All other variants are terminal.
+        // `AiResolutionComplete` does NOT close the screen — it flips the
+        // AI Activity panel into the Complete/Cancel decision step. All
+        // other variants are terminal.
         if let Ok(UpdatePrSuccess {
-            outcome:
-                UpdatePullRequestOutcome::MergedAwaitingReview {
-                    commit_sha,
-                    stat,
-                    diff,
-                },
+            outcome: UpdatePullRequestOutcome::AiResolutionComplete,
             ..
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                screen.present_review(commit_sha.clone(), stat.clone(), diff.clone());
+                screen.mark_ai_done();
                 return;
             }
         }
@@ -1668,31 +1654,39 @@ impl App {
                     self.show_toast(
                         ToastVariant::Success,
                         format!(
-                            "Pull Request #{number} updated (Gemini-resolved, reviewed) \
-                             and pushed."
+                            "Pull Request #{number} updated (opencode-resolved) and pushed."
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::MergedAwaitingReview { .. } => {
+                UpdatePullRequestOutcome::AiResolutionComplete => {
                     // Handled by the early-return branch above; this arm
                     // only fires if `update_pr` was already torn down.
                 }
-                UpdatePullRequestOutcome::DiscardedAfterReview => {
+                UpdatePullRequestOutcome::DiscardedAiMerge => {
                     self.show_toast(
                         ToastVariant::Warning,
                         format!(
-                            "Discarded AI merge commit for PR #{number}. \
+                            "Discarded AI merge for PR #{number}. \
                              Branch is back where it was before the update."
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::GeminiMissing { conflicts } => {
+                UpdatePullRequestOutcome::ConflictsRequireAi { .. } => {
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        "Conflicts found, please resolve them locally or setup `useAi` \
+                         setting so we can solve conflicts + merge via AI."
+                            .to_string(),
+                    );
+                }
+                UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
                     let count = conflicts.len();
                     self.show_toast(
                         ToastVariant::Error,
                         format!(
                             "Merge has {count} conflicted file(s). \
-                             Gemini is unavailable — sign in with Gemini CLI or set `GEMINI_API_KEY` / `GOOGLE_API_KEY`, then retry. \
+                             `opencode` CLI is not on PATH — install it from \
+                             https://opencode.ai then retry. \
                              Pull Request #{number} was NOT updated."
                         ),
                     );
@@ -1725,11 +1719,11 @@ impl App {
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::DiscardFailed(detail) => {
+                UpdatePullRequestOutcome::AbortFailed(detail) => {
                     self.show_toast(
                         ToastVariant::Error,
                         format!(
-                            "Failed to discard AI merge for PR #{number}: {}",
+                            "Failed to abort AI merge for PR #{number}: {}",
                             truncate_error(&detail)
                         ),
                     );
@@ -3139,10 +3133,12 @@ fn kick_off_update_branch(
     });
 }
 
-fn kick_off_push_after_review(
+fn kick_off_commit_and_push(
     git_root: Option<String>,
     config: DashboardConfig,
     request: UpdatePullRequestRequest,
+    use_ai: String,
+    base_ref: String,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let number = request.number;
@@ -3153,17 +3149,16 @@ fn kick_off_push_after_review(
         })));
         return;
     };
-    let base_ref = request
-        .base_ref
-        .clone()
-        .unwrap_or_else(|| "(unknown)".to_string());
+    let report_base = base_ref.clone();
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service.push_after_review(&request.worktree_path).await;
+        let result = service
+            .commit_and_push_ai_merge(&request.worktree_path, &base_ref, &use_ai)
+            .await;
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
-                base_ref,
+                base_ref: report_base,
                 outcome,
             }),
             Err(err) => Err(UpdatePrFailure {
@@ -3175,7 +3170,7 @@ fn kick_off_push_after_review(
     });
 }
 
-fn kick_off_discard_after_review(
+fn kick_off_abort_ai_merge(
     git_root: Option<String>,
     config: DashboardConfig,
     request: UpdatePullRequestRequest,
@@ -3185,7 +3180,7 @@ fn kick_off_discard_after_review(
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
             number,
-            message: "Could not resolve git root for discard.".to_string(),
+            message: "Could not resolve git root for abort.".to_string(),
         })));
         return;
     };
@@ -3195,7 +3190,7 @@ fn kick_off_discard_after_review(
         .unwrap_or_else(|| "(unknown)".to_string());
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service.discard_after_review(&request.worktree_path).await;
+        let result = service.abort_ai_merge(&request.worktree_path).await;
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
@@ -4461,6 +4456,7 @@ mod tests {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
                     columns: vec!["branch".into(), "status".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4469,6 +4465,7 @@ mod tests {
                     refresh_interval_ms: 6000,
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4488,6 +4485,7 @@ mod tests {
                 refresh_interval_ms: 7000,
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into(), "pull_request".into()],
+                use_ai: String::new(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -4517,6 +4515,7 @@ mod tests {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4535,6 +4534,7 @@ mod tests {
                 refresh_interval_ms: 8000,
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into()],
+                use_ai: String::new(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 

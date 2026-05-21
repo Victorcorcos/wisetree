@@ -941,13 +941,15 @@ pub enum DashboardField {
     RefreshIntervalMs,
     ShowPullRequests,
     Columns,
+    UseAi,
 }
 
 impl DashboardField {
-    pub const ALL: [DashboardField; 3] = [
+    pub const ALL: [DashboardField; 4] = [
         DashboardField::RefreshIntervalMs,
         DashboardField::ShowPullRequests,
         DashboardField::Columns,
+        DashboardField::UseAi,
     ];
 
     pub fn label(self) -> &'static str {
@@ -955,6 +957,7 @@ impl DashboardField {
             DashboardField::RefreshIntervalMs => "refreshIntervalMs",
             DashboardField::ShowPullRequests => "showPullRequests",
             DashboardField::Columns => "columns",
+            DashboardField::UseAi => "useAi",
         }
     }
 
@@ -964,6 +967,9 @@ impl DashboardField {
             DashboardField::ShowPullRequests => "Press Enter to toggle",
             DashboardField::Columns => {
                 "Comma-separated: branch, status, ahead_behind, last_commit, pull_request"
+            }
+            DashboardField::UseAi => {
+                "Provider/model for opencode (e.g. anthropic/claude-sonnet-4-5). Blank disables AI."
             }
         }
     }
@@ -996,6 +1002,7 @@ impl DashboardEditor {
             config.refresh_interval_ms.to_string(),
             config.show_pull_requests.to_string(),
             config.columns.join(", "),
+            config.use_ai.clone(),
         ];
         let statuses = vec![DashboardRectStatus::Saved; values.len()];
         Self {
@@ -1060,10 +1067,13 @@ impl DashboardEditor {
             .collect();
         let (columns, _warnings) = normalize_dashboard_columns(&raw_columns);
 
+        let use_ai = self.values[3].trim().to_string();
+
         DashboardConfig {
             refresh_interval_ms,
             show_pull_requests,
             columns,
+            use_ai,
         }
     }
 }
@@ -4209,6 +4219,7 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
         DashboardField::RefreshIntervalMs => "Refresh interval in ms (5000..60000)",
         DashboardField::ShowPullRequests => "true or false",
         DashboardField::Columns => "branch, status, ahead_behind, last_commit, pull_request",
+        DashboardField::UseAi => "provider/model (e.g. anthropic/claude-sonnet-4-5)",
     };
     InputPrompt::new("")
         .with_placeholder(placeholder)
