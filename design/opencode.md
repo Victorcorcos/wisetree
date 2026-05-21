@@ -138,22 +138,10 @@ Format: `{icon} {ToolName} {short args}` — single line.
 - Color: `fg = textMuted` (`#75715e`) once the call has completed, which
   is the dominant state in the transcript. Active calls flash in `text`
   until they finish.
-- The icon and the tool-name keep that muted color. The argument
-  fragment then runs through wisetree's hand-rolled
-  `highlight_tool_args` tokenizer (deliberate divergence from opencode,
-  which leaves arguments gray) so the BG_ALT code-block row reads as
-  syntax-highlighted Monokai instead of dead gray text. Token map:
-  - `<tag>` / `</tag>` markers → `syntaxKeyword` (`#f92672`).
-  - `"…"` / `'…'` strings      → `syntaxString` (`#e6db74`).
-  - `// …` trailing comments    → `syntaxComment` (`#75715e`).
-  - Numbers, percentages, ≥7-char hex SHAs → `syntaxNumber` (`#ae81ff`).
-  - File paths (any token containing `/`) → `syntaxType` (`#66d9ef`).
-  - Keywords (`use`, `fn`, `let`, …) and arrow/comparison operators
-    (`->`, `=>`, `==`, …) → `syntaxKeyword` (`#f92672`).
-  - `UPPER_SNAKE_CASE` constants and `ident(`/`ident!` call/macro forms
-    → `syntaxFunction` (`#a6e22e`).
-  - `PascalCase` identifiers   → `syntaxType` (`#66d9ef`).
-  - Everything else            → `syntaxVariable`/`foreground`.
+- The icon and the text share the same muted color — opencode does **not**
+  syntax-highlight tool arguments inline. Quoted strings, flags, paths,
+  and numbers all read in muted gray. (This is intentional: the tool
+  output renders separately when expanded.)
 - Tool name appears in **title case** (e.g. `Read`, `Grep`, `Skill`,
   `Bash`) — never lowercase, never with parentheses.
 - The argument fragment uses a tool-specific shape (also from opencode):

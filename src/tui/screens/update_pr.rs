@@ -718,8 +718,7 @@ impl UpdatePullRequestScreen {
                     0,
                 )
             } else {
-                let mut expanded =
-                    render_ai_activity_log(&self.ai_log, inner.width.saturating_sub(1));
+                let mut expanded = render_ai_activity_log(&self.ai_log);
                 let total = expanded.len();
                 let max_scroll = total.saturating_sub(visible_rows) as u16;
                 let scroll_up = self.ai_scroll.min(max_scroll) as usize;
@@ -967,7 +966,7 @@ fn write_ai_activity_log(
     }
 }
 
-fn ai_activity_event_to_lines(event: &AiActivityEvent, panel_width: u16) -> Vec<Line<'static>> {
+fn ai_activity_event_to_lines(event: &AiActivityEvent) -> Vec<Line<'static>> {
     let muted = Style::default().fg(colors::opencode::COMMENT);
     let lines = match event {
         AiActivityEvent::SessionStart { model } => vec![Line::from(vec![
@@ -976,7 +975,7 @@ fn ai_activity_event_to_lines(event: &AiActivityEvent, panel_width: u16) -> Vec<
             Span::styled(model.clone(), Style::default().fg(colors::opencode::FG)),
         ])],
         AiActivityEvent::AssistantText { content } => render_assistant_text(content),
-        AiActivityEvent::Thinking { content } => render_thinking_text(content, panel_width),
+        AiActivityEvent::Thinking { content } => render_thinking_text(content),
         AiActivityEvent::ToolCall { tool_name, summary } => {
             vec![render_tool_line(tool_name, summary, muted, None)]
         }
@@ -1042,15 +1041,11 @@ fn ai_activity_event_to_lines(event: &AiActivityEvent, panel_width: u16) -> Vec<
     cap_event_lines(lines)
 }
 
-/// Render a single-line `<icon> <ToolName> <args>` tool entry on the
-/// `BG_ALT` (#1e1f1c) code-block surface. The icon and tool name stay
-/// in the caller-supplied `style` (muted gray for success, pink for
-/// errors) so the row still reads as part of the tool group, while the
-/// args portion is tokenized through `highlight_tool_args` and rendered
-/// with the Monokai palette from `design/opencode.md` — paths cyan,
-/// strings yellow, numbers/SHAs purple, UPPER_SNAKE constants green,
-/// XML-like `<tag>` markers pink, etc. Errors skip the tokenizer so the
-/// whole row keeps screaming in `PINK`.
+/// Render a single-line `<icon> <ToolName> <args>` tool entry in
+/// opencode's muted style. `icon_override` lets the error variant of
+/// `ToolResult` swap the icon for `✗`. The row is rendered with the
+/// `BG_ALT` (#1e1f1c) backdrop so it visually reads as a code block, in
+/// line with opencode's TUI.
 fn render_tool_line(
     tool_name: &str,
     args: &str,
@@ -1066,219 +1061,9 @@ fn render_tool_line(
     let trimmed_args = args.trim();
     if !trimmed_args.is_empty() {
         spans.push(Span::styled(" ".to_string(), style));
-        let highlight = style.fg != Some(colors::opencode::PINK);
-        if highlight {
-            spans.extend(highlight_tool_args(trimmed_args, colors::opencode::BG_ALT));
-        } else {
-            spans.push(Span::styled(trimmed_args.to_string(), style));
-        }
+        spans.push(Span::styled(trimmed_args.to_string(), style));
     }
     Line::from(spans)
-}
-
-/// Tokenize a tool-args string into Monokai-coloured `Span`s sitting on
-/// the `bg` backdrop. This is a deliberately small hand-written
-/// tokenizer — opencode tool args are short prose-like strings (paths,
-/// SHAs, XML-tagged Read summaries, occasional snippets of source) so a
-/// real parser would be overkill. Token rules, mirroring the table in
-/// `design/opencode.md`:
-///
-/// - `<tag>` / `</tag>` markers → `PINK` (syntax keyword/operator).
-/// - Quoted strings `"…"` / `'…'`             → `YELLOW`.
-/// - Line comments `// …` (to end of input)   → `COMMENT`.
-/// - Decimal numbers, percentages, SHAs       → `PURPLE`.
-/// - File paths (token containing `/`)        → `CYAN`.
-/// - Rust/JS keywords (`use`, `fn`, `let`, …) → `PINK`.
-/// - `UPPER_SNAKE_CASE` constants             → `GREEN`.
-/// - Identifiers followed by `(` or `!`       → `GREEN` (function/macro).
-/// - `PascalCase` identifiers                 → `CYAN` (type).
-/// - Comparison/arrow operators (`->`, `=>`, `==`, …) → `PINK`.
-/// - Everything else                          → `FG`.
-fn highlight_tool_args(args: &str, bg: ratatui::style::Color) -> Vec<Span<'static>> {
-    use colors::opencode::{COMMENT, CYAN, FG, PINK, PURPLE, YELLOW};
-
-    let styled = |s: String, fg: ratatui::style::Color| -> Span<'static> {
-        Span::styled(s, Style::default().fg(fg).bg(bg))
-    };
-
-    let chars: Vec<char> = args.chars().collect();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-
-        if c.is_whitespace() {
-            let start = i;
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            spans.push(styled(chars[start..i].iter().collect(), FG));
-            continue;
-        }
-
-        if c == '<' {
-            if let Some(end) = scan_xml_tag(&chars, i) {
-                spans.push(styled(chars[i..=end].iter().collect(), PINK));
-                i = end + 1;
-                continue;
-            }
-        }
-
-        if c == '"' || c == '\'' {
-            let end = scan_quoted(&chars, i, c);
-            spans.push(styled(chars[i..=end].iter().collect(), YELLOW));
-            i = end + 1;
-            continue;
-        }
-
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
-            spans.push(styled(chars[i..].iter().collect(), COMMENT));
-            break;
-        }
-
-        if c.is_ascii_digit() {
-            let start = i;
-            while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '%')
-            {
-                i += 1;
-            }
-            spans.push(styled(chars[start..i].iter().collect(), PURPLE));
-            continue;
-        }
-
-        if is_ident_char(c) {
-            let start = i;
-            while i < chars.len() && is_ident_char(chars[i]) {
-                i += 1;
-            }
-
-            if i < chars.len() && chars[i] == '/' {
-                while i < chars.len()
-                    && (is_ident_char(chars[i])
-                        || chars[i] == '/'
-                        || chars[i] == '.'
-                        || chars[i] == '-')
-                {
-                    i += 1;
-                }
-                spans.push(styled(chars[start..i].iter().collect(), CYAN));
-                continue;
-            }
-
-            let word: String = chars[start..i].iter().collect();
-            let color = classify_word(&word, chars.get(i).copied());
-            spans.push(styled(word, color));
-            continue;
-        }
-
-        let start = i;
-        while i < chars.len()
-            && !chars[i].is_whitespace()
-            && !is_ident_char(chars[i])
-            && chars[i] != '<'
-            && chars[i] != '"'
-            && chars[i] != '\''
-            && !(chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '/')
-        {
-            i += 1;
-        }
-        if i == start {
-            i += 1;
-            continue;
-        }
-        let punct: String = chars[start..i].iter().collect();
-        let color = match punct.as_str() {
-            "->" | "=>" | "==" | "!=" | "<=" | ">=" | "&&" | "||" | "=" | "+" | "-" | "!"
-            | "::" => PINK,
-            _ => FG,
-        };
-        spans.push(styled(punct, color));
-    }
-
-    spans
-}
-
-fn is_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-fn scan_xml_tag(chars: &[char], start: usize) -> Option<usize> {
-    let mut j = start + 1;
-    if j < chars.len() && chars[j] == '/' {
-        j += 1;
-    }
-    let name_start = j;
-    while j < chars.len()
-        && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '-')
-    {
-        j += 1;
-    }
-    if j > name_start && j < chars.len() && chars[j] == '>' {
-        Some(j)
-    } else {
-        None
-    }
-}
-
-fn scan_quoted(chars: &[char], start: usize, quote: char) -> usize {
-    let mut j = start + 1;
-    while j < chars.len() && chars[j] != quote {
-        if chars[j] == '\\' && j + 1 < chars.len() {
-            j += 2;
-        } else {
-            j += 1;
-        }
-    }
-    j.min(chars.len() - 1)
-}
-
-fn classify_word(word: &str, next: Option<char>) -> ratatui::style::Color {
-    use colors::opencode::{CYAN, FG, GREEN, PINK, PURPLE};
-
-    const KEYWORDS: &[&str] = &[
-        "use", "fn", "let", "mut", "pub", "mod", "if", "else", "match", "for", "while", "loop",
-        "return", "break", "continue", "in", "as", "struct", "enum", "impl", "trait", "where",
-        "self", "Self", "super", "crate", "extern", "unsafe", "async", "await", "move", "static",
-        "const", "type", "dyn", "ref", "import", "from", "export", "function", "var", "class",
-        "def", "lambda", "yield",
-    ];
-    const LITERALS: &[&str] = &["true", "false", "None", "Some", "Ok", "Err", "null", "nil"];
-
-    if KEYWORDS.contains(&word) {
-        return PINK;
-    }
-    if LITERALS.contains(&word) {
-        return PURPLE;
-    }
-
-    if word.len() >= 7
-        && word.chars().all(|c| c.is_ascii_hexdigit())
-        && word.chars().any(|c| c.is_ascii_digit())
-        && word.chars().any(|c| c.is_ascii_alphabetic())
-    {
-        return PURPLE;
-    }
-
-    if matches!(next, Some('(') | Some('!')) {
-        return GREEN;
-    }
-
-    let all_upper = word
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if all_upper && word.chars().any(|c| c.is_ascii_uppercase()) && word.len() > 1 {
-        return GREEN;
-    }
-
-    if let Some(first) = word.chars().next() {
-        if first.is_ascii_uppercase() && word.chars().any(|c| c.is_ascii_lowercase()) {
-            return CYAN;
-        }
-    }
-
-    FG
 }
 
 /// Title-case the tool name to match opencode's `Read`, `Grep`,
@@ -1343,13 +1128,13 @@ enum AiActivityLayoutKind {
     Raw,
 }
 
-fn render_ai_activity_log(events: &[AiActivityEvent], panel_width: u16) -> Vec<Line<'static>> {
+fn render_ai_activity_log(events: &[AiActivityEvent]) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut previous_kind = None;
 
     for event in events {
         let kind = ai_activity_layout_kind(event);
-        let mut lines = ai_activity_event_to_lines(event, panel_width);
+        let mut lines = ai_activity_event_to_lines(event);
         if lines.is_empty() {
             continue;
         }
@@ -1599,10 +1384,7 @@ fn split_enumeration(input: &str) -> Option<(u32, &str)> {
 /// the body uses regular markdown styling on top of the muted base
 /// (so `**bold**` titles still appear in orange, `*italic*` in yellow,
 /// `` `code` `` in green). No emoji.
-const THINKING_MAX_WIDTH: u16 = 120;
-const THINKING_MIN_WIDTH: u16 = 60;
-
-fn render_thinking_text(content: &str, panel_width: u16) -> Vec<Line<'static>> {
+fn render_thinking_text(content: &str) -> Vec<Line<'static>> {
     let label = Span::styled(
         "Thinking:".to_string(),
         Style::default()
@@ -1611,39 +1393,23 @@ fn render_thinking_text(content: &str, panel_width: u16) -> Vec<Line<'static>> {
     );
     let space = Span::styled(" ".to_string(), Style::default().fg(colors::opencode::FG));
 
-    // Body lines are rendered inside a centered block of clamped width.
-    // render_ai_activity_log prepends 2 spaces to every non-empty line, so
-    // subtract 2 from the pre-padding to keep the block visually centered.
-    let block_width = panel_width.min(THINKING_MAX_WIDTH).max(THINKING_MIN_WIDTH);
-    let left_pad = panel_width.saturating_sub(block_width) / 2;
-    let body_pad = " ".repeat(left_pad.saturating_sub(2) as usize);
-
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut first = true;
     for raw_line in content.split('\n') {
         if raw_line.trim().is_empty() {
-            out.push(Line::default());
+            out.push(Line::default().alignment(Alignment::Center));
             first = false;
             continue;
         }
-        if first {
+        let (prefix, is_title) = if first {
             first = false;
-            out.push(
-                render_thinking_markdown_line(
-                    raw_line,
-                    Some(vec![label.clone(), space.clone()]),
-                    true,
-                )
-                .alignment(Alignment::Center),
-            );
+            (Some(vec![label.clone(), space.clone()]), true)
         } else {
-            let prefix = if body_pad.is_empty() {
-                None
-            } else {
-                Some(vec![Span::raw(body_pad.clone())])
-            };
-            out.push(render_thinking_markdown_line(raw_line, prefix, false));
-        }
+            (None, false)
+        };
+        out.push(
+            render_thinking_markdown_line(raw_line, prefix, is_title).alignment(Alignment::Center),
+        );
     }
     if out.is_empty() {
         out.push(Line::from(label).alignment(Alignment::Center));
@@ -2226,28 +1992,17 @@ mod tests {
 
     #[test]
     fn tool_call_activity_uses_opencode_muted_style() {
-        let lines = ai_activity_event_to_lines(
-            &AiActivityEvent::ToolCall {
-                tool_name: "run_shell_command".to_string(),
-                summary: "git diff -- src/main.rs --color=never".to_string(),
-            },
-            80,
-        );
+        let lines = ai_activity_event_to_lines(&AiActivityEvent::ToolCall {
+            tool_name: "run_shell_command".to_string(),
+            summary: "git diff -- src/main.rs --color=never".to_string(),
+        });
         let line = lines.first().expect("at least one line");
 
-        // Icon + tool name (the first two spans) stay in the muted
-        // opencode colour so the row still reads as part of the tool
-        // group; the args portion is tokenised by `highlight_tool_args`
-        // and will use various Monokai colours.
-        assert_eq!(
-            line.spans[0].style.fg,
-            Some(colors::opencode::COMMENT),
-            "tool icon should be muted: {line:?}"
-        );
-        assert_eq!(
-            line.spans[1].style.fg,
-            Some(colors::opencode::COMMENT),
-            "tool name should be muted: {line:?}"
+        assert!(
+            line.spans
+                .iter()
+                .all(|span| span.style.fg == Some(colors::opencode::COMMENT)),
+            "opencode renders tool calls entirely in textMuted (#75715e): {line:?}"
         );
         assert!(
             line.spans
@@ -2271,52 +2026,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_args_get_monokai_syntax_highlighting() {
-        // `Read <path>...</path> <type>file</type>` is a representative
-        // mix of the tokens `highlight_tool_args` is meant to colour:
-        // XML-like markers (pink), a file path (cyan), the literal `file`
-        // identifier (foreground), all on the BG_ALT backdrop.
-        let lines = ai_activity_event_to_lines(
-            &AiActivityEvent::ToolCall {
-                tool_name: "read".to_string(),
-                summary: "<path>src/main.rs</path> <type>file</type> 42".to_string(),
-            },
-            80,
-        );
-        let line = lines.first().expect("at least one line");
-        let by_text = |needle: &str| {
-            line.spans
-                .iter()
-                .find(|s| s.content.as_ref() == needle)
-                .unwrap_or_else(|| panic!("no span for {needle:?} in {line:?}"))
-        };
-
-        assert_eq!(by_text("<path>").style.fg, Some(colors::opencode::PINK));
-        assert_eq!(by_text("</path>").style.fg, Some(colors::opencode::PINK));
-        assert_eq!(by_text("<type>").style.fg, Some(colors::opencode::PINK));
-        assert_eq!(
-            by_text("src/main.rs").style.fg,
-            Some(colors::opencode::CYAN)
-        );
-        assert_eq!(by_text("42").style.fg, Some(colors::opencode::PURPLE));
-        assert!(
-            line.spans
-                .iter()
-                .all(|span| span.style.bg == Some(colors::opencode::BG_ALT)),
-            "every highlighted span keeps the BG_ALT backdrop: {line:?}"
-        );
-    }
-
-    #[test]
     fn tool_result_error_uses_pink_cross_icon() {
-        let lines = ai_activity_event_to_lines(
-            &AiActivityEvent::ToolResult {
-                tool_name: Some("read".to_string()),
-                status: AiToolResultStatus::Error,
-                detail: "file not found".to_string(),
-            },
-            80,
-        );
+        let lines = ai_activity_event_to_lines(&AiActivityEvent::ToolResult {
+            tool_name: Some("read".to_string()),
+            status: AiToolResultStatus::Error,
+            detail: "file not found".to_string(),
+        });
         let line = lines.first().expect("error tool result line");
         assert!(
             line.spans
@@ -2334,12 +2049,9 @@ mod tests {
 
     #[test]
     fn assistant_text_with_fenced_code_emits_multiple_lines() {
-        let lines = ai_activity_event_to_lines(
-            &AiActivityEvent::AssistantText {
-                content: "Here is the patch:\n```rust\nfn main() {}\nlet x = 1;\n```".to_string(),
-            },
-            80,
-        );
+        let lines = ai_activity_event_to_lines(&AiActivityEvent::AssistantText {
+            content: "Here is the patch:\n```rust\nfn main() {}\nlet x = 1;\n```".to_string(),
+        });
         assert!(
             lines.len() >= 3,
             "expected multi-line output for fenced code, got {} line(s): {lines:?}",
@@ -2349,12 +2061,9 @@ mod tests {
 
     #[test]
     fn thinking_text_wraps_across_newlines() {
-        let lines = ai_activity_event_to_lines(
-            &AiActivityEvent::Thinking {
-                content: "Step one\nStep two".to_string(),
-            },
-            80,
-        );
+        let lines = ai_activity_event_to_lines(&AiActivityEvent::Thinking {
+            content: "Step one\nStep two".to_string(),
+        });
         assert_eq!(
             lines.len(),
             2,
@@ -2384,37 +2093,34 @@ mod tests {
 
     #[test]
     fn ai_activity_log_inserts_opencode_like_blank_lines_between_groups() {
-        let lines = render_ai_activity_log(
-            &[
-                AiActivityEvent::SessionStart {
-                    model: "opencode/minimax-m2.5-free".to_string(),
-                },
-                AiActivityEvent::Thinking {
-                    content: "Investigating the repository.".to_string(),
-                },
-                AiActivityEvent::AssistantText {
-                    content: "I will inspect the README.".to_string(),
-                },
-                AiActivityEvent::ToolCall {
-                    tool_name: "read".to_string(),
-                    summary: "README.md".to_string(),
-                },
-                AiActivityEvent::ToolResult {
-                    tool_name: Some("read".to_string()),
-                    status: AiToolResultStatus::Success,
-                    detail: "ok".to_string(),
-                },
-                AiActivityEvent::Summary {
-                    tool_calls: 1,
-                    duration_ms: 9500,
-                    total_tokens: 42,
-                },
-                AiActivityEvent::Thinking {
-                    content: "Now I can summarize it.".to_string(),
-                },
-            ],
-            80,
-        );
+        let lines = render_ai_activity_log(&[
+            AiActivityEvent::SessionStart {
+                model: "opencode/minimax-m2.5-free".to_string(),
+            },
+            AiActivityEvent::Thinking {
+                content: "Investigating the repository.".to_string(),
+            },
+            AiActivityEvent::AssistantText {
+                content: "I will inspect the README.".to_string(),
+            },
+            AiActivityEvent::ToolCall {
+                tool_name: "read".to_string(),
+                summary: "README.md".to_string(),
+            },
+            AiActivityEvent::ToolResult {
+                tool_name: Some("read".to_string()),
+                status: AiToolResultStatus::Success,
+                detail: "ok".to_string(),
+            },
+            AiActivityEvent::Summary {
+                tool_calls: 1,
+                duration_ms: 9500,
+                total_tokens: 42,
+            },
+            AiActivityEvent::Thinking {
+                content: "Now I can summarize it.".to_string(),
+            },
+        ]);
 
         assert!(
             lines[2].spans.is_empty(),
