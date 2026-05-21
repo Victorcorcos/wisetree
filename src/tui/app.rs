@@ -29,14 +29,15 @@ use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
-    check_for_updates, default_dashboard_warning, detect_shell_integration,
+    check_for_updates, default_dashboard_warning, detect_shell_integration, fetch_opencode_models,
     install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
-    UpdateCheckResult, UpdatePhase, UpdateProgress,
+    DashboardUpdate, DashboardWatch, OpencodeModel, Shell, ShellIntegrationStatus,
+    UpdateBranchOutcome, UpdateCheckResult, UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
+use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryLine, SummaryTone};
 use crate::tui::screens::dashboard::{
@@ -116,6 +117,9 @@ enum AppEvent {
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
     UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
+    /// Result of the background fetch that powers the AI provider/model
+    /// picker. The picker stays in its loading state until this lands.
+    AiModelsFetched(Result<Vec<OpencodeModel>, String>),
 }
 
 struct MergePrDetailsPayload {
@@ -163,6 +167,10 @@ pub struct App {
     merge_pr: Option<MergePullRequestScreen>,
     update_pr: Option<UpdatePullRequestScreen>,
     update_branch: Option<UpdateBranchScreen>,
+    /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
+    /// top of the Settings screen — when active the Settings state is
+    /// preserved so the user lands back on the dashboard editor on exit.
+    ai_model_picker: Option<AiModelPickerScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
     last_rendered_buffer: Option<Buffer>,
@@ -204,6 +212,7 @@ impl App {
             merge_pr: None,
             update_pr: None,
             update_branch: None,
+            ai_model_picker: None,
             shell_integration_status: None,
             toast: ToastState::default(),
             last_rendered_buffer: None,
@@ -485,6 +494,13 @@ impl App {
                     update_branch.render(frame, panel);
                 }
             }
+            Screen::AiModelPicker => {
+                let panel = self.render_framed_panel_fill(frame, area);
+                if let Some(picker) = self.ai_model_picker.as_mut() {
+                    picker.tick = self.tick;
+                    picker.render(frame, panel);
+                }
+            }
         }
     }
 
@@ -684,7 +700,61 @@ impl App {
                     screen.handle_key(key);
                 }
             }
+            Screen::AiModelPicker => self.handle_ai_model_picker_key(key, tx),
         }
+    }
+
+    fn handle_ai_model_picker_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.ai_model_picker.as_mut() {
+            Some(picker) => picker.handle_key(key),
+            None => {
+                self.close_ai_model_picker();
+                return;
+            }
+        };
+
+        match action {
+            AiModelPickerAction::Continue => {}
+            AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
+            AiModelPickerAction::Selected(model) => {
+                let dashboard = self
+                    .settings
+                    .as_mut()
+                    .and_then(|settings| settings.apply_use_ai_selection(model));
+                self.close_ai_model_picker();
+                if let Some(dashboard) = dashboard {
+                    if let Err(err) = self.save_dashboard(dashboard) {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings
+                                .set_error(format!("Failed to save dashboard settings: {err}"));
+                        }
+                    }
+                }
+                let _ = tx;
+            }
+        }
+    }
+
+    /// Push the picker on top of the still-alive Settings screen, kick off the
+    /// background catalogue fetch, and flip the route. The picker reads
+    /// `current_use_ai` so reopening the picker lands on the user's prior
+    /// choice.
+    fn open_ai_model_picker(
+        &mut self,
+        current_use_ai: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.ai_model_picker = Some(AiModelPickerScreen::new(current_use_ai));
+        self.screen = Screen::AiModelPicker;
+        kick_off_fetch_opencode_models(tx.clone());
+    }
+
+    /// Tear down the picker overlay and return to the underlying Settings
+    /// screen. `clear_screen_state` is deliberately *not* called — the
+    /// Settings instance must survive so the dashboard editor remains visible.
+    fn close_ai_model_picker(&mut self) {
+        self.ai_model_picker = None;
+        self.screen = Screen::Settings;
     }
 
     fn handle_merge_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -1180,6 +1250,9 @@ impl App {
                     }
                 }
             }
+            SettingsAction::OpenAiModelPicker(current_use_ai) => {
+                self.open_ai_model_picker(current_use_ai, tx);
+            }
         }
     }
 
@@ -1441,6 +1514,17 @@ impl App {
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
             AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
+            AppEvent::AiModelsFetched(result) => {
+                // The fetch is best-effort: by the time it returns the user may
+                // have already closed the picker. Silently drop the result in
+                // that case — there's nothing to update.
+                if let Some(picker) = self.ai_model_picker.as_mut() {
+                    match result {
+                        Ok(models) => picker.set_models(models),
+                        Err(message) => picker.set_error(message),
+                    }
+                }
+            }
         }
     }
 
@@ -1904,6 +1988,15 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::AiModelPicker => {
+                // The picker is opened as a modal overlay via
+                // `open_ai_model_picker`, not through `enter_screen`. Hitting
+                // this arm means we lost the underlying Settings state — bail
+                // back to the menu rather than render an empty panel.
+                if self.ai_model_picker.is_none() {
+                    self.back_to_menu();
+                }
+            }
         }
 
         if !matches!(screen, Screen::Delete) {
@@ -1927,6 +2020,7 @@ impl App {
         self.merge_pr = None;
         self.update_pr = None;
         self.update_branch = None;
+        self.ai_model_picker = None;
         self.mouse_selection = None;
     }
 
@@ -3029,6 +3123,13 @@ fn kick_off_update_check(tx: mpsc::UnboundedSender<AppEvent>) {
         state.load();
         let result = check_for_updates(VERSION, &mut state, true).await;
         let _ = tx.send(AppEvent::SettingsUpdateChecked(result));
+    });
+}
+
+fn kick_off_fetch_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = fetch_opencode_models().await;
+        let _ = tx.send(AppEvent::AiModelsFetched(result));
     });
 }
 

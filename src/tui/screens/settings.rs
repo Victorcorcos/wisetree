@@ -87,6 +87,10 @@ pub enum SettingsAction {
     /// columns) to the active config file. Invalid numbers or unknown columns
     /// are normalized by the caller.
     SaveDashboard(DashboardConfig),
+    /// Open the fullscreen AI provider/model picker prefilled with the current
+    /// `useAi` value. The caller owns the picker screen and writes the user's
+    /// choice back via `apply_use_ai_selection`.
+    OpenAiModelPicker(String),
     /// Copy the active config from one location to the other.
     CopySettings(CopyDirection),
 }
@@ -1305,6 +1309,23 @@ impl SettingsScreen {
         self.step = SettingsStep::Menu;
     }
 
+    /// Stamp the picked `useAi` value into the still-active dashboard editor
+    /// and return the rebuilt config to be persisted. Unlike
+    /// `mark_dashboard_saved`, this leaves the editor on screen so the user
+    /// sees the new value land green in the `useAi` rectangle.
+    pub fn apply_use_ai_selection(&mut self, value: String) -> Option<DashboardConfig> {
+        let editor = self.dashboard_editor.as_mut()?;
+        let idx = DashboardField::ALL
+            .iter()
+            .position(|f| matches!(f, DashboardField::UseAi))?;
+        editor.values[idx] = value;
+        editor.statuses[idx] = DashboardRectStatus::Saved;
+        let config = editor.build_config();
+        self.config.dashboard = config.clone();
+        self.select = Some(self.build_menu());
+        Some(config)
+    }
+
     pub fn start_checking_updates(&mut self) {
         self.checking_updates = true;
         self.update_result = None;
@@ -2266,12 +2287,20 @@ impl SettingsScreen {
             }
             KeyCode::Enter => match editor.selection {
                 DashboardSelection::Rect(i) => {
-                    if editor.field(i).is_toggle() {
+                    let field = editor.field(i);
+                    if field.is_toggle() {
                         toggle_idx = Some(i);
+                        SettingsAction::Continue
+                    } else if matches!(field, DashboardField::UseAi) {
+                        // The useAi field is selected from a fetched list of
+                        // opencode-known provider/model pairs, not free-typed.
+                        // Surface the current value so the picker pre-selects
+                        // it when the catalogue arrives.
+                        SettingsAction::OpenAiModelPicker(editor.values[i].clone())
                     } else {
                         start_editing = Some(i);
+                        SettingsAction::Continue
                     }
-                    SettingsAction::Continue
                 }
                 DashboardSelection::Save => SettingsAction::SaveDashboard(editor.build_config()),
             },

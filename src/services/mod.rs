@@ -3,10 +3,12 @@
 pub mod app_state;
 pub mod presets;
 pub mod dashboard;
+pub mod opencode_models;
 pub mod shell_integration;
 pub mod update;
 
 pub use app_state::AppStateService;
+pub use opencode_models::{fetch_opencode_models, OpencodeModel};
 pub use dashboard::{
     default_dashboard_warning, is_behind, resolve_base_ref, resolve_dashboard_columns, CheckStatus,
     CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, DashboardService,
