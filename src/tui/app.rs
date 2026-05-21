@@ -2952,7 +2952,6 @@ fn controlling_tty_alive() -> bool {
     true
 }
 
-
 fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let git_root = get_git_root(None).await;
