@@ -171,8 +171,7 @@ impl UpdatePullRequestScreen {
         self.ai_button = AiButton::Complete;
     }
 
-    #[cfg(test)]
-    pub(crate) fn ai_active(&self) -> bool {
+    pub fn ai_active(&self) -> bool {
         self.ai_active
     }
 
