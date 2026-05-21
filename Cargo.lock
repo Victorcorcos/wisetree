@@ -2585,6 +2585,7 @@ dependencies = [
  "dirs",
  "globset",
  "insta",
+ "libc",
  "once_cell",
  "predicates",
  "pulldown-cmark",

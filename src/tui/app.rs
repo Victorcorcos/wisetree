@@ -80,6 +80,12 @@ enum InitPhase {
     Errored,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalExit {
+    Clean,
+    Detached,
+}
+
 enum AppEvent {
     Initialized(Box<InitOutcome>),
     CacheLoaded(Result<crate::files::CacheOverview, String>),
@@ -231,19 +237,27 @@ impl App {
                 )
             })?;
             let result = self.event_loop(&mut terminal).await;
-            // Wrapper mode renders into a fixed bottom viewport on `/dev/tty`.
-            // Clear the screen and reset the cursor so the shell prompt
-            // returns at the top instead of below a block of empty rows.
-            let _ = terminal::clear_wrapper_for_shell(&mut terminal);
-            let _ = terminal::restore_wrapper_tty();
-            let _ = terminal.show_cursor();
+            if matches!(result, Ok(TerminalExit::Clean)) && controlling_tty_alive() {
+                // Wrapper mode renders into a fixed bottom viewport on `/dev/tty`.
+                // Clear the screen and reset the cursor so the shell prompt
+                // returns at the top instead of below a block of empty rows.
+                let _ = terminal::clear_wrapper_for_shell(&mut terminal);
+                let _ = terminal::restore_wrapper_tty();
+                let _ = terminal.show_cursor();
+            } else {
+                let _ = terminal::leave_raw_mode_only();
+            }
             result?;
         } else {
             let mut terminal = terminal::enter()?;
             let result = self.event_loop(&mut terminal).await;
-            let _ = terminal.clear();
-            let _ = terminal::restore();
-            let _ = terminal.show_cursor();
+            if matches!(result, Ok(TerminalExit::Clean)) && controlling_tty_alive() {
+                let _ = terminal.clear();
+                let _ = terminal::restore();
+                let _ = terminal.show_cursor();
+            } else {
+                let _ = terminal::leave_raw_mode_only();
+            }
             result?;
         }
         Ok(self.selected_path.clone())
@@ -252,7 +266,7 @@ impl App {
     async fn event_loop<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut ratatui::Terminal<B>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<TerminalExit> {
         let local = tokio::task::LocalSet::new();
         local.run_until(self.event_loop_inner(terminal)).await
     }
@@ -260,20 +274,37 @@ impl App {
     async fn event_loop_inner<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut ratatui::Terminal<B>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<TerminalExit> {
         let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         kick_off_initialize(tx.clone());
 
         let mut events = EventLoop::new(Duration::from_millis(50));
         let signal_quit = install_termination_listener();
+        let orphan_quit = install_orphan_watchdog();
 
-        while !self.quit_requested && !signal_quit.load(Ordering::Relaxed) {
+        while !self.quit_requested
+            && !signal_quit.load(Ordering::Relaxed)
+            && !orphan_quit.load(Ordering::Relaxed)
+        {
             while let Ok(event) = rx.try_recv() {
                 self.handle_app_event(event, &tx);
             }
             self.poll_dashboard_updates();
 
-            let completed = terminal.draw(|frame| self.draw(frame))?;
+            // The event loop only notices dead stdin inside `next_event()`, but
+            // the render path runs first. If the terminal disappears while a
+            // live screen is repainting (dashboard ticks, mouse movement, etc.),
+            // drawing against the dead tty can spin hard before the watchdog
+            // gets its next 500ms turn.
+            if !controlling_tty_alive() {
+                return Ok(TerminalExit::Detached);
+            }
+
+            let completed = match terminal.draw(|frame| self.draw(frame)) {
+                Ok(completed) => completed,
+                Err(_err) if !controlling_tty_alive() => return Ok(TerminalExit::Detached),
+                Err(err) => return Err(err.into()),
+            };
             self.last_rendered_buffer = Some(completed.buffer.clone());
 
             match events.next_event()? {
@@ -281,9 +312,14 @@ impl App {
                 Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
                 Event::Tick => self.tick = self.tick.wrapping_add(1),
                 Event::Resize(_, _) => {}
+                // The input fd is in POLLHUP — the terminal tab is gone.
+                // Calling crossterm again would wedge us at 100% CPU
+                // inside its `try_read` loop. Break out so the cleanup
+                // path runs and the process exits.
+                Event::TtyDisconnected => return Ok(TerminalExit::Detached),
             }
         }
-        Ok(())
+        Ok(TerminalExit::Clean)
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -2526,27 +2562,43 @@ struct InitOutcome {
     result: Result<WorktreeService, String>,
 }
 
-/// Route SIGHUP (terminal tab closed) and SIGTERM through the normal
-/// shutdown path so `restore()` runs and the tty doesn't get stranded in
-/// raw mode. Without this, closing the tab with Cmd+W kills the process
-/// before cleanup, leaving the parent shell's `dir=$(...)` capture stuck on
-/// a tty with ICANON/ECHO disabled.
+/// Route asynchronous termination signals through the shutdown path.
+///
+/// SIGHUP gets a *raw* sigaction handler that calls `_exit(0)` directly,
+/// bypassing every layer of Rust/tokio cleanup. This is intentional: SIGHUP
+/// arrives exactly when the terminal is being torn down (user closed the
+/// tab), so the controlling tty is already dead. Routing SIGHUP through
+/// tokio's cooperative signal stream means the flag is only consulted on
+/// the next iteration of the main loop — and if the main loop is wedged in
+/// a `write()` to the dead pty slave, that iteration never happens, leaving
+/// `wisetree` pegged as an orphan reparented to launchd.
+///
+/// SIGTERM/SIGINT/SIGQUIT still go through the tokio-driven cooperative
+/// shutdown so external `kill -TERM` / `kill -INT` calls trigger normal
+/// terminal restoration. Those signals arrive while the tty is still alive,
+/// so cleanup has a chance to succeed.
 fn install_termination_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
+        install_raw_sighup_exit();
+
         let flag = flag.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
-            let Ok(mut hup) = signal(SignalKind::hangup()) else {
-                return;
-            };
             let Ok(mut term) = signal(SignalKind::terminate()) else {
                 return;
             };
+            let Ok(mut int) = signal(SignalKind::interrupt()) else {
+                return;
+            };
+            let Ok(mut quit) = signal(SignalKind::quit()) else {
+                return;
+            };
             tokio::select! {
-                _ = hup.recv() => {}
                 _ = term.recv() => {}
+                _ = int.recv() => {}
+                _ = quit.recv() => {}
             }
             flag.store(true, Ordering::Relaxed);
         });
