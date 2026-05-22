@@ -34,6 +34,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::Settings => Some("Settings"),
             Screen::Setup => Some("Setup"),
             Screen::SetupProject => Some("Setup Project Config"),
+            Screen::AiModelPicker => Some("Select AI Provider/Model"),
         }
     }
 

@@ -94,6 +94,13 @@ pub struct DashboardConfig {
 
     #[serde(rename = "columns", default = "default_columns")]
     pub columns: Vec<String>,
+
+    /// Provider/model selector passed to `opencode run -m <value>` when
+    /// resolving merge conflicts (e.g. `anthropic/claude-sonnet-4-5`). When
+    /// empty, AI-assisted conflict resolution is disabled and the user is
+    /// asked to resolve conflicts manually.
+    #[serde(rename = "useAi", default)]
+    pub use_ai: String,
 }
 
 impl Default for DashboardConfig {
@@ -102,6 +109,7 @@ impl Default for DashboardConfig {
             refresh_interval_ms: default_refresh_ms(),
             show_pull_requests: false,
             columns: default_columns(),
+            use_ai: String::new(),
         }
     }
 }

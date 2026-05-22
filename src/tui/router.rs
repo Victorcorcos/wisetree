@@ -16,6 +16,7 @@ pub enum Screen {
     Settings,
     Setup,
     SetupProject,
+    AiModelPicker,
 }
 
 impl Screen {
@@ -42,6 +43,7 @@ impl Screen {
             Self::Settings => "settings",
             Self::Setup => "setup",
             Self::SetupProject => "setup_project",
+            Self::AiModelPicker => "ai_model_picker",
         }
     }
 }

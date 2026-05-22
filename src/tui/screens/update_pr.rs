@@ -1,57 +1,66 @@
-//! Update Pull Request confirmation screen. Four-step state machine:
+//! Update Pull Request confirmation screen. Three-step state machine:
 //!
-//! - `Loading`       : spinner while `App` resolves the base ref against
-//!   the priority list (`upstream/main → upstream/master → origin/main →
+//! - `Loading`  : spinner while `App` resolves the base ref against the
+//!   priority list (`upstream/main → upstream/master → origin/main →
 //!   origin/master`).
-//! - `Confirm`       : details panel on top, `ConfirmDialog` (Yes/No,
-//!   **No** default) on the bottom. Enter on Yes returns
-//!   `UpdateAction::Confirmed`.
-//! - `Updating`      : spinner with a phase-specific label on top
-//!   (driven by `set_phase_message` as the pipeline progresses), plus a
-//!   bordered "AI Activity" panel below that streams the AI subprocess's
+//! - `Confirm`  : details panel on top, `ConfirmDialog` (Yes/No, **No**
+//!   default) on the bottom. Enter on Yes returns `UpdateAction::Confirmed`.
+//! - `Updating` : spinner with a phase-specific label on top, plus a
+//!   bordered "AI Activity" panel that streams the opencode subprocess's
 //!   stdout/stderr lines as they arrive (auto-scrolled to the latest).
-//! - `AwaitingReview`: shown after Gemini resolved conflicts. Renders
-//!   the merge commit SHA on top, the full `git diff HEAD~1 HEAD` in a
-//!   scrollable colorized panel (Up/Down/PgUp/PgDn/Home/End), and the
-//!   Push/Discard `ConfirmDialog` at the bottom (Left/Right toggle,
-//!   default = **Discard**). Push asks the App to run `git push origin
-//!   HEAD`; Discard asks it to run `git reset --hard HEAD~1`.
+//!   Once opencode exits the panel grows a `[ Complete ] [ Cancel ]`
+//!   button row at the bottom; **Complete** commits + pushes the AI
+//!   resolution, **Cancel** aborts the merge.
 //!
 //! Async work is owned by `App`; this screen is purely a presentation
 //! state machine.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use std::path::PathBuf;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status, StatusIndicator,
+    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, PtyView, Status, StatusIndicator,
 };
 
 const UPDATE_LOADING_MESSAGE: &str = "Resolving base ref...";
 const UPDATE_RUNNING_MESSAGE: &str = "Updating pull request...";
-const UPDATE_PUSHING_MESSAGE: &str = "Pushing reviewed merge...";
-const UPDATE_DISCARDING_MESSAGE: &str = "Discarding merge commit...";
 
 /// Hard cap on the number of AI activity lines retained in memory. A
-/// long Gemini run can emit thousands of rows (tool calls, file edits,
+/// long opencode run can emit thousands of rows (tool calls, file edits,
 /// progress dots); we only ever render the bottom slice that fits the
 /// activity panel, so anything older is pure memory pressure.
 const AI_LOG_MAX_LINES: usize = 1024;
+
+/// CSI sequences for PageUp / PageDown forwarded to the embedded opencode
+/// process. Mouse wheel + arrow keys both synthesize these so the user
+/// scrolls opencode's own message buffer (vt100's alt-screen scrollback
+/// is unusable while opencode owns the alternate grid).
+const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
+const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateStep {
     Loading,
     Confirm,
     Updating,
-    AwaitingReview,
-    PostReview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiButton {
+    Complete,
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,31 +68,20 @@ pub enum UpdateAction {
     Continue,
     Cancelled,
     Confirmed,
-    /// User accepted the AI merge during review; App should run push.
-    PushReviewed,
-    /// User rejected the AI merge during review; App should run reset.
-    DiscardReviewed,
-    /// User Esc'd out of the review screen — App should leave the commit
-    /// in place and surface a warning toast so the user can deal with it.
-    ReviewBackedOut,
+    /// User pressed `Complete` after the AI finished — commit + push.
+    AiComplete,
+    /// User pressed `Cancel` after the AI finished — abort merge.
+    AiCancel,
 }
 
 pub struct UpdatePullRequestScreen {
     request: UpdatePullRequestRequest,
     confirm: Option<ConfirmDialog>,
-    review_confirm: Option<ConfirmDialog>,
-    review_commit_sha: Option<String>,
-    review_stat: Option<String>,
-    review_diff: Option<String>,
-    /// Visible scroll offset (in diff lines) for the review panel.
-    /// Clamped against the rendered diff height every frame.
-    review_scroll: u16,
     /// Scroll offset from the bottom of the AI activity log. `0` means
     /// "follow the latest output". When the user wheels upward we increase
     /// this offset and preserve it as new lines arrive so the viewport stays
     /// stable instead of snapping back to the tail.
     ai_scroll: u16,
-    post_review_message: Option<&'static str>,
     /// Label shown next to the spinner during `Updating`. Updated as the
     /// pipeline emits `UpdatePhase` events so the user knows whether
     /// we're fetching, merging, waiting on the AI, or committing.
@@ -97,6 +95,28 @@ pub struct UpdatePullRequestScreen {
     /// AI Activity panel: when `false`, the `Updating` step renders just
     /// the spinner so the panel doesn't appear during clean merges.
     ai_active: bool,
+    /// `true` once opencode has exited and the user is being asked to
+    /// decide on Complete or Cancel.
+    ai_done: bool,
+    /// Currently focused button in the Complete/Cancel pair.
+    ai_button: AiButton,
+    /// Embedded opencode subprocess + vt100 emulator. `Some` once the
+    /// pipeline reached `ConflictsHandedOffToUi` and the App handed us
+    /// the spawn parameters; the PTY is rendered into the AI Activity
+    /// panel and torn down via `Drop` when the screen is replaced.
+    pty: Option<PtyView>,
+    /// Which terminal owns keyboard input while the embedded opencode TUI
+    /// is alive. `false` = outer Wisetree (default), `true` = inner PTY
+    /// so the user can chat with opencode directly. Tab toggles.
+    pty_focused: bool,
+    /// When `Some`, an overlay confirmation modal is open asking the user
+    /// to confirm that the AI resolution is finalized. Reachable from the
+    /// Outer (Wisetree) focus during the streaming phase by pressing
+    /// Enter; the modal swallows keys until the user picks Yes (transition
+    /// to the Complete/Cancel review buttons) or No/Esc (resume the AI
+    /// Activity panel). The embedded opencode PTY keeps running
+    /// underneath either way because `App::tick_pty` ticks every frame.
+    finalize_confirm: Option<ConfirmationModal>,
     error: Option<String>,
     step: UpdateStep,
     pub tick: usize,
@@ -116,16 +136,15 @@ impl UpdatePullRequestScreen {
         Self {
             request,
             confirm,
-            review_confirm: None,
-            review_commit_sha: None,
-            review_stat: None,
-            review_diff: None,
-            review_scroll: 0,
             ai_scroll: 0,
-            post_review_message: None,
             phase_message: UPDATE_RUNNING_MESSAGE.to_string(),
             ai_log: Vec::new(),
             ai_active: false,
+            ai_done: false,
+            ai_button: AiButton::Complete,
+            pty: None,
+            pty_focused: false,
+            finalize_confirm: None,
             error: None,
             step,
             tick: 0,
@@ -166,6 +185,60 @@ impl UpdatePullRequestScreen {
         self.ai_log.clear();
         self.ai_scroll = 0;
         self.ai_active = false;
+        self.ai_done = false;
+        self.ai_button = AiButton::Complete;
+        self.pty = None;
+        self.pty_focused = false;
+        self.finalize_confirm = None;
+    }
+
+    /// Spawn the opencode subprocess inside an embedded PTY and route
+    /// its raw output through vt100 so the user sees the real opencode
+    /// TUI (formatted assistant text, thinking blocks, tool calls)
+    /// inside the AI Activity panel. The App invokes this once the
+    /// service pipeline returns `ConflictsHandedOffToUi`. Failure to
+    /// spawn surfaces as a Notice in the AI log; the user will still see
+    /// the Complete/Cancel buttons once the (empty) PTY is reaped.
+    pub fn spawn_opencode_pty(
+        &mut self,
+        binary: PathBuf,
+        args: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<(String, String)>,
+    ) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+            Ok(pty) => {
+                self.pty = Some(pty);
+            }
+            Err(err) => {
+                self.append_ai_line(AiActivityEvent::Notice {
+                    severity: AiActivitySeverity::Error,
+                    message: format!("Could not spawn opencode in PTY: {err}"),
+                });
+                // No PTY → the AI is effectively done; surface
+                // Complete/Cancel so the user can recover.
+                self.mark_ai_done();
+            }
+        }
+    }
+
+    /// Called every frame by the App. Polls the embedded opencode PTY
+    /// for child exit and resizes the PTY to match the AI Activity
+    /// panel's inner area when it changes. Returns `true` exactly once
+    /// — on the tick where the child transitions to exited — so the App
+    /// can flip the screen into the Complete/Cancel decision step.
+    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> bool {
+        let Some(pty) = self.pty.as_mut() else {
+            return false;
+        };
+        if let Some((rows, cols)) = panel_inner {
+            pty.resize(rows, cols);
+        }
+        if pty.poll_exited() {
+            self.mark_ai_done();
+            return true;
+        }
+        false
     }
 
     /// Flip on the AI Activity panel. Called by the App once the pipeline
@@ -175,13 +248,43 @@ impl UpdatePullRequestScreen {
         self.ai_active = true;
     }
 
-    #[cfg(test)]
-    pub(crate) fn ai_active(&self) -> bool {
+    /// Called by the App once opencode has exited. Surfaces the
+    /// Complete / Cancel button row so the user can commit or abort.
+    ///
+    /// Idempotent on purpose: `tick_pty` polls the PTY every frame and
+    /// `PtyView::poll_exited` returns true on every poll after the child
+    /// has exited (the underlying `done` flag stays set). Without the
+    /// early return, the user's `→` press to focus Cancel would be
+    /// undone the very next tick when this method reset `ai_button`
+    /// back to `Complete`.
+    pub fn mark_ai_done(&mut self) {
+        if self.ai_done {
+            return;
+        }
+        self.ai_done = true;
+        self.ai_button = AiButton::Complete;
+    }
+
+    pub fn ai_active(&self) -> bool {
         self.ai_active
     }
 
+    pub fn is_pty_focused(&self) -> bool {
+        self.pty_focused
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ai_done(&self) -> bool {
+        self.ai_done
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ai_button(&self) -> AiButton {
+        self.ai_button
+    }
+
     pub fn is_updating(&self) -> bool {
-        matches!(self.step, UpdateStep::Updating | UpdateStep::PostReview)
+        matches!(self.step, UpdateStep::Updating)
     }
 
     /// Update the spinner label during `Updating` so the user knows what
@@ -245,68 +348,38 @@ impl UpdatePullRequestScreen {
         &self.phase_message
     }
 
-    /// App calls this when the pipeline returned `MergedAwaitingReview`.
-    /// Transitions the screen into the review step and builds the
-    /// Push/Discard dialog with **Discard** as the default. `diff` is
-    /// the full `git diff HEAD~1 HEAD` output; the review panel renders
-    /// it line by line with `+` / `-` coloring.
-    pub fn present_review(&mut self, commit_sha: String, stat: String, diff: String) {
-        self.review_commit_sha = Some(commit_sha);
-        self.review_stat = Some(stat);
-        self.review_diff = Some(diff);
-        self.review_scroll = 0;
-        self.review_confirm = Some(build_review_confirm(&self.request));
-        self.step = UpdateStep::AwaitingReview;
-    }
-
-    /// App calls this when it has spawned the post-review push or discard
-    /// task so the screen renders a spinner instead of the review dialog.
-    pub fn start_post_review(&mut self, pushing: bool) {
-        self.post_review_message = Some(if pushing {
-            UPDATE_PUSHING_MESSAGE
-        } else {
-            UPDATE_DISCARDING_MESSAGE
-        });
-        self.step = UpdateStep::PostReview;
-    }
-
-    pub fn review_commit_sha(&self) -> Option<&str> {
-        self.review_commit_sha.as_deref()
-    }
-
-    /// Scroll the active wheel-scrollable panel up by `lines`. During merge
-    /// review that is the diff panel; while the AI is actively resolving
-    /// conflicts it is the AI Activity panel.
+    /// Scroll the AI Activity panel up by `lines` (only meaningful while
+    /// the AI is actively streaming or has just finished). When the
+    /// embedded PTY is alive, opencode runs on the alt-screen so vt100's
+    /// own scrollback is empty — we forward a PageUp keystroke to the
+    /// subprocess instead, which fires opencode's own message-history
+    /// scroll binding. Without a PTY we fall back to the structured-event
+    /// log offset.
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
-        if matches!(self.step, UpdateStep::AwaitingReview) {
-            self.review_scroll = self.review_scroll.saturating_sub(lines);
-            return true;
+        if !matches!(self.step, UpdateStep::Updating) || !self.ai_active {
+            return false;
         }
-        if matches!(self.step, UpdateStep::Updating) && self.ai_active {
+        if let Some(pty) = self.pty.as_mut() {
+            pty.send_input(PTY_PAGE_UP);
+        } else {
             self.ai_scroll = self.ai_scroll.saturating_add(lines);
-            return true;
         }
-        false
+        true
     }
 
-    /// Scroll the active wheel-scrollable panel down by `lines`. The render
-    /// path clamps against the content height every frame, so over-scrolling is
+    /// Scroll the AI Activity panel down by `lines`. The render path
+    /// clamps against the content height every frame, so over-scrolling is
     /// safe here.
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
-        if matches!(self.step, UpdateStep::AwaitingReview) {
-            self.review_scroll = self.review_scroll.saturating_add(lines);
-            return true;
+        if !matches!(self.step, UpdateStep::Updating) || !self.ai_active {
+            return false;
         }
-        if matches!(self.step, UpdateStep::Updating) && self.ai_active {
+        if let Some(pty) = self.pty.as_mut() {
+            pty.send_input(PTY_PAGE_DOWN);
+        } else {
             self.ai_scroll = self.ai_scroll.saturating_sub(lines);
-            return true;
         }
-        false
-    }
-
-    #[cfg(test)]
-    pub(crate) fn review_scroll(&self) -> u16 {
-        self.review_scroll
+        true
     }
 
     #[cfg(test)]
@@ -314,10 +387,82 @@ impl UpdatePullRequestScreen {
         self.ai_scroll
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
-        if matches!(self.step, UpdateStep::Updating | UpdateStep::PostReview) {
-            return UpdateAction::Continue;
+    /// Page size used for PgUp/PgDn scrolling. The PTY's panel area is
+    /// only known at render time, so we use a sensible constant that
+    /// matches the typical visible row count of the AI Activity panel.
+    /// Roughly half a screen — enough to feel snappy without losing the
+    /// reader's place.
+    const KEYBOARD_PAGE_SCROLL: u16 = 10;
+    const KEYBOARD_LINE_SCROLL: u16 = 1;
+
+    /// Handle scroll-only keys when the outer (Wisetree) terminal owns
+    /// focus. Returns true when the key was consumed as a scroll action.
+    fn handle_outer_scroll_key(&mut self, key: &KeyEvent) -> bool {
+        if !self.ai_active {
+            return false;
         }
+        match key.code {
+            KeyCode::PageUp => {
+                self.handle_mouse_scroll_up(Self::KEYBOARD_PAGE_SCROLL);
+                true
+            }
+            KeyCode::PageDown => {
+                self.handle_mouse_scroll_down(Self::KEYBOARD_PAGE_SCROLL);
+                true
+            }
+            KeyCode::Up => {
+                self.handle_mouse_scroll_up(Self::KEYBOARD_LINE_SCROLL);
+                true
+            }
+            KeyCode::Down => {
+                self.handle_mouse_scroll_down(Self::KEYBOARD_LINE_SCROLL);
+                true
+            }
+            KeyCode::Home => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_to_top();
+                }
+                true
+            }
+            KeyCode::End => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_to_bottom();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Route a keystroke into the finalize-confirmation modal. Caller
+    /// must have already established that the modal is open. Tab / ← /
+    /// → toggle the selection; Enter commits (Yes flips the screen into
+    /// the Complete/Cancel review state, No simply closes the modal);
+    /// Esc closes the modal without acting (same as picking No).
+    fn handle_finalize_modal_key(&mut self, key: KeyEvent) -> UpdateAction {
+        let modal = self
+            .finalize_confirm
+            .as_mut()
+            .expect("handle_finalize_modal_key called with no modal open");
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => {}
+            ConfirmationOutcome::Confirmed => {
+                self.finalize_confirm = None;
+                self.mark_ai_done();
+            }
+            ConfirmationOutcome::Cancelled => {
+                self.finalize_confirm = None;
+            }
+        }
+        UpdateAction::Continue
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finalize_confirm(&self) -> Option<ConfirmationChoice> {
+        self.finalize_confirm.as_ref().map(|m| m.selected())
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
         if self.error.is_some() {
             return UpdateAction::Cancelled;
         }
@@ -327,52 +472,78 @@ impl UpdatePullRequestScreen {
                 _ => UpdateAction::Continue,
             };
         }
-        if matches!(self.step, UpdateStep::AwaitingReview) {
-            // Esc here means "I want out, but don't touch the merge
-            // commit" — propagate ReviewBackedOut so App can show a
-            // warning toast pointing at the SHA.
-            if matches!(key.code, KeyCode::Esc) {
-                return UpdateAction::ReviewBackedOut;
+        if matches!(self.step, UpdateStep::Updating) {
+            if !self.ai_done {
+                // The finalize-confirmation modal — when open — owns all
+                // input. Tab/←/→ toggle Yes↔No, Enter commits the choice,
+                // Esc dismisses. The PTY keeps running underneath via
+                // `App::tick_pty`, so opencode is unaffected by the modal.
+                if self.finalize_confirm.is_some() {
+                    return self.handle_finalize_modal_key(key);
+                }
+                // While opencode is running we let the user split focus
+                // between the outer Wisetree TUI and the inner PTY: Tab
+                // toggles, and when the PTY owns focus we transparently
+                // forward keystrokes to the subprocess so the user can
+                // chat with opencode just like they would standalone.
+                if self.pty.is_some() && matches!(key.code, KeyCode::Tab) {
+                    self.pty_focused = !self.pty_focused;
+                    return UpdateAction::Continue;
+                }
+                if self.pty_focused {
+                    if let Some(pty) = self.pty.as_mut() {
+                        // opencode runs on the alt-screen, so vt100's
+                        // own scrollback is always empty — we can't
+                        // intercept arrows and scroll from the outside.
+                        // Instead remap plain Up/Down to PageUp/PageDown
+                        // (opencode's own scroll bindings) so the user's
+                        // expectation of "arrow keys scroll history"
+                        // works. Modified arrows still pass through so
+                        // opencode's prompt-history navigation keeps
+                        // working when explicitly requested.
+                        let effective = remap_pty_scroll_key(&key);
+                        if let Some(bytes) = key_event_to_pty_bytes(&effective) {
+                            pty.send_input(&bytes);
+                        }
+                    }
+                    return UpdateAction::Continue;
+                }
+                if self.handle_outer_scroll_key(&key) {
+                    return UpdateAction::Continue;
+                }
+                // Outer focus + AI streaming + Enter is the documented
+                // "I'm done with opencode, let me review and decide" cue.
+                // We don't transition straight to the review buttons —
+                // an accidental Enter while opencode is mid-edit would
+                // be destructive — so we surface a confirmation modal
+                // first. The PTY keeps running underneath.
+                if self.ai_active && matches!(key.code, KeyCode::Enter) {
+                    self.finalize_confirm = Some(build_finalize_modal());
+                    return UpdateAction::Continue;
+                }
+                // Outer-focus & still streaming → swallow other keys so
+                // the user doesn't accidentally trigger Wisetree actions
+                // mid-resolution.
+                return UpdateAction::Continue;
             }
-            // Scroll keys for the diff panel are intercepted BEFORE
-            // delegating to the dialog so they don't toggle Push/Discard.
-            // Left/Right stay with the dialog for the variant selection.
-            match key.code {
-                KeyCode::Up => {
-                    self.review_scroll = self.review_scroll.saturating_sub(1);
-                    return UpdateAction::Continue;
-                }
-                KeyCode::Down => {
-                    self.review_scroll = self.review_scroll.saturating_add(1);
-                    return UpdateAction::Continue;
-                }
-                KeyCode::PageUp => {
-                    self.review_scroll = self.review_scroll.saturating_sub(10);
-                    return UpdateAction::Continue;
-                }
-                KeyCode::PageDown => {
-                    self.review_scroll = self.review_scroll.saturating_add(10);
-                    return UpdateAction::Continue;
-                }
-                KeyCode::Home => {
-                    self.review_scroll = 0;
-                    return UpdateAction::Continue;
-                }
-                KeyCode::End => {
-                    self.review_scroll = u16::MAX;
-                    return UpdateAction::Continue;
-                }
-                _ => {}
+            if self.handle_outer_scroll_key(&key) {
+                return UpdateAction::Continue;
             }
-            let dialog = match self.review_confirm.as_mut() {
-                Some(d) => d,
-                None => return UpdateAction::ReviewBackedOut,
-            };
-            return match dialog.handle_key(key) {
-                ConfirmOutcome::Confirmed => UpdateAction::PushReviewed,
-                ConfirmOutcome::Declined => UpdateAction::DiscardReviewed,
-                ConfirmOutcome::Cancelled => UpdateAction::ReviewBackedOut,
-                ConfirmOutcome::Pending => UpdateAction::Continue,
+            return match key.code {
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                    self.ai_button = match self.ai_button {
+                        AiButton::Complete => AiButton::Cancel,
+                        AiButton::Cancel => AiButton::Complete,
+                    };
+                    UpdateAction::Continue
+                }
+                KeyCode::Enter => match self.ai_button {
+                    AiButton::Complete => UpdateAction::AiComplete,
+                    AiButton::Cancel => UpdateAction::AiCancel,
+                },
+                KeyCode::Char('c') | KeyCode::Char('C') => UpdateAction::AiComplete,
+                KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Esc => UpdateAction::AiCancel,
+                _ => UpdateAction::Continue,
             };
         }
         let dialog = match self.confirm.as_mut() {
@@ -388,14 +559,18 @@ impl UpdatePullRequestScreen {
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
-            UpdateStep::Loading | UpdateStep::PostReview => 3,
+            UpdateStep::Loading => 3,
             UpdateStep::Updating => {
                 // Pre-conflict phases (fetching, merging, pushing-clean)
                 // don't need the AI Activity panel — keep the panel tall
                 // only once we've flipped into AI mode so the streaming
                 // output has room to breathe.
                 if self.ai_active {
-                    24
+                    if self.ai_done {
+                        29
+                    } else {
+                        25
+                    }
                 } else {
                     3
                 }
@@ -407,15 +582,6 @@ impl UpdatePullRequestScreen {
                     .saturating_add(steps_rows)
                     .saturating_add(14)
                     .max(16)
-            }
-            UpdateStep::AwaitingReview => {
-                let diff_rows = self
-                    .review_diff
-                    .as_deref()
-                    .map(|s| s.lines().count() as u16)
-                    .unwrap_or(0);
-                // Title + sha + blank + scrollable diff + blank + dialog.
-                diff_rows.saturating_add(16).max(24)
             }
         }
     }
@@ -435,7 +601,7 @@ impl UpdatePullRequestScreen {
         5
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         if let Some(err) = self.error.as_deref() {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -465,16 +631,7 @@ impl UpdatePullRequestScreen {
                     .render(frame, area);
             }
             UpdateStep::Updating => self.render_updating(frame, area),
-            UpdateStep::PostReview => {
-                StatusIndicator::new(
-                    Status::Loading,
-                    self.post_review_message.unwrap_or(UPDATE_RUNNING_MESSAGE),
-                )
-                .with_tick(self.tick)
-                .render(frame, area);
-            }
             UpdateStep::Confirm => self.render_confirm(frame, area),
-            UpdateStep::AwaitingReview => self.render_review(frame, area),
         }
     }
 
@@ -527,23 +684,8 @@ fn build_confirm(request: &UpdatePullRequestRequest) -> ConfirmDialog {
         .with_default(ConfirmChoice::Cancel)
 }
 
-fn build_review_confirm(request: &UpdatePullRequestRequest) -> ConfirmDialog {
-    let prompt = format!(
-        "Gemini resolved the conflicts and created a merge commit on `{}`. \
-         Push this commit to origin, or discard it locally?",
-        request.branch
-    );
-    ConfirmDialog::new(
-        format!("Review AI Merge for PR #{}", request.number),
-        prompt,
-    )
-    .with_labels("Push", "Discard")
-    .with_variant(ConfirmVariant::Default)
-    .with_default(ConfirmChoice::Cancel)
-}
-
 impl UpdatePullRequestScreen {
-    fn render_updating(&self, frame: &mut Frame, area: Rect) {
+    fn render_updating(&mut self, frame: &mut Frame, area: Rect) {
         // Pre-conflict (or "no conflict at all") runs render as just a
         // spinner — the AI Activity panel is reserved for the post-
         // `ConflictsDetected` portion of the pipeline. We also fall back
@@ -555,23 +697,43 @@ impl UpdatePullRequestScreen {
             return;
         }
 
+        let mut constraints = vec![
+            Constraint::Length(1), // spinner line
+            Constraint::Length(1), // blank
+            Constraint::Min(3),    // AI Activity panel
+            Constraint::Length(1), // focus / shortcuts hint
+        ];
+        if self.ai_done {
+            constraints.push(Constraint::Length(1)); // blank
+            constraints.push(Constraint::Length(3)); // button row
+        }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // spinner line
-                Constraint::Length(1), // blank
-                Constraint::Min(3),    // AI Activity panel
-            ])
+            .constraints(constraints)
             .split(area);
 
         StatusIndicator::new(Status::Loading, self.phase_message.clone())
             .with_tick(self.tick)
             .render(frame, chunks[0]);
         self.render_ai_activity(frame, chunks[2]);
+        self.render_ai_shortcuts(frame, chunks[3]);
+        if self.ai_done {
+            self.render_ai_buttons(frame, chunks[5]);
+        }
+        // The finalize-confirmation modal is an overlay — render it last
+        // so it draws over the AI Activity panel without disturbing the
+        // PTY emulator state underneath. The PTY child keeps streaming;
+        // we just stop forwarding keystrokes to it while the modal owns
+        // input.
+        if let Some(modal) = self.finalize_confirm.as_ref() {
+            modal.render(frame, area);
+        }
     }
 
-    fn render_ai_activity(&self, frame: &mut Frame, area: Rect) {
-        let title = Line::from(vec![
+    fn render_ai_activity(&mut self, frame: &mut Frame, area: Rect) {
+        let pty_alive = self.pty.is_some() && !self.ai_done;
+        let focused_inner = pty_alive && self.pty_focused;
+        let mut title_spans = vec![
             Span::raw(" "),
             Span::styled(
                 "AI Activity",
@@ -579,20 +741,83 @@ impl UpdatePullRequestScreen {
                     .fg(colors::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" "),
-        ]);
+        ];
+        if pty_alive {
+            title_spans.push(Span::styled(
+                " · ".to_string(),
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ));
+            title_spans.push(Span::styled(
+                if focused_inner {
+                    "inner focused"
+                } else {
+                    "outer focused"
+                }
+                .to_string(),
+                Style::default()
+                    .fg(if focused_inner {
+                        colors::ACCENT
+                    } else {
+                        colors::INFO
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        title_spans.push(Span::raw(" "));
+        let title = Line::from(title_spans);
+        let border_color = if focused_inner {
+            colors::ACCENT
+        } else {
+            colors::INFO
+        };
+        // Only the color flips on focus — keep the border style otherwise
+        // untouched so `BorderType::Rounded` glyphs stay rounded. Adding
+        // BOLD here makes some terminals swap in a heavier, non-rounded
+        // glyph and the rectangle visibly changes shape on Tab.
+        let border_style = Style::default().fg(border_color);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::INFO))
+            .border_style(border_style)
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let visible_rows = inner.height as usize;
-        if visible_rows == 0 {
+        if inner.height == 0 || inner.width == 0 {
             return;
         }
+
+        // Real opencode embed: keep the vt100 emulator sized to the
+        // visible panel area so line wrapping matches what the user
+        // sees, then blit its screen state into the panel.
+        if let Some(pty) = self.pty.as_mut() {
+            pty.resize(inner.height, inner.width);
+            pty.render(frame, inner);
+            let scrollback_len = pty.scrollback_len();
+            if scrollback_len > 0 {
+                // Position: 0 = top of scrollback (oldest), len = bottom
+                // (live tail). vt100's offset is "rows back from tail",
+                // so invert to keep the thumb intuitive.
+                let offset = pty.scrollback_offset();
+                let position = scrollback_len.saturating_sub(offset);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(Style::default().fg(colors::MUTED))
+                    .thumb_style(Style::default().fg(colors::INFO));
+                let mut state =
+                    ScrollbarState::new(scrollback_len.saturating_add(inner.height as usize))
+                        .viewport_content_length(inner.height as usize)
+                        .position(position);
+                frame.render_stateful_widget(scrollbar, inner, &mut state);
+            }
+            return;
+        }
+
+        // Fallback path — no PTY yet (typically the brief window between
+        // "AI active" and the App invoking `spawn_opencode_pty`, or the
+        // unit-test renderer). Show a placeholder + any structured
+        // events we accumulated (e.g. spawn errors via `Notice`).
         let lines: Vec<Line<'static>> = if self.ai_log.is_empty() {
             vec![Line::from(Span::styled(
                 "Waiting for AI to start working on the conflicts...",
@@ -601,6 +826,7 @@ impl UpdatePullRequestScreen {
                     .add_modifier(Modifier::DIM),
             ))]
         } else {
+            let visible_rows = inner.height as usize;
             let max_scroll = self.ai_log.len().saturating_sub(visible_rows) as u16;
             let scroll = self.ai_scroll.min(max_scroll) as usize;
             let end = self.ai_log.len().saturating_sub(scroll);
@@ -613,143 +839,190 @@ impl UpdatePullRequestScreen {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn render_review(&self, frame: &mut Frame, area: Rect) {
-        let title = Line::from(Span::styled(
-            format!("Review AI Merge for PR #{}?", self.request.number),
-            Style::default()
-                .fg(colors::BRAND)
-                .add_modifier(Modifier::BOLD),
-        ));
-        let sha_line = Line::from(vec![
-            Span::styled(
-                "Merge commit ",
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            ),
-            Span::styled(
-                self.review_commit_sha
-                    .clone()
-                    .unwrap_or_else(|| "HEAD".to_string()),
-                Style::default()
-                    .fg(colors::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  (not yet pushed)",
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            ),
-        ]);
-        let hint_line = Line::from(Span::styled(
-            "Scroll: ↑/↓ or wheel · PgUp/PgDn page · Home/End jump · ←/→ Push/Discard",
-            Style::default()
-                .fg(colors::MUTED)
-                .add_modifier(Modifier::DIM),
-        ));
+    fn render_ai_shortcuts(&self, frame: &mut Frame, area: Rect) {
+        let muted = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        let separator = Span::styled("  ·  ".to_string(), muted);
 
-        let confirm_height: u16 = 8;
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),              // title
-                Constraint::Length(1),              // blank
-                Constraint::Length(1),              // sha line
-                Constraint::Length(1),              // hint line
-                Constraint::Length(1),              // blank
-                Constraint::Min(3),                 // scrollable diff panel
-                Constraint::Length(1),              // blank
-                Constraint::Length(confirm_height), // ConfirmDialog
-            ])
-            .split(area);
+        let mut spans: Vec<Span<'static>> = Vec::new();
 
-        frame.render_widget(Paragraph::new(title), chunks[0]);
-        frame.render_widget(Paragraph::new(sha_line), chunks[2]);
-        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
-        self.render_diff_panel(frame, chunks[5]);
-        if let Some(dialog) = self.review_confirm.as_ref() {
-            dialog.render(frame, chunks[7]);
-        }
-    }
-
-    fn render_diff_panel(&self, frame: &mut Frame, area: Rect) {
-        let diff_text = self.review_diff.as_deref().unwrap_or("");
-        let stat_summary = self
-            .review_stat
-            .as_deref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty());
-        let title_text: String = match stat_summary {
-            Some(stat) => {
-                let first = stat.lines().last().unwrap_or(stat);
-                format!(" Diff vs HEAD~1 — {first} ")
-            }
-            None => " Diff vs HEAD~1 ".to_string(),
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::INFO))
-            .title(Line::from(Span::styled(
-                title_text,
-                Style::default()
-                    .fg(colors::INFO)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        if inner.height == 0 {
+        if self.ai_done {
+            // Post-resolution: Complete / Cancel buttons are the only
+            // affordances. Match the dashboard's shortcut-row idiom so
+            // the user sees a familiar key reference.
+            spans.push(Span::styled(
+                "← → ".to_string(),
+                Style::default().fg(colors::INFO),
+            ));
+            spans.push(Span::styled("Switch button".to_string(), muted));
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "↵ ".to_string(),
+                Style::default().fg(colors::SUCCESS),
+            ));
+            spans.push(Span::styled("Confirm".to_string(), muted));
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "Esc ".to_string(),
+                Style::default().fg(colors::ERROR),
+            ));
+            spans.push(Span::styled("Cancel".to_string(), muted));
+            self.append_scroll_hint(&mut spans, &separator, muted);
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
 
-        let all_lines: Vec<Line<'static>> = if diff_text.trim().is_empty() {
-            vec![Line::from(Span::styled(
-                "(no diff captured — the merge commit may have no textual changes)",
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            ))]
+        // Streaming phase. Show what Tab does and which terminal owns
+        // the keyboard right now, in the palette already used by the
+        // Dashboard's shortcuts row.
+        let focused_inner = self.pty.is_some() && self.pty_focused;
+        let focus_label = if focused_inner {
+            "Inner (opencode)"
         } else {
-            diff_text.lines().map(diff_line_to_styled).collect()
+            "Outer (wisetree)"
         };
+        spans.push(Span::styled("Focus: ".to_string(), muted));
+        spans.push(Span::styled(
+            focus_label.to_string(),
+            Style::default()
+                .fg(if focused_inner {
+                    colors::ACCENT
+                } else {
+                    colors::INFO
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(separator.clone());
+        spans.push(Span::styled(
+            "Tab ".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(
+            if focused_inner {
+                "Switch to Wisetree"
+            } else {
+                "Switch to opencode"
+            }
+            .to_string(),
+            muted,
+        ));
+        if focused_inner {
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "keys flow into the inner TUI".to_string(),
+                Style::default()
+                    .fg(colors::GRAY_LIGHT)
+                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+            ));
+        } else {
+            self.append_scroll_hint(&mut spans, &separator, muted);
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
 
-        let total = all_lines.len();
-        let visible = inner.height as usize;
-        // Clamp scroll so End / repeated Down never run past the bottom.
-        let max_scroll = total.saturating_sub(visible) as u16;
-        let scroll = self.review_scroll.min(max_scroll) as usize;
-        let end = (scroll + visible).min(total);
-        let slice: Vec<Line<'static>> = all_lines[scroll..end].to_vec();
-        frame.render_widget(Paragraph::new(slice), inner);
+    /// Append the scroll-shortcut hint to the footer line. Only shown
+    /// when scrolling actually applies — i.e. there's a PTY alive or
+    /// the fallback ai_log has content. Colors come from
+    /// `design/pallete.md`: the `Scroll:` label is teal/INFO, the key
+    /// glyphs are purple/BRAND to mirror the existing `Tab` cue, and
+    /// the descriptive words stay muted/dim.
+    fn append_scroll_hint(
+        &self,
+        spans: &mut Vec<Span<'static>>,
+        separator: &Span<'static>,
+        muted: Style,
+    ) {
+        let scrollable = self.pty.is_some() || !self.ai_log.is_empty();
+        if !scrollable {
+            return;
+        }
+        spans.push(separator.clone());
+        spans.push(Span::styled(
+            "Scroll: ".to_string(),
+            Style::default()
+                .fg(colors::INFO)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            "↑/↓".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(" line".to_string(), muted));
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            "PgUp/PgDn".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(" page".to_string(), muted));
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            "Home/End".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(" jump".to_string(), muted));
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            "wheel".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+    }
+
+    fn render_ai_buttons(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(16),
+                Constraint::Length(2),
+                Constraint::Length(16),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        frame.render_widget(
+            button_paragraph(
+                "  Apply   ",
+                colors::SUCCESS,
+                matches!(self.ai_button, AiButton::Complete),
+            ),
+            chunks[1],
+        );
+        frame.render_widget(
+            button_paragraph(
+                "  Cancel  ",
+                colors::ERROR,
+                matches!(self.ai_button, AiButton::Cancel),
+            ),
+            chunks[3],
+        );
     }
 }
 
-/// Color a raw diff line based on its leading marker. Matches the
-/// classic git diff palette (green added, red removed, cyan hunk
-/// header, dim file metadata) so the AI's changes are easy to scan.
-fn diff_line_to_styled(line: &str) -> Line<'static> {
-    let style = if line.starts_with("+++") || line.starts_with("---") {
+fn button_paragraph(
+    label: &str,
+    color: ratatui::style::Color,
+    focused: bool,
+) -> Paragraph<'static> {
+    // Match the canonical `ConfirmDialog` button style: the border only
+    // changes color on selection (never gains BOLD), and the label is
+    // what actually highlights — that way `BorderType::Rounded` renders
+    // identical glyphs whether the button is selected or not.
+    let border_color = if focused { color } else { colors::MUTED };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+    let label_style = if focused {
         Style::default()
-            .fg(colors::MUTED)
-            .add_modifier(Modifier::DIM)
-    } else if line.starts_with("@@") {
-        Style::default()
-            .fg(colors::INFO)
+            .fg(colors::WHITE)
             .add_modifier(Modifier::BOLD)
-    } else if line.starts_with("diff ") || line.starts_with("index ") {
-        Style::default()
-            .fg(colors::EMPHASIS)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with('+') {
-        Style::default().fg(colors::SUCCESS)
-    } else if line.starts_with('-') {
-        Style::default().fg(colors::ERROR)
     } else {
-        Style::default().fg(colors::WHITE)
+        Style::default().fg(colors::MUTED)
     };
-    Line::from(Span::styled(line.to_string(), style))
+    Paragraph::new(Line::from(Span::styled(label.to_string(), label_style)))
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Center)
 }
 
 fn ai_activity_event_to_line(event: &AiActivityEvent) -> Line<'static> {
@@ -1181,7 +1454,7 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
             Span::styled(
-                "on conflict: direct Gemini API stream + local tools → commit".to_string(),
+                "on conflict: opencode streams resolution, then Complete/Cancel".to_string(),
                 bullet_style,
             ),
         ]),
@@ -1190,6 +1463,121 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
             Span::styled("git push origin HEAD".to_string(), bullet_style),
         ]),
     ]
+}
+
+/// Translate a crossterm `KeyEvent` into the raw byte sequence a terminal
+/// would normally write into the PTY for that keystroke. Covers the keys
+/// opencode actually cares about (printable chars, control combos, arrow
+/// keys, function keys, navigation). Tab is intentionally not mapped —
+/// callers reserve it as the focus-toggle shortcut.
+/// Translate plain (unmodified) Up/Down arrow keys into PageUp/PageDown
+/// before forwarding to the embedded opencode subprocess. opencode binds
+/// pageup/pagedown to "scroll message history" but uses plain up/down for
+/// prompt-history navigation, so this remap is what makes "press arrow to
+/// scroll" actually move the chat view. Modified arrow keys (Shift / Ctrl
+/// / Alt) pass through unchanged so users who *want* prompt history can
+/// still reach it.
+fn remap_pty_scroll_key(key: &KeyEvent) -> KeyEvent {
+    if !key.modifiers.is_empty() {
+        return *key;
+    }
+    let remapped = match key.code {
+        KeyCode::Up => Some(KeyCode::PageUp),
+        KeyCode::Down => Some(KeyCode::PageDown),
+        _ => None,
+    };
+    match remapped {
+        Some(code) => KeyEvent { code, ..*key },
+        None => *key,
+    }
+}
+
+fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    let with_alt = |mut bytes: Vec<u8>| -> Vec<u8> {
+        if alt {
+            let mut out = Vec::with_capacity(bytes.len() + 1);
+            out.push(0x1b);
+            out.append(&mut bytes);
+            out
+        } else {
+            bytes
+        }
+    };
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                // Ctrl+letter → standard ASCII control mapping
+                // (Ctrl+A=0x01 .. Ctrl+Z=0x1a, Ctrl+@=0, Ctrl+]=0x1d, …).
+                let upper = c.to_ascii_uppercase();
+                let byte = match upper {
+                    'A'..='Z' => Some((upper as u8) - b'A' + 1),
+                    '@' => Some(0x00),
+                    '[' => Some(0x1b),
+                    '\\' => Some(0x1c),
+                    ']' => Some(0x1d),
+                    '^' => Some(0x1e),
+                    '_' => Some(0x1f),
+                    ' ' => Some(0x00),
+                    _ => None,
+                };
+                byte.map(|b| with_alt(vec![b]))
+            } else {
+                let mut buf = [0u8; 4];
+                Some(with_alt(c.encode_utf8(&mut buf).as_bytes().to_vec()))
+            }
+        }
+        KeyCode::Enter => Some(with_alt(vec![b'\r'])),
+        KeyCode::Backspace => Some(with_alt(vec![0x7f])),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Left => Some(with_alt(b"\x1b[D".to_vec())),
+        KeyCode::Right => Some(with_alt(b"\x1b[C".to_vec())),
+        KeyCode::Up => Some(with_alt(b"\x1b[A".to_vec())),
+        KeyCode::Down => Some(with_alt(b"\x1b[B".to_vec())),
+        KeyCode::Home => Some(with_alt(b"\x1b[H".to_vec())),
+        KeyCode::End => Some(with_alt(b"\x1b[F".to_vec())),
+        KeyCode::PageUp => Some(with_alt(b"\x1b[5~".to_vec())),
+        KeyCode::PageDown => Some(with_alt(b"\x1b[6~".to_vec())),
+        KeyCode::Delete => Some(with_alt(b"\x1b[3~".to_vec())),
+        KeyCode::Insert => Some(with_alt(b"\x1b[2~".to_vec())),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        KeyCode::F(n) => {
+            let seq: &[u8] = match n {
+                1 => b"\x1bOP",
+                2 => b"\x1bOQ",
+                3 => b"\x1bOR",
+                4 => b"\x1bOS",
+                5 => b"\x1b[15~",
+                6 => b"\x1b[17~",
+                7 => b"\x1b[18~",
+                8 => b"\x1b[19~",
+                9 => b"\x1b[20~",
+                10 => b"\x1b[21~",
+                11 => b"\x1b[23~",
+                12 => b"\x1b[24~",
+                _ => return None,
+            };
+            Some(seq.to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// Build the finalize-confirmation modal that opens when the user
+/// presses Enter on the outer focus while opencode is streaming. Yes is
+/// preselected so a careful confirmation flow (Enter → modal → Enter)
+/// commits the merge resolution; No / Esc returns to the live PTY.
+fn build_finalize_modal() -> ConfirmationModal {
+    ConfirmationModal::new()
+        .with_title("Confirm finalization")
+        .with_subtitle("Do you confirm that the merge resolution is finalized?")
+        .with_confirm_text("Yes")
+        .with_cancel_text("No")
+        .with_color("#eada61")
+        .with_selected(ConfirmationChoice::Confirm)
 }
 
 fn labeled_line(
@@ -1218,7 +1606,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn render_dump(screen: &UpdatePullRequestScreen, width: u16, height: u16) -> String {
+    fn render_dump(screen: &mut UpdatePullRequestScreen, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| screen.render(f, f.area())).unwrap();
@@ -1294,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_ignored_while_updating() {
+    fn keys_are_ignored_while_updating_before_ai_done() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
@@ -1314,64 +1702,63 @@ mod tests {
     }
 
     #[test]
-    fn present_review_transitions_step_and_defaults_to_discard() {
+    fn enter_on_complete_returns_ai_complete() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
-        screen.present_review(
-            "deadbee".to_string(),
-            "README.md | 2 +-\n".to_string(),
-            "diff --git a/README.md b/README.md\n+added\n-removed\n".to_string(),
-        );
-        assert_eq!(screen.step(), UpdateStep::AwaitingReview);
-        let dialog = screen
-            .review_confirm
-            .as_ref()
-            .expect("review confirm built");
-        assert_eq!(dialog.selected, ConfirmChoice::Cancel);
-        assert_eq!(dialog.confirm_label, "Push");
-        assert_eq!(dialog.cancel_label, "Discard");
-    }
-
-    #[test]
-    fn enter_on_discard_returns_discard_reviewed() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
-        screen.set_base_ref("upstream/main".to_string());
-        screen.present_review(
-            "deadbee".to_string(),
-            "stat".to_string(),
-            "diff".to_string(),
-        );
+        screen.mark_ai_active();
+        screen.mark_ai_done();
+        assert_eq!(screen.ai_button(), AiButton::Complete);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(screen.handle_key(enter), UpdateAction::DiscardReviewed);
+        assert_eq!(screen.handle_key(enter), UpdateAction::AiComplete);
     }
 
     #[test]
-    fn tab_then_enter_on_review_returns_push_reviewed() {
+    fn right_then_enter_returns_ai_cancel() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review(
-            "deadbee".to_string(),
-            "stat".to_string(),
-            "diff".to_string(),
-        );
-        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
+        screen.start_updating();
+        screen.mark_ai_active();
+        screen.mark_ai_done();
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(right), UpdateAction::Continue);
+        assert_eq!(screen.ai_button(), AiButton::Cancel);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(screen.handle_key(enter), UpdateAction::PushReviewed);
+        assert_eq!(screen.handle_key(enter), UpdateAction::AiCancel);
     }
 
     #[test]
-    fn esc_during_review_returns_review_backed_out() {
+    fn mark_ai_done_is_idempotent_and_preserves_button_selection() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.present_review(
-            "deadbee".to_string(),
-            "stat".to_string(),
-            "diff".to_string(),
-        );
+        screen.start_updating();
+        screen.mark_ai_active();
+        screen.mark_ai_done();
+        assert_eq!(screen.ai_button(), AiButton::Complete);
+
+        // User flips to Cancel...
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(right), UpdateAction::Continue);
+        assert_eq!(screen.ai_button(), AiButton::Cancel);
+
+        // ...and the next PTY tick re-fires mark_ai_done. The selection
+        // must survive — otherwise Cancel is unreachable.
+        screen.mark_ai_done();
+        assert_eq!(screen.ai_button(), AiButton::Cancel);
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(enter), UpdateAction::AiCancel);
+    }
+
+    #[test]
+    fn esc_after_ai_done_returns_ai_cancel() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        screen.mark_ai_done();
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(screen.handle_key(esc), UpdateAction::ReviewBackedOut);
+        assert_eq!(screen.handle_key(esc), UpdateAction::AiCancel);
     }
 
     #[test]
@@ -1433,41 +1820,11 @@ mod tests {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
-        screen.set_phase_message("Conflict found — Gemini resolving...");
+        screen.set_phase_message("Conflict found — opencode resolving...");
         assert_eq!(
             screen.phase_message(),
-            "Conflict found — Gemini resolving..."
+            "Conflict found — opencode resolving..."
         );
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_review_diff() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
-        screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
-        assert_eq!(screen.review_scroll(), 0);
-        assert!(screen.handle_mouse_scroll_down(3));
-        assert_eq!(screen.review_scroll(), 3);
-        assert!(screen.handle_mouse_scroll_down(2));
-        assert_eq!(screen.review_scroll(), 5);
-        assert!(screen.handle_mouse_scroll_up(4));
-        assert_eq!(screen.review_scroll(), 1);
-        // Scroll up past the top clamps to 0 (no underflow).
-        assert!(screen.handle_mouse_scroll_up(99));
-        assert_eq!(screen.review_scroll(), 0);
-    }
-
-    #[test]
-    fn mouse_wheel_is_ignored_outside_review_step() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
-        screen.set_base_ref("upstream/main".to_string());
-        // In Confirm step the wheel must not advance the (unused)
-        // review scroll counter, and the call must report unhandled so
-        // the App layer could in principle route it elsewhere later.
-        assert!(!screen.handle_mouse_scroll_down(3));
-        assert_eq!(screen.review_scroll(), 0);
-        screen.start_updating();
-        assert!(!screen.handle_mouse_scroll_down(3));
     }
 
     #[test]
@@ -1504,35 +1861,13 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_does_not_toggle_push_discard() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
-        screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
-        screen.handle_mouse_scroll_down(3);
-        let dialog = screen.review_confirm.as_ref().unwrap();
-        assert_eq!(dialog.selected, ConfirmChoice::Cancel);
-    }
-
-    #[test]
-    fn scroll_keys_during_review_do_not_toggle_push_discard() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
-        screen.set_base_ref("upstream/main".to_string());
-        screen.present_review("deadbee".into(), "stat".into(), "+a\n-b\n+c\n".into());
-        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(screen.handle_key(down), UpdateAction::Continue);
-        let dialog = screen.review_confirm.as_ref().unwrap();
-        // Default is Cancel (Discard); Down must not have toggled it.
-        assert_eq!(dialog.selected, ConfirmChoice::Cancel);
-    }
-
-    #[test]
     fn ai_activity_panel_hidden_until_marked_active() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         assert!(!screen.ai_active());
 
-        let before = render_dump(&screen, 100, 24);
+        let before = render_dump(&mut screen, 100, 24);
         assert!(
             !before.contains("AI Activity"),
             "AI Activity panel rendered before conflicts detected:\n{before}"
@@ -1540,10 +1875,26 @@ mod tests {
 
         screen.mark_ai_active();
         assert!(screen.ai_active());
-        let after = render_dump(&screen, 100, 24);
+        let after = render_dump(&mut screen, 100, 24);
         assert!(
             after.contains("AI Activity"),
             "AI Activity panel missing after mark_ai_active:\n{after}"
+        );
+    }
+
+    #[test]
+    fn apply_and_cancel_buttons_visible_after_ai_done() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        screen.mark_ai_done();
+        assert!(screen.ai_done());
+        let dumped = render_dump(&mut screen, 100, 28);
+        assert!(dumped.contains("Apply"), "expected Apply button:\n{dumped}");
+        assert!(
+            dumped.contains("Cancel"),
+            "expected Cancel button:\n{dumped}"
         );
     }
 
@@ -1568,8 +1919,211 @@ mod tests {
         screen.start_updating();
         screen.mark_ai_active();
         assert!(screen.ai_active());
+        screen.mark_ai_done();
+        assert!(screen.ai_done());
         screen.start_updating();
         assert!(!screen.ai_active());
+        assert!(!screen.ai_done());
+    }
+
+    #[test]
+    fn key_event_to_pty_bytes_maps_common_keys() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let plain = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&plain), Some(b"a".to_vec()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&enter), Some(b"\r".to_vec()));
+
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&backspace), Some(vec![0x7f]));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&esc), Some(vec![0x1b]));
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&up), Some(b"\x1b[A".to_vec()));
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(key_event_to_pty_bytes(&ctrl_c), Some(vec![0x03]));
+
+        let alt_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(key_event_to_pty_bytes(&alt_a), Some(vec![0x1b, b'a']));
+    }
+
+    #[test]
+    fn pty_focus_defaults_to_outer_after_start_updating() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        assert!(!screen.is_pty_focused());
+    }
+
+    #[test]
+    fn footer_includes_scroll_hint_during_streaming_when_log_has_content() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        screen.append_ai_line("a line of output".to_string());
+
+        let dumped = render_dump(&mut screen, 140, 28);
+        assert!(
+            dumped.contains("Scroll:"),
+            "expected scroll hint in footer:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("PgUp/PgDn"),
+            "expected PgUp/PgDn hint in footer:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn pty_focus_indicator_renders_below_ai_activity_panel() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        let dumped = render_dump(&mut screen, 100, 28);
+        // Streaming-phase hint must always mention the Tab shortcut and
+        // which terminal currently owns the keyboard.
+        assert!(
+            dumped.contains("Tab"),
+            "expected Tab shortcut hint in:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("Focus"),
+            "expected focus indicator in:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn enter_on_outer_focus_while_streaming_opens_finalize_modal() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        assert!(screen.finalize_confirm().is_none());
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(enter), UpdateAction::Continue);
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Confirm));
+        // Opening the modal must not prematurely finalize anything.
+        assert!(!screen.ai_done());
+    }
+
+    #[test]
+    fn tab_inside_finalize_modal_toggles_selection() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        screen.handle_key(enter);
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Confirm));
+
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        screen.handle_key(tab);
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Cancel));
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        screen.handle_key(right);
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Confirm));
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        screen.handle_key(left);
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Cancel));
+    }
+
+    #[test]
+    fn enter_on_yes_in_finalize_modal_transitions_to_review() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        screen.handle_key(enter); // opens modal (Yes selected)
+
+        // Confirm with Enter — must close the modal and surface the
+        // Complete/Cancel review buttons.
+        let confirm = screen.handle_key(enter);
+        assert_eq!(confirm, UpdateAction::Continue);
+        assert!(screen.finalize_confirm().is_none());
+        assert!(screen.ai_done());
+        assert_eq!(screen.ai_button(), AiButton::Complete);
+    }
+
+    #[test]
+    fn enter_on_no_in_finalize_modal_dismisses_and_keeps_streaming() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        screen.handle_key(enter); // opens modal
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        screen.handle_key(tab); // flips to No
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Cancel));
+
+        let confirm = screen.handle_key(enter);
+        assert_eq!(confirm, UpdateAction::Continue);
+        assert!(screen.finalize_confirm().is_none());
+        assert!(
+            !screen.ai_done(),
+            "No must not flip the screen into the review state"
+        );
+    }
+
+    #[test]
+    fn esc_inside_finalize_modal_dismisses_without_finalizing() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        screen.handle_key(enter);
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Confirm));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        screen.handle_key(esc);
+        assert!(screen.finalize_confirm().is_none());
+        assert!(!screen.ai_done());
+    }
+
+    #[test]
+    fn finalize_modal_renders_centered_overlay() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        screen.handle_key(enter);
+
+        let dumped = render_dump(&mut screen, 100, 28);
+        assert!(
+            dumped.contains("Do you confirm that the merge resolution is finalized?"),
+            "expected modal prompt in:\n{dumped}"
+        );
+        // "  Yes  " in a 7-cell inner area = symmetric 2-cell margins.
+        assert!(
+            dumped.contains("  Yes  "),
+            "expected centered Yes button in:\n{dumped}"
+        );
+        // "  No  " in a 6-cell inner area = symmetric 2-cell margins.
+        assert!(
+            dumped.contains("  No  "),
+            "expected centered No button in:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn enter_with_outer_focus_does_not_open_modal_before_ai_active() {
+        // Pre-AI Activity (e.g. fetching base ref) — Enter is still a
+        // swallowed no-op, not a modal trigger.
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(enter), UpdateAction::Continue);
+        assert!(screen.finalize_confirm().is_none());
     }
 
     #[test]
@@ -1577,7 +2131,7 @@ mod tests {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
 
-        let dumped = render_dump(&screen, 100, 28);
+        let dumped = render_dump(&mut screen, 100, 28);
 
         assert!(
             dumped.contains("Update Pull Request #21?"),
@@ -1587,41 +2141,5 @@ mod tests {
         assert!(dumped.contains("-7"));
         assert!(dumped.contains("Yes"));
         assert!(dumped.contains("No"));
-    }
-
-    #[test]
-    fn render_review_inserts_blank_lines_before_diff_and_buttons() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
-        screen.set_base_ref("upstream/main".to_string());
-        screen.present_review(
-            "deadbee".to_string(),
-            "1 file changed, 2 insertions(+)".to_string(),
-            "diff --git a/README.md b/README.md\n+added\n".to_string(),
-        );
-
-        let dumped = render_dump(&screen, 100, 28);
-        let lines: Vec<&str> = dumped.lines().collect();
-
-        let scroll_idx = lines
-            .iter()
-            .position(|line| line.contains("Scroll: ↑/↓ or wheel"))
-            .expect("missing scroll hint");
-        assert!(
-            lines[scroll_idx + 1].trim().is_empty(),
-            "expected blank line after scroll hint:\n{dumped}"
-        );
-
-        let push_idx = lines
-            .iter()
-            .position(|line| line.contains("│ Push │") || line.contains(" Push "))
-            .expect("missing Push button");
-        assert!(
-            lines[push_idx - 1].trim().is_empty(),
-            "expected blank line before buttons:\n{dumped}"
-        );
-        assert!(
-            !lines[push_idx - 2].trim().is_empty(),
-            "expected review message immediately above the blank line before buttons:\n{dumped}"
-        );
     }
 }
