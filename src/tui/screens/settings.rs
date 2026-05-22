@@ -1037,26 +1037,6 @@ impl DashboardEditor {
             .position(|&s| s == DashboardRectStatus::Editing)
     }
 
-    fn move_up(&mut self) {
-        self.selection = match self.selection {
-            DashboardSelection::Rect(0) => DashboardSelection::Rect(0),
-            DashboardSelection::Rect(i) => DashboardSelection::Rect(i - 1),
-            DashboardSelection::FreeModels(_) => DashboardSelection::Rect(self.values.len() - 1),
-            DashboardSelection::Save => DashboardSelection::Rect(self.values.len() - 1),
-        };
-    }
-
-    fn move_down(&mut self) {
-        self.selection = match self.selection {
-            DashboardSelection::Rect(i) if i + 1 < self.values.len() => {
-                DashboardSelection::Rect(i + 1)
-            }
-            DashboardSelection::Rect(_) => DashboardSelection::Save,
-            DashboardSelection::FreeModels(_) => DashboardSelection::Save,
-            DashboardSelection::Save => DashboardSelection::Save,
-        };
-    }
-
     /// Build the `DashboardConfig` from current editor values. Numeric and
     /// column normalization happens here so invalid input falls back to the
     /// schema defaults rather than rejecting the save.
