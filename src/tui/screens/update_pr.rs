@@ -22,8 +22,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::Frame;
 
@@ -31,7 +30,8 @@ use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, PtyView, Status, StatusIndicator,
+    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, PtyView, Status, StatusIndicator,
 };
 
 const UPDATE_LOADING_MESSAGE: &str = "Resolving base ref...";
@@ -42,6 +42,13 @@ const UPDATE_RUNNING_MESSAGE: &str = "Updating pull request...";
 /// progress dots); we only ever render the bottom slice that fits the
 /// activity panel, so anything older is pure memory pressure.
 const AI_LOG_MAX_LINES: usize = 1024;
+
+/// CSI sequences for PageUp / PageDown forwarded to the embedded opencode
+/// process. Mouse wheel + arrow keys both synthesize these so the user
+/// scrolls opencode's own message buffer (vt100's alt-screen scrollback
+/// is unusable while opencode owns the alternate grid).
+const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
+const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateStep {
@@ -54,17 +61,6 @@ pub enum UpdateStep {
 pub enum AiButton {
     Complete,
     Cancel,
-}
-
-/// Which option is highlighted in the "finalize the AI resolution?"
-/// confirmation modal. `Yes` is the default (green) so a careful
-/// user pressing Enter immediately confirms; `No` (red) bails back
-/// into the live AI Activity panel without disturbing the running
-/// opencode subprocess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FinalizeChoice {
-    Yes,
-    No,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +116,7 @@ pub struct UpdatePullRequestScreen {
     /// to the Complete/Cancel review buttons) or No/Esc (resume the AI
     /// Activity panel). The embedded opencode PTY keeps running
     /// underneath either way because `App::tick_pty` ticks every frame.
-    finalize_confirm: Option<FinalizeChoice>,
+    finalize_confirm: Option<ConfirmationModal>,
     error: Option<String>,
     step: UpdateStep,
     pub tick: usize,
@@ -354,15 +350,17 @@ impl UpdatePullRequestScreen {
 
     /// Scroll the AI Activity panel up by `lines` (only meaningful while
     /// the AI is actively streaming or has just finished). When the
-    /// embedded PTY is alive, scrolling routes through vt100's scrollback
-    /// so the user sees real terminal history; otherwise we fall back to
-    /// the structured-event log offset.
+    /// embedded PTY is alive, opencode runs on the alt-screen so vt100's
+    /// own scrollback is empty — we forward a PageUp keystroke to the
+    /// subprocess instead, which fires opencode's own message-history
+    /// scroll binding. Without a PTY we fall back to the structured-event
+    /// log offset.
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
         if !matches!(self.step, UpdateStep::Updating) || !self.ai_active {
             return false;
         }
         if let Some(pty) = self.pty.as_mut() {
-            pty.scroll_up(lines);
+            pty.send_input(PTY_PAGE_UP);
         } else {
             self.ai_scroll = self.ai_scroll.saturating_add(lines);
         }
@@ -377,7 +375,7 @@ impl UpdatePullRequestScreen {
             return false;
         }
         if let Some(pty) = self.pty.as_mut() {
-            pty.scroll_down(lines);
+            pty.send_input(PTY_PAGE_DOWN);
         } else {
             self.ai_scroll = self.ai_scroll.saturating_sub(lines);
         }
@@ -442,38 +440,26 @@ impl UpdatePullRequestScreen {
     /// the Complete/Cancel review state, No simply closes the modal);
     /// Esc closes the modal without acting (same as picking No).
     fn handle_finalize_modal_key(&mut self, key: KeyEvent) -> UpdateAction {
-        let current = self
+        let modal = self
             .finalize_confirm
+            .as_mut()
             .expect("handle_finalize_modal_key called with no modal open");
-        match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                self.finalize_confirm = Some(match current {
-                    FinalizeChoice::Yes => FinalizeChoice::No,
-                    FinalizeChoice::No => FinalizeChoice::Yes,
-                });
-            }
-            KeyCode::Char(c) => match c.to_ascii_lowercase() {
-                'y' => self.finalize_confirm = Some(FinalizeChoice::Yes),
-                'n' => self.finalize_confirm = Some(FinalizeChoice::No),
-                _ => {}
-            },
-            KeyCode::Enter => {
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => {}
+            ConfirmationOutcome::Confirmed => {
                 self.finalize_confirm = None;
-                if matches!(current, FinalizeChoice::Yes) {
-                    self.mark_ai_done();
-                }
+                self.mark_ai_done();
             }
-            KeyCode::Esc => {
+            ConfirmationOutcome::Cancelled => {
                 self.finalize_confirm = None;
             }
-            _ => {}
         }
         UpdateAction::Continue
     }
 
     #[cfg(test)]
-    pub(crate) fn finalize_confirm(&self) -> Option<FinalizeChoice> {
-        self.finalize_confirm
+    pub(crate) fn finalize_confirm(&self) -> Option<ConfirmationChoice> {
+        self.finalize_confirm.as_ref().map(|m| m.selected())
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
@@ -532,7 +518,7 @@ impl UpdatePullRequestScreen {
                 // be destructive — so we surface a confirmation modal
                 // first. The PTY keeps running underneath.
                 if self.ai_active && matches!(key.code, KeyCode::Enter) {
-                    self.finalize_confirm = Some(FinalizeChoice::Yes);
+                    self.finalize_confirm = Some(build_finalize_modal());
                     return UpdateAction::Continue;
                 }
                 // Outer-focus & still streaming → swallow other keys so
@@ -739,102 +725,9 @@ impl UpdatePullRequestScreen {
         // PTY emulator state underneath. The PTY child keeps streaming;
         // we just stop forwarding keystrokes to it while the modal owns
         // input.
-        if let Some(selected) = self.finalize_confirm {
-            self.render_finalize_modal(frame, area, selected);
+        if let Some(modal) = self.finalize_confirm.as_ref() {
+            modal.render(frame, area);
         }
-    }
-
-    fn render_finalize_modal(&self, frame: &mut Frame, area: Rect, selected: FinalizeChoice) {
-        let rect = finalize_modal_rect(area);
-        if rect.width < 6 || rect.height < 6 {
-            return;
-        }
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(
-                Style::default()
-                    .fg(colors::WARNING)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .padding(Padding::horizontal(1));
-        let inner = block.inner(rect);
-        frame.render_widget(Clear, rect);
-        frame.render_widget(block, rect);
-
-        if inner.height == 0 || inner.width == 0 {
-            return;
-        }
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // title
-                Constraint::Length(1), // blank
-                Constraint::Length(1), // prompt
-                Constraint::Length(1), // blank
-                Constraint::Length(3), // buttons row
-                Constraint::Length(1), // hint
-                Constraint::Min(0),
-            ])
-            .split(inner);
-
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Confirm finalization".to_string(),
-                Style::default()
-                    .fg(colors::WARNING)
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            chunks[0],
-        );
-
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Do you confirm that the merge resolution is finalized?".to_string(),
-                Style::default().fg(colors::WHITE),
-            ))),
-            chunks[2],
-        );
-
-        let yes_selected = matches!(selected, FinalizeChoice::Yes);
-        let no_selected = matches!(selected, FinalizeChoice::No);
-        // Center alignment can only place a label *perfectly* when the
-        // inner-width parity matches the label length, so we pick a
-        // dedicated width per button rather than padding manually:
-        //   "Yes" (3 cells) → inner 7 → 2 left / 2 right
-        //   "No"  (2 cells) → inner 6 → 2 left / 2 right
-        let yes_box = button_paragraph("Yes", colors::SUCCESS, yes_selected);
-        let no_box = button_paragraph("No", colors::ERROR, no_selected);
-
-        let yes_width: u16 = 9;
-        let no_width: u16 = 8;
-        let gap: u16 = 2;
-        let total = yes_width + gap + no_width;
-        let side = chunks[4].width.saturating_sub(total) / 2;
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(side),
-                Constraint::Length(yes_width),
-                Constraint::Length(gap),
-                Constraint::Length(no_width),
-                Constraint::Min(0),
-            ])
-            .split(chunks[4]);
-        frame.render_widget(yes_box, cols[1]);
-        frame.render_widget(no_box, cols[3]);
-
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "←→/Tab to switch · Enter to confirm · Esc to cancel".to_string(),
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            )))
-            .alignment(ratatui::layout::Alignment::Center),
-            chunks[5],
-        );
     }
 
     fn render_ai_activity(&mut self, frame: &mut Frame, area: Rect) {
@@ -1089,7 +982,7 @@ impl UpdatePullRequestScreen {
 
         frame.render_widget(
             button_paragraph(
-                " Complete ",
+                "  Apply   ",
                 colors::SUCCESS,
                 matches!(self.ai_button, AiButton::Complete),
             ),
@@ -1673,26 +1566,18 @@ fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
-/// Centered rectangle used by the finalize-confirmation modal. Sized
-/// to comfortably fit the prompt + button row on standard terminals,
-/// clamped against the available area so very small terminals still
-/// produce a valid rect (the renderer also defends against the
-/// degenerate case where the rect collapses too far).
-fn finalize_modal_rect(area: Rect) -> Rect {
-    // Width: 60 cols for breathing room around the prompt; never wider
-    // than the panel minus a 2-cell margin.
-    let width = 60u16.min(area.width.saturating_sub(4)).max(20);
-    // Height tally (inner rows): title(1) + blank(1) + prompt(1)
-    // + blank(1) + button row(3) + hint(1) = 8. Plus 2 border rows = 10.
-    let height = 10u16.min(area.height.saturating_sub(2)).max(8);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect {
-        x,
-        y,
-        width,
-        height,
-    }
+/// Build the finalize-confirmation modal that opens when the user
+/// presses Enter on the outer focus while opencode is streaming. Yes is
+/// preselected so a careful confirmation flow (Enter → modal → Enter)
+/// commits the merge resolution; No / Esc returns to the live PTY.
+fn build_finalize_modal() -> ConfirmationModal {
+    ConfirmationModal::new()
+        .with_title("Confirm finalization")
+        .with_subtitle("Do you confirm that the merge resolution is finalized?")
+        .with_confirm_text("Yes")
+        .with_cancel_text("No")
+        .with_color("#eada61")
+        .with_selected(ConfirmationChoice::Confirm)
 }
 
 fn labeled_line(
@@ -1998,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_and_cancel_buttons_visible_after_ai_done() {
+    fn apply_and_cancel_buttons_visible_after_ai_done() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
@@ -2006,10 +1891,7 @@ mod tests {
         screen.mark_ai_done();
         assert!(screen.ai_done());
         let dumped = render_dump(&mut screen, 100, 28);
-        assert!(
-            dumped.contains("Complete"),
-            "expected Complete button:\n{dumped}"
-        );
+        assert!(dumped.contains("Apply"), "expected Apply button:\n{dumped}");
         assert!(
             dumped.contains("Cancel"),
             "expected Cancel button:\n{dumped}"
@@ -2126,7 +2008,7 @@ mod tests {
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(enter), UpdateAction::Continue);
-        assert_eq!(screen.finalize_confirm(), Some(FinalizeChoice::Yes));
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Confirm));
         // Opening the modal must not prematurely finalize anything.
         assert!(!screen.ai_done());
     }
@@ -2139,17 +2021,17 @@ mod tests {
         screen.mark_ai_active();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         screen.handle_key(enter);
-        assert_eq!(screen.finalize_confirm(), Some(FinalizeChoice::Yes));
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Confirm));
 
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         screen.handle_key(tab);
-        assert_eq!(screen.finalize_confirm(), Some(FinalizeChoice::No));
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Cancel));
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         screen.handle_key(right);
-        assert_eq!(screen.finalize_confirm(), Some(FinalizeChoice::Yes));
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Confirm));
         let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         screen.handle_key(left);
-        assert_eq!(screen.finalize_confirm(), Some(FinalizeChoice::No));
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Cancel));
     }
 
     #[test]
@@ -2180,7 +2062,7 @@ mod tests {
         screen.handle_key(enter); // opens modal
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         screen.handle_key(tab); // flips to No
-        assert_eq!(screen.finalize_confirm(), Some(FinalizeChoice::No));
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Cancel));
 
         let confirm = screen.handle_key(enter);
         assert_eq!(confirm, UpdateAction::Continue);
@@ -2199,7 +2081,7 @@ mod tests {
         screen.mark_ai_active();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         screen.handle_key(enter);
-        assert_eq!(screen.finalize_confirm(), Some(FinalizeChoice::Yes));
+        assert_eq!(screen.finalize_confirm(), Some(ConfirmationChoice::Confirm));
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         screen.handle_key(esc);
         assert!(screen.finalize_confirm().is_none());

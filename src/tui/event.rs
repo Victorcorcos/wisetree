@@ -25,14 +25,15 @@ const INSTANT_RETURN_LIMIT: u32 = 8;
 /// actually wait). Threshold is generous enough to absorb scheduling jitter.
 const INSTANT_POLL_THRESHOLD: Duration = Duration::from_micros(500);
 
-/// How long to sleep once we believe the loop is spinning.
-const SPIN_BACKOFF: Duration = Duration::from_millis(50);
-
 #[derive(Debug, Clone)]
 pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Resize(u16, u16),
+    /// Crossterm can surface a dead TTY as an endless streak of immediate
+    /// empty polls instead of a read error or signal. Treat that as terminal
+    /// loss so the app can shut down cleanly instead of lingering forever.
+    Closed,
     Tick,
 }
 
@@ -80,7 +81,7 @@ impl EventLoop {
         }
 
         if self.spin_guard.note_empty_poll(timeout, elapsed) {
-            std::thread::sleep(SPIN_BACKOFF);
+            return Ok(Event::Closed);
         }
 
         self.last_tick = Instant::now();
@@ -96,7 +97,8 @@ impl Default for EventLoop {
 
 /// Tracks how many empty `event::poll` calls returned essentially instantly,
 /// which is the signature of a dead tty (POLLHUP / POLLERR). Once the streak
-/// crosses [`INSTANT_RETURN_LIMIT`] the caller throttles itself.
+/// crosses [`INSTANT_RETURN_LIMIT`] the caller should treat the terminal as
+/// gone and stop waiting for further input.
 #[derive(Debug, Clone, Default)]
 struct SpinGuard {
     instant_return_streak: u32,
@@ -111,7 +113,8 @@ impl SpinGuard {
         self.instant_return_streak = 0;
     }
 
-    /// Record an empty poll. Returns `true` when the caller should throttle.
+    /// Record an empty poll. Returns `true` when the caller should treat the
+    /// TTY as dead.
     fn note_empty_poll(&mut self, requested_timeout: Duration, actual_elapsed: Duration) -> bool {
         if requested_timeout > INSTANT_POLL_THRESHOLD && actual_elapsed < INSTANT_POLL_THRESHOLD {
             self.instant_return_streak = self.instant_return_streak.saturating_add(1);
@@ -147,12 +150,12 @@ mod tests {
         for iteration in 0..INSTANT_RETURN_LIMIT.saturating_sub(1) {
             assert!(
                 !guard.note_empty_poll(timeout, instant),
-                "iteration {iteration} should not throttle yet"
+                "iteration {iteration} should not report a dead tty yet"
             );
         }
         assert!(
             guard.note_empty_poll(timeout, instant),
-            "streak at the limit should request throttling"
+            "streak at the limit should report a dead tty"
         );
     }
 

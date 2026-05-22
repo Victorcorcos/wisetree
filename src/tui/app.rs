@@ -292,6 +292,7 @@ impl App {
             match events.next_event()? {
                 Event::Key(key) => self.handle_key(key, &tx),
                 Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
+                Event::Closed => self.quit_requested = true,
                 Event::Tick => {
                     self.tick = self.tick.wrapping_add(1);
                     if let Some(screen) = self.update_pr.as_mut() {
