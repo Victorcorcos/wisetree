@@ -59,9 +59,7 @@ impl PtyView {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("openpty: {err}"))
-            })?;
+            .map_err(|err| std::io::Error::other(format!("openpty: {err}")))?;
 
         let mut cmd = CommandBuilder::new(binary);
         for arg in args {
@@ -82,7 +80,7 @@ impl PtyView {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, format!("spawn: {err}")))?;
+            .map_err(|err| std::io::Error::other(format!("spawn: {err}")))?;
         // The slave handle keeps the child's controlling tty open. We
         // drop it after spawn — the child holds its own dup'd fds for
         // stdin/stdout/stderr and the master keeps the kernel pty pair
@@ -92,15 +90,11 @@ impl PtyView {
         let reader = pair
             .master
             .try_clone_reader()
-            .map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("clone reader: {err}"))
-            })?;
+            .map_err(|err| std::io::Error::other(format!("clone reader: {err}")))?;
         let writer = pair
             .master
             .take_writer()
-            .map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("take writer: {err}"))
-            })?;
+            .map_err(|err| std::io::Error::other(format!("take writer: {err}")))?;
 
         let parser = Arc::new(Mutex::new(Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0)));
         let done = Arc::new(AtomicBool::new(false));

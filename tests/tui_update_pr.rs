@@ -68,9 +68,10 @@ fn sh_quote(path: &Path) -> String {
 }
 
 fn ai_config() -> DashboardConfig {
-    let mut cfg = DashboardConfig::default();
-    cfg.use_ai = "anthropic/claude-sonnet-4-5".to_string();
-    cfg
+    DashboardConfig {
+        use_ai: "anthropic/claude-sonnet-4-5".to_string(),
+        ..DashboardConfig::default()
+    }
 }
 
 /// Build the standard fixture:

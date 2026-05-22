@@ -9,12 +9,16 @@
 //! `models` map yields zero entries) so a schema drift upstream doesn't crash
 //! the picker.
 
+use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const OPENCODE_MODELS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One row in the picker: a single `provider/model` pair plus the human
 /// names the picker uses for the description column.
@@ -85,8 +89,50 @@ fn flatten_providers(
             });
         }
     }
-    out.sort_by(|a, b| a.pair().cmp(&b.pair()));
+    out.sort_by_key(|m| m.pair());
     out
+}
+
+/// Ask the locally installed `opencode` binary for the models its
+/// `opencode/*` provider can actually serve right now. This is more
+/// authoritative than `models.dev/api.json` for the free-model picker:
+/// the upstream catalogue advertises ~17 free models, but the local CLI
+/// only forwards the small subset its servers currently route — calling
+/// any other "free" model fails with `Model not found: ...`. Each line
+/// of stdout is one `provider/model` pair.
+pub async fn fetch_free_opencode_models(binary: &Path) -> Result<Vec<String>, String> {
+    let mut cmd = Command::new(binary);
+    cmd.arg("models")
+        .arg("opencode")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = tokio::time::timeout(OPENCODE_MODELS_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| "opencode models timed out".to_string())?
+        .map_err(|e| format!("spawn opencode: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "opencode models exited non-zero".to_string()
+        } else {
+            stderr
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_opencode_models_output(&stdout))
+}
+
+/// Pulled out so unit tests can exercise the parser without spawning a
+/// subprocess. Each non-empty, non-whitespace line is treated as a
+/// `provider/model` pair; we additionally filter to lines that contain
+/// a `/` to defend against banner / log noise sneaking into stdout.
+pub fn parse_opencode_models_output(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && line.contains('/'))
+        .map(|line| line.to_string())
+        .collect()
 }
 
 /// Test-only helper: run the same flattening logic against a raw JSON string.
@@ -167,5 +213,30 @@ mod tests {
     fn malformed_json_returns_err() {
         let parsed = parse_models_json("not json");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn parse_opencode_models_output_keeps_provider_model_lines() {
+        let raw = "opencode/big-pickle\nopencode/deepseek-v4-flash-free\nopencode/nemotron-3-super-free\n";
+        assert_eq!(
+            parse_opencode_models_output(raw),
+            vec![
+                "opencode/big-pickle".to_string(),
+                "opencode/deepseek-v4-flash-free".to_string(),
+                "opencode/nemotron-3-super-free".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_opencode_models_output_skips_noise_lines() {
+        // opencode's CLI sometimes leads with an ASCII-art banner before
+        // the actual list. Filter anything without a slash so banners,
+        // blank lines, and progress chatter never sneak into the picker.
+        let raw = "\n   opencode banner\nopencode/big-pickle\n\n";
+        assert_eq!(
+            parse_opencode_models_output(raw),
+            vec!["opencode/big-pickle".to_string()]
+        );
     }
 }

@@ -29,10 +29,11 @@ use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
-    check_for_updates, default_dashboard_warning, detect_shell_integration, fetch_opencode_models,
-    install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, OpencodeModel, Shell, ShellIntegrationStatus,
-    UpdateBranchOutcome, UpdateCheckResult, UpdatePhase, UpdateProgress,
+    check_for_updates, default_dashboard_warning, detect_shell_integration,
+    fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
+    resolve_dashboard_columns, AppStateService, DashboardService, DashboardUpdate, DashboardWatch,
+    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult,
+    UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -81,12 +82,6 @@ enum InitPhase {
     Errored,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalExit {
-    Clean,
-    Detached,
-}
-
 enum AppEvent {
     Initialized(Box<InitOutcome>),
     CacheLoaded(Result<crate::files::CacheOverview, String>),
@@ -120,6 +115,9 @@ enum AppEvent {
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
+    /// Result of the background `opencode models opencode` shell-out that
+    /// powers the Dashboard footer's free-model quick-pick.
+    FreeOpencodeModelsFetched(Result<Vec<String>, String>),
 }
 
 struct MergePrDetailsPayload {
@@ -246,27 +244,19 @@ impl App {
                 )
             })?;
             let result = self.event_loop(&mut terminal).await;
-            if matches!(result, Ok(TerminalExit::Clean)) && controlling_tty_alive() {
-                // Wrapper mode renders into a fixed bottom viewport on `/dev/tty`.
-                // Clear the screen and reset the cursor so the shell prompt
-                // returns at the top instead of below a block of empty rows.
-                let _ = terminal::clear_wrapper_for_shell(&mut terminal);
-                let _ = terminal::restore_wrapper_tty();
-                let _ = terminal.show_cursor();
-            } else {
-                let _ = terminal::leave_raw_mode_only();
-            }
+            // Wrapper mode renders into a fixed bottom viewport on `/dev/tty`.
+            // Clear the screen and reset the cursor so the shell prompt
+            // returns at the top instead of below a block of empty rows.
+            let _ = terminal::clear_wrapper_for_shell(&mut terminal);
+            let _ = terminal::restore_wrapper_tty();
+            let _ = terminal.show_cursor();
             result?;
         } else {
             let mut terminal = terminal::enter()?;
             let result = self.event_loop(&mut terminal).await;
-            if matches!(result, Ok(TerminalExit::Clean)) && controlling_tty_alive() {
-                let _ = terminal.clear();
-                let _ = terminal::restore();
-                let _ = terminal.show_cursor();
-            } else {
-                let _ = terminal::leave_raw_mode_only();
-            }
+            let _ = terminal.clear();
+            let _ = terminal::restore();
+            let _ = terminal.show_cursor();
             result?;
         }
         Ok(self.selected_path.clone())
@@ -275,7 +265,7 @@ impl App {
     async fn event_loop<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut ratatui::Terminal<B>,
-    ) -> anyhow::Result<TerminalExit> {
+    ) -> anyhow::Result<()> {
         let local = tokio::task::LocalSet::new();
         local.run_until(self.event_loop_inner(terminal)).await
     }
@@ -283,37 +273,20 @@ impl App {
     async fn event_loop_inner<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut ratatui::Terminal<B>,
-    ) -> anyhow::Result<TerminalExit> {
+    ) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         kick_off_initialize(tx.clone());
 
         let mut events = EventLoop::new(Duration::from_millis(50));
         let signal_quit = install_termination_listener();
-        let orphan_quit = install_orphan_watchdog();
 
-        while !self.quit_requested
-            && !signal_quit.load(Ordering::Relaxed)
-            && !orphan_quit.load(Ordering::Relaxed)
-        {
+        while !self.quit_requested && !signal_quit.load(Ordering::Relaxed) {
             while let Ok(event) = rx.try_recv() {
                 self.handle_app_event(event, &tx);
             }
             self.poll_dashboard_updates();
 
-            // The event loop only notices dead stdin inside `next_event()`, but
-            // the render path runs first. If the terminal disappears while a
-            // live screen is repainting (dashboard ticks, mouse movement, etc.),
-            // drawing against the dead tty can spin hard before the watchdog
-            // gets its next 500ms turn.
-            if !controlling_tty_alive() {
-                return Ok(TerminalExit::Detached);
-            }
-
-            let completed = match terminal.draw(|frame| self.draw(frame)) {
-                Ok(completed) => completed,
-                Err(_err) if !controlling_tty_alive() => return Ok(TerminalExit::Detached),
-                Err(err) => return Err(err.into()),
-            };
+            let completed = terminal.draw(|frame| self.draw(frame))?;
             self.last_rendered_buffer = Some(completed.buffer.clone());
 
             match events.next_event()? {
@@ -330,14 +303,9 @@ impl App {
                     }
                 }
                 Event::Resize(_, _) => {}
-                // The input fd is in POLLHUP — the terminal tab is gone.
-                // Calling crossterm again would wedge us at 100% CPU
-                // inside its `try_read` loop. Break out so the cleanup
-                // path runs and the process exits.
-                Event::TtyDisconnected => return Ok(TerminalExit::Detached),
             }
         }
-        Ok(TerminalExit::Clean)
+        Ok(())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -1276,6 +1244,23 @@ impl App {
             SettingsAction::OpenAiModelPicker(current_use_ai) => {
                 self.open_ai_model_picker(current_use_ai, tx);
             }
+            SettingsAction::FetchFreeModels => {
+                kick_off_fetch_free_opencode_models(tx.clone());
+            }
+            SettingsAction::ApplyFreeModel(model) => {
+                let dashboard = self
+                    .settings
+                    .as_mut()
+                    .and_then(|settings| settings.apply_use_ai_selection(model));
+                if let Some(dashboard) = dashboard {
+                    if let Err(err) = self.save_dashboard(dashboard) {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings
+                                .set_error(format!("Failed to save dashboard settings: {err}"));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1545,6 +1530,18 @@ impl App {
                     match result {
                         Ok(models) => picker.set_models(models),
                         Err(message) => picker.set_error(message),
+                    }
+                }
+            }
+            AppEvent::FreeOpencodeModelsFetched(result) => {
+                // Same best-effort posture as the picker fetch: by the time
+                // this lands the user may have already left the Dashboard
+                // editor, so we silently drop the result if there's no
+                // Settings screen to update.
+                if let Some(settings) = self.settings.as_mut() {
+                    match result {
+                        Ok(models) => settings.set_free_models(models),
+                        Err(message) => settings.set_free_models_error(message),
                     }
                 }
             }
@@ -2630,27 +2627,16 @@ struct InitOutcome {
     result: Result<WorktreeService, String>,
 }
 
-/// Route asynchronous termination signals through the shutdown path.
-///
-/// SIGHUP gets a *raw* sigaction handler that calls `_exit(0)` directly,
-/// bypassing every layer of Rust/tokio cleanup. This is intentional: SIGHUP
-/// arrives exactly when the terminal is being torn down (user closed the
-/// tab), so the controlling tty is already dead. Routing SIGHUP through
-/// tokio's cooperative signal stream means the flag is only consulted on
-/// the next iteration of the main loop — and if the main loop is wedged in
-/// a `write()` to the dead pty slave, that iteration never happens, leaving
-/// `wisetree` pegged as an orphan reparented to launchd.
-///
-/// SIGTERM/SIGINT/SIGQUIT still go through the tokio-driven cooperative
-/// shutdown so external `kill -TERM` / `kill -INT` calls trigger normal
-/// terminal restoration. Those signals arrive while the tty is still alive,
-/// so cleanup has a chance to succeed.
+/// Listen for terminal-related signals (SIGTERM/SIGINT/SIGQUIT/SIGHUP) and
+/// flip a shared flag when any of them arrives. The main event loop checks
+/// the flag every tick and breaks out cleanly, which routes the shutdown
+/// through the normal Drop chain — including crossterm's
+/// `DisableMouseCapture` and `disable_raw_mode`, so the user's terminal is
+/// returned to a sane state.
 fn install_termination_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
-        install_raw_sighup_exit();
-
         let flag = flag.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
@@ -2663,474 +2649,19 @@ fn install_termination_listener() -> Arc<AtomicBool> {
             let Ok(mut quit) = signal(SignalKind::quit()) else {
                 return;
             };
+            let Ok(mut hup) = signal(SignalKind::hangup()) else {
+                return;
+            };
             tokio::select! {
                 _ = term.recv() => {}
                 _ = int.recv() => {}
                 _ = quit.recv() => {}
+                _ = hup.recv() => {}
             }
             flag.store(true, Ordering::Relaxed);
         });
     }
     flag
-}
-
-/// Install a raw `sigaction` handler for SIGHUP that immediately calls
-/// `_exit(0)`. Idempotent: safe to call multiple times.
-///
-/// We use a real signal handler (not tokio's cooperative stream) because the
-/// failure mode we're guarding against is "main thread is wedged inside a
-/// syscall that never returns" — exactly the state where flag-based
-/// shutdown can't run. `_exit` is async-signal-safe and terminates the
-/// process synchronously inside the handler.
-///
-/// When `WISETREE_DEBUG_WATCHDOG=1` is set we also `write(2)` a fixed marker
-/// to `/tmp/wisetree_watchdog.log` *before* exiting. That lets us tell
-/// post-mortem whether SIGHUP ever reached the process — if the log has
-/// "sighup-received" but the process is still alive, something between
-/// delivery and `_exit` is broken; if there's no marker, SIGHUP was never
-/// delivered in the first place.
-#[cfg(unix)]
-static SIGHUP_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-#[cfg(unix)]
-fn install_raw_sighup_exit() {
-    if std::env::var_os("WISETREE_DEBUG_WATCHDOG").is_some() {
-        let path =
-            std::ffi::CString::new("/tmp/wisetree_watchdog.log").expect("static path has no NUL");
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
-                0o644,
-            )
-        };
-        if fd >= 0 {
-            SIGHUP_LOG_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    extern "C" fn sighup_exit(_sig: libc::c_int) {
-        let fd = SIGHUP_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
-        if fd >= 0 {
-            let msg = b"sighup-received\n";
-            // `write(2)` is async-signal-safe. We can't format the pid in
-            // here without violating that, so the watchdog logs the pid at
-            // startup; the user can correlate via timestamps.
-            unsafe {
-                let _ = libc::write(fd, msg.as_ptr().cast::<libc::c_void>(), msg.len());
-            }
-        }
-        // Best-effort terminal restoration from inside a signal handler.
-        // Only async-signal-safe syscalls — no crossterm, no mutexes.
-        // Even if the terminal is gone these calls fail silently. When the
-        // terminal is alive (SIGHUP was delivered by something other than
-        // the tab closing) this is what keeps mouse-tracking from leaking.
-        restore_terminal_async_signal_safe();
-        unsafe { libc::_exit(0) }
-    }
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = sighup_exit as *const () as libc::sighandler_t;
-        libc::sigemptyset(&mut action.sa_mask);
-        action.sa_flags = 0;
-        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
-    }
-}
-
-/// Orphan / dead-terminal watchdog. Defends against the scenario that left
-/// `wisetree` processes pegged at 100% CPU after the user closed the
-/// terminal tab (the original bug report).
-///
-/// Real-world scenario, end-to-end:
-///
-///   1. User runs `wisetree` via the shell wrapper
-///      (`dir=$(... wisetree --from-wrapper)`), which forks a bash subshell
-///      that then execs wisetree.
-///   2. User closes the terminal tab. Terminal.app sends SIGHUP to the
-///      session leader (the interactive shell), then closes the master pty.
-///   3. The interactive shell exits — but the `$()` subshell is a separate
-///      process that may stay alive (reparented to launchd) waiting for
-///      wisetree's stdout, so `getppid()` does NOT necessarily change.
-///   4. Terminal.app *may* keep the master fd open while waiting for child
-///      processes to finish draining the slave, so `POLLHUP` on stdin/stderr
-///      doesn't fire either.
-///
-/// One of the following IS reliable, though: when the session leader exits,
-/// the kernel disassociates the session from its controlling terminal. From
-/// any other process in that session:
-///
-///   * `tcgetpgrp(stdin)` returns `-1` with `ENOTTY` — the fd is still a
-///     character device but it's no longer the *controlling* tty.
-///   * `open("/dev/tty", ...)` fails with `ENXIO` for the same reason.
-///
-/// We poll all four signals every 200ms (was 500ms) so the watchdog reacts
-/// within ~½ second of any failure mode, then `_exit(0)` after a short
-/// grace period to bypass the libc atexit handlers (which would flush
-/// stdio onto the dead pty slave and re-wedge the process).
-fn install_orphan_watchdog() -> Arc<AtomicBool> {
-    let flag = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    {
-        let original_ppid = unsafe { libc::getppid() };
-        let debug = std::env::var_os("WISETREE_DEBUG_WATCHDOG").is_some();
-        let tokio_flag = flag.clone();
-        tokio::spawn(async move {
-            let mut log = WatchdogLog::open(debug, "tokio");
-            log.write(format_args!(
-                "start pid={} ppid={original_ppid} sid={} pgrp={}",
-                std::process::id(),
-                unsafe { libc::getsid(0) },
-                unsafe { libc::getpgrp() }
-            ));
-
-            let mut tick = 0u32;
-            let mut consecutive_trips = 0u32;
-            loop {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                tick += 1;
-                let probe = TtyProbe::sample(original_ppid);
-                if debug {
-                    log.write(format_args!("tick {tick}: {probe:?}"));
-                }
-                if probe.dead_reason().is_some() {
-                    consecutive_trips += 1;
-                    // Require two consecutive failed ticks before we commit
-                    // to shutdown. Single-tick blips happen when a child
-                    // process (e.g. opencode forking out to git or to its
-                    // own model client) briefly perturbs our process tree
-                    // or contends for the controlling terminal. Two ticks
-                    // = ~400ms of confirmed badness, which is still well
-                    // under the original closed-terminal recovery target.
-                    if consecutive_trips < 2 {
-                        if debug {
-                            log.write(format_args!(
-                                "transient trip on tick {tick}: {:?} (waiting for confirmation)",
-                                probe.dead_reason()
-                            ));
-                        }
-                        continue;
-                    }
-                    log.write(format_args!(
-                        "tripped on tick {tick}: {:?}",
-                        probe.dead_reason()
-                    ));
-                    tokio_flag.store(true, Ordering::Relaxed);
-                    break;
-                } else {
-                    consecutive_trips = 0;
-                }
-            }
-            // Hard exit fallback. The cooperative shutdown needs a beat to
-            // unwind, but if the main thread is wedged in a `write()` to the
-            // dead pty slave, that path never completes. After 500ms we call
-            // `_exit(0)` directly: `std::process::exit` / `libc::exit` would
-            // run atexit handlers that flush stdio (= write to the dead pty),
-            // which re-wedges us for ~60s until the kernel times the slave out.
-            //
-            // Right before `_exit`, restore the terminal so the user's shell
-            // isn't left in raw mode + SGR mouse tracking. Without this, a
-            // watchdog trip during opencode (or any other false-positive)
-            // leaves the parent terminal spewing `<ESC>[<button;col;row>M`
-            // on every mouse move and unable to echo input properly.
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            log.write(format_args!("hard _exit(0)"));
-            restore_terminal_async_signal_safe();
-            unsafe { libc::_exit(0) };
-        });
-
-        // Belt-and-suspenders: an OS-thread watchdog that runs the same
-        // probes outside of tokio. The tokio task can be starved if the
-        // runtime ends up wedged (no worker available, blocking task
-        // monopolizing the executor, etc.). A bare std::thread runs on its
-        // own kernel-scheduled thread and is independent of tokio's state.
-        // First watchdog to detect death wins.
-        let os_flag = flag.clone();
-        std::thread::Builder::new()
-            .name("wisetree-watchdog".into())
-            .spawn(move || {
-                let mut log = WatchdogLog::open(debug, "os");
-                log.write(format_args!(
-                    "start pid={} ppid={original_ppid}",
-                    std::process::id()
-                ));
-                let mut tick = 0u32;
-                let mut consecutive_trips = 0u32;
-                loop {
-                    std::thread::sleep(Duration::from_millis(200));
-                    tick += 1;
-                    let probe = TtyProbe::sample(original_ppid);
-                    if debug {
-                        log.write(format_args!("tick {tick}: {probe:?}"));
-                    }
-                    if probe.dead_reason().is_some() {
-                        consecutive_trips += 1;
-                        if consecutive_trips < 2 {
-                            if debug {
-                                log.write(format_args!(
-                                    "transient trip on tick {tick}: {:?} (waiting for confirmation)",
-                                    probe.dead_reason()
-                                ));
-                            }
-                            continue;
-                        }
-                        log.write(format_args!(
-                            "tripped on tick {tick}: {:?}",
-                            probe.dead_reason()
-                        ));
-                        os_flag.store(true, Ordering::Relaxed);
-                        break;
-                    } else {
-                        consecutive_trips = 0;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(500));
-                log.write(format_args!("hard _exit(0)"));
-                restore_terminal_async_signal_safe();
-                unsafe { libc::_exit(0) };
-            })
-            .expect("spawning the OS watchdog thread should not fail");
-    }
-    flag
-}
-
-/// Best-effort terminal restoration that bypasses crossterm and any other
-/// machinery that might touch a Mutex, the heap, or stdio.
-///
-/// Used right before `libc::_exit(0)` in the watchdog paths and from the
-/// SIGHUP signal handler. Every call here is async-signal-safe per POSIX
-/// (`open`, `write`, `close`, `tcgetattr`, `tcsetattr`, `ioctl`) so the
-/// signal-handler path is reentrancy-safe.
-///
-/// Why this matters: `_exit(2)` skips libc atexit handlers, which means
-/// crossterm's `DisableMouseCapture` + `disable_raw_mode` calls in our
-/// normal cleanup never run. Without this helper, every watchdog-driven
-/// exit leaves the parent terminal in SGR mouse-tracking mode (`?1006`)
-/// — the user sees `<ESC>[<button;col;row>M` coordinates leaking onto
-/// their prompt on every mouse move, and the terminal becomes unusable
-/// until they close the tab.
-///
-/// What we restore:
-///   - `?1006l` SGR mouse mode off
-///   - `?1003l` any-event mouse off
-///   - `?1002l` button-event mouse off
-///   - `?1000l` basic mouse off
-///   - `?25h`   show cursor
-///   - `\x1b[0m` reset SGR attributes
-///   - `tcsetattr` with ICANON|ECHO|ISIG set, raw flags cleared — so the
-///     user's shell prompt echoes input again.
-///
-/// All writes go to `/dev/tty` directly (opened O_WRONLY|O_NONBLOCK) so
-/// we never block on a dead pty slave. If `/dev/tty` itself is gone
-/// (the terminal really did disappear) the writes fail silently — that's
-/// fine, the terminal can't be restored anyway.
-#[cfg(unix)]
-fn restore_terminal_async_signal_safe() {
-    // Disable mouse tracking + show cursor + reset attrs. SGR `?1006` is
-    // the form Terminal.app / iTerm2 / Ghostty advertise on every mouse
-    // move when raw + mouse capture is on; clearing all of `1000/1002/
-    // 1003/1006` covers every flavor we may have enabled.
-    const RESTORE_SEQ: &[u8] =
-        b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m";
-    let path = c"/dev/tty";
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-    if fd >= 0 {
-        unsafe {
-            let _ = libc::write(
-                fd,
-                RESTORE_SEQ.as_ptr().cast::<libc::c_void>(),
-                RESTORE_SEQ.len(),
-            );
-            let _ = libc::close(fd);
-        }
-    }
-
-    // Best-effort cooked-mode restore directly on STDIN_FILENO. We don't
-    // have access to the original termios crossterm stored (and reading
-    // from its OnceLock from a signal handler would be unsafe), so we
-    // reconstruct a sensible cooked state from the *current* termios:
-    // re-enable canonical mode, echo, signal generation, output post-
-    // processing, and CR/NL translation — the flags `enable_raw_mode`
-    // turns off.
-    unsafe {
-        let mut termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0 {
-            termios.c_iflag |= libc::ICRNL | libc::IXON | libc::BRKINT;
-            termios.c_oflag |= libc::OPOST;
-            termios.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
-            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn restore_terminal_async_signal_safe() {}
-
-/// Snapshot of every signal we know how to test for "the terminal that
-/// owned us is gone." Each field captures whether one independent probe
-/// thinks the tty is dead.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
-struct TtyProbe {
-    /// Original parent pid changed (subshell or shell died).
-    parent_changed: bool,
-    /// Stdin fd has `POLLHUP`/`POLLERR`/`POLLNVAL`.
-    stdin_pollhup: bool,
-    /// `open("/dev/tty")` failed — session lost its controlling tty.
-    devtty_unavailable: bool,
-    /// `tcgetpgrp(stdin)` failed — fd is no longer a controlling tty.
-    /// We accept `ENOTTY`/`ENXIO`/`EBADF` as evidence of death; transient
-    /// `EINTR` or unrelated errors do not count.
-    stdin_no_pgrp: bool,
-}
-
-#[cfg(unix)]
-impl TtyProbe {
-    fn sample(original_ppid: libc::pid_t) -> Self {
-        let parent_changed = original_ppid > 1 && unsafe { libc::getppid() } != original_ppid;
-        let stdin_pollhup =
-            unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 && fd_is_dead(libc::STDIN_FILENO);
-        let devtty_unavailable = !devtty_open_succeeds();
-        let stdin_no_pgrp = stdin_pgrp_unavailable();
-        Self {
-            parent_changed,
-            stdin_pollhup,
-            devtty_unavailable,
-            stdin_no_pgrp,
-        }
-    }
-
-    fn dead_reason(&self) -> Option<&'static str> {
-        if self.parent_changed {
-            return Some("parent_changed");
-        }
-        if self.stdin_pollhup {
-            return Some("stdin_pollhup");
-        }
-        if self.devtty_unavailable {
-            return Some("devtty_unavailable");
-        }
-        if self.stdin_no_pgrp {
-            return Some("stdin_no_pgrp");
-        }
-        None
-    }
-}
-
-/// Best-effort logger that writes to `/tmp/wisetree_watchdog.log` only when
-/// `WISETREE_DEBUG_WATCHDOG=1` is set. No-ops otherwise so production runs
-/// don't touch the filesystem.
-#[cfg(unix)]
-struct WatchdogLog {
-    file: Option<std::fs::File>,
-    tag: &'static str,
-}
-
-#[cfg(unix)]
-impl WatchdogLog {
-    fn open(enabled: bool, tag: &'static str) -> Self {
-        let file = if enabled {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/wisetree_watchdog.log")
-                .ok()
-        } else {
-            None
-        };
-        Self { file, tag }
-    }
-
-    fn write(&mut self, args: std::fmt::Arguments) {
-        let Some(file) = self.file.as_mut() else {
-            return;
-        };
-        use std::io::Write;
-        let _ = writeln!(file, "[{} {}] {args}", std::process::id(), self.tag);
-        let _ = file.flush();
-    }
-}
-
-/// True when `controlling_tty_alive()` and friends should treat the tty as
-/// already dead. Used by render/cleanup paths that need a single boolean.
-///
-/// Note: only uses the probes that are safe to call mid-render — we skip
-/// `parent_changed` (the render path can outrace orphan reparenting on
-/// macOS, causing a spurious detach during startup) and rely on the
-/// watchdog's 200ms tick for that signal.
-#[cfg(unix)]
-fn controlling_tty_alive() -> bool {
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 && fd_is_dead(libc::STDIN_FILENO) {
-        return false;
-    }
-    if stdin_pgrp_unavailable() {
-        return false;
-    }
-    if !devtty_open_succeeds() {
-        return false;
-    }
-    true
-}
-
-#[cfg(unix)]
-fn devtty_open_succeeds() -> bool {
-    let path = std::ffi::CString::new("/dev/tty").expect("static path has no NUL");
-    // `O_NONBLOCK` is critical: a blocking `open("/dev/tty")` can wedge
-    // inside the kernel after the session loses its controlling tty,
-    // which would disarm the watchdog by stalling its 200ms tick.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-    if fd < 0 {
-        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        // ENXIO = session has no controlling terminal. That's the only
-        // "real" death signal. Other errors (EACCES, EINTR, EMFILE) are
-        // transient or environmental and should NOT trip the watchdog.
-        return e != libc::ENXIO;
-    }
-    // NOTE: don't poll the resulting fd. macOS rejects `poll()` on
-    // `/dev/tty` with `POLLNVAL` even when the device is healthy, which
-    // would false-positive into "tty is dead." The open() call itself is
-    // the reliable signal — if we got here the session still has a
-    // controlling terminal.
-    unsafe {
-        libc::close(fd);
-    }
-    true
-}
-
-/// True when `tcgetpgrp(STDIN_FILENO)` returns a documented "fd is no longer
-/// a controlling terminal" error. Other failures (e.g. transient `EINTR`)
-/// fall through as "still alive" so we don't false-positive.
-#[cfg(unix)]
-fn stdin_pgrp_unavailable() -> bool {
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
-        // Not a tty in the first place — this probe has nothing to say.
-        // Other probes will catch the broken case.
-        return false;
-    }
-    let pgrp = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
-    if pgrp >= 0 {
-        return false;
-    }
-    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    matches!(err, libc::ENOTTY | libc::ENXIO | libc::EBADF)
-}
-
-#[cfg(unix)]
-fn fd_is_dead(fd: libc::c_int) -> bool {
-    let mut fds = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // 0 timeout = snapshot of the current ready/HUP state.
-    let result = unsafe { libc::poll(&mut fds, 1, 0) };
-    if result < 0 {
-        return true;
-    }
-    fds.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-}
-
-#[cfg(not(unix))]
-fn controlling_tty_alive() -> bool {
-    true
 }
 
 fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
@@ -3286,6 +2817,20 @@ fn kick_off_fetch_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let result = fetch_opencode_models().await;
         let _ = tx.send(AppEvent::AiModelsFetched(result));
+    });
+}
+
+/// Shell out to the locally installed `opencode models opencode` to harvest
+/// the small subset of "free" provider/model pairs the upstream router is
+/// actually willing to serve right now. The Dashboard editor footer renders
+/// the result as selectable chips. Uses the default binary name from
+/// `crate::constants::OPENCODE_CLI_BINARY` — same lookup the dashboard
+/// service uses for the conflict-resolution shell-out.
+fn kick_off_fetch_free_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
+        let result = fetch_free_opencode_models(&binary).await;
+        let _ = tx.send(AppEvent::FreeOpencodeModelsFetched(result));
     });
 }
 
