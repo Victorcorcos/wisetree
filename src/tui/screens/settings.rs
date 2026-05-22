@@ -3356,10 +3356,7 @@ impl SettingsScreen {
         ]);
         frame.render_widget(Paragraph::new(saving_line), chunks[cursor + 2]);
 
-        let on_chips = matches!(
-            editor.selection,
-            DashboardSelection::FreeModels(_)
-        );
+        let on_chips = matches!(editor.selection, DashboardSelection::FreeModels(_));
         let hint = if editing_idx.is_some() {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else if on_chips {
@@ -3381,12 +3378,7 @@ impl SettingsScreen {
     /// is highlighted SUCCESS so the user can tell at a glance which pair
     /// is staged. Scoped to `useAi` because the chips only ever apply to
     /// that one field.
-    fn render_dashboard_free_models(
-        &self,
-        frame: &mut Frame,
-        chips_area: Rect,
-        hint_area: Rect,
-    ) {
+    fn render_dashboard_free_models(&self, frame: &mut Frame, chips_area: Rect, hint_area: Rect) {
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
         let info_style = Style::default().fg(colors::INFO);
@@ -3420,9 +3412,7 @@ impl SettingsScreen {
                 let active = self
                     .dashboard_editor
                     .as_ref()
-                    .and_then(|e| {
-                        use_ai_field_index().map(|idx| e.values[idx].trim().to_string())
-                    })
+                    .and_then(|e| use_ai_field_index().map(|idx| e.values[idx].trim().to_string()))
                     .unwrap_or_default();
                 for (i, model) in models.iter().enumerate() {
                     if i > 0 {
@@ -4608,7 +4598,10 @@ mod tests {
         focus_use_ai(&mut screen);
         let _ = screen.handle_dashboard(key(KeyCode::Down));
         let editor = screen.dashboard_editor.as_ref().unwrap();
-        assert!(matches!(editor.selection, DashboardSelection::FreeModels(_)));
+        assert!(matches!(
+            editor.selection,
+            DashboardSelection::FreeModels(_)
+        ));
     }
 
     #[test]
@@ -4629,8 +4622,7 @@ mod tests {
             "b/y".to_string(),
             "c/z".to_string(),
         ]);
-        screen.dashboard_editor.as_mut().unwrap().selection =
-            DashboardSelection::FreeModels(0);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         let _ = screen.handle_dashboard(key(KeyCode::Right));
         assert_eq!(
             screen.dashboard_editor.as_ref().unwrap().selection,
@@ -4657,8 +4649,7 @@ mod tests {
             "opencode/big-pickle".to_string(),
             "opencode/deepseek-v4-flash-free".to_string(),
         ]);
-        screen.dashboard_editor.as_mut().unwrap().selection =
-            DashboardSelection::FreeModels(1);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(1);
         let action = screen.handle_dashboard(key(KeyCode::Enter));
         // Stays on the page — no SaveDashboard, no ApplyFreeModel side-effect.
         assert_eq!(action, SettingsAction::Continue);
@@ -4672,11 +4663,8 @@ mod tests {
 
     #[test]
     fn up_from_chips_returns_to_use_ai() {
-        let mut screen = dashboard_screen_with_free_models(vec![
-            "opencode/big-pickle".to_string(),
-        ]);
-        screen.dashboard_editor.as_mut().unwrap().selection =
-            DashboardSelection::FreeModels(0);
+        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         let _ = screen.handle_dashboard(key(KeyCode::Up));
         let idx = use_ai_field_index().unwrap();
         assert_eq!(
@@ -4687,11 +4675,8 @@ mod tests {
 
     #[test]
     fn down_from_chips_advances_to_save() {
-        let mut screen = dashboard_screen_with_free_models(vec![
-            "opencode/big-pickle".to_string(),
-        ]);
-        screen.dashboard_editor.as_mut().unwrap().selection =
-            DashboardSelection::FreeModels(0);
+        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         let _ = screen.handle_dashboard(key(KeyCode::Down));
         assert_eq!(
             screen.dashboard_editor.as_ref().unwrap().selection,
@@ -4701,11 +4686,9 @@ mod tests {
 
     #[test]
     fn enter_on_save_after_chip_stage_emits_save_dashboard_with_chosen_model() {
-        let mut screen = dashboard_screen_with_free_models(vec![
-            "opencode/deepseek-v4-flash-free".to_string(),
-        ]);
-        screen.dashboard_editor.as_mut().unwrap().selection =
-            DashboardSelection::FreeModels(0);
+        let mut screen =
+            dashboard_screen_with_free_models(vec!["opencode/deepseek-v4-flash-free".to_string()]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         let _ = screen.handle_dashboard(key(KeyCode::Enter)); // stage
         let _ = screen.handle_dashboard(key(KeyCode::Down)); // → Save
         let action = screen.handle_dashboard(key(KeyCode::Enter));
@@ -4733,11 +4716,8 @@ mod tests {
 
     #[test]
     fn set_free_models_error_pulls_cursor_off_invisible_chip_row() {
-        let mut screen = dashboard_screen_with_free_models(vec![
-            "opencode/big-pickle".to_string(),
-        ]);
-        screen.dashboard_editor.as_mut().unwrap().selection =
-            DashboardSelection::FreeModels(0);
+        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         screen.set_free_models_error("opencode CLI missing".to_string());
         assert!(matches!(screen.free_models(), Some(Err(_))));
         let idx = use_ai_field_index().unwrap();

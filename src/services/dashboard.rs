@@ -956,16 +956,11 @@ impl DashboardService {
             )));
         }
         let title = crate::constants::UPDATE_MERGE_COMMIT_MESSAGE;
-        let description = format!(
-            "Merged `{base_ref}` and resolved conflicts using opencode ({use_ai})."
-        );
+        let description =
+            format!("Merged `{base_ref}` and resolved conflicts using opencode ({use_ai}).");
         let message = format!("{title}\n\n{description}");
-        if let Err(err) = run_command(
-            &self.git_binary,
-            &["commit", "-m", &message],
-            Some(&cwd),
-        )
-        .await
+        if let Err(err) =
+            run_command(&self.git_binary, &["commit", "-m", &message], Some(&cwd)).await
         {
             return Ok(UpdatePullRequestOutcome::MergeFailed(format!(
                 "git commit failed: {err}"
@@ -977,11 +972,7 @@ impl DashboardService {
         for remote in ["upstream", "origin"] {
             let push = time::timeout(
                 UPDATE_PUSH_TIMEOUT,
-                run_command(
-                    &self.git_binary,
-                    &["push", remote, "HEAD"],
-                    Some(&cwd),
-                ),
+                run_command(&self.git_binary, &["push", remote, "HEAD"], Some(&cwd)),
             )
             .await
             .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
@@ -996,10 +987,7 @@ impl DashboardService {
     /// Abort the in-progress merge (`git merge --abort`) after the user
     /// clicks **Cancel** in the AI Activity panel. Restores the worktree
     /// to its pre-merge state.
-    pub async fn abort_ai_merge(
-        &self,
-        worktree_path: &str,
-    ) -> Result<UpdatePullRequestOutcome> {
+    pub async fn abort_ai_merge(&self, worktree_path: &str) -> Result<UpdatePullRequestOutcome> {
         let cwd = PathBuf::from(worktree_path);
         let abort = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
         match abort {
@@ -2023,7 +2011,6 @@ fn send_ai_activity(
         let _ = tx.send(UpdateProgress::AiOutput(event));
     }
 }
-
 
 /// Return the first reachable base ref in `BASE_REF_PRIORITY`. Probes each
 /// ref with `git rev-parse --verify` against the supplied worktree. Used

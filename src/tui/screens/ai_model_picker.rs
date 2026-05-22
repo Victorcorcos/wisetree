@@ -76,10 +76,7 @@ impl AiModelPickerScreen {
                     .with_description_color(colors::GRAY_DARK)
             })
             .collect();
-        let default_idx = models
-            .iter()
-            .position(|m| m.pair() == initial)
-            .unwrap_or(0);
+        let default_idx = models.iter().position(|m| m.pair() == initial).unwrap_or(0);
         let prompt = SelectPrompt::new("Select AI provider/model:", options)
             .searchable()
             .with_default_index(default_idx)
@@ -149,7 +146,10 @@ impl AiModelPickerScreen {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled("Fetching available models…", Style::default().fg(colors::EMPHASIS)),
+            Span::styled(
+                "Fetching available models…",
+                Style::default().fg(colors::EMPHASIS),
+            ),
         ]);
         let widget = Paragraph::new(line).alignment(Alignment::Center);
         frame.render_widget(widget, area);
@@ -172,7 +172,10 @@ impl AiModelPickerScreen {
                     .fg(colors::ERROR)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(msg.to_string(), Style::default().fg(colors::EMPHASIS))),
+            Line::from(Span::styled(
+                msg.to_string(),
+                Style::default().fg(colors::EMPHASIS),
+            )),
         ])
         .alignment(Alignment::Center);
         frame.render_widget(widget, area);
@@ -221,9 +224,18 @@ mod tests {
     #[test]
     fn loading_state_ignores_non_esc_keys() {
         let mut screen = AiModelPickerScreen::new(String::new());
-        assert_eq!(screen.handle_key(key(KeyCode::Enter)), AiModelPickerAction::Continue);
-        assert_eq!(screen.handle_key(key(KeyCode::Char('a'))), AiModelPickerAction::Continue);
-        assert_eq!(screen.handle_key(key(KeyCode::Esc)), AiModelPickerAction::Cancelled);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            AiModelPickerAction::Continue
+        );
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('a'))),
+            AiModelPickerAction::Continue
+        );
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Esc)),
+            AiModelPickerAction::Cancelled
+        );
     }
 
     #[test]
@@ -241,16 +253,28 @@ mod tests {
     fn empty_models_show_empty_state() {
         let mut screen = AiModelPickerScreen::new(String::new());
         screen.set_models(Vec::new());
-        assert_eq!(screen.handle_key(key(KeyCode::Enter)), AiModelPickerAction::Continue);
-        assert_eq!(screen.handle_key(key(KeyCode::Esc)), AiModelPickerAction::Cancelled);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            AiModelPickerAction::Continue
+        );
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Esc)),
+            AiModelPickerAction::Cancelled
+        );
     }
 
     #[test]
     fn error_state_is_dismissable_with_esc() {
         let mut screen = AiModelPickerScreen::new(String::new());
         screen.set_error("network down".to_string());
-        assert_eq!(screen.handle_key(key(KeyCode::Enter)), AiModelPickerAction::Continue);
-        assert_eq!(screen.handle_key(key(KeyCode::Esc)), AiModelPickerAction::Cancelled);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            AiModelPickerAction::Continue
+        );
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Esc)),
+            AiModelPickerAction::Cancelled
+        );
     }
 
     #[test]
@@ -259,6 +283,9 @@ mod tests {
         screen.set_models(sample_models());
         // Enter without moving must yield the pre-selected pair.
         let outcome = screen.handle_key(key(KeyCode::Enter));
-        assert_eq!(outcome, AiModelPickerAction::Selected("openai/gpt-4o".to_string()));
+        assert_eq!(
+            outcome,
+            AiModelPickerAction::Selected("openai/gpt-4o".to_string())
+        );
     }
 }

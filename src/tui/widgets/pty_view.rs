@@ -237,10 +237,7 @@ impl PtyView {
     /// Scroll the view forward by `lines` rows toward the live tail.
     pub fn scroll_down(&mut self, lines: u16) {
         if let Ok(mut parser) = self.parser.lock() {
-            let target = parser
-                .screen()
-                .scrollback()
-                .saturating_sub(lines as usize);
+            let target = parser.screen().scrollback().saturating_sub(lines as usize);
             parser.set_scrollback(target);
         }
     }

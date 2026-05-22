@@ -1630,9 +1630,7 @@ impl App {
             UpdatePhase::ConflictsDetected { count } => {
                 self.show_toast(
                     ToastVariant::Warning,
-                    format!(
-                        "PR #{number}: {count} conflicted file(s) — handing off to opencode."
-                    ),
+                    format!("PR #{number}: {count} conflicted file(s) — handing off to opencode."),
                 );
                 if let Some(screen) = self.update_pr.as_mut() {
                     screen.mark_ai_active();
@@ -1754,9 +1752,7 @@ impl App {
                 UpdatePullRequestOutcome::MergedWithAiResolution => {
                     self.show_toast(
                         ToastVariant::Success,
-                        format!(
-                            "Pull Request #{number} updated (opencode-resolved) and pushed."
-                        ),
+                        format!("Pull Request #{number} updated (opencode-resolved) and pushed."),
                     );
                 }
                 UpdatePullRequestOutcome::ConflictsHandedOffToUi { .. } => {
