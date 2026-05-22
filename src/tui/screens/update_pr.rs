@@ -15,7 +15,9 @@
 //! Async work is owned by `App`; this screen is purely a presentation
 //! state machine.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use std::path::PathBuf;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -26,7 +28,7 @@ use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status, StatusIndicator,
+    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, PtyView, Status, StatusIndicator,
 };
 
 const UPDATE_LOADING_MESSAGE: &str = "Resolving base ref...";
@@ -88,6 +90,15 @@ pub struct UpdatePullRequestScreen {
     ai_done: bool,
     /// Currently focused button in the Complete/Cancel pair.
     ai_button: AiButton,
+    /// Embedded opencode subprocess + vt100 emulator. `Some` once the
+    /// pipeline reached `ConflictsHandedOffToUi` and the App handed us
+    /// the spawn parameters; the PTY is rendered into the AI Activity
+    /// panel and torn down via `Drop` when the screen is replaced.
+    pty: Option<PtyView>,
+    /// Which terminal owns keyboard input while the embedded opencode TUI
+    /// is alive. `false` = outer Wisetree (default), `true` = inner PTY
+    /// so the user can chat with opencode directly. Tab toggles.
+    pty_focused: bool,
     error: Option<String>,
     step: UpdateStep,
     pub tick: usize,
@@ -113,6 +124,8 @@ impl UpdatePullRequestScreen {
             ai_active: false,
             ai_done: false,
             ai_button: AiButton::Complete,
+            pty: None,
+            pty_focused: false,
             error: None,
             step,
             tick: 0,
@@ -155,6 +168,57 @@ impl UpdatePullRequestScreen {
         self.ai_active = false;
         self.ai_done = false;
         self.ai_button = AiButton::Complete;
+        self.pty = None;
+        self.pty_focused = false;
+    }
+
+    /// Spawn the opencode subprocess inside an embedded PTY and route
+    /// its raw output through vt100 so the user sees the real opencode
+    /// TUI (formatted assistant text, thinking blocks, tool calls)
+    /// inside the AI Activity panel. The App invokes this once the
+    /// service pipeline returns `ConflictsHandedOffToUi`. Failure to
+    /// spawn surfaces as a Notice in the AI log; the user will still see
+    /// the Complete/Cancel buttons once the (empty) PTY is reaped.
+    pub fn spawn_opencode_pty(
+        &mut self,
+        binary: PathBuf,
+        args: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<(String, String)>,
+    ) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+            Ok(pty) => {
+                self.pty = Some(pty);
+            }
+            Err(err) => {
+                self.append_ai_line(AiActivityEvent::Notice {
+                    severity: AiActivitySeverity::Error,
+                    message: format!("Could not spawn opencode in PTY: {err}"),
+                });
+                // No PTY → the AI is effectively done; surface
+                // Complete/Cancel so the user can recover.
+                self.mark_ai_done();
+            }
+        }
+    }
+
+    /// Called every frame by the App. Polls the embedded opencode PTY
+    /// for child exit and resizes the PTY to match the AI Activity
+    /// panel's inner area when it changes. Returns `true` exactly once
+    /// — on the tick where the child transitions to exited — so the App
+    /// can flip the screen into the Complete/Cancel decision step.
+    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> bool {
+        let Some(pty) = self.pty.as_mut() else {
+            return false;
+        };
+        if let Some((rows, cols)) = panel_inner {
+            pty.resize(rows, cols);
+        }
+        if pty.poll_exited() {
+            self.mark_ai_done();
+            return true;
+        }
+        false
     }
 
     /// Flip on the AI Activity panel. Called by the App once the pipeline
@@ -173,6 +237,10 @@ impl UpdatePullRequestScreen {
 
     pub fn ai_active(&self) -> bool {
         self.ai_active
+    }
+
+    pub fn is_pty_focused(&self) -> bool {
+        self.pty_focused
     }
 
     #[cfg(test)]
@@ -288,7 +356,26 @@ impl UpdatePullRequestScreen {
         }
         if matches!(self.step, UpdateStep::Updating) {
             if !self.ai_done {
-                // Pipeline still running; swallow keys.
+                // While opencode is running we let the user split focus
+                // between the outer Wisetree TUI and the inner PTY: Tab
+                // toggles, and when the PTY owns focus we transparently
+                // forward keystrokes to the subprocess so the user can
+                // chat with opencode just like they would standalone.
+                if self.pty.is_some() && matches!(key.code, KeyCode::Tab) {
+                    self.pty_focused = !self.pty_focused;
+                    return UpdateAction::Continue;
+                }
+                if self.pty_focused {
+                    if let Some(pty) = self.pty.as_mut() {
+                        if let Some(bytes) = key_event_to_pty_bytes(&key) {
+                            pty.send_input(&bytes);
+                        }
+                    }
+                    return UpdateAction::Continue;
+                }
+                // Outer-focus & still streaming → swallow other keys so
+                // the user doesn't accidentally trigger Wisetree actions
+                // mid-resolution.
                 return UpdateAction::Continue;
             }
             return match key.code {
@@ -329,9 +416,9 @@ impl UpdatePullRequestScreen {
                 // output has room to breathe.
                 if self.ai_active {
                     if self.ai_done {
-                        28
+                        29
                     } else {
-                        24
+                        25
                     }
                 } else {
                     3
@@ -363,7 +450,7 @@ impl UpdatePullRequestScreen {
         5
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         if let Some(err) = self.error.as_deref() {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -447,7 +534,7 @@ fn build_confirm(request: &UpdatePullRequestRequest) -> ConfirmDialog {
 }
 
 impl UpdatePullRequestScreen {
-    fn render_updating(&self, frame: &mut Frame, area: Rect) {
+    fn render_updating(&mut self, frame: &mut Frame, area: Rect) {
         // Pre-conflict (or "no conflict at all") runs render as just a
         // spinner — the AI Activity panel is reserved for the post-
         // `ConflictsDetected` portion of the pipeline. We also fall back
@@ -463,6 +550,7 @@ impl UpdatePullRequestScreen {
             Constraint::Length(1), // spinner line
             Constraint::Length(1), // blank
             Constraint::Min(3),    // AI Activity panel
+            Constraint::Length(1), // focus / shortcuts hint
         ];
         if self.ai_done {
             constraints.push(Constraint::Length(1)); // blank
@@ -477,13 +565,16 @@ impl UpdatePullRequestScreen {
             .with_tick(self.tick)
             .render(frame, chunks[0]);
         self.render_ai_activity(frame, chunks[2]);
+        self.render_ai_shortcuts(frame, chunks[3]);
         if self.ai_done {
-            self.render_ai_buttons(frame, chunks[4]);
+            self.render_ai_buttons(frame, chunks[5]);
         }
     }
 
-    fn render_ai_activity(&self, frame: &mut Frame, area: Rect) {
-        let title = Line::from(vec![
+    fn render_ai_activity(&mut self, frame: &mut Frame, area: Rect) {
+        let pty_alive = self.pty.is_some() && !self.ai_done;
+        let focused_inner = pty_alive && self.pty_focused;
+        let mut title_spans = vec![
             Span::raw(" "),
             Span::styled(
                 "AI Activity",
@@ -491,20 +582,69 @@ impl UpdatePullRequestScreen {
                     .fg(colors::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" "),
-        ]);
+        ];
+        if pty_alive {
+            title_spans.push(Span::styled(
+                " · ".to_string(),
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ));
+            title_spans.push(Span::styled(
+                if focused_inner {
+                    "inner focused"
+                } else {
+                    "outer focused"
+                }
+                .to_string(),
+                Style::default()
+                    .fg(if focused_inner {
+                        colors::ACCENT
+                    } else {
+                        colors::INFO
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        title_spans.push(Span::raw(" "));
+        let title = Line::from(title_spans);
+        let border_color = if focused_inner {
+            colors::ACCENT
+        } else {
+            colors::INFO
+        };
+        let border_style = if focused_inner {
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(border_color)
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::INFO))
+            .border_style(border_style)
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let visible_rows = inner.height as usize;
-        if visible_rows == 0 {
+        if inner.height == 0 || inner.width == 0 {
             return;
         }
+
+        // Real opencode embed: keep the vt100 emulator sized to the
+        // visible panel area so line wrapping matches what the user
+        // sees, then blit its screen state into the panel.
+        if let Some(pty) = self.pty.as_mut() {
+            pty.resize(inner.height, inner.width);
+            pty.render(frame, inner);
+            return;
+        }
+
+        // Fallback path — no PTY yet (typically the brief window between
+        // "AI active" and the App invoking `spawn_opencode_pty`, or the
+        // unit-test renderer). Show a placeholder + any structured
+        // events we accumulated (e.g. spawn errors via `Notice`).
         let lines: Vec<Line<'static>> = if self.ai_log.is_empty() {
             vec![Line::from(Span::styled(
                 "Waiting for AI to start working on the conflicts...",
@@ -513,6 +653,7 @@ impl UpdatePullRequestScreen {
                     .add_modifier(Modifier::DIM),
             ))]
         } else {
+            let visible_rows = inner.height as usize;
             let max_scroll = self.ai_log.len().saturating_sub(visible_rows) as u16;
             let scroll = self.ai_scroll.min(max_scroll) as usize;
             let end = self.ai_log.len().saturating_sub(scroll);
@@ -523,6 +664,88 @@ impl UpdatePullRequestScreen {
                 .collect()
         };
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_ai_shortcuts(&self, frame: &mut Frame, area: Rect) {
+        let muted = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        let separator = Span::styled("  ·  ".to_string(), muted);
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+
+        if self.ai_done {
+            // Post-resolution: Complete / Cancel buttons are the only
+            // affordances. Match the dashboard's shortcut-row idiom so
+            // the user sees a familiar key reference.
+            spans.push(Span::styled(
+                "← → ".to_string(),
+                Style::default().fg(colors::INFO),
+            ));
+            spans.push(Span::styled("Switch button".to_string(), muted));
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "↵ ".to_string(),
+                Style::default().fg(colors::SUCCESS),
+            ));
+            spans.push(Span::styled("Confirm".to_string(), muted));
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "Esc ".to_string(),
+                Style::default().fg(colors::ERROR),
+            ));
+            spans.push(Span::styled("Cancel".to_string(), muted));
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
+
+        // Streaming phase. Show what Tab does and which terminal owns
+        // the keyboard right now, in the palette already used by the
+        // Dashboard's shortcuts row.
+        let focused_inner = self.pty.is_some() && self.pty_focused;
+        let focus_label = if focused_inner {
+            "Inner (opencode)"
+        } else {
+            "Outer (wisetree)"
+        };
+        spans.push(Span::styled(
+            "Focus: ".to_string(),
+            muted,
+        ));
+        spans.push(Span::styled(
+            focus_label.to_string(),
+            Style::default()
+                .fg(if focused_inner {
+                    colors::ACCENT
+                } else {
+                    colors::INFO
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(separator.clone());
+        spans.push(Span::styled(
+            "Tab ".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(
+            if focused_inner {
+                "Switch to Wisetree"
+            } else {
+                "Switch to opencode"
+            }
+            .to_string(),
+            muted,
+        ));
+        if focused_inner {
+            spans.push(separator);
+            spans.push(Span::styled(
+                "keys flow into the inner TUI".to_string(),
+                Style::default()
+                    .fg(colors::GRAY_LIGHT)
+                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_ai_buttons(&self, frame: &mut Frame, area: Rect) {
@@ -1018,6 +1241,85 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
     ]
 }
 
+/// Translate a crossterm `KeyEvent` into the raw byte sequence a terminal
+/// would normally write into the PTY for that keystroke. Covers the keys
+/// opencode actually cares about (printable chars, control combos, arrow
+/// keys, function keys, navigation). Tab is intentionally not mapped —
+/// callers reserve it as the focus-toggle shortcut.
+fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    let with_alt = |mut bytes: Vec<u8>| -> Vec<u8> {
+        if alt {
+            let mut out = Vec::with_capacity(bytes.len() + 1);
+            out.push(0x1b);
+            out.append(&mut bytes);
+            out
+        } else {
+            bytes
+        }
+    };
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                // Ctrl+letter → standard ASCII control mapping
+                // (Ctrl+A=0x01 .. Ctrl+Z=0x1a, Ctrl+@=0, Ctrl+]=0x1d, …).
+                let upper = c.to_ascii_uppercase();
+                let byte = match upper {
+                    'A'..='Z' => Some((upper as u8) - b'A' + 1),
+                    '@' => Some(0x00),
+                    '[' => Some(0x1b),
+                    '\\' => Some(0x1c),
+                    ']' => Some(0x1d),
+                    '^' => Some(0x1e),
+                    '_' => Some(0x1f),
+                    ' ' => Some(0x00),
+                    _ => None,
+                };
+                byte.map(|b| with_alt(vec![b]))
+            } else {
+                let mut buf = [0u8; 4];
+                Some(with_alt(c.encode_utf8(&mut buf).as_bytes().to_vec()))
+            }
+        }
+        KeyCode::Enter => Some(with_alt(vec![b'\r'])),
+        KeyCode::Backspace => Some(with_alt(vec![0x7f])),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Left => Some(with_alt(b"\x1b[D".to_vec())),
+        KeyCode::Right => Some(with_alt(b"\x1b[C".to_vec())),
+        KeyCode::Up => Some(with_alt(b"\x1b[A".to_vec())),
+        KeyCode::Down => Some(with_alt(b"\x1b[B".to_vec())),
+        KeyCode::Home => Some(with_alt(b"\x1b[H".to_vec())),
+        KeyCode::End => Some(with_alt(b"\x1b[F".to_vec())),
+        KeyCode::PageUp => Some(with_alt(b"\x1b[5~".to_vec())),
+        KeyCode::PageDown => Some(with_alt(b"\x1b[6~".to_vec())),
+        KeyCode::Delete => Some(with_alt(b"\x1b[3~".to_vec())),
+        KeyCode::Insert => Some(with_alt(b"\x1b[2~".to_vec())),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        KeyCode::F(n) => {
+            let seq: &[u8] = match n {
+                1 => b"\x1bOP",
+                2 => b"\x1bOQ",
+                3 => b"\x1bOR",
+                4 => b"\x1bOS",
+                5 => b"\x1b[15~",
+                6 => b"\x1b[17~",
+                7 => b"\x1b[18~",
+                8 => b"\x1b[19~",
+                9 => b"\x1b[20~",
+                10 => b"\x1b[21~",
+                11 => b"\x1b[23~",
+                12 => b"\x1b[24~",
+                _ => return None,
+            };
+            Some(seq.to_vec())
+        }
+        _ => None,
+    }
+}
+
 fn labeled_line(
     label: &str,
     value: Span<'static>,
@@ -1044,7 +1346,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn render_dump(screen: &UpdatePullRequestScreen, width: u16, height: u16) -> String {
+    fn render_dump(screen: &mut UpdatePullRequestScreen, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| screen.render(f, f.area())).unwrap();
@@ -1282,7 +1584,7 @@ mod tests {
         screen.start_updating();
         assert!(!screen.ai_active());
 
-        let before = render_dump(&screen, 100, 24);
+        let before = render_dump(&mut screen, 100, 24);
         assert!(
             !before.contains("AI Activity"),
             "AI Activity panel rendered before conflicts detected:\n{before}"
@@ -1290,7 +1592,7 @@ mod tests {
 
         screen.mark_ai_active();
         assert!(screen.ai_active());
-        let after = render_dump(&screen, 100, 24);
+        let after = render_dump(&mut screen, 100, 24);
         assert!(
             after.contains("AI Activity"),
             "AI Activity panel missing after mark_ai_active:\n{after}"
@@ -1305,7 +1607,7 @@ mod tests {
         screen.mark_ai_active();
         screen.mark_ai_done();
         assert!(screen.ai_done());
-        let dumped = render_dump(&screen, 100, 28);
+        let dumped = render_dump(&mut screen, 100, 28);
         assert!(
             dumped.contains("Complete"),
             "expected Complete button:\n{dumped}"
@@ -1345,11 +1647,64 @@ mod tests {
     }
 
     #[test]
+    fn key_event_to_pty_bytes_maps_common_keys() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let plain = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&plain), Some(b"a".to_vec()));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&enter), Some(b"\r".to_vec()));
+
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&backspace), Some(vec![0x7f]));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&esc), Some(vec![0x1b]));
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(key_event_to_pty_bytes(&up), Some(b"\x1b[A".to_vec()));
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(key_event_to_pty_bytes(&ctrl_c), Some(vec![0x03]));
+
+        let alt_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(key_event_to_pty_bytes(&alt_a), Some(vec![0x1b, b'a']));
+    }
+
+    #[test]
+    fn pty_focus_defaults_to_outer_after_start_updating() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        assert!(!screen.is_pty_focused());
+    }
+
+    #[test]
+    fn pty_focus_indicator_renders_below_ai_activity_panel() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        let dumped = render_dump(&mut screen, 100, 28);
+        // Streaming-phase hint must always mention the Tab shortcut and
+        // which terminal currently owns the keyboard.
+        assert!(
+            dumped.contains("Tab"),
+            "expected Tab shortcut hint in:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("Focus"),
+            "expected focus indicator in:\n{dumped}"
+        );
+    }
+
+    #[test]
     fn render_confirm_shows_base_ref_and_buttons() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
 
-        let dumped = render_dump(&screen, 100, 28);
+        let dumped = render_dump(&mut screen, 100, 28);
 
         assert!(
             dumped.contains("Update Pull Request #21?"),

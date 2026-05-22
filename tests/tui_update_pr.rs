@@ -176,8 +176,14 @@ impl Fixture {
 
     fn write_resolved_readme_stub(&self) -> PathBuf {
         let repo = sh_quote(&self.src);
+        // The stub doubles as the binary the service probes via
+        // `opencode --version` to verify availability — so the resolution
+        // side-effects must NOT fire for that probe, only for an actual
+        // `run` invocation. Otherwise the availability check would
+        // unintentionally stage README.md before the test even gets to
+        // assert on the mid-merge state.
         self.write_opencode_stub(&format!(
-            "#!/bin/sh\nset -e\nrepo={repo}\nprintf 'resolved\\n' > \"$repo/README.md\"\ngit -C \"$repo\" add -- README.md\n",
+            "#!/bin/sh\nset -e\nif [ \"$1\" = \"--version\" ]; then echo 'opencode 0.0.0-test'; exit 0; fi\nrepo={repo}\nprintf 'resolved\\n' > \"$repo/README.md\"\ngit -C \"$repo\" add -- README.md\n",
         ))
     }
 
@@ -310,45 +316,79 @@ async fn pipeline_returns_ai_unavailable_when_opencode_binary_is_missing() {
 }
 
 #[tokio::test]
-async fn pipeline_returns_ai_resolution_complete_when_opencode_writes_a_fix() {
+async fn pipeline_hands_off_to_ui_when_conflicts_detected_and_opencode_available() {
     let fx = Fixture::new();
-    let repo_readme = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
-    let repo_readme_before = fs::read_to_string(&repo_readme).unwrap();
     fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
     git(&fx.src, &["add", "README.md"]);
     git(&fx.src, &["commit", "-q", "-m", "feat edit"]);
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
 
-    // Stub opencode: write a resolved file and stage it.
+    // Stub opencode exists on disk — the pipeline's availability check
+    // sees it and hands the embed off to the UI. The stub is NEVER
+    // invoked by the service itself: opencode runs inside the embedded
+    // PTY owned by the screen, which we exercise via the screen-level
+    // unit tests rather than this integration test.
     let stub = fx.write_resolved_readme_stub();
-    let service = fx.ai_service().with_opencode_binary(stub);
+    let service = fx.ai_service().with_opencode_binary(stub.clone());
 
     let outcome = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
         .await
         .expect("update should succeed");
 
-    assert_eq!(outcome, UpdatePullRequestOutcome::AiResolutionComplete);
+    match outcome {
+        UpdatePullRequestOutcome::ConflictsHandedOffToUi {
+            opencode_binary,
+            opencode_args,
+            cwd,
+            model,
+            base_ref,
+            conflicts,
+        } => {
+            assert_eq!(opencode_binary, stub);
+            assert_eq!(base_ref, "origin/main");
+            assert_eq!(model, "anthropic/claude-sonnet-4-5");
+            assert_eq!(cwd, fx.src);
+            assert!(
+                conflicts.iter().any(|f| f == "README.md"),
+                "expected README.md among {conflicts:?}"
+            );
+            // opencode is invoked with `run -m <model> --dir <cwd> <prompt>`
+            // — verify the structural args so the screen-side spawn
+            // can't drift away from the contract.
+            assert_eq!(opencode_args[0], "run");
+            assert_eq!(opencode_args[1], "-m");
+            assert_eq!(opencode_args[2], "anthropic/claude-sonnet-4-5");
+            assert_eq!(opencode_args[3], "--dir");
+            assert!(
+                opencode_args[4].contains(fx.src.to_str().unwrap()),
+                "expected --dir {:?} in args, got {:?}",
+                fx.src,
+                opencode_args
+            );
+            assert!(
+                !opencode_args.last().unwrap().is_empty(),
+                "merger prompt should be the last positional arg"
+            );
+            // Crucially: no `--format json` — we want the real opencode
+            // TUI rendered inside the embedded PTY, not an NDJSON stream
+            // that we'd have to re-render ourselves.
+            assert!(
+                !opencode_args.iter().any(|a| a == "--format"),
+                "service must not pass --format; the UI embeds opencode's real TUI: {opencode_args:?}"
+            );
+        }
+        other => panic!("expected ConflictsHandedOffToUi, got {other:?}"),
+    }
 
-    // Tree must still show the staged/in-progress merge — opencode resolved
-    // the conflict but commit hasn't been issued yet.
-    let head_msg = git_output(&fx.src, &["log", "-1", "--pretty=%s"]);
-    assert_eq!(
-        head_msg, "feat edit",
-        "HEAD must still be the feat-edit commit; the merge commit comes from commit_and_push_ai_merge"
-    );
-    // origin/feat should NOT include any merge commit yet.
-    let local_head = git_output(&fx.src, &["rev-parse", "HEAD"]);
-    let remote_head = git_output(&fx.src, &["rev-parse", "origin/feat"]);
-    assert_eq!(
-        local_head, remote_head,
-        "push must not have run yet; local and origin/feat must match"
-    );
-    let repo_readme_after = fs::read_to_string(&repo_readme).unwrap();
-    assert_eq!(
-        repo_readme_after, repo_readme_before,
-        "opencode stub must not touch the repository README"
+    // Tree must still be mid-merge with conflict markers in README.md —
+    // the service paused before any resolution, and `git merge --abort`
+    // / `commit_and_push_ai_merge` happen later via the UI layer.
+    let status = git_output(&fx.src, &["status", "--porcelain"]);
+    assert!(
+        status.contains("UU README.md"),
+        "expected unmerged README.md, got: {status}"
     );
 }
 
@@ -361,11 +401,26 @@ async fn commit_and_push_ai_merge_pushes_and_returns_merged_with_ai_resolution()
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
     let stub = fx.write_resolved_readme_stub();
-    let service = fx.ai_service().with_opencode_binary(stub);
+    let service = fx.ai_service().with_opencode_binary(stub.clone());
+
+    // First half: run the pipeline so the merge state lands on disk
+    // with conflicts in the index. The service no longer invokes
+    // opencode itself — it returns `ConflictsHandedOffToUi` and the UI
+    // takes over.
     let _initial = service
         .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
         .await
         .expect("update should succeed");
+
+    // Second half: simulate what the screen-owned PTY would do —
+    // invoke the resolved-readme stub directly so the worktree has the
+    // resolved file staged. Then call `commit_and_push_ai_merge` (the
+    // real production code) and verify the commit + push.
+    let stub_status = Command::new(&stub)
+        .current_dir(&fx.src)
+        .status()
+        .expect("stub invoke");
+    assert!(stub_status.success(), "stub must succeed: {stub_status}");
 
     let outcome = service
         .commit_and_push_ai_merge(
@@ -416,47 +471,6 @@ async fn abort_ai_merge_resets_to_pre_merge_state() {
     assert!(
         status.is_empty(),
         "abort must leave a clean tree, got: {status}"
-    );
-}
-
-#[tokio::test]
-async fn pipeline_returns_merge_failed_when_opencode_exits_non_zero() {
-    let fx = Fixture::new();
-    fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
-    git(&fx.src, &["add", "README.md"]);
-    git(&fx.src, &["commit", "-q", "-m", "feat edit"]);
-    git(&fx.src, &["push", "-q", "origin", "feat"]);
-    fx.advance_main("README.md", "main side\n");
-
-    // Stub opencode that fails. The pipeline must surface this as
-    // `MergeFailed` (with an "opencode failed" prefix) and abort the
-    // merge cleanly so the worktree isn't left in a half-merged state.
-    // `--version` (used by the availability check) must succeed; only
-    // the `run` subcommand fails so we exercise the opencode-error path.
-    let stub = fx.write_opencode_stub(
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '0.0.0-stub'; exit 0; fi\necho 'AI rate-limited' >&2\nexit 1\n",
-    );
-    let service = fx.ai_service().with_opencode_binary(stub);
-
-    let outcome = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
-        .await
-        .expect("update should succeed");
-
-    match outcome {
-        UpdatePullRequestOutcome::MergeFailed(msg) => {
-            assert!(
-                msg.contains("opencode"),
-                "expected opencode-failure message, got: {msg}"
-            );
-        }
-        other => panic!("expected MergeFailed, got {other:?}"),
-    }
-
-    let status = git_output(&fx.src, &["status", "--porcelain"]);
-    assert!(
-        status.is_empty(),
-        "merge should have been aborted: {status}"
     );
 }
 

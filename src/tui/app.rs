@@ -319,7 +319,16 @@ impl App {
             match events.next_event()? {
                 Event::Key(key) => self.handle_key(key, &tx),
                 Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
-                Event::Tick => self.tick = self.tick.wrapping_add(1),
+                Event::Tick => {
+                    self.tick = self.tick.wrapping_add(1);
+                    if let Some(screen) = self.update_pr.as_mut() {
+                        // Resize tracking happens during render (where
+                        // the panel area is known); the tick handles
+                        // child-exit detection. `None` keeps the PTY at
+                        // its last known size between resize events.
+                        screen.tick_pty(None);
+                    }
+                }
                 Event::Resize(_, _) => {}
                 // The input fd is in POLLHUP — the terminal tab is gone.
                 // Calling crossterm again would wedge us at 100% CPU
@@ -1717,16 +1726,30 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         use crate::services::UpdatePullRequestOutcome;
-        // `AiResolutionComplete` does NOT close the screen — it flips the
-        // AI Activity panel into the Complete/Cancel decision step. All
-        // other variants are terminal.
+        // `ConflictsHandedOffToUi` does NOT close the screen — the
+        // service paused mid-flight (conflicts in the index, opencode
+        // not yet invoked). We spawn opencode inside the screen's
+        // embedded PTY here; the screen ticks the PTY each frame and
+        // flips into the Complete/Cancel decision step once the child
+        // exits. All other variants are terminal.
         if let Ok(UpdatePrSuccess {
-            outcome: UpdatePullRequestOutcome::AiResolutionComplete,
+            outcome:
+                UpdatePullRequestOutcome::ConflictsHandedOffToUi {
+                    opencode_binary,
+                    opencode_args,
+                    cwd,
+                    ..
+                },
             ..
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                screen.mark_ai_done();
+                screen.spawn_opencode_pty(
+                    opencode_binary.clone(),
+                    opencode_args.clone(),
+                    cwd.clone(),
+                    Vec::new(),
+                );
                 return;
             }
         }
@@ -1756,7 +1779,7 @@ impl App {
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::AiResolutionComplete => {
+                UpdatePullRequestOutcome::ConflictsHandedOffToUi { .. } => {
                     // Handled by the early-return branch above; this arm
                     // only fires if `update_pr` was already torn down.
                 }

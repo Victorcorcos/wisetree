@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -32,7 +31,6 @@ const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_MERGE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
-const UPDATE_AI_TIMEOUT: Duration = Duration::from_secs(600);
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -321,11 +319,20 @@ pub enum UpdatePullRequestOutcome {
     AlreadyUpToDate,
     /// `git merge` succeeded with no conflicts; the result has been pushed.
     MergedCleanly,
-    /// Opencode finished resolving conflicts; files have been edited in the
-    /// worktree but NOT yet committed or pushed. The UI surfaces the
-    /// Complete/Cancel buttons inside the AI Activity panel so the user
-    /// can commit + push or abort the merge.
-    AiResolutionComplete,
+    /// Conflicts were detected, `useAi` is set, opencode is on PATH, and
+    /// the merge is paused mid-flight (index has conflict markers). The
+    /// UI takes over from here: it spawns opencode inside an embedded
+    /// PTY so the user sees the real opencode TUI in the AI Activity
+    /// panel. Once opencode exits, the screen surfaces Complete/Cancel
+    /// which dispatches `commit_and_push_ai_merge` or `abort_ai_merge`.
+    ConflictsHandedOffToUi {
+        opencode_binary: PathBuf,
+        opencode_args: Vec<String>,
+        cwd: PathBuf,
+        model: String,
+        base_ref: String,
+        conflicts: Vec<String>,
+    },
     /// Conflicts were detected but `useAi` is blank in DashboardConfig, so
     /// no AI is available to resolve them. The merge has been aborted and
     /// the worktree is clean again. The list of conflicted files is
@@ -483,15 +490,6 @@ struct PrCacheEntry {
 
 /// On-disk schema: `repo_root` → `branch` → entry.
 type DiskCache = HashMap<String, HashMap<String, PrCacheEntry>>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AiConflictResolutionError {
-    /// `opencode` binary is not on PATH (or the test override path was
-    /// missing).
-    Unavailable,
-    /// Opencode ran but reported a failure (non-zero exit, stderr, …).
-    Failed(String),
-}
 
 #[derive(Debug, Default)]
 struct PrCacheState {
@@ -836,39 +834,54 @@ impl DashboardService {
             send_phase(UpdatePhase::ConflictsDetected {
                 count: conflicts.len(),
             });
+
+            // Bail early if opencode isn't on PATH so the user sees the
+            // dedicated "install opencode" toast instead of a spawn
+            // error from the PTY widget.
+            if !binary_available(&self.opencode_binary) {
+                let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                return Ok(UpdatePullRequestOutcome::AiUnavailable { conflicts });
+            }
+
             send_phase(UpdatePhase::AiResolving {
                 model: use_ai.clone(),
             });
-            let ai_result = time::timeout(
-                UPDATE_AI_TIMEOUT,
-                self.resolve_conflicts_with_opencode(
-                    &cwd,
-                    &use_ai,
-                    base_ref,
-                    &conflicts,
-                    progress.clone(),
-                ),
-            )
-            .await
-            .map_err(|_| WisetreeError::other("opencode timed out after 10m"))?;
-            if let Err(err) = ai_result {
-                let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
-                return Ok(match err {
-                    AiConflictResolutionError::Unavailable => {
-                        UpdatePullRequestOutcome::AiUnavailable { conflicts }
-                    }
-                    AiConflictResolutionError::Failed(err) => {
-                        UpdatePullRequestOutcome::MergeFailed(format!("opencode failed: {err}"))
-                    }
-                });
-            }
+            send_ai_activity(
+                progress.as_ref(),
+                AiActivityEvent::SessionStart {
+                    model: use_ai.clone(),
+                },
+            );
 
-            // Opencode finished. We hand control back to the UI which
-            // surfaces the Complete/Cancel buttons inside the AI Activity
-            // panel. Commit + push (or abort) happen via
-            // `commit_and_push_ai_merge` / `abort_ai_merge` once the user
-            // chooses.
-            return Ok(UpdatePullRequestOutcome::AiResolutionComplete);
+            // Build the command the UI will spawn inside its embedded
+            // PTY. We pass the merger prompt as a positional arg the
+            // same way `opencode run "<prompt>"` is invoked standalone,
+            // but WITHOUT `--format json`: we want opencode's real TUI
+            // (formatted Thinking blocks, tool calls, syntax-coloured
+            // diffs) inside the AI Activity panel, not an NDJSON event
+            // stream that we'd re-render ourselves.
+            let prompt = build_merge_prompt(base_ref, &conflicts);
+            let opencode_args: Vec<String> = vec![
+                "run".to_string(),
+                "-m".to_string(),
+                use_ai.clone(),
+                "--dir".to_string(),
+                cwd.to_string_lossy().to_string(),
+                prompt,
+            ];
+
+            // Hand control to the UI. The merge is still mid-flight on
+            // disk (conflict markers in the index); the screen owns the
+            // PTY lifecycle from here, and the user finishes the flow
+            // via `commit_and_push_ai_merge` or `abort_ai_merge`.
+            return Ok(UpdatePullRequestOutcome::ConflictsHandedOffToUi {
+                opencode_binary: self.opencode_binary.clone(),
+                opencode_args,
+                cwd: cwd.clone(),
+                model: use_ai,
+                base_ref: base_ref.to_string(),
+                conflicts,
+            });
         }
 
         // 4. push (clean merge path only — AI merges return above for review)
@@ -991,47 +1004,6 @@ impl DashboardService {
             Ok(_) => Ok(UpdatePullRequestOutcome::DiscardedAiMerge),
             Err(err) => Ok(UpdatePullRequestOutcome::AbortFailed(err)),
         }
-    }
-
-    /// Invoke `opencode run` against the worktree to resolve merge
-    /// conflicts. Streams opencode's NDJSON events into the AI Activity
-    /// panel via `progress`. Returns `Unavailable` if the binary isn't on
-    /// PATH; `Failed` if opencode exits non-zero.
-    async fn resolve_conflicts_with_opencode(
-        &self,
-        cwd: &Path,
-        model: &str,
-        base_ref: &str,
-        conflicts: &[String],
-        progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
-    ) -> std::result::Result<(), AiConflictResolutionError> {
-        if !binary_available(&self.opencode_binary) {
-            return Err(AiConflictResolutionError::Unavailable);
-        }
-
-        send_ai_activity(
-            progress.as_ref(),
-            AiActivityEvent::SessionStart {
-                model: model.to_string(),
-            },
-        );
-
-        let prompt = build_merge_prompt(base_ref, conflicts);
-        let cwd_str = cwd.to_string_lossy().to_string();
-        let args: Vec<&str> = vec![
-            "run",
-            "-m",
-            model,
-            "--dir",
-            &cwd_str,
-            "--format",
-            "json",
-            &prompt,
-        ];
-        run_command_streamed(&self.opencode_binary, &args, Some(cwd), progress)
-            .await
-            .map(|_| ())
-            .map_err(AiConflictResolutionError::Failed)
     }
 
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
@@ -2050,409 +2022,6 @@ fn send_ai_activity(
     }
 }
 
-/// Spawn a subprocess and forward every stdout/stderr line through
-/// `progress` (as `UpdateProgress::AiOutput`) as it arrives. Returns the
-/// same `Ok(stdout) / Err(stderr)` shape as `run_command` once the
-/// process exits so callers can keep their post-processing logic unchanged.
-/// Used to give the user a live view of the opencode CLI's streamed activity
-/// during conflict resolution (tool calls, assistant text, and warnings).
-async fn run_command_streamed(
-    binary: &Path,
-    args: &[&str],
-    cwd: Option<&Path>,
-    progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
-) -> std::result::Result<String, String> {
-    let mut cmd = Command::new(binary);
-    cmd.args(args)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-
-    let mut child = cmd.spawn().map_err(|err| err.to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "child stdout unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "child stderr unavailable".to_string())?;
-
-    let stdout_buf = Arc::new(Mutex::new(String::new()));
-    let stderr_buf = Arc::new(Mutex::new(String::new()));
-
-    let stdout_task = tokio::spawn(forward_stream(
-        BufReader::new(stdout),
-        Arc::clone(&stdout_buf),
-        progress.clone(),
-    ));
-    let stderr_task = tokio::spawn(forward_stream(
-        BufReader::new(stderr),
-        Arc::clone(&stderr_buf),
-        progress.clone(),
-    ));
-
-    let status = child.wait().await.map_err(|err| err.to_string())?;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-
-    let stdout_str = stdout_buf
-        .lock()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let stderr_str = stderr_buf
-        .lock()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-
-    if status.success() {
-        Ok(stdout_str)
-    } else if stderr_str.is_empty() {
-        Err(format!("exit status: {status}"))
-    } else {
-        Err(stderr_str)
-    }
-}
-
-/// Read `reader` line-by-line, append each (raw) line to `buf`, and
-/// forward an ANSI-stripped copy through `progress`. Lines without a
-/// trailing newline (the final partial line) are flushed when EOF hits.
-///
-/// opencode's `--format json` mode emits one NDJSON event per line
-/// (`init` / `message` / `tool_use` / `tool_result` / `error` / `result`);
-/// those are translated into structured UI events. Non-JSON lines pass
-/// through verbatim so any startup output still reaches the user.
-async fn forward_stream<R>(
-    mut reader: BufReader<R>,
-    buf: Arc<Mutex<String>>,
-    progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                if let Ok(mut guard) = buf.lock() {
-                    guard.push_str(&line);
-                }
-                if let Some(tx) = progress.as_ref() {
-                    let clean = strip_ansi(line.trim_end_matches(['\r', '\n']));
-                    if let Some(formatted) = format_stream_event(&clean) {
-                        let _ = tx.send(UpdateProgress::AiOutput(formatted));
-                    }
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-/// Translate a single line of opencode stdout/stderr into a structured event
-/// for the AI Activity panel. Returns `None` for lines we deliberately hide
-/// (empties, the user-prompt echo). Lines that don't parse as a known NDJSON
-/// event are surfaced as raw text so startup warnings still reach the user.
-fn format_stream_event(line: &str) -> Option<AiActivityEvent> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let value: serde_json::Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => {
-            return Some(AiActivityEvent::Raw {
-                text: clip_activity_text(line),
-            });
-        }
-    };
-    let event_type = value.get("type").and_then(|v| v.as_str())?;
-    match event_type {
-        "init" => {
-            let model = value.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-            Some(AiActivityEvent::SessionStart {
-                model: model.to_string(),
-            })
-        }
-        "message" => {
-            let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role != "assistant" {
-                return None;
-            }
-            let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if content.is_empty() {
-                return None;
-            }
-            Some(AiActivityEvent::AssistantText {
-                content: flatten_stream_chunk(content),
-            })
-        }
-        "thought" | "thinking" => {
-            let content = json_str(&value, &["content"])
-                .or_else(|| json_str(&value, &["text"]))
-                .or_else(|| json_str(&value, &["thought"]))
-                .or_else(|| json_str(&value, &["summary"]))
-                .or_else(|| json_str(&value, &["subject"]))
-                .unwrap_or("");
-            if content.is_empty() {
-                return None;
-            }
-            Some(AiActivityEvent::Thinking {
-                content: flatten_stream_chunk(content),
-            })
-        }
-        "tool_use" => {
-            let tool = value
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let summary = summarize_tool_params(value.get("parameters"));
-            Some(AiActivityEvent::ToolCall {
-                tool_name: tool.to_string(),
-                summary,
-            })
-        }
-        "tool_result" => {
-            let status = value
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("success");
-            let tool_name = value
-                .get("tool_id")
-                .and_then(|v| v.as_str())
-                .and_then(tool_name_from_tool_id);
-            let detail = summarize_tool_result_detail(&value);
-            if status == "success" {
-                return detail.map(|detail| AiActivityEvent::ToolResult {
-                    tool_name,
-                    status: AiToolResultStatus::Success,
-                    detail,
-                });
-            }
-            Some(AiActivityEvent::ToolResult {
-                tool_name,
-                status: AiToolResultStatus::Error,
-                detail: detail.unwrap_or_else(|| "failed".to_string()),
-            })
-        }
-        "error" => {
-            let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            if message.is_empty() {
-                return None;
-            }
-            let severity = match value
-                .get("severity")
-                .and_then(|v| v.as_str())
-                .unwrap_or("error")
-            {
-                "warning" => AiActivitySeverity::Warning,
-                "info" => AiActivitySeverity::Info,
-                _ => AiActivitySeverity::Error,
-            };
-            Some(AiActivityEvent::Notice {
-                severity,
-                message: clip_activity_text(message),
-            })
-        }
-        "result" => {
-            let status = value
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("success");
-            if status == "error" {
-                let message = json_str(&value, &["error", "message"])
-                    .or_else(|| value.get("message").and_then(|v| v.as_str()))
-                    .unwrap_or("request failed");
-                return Some(AiActivityEvent::Notice {
-                    severity: AiActivitySeverity::Error,
-                    message: clip_activity_text(message),
-                });
-            }
-            let stats = value.get("stats");
-            let tool_calls = stats
-                .and_then(|s| s.get("tool_calls"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let duration_ms = stats
-                .and_then(|s| s.get("duration_ms"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let tokens = stats
-                .and_then(|s| s.get("total_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            Some(AiActivityEvent::Summary {
-                tool_calls,
-                duration_ms,
-                total_tokens: tokens,
-            })
-        }
-        other => {
-            if other.contains("thought") || other.contains("thinking") {
-                let content = json_str(&value, &["content"])
-                    .or_else(|| json_str(&value, &["text"]))
-                    .or_else(|| json_str(&value, &["summary"]))
-                    .unwrap_or("");
-                if !content.is_empty() {
-                    return Some(AiActivityEvent::Thinking {
-                        content: flatten_stream_chunk(content),
-                    });
-                }
-            }
-            let text = value
-                .get("message")
-                .and_then(|v| v.as_str())
-                .or_else(|| value.get("content").and_then(|v| v.as_str()))
-                .or_else(|| value.get("text").and_then(|v| v.as_str()));
-            match text {
-                Some(text) if !text.is_empty() => Some(AiActivityEvent::Raw {
-                    text: format!("[{other}] {}", clip_activity_text(text)),
-                }),
-                _ => Some(AiActivityEvent::Raw {
-                    text: clip_activity_text(line),
-                }),
-            }
-        }
-    }
-}
-
-fn json_str<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
-    let mut current = value;
-    for segment in path {
-        current = current.get(*segment)?;
-    }
-    current.as_str()
-}
-
-fn flatten_stream_chunk(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| if matches!(ch, '\r' | '\n') { ' ' } else { ch })
-        .collect()
-}
-
-fn collapse_activity_whitespace(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn clip_activity_text(input: &str) -> String {
-    const MAX_CHARS: usize = 160;
-    let collapsed = collapse_activity_whitespace(input);
-    let total = collapsed.chars().count();
-    if total <= MAX_CHARS {
-        return collapsed;
-    }
-    let prefix: String = collapsed.chars().take(MAX_CHARS - 3).collect();
-    format!("{prefix}...")
-}
-
-fn summarize_tool_result_detail(value: &serde_json::Value) -> Option<String> {
-    json_str(value, &["error", "message"])
-        .or_else(|| value.get("output").and_then(|v| v.as_str()))
-        .map(clip_activity_text)
-        .filter(|detail| !detail.is_empty())
-}
-
-fn tool_name_from_tool_id(tool_id: &str) -> Option<String> {
-    let tool_name = tool_id.split("__").next().unwrap_or(tool_id).trim();
-    if tool_name.is_empty() {
-        None
-    } else {
-        Some(tool_name.to_string())
-    }
-}
-
-/// Pick the single most informative key in a tool-call parameter blob.
-/// Most CLI tools carry one obvious "what is this about" field
-/// (`file_path` for read/edit, `command` for shell, `pattern` for
-/// grep, …); rendering just that keeps the activity row short. Falls
-/// back to the first key=value pair when nothing recognisable is
-/// found.
-fn summarize_tool_params(params: Option<&serde_json::Value>) -> String {
-    let Some(obj) = params.and_then(|v| v.as_object()) else {
-        return String::new();
-    };
-    const PREFERRED: &[&str] = &[
-        "file_path",
-        "path",
-        "absolute_path",
-        "command",
-        "pattern",
-        "query",
-        "url",
-        "strategic_intent",
-    ];
-    for key in PREFERRED {
-        if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
-            return clip_activity_text(v);
-        }
-    }
-    obj.iter()
-        .next()
-        .map(|(k, v)| match v.as_str() {
-            Some(s) => clip_activity_text(&format!("{k}={s}")),
-            None => clip_activity_text(&format!("{k}={v}")),
-        })
-        .unwrap_or_default()
-}
-
-/// Strip CSI / OSC ANSI escape sequences and bare ESC characters so
-/// streamed AI output renders cleanly in a TUI Paragraph (which doesn't
-/// interpret escapes). Intentionally minimal — handles the
-/// `ESC [ ... <final>` and `ESC ] ... BEL` forms that account for
-/// virtually all color/cursor output. UTF-8 safe.
-fn strip_ansi(input: &str) -> String {
-    const ESC: char = '\x1b';
-    const BEL: char = '\x07';
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != ESC {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
-                chars.next();
-                // Consume params then the final byte (range 0x40..=0x7E).
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    let code = next as u32;
-                    if (0x40..=0x7e).contains(&code) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                chars.next();
-                // OSC: terminated by BEL or ESC \.
-                while let Some(&next) = chars.peek() {
-                    if next == BEL {
-                        chars.next();
-                        break;
-                    }
-                    if next == ESC {
-                        chars.next();
-                        if let Some('\\') = chars.peek() {
-                            chars.next();
-                        }
-                        break;
-                    }
-                    chars.next();
-                }
-            }
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
-}
 
 /// Return the first reachable base ref in `BASE_REF_PRIORITY`. Probes each
 /// ref with `git rev-parse --verify` against the supplied worktree. Used
@@ -3320,76 +2889,6 @@ mod tests {
         assert!(prompt.contains("git commit"));
         assert!(prompt.contains("git push"));
         assert!(prompt.to_lowercase().contains("stay focused on the merge"));
-    }
-
-    #[test]
-    fn format_stream_event_preserves_assistant_delta_spacing() {
-        let event = format_stream_event(
-            r#"{"type":"message","role":"assistant","content":" hello","delta":true}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            event,
-            AiActivityEvent::AssistantText {
-                content: " hello".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn format_stream_event_parses_successful_tool_results() {
-        let event = format_stream_event(
-            r#"{"type":"tool_result","tool_id":"run_shell_command__123","status":"success","output":"modified src/main.rs\n1 file changed"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            event,
-            AiActivityEvent::ToolResult {
-                tool_name: Some("run_shell_command".to_string()),
-                status: AiToolResultStatus::Success,
-                detail: "modified src/main.rs 1 file changed".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn format_stream_event_parses_structured_errors() {
-        let warning = format_stream_event(
-            r#"{"type":"error","severity":"warning","message":"Quota getting low"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            warning,
-            AiActivityEvent::Notice {
-                severity: AiActivitySeverity::Warning,
-                message: "Quota getting low".to_string(),
-            }
-        );
-
-        let tool_error = format_stream_event(
-            r#"{"type":"tool_result","tool_id":"read_file__456","status":"error","error":{"type":"TOOL_EXECUTION_ERROR","message":"ENOENT: missing file"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            tool_error,
-            AiActivityEvent::ToolResult {
-                tool_name: Some("read_file".to_string()),
-                status: AiToolResultStatus::Error,
-                detail: "ENOENT: missing file".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn format_stream_event_is_ready_for_future_thinking_events() {
-        let event =
-            format_stream_event(r#"{"type":"thinking","content":"Scanning both sides"}"#).unwrap();
-        assert_eq!(
-            event,
-            AiActivityEvent::Thinking {
-                content: "Scanning both sides".to_string(),
-            }
-        );
     }
 
     #[test]

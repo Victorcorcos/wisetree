@@ -9,6 +9,7 @@ pub mod command_list_progress;
 pub mod command_progress;
 pub mod confirm_dialog;
 pub mod input_prompt;
+pub mod pty_view;
 pub mod select_prompt;
 pub mod spinner;
 pub mod status_indicator;
@@ -24,6 +25,7 @@ pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
 pub use confirm_dialog::{ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant};
 pub use input_prompt::{InputOutcome, InputPrompt};
+pub use pty_view::PtyView;
 pub use select_prompt::{
     branded_line, branded_spans, SelectOption, SelectOutcome, SelectPrompt, SelectStyle,
     SELECT_CURSOR,
