@@ -30,6 +30,11 @@ use vt100::{Color as VtColor, Parser};
 /// rather not have wrap awkwardly, so we start generous.
 const DEFAULT_ROWS: u16 = 40;
 const DEFAULT_COLS: u16 = 160;
+/// How many lines of scrollback the vt100 parser retains. opencode runs
+/// can emit thousands of formatted lines (Thinking blocks, diffs, tool
+/// output); 5000 rows gives the user plenty of history to scroll back
+/// through without ballooning memory.
+const SCROLLBACK_ROWS: usize = 5000;
 
 pub struct PtyView {
     parser: Arc<Mutex<Parser>>,
@@ -96,7 +101,11 @@ impl PtyView {
             .take_writer()
             .map_err(|err| std::io::Error::other(format!("take writer: {err}")))?;
 
-        let parser = Arc::new(Mutex::new(Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0)));
+        let parser = Arc::new(Mutex::new(Parser::new(
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+            SCROLLBACK_ROWS,
+        )));
         let done = Arc::new(AtomicBool::new(false));
         let exit_status: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
 
@@ -190,6 +199,68 @@ impl PtyView {
         let _ = self.writer.flush();
     }
 
+    /// Total scrollback rows currently retained by the vt100 parser.
+    /// vt100's `Screen` only exposes the *current* scrollback offset, not
+    /// the buffer length — so we probe by saving the offset, asking
+    /// `set_scrollback` to clamp at the maximum (it caps at the actual
+    /// length), reading it back, then restoring. The whole operation
+    /// runs under the parser mutex so the reader thread can't race.
+    pub fn scrollback_len(&self) -> usize {
+        if let Ok(mut parser) = self.parser.lock() {
+            let saved = parser.screen().scrollback();
+            parser.set_scrollback(usize::MAX);
+            let len = parser.screen().scrollback();
+            parser.set_scrollback(saved);
+            return len;
+        }
+        0
+    }
+
+    /// Current scrollback offset — `0` means we're at the bottom (live
+    /// tail), larger values mean we've moved further back in history.
+    pub fn scrollback_offset(&self) -> usize {
+        self.parser
+            .lock()
+            .map(|p| p.screen().scrollback())
+            .unwrap_or(0)
+    }
+
+    /// Scroll the view back by `lines` rows. Clamped to scrollback_len
+    /// by vt100, so over-scroll is safe.
+    pub fn scroll_up(&mut self, lines: u16) {
+        if let Ok(mut parser) = self.parser.lock() {
+            let target = parser.screen().scrollback().saturating_add(lines as usize);
+            parser.set_scrollback(target);
+        }
+    }
+
+    /// Scroll the view forward by `lines` rows toward the live tail.
+    pub fn scroll_down(&mut self, lines: u16) {
+        if let Ok(mut parser) = self.parser.lock() {
+            let target = parser
+                .screen()
+                .scrollback()
+                .saturating_sub(lines as usize);
+            parser.set_scrollback(target);
+        }
+    }
+
+    /// Snap to the top of the scrollback (oldest line at top of view).
+    pub fn scroll_to_top(&mut self) {
+        if let Ok(mut parser) = self.parser.lock() {
+            // `set_scrollback` clamps internally — passing usize::MAX
+            // lands us at the actual top regardless of buffer size.
+            parser.set_scrollback(usize::MAX);
+        }
+    }
+
+    /// Snap back to the live tail.
+    pub fn scroll_to_bottom(&mut self) {
+        if let Ok(mut parser) = self.parser.lock() {
+            parser.set_scrollback(0);
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -272,5 +343,46 @@ fn convert_color(c: VtColor, _is_fg: bool) -> RatColor {
             other => RatColor::Indexed(other),
         },
         VtColor::Rgb(r, g, b) => RatColor::Rgb(r, g, b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn spawn_echo() -> PtyView {
+        PtyView::spawn(Path::new("/bin/echo"), &["hello".to_string()], None, &[])
+            .expect("spawn /bin/echo")
+    }
+
+    fn wait_for_exit(pty: &mut PtyView) {
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline {
+            if pty.poll_exited() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn scroll_apis_clamp_safely_and_dont_panic_on_overscroll() {
+        let mut pty = spawn_echo();
+        wait_for_exit(&mut pty);
+
+        // Over-scroll past the available scrollback (likely zero rows for
+        // a one-line `echo`): all of these must no-op without panicking.
+        pty.scroll_up(u16::MAX);
+        pty.scroll_down(u16::MAX);
+        pty.scroll_up(50);
+        pty.scroll_down(50);
+        pty.scroll_to_top();
+        pty.scroll_to_bottom();
+        assert_eq!(pty.scrollback_offset(), 0);
+
+        // scrollback_len matches what vt100 actually retains; for a
+        // single-line echo this is 0, but the accessor must still work.
+        let _ = pty.scrollback_len();
     }
 }

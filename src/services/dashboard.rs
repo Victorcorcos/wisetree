@@ -854,20 +854,22 @@ impl DashboardService {
             );
 
             // Build the command the UI will spawn inside its embedded
-            // PTY. We pass the merger prompt as a positional arg the
-            // same way `opencode run "<prompt>"` is invoked standalone,
-            // but WITHOUT `--format json`: we want opencode's real TUI
-            // (formatted Thinking blocks, tool calls, syntax-coloured
-            // diffs) inside the AI Activity panel, not an NDJSON event
-            // stream that we'd re-render ourselves.
+            // PTY. Invoke opencode's *default* TUI subcommand (no
+            // explicit subcommand → `opencode [project]` starts the
+            // full TUI) with `--prompt <prompt>` so the merger prompt
+            // is auto-sent on launch and `-m <model>` so the user's
+            // configured model is honored. `opencode run` would also
+            // work, but its output is the plain CLI transcript — only
+            // the TUI renders the full Monokai theme (orange Thinking
+            // headers, colored tool calls, syntax-highlighted diffs)
+            // the user expects to see inside the AI Activity panel.
             let prompt = build_merge_prompt(base_ref, &conflicts);
             let opencode_args: Vec<String> = vec![
-                "run".to_string(),
+                "--prompt".to_string(),
+                prompt,
                 "-m".to_string(),
                 use_ai.clone(),
-                "--dir".to_string(),
                 cwd.to_string_lossy().to_string(),
-                prompt,
             ];
 
             // Hand control to the UI. The merge is still mid-flight on

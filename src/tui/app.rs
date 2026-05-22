@@ -708,19 +708,16 @@ impl App {
             AiModelPickerAction::Continue => {}
             AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
             AiModelPickerAction::Selected(model) => {
-                let dashboard = self
-                    .settings
-                    .as_mut()
-                    .and_then(|settings| settings.apply_use_ai_selection(model));
-                self.close_ai_model_picker();
-                if let Some(dashboard) = dashboard {
-                    if let Err(err) = self.save_dashboard(dashboard) {
-                        if let Some(settings) = self.settings.as_mut() {
-                            settings
-                                .set_error(format!("Failed to save dashboard settings: {err}"));
-                        }
-                    }
+                // Stamp the chosen pair into the still-live Dashboard editor
+                // and drop back onto it — the user persists the change by
+                // pressing the editor's Save button (same pattern as every
+                // other dashboard field). Auto-saving here would route the
+                // user past the editor to the Settings menu, which they
+                // don't expect.
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.apply_use_ai_selection(model);
                 }
+                self.close_ai_model_picker();
                 let _ = tx;
             }
         }
@@ -1246,20 +1243,6 @@ impl App {
             }
             SettingsAction::FetchFreeModels => {
                 kick_off_fetch_free_opencode_models(tx.clone());
-            }
-            SettingsAction::ApplyFreeModel(model) => {
-                let dashboard = self
-                    .settings
-                    .as_mut()
-                    .and_then(|settings| settings.apply_use_ai_selection(model));
-                if let Some(dashboard) = dashboard {
-                    if let Err(err) = self.save_dashboard(dashboard) {
-                        if let Some(settings) = self.settings.as_mut() {
-                            settings
-                                .set_error(format!("Failed to save dashboard settings: {err}"));
-                        }
-                    }
-                }
             }
         }
     }

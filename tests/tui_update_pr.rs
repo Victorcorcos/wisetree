@@ -355,26 +355,29 @@ async fn pipeline_hands_off_to_ui_when_conflicts_detected_and_opencode_available
                 conflicts.iter().any(|f| f == "README.md"),
                 "expected README.md among {conflicts:?}"
             );
-            // opencode is invoked with `run -m <model> --dir <cwd> <prompt>`
-            // — verify the structural args so the screen-side spawn
-            // can't drift away from the contract.
-            assert_eq!(opencode_args[0], "run");
-            assert_eq!(opencode_args[1], "-m");
-            assert_eq!(opencode_args[2], "anthropic/claude-sonnet-4-5");
-            assert_eq!(opencode_args[3], "--dir");
+            // opencode is invoked via its *default* TUI subcommand —
+            // `--prompt <prompt> -m <model> <cwd>` — so the embedded PTY
+            // renders the full Monokai-themed TUI (formatted Thinking
+            // blocks, colored tool calls, syntax-highlighted diffs)
+            // instead of `opencode run`'s plain CLI transcript.
+            assert_eq!(opencode_args[0], "--prompt");
+            assert!(
+                !opencode_args[1].is_empty(),
+                "merger prompt should follow --prompt"
+            );
+            assert_eq!(opencode_args[2], "-m");
+            assert_eq!(opencode_args[3], "anthropic/claude-sonnet-4-5");
             assert!(
                 opencode_args[4].contains(fx.src.to_str().unwrap()),
-                "expected --dir {:?} in args, got {:?}",
-                fx.src,
+                "expected cwd positional in args, got {:?}",
                 opencode_args
             );
+            // We must NOT invoke `opencode run` — that's the plain CLI
+            // mode that strips most of the Monokai theming.
             assert!(
-                !opencode_args.last().unwrap().is_empty(),
-                "merger prompt should be the last positional arg"
+                !opencode_args.iter().any(|a| a == "run"),
+                "service must not use `opencode run`; the UI embeds opencode's real TUI: {opencode_args:?}"
             );
-            // Crucially: no `--format json` — we want the real opencode
-            // TUI rendered inside the embedded PTY, not an NDJSON stream
-            // that we'd have to re-render ourselves.
             assert!(
                 !opencode_args.iter().any(|a| a == "--format"),
                 "service must not pass --format; the UI embeds opencode's real TUI: {opencode_args:?}"

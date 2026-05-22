@@ -21,7 +21,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use crate::messages::colors;
@@ -230,7 +232,17 @@ impl UpdatePullRequestScreen {
 
     /// Called by the App once opencode has exited. Surfaces the
     /// Complete / Cancel button row so the user can commit or abort.
+    ///
+    /// Idempotent on purpose: `tick_pty` polls the PTY every frame and
+    /// `PtyView::poll_exited` returns true on every poll after the child
+    /// has exited (the underlying `done` flag stays set). Without the
+    /// early return, the user's `→` press to focus Cancel would be
+    /// undone the very next tick when this method reset `ai_button`
+    /// back to `Complete`.
     pub fn mark_ai_done(&mut self) {
+        if self.ai_done {
+            return;
+        }
         self.ai_done = true;
         self.ai_button = AiButton::Complete;
     }
@@ -319,29 +331,87 @@ impl UpdatePullRequestScreen {
     }
 
     /// Scroll the AI Activity panel up by `lines` (only meaningful while
-    /// the AI is actively streaming or has just finished).
+    /// the AI is actively streaming or has just finished). When the
+    /// embedded PTY is alive, scrolling routes through vt100's scrollback
+    /// so the user sees real terminal history; otherwise we fall back to
+    /// the structured-event log offset.
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
-        if matches!(self.step, UpdateStep::Updating) && self.ai_active {
-            self.ai_scroll = self.ai_scroll.saturating_add(lines);
-            return true;
+        if !matches!(self.step, UpdateStep::Updating) || !self.ai_active {
+            return false;
         }
-        false
+        if let Some(pty) = self.pty.as_mut() {
+            pty.scroll_up(lines);
+        } else {
+            self.ai_scroll = self.ai_scroll.saturating_add(lines);
+        }
+        true
     }
 
     /// Scroll the AI Activity panel down by `lines`. The render path
     /// clamps against the content height every frame, so over-scrolling is
     /// safe here.
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
-        if matches!(self.step, UpdateStep::Updating) && self.ai_active {
-            self.ai_scroll = self.ai_scroll.saturating_sub(lines);
-            return true;
+        if !matches!(self.step, UpdateStep::Updating) || !self.ai_active {
+            return false;
         }
-        false
+        if let Some(pty) = self.pty.as_mut() {
+            pty.scroll_down(lines);
+        } else {
+            self.ai_scroll = self.ai_scroll.saturating_sub(lines);
+        }
+        true
     }
 
     #[cfg(test)]
     pub(crate) fn ai_scroll(&self) -> u16 {
         self.ai_scroll
+    }
+
+    /// Page size used for PgUp/PgDn scrolling. The PTY's panel area is
+    /// only known at render time, so we use a sensible constant that
+    /// matches the typical visible row count of the AI Activity panel.
+    /// Roughly half a screen — enough to feel snappy without losing the
+    /// reader's place.
+    const KEYBOARD_PAGE_SCROLL: u16 = 10;
+    const KEYBOARD_LINE_SCROLL: u16 = 1;
+
+    /// Handle scroll-only keys when the outer (Wisetree) terminal owns
+    /// focus. Returns true when the key was consumed as a scroll action.
+    fn handle_outer_scroll_key(&mut self, key: &KeyEvent) -> bool {
+        if !self.ai_active {
+            return false;
+        }
+        match key.code {
+            KeyCode::PageUp => {
+                self.handle_mouse_scroll_up(Self::KEYBOARD_PAGE_SCROLL);
+                true
+            }
+            KeyCode::PageDown => {
+                self.handle_mouse_scroll_down(Self::KEYBOARD_PAGE_SCROLL);
+                true
+            }
+            KeyCode::Up => {
+                self.handle_mouse_scroll_up(Self::KEYBOARD_LINE_SCROLL);
+                true
+            }
+            KeyCode::Down => {
+                self.handle_mouse_scroll_down(Self::KEYBOARD_LINE_SCROLL);
+                true
+            }
+            KeyCode::Home => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_to_top();
+                }
+                true
+            }
+            KeyCode::End => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_to_bottom();
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
@@ -373,9 +443,15 @@ impl UpdatePullRequestScreen {
                     }
                     return UpdateAction::Continue;
                 }
+                if self.handle_outer_scroll_key(&key) {
+                    return UpdateAction::Continue;
+                }
                 // Outer-focus & still streaming → swallow other keys so
                 // the user doesn't accidentally trigger Wisetree actions
                 // mid-resolution.
+                return UpdateAction::Continue;
+            }
+            if self.handle_outer_scroll_key(&key) {
                 return UpdateAction::Continue;
             }
             return match key.code {
@@ -613,13 +689,11 @@ impl UpdatePullRequestScreen {
         } else {
             colors::INFO
         };
-        let border_style = if focused_inner {
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(border_color)
-        };
+        // Only the color flips on focus — keep the border style otherwise
+        // untouched so `BorderType::Rounded` glyphs stay rounded. Adding
+        // BOLD here makes some terminals swap in a heavier, non-rounded
+        // glyph and the rectangle visibly changes shape on Tab.
+        let border_style = Style::default().fg(border_color);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -638,6 +712,22 @@ impl UpdatePullRequestScreen {
         if let Some(pty) = self.pty.as_mut() {
             pty.resize(inner.height, inner.width);
             pty.render(frame, inner);
+            let scrollback_len = pty.scrollback_len();
+            if scrollback_len > 0 {
+                // Position: 0 = top of scrollback (oldest), len = bottom
+                // (live tail). vt100's offset is "rows back from tail",
+                // so invert to keep the thumb intuitive.
+                let offset = pty.scrollback_offset();
+                let position = scrollback_len.saturating_sub(offset);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(Style::default().fg(colors::MUTED))
+                    .thumb_style(Style::default().fg(colors::INFO));
+                let mut state =
+                    ScrollbarState::new(scrollback_len.saturating_add(inner.height as usize))
+                        .viewport_content_length(inner.height as usize)
+                        .position(position);
+                frame.render_stateful_widget(scrollbar, inner, &mut state);
+            }
             return;
         }
 
@@ -695,6 +785,7 @@ impl UpdatePullRequestScreen {
                 Style::default().fg(colors::ERROR),
             ));
             spans.push(Span::styled("Cancel".to_string(), muted));
+            self.append_scroll_hint(&mut spans, &separator, muted);
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
@@ -737,15 +828,64 @@ impl UpdatePullRequestScreen {
             muted,
         ));
         if focused_inner {
-            spans.push(separator);
+            spans.push(separator.clone());
             spans.push(Span::styled(
                 "keys flow into the inner TUI".to_string(),
                 Style::default()
                     .fg(colors::GRAY_LIGHT)
                     .add_modifier(Modifier::DIM | Modifier::ITALIC),
             ));
+        } else {
+            self.append_scroll_hint(&mut spans, &separator, muted);
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Append the scroll-shortcut hint to the footer line. Only shown
+    /// when scrolling actually applies — i.e. there's a PTY alive or
+    /// the fallback ai_log has content. Colors come from
+    /// `design/pallete.md`: the `Scroll:` label is teal/INFO, the key
+    /// glyphs are purple/BRAND to mirror the existing `Tab` cue, and
+    /// the descriptive words stay muted/dim.
+    fn append_scroll_hint(
+        &self,
+        spans: &mut Vec<Span<'static>>,
+        separator: &Span<'static>,
+        muted: Style,
+    ) {
+        let scrollable = self.pty.is_some() || !self.ai_log.is_empty();
+        if !scrollable {
+            return;
+        }
+        spans.push(separator.clone());
+        spans.push(Span::styled(
+            "Scroll: ".to_string(),
+            Style::default()
+                .fg(colors::INFO)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            "↑/↓".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(" line".to_string(), muted));
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            "PgUp/PgDn".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(" page".to_string(), muted));
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            "Home/End".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(" jump".to_string(), muted));
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            "wheel".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
     }
 
     fn render_ai_buttons(&self, frame: &mut Frame, area: Rect) {
@@ -780,21 +920,21 @@ impl UpdatePullRequestScreen {
 }
 
 fn button_paragraph(label: &str, color: ratatui::style::Color, focused: bool) -> Paragraph<'static> {
-    let border_style = if focused {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(color)
-    };
+    // Match the canonical `ConfirmDialog` button style: the border only
+    // changes color on selection (never gains BOLD), and the label is
+    // what actually highlights — that way `BorderType::Rounded` renders
+    // identical glyphs whether the button is selected or not.
+    let border_color = if focused { color } else { colors::MUTED };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(border_style);
+        .border_style(Style::default().fg(border_color));
     let label_style = if focused {
         Style::default()
-            .fg(color)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            .fg(colors::WHITE)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
+        Style::default().fg(colors::MUTED)
     };
     Paragraph::new(Line::from(Span::styled(label.to_string(), label_style)))
         .block(block)
@@ -1468,6 +1608,29 @@ mod tests {
     }
 
     #[test]
+    fn mark_ai_done_is_idempotent_and_preserves_button_selection() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        screen.mark_ai_done();
+        assert_eq!(screen.ai_button(), AiButton::Complete);
+
+        // User flips to Cancel...
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(right), UpdateAction::Continue);
+        assert_eq!(screen.ai_button(), AiButton::Cancel);
+
+        // ...and the next PTY tick re-fires mark_ai_done. The selection
+        // must survive — otherwise Cancel is unreachable.
+        screen.mark_ai_done();
+        assert_eq!(screen.ai_button(), AiButton::Cancel);
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(enter), UpdateAction::AiCancel);
+    }
+
+    #[test]
     fn esc_after_ai_done_returns_ai_cancel() {
         let mut screen = UpdatePullRequestScreen::new(sample_request());
         screen.set_base_ref("upstream/main".to_string());
@@ -1678,6 +1841,25 @@ mod tests {
         screen.start_updating();
         screen.mark_ai_active();
         assert!(!screen.is_pty_focused());
+    }
+
+    #[test]
+    fn footer_includes_scroll_hint_during_streaming_when_log_has_content() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_updating();
+        screen.mark_ai_active();
+        screen.append_ai_line("a line of output".to_string());
+
+        let dumped = render_dump(&mut screen, 140, 28);
+        assert!(
+            dumped.contains("Scroll:"),
+            "expected scroll hint in footer:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("PgUp/PgDn"),
+            "expected PgUp/PgDn hint in footer:\n{dumped}"
+        );
     }
 
     #[test]
