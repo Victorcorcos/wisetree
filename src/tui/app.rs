@@ -9,6 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, ffi::OsString};
 
+#[cfg(unix)]
+use libc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -2613,11 +2616,19 @@ struct InitOutcome {
 /// through the normal Drop chain — including crossterm's
 /// `DisableMouseCapture` and `disable_raw_mode`, so the user's terminal is
 /// returned to a sane state.
+///
+/// On Linux there is a secondary fallback: crossterm's mio backend can
+/// enter an infinite inner read-loop when the PTY master closes (EIO is
+/// silently dropped without `break`), so the cooperative tokio-signal path
+/// never gets a chance to run. A dedicated OS thread polls `STDIN_FILENO`
+/// for `POLLHUP` with a raw `libc::poll()` call. When triggered it runs
+/// terminal cleanup and calls `process::exit` directly, bypassing the stuck
+/// crossterm loop.
 fn install_termination_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
-        let flag = flag.clone();
+        let flag_for_signal = flag.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let Ok(mut term) = signal(SignalKind::terminate()) else {
@@ -2638,8 +2649,42 @@ fn install_termination_listener() -> Arc<AtomicBool> {
                 _ = quit.recv() => {}
                 _ = hup.recv() => {}
             }
-            flag.store(true, Ordering::Relaxed);
+            flag_for_signal.store(true, Ordering::Relaxed);
         });
+
+        // Only install the watchdog when stdin is a real TTY. Piped or
+        // redirected stdin would trigger POLLHUP immediately and cause a
+        // spurious exit before any user interaction.
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+            let flag_for_watchdog = flag.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let mut pfd = libc::pollfd {
+                        fd: libc::STDIN_FILENO,
+                        // events = 0: POLLHUP is always reported in revents
+                        // regardless of the events mask, so we need not request
+                        // POLLIN. Avoiding POLLIN prevents the inner crossterm
+                        // read-loop from being confused by this thread's poll.
+                        events: 0,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, 250) };
+
+                    if flag_for_watchdog.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                        // PTY master closed. crossterm may be stuck in an EIO
+                        // spin on Linux so we cannot rely on the cooperative
+                        // shutdown path. Restore the terminal ourselves and
+                        // force-exit so the parent shell is not left in raw mode.
+                        let _ = crossterm::terminal::disable_raw_mode();
+                        std::process::exit(0);
+                    }
+                }
+            });
+        }
     }
     flag
 }
