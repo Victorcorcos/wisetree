@@ -375,6 +375,55 @@ impl UpdatePullRequestScreen {
     const KEYBOARD_PAGE_SCROLL: u16 = 10;
     const KEYBOARD_LINE_SCROLL: u16 = 1;
 
+    /// Handle scroll keys when the inner PTY owns focus. Plain Up / Down /
+    /// PageUp / PageDown / Home / End scroll the embedded terminal's
+    /// vt100 scrollback instead of being forwarded to opencode — the user
+    /// expects to be able to review history while still typing into the
+    /// chat. Any modifier (Shift/Ctrl/Alt) opts out so power users can
+    /// still send raw arrow sequences to the subprocess if they need to.
+    fn handle_pty_scroll_key(&mut self, key: &KeyEvent) -> bool {
+        if !self.ai_active {
+            return false;
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        match key.code {
+            KeyCode::Up => {
+                self.handle_mouse_scroll_up(Self::KEYBOARD_LINE_SCROLL);
+                true
+            }
+            KeyCode::Down => {
+                self.handle_mouse_scroll_down(Self::KEYBOARD_LINE_SCROLL);
+                true
+            }
+            KeyCode::PageUp => {
+                self.handle_mouse_scroll_up(Self::KEYBOARD_PAGE_SCROLL);
+                true
+            }
+            KeyCode::PageDown => {
+                self.handle_mouse_scroll_down(Self::KEYBOARD_PAGE_SCROLL);
+                true
+            }
+            KeyCode::Home => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_to_top();
+                }
+                true
+            }
+            KeyCode::End => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_to_bottom();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Handle scroll-only keys when the outer (Wisetree) terminal owns
     /// focus. Returns true when the key was consumed as a scroll action.
     fn handle_outer_scroll_key(&mut self, key: &KeyEvent) -> bool {
@@ -436,8 +485,15 @@ impl UpdatePullRequestScreen {
                     return UpdateAction::Continue;
                 }
                 if self.pty_focused {
+                    if self.handle_pty_scroll_key(&key) {
+                        return UpdateAction::Continue;
+                    }
                     if let Some(pty) = self.pty.as_mut() {
                         if let Some(bytes) = key_event_to_pty_bytes(&key) {
+                            // Any forwarded keystroke means the user is
+                            // interacting again — snap back to the live
+                            // tail so they see their input land.
+                            pty.scroll_to_bottom();
                             pty.send_input(&bytes);
                         }
                     }
