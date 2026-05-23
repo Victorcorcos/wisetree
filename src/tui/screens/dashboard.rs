@@ -650,7 +650,9 @@ impl DashboardScreen {
                 ActionChoice::UpdateBranch,
             ));
         }
-        SelectPrompt::new("Choose action:", options).without_hint()
+        SelectPrompt::new("Choose action:", options)
+            .searchable()
+            .without_hint()
     }
 
     fn handle_action_menu(&mut self, key: KeyEvent) -> DashboardAction {
