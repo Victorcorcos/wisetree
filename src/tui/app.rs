@@ -1913,7 +1913,11 @@ impl App {
             Err(message) => {
                 let trimmed = message.trim();
                 let snippet: String = trimmed.chars().take(160).collect();
-                let suffix = if trimmed.chars().count() > 160 { "…" } else { "" };
+                let suffix = if trimmed.chars().count() > 160 {
+                    "…"
+                } else {
+                    ""
+                };
                 self.show_toast(
                     ToastVariant::Error,
                     format!("Failed to close Pull Request: {snippet}{suffix}"),

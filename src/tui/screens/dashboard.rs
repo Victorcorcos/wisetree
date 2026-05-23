@@ -703,16 +703,13 @@ impl DashboardScreen {
                     ActionChoice::UpdatePullRequest => {
                         self.mode = DashboardMode::Table;
                         match update_request {
-                            Some(request) => {
-                                DashboardAction::UpdatePullRequest(Box::new(request))
-                            }
+                            Some(request) => DashboardAction::UpdatePullRequest(Box::new(request)),
                             None => DashboardAction::Continue,
                         }
                     }
                     ActionChoice::ClosePullRequest => match close_request {
                         Some(request) => {
-                            self.close_pr_modal =
-                                Some((build_close_pr_modal(), request));
+                            self.close_pr_modal = Some((build_close_pr_modal(), request));
                             self.mode = DashboardMode::ConfirmClosePr;
                             DashboardAction::Continue
                         }

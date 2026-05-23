@@ -151,9 +151,7 @@ impl ConfirmationModal {
 
         // Total height: border(2) + title(1) + blank(1) + subtitle + blank(1) + buttons(3) + hint(1)
         let needed_height = 2 + 1 + 1 + subtitle_lines + 1 + 3 + 1;
-        let modal_height = needed_height
-            .min(area.height.saturating_sub(2))
-            .max(8);
+        let modal_height = needed_height.min(area.height.saturating_sub(2)).max(8);
 
         let rect = centered_rect(area, modal_width, modal_height);
         if rect.width < 6 || rect.height < 6 {
@@ -277,7 +275,12 @@ fn button_paragraph(label: &str, color: Color, focused: bool) -> Paragraph<'stat
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect { x, y, width, height }
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 /// Count how many wrapped lines `text` needs when rendered into `width` columns.
