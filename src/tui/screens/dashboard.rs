@@ -16,7 +16,10 @@ use crate::services::{
     PrState, ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
-use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator};
+use crate::tui::widgets::{
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, SelectOption, SelectOutcome,
+    SelectPrompt, Status, StatusIndicator,
+};
 
 const SELECT_MARKER: &str = " ➤ ";
 const BLANK_SELECT_MARKER: &str = "   ";
@@ -33,6 +36,7 @@ fn worktree_display_name(path: &str) -> String {
 enum DashboardMode {
     Table,
     ActionMenu,
+    ConfirmClosePr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +47,7 @@ enum ActionChoice {
     OpenPullRequest,
     MergePullRequest,
     UpdatePullRequest,
+    ClosePullRequest,
     UpdateBranch,
 }
 
@@ -76,6 +81,15 @@ pub struct UpdatePullRequestRequest {
     pub ahead: u64,
     pub behind: u64,
     pub base_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosePullRequestRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub branch: String,
+    pub worktree_path: String,
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
@@ -144,6 +158,7 @@ pub enum DashboardAction {
     OpenPullRequest(String),
     MergePullRequest(Box<MergePullRequestRequest>),
     UpdatePullRequest(Box<UpdatePullRequestRequest>),
+    ClosePullRequest(Box<ClosePullRequestRequest>),
     /// Fetch the remote and merge the mother branch with the first
     /// reachable ref in `BASE_REF_PRIORITY` (upstream/main →
     /// upstream/master → origin/main → origin/master). Only offered on
@@ -215,6 +230,7 @@ pub struct DashboardScreen {
     /// Captured during render so mouse clicks on the footer buttons can
     /// be hit-tested by the app.
     bulk_button_rects: Vec<(BulkDeleteStatus, Rect)>,
+    close_pr_modal: Option<(ConfirmationModal, ClosePullRequestRequest)>,
     pub tick: usize,
 }
 
@@ -250,6 +266,7 @@ impl DashboardScreen {
             pr_enrichment_enabled,
             bulk_focus: None,
             bulk_button_rects: Vec::new(),
+            close_pr_modal: None,
             tick: 0,
         }
     }
@@ -320,6 +337,10 @@ impl DashboardScreen {
 
         if matches!(self.mode, DashboardMode::ActionMenu) {
             return self.handle_action_menu(key);
+        }
+
+        if matches!(self.mode, DashboardMode::ConfirmClosePr) {
+            return self.handle_close_pr_confirm(key);
         }
 
         // Refresh shortcut (Ctrl+R) takes priority so it isn't swallowed by
@@ -438,6 +459,13 @@ impl DashboardScreen {
 
         if matches!(self.mode, DashboardMode::ActionMenu) {
             self.render_action_menu(frame, area);
+            return;
+        }
+
+        if matches!(self.mode, DashboardMode::ConfirmClosePr) {
+            if let Some((modal, _)) = self.close_pr_modal.as_mut() {
+                modal.render(frame, area);
+            }
             return;
         }
 
@@ -602,6 +630,16 @@ impl DashboardScreen {
                 ActionChoice::UpdatePullRequest,
             ));
         }
+        if row
+            .pull_request
+            .as_ref()
+            .is_some_and(|pr| matches!(pr.state, PrState::Open))
+        {
+            options.push(SelectOption::new(
+                "Close Pull Request",
+                ActionChoice::ClosePullRequest,
+            ));
+        }
         // The mother (main) worktree has no PR of its own, but we still
         // want a one-click way to pull the upstream tip into it. Fetches
         // the remote and merges the first reachable ref from
@@ -632,26 +670,61 @@ impl DashboardScreen {
                 let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
                 let merge_request = build_merge_request(row);
                 let update_request = build_update_request(row);
-                self.mode = DashboardMode::Table;
+                let close_request = build_close_request(row);
                 self.action_select = None;
                 self.action_target = None;
                 match choice {
-                    ActionChoice::Navigate => DashboardAction::NavigateTo(path),
-                    ActionChoice::OpenWithCommand => DashboardAction::OpenTerminal(path),
-                    ActionChoice::CopyPath => DashboardAction::CopyPath(path),
-                    ActionChoice::OpenPullRequest => match pr_url {
-                        Some(url) => DashboardAction::OpenPullRequest(url),
-                        None => DashboardAction::Continue,
+                    ActionChoice::Navigate => {
+                        self.mode = DashboardMode::Table;
+                        DashboardAction::NavigateTo(path)
+                    }
+                    ActionChoice::OpenWithCommand => {
+                        self.mode = DashboardMode::Table;
+                        DashboardAction::OpenTerminal(path)
+                    }
+                    ActionChoice::CopyPath => {
+                        self.mode = DashboardMode::Table;
+                        DashboardAction::CopyPath(path)
+                    }
+                    ActionChoice::OpenPullRequest => {
+                        self.mode = DashboardMode::Table;
+                        match pr_url {
+                            Some(url) => DashboardAction::OpenPullRequest(url),
+                            None => DashboardAction::Continue,
+                        }
+                    }
+                    ActionChoice::MergePullRequest => {
+                        self.mode = DashboardMode::Table;
+                        match merge_request {
+                            Some(request) => DashboardAction::MergePullRequest(Box::new(request)),
+                            None => DashboardAction::Continue,
+                        }
+                    }
+                    ActionChoice::UpdatePullRequest => {
+                        self.mode = DashboardMode::Table;
+                        match update_request {
+                            Some(request) => {
+                                DashboardAction::UpdatePullRequest(Box::new(request))
+                            }
+                            None => DashboardAction::Continue,
+                        }
+                    }
+                    ActionChoice::ClosePullRequest => match close_request {
+                        Some(request) => {
+                            self.close_pr_modal =
+                                Some((build_close_pr_modal(), request));
+                            self.mode = DashboardMode::ConfirmClosePr;
+                            DashboardAction::Continue
+                        }
+                        None => {
+                            self.mode = DashboardMode::Table;
+                            DashboardAction::Continue
+                        }
                     },
-                    ActionChoice::MergePullRequest => match merge_request {
-                        Some(request) => DashboardAction::MergePullRequest(Box::new(request)),
-                        None => DashboardAction::Continue,
-                    },
-                    ActionChoice::UpdatePullRequest => match update_request {
-                        Some(request) => DashboardAction::UpdatePullRequest(Box::new(request)),
-                        None => DashboardAction::Continue,
-                    },
-                    ActionChoice::UpdateBranch => DashboardAction::UpdateBranch(path),
+                    ActionChoice::UpdateBranch => {
+                        self.mode = DashboardMode::Table;
+                        DashboardAction::UpdateBranch(path)
+                    }
                 }
             }
             SelectOutcome::Cancelled => {
@@ -661,6 +734,26 @@ impl DashboardScreen {
                 DashboardAction::Continue
             }
             SelectOutcome::Pending => DashboardAction::Continue,
+        }
+    }
+
+    fn handle_close_pr_confirm(&mut self, key: KeyEvent) -> DashboardAction {
+        let Some((modal, _)) = self.close_pr_modal.as_mut() else {
+            self.mode = DashboardMode::Table;
+            return DashboardAction::Continue;
+        };
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Confirmed => {
+                let (_, request) = self.close_pr_modal.take().unwrap();
+                self.mode = DashboardMode::Table;
+                DashboardAction::ClosePullRequest(Box::new(request))
+            }
+            ConfirmationOutcome::Cancelled => {
+                self.close_pr_modal = None;
+                self.mode = DashboardMode::Table;
+                DashboardAction::Continue
+            }
+            ConfirmationOutcome::Pending => DashboardAction::Continue,
         }
     }
 
@@ -1789,6 +1882,30 @@ fn build_merge_request(row: &DashboardRow) -> Option<MergePullRequestRequest> {
         ahead_behind,
         last_commit: row.last_commit.clone(),
     })
+}
+
+fn build_close_request(row: &DashboardRow) -> Option<ClosePullRequestRequest> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    Some(ClosePullRequestRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+    })
+}
+
+fn build_close_pr_modal() -> ConfirmationModal {
+    ConfirmationModal::new()
+        .with_title("Close Pull Request")
+        .with_subtitle("Are you sure you want to close this pull request without merging?")
+        .with_confirm_text("Close PR")
+        .with_cancel_text("Cancel")
+        .with_color("#e05a4e")
+        .with_selected(ConfirmationChoice::Cancel)
 }
 
 fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
