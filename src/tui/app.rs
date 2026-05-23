@@ -45,8 +45,8 @@ use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScr
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryLine, SummaryTone};
 use crate::tui::screens::dashboard::{
-    BulkDeleteStatus, DashboardAction, DashboardScreen, MergePullRequestRequest,
-    UpdatePullRequestRequest,
+    BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
+    MergePullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
@@ -102,6 +102,7 @@ enum AppEvent {
     WisePresetDiscovered(Result<WisePresetDiscovery, String>),
     MergePrDetailsLoaded(Result<MergePrDetailsPayload, String>),
     MergePrFinished(Result<u64, MergePrFailure>),
+    ClosePrFinished(Result<u64, String>),
     UpdatePrBaseRefResolved {
         number: u64,
         base_ref: Option<String>,
@@ -306,7 +307,21 @@ impl App {
                         screen.tick_pty(None);
                     }
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(width, height) => {
+                    // `Viewport::Fixed` (see `terminal::app_viewport`) does
+                    // not auto-resize, so a terminal resize would leave the
+                    // viewport at its original dimensions and corrupt every
+                    // subsequent frame (clipped widgets, ghost cells from
+                    // the previous size, mis-aligned borders). Explicitly
+                    // resize the viewport to the new terminal size; ratatui
+                    // also clears the screen as part of `resize`, so the
+                    // next `terminal.draw` repaints cleanly.
+                    terminal.resize(Rect::new(0, 0, width, height))?;
+                    // Pixel coordinates of an in-progress text selection
+                    // refer to the previous buffer dimensions; drop it so
+                    // the user doesn't see ghost highlights at stale cells.
+                    self.mouse_selection = None;
+                }
             }
         }
         Ok(())
@@ -938,6 +953,9 @@ impl App {
             DashboardAction::UpdateBranch(path) => {
                 self.start_update_branch_flow(path, tx);
             }
+            DashboardAction::ClosePullRequest(request) => {
+                self.start_close_pr_flow(*request, tx);
+            }
         }
     }
 
@@ -1008,6 +1026,23 @@ impl App {
         self.update_pr = Some(UpdatePullRequestScreen::new(request));
         self.screen = Screen::UpdatePullRequest;
         kick_off_resolve_base_ref(worktree_path, number, tx.clone());
+    }
+
+    fn start_close_pr_flow(
+        &mut self,
+        request: ClosePullRequestRequest,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.show_toast(
+            ToastVariant::Info,
+            format!("Closing Pull Request #{}…", request.number),
+        );
+        kick_off_close_pull_request(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request.number,
+            tx.clone(),
+        );
     }
 
     fn current_dashboard_config(&self) -> DashboardConfig {
@@ -1501,6 +1536,7 @@ impl App {
             AppEvent::WisePresetDiscovered(result) => self.apply_wise_preset_discovery(result),
             AppEvent::MergePrDetailsLoaded(result) => self.apply_merge_pr_details(result, tx),
             AppEvent::MergePrFinished(result) => self.apply_merge_pr_finished(result, tx),
+            AppEvent::ClosePrFinished(result) => self.apply_close_pr_finished(result),
             AppEvent::UpdatePrBaseRefResolved { number, base_ref } => {
                 self.apply_update_pr_base_ref(number, base_ref);
             }
@@ -1878,6 +1914,33 @@ impl App {
         // Routing through `enter_screen` rebuilds the Dashboard so the
         // freshly merged row re-fetches and the Merge action disappears.
         self.enter_screen(Screen::Dashboard, tx);
+    }
+
+    fn apply_close_pr_finished(&mut self, result: Result<u64, String>) {
+        match result {
+            Ok(number) => {
+                self.show_toast(
+                    ToastVariant::Success,
+                    format!("Pull Request #{number} closed."),
+                );
+            }
+            Err(message) => {
+                let trimmed = message.trim();
+                let snippet: String = trimmed.chars().take(160).collect();
+                let suffix = if trimmed.chars().count() > 160 {
+                    "…"
+                } else {
+                    ""
+                };
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to close Pull Request: {snippet}{suffix}"),
+                );
+            }
+        }
+        if let Some(watch) = self.dashboard_watch.as_ref() {
+            watch.refresh();
+        }
     }
 
     fn apply_init_outcome(&mut self, outcome: InitOutcome, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -2927,6 +2990,28 @@ fn kick_off_merge_pull_request(
             }),
         };
         let _ = tx.send(AppEvent::MergePrFinished(result));
+    });
+}
+
+fn kick_off_close_pull_request(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    number: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ClosePrFinished(Err(
+            "Could not resolve git root for closing the pull request.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = match service.close_pull_request(number).await {
+            Ok(()) => Ok(number),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::ClosePrFinished(result));
     });
 }
 

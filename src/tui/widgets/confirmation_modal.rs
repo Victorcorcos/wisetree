@@ -18,7 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::messages::colors;
@@ -140,8 +140,20 @@ impl ConfirmationModal {
     /// area of the parent panel so the modal floats over it. `Clear` is
     /// rendered behind the modal rect so whatever lies underneath gets
     /// wiped without disturbing the rest of the frame.
+    ///
+    /// The modal height grows automatically to fit a multi-line subtitle.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let rect = modal_rect(area);
+        // Modal is at most 60 cols wide, clamped to the terminal.
+        let modal_width = 60u16.min(area.width.saturating_sub(4)).max(20);
+        // Inner text width: modal minus borders (2) minus horizontal padding (2).
+        let inner_width = modal_width.saturating_sub(4) as usize;
+        let subtitle_lines = wrap_line_count(&self.subtitle, inner_width).max(1) as u16;
+
+        // Total height: border(2) + title(1) + blank(1) + subtitle + blank(1) + buttons(3) + hint(1)
+        let needed_height = 2 + 1 + 1 + subtitle_lines + 1 + 3 + 1;
+        let modal_height = needed_height.min(area.height.saturating_sub(2)).max(8);
+
+        let rect = centered_rect(area, modal_width, modal_height);
         if rect.width < 6 || rect.height < 6 {
             return;
         }
@@ -162,12 +174,12 @@ impl ConfirmationModal {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // title
-                Constraint::Length(1), // blank
-                Constraint::Length(1), // subtitle
-                Constraint::Length(1), // blank
-                Constraint::Length(3), // buttons row
-                Constraint::Length(1), // hint
+                Constraint::Length(1),              // title
+                Constraint::Length(1),              // blank
+                Constraint::Length(subtitle_lines), // subtitle (wraps)
+                Constraint::Length(1),              // blank
+                Constraint::Length(3),              // buttons row
+                Constraint::Length(1),              // hint
                 Constraint::Min(0),
             ])
             .split(inner);
@@ -181,10 +193,9 @@ impl ConfirmationModal {
         );
 
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                self.subtitle.clone(),
-                Style::default().fg(colors::WHITE),
-            ))),
+            Paragraph::new(self.subtitle.clone())
+                .style(Style::default().fg(colors::WHITE))
+                .wrap(Wrap { trim: true }),
             chunks[2],
         );
 
@@ -260,13 +271,8 @@ fn button_paragraph(label: &str, color: Color, focused: bool) -> Paragraph<'stat
         .alignment(ratatui::layout::Alignment::Center)
 }
 
-/// Centered rectangle used by the confirmation modal. Matches the
-/// historical finalize-modal sizing (60 wide × 10 tall) and clamps
-/// against the available area so very small terminals still produce
-/// a valid rect.
-fn modal_rect(area: Rect) -> Rect {
-    let width = 60u16.min(area.width.saturating_sub(4)).max(20);
-    let height = 10u16.min(area.height.saturating_sub(2)).max(8);
+/// Returns a centered rectangle of the given dimensions inside `area`.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect {
@@ -275,6 +281,28 @@ fn modal_rect(area: Rect) -> Rect {
         width,
         height,
     }
+}
+
+/// Count how many wrapped lines `text` needs when rendered into `width` columns.
+fn wrap_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut lines = 0usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if col == 0 {
+            col = wlen;
+            lines = 1;
+        } else if col + 1 + wlen <= width {
+            col += 1 + wlen;
+        } else {
+            lines += 1;
+            col = wlen;
+        }
+    }
+    lines.max(1)
 }
 
 fn parse_hex_color(hex: &str) -> Option<Color> {
