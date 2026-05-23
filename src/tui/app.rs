@@ -43,7 +43,7 @@ use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
-use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryLine, SummaryTone};
+use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryRow};
 use crate::tui::screens::dashboard::{
     BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
     MergePullRequestRequest, UpdatePullRequestRequest,
@@ -1442,9 +1442,9 @@ impl App {
                 if let Some(create) = self.create.as_mut() {
                     match result {
                         Ok(path) => {
-                            let summary = create_summary_lines(&path);
+                            let rows = create_summary_rows(&path);
                             create.set_created_worktree_path(path.worktree_path.clone());
-                            create.mark_complete(summary);
+                            create.mark_complete(rows);
                         }
                         Err(message) => create.set_error(message),
                     }
@@ -3207,129 +3207,66 @@ fn screen_delete_outcome(outcome: ServiceDeleteOutcome) -> ScreenDeleteOutcome {
     }
 }
 
-fn create_summary_lines(outcome: &ServiceCreateOutcome) -> Vec<SummaryLine> {
-    let mut lines = vec![SummaryLine::new(
-        format!("Worktree path: {}", outcome.worktree_path.display()),
-        SummaryTone::Emphasis,
-    )];
+/// Flatten the create outcome into one row per executed action so the
+/// success screen can render a status table (Command | Status | Failure).
+fn create_summary_rows(outcome: &ServiceCreateOutcome) -> Vec<SummaryRow> {
+    let mut rows: Vec<SummaryRow> = Vec::new();
 
     if let Some(report) = &outcome.copy_report {
-        append_section_header(&mut lines, "Copy Report");
-        append_summary_values(
-            &mut lines,
-            report.copied.iter().map(|path| format!("Copied {path}")),
-            SummaryTone::Success,
-            3,
+        let label = format!(
+            "Copy patterns ({} copied)",
+            report.copied.len()
         );
-        append_summary_values(
-            &mut lines,
-            report.skipped.iter().map(|path| format!("Skipped {path}")),
-            SummaryTone::Warning,
-            2,
-        );
-        append_summary_values(
-            &mut lines,
-            report.errors.iter().cloned(),
-            SummaryTone::Error,
-            2,
-        );
+        if report.errors.is_empty() {
+            rows.push(SummaryRow::success(label));
+        } else {
+            rows.push(SummaryRow::failure(label, report.errors.join("; ")));
+        }
+
+        if !report.skipped.is_empty() {
+            rows.push(SummaryRow::success(format!(
+                "Ignore patterns ({} skipped)",
+                report.skipped.len()
+            )));
+        }
     }
 
     if let Some(report) = &outcome.link_report {
-        append_section_header(&mut lines, "Shared Cache Links");
-        append_summary_values(
-            &mut lines,
-            report.linked.iter().map(|entry| {
-                if entry.seeded {
-                    format!("Linked {} (seeded from source)", entry.pattern)
-                } else {
-                    format!("Linked {} (using shared cache)", entry.pattern)
-                }
-            }),
-            SummaryTone::Success,
-            4,
+        let label = format!(
+            "Link patterns ({} linked)",
+            report.linked.len()
         );
-        append_summary_values(
-            &mut lines,
-            report.skipped.iter().cloned(),
-            SummaryTone::Warning,
-            3,
-        );
-        append_summary_values(
-            &mut lines,
-            report.errors.iter().cloned(),
-            SummaryTone::Error,
-            3,
-        );
+        if report.errors.is_empty() {
+            rows.push(SummaryRow::success(label));
+        } else {
+            rows.push(SummaryRow::failure(label, report.errors.join("; ")));
+        }
     }
 
-    if !outcome.command_runs.is_empty() {
-        append_section_header(&mut lines, "Post-Create Commands");
-        let successful = outcome
-            .command_runs
-            .iter()
-            .filter(|run| run.success)
-            .count();
-        lines.push(SummaryLine::new(
-            format!(
-                "Completed {successful}/{} command(s)",
-                outcome.command_runs.len()
-            ),
-            if successful == outcome.command_runs.len() {
-                SummaryTone::Success
-            } else {
-                SummaryTone::Warning
-            },
-        ));
-        append_summary_values(
-            &mut lines,
-            outcome
-                .command_runs
-                .iter()
-                .filter(|run| !run.success)
-                .map(|run| format!("Command failed: {}", run.command)),
-            SummaryTone::Error,
-            2,
-        );
+    for run in &outcome.command_runs {
+        if run.success {
+            rows.push(SummaryRow::success(run.command.clone()));
+        } else {
+            // Prefer the explicit error string; otherwise fall back to the
+            // last non-empty line of captured output so the user still sees
+            // *something* concrete in the Failure column.
+            let reason = run
+                .error
+                .clone()
+                .or_else(|| {
+                    run.output
+                        .lines()
+                        .map(|line| line.trim())
+                        .rev()
+                        .find(|line| !line.is_empty())
+                        .map(|line| line.to_string())
+                })
+                .unwrap_or_else(|| "Command failed".to_string());
+            rows.push(SummaryRow::failure(run.command.clone(), reason));
+        }
     }
 
-    if lines.len() == 1 {
-        lines.push(SummaryLine::new(
-            "No copy, shared cache link, or post-create steps were configured.",
-            SummaryTone::Muted,
-        ));
-    }
-
-    lines
-}
-
-fn append_section_header(lines: &mut Vec<SummaryLine>, title: &str) {
-    lines.push(SummaryLine::new(title, SummaryTone::Info));
-}
-
-fn append_summary_values<I>(
-    lines: &mut Vec<SummaryLine>,
-    values: I,
-    tone: SummaryTone,
-    limit: usize,
-) where
-    I: IntoIterator<Item = String>,
-{
-    let collected: Vec<String> = values.into_iter().collect();
-    if collected.is_empty() {
-        return;
-    }
-
-    for value in collected.iter().take(limit) {
-        lines.push(SummaryLine::new(format!("  • {value}"), tone));
-    }
-
-    if collected.len() > limit {
-        lines.push(SummaryLine::new(
-            format!("  • {} more", collected.len() - limit),
-            SummaryTone::Muted,
-        ));
-    }
+    rows
 }
 
 fn summarize_wise_preset_matches(discovery: &WisePresetDiscovery) -> String {
@@ -4576,6 +4513,124 @@ mod tests {
             app.delete.as_ref().unwrap().step(),
             screens::delete::DeleteStep::Success
         );
+    }
+
+    #[test]
+    fn create_summary_rows_flattens_reports_and_command_runs() {
+        use crate::files::{CommandRun, CopyReport, LinkReport, LinkedEntry};
+
+        let outcome = ServiceCreateOutcome {
+            worktree_path: PathBuf::from("/tmp/repo/feat-x"),
+            copy_report: Some(CopyReport {
+                copied: vec![".env".into(), ".envrc".into()],
+                skipped: vec!["node_modules".into()],
+                errors: Vec::new(),
+            }),
+            link_report: Some(LinkReport {
+                linked: vec![LinkedEntry {
+                    pattern: ".cache".into(),
+                    cache_path: PathBuf::from("/cache/.cache"),
+                    link_path: PathBuf::from("/tmp/repo/feat-x/.cache"),
+                    seeded: false,
+                }],
+                skipped: Vec::new(),
+                errors: vec!["link broke".into()],
+            }),
+            command_runs: vec![
+                CommandRun {
+                    command: "bun install".into(),
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                },
+                CommandRun {
+                    command: "install_skills".into(),
+                    success: false,
+                    output: String::new(),
+                    error: Some("not found".into()),
+                },
+            ],
+            terminal_launch: None,
+        };
+
+        let rows = create_summary_rows(&outcome);
+
+        assert_eq!(rows.len(), 5);
+        // Copy patterns succeeded.
+        assert_eq!(rows[0].command, "Copy patterns (2 copied)");
+        assert!(rows[0].success);
+        assert!(rows[0].failure.is_none());
+        // Ignore patterns row only appears when some files were skipped.
+        assert_eq!(rows[1].command, "Ignore patterns (1 skipped)");
+        assert!(rows[1].success);
+        // Link patterns failed with the explicit error.
+        assert_eq!(rows[2].command, "Link patterns (1 linked)");
+        assert!(!rows[2].success);
+        assert_eq!(rows[2].failure.as_deref(), Some("link broke"));
+        // Post-create commands appear in order.
+        assert_eq!(rows[3].command, "bun install");
+        assert!(rows[3].success);
+        assert_eq!(rows[4].command, "install_skills");
+        assert!(!rows[4].success);
+        assert_eq!(rows[4].failure.as_deref(), Some("not found"));
+    }
+
+    #[test]
+    fn create_finished_renders_summary_table_with_status_icons() {
+        use crate::files::CommandRun;
+
+        let mut app = initialized_menu_app();
+        app.screen = Screen::Create;
+        app.menu = None;
+        app.create = Some(CreateScreen::new());
+        if let Some(create) = app.create.as_mut() {
+            create.set_branches(Vec::new());
+            create.navigate_after_create = false;
+        }
+
+        app.handle_app_event(
+            AppEvent::CreateFinished(Ok(ServiceCreateOutcome {
+                worktree_path: PathBuf::from("/tmp/repo/feat-x"),
+                command_runs: vec![
+                    CommandRun {
+                        command: "bun install".into(),
+                        success: true,
+                        output: String::new(),
+                        error: None,
+                    },
+                    CommandRun {
+                        command: "install_skills".into(),
+                        success: false,
+                        output: String::new(),
+                        error: Some("not found".into()),
+                    },
+                ],
+                ..ServiceCreateOutcome::default()
+            })),
+            &app_event_tx(),
+        );
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let dumped = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(dumped.contains("Command"));
+        assert!(dumped.contains("Status"));
+        assert!(dumped.contains("Failure"));
+        assert!(dumped.contains("bun install"));
+        assert!(dumped.contains("install_skills"));
+        assert!(dumped.contains("not found"));
+        assert!(dumped.contains("✅"));
+        assert!(dumped.contains("❌"));
+        assert!(dumped.contains("None"));
     }
 
     #[test]
