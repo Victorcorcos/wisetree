@@ -306,7 +306,21 @@ impl App {
                         screen.tick_pty(None);
                     }
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(width, height) => {
+                    // `Viewport::Fixed` (see `terminal::app_viewport`) does
+                    // not auto-resize, so a terminal resize would leave the
+                    // viewport at its original dimensions and corrupt every
+                    // subsequent frame (clipped widgets, ghost cells from
+                    // the previous size, mis-aligned borders). Explicitly
+                    // resize the viewport to the new terminal size; ratatui
+                    // also clears the screen as part of `resize`, so the
+                    // next `terminal.draw` repaints cleanly.
+                    terminal.resize(Rect::new(0, 0, width, height))?;
+                    // Pixel coordinates of an in-progress text selection
+                    // refer to the previous buffer dimensions; drop it so
+                    // the user doesn't see ghost highlights at stale cells.
+                    self.mouse_selection = None;
+                }
             }
         }
         Ok(())
