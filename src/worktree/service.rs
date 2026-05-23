@@ -161,11 +161,7 @@ impl WorktreeService {
         };
 
         if !config.worktree_copy_patterns.is_empty() {
-            emit_activity(
-                &mut activity,
-                "$ Copy patterns",
-                ActivityKind::Status,
-            );
+            emit_activity(&mut activity, "$ Copy patterns", ActivityKind::Status);
             let report = copy_files(&git_root, &worktree_path, &config).await;
             for path in &report.copied {
                 emit_activity(
@@ -181,11 +177,7 @@ impl WorktreeService {
         }
 
         if !config.worktree_link_patterns.is_empty() {
-            emit_activity(
-                &mut activity,
-                "$ Link patterns",
-                ActivityKind::Status,
-            );
+            emit_activity(&mut activity, "$ Link patterns", ActivityKind::Status);
             let cache_dir = self.cache_dir_for(
                 Some(&options.new_branch),
                 Some(&options.source_branch),
@@ -403,11 +395,7 @@ impl WorktreeService {
     }
 }
 
-fn emit_activity(
-    activity: &mut Option<ActivityCallback<'_>>,
-    text: &str,
-    kind: ActivityKind,
-) {
+fn emit_activity(activity: &mut Option<ActivityCallback<'_>>, text: &str, kind: ActivityKind) {
     if let Some(cb) = activity.as_deref_mut() {
         cb(text, kind);
     }

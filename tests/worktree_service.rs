@@ -82,7 +82,10 @@ async fn create_worktree_full_flow_copies_env_files() {
                 new_branch: "feat-x".into(),
                 base_path: String::new(),
             };
-            let outcome = svc.create_worktree(&opts, None, None).await.expect("create");
+            let outcome = svc
+                .create_worktree(&opts, None, None)
+                .await
+                .expect("create");
 
             assert!(outcome.worktree_path.exists());
             assert!(outcome.worktree_path.join(".env").exists());
@@ -167,7 +170,10 @@ async fn create_worktree_populates_link_report_when_link_patterns_enabled() {
                 new_branch: "feat-link".into(),
                 base_path: String::new(),
             };
-            let outcome = svc.create_worktree(&opts, None, None).await.expect("create");
+            let outcome = svc
+                .create_worktree(&opts, None, None)
+                .await
+                .expect("create");
 
             let report = outcome.link_report.expect("link report present");
             assert_eq!(report.linked.len(), 1);
@@ -231,7 +237,10 @@ async fn create_worktree_allows_checkout_when_branch_matches_source() {
                 new_branch: "feat-existing".into(),
                 base_path: String::new(),
             };
-            let outcome = svc.create_worktree(&opts, None, None).await.expect("create");
+            let outcome = svc
+                .create_worktree(&opts, None, None)
+                .await
+                .expect("create");
             assert!(outcome.worktree_path.exists());
         };
         tokio::runtime::Runtime::new().unwrap().block_on(body);
@@ -255,7 +264,10 @@ async fn delete_worktree_removes_path_and_skips_branch_when_disabled() {
                 new_branch: "feat-d".into(),
                 base_path: String::new(),
             };
-            let outcome = svc.create_worktree(&opts, None, None).await.expect("create");
+            let outcome = svc
+                .create_worktree(&opts, None, None)
+                .await
+                .expect("create");
             let path = outcome.worktree_path.to_string_lossy().into_owned();
 
             let result = svc
@@ -293,7 +305,10 @@ async fn delete_worktree_with_branch_deletion_when_enabled() {
                 new_branch: "feat-e".into(),
                 base_path: String::new(),
             };
-            let outcome = svc.create_worktree(&opts, None, None).await.expect("create");
+            let outcome = svc
+                .create_worktree(&opts, None, None)
+                .await
+                .expect("create");
             let path = outcome.worktree_path.to_string_lossy().into_owned();
 
             let result = svc
@@ -331,7 +346,10 @@ async fn delete_worktree_keeps_unmerged_branch_and_returns_warning() {
                 new_branch: "feat-unmerged".into(),
                 base_path: String::new(),
             };
-            let outcome = svc.create_worktree(&opts, None, None).await.expect("create");
+            let outcome = svc
+                .create_worktree(&opts, None, None)
+                .await
+                .expect("create");
             fs::write(outcome.worktree_path.join("feature.txt"), "hello").unwrap();
             git(&outcome.worktree_path, &["add", "feature.txt"]);
             git(
@@ -375,7 +393,10 @@ async fn delete_worktree_dirty_without_force_errors() {
                 new_branch: "feat-dirty".into(),
                 base_path: String::new(),
             };
-            let outcome = svc.create_worktree(&opts, None, None).await.expect("create");
+            let outcome = svc
+                .create_worktree(&opts, None, None)
+                .await
+                .expect("create");
             let wt_path = outcome.worktree_path.clone();
             std::fs::write(wt_path.join("scratch.txt"), "x").unwrap();
             git(&wt_path, &["add", "."]);
@@ -411,7 +432,10 @@ async fn manual_worktree_cleanup_runs_prune() {
                 new_branch: "feat-manual".into(),
                 base_path: String::new(),
             };
-            let outcome = svc.create_worktree(&opts, None, None).await.expect("create");
+            let outcome = svc
+                .create_worktree(&opts, None, None)
+                .await
+                .expect("create");
             let path = outcome.worktree_path.to_string_lossy().into_owned();
 
             // Manually nuke the worktree dir; manual_worktree_cleanup should

@@ -3241,10 +3241,7 @@ fn create_summary_rows(outcome: &ServiceCreateOutcome) -> Vec<SummaryRow> {
     let mut rows: Vec<SummaryRow> = Vec::new();
 
     if let Some(report) = &outcome.copy_report {
-        let label = format!(
-            "Copy patterns ({} copied)",
-            report.copied.len()
-        );
+        let label = format!("Copy patterns ({} copied)", report.copied.len());
         if report.errors.is_empty() {
             rows.push(SummaryRow::success(label));
         } else {
@@ -3260,10 +3257,7 @@ fn create_summary_rows(outcome: &ServiceCreateOutcome) -> Vec<SummaryRow> {
     }
 
     if let Some(report) = &outcome.link_report {
-        let label = format!(
-            "Link patterns ({} linked)",
-            report.linked.len()
-        );
+        let label = format!("Link patterns ({} linked)", report.linked.len());
         if report.errors.is_empty() {
             rows.push(SummaryRow::success(label));
         } else {

@@ -759,18 +759,11 @@ fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) {
                 Style::default().fg(status_color),
             )));
             let (failure_text, failure_style) = match &r.failure {
-                Some(reason) => (
-                    truncate_failure(reason),
-                    Style::default().fg(colors::ERROR),
-                ),
-                None => (
-                    "None".to_string(),
-                    Style::default().fg(colors::MUTED),
-                ),
+                Some(reason) => (truncate_failure(reason), Style::default().fg(colors::ERROR)),
+                None => ("None".to_string(), Style::default().fg(colors::MUTED)),
             };
             Row::new(vec![
-                Cell::from(r.command.clone())
-                    .style(Style::default().fg(colors::EMPHASIS)),
+                Cell::from(r.command.clone()).style(Style::default().fg(colors::EMPHASIS)),
                 status_cell,
                 Cell::from(failure_text).style(failure_style),
             ])

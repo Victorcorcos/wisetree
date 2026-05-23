@@ -63,8 +63,7 @@ async fn post_create_runs_commands_and_invokes_progress() {
         source_branch: String::new(),
     };
     let commands = vec!["echo hello > out.txt".to_string(), "false".to_string()];
-    let results =
-        execute_post_create_commands(&commands, &vars, Some(cb_dyn), &mut None).await;
+    let results = execute_post_create_commands(&commands, &vars, Some(cb_dyn), &mut None).await;
 
     assert_eq!(results.len(), 2);
     assert!(results[0].success);
