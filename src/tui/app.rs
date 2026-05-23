@@ -91,6 +91,14 @@ enum AppEvent {
     CacheEntryDeleted(Result<crate::files::CacheOverview, String>),
     CreateBranchesLoaded(Result<Vec<GitBranch>, String>),
     CreateFinished(Result<ServiceCreateOutcome, String>),
+    /// One line of activity from the create pipeline — stage banner, stdout, or
+    /// stderr. Routed into the Terminal Activity panel under the "Creating"
+    /// step so long-running post-create commands (`flutter pub get`,
+    /// `bun install`) surface their output live instead of after they finish.
+    CreateActivity {
+        text: String,
+        kind: crate::files::ActivityKind,
+    },
     DeleteLoaded(Result<Vec<GitWorktree>, String>),
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
     SettingsUpdateChecked(UpdateCheckResult),
@@ -388,11 +396,16 @@ impl App {
                 }
             }
             Screen::Create => {
-                let h = self
-                    .create
-                    .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                let full = self.create.as_ref().is_some_and(|s| s.wants_full_height());
+                let panel = if full {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .create
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
                 if let Some(create) = self.create.as_mut() {
                     create.tick = self.tick;
                     create.render(frame, panel);
@@ -1448,6 +1461,11 @@ impl App {
                         }
                         Err(message) => create.set_error(message),
                     }
+                }
+            }
+            AppEvent::CreateActivity { text, kind } => {
+                if let Some(create) = self.create.as_mut() {
+                    create.append_terminal_line(text, kind);
                 }
             }
             AppEvent::DeleteLoaded(result) => {
@@ -2863,8 +2881,18 @@ fn kick_off_create_worktree(
             return;
         }
 
+        let activity_tx = tx.clone();
+        let mut on_activity = move |text: &str, kind: crate::files::ActivityKind| {
+            let _ = activity_tx.send(AppEvent::CreateActivity {
+                text: text.to_string(),
+                kind,
+            });
+        };
+        let activity_cb: &mut (dyn FnMut(&str, crate::files::ActivityKind) + Send) =
+            &mut on_activity;
+
         let result = service
-            .create_worktree(&options, None)
+            .create_worktree(&options, None, Some(activity_cb))
             .await
             .map_err(|e| user_friendly_message(&e));
         let _ = tx.send(AppEvent::CreateFinished(result));

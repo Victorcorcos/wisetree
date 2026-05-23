@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::service::ConfigService;
 use crate::errors::{GitErrorCode, Result, WisetreeError};
-use crate::files::service::ProgressCallback;
+use crate::files::service::{ActivityCallback, ActivityKind, ProgressCallback};
 use crate::files::{
     clear_cache, copy_files, execute_post_create_commands, link_patterns, list_cache,
     open_terminal, prune_cache, remove_cache_entry, resolve_cache_dir,
@@ -93,11 +93,16 @@ impl WorktreeService {
     /// post-create commands, optional terminal spawn.
     ///
     /// `progress` is forwarded to `execute_post_create_commands` and called
-    /// once per command before it runs.
+    /// once per command before it runs. `activity`, when provided, receives
+    /// every line that should be surfaced in the Terminal Activity panel:
+    /// stage banners ("$ Copying patterns…") emitted here, and the
+    /// streamed stdout / stderr of each post-create command (forwarded by
+    /// `execute_post_create_commands`).
     pub async fn create_worktree(
         &self,
         options: &WorktreeCreateOptions,
         progress: Option<ProgressCallback<'_>>,
+        mut activity: Option<ActivityCallback<'_>>,
     ) -> Result<CreateOutcome> {
         let config = self.config_service.config().clone();
         let git_root = self.effective_git_root();
@@ -138,7 +143,17 @@ impl WorktreeService {
             base_path: parent_for_git,
         };
 
+        emit_activity(
+            &mut activity,
+            &format!("$ git worktree add {worktree_path_str}"),
+            ActivityKind::Status,
+        );
         self.git_service.create_worktree(&git_options).await?;
+        emit_activity(
+            &mut activity,
+            &format!("Created worktree at {worktree_path_str}"),
+            ActivityKind::Stdout,
+        );
 
         let mut outcome = CreateOutcome {
             worktree_path: worktree_path.clone(),
@@ -146,17 +161,52 @@ impl WorktreeService {
         };
 
         if !config.worktree_copy_patterns.is_empty() {
+            emit_activity(
+                &mut activity,
+                "$ Copy patterns",
+                ActivityKind::Status,
+            );
             let report = copy_files(&git_root, &worktree_path, &config).await;
+            for path in &report.copied {
+                emit_activity(
+                    &mut activity,
+                    &format!("Copied {path}"),
+                    ActivityKind::Stdout,
+                );
+            }
+            for err in &report.errors {
+                emit_activity(&mut activity, err, ActivityKind::Stderr);
+            }
             outcome.copy_report = Some(report);
         }
 
         if !config.worktree_link_patterns.is_empty() {
+            emit_activity(
+                &mut activity,
+                "$ Link patterns",
+                ActivityKind::Status,
+            );
             let cache_dir = self.cache_dir_for(
                 Some(&options.new_branch),
                 Some(&options.source_branch),
                 Some(&worktree_path),
             )?;
             let report = link_patterns(&git_root, &worktree_path, &cache_dir, &config).await;
+            for entry in &report.linked {
+                let suffix = if entry.seeded {
+                    " (seeded from source)"
+                } else {
+                    " (using shared cache)"
+                };
+                emit_activity(
+                    &mut activity,
+                    &format!("Linked {}{suffix}", entry.pattern),
+                    ActivityKind::Stdout,
+                );
+            }
+            for err in &report.errors {
+                emit_activity(&mut activity, err, ActivityKind::Stderr);
+            }
             outcome.link_report = Some(report);
         }
 
@@ -168,8 +218,13 @@ impl WorktreeService {
                 source_branch: options.source_branch.clone(),
             };
 
-            let runs =
-                execute_post_create_commands(&config.post_create_cmd, &variables, progress).await;
+            let runs = execute_post_create_commands(
+                &config.post_create_cmd,
+                &variables,
+                progress,
+                &mut activity,
+            )
+            .await;
             outcome.command_runs = runs;
         }
 
@@ -345,5 +400,15 @@ impl WorktreeService {
             source_branch: source_branch.unwrap_or("").to_string(),
         };
         resolve_cache_dir(&git_root, self.config_service.config(), &variables)
+    }
+}
+
+fn emit_activity(
+    activity: &mut Option<ActivityCallback<'_>>,
+    text: &str,
+    kind: ActivityKind,
+) {
+    if let Some(cb) = activity.as_deref_mut() {
+        cb(text, kind);
     }
 }

@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
+use crate::files::ActivityKind;
 use crate::git::types::GitBranch;
 use crate::messages::{
     colors, CREATE_CONFIRM_TITLE, CREATE_CREATING, CREATE_DIRECTORY_PLACEHOLDER,
@@ -98,6 +99,20 @@ impl SummaryRow {
     }
 }
 
+/// One line in the Terminal Activity panel: a stage banner emitted by the
+/// orchestrator ("$ Copy patterns"), or a line of stdout / stderr streamed
+/// from a post-create command. The `kind` drives the color.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalLine {
+    pub text: String,
+    pub kind: ActivityKind,
+}
+
+/// Cap on retained Terminal Activity lines. `flutter pub get` and similar
+/// can produce thousands of lines — keep the most recent slice so the panel
+/// renders fast and stays useful as a tail.
+const TERMINAL_LOG_MAX_LINES: usize = 2000;
+
 pub struct CreateScreen {
     step: CreateStep,
     pub directory_name: String,
@@ -132,6 +147,13 @@ pub struct CreateScreen {
     pub current_command_index: usize,
     summary_rows: Vec<SummaryRow>,
 
+    /// Streamed lines from the worktree-creation pipeline. Driven by
+    /// `AppEvent::CreateActivity`. Rendered as the Terminal Activity panel
+    /// below the "Creating" spinner so the user sees long-running commands
+    /// (`flutter pub get`, `bun install`) make progress instead of staring
+    /// at an opaque spinner.
+    terminal_log: Vec<TerminalLine>,
+
     pub tick: usize,
 }
 
@@ -158,8 +180,24 @@ impl CreateScreen {
             failed_commands: Vec::new(),
             current_command_index: 0,
             summary_rows: Vec::new(),
+            terminal_log: Vec::new(),
             tick: 0,
         }
+    }
+
+    /// Push a single line into the Terminal Activity log. Lines beyond
+    /// `TERMINAL_LOG_MAX_LINES` are dropped from the front so memory and
+    /// render cost stay bounded on noisy commands.
+    pub fn append_terminal_line(&mut self, text: String, kind: ActivityKind) {
+        self.terminal_log.push(TerminalLine { text, kind });
+        if self.terminal_log.len() > TERMINAL_LOG_MAX_LINES {
+            let drop = self.terminal_log.len() - TERMINAL_LOG_MAX_LINES;
+            self.terminal_log.drain(0..drop);
+        }
+    }
+
+    pub fn terminal_log_len(&self) -> usize {
+        self.terminal_log.len()
     }
 
     pub fn step(&self) -> CreateStep {
@@ -483,6 +521,14 @@ impl CreateScreen {
         }
     }
 
+    /// Whether this screen should claim the full terminal height (like the
+    /// Dashboard) instead of the dynamically-sized framed panel. Returns
+    /// true for `Creating` so the Terminal Activity panel has room to show
+    /// long, scrolling output (e.g. `flutter pub get`).
+    pub fn wants_full_height(&self) -> bool {
+        !self.loading && self.error.is_none() && matches!(self.step, CreateStep::Creating)
+    }
+
     /// Inner content height for the framed panel (excludes the rounded
     /// border).
     pub fn preferred_content_height(&self) -> u16 {
@@ -494,7 +540,13 @@ impl CreateScreen {
             CreateStep::CustomRef | CreateStep::NewBranch => 6,
             CreateStep::SourceBranch => (6 + (self.branches.len() + 1).max(1) as u16).min(15),
             CreateStep::Confirm | CreateStep::NavigateConfirm => 10,
-            CreateStep::Creating => 3,
+            // Creating: spinner (3 rows) + terminal panel. The panel grows
+            // to fit recent activity, capped so we don't push the rest of
+            // the layout off-screen.
+            CreateStep::Creating => {
+                let terminal_rows = (self.terminal_log.len() as u16 + 2).clamp(5, 20);
+                3 + terminal_rows
+            }
             CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
             // Success layout = 3 (status banner) + 2 (worktree path + spacer)
             // + table (2 chrome rows + N data rows, capped) + 1 (footer hint).
@@ -567,9 +619,14 @@ impl CreateScreen {
                 }
             }
             CreateStep::Creating => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(3)])
+                    .split(area);
                 StatusIndicator::new(Status::Loading, CREATE_CREATING)
                     .with_tick(self.tick)
-                    .render(frame, area);
+                    .render(frame, chunks[0]);
+                render_terminal_activity(&self.terminal_log, frame, chunks[1]);
             }
             CreateStep::RunningCommands => {
                 CommandListProgress::new(&self.post_create_commands, self.current_command_index)
@@ -757,4 +814,61 @@ fn truncate_failure(text: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Render the live "Terminal Activity" panel under the Creating spinner.
+/// Mirrors the AI Activity panel's visual treatment (rounded border, bold
+/// title) but uses TEAL instead of orange to distinguish "background
+/// commands running" from "AI working on conflicts". Auto-tails the log so
+/// the most recent line is always visible.
+fn render_terminal_activity(log: &[TerminalLine], frame: &mut Frame, area: Rect) {
+    let border_style = Style::default().fg(colors::TEAL);
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "Terminal Activity",
+            Style::default()
+                .fg(colors::TEAL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if log.is_empty() {
+        let placeholder = Paragraph::new("Waiting for commands to run...").style(
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        );
+        frame.render_widget(placeholder, inner);
+        return;
+    }
+
+    let visible_rows = inner.height as usize;
+    let start = log.len().saturating_sub(visible_rows);
+    let lines: Vec<Line<'static>> = log[start..]
+        .iter()
+        .map(|line| {
+            let style = match line.kind {
+                ActivityKind::Status => Style::default()
+                    .fg(colors::TEAL)
+                    .add_modifier(Modifier::BOLD),
+                ActivityKind::Stdout => Style::default().fg(colors::EMPHASIS),
+                ActivityKind::Stderr => Style::default().fg(colors::ERROR),
+            };
+            Line::from(Span::styled(line.text.clone(), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
