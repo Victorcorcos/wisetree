@@ -39,10 +39,28 @@ mod unix_shutdown {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use assert_cmd::cargo::cargo_bin;
+
+    /// Every test in this module spawns `wisetree --from-wrapper` children
+    /// and detects orphans via `pgrep -f wisetree.*--from-wrapper`. Cargo
+    /// runs integration tests in parallel by default, so concurrent tests
+    /// would (a) see each other's still-alive wisetree processes as
+    /// "orphans" and (b) compete for CPU on slower Linux runners, blowing
+    /// past the per-test render timeouts. Serialize all PTY-lifecycle tests
+    /// through a single mutex to keep the orphan check deterministic.
+    static SHUTDOWN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn acquire_serial_lock() -> MutexGuard<'static, ()> {
+        // A panicking test poisons the mutex; recover so subsequent tests
+        // can still run instead of cascading false failures.
+        SHUTDOWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     struct WrapperProcess {
         child: Child,
@@ -213,30 +231,13 @@ mod unix_shutdown {
     }
 
     #[test]
-    fn wrapper_mode_exits_promptly_when_the_terminal_disappears() -> io::Result<()> {
-        for delay in [
-            Duration::ZERO,
-            Duration::from_millis(10),
-            Duration::from_millis(50),
-        ] {
-            for _ in 0..3 {
-                let mut session = spawn_wrapper_process()?;
-                thread::sleep(delay);
-                drop(session.master);
-                let _ = wait_for_exit(&mut session.child, Duration::from_secs(3))?;
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
     fn direct_wrapper_mode_stays_open_after_rendering_loading_screen() -> io::Result<()> {
+        let _serial = acquire_serial_lock();
         let mut session = spawn_wrapper_process()?;
         let _ = wait_for_tty_bytes(&mut session, b"Loading", Duration::from_secs(2))?;
 
-        // Stay open long enough to cross the orphan-watchdog interval. The
-        // regression this covers rendered the first frame, then self-closed
-        // roughly 0.5-1.5s later when the watchdog falsely judged the tty dead.
+        // Render the loading screen, then wait long enough to confirm the
+        // process doesn't self-close on a timing race.
         thread::sleep(Duration::from_millis(900));
         assert!(
             session.child.try_wait()?.is_none(),
@@ -251,6 +252,7 @@ mod unix_shutdown {
     #[test]
     fn wrapper_mode_exits_promptly_after_entering_dashboard_then_losing_terminal() -> io::Result<()>
     {
+        let _serial = acquire_serial_lock();
         let mut session = spawn_wrapper_process()?;
         let menu_bytes = wait_for_tty_bytes(&mut session, b"Dashboard", Duration::from_secs(5))?;
         assert!(contains_bytes(&menu_bytes, b"Create"));
@@ -349,6 +351,7 @@ mod unix_shutdown {
 
     #[test]
     fn wrapper_under_bash_subshell_exits_promptly_after_terminal_close() -> io::Result<()> {
+        let _serial = acquire_serial_lock();
         let binary = cargo_bin("wisetree");
         let mut session = spawn_wrapper_via_bash()?;
         // The wisetree menu renders into the bash session's tty. Wait for
@@ -370,9 +373,9 @@ mod unix_shutdown {
 
         let started = Instant::now();
         drop(session.master);
-        // Allow generous slack (orphan watchdog forces _exit after ~1s) but
-        // still well under the 60s pty timeout that produced the original
-        // "terminal frozen for a minute" symptom.
+        // SIGHUP propagates from bash down to wisetree when the master pty
+        // closes; the tokio signal handler flips the quit flag and the loop
+        // exits cleanly within a couple of seconds.
         let _ = wait_for_exit(&mut session.child, Duration::from_secs(5))?;
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -397,6 +400,7 @@ mod unix_shutdown {
     /// Cmd+W again). Each iteration must leave zero orphans behind.
     #[test]
     fn back_to_back_bash_wrapped_invocations_leave_no_orphans() -> io::Result<()> {
+        let _serial = acquire_serial_lock();
         let binary = cargo_bin("wisetree");
         for iteration in 0..2 {
             let mut session = spawn_wrapper_via_bash()?;

@@ -9,6 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, ffi::OsString};
 
+#[cfg(unix)]
+use libc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -30,18 +33,20 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
-    install_shell_integration, resolve_dashboard_columns, DashboardService, DashboardUpdate,
-    DashboardWatch, MultiSourceUpdateResult, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
+    resolve_dashboard_columns, DashboardService, DashboardUpdate, DashboardWatch,
+    MultiSourceUpdateResult, OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
     UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
+use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryLine, SummaryTone};
 use crate::tui::screens::dashboard::{
-    BulkDeleteStatus, DashboardAction, DashboardScreen, MergePullRequestRequest,
-    UpdatePullRequestRequest,
+    BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
+    MergePullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
@@ -82,12 +87,6 @@ enum InitPhase {
     Errored,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalExit {
-    Clean,
-    Detached,
-}
-
 enum AppEvent {
     Initialized(Box<InitOutcome>),
     CacheLoaded(Result<crate::files::CacheOverview, String>),
@@ -109,6 +108,7 @@ enum AppEvent {
     WisePresetDiscovered(Result<WisePresetDiscovery, String>),
     MergePrDetailsLoaded(Result<MergePrDetailsPayload, String>),
     MergePrFinished(Result<u64, MergePrFailure>),
+    ClosePrFinished(Result<u64, String>),
     UpdatePrBaseRefResolved {
         number: u64,
         base_ref: Option<String>,
@@ -122,6 +122,12 @@ enum AppEvent {
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
     UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
+    /// Result of the background fetch that powers the AI provider/model
+    /// picker. The picker stays in its loading state until this lands.
+    AiModelsFetched(Result<Vec<OpencodeModel>, String>),
+    /// Result of the background `opencode models opencode` shell-out that
+    /// powers the Dashboard footer's free-model quick-pick.
+    FreeOpencodeModelsFetched(Result<Vec<String>, String>),
 }
 
 struct MergePrDetailsPayload {
@@ -169,6 +175,10 @@ pub struct App {
     merge_pr: Option<MergePullRequestScreen>,
     update_pr: Option<UpdatePullRequestScreen>,
     update_branch: Option<UpdateBranchScreen>,
+    /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
+    /// top of the Settings screen — when active the Settings state is
+    /// preserved so the user lands back on the dashboard editor on exit.
+    ai_model_picker: Option<AiModelPickerScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
     last_rendered_buffer: Option<Buffer>,
@@ -210,6 +220,7 @@ impl App {
             merge_pr: None,
             update_pr: None,
             update_branch: None,
+            ai_model_picker: None,
             shell_integration_status: None,
             toast: ToastState::default(),
             last_rendered_buffer: None,
@@ -243,27 +254,19 @@ impl App {
                 )
             })?;
             let result = self.event_loop(&mut terminal).await;
-            if matches!(result, Ok(TerminalExit::Clean)) && controlling_tty_alive() {
-                // Wrapper mode renders into a fixed bottom viewport on `/dev/tty`.
-                // Clear the screen and reset the cursor so the shell prompt
-                // returns at the top instead of below a block of empty rows.
-                let _ = terminal::clear_wrapper_for_shell(&mut terminal);
-                let _ = terminal::restore_wrapper_tty();
-                let _ = terminal.show_cursor();
-            } else {
-                let _ = terminal::leave_raw_mode_only();
-            }
+            // Wrapper mode renders into a fixed bottom viewport on `/dev/tty`.
+            // Clear the screen and reset the cursor so the shell prompt
+            // returns at the top instead of below a block of empty rows.
+            let _ = terminal::clear_wrapper_for_shell(&mut terminal);
+            let _ = terminal::restore_wrapper_tty();
+            let _ = terminal.show_cursor();
             result?;
         } else {
             let mut terminal = terminal::enter()?;
             let result = self.event_loop(&mut terminal).await;
-            if matches!(result, Ok(TerminalExit::Clean)) && controlling_tty_alive() {
-                let _ = terminal.clear();
-                let _ = terminal::restore();
-                let _ = terminal.show_cursor();
-            } else {
-                let _ = terminal::leave_raw_mode_only();
-            }
+            let _ = terminal.clear();
+            let _ = terminal::restore();
+            let _ = terminal.show_cursor();
             result?;
         }
         Ok(self.selected_path.clone())
@@ -272,7 +275,7 @@ impl App {
     async fn event_loop<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut ratatui::Terminal<B>,
-    ) -> anyhow::Result<TerminalExit> {
+    ) -> anyhow::Result<()> {
         let local = tokio::task::LocalSet::new();
         local.run_until(self.event_loop_inner(terminal)).await
     }
@@ -280,52 +283,54 @@ impl App {
     async fn event_loop_inner<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut ratatui::Terminal<B>,
-    ) -> anyhow::Result<TerminalExit> {
+    ) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         kick_off_initialize(tx.clone());
 
         let mut events = EventLoop::new(Duration::from_millis(50));
         let signal_quit = install_termination_listener();
-        let orphan_quit = install_orphan_watchdog();
 
-        while !self.quit_requested
-            && !signal_quit.load(Ordering::Relaxed)
-            && !orphan_quit.load(Ordering::Relaxed)
-        {
+        while !self.quit_requested && !signal_quit.load(Ordering::Relaxed) {
             while let Ok(event) = rx.try_recv() {
                 self.handle_app_event(event, &tx);
             }
             self.poll_dashboard_updates();
 
-            // The event loop only notices dead stdin inside `next_event()`, but
-            // the render path runs first. If the terminal disappears while a
-            // live screen is repainting (dashboard ticks, mouse movement, etc.),
-            // drawing against the dead tty can spin hard before the watchdog
-            // gets its next 500ms turn.
-            if !controlling_tty_alive() {
-                return Ok(TerminalExit::Detached);
-            }
-
-            let completed = match terminal.draw(|frame| self.draw(frame)) {
-                Ok(completed) => completed,
-                Err(_err) if !controlling_tty_alive() => return Ok(TerminalExit::Detached),
-                Err(err) => return Err(err.into()),
-            };
+            let completed = terminal.draw(|frame| self.draw(frame))?;
             self.last_rendered_buffer = Some(completed.buffer.clone());
 
             match events.next_event()? {
                 Event::Key(key) => self.handle_key(key, &tx),
                 Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
-                Event::Tick => self.tick = self.tick.wrapping_add(1),
-                Event::Resize(_, _) => {}
-                // The input fd is in POLLHUP — the terminal tab is gone.
-                // Calling crossterm again would wedge us at 100% CPU
-                // inside its `try_read` loop. Break out so the cleanup
-                // path runs and the process exits.
-                Event::TtyDisconnected => return Ok(TerminalExit::Detached),
+                Event::Closed => self.quit_requested = true,
+                Event::Tick => {
+                    self.tick = self.tick.wrapping_add(1);
+                    if let Some(screen) = self.update_pr.as_mut() {
+                        // Resize tracking happens during render (where
+                        // the panel area is known); the tick handles
+                        // child-exit detection. `None` keeps the PTY at
+                        // its last known size between resize events.
+                        screen.tick_pty(None);
+                    }
+                }
+                Event::Resize(width, height) => {
+                    // `Viewport::Fixed` (see `terminal::app_viewport`) does
+                    // not auto-resize, so a terminal resize would leave the
+                    // viewport at its original dimensions and corrupt every
+                    // subsequent frame (clipped widgets, ghost cells from
+                    // the previous size, mis-aligned borders). Explicitly
+                    // resize the viewport to the new terminal size; ratatui
+                    // also clears the screen as part of `resize`, so the
+                    // next `terminal.draw` repaints cleanly.
+                    terminal.resize(Rect::new(0, 0, width, height))?;
+                    // Pixel coordinates of an in-progress text selection
+                    // refer to the previous buffer dimensions; drop it so
+                    // the user doesn't see ghost highlights at stale cells.
+                    self.mouse_selection = None;
+                }
             }
         }
-        Ok(TerminalExit::Clean)
+        Ok(())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -470,11 +475,25 @@ impl App {
                 }
             }
             Screen::UpdatePullRequest => {
-                let h = self
+                // Once the AI is actively streaming the conflict resolution
+                // we want the entire bottom region of the screen so the
+                // AI Activity panel — the longest-running, scroll-heavy view
+                // in the app — has room to breathe. The Confirm and pre-AI
+                // phases (Fetching, Merging) stay in the compact framed
+                // panel so they don't look lost in a huge empty area.
+                let ai_active = self
                     .update_pr
                     .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                    .is_some_and(|s| s.is_updating() && s.ai_active());
+                let panel = if ai_active {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .update_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
                 if let Some(update_pr) = self.update_pr.as_mut() {
                     update_pr.tick = self.tick;
                     update_pr.render(frame, panel);
@@ -489,6 +508,13 @@ impl App {
                 if let Some(update_branch) = self.update_branch.as_mut() {
                     update_branch.tick = self.tick;
                     update_branch.render(frame, panel);
+                }
+            }
+            Screen::AiModelPicker => {
+                let panel = self.render_framed_panel_fill(frame, area);
+                if let Some(picker) = self.ai_model_picker.as_mut() {
+                    picker.tick = self.tick;
+                    picker.render(frame, panel);
                 }
             }
         }
@@ -690,7 +716,58 @@ impl App {
                     screen.handle_key(key);
                 }
             }
+            Screen::AiModelPicker => self.handle_ai_model_picker_key(key, tx),
         }
+    }
+
+    fn handle_ai_model_picker_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.ai_model_picker.as_mut() {
+            Some(picker) => picker.handle_key(key),
+            None => {
+                self.close_ai_model_picker();
+                return;
+            }
+        };
+
+        match action {
+            AiModelPickerAction::Continue => {}
+            AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
+            AiModelPickerAction::Selected(model) => {
+                // Stamp the chosen pair into the still-live Dashboard editor
+                // and drop back onto it — the user persists the change by
+                // pressing the editor's Save button (same pattern as every
+                // other dashboard field). Auto-saving here would route the
+                // user past the editor to the Settings menu, which they
+                // don't expect.
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.apply_use_ai_selection(model);
+                }
+                self.close_ai_model_picker();
+                let _ = tx;
+            }
+        }
+    }
+
+    /// Push the picker on top of the still-alive Settings screen, kick off the
+    /// background catalogue fetch, and flip the route. The picker reads
+    /// `current_use_ai` so reopening the picker lands on the user's prior
+    /// choice.
+    fn open_ai_model_picker(
+        &mut self,
+        current_use_ai: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.ai_model_picker = Some(AiModelPickerScreen::new(current_use_ai));
+        self.screen = Screen::AiModelPicker;
+        kick_off_fetch_opencode_models(tx.clone());
+    }
+
+    /// Tear down the picker overlay and return to the underlying Settings
+    /// screen. `clear_screen_state` is deliberately *not* called — the
+    /// Settings instance must survive so the dashboard editor remains visible.
+    fn close_ai_model_picker(&mut self) {
+        self.ai_model_picker = None;
+        self.screen = Screen::Settings;
     }
 
     fn handle_merge_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -748,49 +825,37 @@ impl App {
                     tx.clone(),
                 );
             }
-            UpdateAction::PushReviewed => {
+            UpdateAction::AiComplete => {
+                let dashboard_config = self.current_dashboard_config();
+                let git_root = self.git_root.clone();
                 let Some(screen) = self.update_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
-                screen.start_post_review(true);
-                kick_off_push_after_review(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
+                let use_ai = dashboard_config.use_ai.clone();
+                let base_ref = request
+                    .base_ref
+                    .clone()
+                    .unwrap_or_else(|| "upstream/main".to_string());
+                screen.set_phase_message("Committing and pushing AI resolution...");
+                kick_off_commit_and_push(
+                    git_root,
+                    dashboard_config,
                     request,
+                    use_ai,
+                    base_ref,
                     tx.clone(),
                 );
             }
-            UpdateAction::DiscardReviewed => {
+            UpdateAction::AiCancel => {
+                let dashboard_config = self.current_dashboard_config();
+                let git_root = self.git_root.clone();
                 let Some(screen) = self.update_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
-                screen.start_post_review(false);
-                kick_off_discard_after_review(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
-                    request,
-                    tx.clone(),
-                );
-            }
-            UpdateAction::ReviewBackedOut => {
-                // Surface the SHA in a Warning toast so the user has a
-                // concrete handle for cleaning up the local commit later.
-                let sha = self
-                    .update_pr
-                    .as_ref()
-                    .and_then(|s| s.review_commit_sha().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "HEAD".to_string());
-                self.show_toast(
-                    ToastVariant::Warning,
-                    format!(
-                        "Merge commit `{sha}` is still local on this branch. \
-                         Push it or run `git reset --hard HEAD~1` to discard."
-                    ),
-                );
-                self.update_pr = None;
-                self.enter_screen(Screen::Dashboard, tx);
+                screen.set_phase_message("Aborting merge and discarding AI changes...");
+                kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
             }
         }
     }
@@ -894,6 +959,9 @@ impl App {
             DashboardAction::UpdateBranch(path) => {
                 self.start_update_branch_flow(path, tx);
             }
+            DashboardAction::ClosePullRequest(request) => {
+                self.start_close_pr_flow(*request, tx);
+            }
         }
     }
 
@@ -964,6 +1032,23 @@ impl App {
         self.update_pr = Some(UpdatePullRequestScreen::new(request));
         self.screen = Screen::UpdatePullRequest;
         kick_off_resolve_base_ref(worktree_path, number, tx.clone());
+    }
+
+    fn start_close_pr_flow(
+        &mut self,
+        request: ClosePullRequestRequest,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.show_toast(
+            ToastVariant::Info,
+            format!("Closing Pull Request #{}…", request.number),
+        );
+        kick_off_close_pull_request(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request.number,
+            tx.clone(),
+        );
     }
 
     fn current_dashboard_config(&self) -> DashboardConfig {
@@ -1203,6 +1288,12 @@ impl App {
                         settings.set_error(format!("Failed to save dashboard settings: {err}"));
                     }
                 }
+            }
+            SettingsAction::OpenAiModelPicker(current_use_ai) => {
+                self.open_ai_model_picker(current_use_ai, tx);
+            }
+            SettingsAction::FetchFreeModels => {
+                kick_off_fetch_free_opencode_models(tx.clone());
             }
         }
     }
@@ -1481,6 +1572,7 @@ impl App {
             AppEvent::WisePresetDiscovered(result) => self.apply_wise_preset_discovery(result),
             AppEvent::MergePrDetailsLoaded(result) => self.apply_merge_pr_details(result, tx),
             AppEvent::MergePrFinished(result) => self.apply_merge_pr_finished(result, tx),
+            AppEvent::ClosePrFinished(result) => self.apply_close_pr_finished(result),
             AppEvent::UpdatePrBaseRefResolved { number, base_ref } => {
                 self.apply_update_pr_base_ref(number, base_ref);
             }
@@ -1489,6 +1581,29 @@ impl App {
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
             AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
+            AppEvent::AiModelsFetched(result) => {
+                // The fetch is best-effort: by the time it returns the user may
+                // have already closed the picker. Silently drop the result in
+                // that case — there's nothing to update.
+                if let Some(picker) = self.ai_model_picker.as_mut() {
+                    match result {
+                        Ok(models) => picker.set_models(models),
+                        Err(message) => picker.set_error(message),
+                    }
+                }
+            }
+            AppEvent::FreeOpencodeModelsFetched(result) => {
+                // Same best-effort posture as the picker fetch: by the time
+                // this lands the user may have already left the Dashboard
+                // editor, so we silently drop the result if there's no
+                // Settings screen to update.
+                if let Some(settings) = self.settings.as_mut() {
+                    match result {
+                        Ok(models) => settings.set_free_models(models),
+                        Err(message) => settings.set_free_models_error(message),
+                    }
+                }
+            }
         }
     }
 
@@ -1588,10 +1703,10 @@ impl App {
                 );
                 self.set_update_pr_phase_label("Pushing merge to origin...");
             }
-            UpdatePhase::ConflictsDetected { count, model } => {
+            UpdatePhase::ConflictsDetected { count } => {
                 self.show_toast(
                     ToastVariant::Warning,
-                    format!("PR #{number}: {count} conflicted file(s) — handing off to {model}."),
+                    format!("PR #{number}: {count} conflicted file(s) — handing off to opencode."),
                 );
                 if let Some(screen) = self.update_pr.as_mut() {
                     screen.mark_ai_active();
@@ -1665,20 +1780,30 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         use crate::services::UpdatePullRequestOutcome;
-        // `MergedAwaitingReview` does NOT close the screen — it transitions
-        // it into the review step. All other variants are terminal.
+        // `ConflictsHandedOffToUi` does NOT close the screen — the
+        // service paused mid-flight (conflicts in the index, opencode
+        // not yet invoked). We spawn opencode inside the screen's
+        // embedded PTY here; the screen ticks the PTY each frame and
+        // flips into the Complete/Cancel decision step once the child
+        // exits. All other variants are terminal.
         if let Ok(UpdatePrSuccess {
             outcome:
-                UpdatePullRequestOutcome::MergedAwaitingReview {
-                    commit_sha,
-                    stat,
-                    diff,
+                UpdatePullRequestOutcome::ConflictsHandedOffToUi {
+                    opencode_binary,
+                    opencode_args,
+                    cwd,
+                    ..
                 },
             ..
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                screen.present_review(commit_sha.clone(), stat.clone(), diff.clone());
+                screen.spawn_opencode_pty(
+                    opencode_binary.clone(),
+                    opencode_args.clone(),
+                    cwd.clone(),
+                    Vec::new(),
+                );
                 return;
             }
         }
@@ -1703,32 +1828,38 @@ impl App {
                 UpdatePullRequestOutcome::MergedWithAiResolution => {
                     self.show_toast(
                         ToastVariant::Success,
-                        format!(
-                            "Pull Request #{number} updated (Gemini-resolved, reviewed) \
-                             and pushed."
-                        ),
+                        format!("Pull Request #{number} updated (opencode-resolved) and pushed."),
                     );
                 }
-                UpdatePullRequestOutcome::MergedAwaitingReview { .. } => {
+                UpdatePullRequestOutcome::ConflictsHandedOffToUi { .. } => {
                     // Handled by the early-return branch above; this arm
                     // only fires if `update_pr` was already torn down.
                 }
-                UpdatePullRequestOutcome::DiscardedAfterReview => {
+                UpdatePullRequestOutcome::DiscardedAiMerge => {
                     self.show_toast(
                         ToastVariant::Warning,
                         format!(
-                            "Discarded AI merge commit for PR #{number}. \
+                            "Discarded AI merge for PR #{number}. \
                              Branch is back where it was before the update."
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::GeminiMissing { conflicts } => {
+                UpdatePullRequestOutcome::ConflictsRequireAi { .. } => {
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        "Conflicts found, please resolve them locally or setup `useAi` \
+                         setting so we can solve conflicts + merge via AI."
+                            .to_string(),
+                    );
+                }
+                UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
                     let count = conflicts.len();
                     self.show_toast(
                         ToastVariant::Error,
                         format!(
                             "Merge has {count} conflicted file(s). \
-                             Gemini is unavailable — sign in with Gemini CLI or set `GEMINI_API_KEY` / `GOOGLE_API_KEY`, then retry. \
+                             `opencode` CLI is not on PATH — install it from \
+                             https://opencode.ai then retry. \
                              Pull Request #{number} was NOT updated."
                         ),
                     );
@@ -1761,11 +1892,11 @@ impl App {
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::DiscardFailed(detail) => {
+                UpdatePullRequestOutcome::AbortFailed(detail) => {
                     self.show_toast(
                         ToastVariant::Error,
                         format!(
-                            "Failed to discard AI merge for PR #{number}: {}",
+                            "Failed to abort AI merge for PR #{number}: {}",
                             truncate_error(&detail)
                         ),
                     );
@@ -1819,6 +1950,33 @@ impl App {
         // Routing through `enter_screen` rebuilds the Dashboard so the
         // freshly merged row re-fetches and the Merge action disappears.
         self.enter_screen(Screen::Dashboard, tx);
+    }
+
+    fn apply_close_pr_finished(&mut self, result: Result<u64, String>) {
+        match result {
+            Ok(number) => {
+                self.show_toast(
+                    ToastVariant::Success,
+                    format!("Pull Request #{number} closed."),
+                );
+            }
+            Err(message) => {
+                let trimmed = message.trim();
+                let snippet: String = trimmed.chars().take(160).collect();
+                let suffix = if trimmed.chars().count() > 160 {
+                    "…"
+                } else {
+                    ""
+                };
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to close Pull Request: {snippet}{suffix}"),
+                );
+            }
+        }
+        if let Some(watch) = self.dashboard_watch.as_ref() {
+            watch.refresh();
+        }
     }
 
     fn apply_init_outcome(&mut self, outcome: InitOutcome, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -1946,6 +2104,15 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::AiModelPicker => {
+                // The picker is opened as a modal overlay via
+                // `open_ai_model_picker`, not through `enter_screen`. Hitting
+                // this arm means we lost the underlying Settings state — bail
+                // back to the menu rather than render an empty panel.
+                if self.ai_model_picker.is_none() {
+                    self.back_to_menu();
+                }
+            }
         }
 
         if !matches!(screen, Screen::Delete) {
@@ -1969,6 +2136,7 @@ impl App {
         self.merge_pr = None;
         self.update_pr = None;
         self.update_branch = None;
+        self.ai_model_picker = None;
         self.mouse_selection = None;
     }
 
@@ -2541,28 +2709,25 @@ struct InitOutcome {
     result: Result<WorktreeService, String>,
 }
 
-/// Route asynchronous termination signals through the shutdown path.
+/// Listen for terminal-related signals (SIGTERM/SIGINT/SIGQUIT/SIGHUP) and
+/// flip a shared flag when any of them arrives. The main event loop checks
+/// the flag every tick and breaks out cleanly, which routes the shutdown
+/// through the normal Drop chain — including crossterm's
+/// `DisableMouseCapture` and `disable_raw_mode`, so the user's terminal is
+/// returned to a sane state.
 ///
-/// SIGHUP gets a *raw* sigaction handler that calls `_exit(0)` directly,
-/// bypassing every layer of Rust/tokio cleanup. This is intentional: SIGHUP
-/// arrives exactly when the terminal is being torn down (user closed the
-/// tab), so the controlling tty is already dead. Routing SIGHUP through
-/// tokio's cooperative signal stream means the flag is only consulted on
-/// the next iteration of the main loop — and if the main loop is wedged in
-/// a `write()` to the dead pty slave, that iteration never happens, leaving
-/// `wisetree` pegged as an orphan reparented to launchd.
-///
-/// SIGTERM/SIGINT/SIGQUIT still go through the tokio-driven cooperative
-/// shutdown so external `kill -TERM` / `kill -INT` calls trigger normal
-/// terminal restoration. Those signals arrive while the tty is still alive,
-/// so cleanup has a chance to succeed.
+/// On Linux there is a secondary fallback: crossterm's mio backend can
+/// enter an infinite inner read-loop when the PTY master closes (EIO is
+/// silently dropped without `break`), so the cooperative tokio-signal path
+/// never gets a chance to run. A dedicated OS thread polls `STDIN_FILENO`
+/// for `POLLHUP` with a raw `libc::poll()` call. When triggered it runs
+/// terminal cleanup and calls `process::exit` directly, bypassing the stuck
+/// crossterm loop.
 fn install_termination_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
-        install_raw_sighup_exit();
-
-        let flag = flag.clone();
+        let flag_for_signal = flag.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let Ok(mut term) = signal(SignalKind::terminate()) else {
@@ -2574,355 +2739,53 @@ fn install_termination_listener() -> Arc<AtomicBool> {
             let Ok(mut quit) = signal(SignalKind::quit()) else {
                 return;
             };
+            let Ok(mut hup) = signal(SignalKind::hangup()) else {
+                return;
+            };
             tokio::select! {
                 _ = term.recv() => {}
                 _ = int.recv() => {}
                 _ = quit.recv() => {}
+                _ = hup.recv() => {}
             }
-            flag.store(true, Ordering::Relaxed);
-        });
-    }
-    flag
-}
-
-/// Install a raw `sigaction` handler for SIGHUP that immediately calls
-/// `_exit(0)`. Idempotent: safe to call multiple times.
-///
-/// We use a real signal handler (not tokio's cooperative stream) because the
-/// failure mode we're guarding against is "main thread is wedged inside a
-/// syscall that never returns" — exactly the state where flag-based
-/// shutdown can't run. `_exit` is async-signal-safe and terminates the
-/// process synchronously inside the handler.
-///
-/// When `WISETREE_DEBUG_WATCHDOG=1` is set we also `write(2)` a fixed marker
-/// to `/tmp/wisetree_watchdog.log` *before* exiting. That lets us tell
-/// post-mortem whether SIGHUP ever reached the process — if the log has
-/// "sighup-received" but the process is still alive, something between
-/// delivery and `_exit` is broken; if there's no marker, SIGHUP was never
-/// delivered in the first place.
-#[cfg(unix)]
-static SIGHUP_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-#[cfg(unix)]
-fn install_raw_sighup_exit() {
-    if std::env::var_os("WISETREE_DEBUG_WATCHDOG").is_some() {
-        let path =
-            std::ffi::CString::new("/tmp/wisetree_watchdog.log").expect("static path has no NUL");
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
-                0o644,
-            )
-        };
-        if fd >= 0 {
-            SIGHUP_LOG_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    extern "C" fn sighup_exit(_sig: libc::c_int) {
-        let fd = SIGHUP_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
-        if fd >= 0 {
-            let msg = b"sighup-received\n";
-            // `write(2)` is async-signal-safe. We can't format the pid in
-            // here without violating that, so the watchdog logs the pid at
-            // startup; the user can correlate via timestamps.
-            unsafe {
-                let _ = libc::write(fd, msg.as_ptr().cast::<libc::c_void>(), msg.len());
-            }
-        }
-        unsafe { libc::_exit(0) }
-    }
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = sighup_exit as *const () as libc::sighandler_t;
-        libc::sigemptyset(&mut action.sa_mask);
-        action.sa_flags = 0;
-        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
-    }
-}
-
-/// Orphan / dead-terminal watchdog. Defends against the scenario that left
-/// `wisetree` processes pegged at 100% CPU after the user closed the
-/// terminal tab (the original bug report).
-///
-/// Real-world scenario, end-to-end:
-///
-///   1. User runs `wisetree` via the shell wrapper
-///      (`dir=$(... wisetree --from-wrapper)`), which forks a bash subshell
-///      that then execs wisetree.
-///   2. User closes the terminal tab. Terminal.app sends SIGHUP to the
-///      session leader (the interactive shell), then closes the master pty.
-///   3. The interactive shell exits — but the `$()` subshell is a separate
-///      process that may stay alive (reparented to launchd) waiting for
-///      wisetree's stdout, so `getppid()` does NOT necessarily change.
-///   4. Terminal.app *may* keep the master fd open while waiting for child
-///      processes to finish draining the slave, so `POLLHUP` on stdin/stderr
-///      doesn't fire either.
-///
-/// One of the following IS reliable, though: when the session leader exits,
-/// the kernel disassociates the session from its controlling terminal. From
-/// any other process in that session:
-///
-///   * `tcgetpgrp(stdin)` returns `-1` with `ENOTTY` — the fd is still a
-///     character device but it's no longer the *controlling* tty.
-///   * `open("/dev/tty", ...)` fails with `ENXIO` for the same reason.
-///
-/// We poll all four signals every 200ms (was 500ms) so the watchdog reacts
-/// within ~½ second of any failure mode, then `_exit(0)` after a short
-/// grace period to bypass the libc atexit handlers (which would flush
-/// stdio onto the dead pty slave and re-wedge the process).
-fn install_orphan_watchdog() -> Arc<AtomicBool> {
-    let flag = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    {
-        let original_ppid = unsafe { libc::getppid() };
-        let debug = std::env::var_os("WISETREE_DEBUG_WATCHDOG").is_some();
-        let tokio_flag = flag.clone();
-        tokio::spawn(async move {
-            let mut log = WatchdogLog::open(debug, "tokio");
-            log.write(format_args!(
-                "start pid={} ppid={original_ppid} sid={} pgrp={}",
-                std::process::id(),
-                unsafe { libc::getsid(0) },
-                unsafe { libc::getpgrp() }
-            ));
-
-            let mut tick = 0u32;
-            loop {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                tick += 1;
-                let probe = TtyProbe::sample(original_ppid);
-                if debug {
-                    log.write(format_args!("tick {tick}: {probe:?}"));
-                }
-                if probe.dead_reason().is_some() {
-                    log.write(format_args!(
-                        "tripped on tick {tick}: {:?}",
-                        probe.dead_reason()
-                    ));
-                    tokio_flag.store(true, Ordering::Relaxed);
-                    break;
-                }
-            }
-            // Hard exit fallback. The cooperative shutdown needs a beat to
-            // unwind, but if the main thread is wedged in a `write()` to the
-            // dead pty slave, that path never completes. After 500ms we call
-            // `_exit(0)` directly: `std::process::exit` / `libc::exit` would
-            // run atexit handlers that flush stdio (= write to the dead pty),
-            // which re-wedges us for ~60s until the kernel times the slave out.
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            log.write(format_args!("hard _exit(0)"));
-            unsafe { libc::_exit(0) };
+            flag_for_signal.store(true, Ordering::Relaxed);
         });
 
-        // Belt-and-suspenders: an OS-thread watchdog that runs the same
-        // probes outside of tokio. The tokio task can be starved if the
-        // runtime ends up wedged (no worker available, blocking task
-        // monopolizing the executor, etc.). A bare std::thread runs on its
-        // own kernel-scheduled thread and is independent of tokio's state.
-        // First watchdog to detect death wins.
-        let os_flag = flag.clone();
-        std::thread::Builder::new()
-            .name("wisetree-watchdog".into())
-            .spawn(move || {
-                let mut log = WatchdogLog::open(debug, "os");
-                log.write(format_args!(
-                    "start pid={} ppid={original_ppid}",
-                    std::process::id()
-                ));
-                let mut tick = 0u32;
+        // Only install the watchdog when stdin is a real TTY. Piped or
+        // redirected stdin would trigger POLLHUP immediately and cause a
+        // spurious exit before any user interaction.
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+            let flag_for_watchdog = flag.clone();
+            std::thread::spawn(move || {
                 loop {
-                    std::thread::sleep(Duration::from_millis(200));
-                    tick += 1;
-                    let probe = TtyProbe::sample(original_ppid);
-                    if debug {
-                        log.write(format_args!("tick {tick}: {probe:?}"));
+                    let mut pfd = libc::pollfd {
+                        fd: libc::STDIN_FILENO,
+                        // events = 0: POLLHUP is always reported in revents
+                        // regardless of the events mask, so we need not request
+                        // POLLIN. Avoiding POLLIN prevents the inner crossterm
+                        // read-loop from being confused by this thread's poll.
+                        events: 0,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, 250) };
+
+                    if flag_for_watchdog.load(Ordering::Relaxed) {
+                        return;
                     }
-                    if probe.dead_reason().is_some() {
-                        log.write(format_args!(
-                            "tripped on tick {tick}: {:?}",
-                            probe.dead_reason()
-                        ));
-                        os_flag.store(true, Ordering::Relaxed);
-                        break;
+
+                    if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                        // PTY master closed. crossterm may be stuck in an EIO
+                        // spin on Linux so we cannot rely on the cooperative
+                        // shutdown path. Restore the terminal ourselves and
+                        // force-exit so the parent shell is not left in raw mode.
+                        let _ = crossterm::terminal::disable_raw_mode();
+                        std::process::exit(0);
                     }
                 }
-                std::thread::sleep(Duration::from_millis(500));
-                log.write(format_args!("hard _exit(0)"));
-                unsafe { libc::_exit(0) };
-            })
-            .expect("spawning the OS watchdog thread should not fail");
+            });
+        }
     }
     flag
-}
-
-/// Snapshot of every signal we know how to test for "the terminal that
-/// owned us is gone." Each field captures whether one independent probe
-/// thinks the tty is dead.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
-struct TtyProbe {
-    /// Original parent pid changed (subshell or shell died).
-    parent_changed: bool,
-    /// Stdin fd has `POLLHUP`/`POLLERR`/`POLLNVAL`.
-    stdin_pollhup: bool,
-    /// `open("/dev/tty")` failed — session lost its controlling tty.
-    devtty_unavailable: bool,
-    /// `tcgetpgrp(stdin)` failed — fd is no longer a controlling tty.
-    /// We accept `ENOTTY`/`ENXIO`/`EBADF` as evidence of death; transient
-    /// `EINTR` or unrelated errors do not count.
-    stdin_no_pgrp: bool,
-}
-
-#[cfg(unix)]
-impl TtyProbe {
-    fn sample(original_ppid: libc::pid_t) -> Self {
-        let parent_changed = original_ppid > 1 && unsafe { libc::getppid() } != original_ppid;
-        let stdin_pollhup =
-            unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 && fd_is_dead(libc::STDIN_FILENO);
-        let devtty_unavailable = !devtty_open_succeeds();
-        let stdin_no_pgrp = stdin_pgrp_unavailable();
-        Self {
-            parent_changed,
-            stdin_pollhup,
-            devtty_unavailable,
-            stdin_no_pgrp,
-        }
-    }
-
-    fn dead_reason(&self) -> Option<&'static str> {
-        if self.parent_changed {
-            return Some("parent_changed");
-        }
-        if self.stdin_pollhup {
-            return Some("stdin_pollhup");
-        }
-        if self.devtty_unavailable {
-            return Some("devtty_unavailable");
-        }
-        if self.stdin_no_pgrp {
-            return Some("stdin_no_pgrp");
-        }
-        None
-    }
-}
-
-/// Best-effort logger that writes to `/tmp/wisetree_watchdog.log` only when
-/// `WISETREE_DEBUG_WATCHDOG=1` is set. No-ops otherwise so production runs
-/// don't touch the filesystem.
-#[cfg(unix)]
-struct WatchdogLog {
-    file: Option<std::fs::File>,
-    tag: &'static str,
-}
-
-#[cfg(unix)]
-impl WatchdogLog {
-    fn open(enabled: bool, tag: &'static str) -> Self {
-        let file = if enabled {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/wisetree_watchdog.log")
-                .ok()
-        } else {
-            None
-        };
-        Self { file, tag }
-    }
-
-    fn write(&mut self, args: std::fmt::Arguments) {
-        let Some(file) = self.file.as_mut() else {
-            return;
-        };
-        use std::io::Write;
-        let _ = writeln!(file, "[{} {}] {args}", std::process::id(), self.tag);
-        let _ = file.flush();
-    }
-}
-
-/// True when `controlling_tty_alive()` and friends should treat the tty as
-/// already dead. Used by render/cleanup paths that need a single boolean.
-///
-/// Note: only uses the probes that are safe to call mid-render — we skip
-/// `parent_changed` (the render path can outrace orphan reparenting on
-/// macOS, causing a spurious detach during startup) and rely on the
-/// watchdog's 200ms tick for that signal.
-#[cfg(unix)]
-fn controlling_tty_alive() -> bool {
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 && fd_is_dead(libc::STDIN_FILENO) {
-        return false;
-    }
-    if stdin_pgrp_unavailable() {
-        return false;
-    }
-    if !devtty_open_succeeds() {
-        return false;
-    }
-    true
-}
-
-#[cfg(unix)]
-fn devtty_open_succeeds() -> bool {
-    let path = std::ffi::CString::new("/dev/tty").expect("static path has no NUL");
-    // `O_NONBLOCK` is critical: a blocking `open("/dev/tty")` can wedge
-    // inside the kernel after the session loses its controlling tty,
-    // which would disarm the watchdog by stalling its 200ms tick.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-    if fd < 0 {
-        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        // ENXIO = session has no controlling terminal. That's the only
-        // "real" death signal. Other errors (EACCES, EINTR, EMFILE) are
-        // transient or environmental and should NOT trip the watchdog.
-        return e != libc::ENXIO;
-    }
-    // NOTE: don't poll the resulting fd. macOS rejects `poll()` on
-    // `/dev/tty` with `POLLNVAL` even when the device is healthy, which
-    // would false-positive into "tty is dead." The open() call itself is
-    // the reliable signal — if we got here the session still has a
-    // controlling terminal.
-    unsafe {
-        libc::close(fd);
-    }
-    true
-}
-
-/// True when `tcgetpgrp(STDIN_FILENO)` returns a documented "fd is no longer
-/// a controlling terminal" error. Other failures (e.g. transient `EINTR`)
-/// fall through as "still alive" so we don't false-positive.
-#[cfg(unix)]
-fn stdin_pgrp_unavailable() -> bool {
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
-        // Not a tty in the first place — this probe has nothing to say.
-        // Other probes will catch the broken case.
-        return false;
-    }
-    let pgrp = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
-    if pgrp >= 0 {
-        return false;
-    }
-    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    matches!(err, libc::ENOTTY | libc::ENXIO | libc::EBADF)
-}
-
-#[cfg(unix)]
-fn fd_is_dead(fd: libc::c_int) -> bool {
-    let mut fds = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // 0 timeout = snapshot of the current ready/HUP state.
-    let result = unsafe { libc::poll(&mut fds, 1, 0) };
-    if result < 0 {
-        return true;
-    }
-    fds.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-}
-
-#[cfg(not(unix))]
-fn controlling_tty_alive() -> bool {
-    true
 }
 
 fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
@@ -3110,6 +2973,27 @@ fn run_upgrade(source: UpdateSource) -> Result<String, String> {
     }
 }
 
+fn kick_off_fetch_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = fetch_opencode_models().await;
+        let _ = tx.send(AppEvent::AiModelsFetched(result));
+    });
+}
+
+/// Shell out to the locally installed `opencode models opencode` to harvest
+/// the small subset of "free" provider/model pairs the upstream router is
+/// actually willing to serve right now. The Dashboard editor footer renders
+/// the result as selectable chips. Uses the default binary name from
+/// `crate::constants::OPENCODE_CLI_BINARY` — same lookup the dashboard
+/// service uses for the conflict-resolution shell-out.
+fn kick_off_fetch_free_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
+        let result = fetch_free_opencode_models(&binary).await;
+        let _ = tx.send(AppEvent::FreeOpencodeModelsFetched(result));
+    });
+}
+
 fn kick_off_clipboard_copy(
     value: String,
     success_message: String,
@@ -3181,6 +3065,28 @@ fn kick_off_merge_pull_request(
     });
 }
 
+fn kick_off_close_pull_request(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    number: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ClosePrFinished(Err(
+            "Could not resolve git root for closing the pull request.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = match service.close_pull_request(number).await {
+            Ok(()) => Ok(number),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::ClosePrFinished(result));
+    });
+}
+
 fn kick_off_resolve_base_ref(
     worktree_path: String,
     number: u64,
@@ -3211,10 +3117,12 @@ fn kick_off_update_branch(
     });
 }
 
-fn kick_off_push_after_review(
+fn kick_off_commit_and_push(
     git_root: Option<String>,
     config: DashboardConfig,
     request: UpdatePullRequestRequest,
+    use_ai: String,
+    base_ref: String,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let number = request.number;
@@ -3225,17 +3133,16 @@ fn kick_off_push_after_review(
         })));
         return;
     };
-    let base_ref = request
-        .base_ref
-        .clone()
-        .unwrap_or_else(|| "(unknown)".to_string());
+    let report_base = base_ref.clone();
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service.push_after_review(&request.worktree_path).await;
+        let result = service
+            .commit_and_push_ai_merge(&request.worktree_path, &base_ref, &use_ai)
+            .await;
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
-                base_ref,
+                base_ref: report_base,
                 outcome,
             }),
             Err(err) => Err(UpdatePrFailure {
@@ -3247,7 +3154,7 @@ fn kick_off_push_after_review(
     });
 }
 
-fn kick_off_discard_after_review(
+fn kick_off_abort_ai_merge(
     git_root: Option<String>,
     config: DashboardConfig,
     request: UpdatePullRequestRequest,
@@ -3257,7 +3164,7 @@ fn kick_off_discard_after_review(
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
             number,
-            message: "Could not resolve git root for discard.".to_string(),
+            message: "Could not resolve git root for abort.".to_string(),
         })));
         return;
     };
@@ -3267,7 +3174,7 @@ fn kick_off_discard_after_review(
         .unwrap_or_else(|| "(unknown)".to_string());
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service.discard_after_review(&request.worktree_path).await;
+        let result = service.abort_ai_merge(&request.worktree_path).await;
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
@@ -4533,6 +4440,7 @@ mod tests {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
                     columns: vec!["branch".into(), "status".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4541,6 +4449,7 @@ mod tests {
                     refresh_interval_ms: 6000,
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4560,6 +4469,7 @@ mod tests {
                 refresh_interval_ms: 7000,
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into(), "pull_request".into()],
+                use_ai: String::new(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -4589,6 +4499,7 @@ mod tests {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4607,6 +4518,7 @@ mod tests {
                 refresh_interval_ms: 8000,
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into()],
+                use_ai: String::new(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 

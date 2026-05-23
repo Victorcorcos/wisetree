@@ -87,6 +87,14 @@ pub enum SettingsAction {
     /// columns) to the active config file. Invalid numbers or unknown columns
     /// are normalized by the caller.
     SaveDashboard(DashboardConfig),
+    /// Open the fullscreen AI provider/model picker prefilled with the current
+    /// `useAi` value. The caller owns the picker screen and writes the user's
+    /// choice back via `apply_use_ai_selection`.
+    OpenAiModelPicker(String),
+    /// Kick off the background `opencode models opencode` shell-out that
+    /// populates the Dashboard editor's inline free-model quick-pick row.
+    /// Emitted once when the user enters the Dashboard editor.
+    FetchFreeModels,
     /// Copy the active config from one location to the other.
     CopySettings(CopyDirection),
 }
@@ -941,13 +949,15 @@ pub enum DashboardField {
     RefreshIntervalMs,
     ShowPullRequests,
     Columns,
+    UseAi,
 }
 
 impl DashboardField {
-    pub const ALL: [DashboardField; 3] = [
+    pub const ALL: [DashboardField; 4] = [
         DashboardField::RefreshIntervalMs,
         DashboardField::ShowPullRequests,
         DashboardField::Columns,
+        DashboardField::UseAi,
     ];
 
     pub fn label(self) -> &'static str {
@@ -955,6 +965,7 @@ impl DashboardField {
             DashboardField::RefreshIntervalMs => "refreshIntervalMs",
             DashboardField::ShowPullRequests => "showPullRequests",
             DashboardField::Columns => "columns",
+            DashboardField::UseAi => "useAi",
         }
     }
 
@@ -964,6 +975,9 @@ impl DashboardField {
             DashboardField::ShowPullRequests => "Press Enter to toggle",
             DashboardField::Columns => {
                 "Comma-separated: branch, status, ahead_behind, last_commit, pull_request"
+            }
+            DashboardField::UseAi => {
+                "Provider/model for opencode (e.g. anthropic/claude-sonnet-4-5). Blank disables AI."
             }
         }
     }
@@ -976,6 +990,12 @@ impl DashboardField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardSelection {
     Rect(usize),
+    /// Cursor lives on the inline "Current free models:" chip row that sits
+    /// directly below the `useAi` rectangle. The inner `usize` is the
+    /// focused chip index — Left/Right cycle within the row, Up/Down step
+    /// out to neighbouring rectangles. Only reachable when the screen has
+    /// a non-empty `free_models` list cached.
+    FreeModels(usize),
     Save,
 }
 
@@ -996,6 +1016,7 @@ impl DashboardEditor {
             config.refresh_interval_ms.to_string(),
             config.show_pull_requests.to_string(),
             config.columns.join(", "),
+            config.use_ai.clone(),
         ];
         let statuses = vec![DashboardRectStatus::Saved; values.len()];
         Self {
@@ -1014,24 +1035,6 @@ impl DashboardEditor {
         self.statuses
             .iter()
             .position(|&s| s == DashboardRectStatus::Editing)
-    }
-
-    fn move_up(&mut self) {
-        self.selection = match self.selection {
-            DashboardSelection::Rect(0) => DashboardSelection::Rect(0),
-            DashboardSelection::Rect(i) => DashboardSelection::Rect(i - 1),
-            DashboardSelection::Save => DashboardSelection::Rect(self.values.len() - 1),
-        };
-    }
-
-    fn move_down(&mut self) {
-        self.selection = match self.selection {
-            DashboardSelection::Rect(i) if i + 1 < self.values.len() => {
-                DashboardSelection::Rect(i + 1)
-            }
-            DashboardSelection::Rect(_) => DashboardSelection::Save,
-            DashboardSelection::Save => DashboardSelection::Save,
-        };
     }
 
     /// Build the `DashboardConfig` from current editor values. Numeric and
@@ -1060,10 +1063,13 @@ impl DashboardEditor {
             .collect();
         let (columns, _warnings) = normalize_dashboard_columns(&raw_columns);
 
+        let use_ai = self.values[3].trim().to_string();
+
         DashboardConfig {
             refresh_interval_ms,
             show_pull_requests,
             columns,
+            use_ai,
         }
     }
 }
@@ -1091,6 +1097,13 @@ pub struct SettingsScreen {
     link_cache_dir_input: Option<InputPrompt>,
     dashboard_editor: Option<DashboardEditor>,
     dashboard_input: Option<InputPrompt>,
+    /// Result of the background `opencode models opencode` fetch surfaced
+    /// inline under the `useAi` rectangle. `None` while the request is in
+    /// flight; `Some(Ok(_))` after a successful list, `Some(Err(_))` to
+    /// render the failure message instead of chips. The cursor lives in
+    /// `DashboardEditor::selection::FreeModels(i)` — there is no separate
+    /// focus field.
+    free_models: Option<Result<Vec<String>, String>>,
     copy_settings_select: Option<SelectPrompt<CopyDirection>>,
     update_result: Option<MultiSourceUpdateResult>,
     checking_updates: bool,
@@ -1136,6 +1149,7 @@ impl SettingsScreen {
             link_cache_dir_input: None,
             dashboard_editor: None,
             dashboard_input: None,
+            free_models: None,
             copy_settings_select: None,
             update_result: None,
             checking_updates: false,
@@ -1250,6 +1264,7 @@ impl SettingsScreen {
         self.link_cache_dir_input = None;
         self.dashboard_editor = None;
         self.dashboard_input = None;
+        self.free_models = None;
         self.copy_settings_select = None;
         self.error = None;
     }
@@ -1323,7 +1338,55 @@ impl SettingsScreen {
         self.select = Some(self.build_menu());
         self.dashboard_editor = None;
         self.dashboard_input = None;
+        self.free_models = None;
         self.step = SettingsStep::Menu;
+    }
+
+    /// Surface the successful free-model list fetched by the background
+    /// `opencode models opencode` shell-out. The chip row becomes navigable
+    /// next time the user steps Down from the useAi rectangle.
+    pub fn set_free_models(&mut self, models: Vec<String>) {
+        self.free_models = Some(Ok(models));
+    }
+
+    /// Surface a failure from the free-model fetch — rendered inline under
+    /// the `useAi` rectangle where the chips would otherwise appear. If the
+    /// cursor happened to be on the chip row when the fetch failed (rare,
+    /// since the chips never showed up to land on), step the cursor back
+    /// onto the useAi rectangle so the user isn't stranded.
+    pub fn set_free_models_error(&mut self, message: String) {
+        self.free_models = Some(Err(message));
+        if let Some(editor) = self.dashboard_editor.as_mut() {
+            if matches!(editor.selection, DashboardSelection::FreeModels(_)) {
+                if let Some(idx) = use_ai_field_index() {
+                    editor.selection = DashboardSelection::Rect(idx);
+                }
+            }
+        }
+    }
+
+    /// Test-only accessor for the cached free-model list.
+    #[cfg(test)]
+    pub fn free_models(&self) -> Option<&Result<Vec<String>, String>> {
+        self.free_models.as_ref()
+    }
+
+    /// Stamp the picked `useAi` value into the still-active dashboard editor
+    /// and put the cursor back on the useAi rectangle. The value is marked
+    /// `Modified` (not `Saved`) — the user persists it via the same Save
+    /// button as every other dashboard field, matching the rest of the
+    /// page's edit-then-Save model. Leaves the editor on screen so the
+    /// user lands back where they were instead of bouncing to the menu.
+    pub fn apply_use_ai_selection(&mut self, value: String) {
+        let Some(editor) = self.dashboard_editor.as_mut() else {
+            return;
+        };
+        let Some(idx) = use_ai_field_index() else {
+            return;
+        };
+        editor.values[idx] = value;
+        editor.statuses[idx] = DashboardRectStatus::Modified;
+        editor.selection = DashboardSelection::Rect(idx);
     }
 
     pub fn start_checking_updates(&mut self) {
@@ -1498,9 +1561,17 @@ impl SettingsScreen {
                 }
                 if matches!(value, SettingsStep::Dashboard) {
                     self.dashboard_editor = Some(DashboardEditor::new(&self.config.dashboard));
+                    // Drop any cached list on each entry — opencode rotates
+                    // its free-model roster regularly, so we always show the
+                    // loading state until the fresh `opencode models opencode`
+                    // shell-out lands.
+                    self.free_models = None;
                 }
                 if matches!(value, SettingsStep::CopySettings) {
                     self.copy_settings_select = Some(self.build_copy_settings_select());
+                }
+                if matches!(value, SettingsStep::Dashboard) {
+                    return SettingsAction::FetchFreeModels;
                 }
                 SettingsAction::Continue
             }
@@ -2291,24 +2362,45 @@ impl SettingsScreen {
             KeyCode::Esc => {
                 self.dashboard_editor = None;
                 self.dashboard_input = None;
+                self.free_models = None;
                 self.step = SettingsStep::Menu;
                 SettingsAction::Continue
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                editor.move_up();
+                self.dashboard_step_up();
                 SettingsAction::Continue
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                editor.move_down();
+                self.dashboard_step_down();
+                SettingsAction::Continue
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.dashboard_cycle_chip(false);
+                SettingsAction::Continue
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.dashboard_cycle_chip(true);
                 SettingsAction::Continue
             }
             KeyCode::Enter => match editor.selection {
                 DashboardSelection::Rect(i) => {
-                    if editor.field(i).is_toggle() {
+                    let field = editor.field(i);
+                    if field.is_toggle() {
                         toggle_idx = Some(i);
+                        SettingsAction::Continue
+                    } else if matches!(field, DashboardField::UseAi) {
+                        // The useAi field is selected from a fetched list of
+                        // opencode-known provider/model pairs, not free-typed.
+                        // Surface the current value so the picker pre-selects
+                        // it when the catalogue arrives.
+                        SettingsAction::OpenAiModelPicker(editor.values[i].clone())
                     } else {
                         start_editing = Some(i);
+                        SettingsAction::Continue
                     }
+                }
+                DashboardSelection::FreeModels(_) => {
+                    self.apply_focused_free_model_inline();
                     SettingsAction::Continue
                 }
                 DashboardSelection::Save => SettingsAction::SaveDashboard(editor.build_config()),
@@ -2324,6 +2416,106 @@ impl SettingsScreen {
         }
 
         action
+    }
+
+    /// Snapshot of the free-model list if the fetch succeeded and produced
+    /// at least one chip. Used both to gate cursor transitions and to
+    /// resolve the active pair on Enter.
+    fn free_models_list(&self) -> Option<&[String]> {
+        match &self.free_models {
+            Some(Ok(list)) if !list.is_empty() => Some(list.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Drive Up navigation across rect / chips / Save. The chip row sits
+    /// between the useAi rectangle and the Save button when models are
+    /// available; otherwise the cursor jumps straight between them.
+    fn dashboard_step_up(&mut self) {
+        let chips: Option<Vec<String>> = self.free_models_list().map(|l| l.to_vec());
+        let Some(editor) = self.dashboard_editor.as_mut() else {
+            return;
+        };
+        let use_ai_idx = use_ai_field_index();
+        editor.selection = match editor.selection {
+            DashboardSelection::Rect(0) => DashboardSelection::Rect(0),
+            DashboardSelection::Rect(i) => DashboardSelection::Rect(i - 1),
+            DashboardSelection::FreeModels(_) => {
+                DashboardSelection::Rect(use_ai_idx.unwrap_or(editor.values.len() - 1))
+            }
+            DashboardSelection::Save => match chips.as_deref() {
+                Some(chips) if !chips.is_empty() => {
+                    DashboardSelection::FreeModels(starting_chip_index(editor, chips))
+                }
+                _ => DashboardSelection::Rect(editor.values.len() - 1),
+            },
+        };
+    }
+
+    fn dashboard_step_down(&mut self) {
+        let chips: Option<Vec<String>> = self.free_models_list().map(|l| l.to_vec());
+        let Some(editor) = self.dashboard_editor.as_mut() else {
+            return;
+        };
+        let use_ai_idx = use_ai_field_index();
+        editor.selection = match editor.selection {
+            DashboardSelection::Rect(i) if Some(i) == use_ai_idx => match chips.as_deref() {
+                Some(chips) if !chips.is_empty() => {
+                    DashboardSelection::FreeModels(starting_chip_index(editor, chips))
+                }
+                _ => DashboardSelection::Save,
+            },
+            DashboardSelection::Rect(i) if i + 1 < editor.values.len() => {
+                DashboardSelection::Rect(i + 1)
+            }
+            DashboardSelection::Rect(_) => DashboardSelection::Save,
+            DashboardSelection::FreeModels(_) => DashboardSelection::Save,
+            DashboardSelection::Save => DashboardSelection::Save,
+        };
+    }
+
+    /// Left/Right cycle within the chip row. No-op unless the cursor is
+    /// actually on the chip row and we have at least one chip cached.
+    fn dashboard_cycle_chip(&mut self, forward: bool) {
+        let chip_count = match self.free_models_list().map(|l| l.len()) {
+            Some(n) if n > 0 => n,
+            _ => return,
+        };
+        let Some(editor) = self.dashboard_editor.as_mut() else {
+            return;
+        };
+        if let DashboardSelection::FreeModels(i) = editor.selection {
+            let next = if forward {
+                (i + 1) % chip_count
+            } else if i == 0 {
+                chip_count - 1
+            } else {
+                i - 1
+            };
+            editor.selection = DashboardSelection::FreeModels(next);
+        }
+    }
+
+    /// Stamp the chip-row cursor's pair into the `useAi` rectangle without
+    /// saving — the user persists the change by pressing the screen's Save
+    /// button just like any other dashboard field. Cursor stays on the
+    /// chip row so the user can keep cycling.
+    fn apply_focused_free_model_inline(&mut self) {
+        let models = match self.free_models_list() {
+            Some(list) => list.to_vec(),
+            None => return,
+        };
+        let Some(editor) = self.dashboard_editor.as_mut() else {
+            return;
+        };
+        let DashboardSelection::FreeModels(i) = editor.selection else {
+            return;
+        };
+        let pair = models[i.min(models.len() - 1)].clone();
+        if let Some(idx) = use_ai_field_index() {
+            editor.values[idx] = pair;
+            editor.statuses[idx] = DashboardRectStatus::Modified;
+        }
     }
 
     fn toggle_dashboard_bool(&mut self, idx: usize) {
@@ -3164,10 +3356,24 @@ impl SettingsScreen {
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
         let rects = DashboardField::ALL.len();
+        // Track where each field's rect chunk ends up so we can splice the
+        // free-model chip rows in immediately after the useAi rectangle's
+        // ↳ hint. The chips are scoped to useAi, not the whole page, so
+        // they belong next to that one field.
+        let use_ai_field_idx = DashboardField::ALL
+            .iter()
+            .position(|f| matches!(f, DashboardField::UseAi));
         let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
-        for _ in 0..rects {
+        let mut chip_chunks: Option<(usize, usize)> = None;
+        for (i, _) in DashboardField::ALL.iter().enumerate() {
             constraints.push(Constraint::Length(3));
             constraints.push(Constraint::Length(1));
+            if Some(i) == use_ai_field_idx {
+                let chip_idx = constraints.len();
+                constraints.push(Constraint::Length(1)); // chips line
+                constraints.push(Constraint::Length(1)); // chip-action hint
+                chip_chunks = Some((chip_idx, chip_idx + 1));
+            }
         }
         constraints.push(Constraint::Min(0));
         constraints.push(Constraint::Length(3));
@@ -3191,13 +3397,24 @@ impl SettingsScreen {
         );
 
         let editing_idx = editor.editing_index();
+        let mut cursor = 2usize;
         for i in 0..rects {
-            let rect_chunk = chunks[2 + i * 2];
-            let hint_chunk = chunks[2 + i * 2 + 1];
+            let rect_chunk = chunks[cursor];
+            let hint_chunk = chunks[cursor + 1];
             self.render_dashboard_rectangle(frame, rect_chunk, hint_chunk, editor, i, editing_idx);
+            cursor += 2;
+            if Some(i) == use_ai_field_idx {
+                cursor += 2;
+            }
         }
 
-        let save_chunk = chunks[2 + rects * 2 + 1];
+        if let Some((chips_idx, hint_idx)) = chip_chunks {
+            self.render_dashboard_free_models(frame, chunks[chips_idx], chunks[hint_idx]);
+        }
+
+        // The cursor now points at `Min(0)`. Save button is one past that,
+        // then `Saving to:`, then the bottom navigation hint.
+        let save_chunk = chunks[cursor + 1];
         self.render_dashboard_save_button(frame, save_chunk, editor);
 
         let target = self.config_path.clone();
@@ -3205,17 +3422,109 @@ impl SettingsScreen {
             Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
             Span::styled(target, Style::default().fg(colors::EMPHASIS)),
         ]);
-        frame.render_widget(Paragraph::new(saving_line), chunks[2 + rects * 2 + 2]);
+        frame.render_widget(Paragraph::new(saving_line), chunks[cursor + 2]);
 
+        let on_chips = matches!(editor.selection, DashboardSelection::FreeModels(_));
         let hint = if editing_idx.is_some() {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
+        } else if on_chips {
+            "← → cycle chips • Enter stages into useAi • ↑↓ leave row • Esc to go back"
         } else {
             "↑↓ to move • Enter to edit/toggle/Save • Esc to go back"
         };
         frame.render_widget(
             Paragraph::new(hint).style(dim_muted_style),
-            chunks[2 + rects * 2 + 3],
+            chunks[cursor + 3],
         );
+    }
+
+    /// Render the "Current free models:" chip row that lives right under
+    /// the `useAi` rectangle's ↳ hint, plus a per-state action hint. The
+    /// row is navigable: the cursor sits in
+    /// `DashboardSelection::FreeModels(i)`, and the matching chip lights
+    /// up ACCENT. A chip whose value equals the current `useAi` rectangle
+    /// is highlighted SUCCESS so the user can tell at a glance which pair
+    /// is staged. Scoped to `useAi` because the chips only ever apply to
+    /// that one field.
+    fn render_dashboard_free_models(&self, frame: &mut Frame, chips_area: Rect, hint_area: Rect) {
+        let muted_style = Style::default().fg(colors::MUTED);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+        let info_style = Style::default().fg(colors::INFO);
+
+        let focused_chip = self
+            .dashboard_editor
+            .as_ref()
+            .and_then(|e| match e.selection {
+                DashboardSelection::FreeModels(i) => Some(i),
+                _ => None,
+            });
+
+        let mut spans: Vec<Span> = vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled("Current free models: ", info_style),
+        ];
+        match &self.free_models {
+            None => {
+                spans.push(Span::styled("(loading from opencode)…", dim_muted_style));
+            }
+            Some(Err(message)) => {
+                spans.push(Span::styled(
+                    format!("(unavailable: {message})"),
+                    Style::default().fg(colors::ERROR),
+                ));
+            }
+            Some(Ok(models)) if models.is_empty() => {
+                spans.push(Span::styled("(none)", dim_muted_style));
+            }
+            Some(Ok(models)) => {
+                let active = self
+                    .dashboard_editor
+                    .as_ref()
+                    .and_then(|e| use_ai_field_index().map(|idx| e.values[idx].trim().to_string()))
+                    .unwrap_or_default();
+                for (i, model) in models.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::styled(" ", muted_style));
+                    }
+                    let is_focused = focused_chip == Some(i);
+                    let is_active = !active.is_empty() && active == *model;
+                    let (left, right) = if is_focused { ("[", "]") } else { (" ", " ") };
+                    let mut chip_style = if is_focused {
+                        Style::default()
+                            .fg(colors::ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                    } else if is_active {
+                        Style::default().fg(colors::SUCCESS)
+                    } else {
+                        Style::default().fg(colors::EMPHASIS)
+                    };
+                    if !is_focused && !is_active {
+                        chip_style = chip_style.add_modifier(Modifier::DIM);
+                    }
+                    spans.push(Span::styled(left.to_string(), chip_style));
+                    spans.push(Span::styled(model.clone(), chip_style));
+                    spans.push(Span::styled(right.to_string(), chip_style));
+                }
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), chips_area);
+
+        let action_hint = match &self.free_models {
+            Some(Ok(models)) if !models.is_empty() && focused_chip.is_some() => {
+                "    ← →/h l cycle • Enter stages into useAi • ↑↓ leave row"
+            }
+            Some(Ok(models)) if !models.is_empty() => {
+                "    Move down into the row to quick-pick a free model"
+            }
+            Some(Err(_)) => "    Free-model picker disabled until opencode CLI is reachable",
+            _ => "",
+        };
+        if !action_hint.is_empty() {
+            frame.render_widget(
+                Paragraph::new(action_hint).style(dim_muted_style),
+                hint_area,
+            );
+        }
     }
 
     fn render_dashboard_rectangle(
@@ -4374,13 +4683,217 @@ fn build_path_template_input(value: &str) -> InputPrompt {
         .with_default(value.to_string())
 }
 
+/// Position of the `UseAi` field inside `DashboardField::ALL`. Re-derived
+/// from the static array so reordering the enum doesn't silently break the
+/// chip-row navigation.
+fn use_ai_field_index() -> Option<usize> {
+    DashboardField::ALL
+        .iter()
+        .position(|f| matches!(f, DashboardField::UseAi))
+}
+
+/// When the cursor enters the chip row, prefer the chip whose value matches
+/// the `useAi` rectangle's current contents. Falls back to chip 0 when no
+/// chip matches so the cursor always has somewhere visible to land.
+fn starting_chip_index(editor: &DashboardEditor, chips: &[String]) -> usize {
+    let Some(idx) = use_ai_field_index() else {
+        return 0;
+    };
+    let current = editor.values[idx].trim();
+    if current.is_empty() {
+        return 0;
+    }
+    chips.iter().position(|m| m == current).unwrap_or(0)
+}
+
 fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
     let placeholder = match field {
         DashboardField::RefreshIntervalMs => "Refresh interval in ms (5000..60000)",
         DashboardField::ShowPullRequests => "true or false",
         DashboardField::Columns => "branch, status, ahead_behind, last_commit, pull_request",
+        DashboardField::UseAi => "provider/model (e.g. anthropic/claude-sonnet-4-5)",
     };
     InputPrompt::new("")
         .with_placeholder(placeholder)
         .with_default(value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::schema::WorktreeConfig;
+
+    fn dashboard_screen_with_free_models(models: Vec<String>) -> SettingsScreen {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        screen.step = SettingsStep::Dashboard;
+        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+        screen.set_free_models(models);
+        screen
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn focus_use_ai(screen: &mut SettingsScreen) {
+        let idx = use_ai_field_index().unwrap();
+        let editor = screen.dashboard_editor.as_mut().unwrap();
+        editor.selection = DashboardSelection::Rect(idx);
+    }
+
+    #[test]
+    fn dashboard_menu_emits_fetch_free_models_on_entry() {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        let select = screen.select.as_mut().expect("menu built in new()");
+        let dashboard_idx = select
+            .options
+            .iter()
+            .position(|opt| opt.value == SettingsStep::Dashboard)
+            .expect("dashboard option exists");
+        select.selected = dashboard_idx;
+        let action = screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(action, SettingsAction::FetchFreeModels);
+        assert!(screen.dashboard_editor.is_some());
+        // Each entry resets the cache so we always re-fetch — opencode
+        // rotates its free-model roster regularly.
+        assert!(screen.free_models.is_none());
+    }
+
+    #[test]
+    fn down_from_use_ai_lands_on_chip_row_when_chips_present() {
+        let mut screen = dashboard_screen_with_free_models(vec![
+            "opencode/big-pickle".to_string(),
+            "opencode/deepseek-v4-flash-free".to_string(),
+        ]);
+        focus_use_ai(&mut screen);
+        let _ = screen.handle_dashboard(key(KeyCode::Down));
+        let editor = screen.dashboard_editor.as_ref().unwrap();
+        assert!(matches!(
+            editor.selection,
+            DashboardSelection::FreeModels(_)
+        ));
+    }
+
+    #[test]
+    fn down_from_use_ai_skips_chips_when_list_unavailable() {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        screen.step = SettingsStep::Dashboard;
+        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+        focus_use_ai(&mut screen);
+        let _ = screen.handle_dashboard(key(KeyCode::Down));
+        let editor = screen.dashboard_editor.as_ref().unwrap();
+        assert_eq!(editor.selection, DashboardSelection::Save);
+    }
+
+    #[test]
+    fn arrows_cycle_chip_selection() {
+        let mut screen = dashboard_screen_with_free_models(vec![
+            "a/x".to_string(),
+            "b/y".to_string(),
+            "c/z".to_string(),
+        ]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().selection,
+            DashboardSelection::FreeModels(1)
+        );
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        // Wraps forward.
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().selection,
+            DashboardSelection::FreeModels(0)
+        );
+        // Wraps backward.
+        let _ = screen.handle_dashboard(key(KeyCode::Left));
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().selection,
+            DashboardSelection::FreeModels(2)
+        );
+    }
+
+    #[test]
+    fn enter_on_chip_stages_value_into_use_ai_without_saving() {
+        let mut screen = dashboard_screen_with_free_models(vec![
+            "opencode/big-pickle".to_string(),
+            "opencode/deepseek-v4-flash-free".to_string(),
+        ]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(1);
+        let action = screen.handle_dashboard(key(KeyCode::Enter));
+        // Stays on the page — no SaveDashboard, no ApplyFreeModel side-effect.
+        assert_eq!(action, SettingsAction::Continue);
+        let editor = screen.dashboard_editor.as_ref().unwrap();
+        let idx = use_ai_field_index().unwrap();
+        assert_eq!(editor.values[idx], "opencode/deepseek-v4-flash-free");
+        assert_eq!(editor.statuses[idx], DashboardRectStatus::Modified);
+        // Cursor stays on the chip so the user can keep cycling.
+        assert_eq!(editor.selection, DashboardSelection::FreeModels(1));
+    }
+
+    #[test]
+    fn up_from_chips_returns_to_use_ai() {
+        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
+        let _ = screen.handle_dashboard(key(KeyCode::Up));
+        let idx = use_ai_field_index().unwrap();
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().selection,
+            DashboardSelection::Rect(idx)
+        );
+    }
+
+    #[test]
+    fn down_from_chips_advances_to_save() {
+        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
+        let _ = screen.handle_dashboard(key(KeyCode::Down));
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().selection,
+            DashboardSelection::Save
+        );
+    }
+
+    #[test]
+    fn enter_on_save_after_chip_stage_emits_save_dashboard_with_chosen_model() {
+        let mut screen =
+            dashboard_screen_with_free_models(vec!["opencode/deepseek-v4-flash-free".to_string()]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
+        let _ = screen.handle_dashboard(key(KeyCode::Enter)); // stage
+        let _ = screen.handle_dashboard(key(KeyCode::Down)); // → Save
+        let action = screen.handle_dashboard(key(KeyCode::Enter));
+        match action {
+            SettingsAction::SaveDashboard(cfg) => {
+                assert_eq!(cfg.use_ai, "opencode/deepseek-v4-flash-free");
+            }
+            other => panic!("expected SaveDashboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_use_ai_selection_marks_modified_and_stays_on_dashboard_step() {
+        let mut screen = dashboard_screen_with_free_models(vec![]);
+        screen.apply_use_ai_selection("anthropic/claude-sonnet-4-5".to_string());
+        let editor = screen.dashboard_editor.as_ref().unwrap();
+        let idx = use_ai_field_index().unwrap();
+        assert_eq!(editor.values[idx], "anthropic/claude-sonnet-4-5");
+        assert_eq!(editor.statuses[idx], DashboardRectStatus::Modified);
+        assert_eq!(editor.selection, DashboardSelection::Rect(idx));
+        // The editor is still on screen — the picker should hand the user
+        // back to the Dashboard editor, not bounce them to the menu.
+        assert_eq!(screen.step, SettingsStep::Dashboard);
+    }
+
+    #[test]
+    fn set_free_models_error_pulls_cursor_off_invisible_chip_row() {
+        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
+        screen.set_free_models_error("opencode CLI missing".to_string());
+        assert!(matches!(screen.free_models(), Some(Err(_))));
+        let idx = use_ai_field_index().unwrap();
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().selection,
+            DashboardSelection::Rect(idx)
+        );
+    }
 }

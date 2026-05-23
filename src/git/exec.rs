@@ -15,10 +15,10 @@ use crate::git::types::GitCommandResult;
 pub async fn execute_git_command(args: &[&str], cwd: Option<&Path>) -> GitCommandResult {
     let mut cmd = Command::new("git");
     cmd.args(args);
-    // If wisetree exits (signal, panic, orphan-watchdog tripping), the awaiting
-    // task is aborted and this Child is dropped. Without kill_on_drop, the
-    // git subprocess would be orphaned and keep running — over time those
-    // orphans accumulate, especially the dashboard's repeated git calls.
+    // If wisetree exits (signal, panic), the awaiting task is aborted and
+    // this Child is dropped. Without kill_on_drop, the git subprocess would
+    // be orphaned and keep running — over time those orphans accumulate,
+    // especially the dashboard's repeated git calls.
     cmd.kill_on_drop(true);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
