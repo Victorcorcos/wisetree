@@ -735,6 +735,28 @@ impl DashboardService {
         Ok(())
     }
 
+    /// Close a pull request via `gh pr close <number>`.
+    pub async fn close_pull_request(&self, number: u64) -> Result<()> {
+        if !self.gh_available {
+            return Err(WisetreeError::other(
+                "gh CLI not found — install `gh` to close pull requests.",
+            ));
+        }
+        let number_arg = number.to_string();
+        time::timeout(
+            PR_MERGE_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &["pr", "close", &number_arg],
+                Some(&self.git_root),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh pr close timed out after 60s"))?
+        .map_err(WisetreeError::other)?;
+        Ok(())
+    }
+
     /// Drive the "Update Pull Request" pipeline against `worktree_path`.
     ///
     /// 1. `git fetch --all --prune`
