@@ -5,6 +5,12 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+# `git push` sets GIT_DIR (and friends) for hooks. If we leave them in
+# the environment, every git invocation in our subprocesses — including
+# the cli_e2e tests' `git init` / `git commit` calls in tempdirs —
+# resolves to this repo and silently commits into our history.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+
 run_fix() {
   local name="$1"
   shift

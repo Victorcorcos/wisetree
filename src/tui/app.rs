@@ -9,6 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, ffi::OsString};
 
+#[cfg(unix)]
+use libc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -30,13 +33,15 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
-    install_shell_integration, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
-    UpdateCheckResult, UpdatePhase, UpdateProgress,
+    fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
+    resolve_dashboard_columns, AppStateService, DashboardService, DashboardUpdate, DashboardWatch,
+    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult,
+    UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
+use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryLine, SummaryTone};
 use crate::tui::screens::dashboard::{
@@ -110,6 +115,12 @@ enum AppEvent {
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
     UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
+    /// Result of the background fetch that powers the AI provider/model
+    /// picker. The picker stays in its loading state until this lands.
+    AiModelsFetched(Result<Vec<OpencodeModel>, String>),
+    /// Result of the background `opencode models opencode` shell-out that
+    /// powers the Dashboard footer's free-model quick-pick.
+    FreeOpencodeModelsFetched(Result<Vec<String>, String>),
 }
 
 struct MergePrDetailsPayload {
@@ -157,6 +168,10 @@ pub struct App {
     merge_pr: Option<MergePullRequestScreen>,
     update_pr: Option<UpdatePullRequestScreen>,
     update_branch: Option<UpdateBranchScreen>,
+    /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
+    /// top of the Settings screen — when active the Settings state is
+    /// preserved so the user lands back on the dashboard editor on exit.
+    ai_model_picker: Option<AiModelPickerScreen>,
     shell_integration_status: Option<ShellIntegrationStatus>,
     toast: ToastState,
     last_rendered_buffer: Option<Buffer>,
@@ -198,6 +213,7 @@ impl App {
             merge_pr: None,
             update_pr: None,
             update_branch: None,
+            ai_model_picker: None,
             shell_integration_status: None,
             toast: ToastState::default(),
             last_rendered_buffer: None,
@@ -279,7 +295,17 @@ impl App {
             match events.next_event()? {
                 Event::Key(key) => self.handle_key(key, &tx),
                 Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
-                Event::Tick => self.tick = self.tick.wrapping_add(1),
+                Event::Closed => self.quit_requested = true,
+                Event::Tick => {
+                    self.tick = self.tick.wrapping_add(1);
+                    if let Some(screen) = self.update_pr.as_mut() {
+                        // Resize tracking happens during render (where
+                        // the panel area is known); the tick handles
+                        // child-exit detection. `None` keeps the PTY at
+                        // its last known size between resize events.
+                        screen.tick_pty(None);
+                    }
+                }
                 Event::Resize(_, _) => {}
             }
         }
@@ -428,11 +454,25 @@ impl App {
                 }
             }
             Screen::UpdatePullRequest => {
-                let h = self
+                // Once the AI is actively streaming the conflict resolution
+                // we want the entire bottom region of the screen so the
+                // AI Activity panel — the longest-running, scroll-heavy view
+                // in the app — has room to breathe. The Confirm and pre-AI
+                // phases (Fetching, Merging) stay in the compact framed
+                // panel so they don't look lost in a huge empty area.
+                let ai_active = self
                     .update_pr
                     .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                    .is_some_and(|s| s.is_updating() && s.ai_active());
+                let panel = if ai_active {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .update_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
                 if let Some(update_pr) = self.update_pr.as_mut() {
                     update_pr.tick = self.tick;
                     update_pr.render(frame, panel);
@@ -447,6 +487,13 @@ impl App {
                 if let Some(update_branch) = self.update_branch.as_mut() {
                     update_branch.tick = self.tick;
                     update_branch.render(frame, panel);
+                }
+            }
+            Screen::AiModelPicker => {
+                let panel = self.render_framed_panel_fill(frame, area);
+                if let Some(picker) = self.ai_model_picker.as_mut() {
+                    picker.tick = self.tick;
+                    picker.render(frame, panel);
                 }
             }
         }
@@ -648,7 +695,58 @@ impl App {
                     screen.handle_key(key);
                 }
             }
+            Screen::AiModelPicker => self.handle_ai_model_picker_key(key, tx),
         }
+    }
+
+    fn handle_ai_model_picker_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.ai_model_picker.as_mut() {
+            Some(picker) => picker.handle_key(key),
+            None => {
+                self.close_ai_model_picker();
+                return;
+            }
+        };
+
+        match action {
+            AiModelPickerAction::Continue => {}
+            AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
+            AiModelPickerAction::Selected(model) => {
+                // Stamp the chosen pair into the still-live Dashboard editor
+                // and drop back onto it — the user persists the change by
+                // pressing the editor's Save button (same pattern as every
+                // other dashboard field). Auto-saving here would route the
+                // user past the editor to the Settings menu, which they
+                // don't expect.
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.apply_use_ai_selection(model);
+                }
+                self.close_ai_model_picker();
+                let _ = tx;
+            }
+        }
+    }
+
+    /// Push the picker on top of the still-alive Settings screen, kick off the
+    /// background catalogue fetch, and flip the route. The picker reads
+    /// `current_use_ai` so reopening the picker lands on the user's prior
+    /// choice.
+    fn open_ai_model_picker(
+        &mut self,
+        current_use_ai: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.ai_model_picker = Some(AiModelPickerScreen::new(current_use_ai));
+        self.screen = Screen::AiModelPicker;
+        kick_off_fetch_opencode_models(tx.clone());
+    }
+
+    /// Tear down the picker overlay and return to the underlying Settings
+    /// screen. `clear_screen_state` is deliberately *not* called — the
+    /// Settings instance must survive so the dashboard editor remains visible.
+    fn close_ai_model_picker(&mut self) {
+        self.ai_model_picker = None;
+        self.screen = Screen::Settings;
     }
 
     fn handle_merge_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -706,49 +804,37 @@ impl App {
                     tx.clone(),
                 );
             }
-            UpdateAction::PushReviewed => {
+            UpdateAction::AiComplete => {
+                let dashboard_config = self.current_dashboard_config();
+                let git_root = self.git_root.clone();
                 let Some(screen) = self.update_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
-                screen.start_post_review(true);
-                kick_off_push_after_review(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
+                let use_ai = dashboard_config.use_ai.clone();
+                let base_ref = request
+                    .base_ref
+                    .clone()
+                    .unwrap_or_else(|| "upstream/main".to_string());
+                screen.set_phase_message("Committing and pushing AI resolution...");
+                kick_off_commit_and_push(
+                    git_root,
+                    dashboard_config,
                     request,
+                    use_ai,
+                    base_ref,
                     tx.clone(),
                 );
             }
-            UpdateAction::DiscardReviewed => {
+            UpdateAction::AiCancel => {
+                let dashboard_config = self.current_dashboard_config();
+                let git_root = self.git_root.clone();
                 let Some(screen) = self.update_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
-                screen.start_post_review(false);
-                kick_off_discard_after_review(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
-                    request,
-                    tx.clone(),
-                );
-            }
-            UpdateAction::ReviewBackedOut => {
-                // Surface the SHA in a Warning toast so the user has a
-                // concrete handle for cleaning up the local commit later.
-                let sha = self
-                    .update_pr
-                    .as_ref()
-                    .and_then(|s| s.review_commit_sha().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "HEAD".to_string());
-                self.show_toast(
-                    ToastVariant::Warning,
-                    format!(
-                        "Merge commit `{sha}` is still local on this branch. \
-                         Push it or run `git reset --hard HEAD~1` to discard."
-                    ),
-                );
-                self.update_pr = None;
-                self.enter_screen(Screen::Dashboard, tx);
+                screen.set_phase_message("Aborting merge and discarding AI changes...");
+                kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
             }
         }
     }
@@ -1156,6 +1242,12 @@ impl App {
                     }
                 }
             }
+            SettingsAction::OpenAiModelPicker(current_use_ai) => {
+                self.open_ai_model_picker(current_use_ai, tx);
+            }
+            SettingsAction::FetchFreeModels => {
+                kick_off_fetch_free_opencode_models(tx.clone());
+            }
         }
     }
 
@@ -1417,6 +1509,29 @@ impl App {
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
             AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
+            AppEvent::AiModelsFetched(result) => {
+                // The fetch is best-effort: by the time it returns the user may
+                // have already closed the picker. Silently drop the result in
+                // that case — there's nothing to update.
+                if let Some(picker) = self.ai_model_picker.as_mut() {
+                    match result {
+                        Ok(models) => picker.set_models(models),
+                        Err(message) => picker.set_error(message),
+                    }
+                }
+            }
+            AppEvent::FreeOpencodeModelsFetched(result) => {
+                // Same best-effort posture as the picker fetch: by the time
+                // this lands the user may have already left the Dashboard
+                // editor, so we silently drop the result if there's no
+                // Settings screen to update.
+                if let Some(settings) = self.settings.as_mut() {
+                    match result {
+                        Ok(models) => settings.set_free_models(models),
+                        Err(message) => settings.set_free_models_error(message),
+                    }
+                }
+            }
         }
     }
 
@@ -1516,10 +1631,10 @@ impl App {
                 );
                 self.set_update_pr_phase_label("Pushing merge to origin...");
             }
-            UpdatePhase::ConflictsDetected { count, model } => {
+            UpdatePhase::ConflictsDetected { count } => {
                 self.show_toast(
                     ToastVariant::Warning,
-                    format!("PR #{number}: {count} conflicted file(s) — handing off to {model}."),
+                    format!("PR #{number}: {count} conflicted file(s) — handing off to opencode."),
                 );
                 if let Some(screen) = self.update_pr.as_mut() {
                     screen.mark_ai_active();
@@ -1593,20 +1708,30 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         use crate::services::UpdatePullRequestOutcome;
-        // `MergedAwaitingReview` does NOT close the screen — it transitions
-        // it into the review step. All other variants are terminal.
+        // `ConflictsHandedOffToUi` does NOT close the screen — the
+        // service paused mid-flight (conflicts in the index, opencode
+        // not yet invoked). We spawn opencode inside the screen's
+        // embedded PTY here; the screen ticks the PTY each frame and
+        // flips into the Complete/Cancel decision step once the child
+        // exits. All other variants are terminal.
         if let Ok(UpdatePrSuccess {
             outcome:
-                UpdatePullRequestOutcome::MergedAwaitingReview {
-                    commit_sha,
-                    stat,
-                    diff,
+                UpdatePullRequestOutcome::ConflictsHandedOffToUi {
+                    opencode_binary,
+                    opencode_args,
+                    cwd,
+                    ..
                 },
             ..
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                screen.present_review(commit_sha.clone(), stat.clone(), diff.clone());
+                screen.spawn_opencode_pty(
+                    opencode_binary.clone(),
+                    opencode_args.clone(),
+                    cwd.clone(),
+                    Vec::new(),
+                );
                 return;
             }
         }
@@ -1631,32 +1756,38 @@ impl App {
                 UpdatePullRequestOutcome::MergedWithAiResolution => {
                     self.show_toast(
                         ToastVariant::Success,
-                        format!(
-                            "Pull Request #{number} updated (Gemini-resolved, reviewed) \
-                             and pushed."
-                        ),
+                        format!("Pull Request #{number} updated (opencode-resolved) and pushed."),
                     );
                 }
-                UpdatePullRequestOutcome::MergedAwaitingReview { .. } => {
+                UpdatePullRequestOutcome::ConflictsHandedOffToUi { .. } => {
                     // Handled by the early-return branch above; this arm
                     // only fires if `update_pr` was already torn down.
                 }
-                UpdatePullRequestOutcome::DiscardedAfterReview => {
+                UpdatePullRequestOutcome::DiscardedAiMerge => {
                     self.show_toast(
                         ToastVariant::Warning,
                         format!(
-                            "Discarded AI merge commit for PR #{number}. \
+                            "Discarded AI merge for PR #{number}. \
                              Branch is back where it was before the update."
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::GeminiMissing { conflicts } => {
+                UpdatePullRequestOutcome::ConflictsRequireAi { .. } => {
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        "Conflicts found, please resolve them locally or setup `useAi` \
+                         setting so we can solve conflicts + merge via AI."
+                            .to_string(),
+                    );
+                }
+                UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
                     let count = conflicts.len();
                     self.show_toast(
                         ToastVariant::Error,
                         format!(
                             "Merge has {count} conflicted file(s). \
-                             Gemini is unavailable — sign in with Gemini CLI or set `GEMINI_API_KEY` / `GOOGLE_API_KEY`, then retry. \
+                             `opencode` CLI is not on PATH — install it from \
+                             https://opencode.ai then retry. \
                              Pull Request #{number} was NOT updated."
                         ),
                     );
@@ -1689,11 +1820,11 @@ impl App {
                         ),
                     );
                 }
-                UpdatePullRequestOutcome::DiscardFailed(detail) => {
+                UpdatePullRequestOutcome::AbortFailed(detail) => {
                     self.show_toast(
                         ToastVariant::Error,
                         format!(
-                            "Failed to discard AI merge for PR #{number}: {}",
+                            "Failed to abort AI merge for PR #{number}: {}",
                             truncate_error(&detail)
                         ),
                     );
@@ -1874,6 +2005,15 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::AiModelPicker => {
+                // The picker is opened as a modal overlay via
+                // `open_ai_model_picker`, not through `enter_screen`. Hitting
+                // this arm means we lost the underlying Settings state — bail
+                // back to the menu rather than render an empty panel.
+                if self.ai_model_picker.is_none() {
+                    self.back_to_menu();
+                }
+            }
         }
 
         if !matches!(screen, Screen::Delete) {
@@ -1897,6 +2037,7 @@ impl App {
         self.merge_pr = None;
         self.update_pr = None;
         self.update_branch = None;
+        self.ai_model_picker = None;
         self.mouse_selection = None;
     }
 
@@ -2469,30 +2610,81 @@ struct InitOutcome {
     result: Result<WorktreeService, String>,
 }
 
-/// Route SIGHUP (terminal tab closed) and SIGTERM through the normal
-/// shutdown path so `restore()` runs and the tty doesn't get stranded in
-/// raw mode. Without this, closing the tab with Cmd+W kills the process
-/// before cleanup, leaving the parent shell's `dir=$(...)` capture stuck on
-/// a tty with ICANON/ECHO disabled.
+/// Listen for terminal-related signals (SIGTERM/SIGINT/SIGQUIT/SIGHUP) and
+/// flip a shared flag when any of them arrives. The main event loop checks
+/// the flag every tick and breaks out cleanly, which routes the shutdown
+/// through the normal Drop chain — including crossterm's
+/// `DisableMouseCapture` and `disable_raw_mode`, so the user's terminal is
+/// returned to a sane state.
+///
+/// On Linux there is a secondary fallback: crossterm's mio backend can
+/// enter an infinite inner read-loop when the PTY master closes (EIO is
+/// silently dropped without `break`), so the cooperative tokio-signal path
+/// never gets a chance to run. A dedicated OS thread polls `STDIN_FILENO`
+/// for `POLLHUP` with a raw `libc::poll()` call. When triggered it runs
+/// terminal cleanup and calls `process::exit` directly, bypassing the stuck
+/// crossterm loop.
 fn install_termination_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
-        let flag = flag.clone();
+        let flag_for_signal = flag.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
-            let Ok(mut hup) = signal(SignalKind::hangup()) else {
-                return;
-            };
             let Ok(mut term) = signal(SignalKind::terminate()) else {
                 return;
             };
+            let Ok(mut int) = signal(SignalKind::interrupt()) else {
+                return;
+            };
+            let Ok(mut quit) = signal(SignalKind::quit()) else {
+                return;
+            };
+            let Ok(mut hup) = signal(SignalKind::hangup()) else {
+                return;
+            };
             tokio::select! {
-                _ = hup.recv() => {}
                 _ = term.recv() => {}
+                _ = int.recv() => {}
+                _ = quit.recv() => {}
+                _ = hup.recv() => {}
             }
-            flag.store(true, Ordering::Relaxed);
+            flag_for_signal.store(true, Ordering::Relaxed);
         });
+
+        // Only install the watchdog when stdin is a real TTY. Piped or
+        // redirected stdin would trigger POLLHUP immediately and cause a
+        // spurious exit before any user interaction.
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+            let flag_for_watchdog = flag.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let mut pfd = libc::pollfd {
+                        fd: libc::STDIN_FILENO,
+                        // events = 0: POLLHUP is always reported in revents
+                        // regardless of the events mask, so we need not request
+                        // POLLIN. Avoiding POLLIN prevents the inner crossterm
+                        // read-loop from being confused by this thread's poll.
+                        events: 0,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, 250) };
+
+                    if flag_for_watchdog.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                        // PTY master closed. crossterm may be stuck in an EIO
+                        // spin on Linux so we cannot rely on the cooperative
+                        // shutdown path. Restore the terminal ourselves and
+                        // force-exit so the parent shell is not left in raw mode.
+                        let _ = crossterm::terminal::disable_raw_mode();
+                        std::process::exit(0);
+                    }
+                }
+            });
+        }
     }
     flag
 }
@@ -2646,6 +2838,27 @@ fn kick_off_update_check(tx: mpsc::UnboundedSender<AppEvent>) {
     });
 }
 
+fn kick_off_fetch_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = fetch_opencode_models().await;
+        let _ = tx.send(AppEvent::AiModelsFetched(result));
+    });
+}
+
+/// Shell out to the locally installed `opencode models opencode` to harvest
+/// the small subset of "free" provider/model pairs the upstream router is
+/// actually willing to serve right now. The Dashboard editor footer renders
+/// the result as selectable chips. Uses the default binary name from
+/// `crate::constants::OPENCODE_CLI_BINARY` — same lookup the dashboard
+/// service uses for the conflict-resolution shell-out.
+fn kick_off_fetch_free_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
+        let result = fetch_free_opencode_models(&binary).await;
+        let _ = tx.send(AppEvent::FreeOpencodeModelsFetched(result));
+    });
+}
+
 fn kick_off_clipboard_copy(
     value: String,
     success_message: String,
@@ -2747,10 +2960,12 @@ fn kick_off_update_branch(
     });
 }
 
-fn kick_off_push_after_review(
+fn kick_off_commit_and_push(
     git_root: Option<String>,
     config: DashboardConfig,
     request: UpdatePullRequestRequest,
+    use_ai: String,
+    base_ref: String,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let number = request.number;
@@ -2761,17 +2976,16 @@ fn kick_off_push_after_review(
         })));
         return;
     };
-    let base_ref = request
-        .base_ref
-        .clone()
-        .unwrap_or_else(|| "(unknown)".to_string());
+    let report_base = base_ref.clone();
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service.push_after_review(&request.worktree_path).await;
+        let result = service
+            .commit_and_push_ai_merge(&request.worktree_path, &base_ref, &use_ai)
+            .await;
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
-                base_ref,
+                base_ref: report_base,
                 outcome,
             }),
             Err(err) => Err(UpdatePrFailure {
@@ -2783,7 +2997,7 @@ fn kick_off_push_after_review(
     });
 }
 
-fn kick_off_discard_after_review(
+fn kick_off_abort_ai_merge(
     git_root: Option<String>,
     config: DashboardConfig,
     request: UpdatePullRequestRequest,
@@ -2793,7 +3007,7 @@ fn kick_off_discard_after_review(
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
             number,
-            message: "Could not resolve git root for discard.".to_string(),
+            message: "Could not resolve git root for abort.".to_string(),
         })));
         return;
     };
@@ -2803,7 +3017,7 @@ fn kick_off_discard_after_review(
         .unwrap_or_else(|| "(unknown)".to_string());
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service.discard_after_review(&request.worktree_path).await;
+        let result = service.abort_ai_merge(&request.worktree_path).await;
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
@@ -4069,6 +4283,7 @@ mod tests {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
                     columns: vec!["branch".into(), "status".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4077,6 +4292,7 @@ mod tests {
                     refresh_interval_ms: 6000,
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4096,6 +4312,7 @@ mod tests {
                 refresh_interval_ms: 7000,
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into(), "pull_request".into()],
+                use_ai: String::new(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -4125,6 +4342,7 @@ mod tests {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
+                    use_ai: String::new(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4143,6 +4361,7 @@ mod tests {
                 refresh_interval_ms: 8000,
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into()],
+                use_ai: String::new(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 

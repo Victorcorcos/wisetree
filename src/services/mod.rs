@@ -2,6 +2,7 @@
 
 pub mod app_state;
 pub mod dashboard;
+pub mod opencode_models;
 pub mod presets;
 pub mod shell_integration;
 pub mod update;
@@ -14,6 +15,7 @@ pub use dashboard::{
     ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
     UpdatePullRequestOutcome, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };
+pub use opencode_models::{fetch_free_opencode_models, fetch_opencode_models, OpencodeModel};
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,

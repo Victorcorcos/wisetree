@@ -20,16 +20,14 @@ pub const CACHE_DIR_NAME: &str = "cache";
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 
-/// Commit message written when the "Update Pull Request" flow committed
-/// the result of an AI-assisted conflict resolution. Kept as a constant
-/// so downstream tooling (release notes, blame heuristics) can recognise
-/// the synthetic commit.
+/// Commit message title written when the "Update Pull Request" flow
+/// committed the result of an AI-assisted conflict resolution. Kept as a
+/// constant so downstream tooling (release notes, blame heuristics) can
+/// recognise the synthetic commit.
 pub const UPDATE_MERGE_COMMIT_MESSAGE: &str = "Merging and solving conflicts";
 
-/// The Gemini model that resolves merge conflicts. Surfaced in both the
-/// CLI invocation and the UI toasts so user-facing copy stays in sync
-/// with what actually runs.
-pub const UPDATE_GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
+/// CLI binary name used for AI-assisted merge conflict resolution.
+pub const OPENCODE_CLI_BINARY: &str = "opencode";
 
 /// Resolve the global config directory (`~/.wisetree/`).
 ///
