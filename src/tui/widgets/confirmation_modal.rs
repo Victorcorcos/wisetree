@@ -39,6 +39,13 @@ pub enum ConfirmationChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmationOutcome {
     Confirmed,
+    /// User explicitly chose the cancel button and pressed Enter. Lets
+    /// callers distinguish "user said no" from "user pressed Esc / left
+    /// the flow", which matters for follow-up prompts (e.g. *navigate
+    /// into the created worktree?*) where No should still continue the
+    /// parent flow but Esc should abort it. Callers that don't care
+    /// about the distinction can treat `Declined` the same as `Cancelled`.
+    Declined,
     Cancelled,
     Pending,
 }
@@ -101,6 +108,15 @@ impl ConfirmationModal {
         self
     }
 
+    /// Set the accent color directly from a `ratatui::style::Color`. Useful
+    /// for callers that already have a palette constant (e.g. `colors::INFO`,
+    /// `colors::WARNING`, `colors::ERROR`) and don't want to round-trip
+    /// through a hex string.
+    pub fn with_color_value(mut self, color: Color) -> Self {
+        self.color = color;
+        self
+    }
+
     pub fn with_selected(mut self, choice: ConfirmationChoice) -> Self {
         self.selected = choice;
         self
@@ -115,7 +131,7 @@ impl ConfirmationModal {
             KeyCode::Esc => ConfirmationOutcome::Cancelled,
             KeyCode::Enter => match self.selected {
                 ConfirmationChoice::Confirm => ConfirmationOutcome::Confirmed,
-                ConfirmationChoice::Cancel => ConfirmationOutcome::Cancelled,
+                ConfirmationChoice::Cancel => ConfirmationOutcome::Declined,
             },
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                 self.selected = match self.selected {
@@ -136,12 +152,35 @@ impl ConfirmationModal {
         }
     }
 
+    /// Minimum total rows a `ConfirmationModal` ever needs to render
+    /// without clipping the buttons or hint line (assumes a 1-line
+    /// subtitle). Callers that decide a panel height up front should
+    /// reserve at least this much for the slot the modal will draw into,
+    /// otherwise the buttons row collapses. Multi-line subtitles need
+    /// even more — see [`Self::required_height`] for the per-instance
+    /// calculation.
+    pub const MIN_HEIGHT: u16 = 10;
+
+    /// Total rows this modal needs to render its current subtitle without
+    /// clipping. Use this when laying out a parent that contains the
+    /// modal so the slot is sized correctly.
+    pub fn required_height(&self, available_width: u16) -> u16 {
+        let modal_width = 60u16.min(available_width.saturating_sub(4)).max(20);
+        let inner_width = modal_width.saturating_sub(4) as usize;
+        let subtitle_lines = wrap_line_count(&self.subtitle, inner_width).max(1) as u16;
+        // border(2) + title(1) + blank(1) + subtitle + blank(1) + buttons(3) + hint(1)
+        (2 + 1 + 1 + subtitle_lines + 1 + 3 + 1).max(Self::MIN_HEIGHT)
+    }
+
     /// Draw the modal centered inside `area`. Callers typically pass the
     /// area of the parent panel so the modal floats over it. `Clear` is
     /// rendered behind the modal rect so whatever lies underneath gets
     /// wiped without disturbing the rest of the frame.
     ///
     /// The modal height grows automatically to fit a multi-line subtitle.
+    /// When `area` is too small to fit the full layout, the modal uses
+    /// the entire area height (no centering padding) so the buttons and
+    /// hint line stay visible.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         // Modal is at most 60 cols wide, clamped to the terminal.
         let modal_width = 60u16.min(area.width.saturating_sub(4)).max(20);
@@ -151,7 +190,14 @@ impl ConfirmationModal {
 
         // Total height: border(2) + title(1) + blank(1) + subtitle + blank(1) + buttons(3) + hint(1)
         let needed_height = 2 + 1 + 1 + subtitle_lines + 1 + 3 + 1;
-        let modal_height = needed_height.min(area.height.saturating_sub(2)).max(8);
+        // Prefer 1 row of breathing room above + below, but if the area
+        // is tight, consume the full height so the buttons aren't clipped.
+        let max_height = if area.height >= needed_height + 2 {
+            area.height.saturating_sub(2)
+        } else {
+            area.height
+        };
+        let modal_height = needed_height.min(max_height).max(Self::MIN_HEIGHT.min(area.height));
 
         let rect = centered_rect(area, modal_width, modal_height);
         if rect.width < 6 || rect.height < 6 {
@@ -283,14 +329,30 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Count how many wrapped lines `text` needs when rendered into `width` columns.
+/// Count how many wrapped lines `text` needs when rendered into `width`
+/// columns. Hard newlines in `text` always start a fresh line so callers
+/// can preserve formatted multi-line content (code previews, bullet lists)
+/// alongside soft-wrapped paragraphs.
 fn wrap_line_count(text: &str, width: usize) -> usize {
     if width == 0 {
+        return text.split('\n').count().max(1);
+    }
+    let mut total = 0usize;
+    for segment in text.split('\n') {
+        total += wrap_segment_line_count(segment, width);
+    }
+    total.max(1)
+}
+
+fn wrap_segment_line_count(segment: &str, width: usize) -> usize {
+    if segment.trim().is_empty() {
+        // Preserve blank lines so the modal grows to fit the spacing the
+        // caller laid out (e.g. blank-line separated paragraphs).
         return 1;
     }
     let mut lines = 0usize;
     let mut col = 0usize;
-    for word in text.split_whitespace() {
+    for word in segment.split_whitespace() {
         let wlen = word.chars().count();
         if col == 0 {
             col = wlen;
@@ -391,17 +453,32 @@ mod tests {
         let mut modal = ConfirmationModal::new().with_selected(ConfirmationChoice::Cancel);
         assert!(matches!(
             modal.handle_key(enter),
+            ConfirmationOutcome::Declined
+        ));
+    }
+
+    #[test]
+    fn esc_always_cancels_regardless_of_selection() {
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        let mut modal = ConfirmationModal::new();
+        assert!(matches!(
+            modal.handle_key(esc),
+            ConfirmationOutcome::Cancelled
+        ));
+
+        let mut modal = ConfirmationModal::new().with_selected(ConfirmationChoice::Cancel);
+        assert!(matches!(
+            modal.handle_key(esc),
             ConfirmationOutcome::Cancelled
         ));
     }
 
     #[test]
-    fn esc_always_cancels() {
-        let mut modal = ConfirmationModal::new();
-        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(matches!(
-            modal.handle_key(esc),
-            ConfirmationOutcome::Cancelled
-        ));
+    fn wrap_line_count_respects_hard_newlines() {
+        // Three logical lines, each fits in 40 cols → 3 rows.
+        assert_eq!(wrap_line_count("alpha\nbeta\ngamma", 40), 3);
+        // Blank line between paragraphs is preserved as its own row.
+        assert_eq!(wrap_line_count("alpha\n\nbeta", 40), 3);
     }
 }

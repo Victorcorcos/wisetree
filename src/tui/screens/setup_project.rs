@@ -30,7 +30,8 @@ use ratatui::Frame;
 use crate::messages::colors;
 use crate::services::presets::{catalog, detect, Preset, PresetId, WisePresetDiscovery};
 use crate::tui::widgets::{
-    branded_line, ConfirmChoice, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+    branded_line, ConfirmationChoice, SelectOption, SelectOutcome, SelectPrompt, Status,
+    StatusIndicator,
 };
 
 const WISE_PRESET_LIST_LABEL: &str = "Wise Preset";
@@ -602,14 +603,14 @@ impl SetupProjectScreen {
     }
 
     /// Yes/No state of the Confirm step, collapsing the block-selection
-    /// rectangles into `ConfirmChoice::Confirm`. Returns `Confirm` when no
-    /// editor is active so callers that probe before discovery completes get
-    /// the same default the screen uses.
-    pub fn confirm_choice(&self) -> ConfirmChoice {
+    /// rectangles into `ConfirmationChoice::Confirm`. Returns `Confirm`
+    /// when no editor is active so callers that probe before discovery
+    /// completes get the same default the screen uses.
+    pub fn confirm_choice(&self) -> ConfirmationChoice {
         self.confirm
             .as_ref()
             .map(|editor| confirm_choice_for(editor.selection))
-            .unwrap_or(ConfirmChoice::Confirm)
+            .unwrap_or(ConfirmationChoice::Confirm)
     }
 
     pub fn complete_wise_discovery(&mut self, discovery: WisePresetDiscovery) {
@@ -1348,12 +1349,13 @@ fn render_yes_no(frame: &mut Frame, area: Rect, selection: ConfirmSelection) {
     frame.render_widget(cancel_box, cols[3]);
 }
 
-/// Map the active selection back to the legacy `ConfirmChoice` enum so callers
-/// that only care about Yes/No (e.g. some tests) can keep using it.
-pub fn confirm_choice_for(selection: ConfirmSelection) -> ConfirmChoice {
+/// Map the active selection to a plain `ConfirmationChoice` so callers
+/// that only care about Yes/No (e.g. some tests) can ignore the block-
+/// selection nuance.
+pub fn confirm_choice_for(selection: ConfirmSelection) -> ConfirmationChoice {
     match selection {
-        ConfirmSelection::No => ConfirmChoice::Cancel,
-        _ => ConfirmChoice::Confirm,
+        ConfirmSelection::No => ConfirmationChoice::Cancel,
+        _ => ConfirmationChoice::Confirm,
     }
 }
 

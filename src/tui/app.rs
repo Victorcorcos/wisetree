@@ -43,23 +43,23 @@ use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
-use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryLine, SummaryTone};
+use crate::tui::screens::create::{CreateAction, CreateScreen, CreateStep, SummaryLine, SummaryTone};
 use crate::tui::screens::dashboard::{
     BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
     MergePullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
-    DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen,
+    DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
 };
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
-use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen};
+use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen, SettingsStep};
-use crate::tui::screens::setup::{SetupAction, SetupScreen};
+use crate::tui::screens::setup::{SetupAction, SetupScreen, SetupStep};
 use crate::tui::screens::setup_project::{
     SetupProjectAction, SetupProjectPresetValues, SetupProjectScreen, SetupProjectStep,
 };
 use crate::tui::screens::update_branch::UpdateBranchScreen;
-use crate::tui::screens::update_pr::{UpdateAction, UpdatePullRequestScreen};
+use crate::tui::screens::update_pr::{UpdateAction, UpdatePullRequestScreen, UpdateStep};
 use crate::tui::selection::{
     clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
 };
@@ -377,41 +377,69 @@ impl App {
                 }
             }
             Screen::Cache => {
-                let h = self
-                    .cache
-                    .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                let panel = self.render_framed_panel_fill(frame, area);
                 if let Some(cache) = self.cache.as_mut() {
                     cache.tick = self.tick;
                     cache.render(frame, panel);
                 }
             }
             Screen::Create => {
-                let h = self
-                    .create
-                    .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                let panel = match self.create.as_ref().map(|s| s.step()) {
+                    Some(CreateStep::Confirm) | Some(CreateStep::NavigateConfirm) => {
+                        self.render_framed_panel_fill(frame, area)
+                    }
+                    _ => {
+                        let h = self
+                            .create
+                            .as_ref()
+                            .map_or(8, |s| s.preferred_content_height());
+                        self.render_framed_panel(frame, area, h)
+                    }
+                };
                 if let Some(create) = self.create.as_mut() {
                     create.tick = self.tick;
                     create.render(frame, panel);
                 }
             }
             Screen::Delete => {
-                let h = self
+                // When the single-target delete is awaiting confirmation,
+                // render the dashboard underneath so the user sees the
+                // worktree row they're about to remove. Bulk delete keeps
+                // the dedicated `BulkConfirmDialog` layout (no overlay).
+                let overlay_modal = self
                     .delete
                     .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
-                if let Some(delete) = self.delete.as_mut() {
-                    delete.tick = self.tick;
-                    delete.render(frame, panel);
+                    .filter(|d| matches!(d.step(), DeleteStep::Confirm))
+                    .and_then(|d| d.overlay_modal().cloned());
+                if let Some(modal) = overlay_modal {
+                    let panel = self.render_framed_panel_fill(frame, area);
+                    if let Some(dashboard) = self.dashboard.as_mut() {
+                        dashboard.tick = self.tick;
+                        dashboard.render(frame, panel);
+                    }
+                    modal.render(frame, panel);
+                } else {
+                    let panel = match self.delete.as_ref().map(|s| s.step()) {
+                        Some(DeleteStep::Confirm) => self.render_framed_panel_fill(frame, area),
+                        _ => {
+                            let h = self
+                                .delete
+                                .as_ref()
+                                .map_or(8, |s| s.preferred_content_height());
+                            self.render_framed_panel(frame, area, h)
+                        }
+                    };
+                    if let Some(delete) = self.delete.as_mut() {
+                        delete.tick = self.tick;
+                        delete.render(frame, panel);
+                    }
                 }
             }
             Screen::Settings => {
                 let panel = match self.settings.as_ref().map(|s| s.step()) {
-                    Some(SettingsStep::Menu) | None => self.render_framed_panel_fill(frame, area),
+                    Some(SettingsStep::Menu)
+                    | Some(SettingsStep::DeleteBranch)
+                    | None => self.render_framed_panel_fill(frame, area),
                     Some(_) => {
                         let h = self
                             .settings
@@ -426,22 +454,32 @@ impl App {
                 }
             }
             Screen::Setup => {
-                let h = self
-                    .setup
-                    .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                let panel = match self.setup.as_ref().map(|s| s.step()) {
+                    Some(SetupStep::Confirm) => self.render_framed_panel_fill(frame, area),
+                    _ => {
+                        let h = self
+                            .setup
+                            .as_ref()
+                            .map_or(8, |s| s.preferred_content_height());
+                        self.render_framed_panel(frame, area, h)
+                    }
+                };
                 if let Some(setup) = self.setup.as_mut() {
                     setup.tick = self.tick;
                     setup.render(frame, panel);
                 }
             }
             Screen::MergePullRequest => {
-                let h = self
-                    .merge_pr
-                    .as_ref()
-                    .map_or(8, |s| s.preferred_content_height());
-                let panel = self.render_framed_panel(frame, area, h);
+                let panel = match self.merge_pr.as_ref().map(|s| s.step()) {
+                    Some(MergeStep::Confirm) => self.render_framed_panel_fill(frame, area),
+                    _ => {
+                        let h = self
+                            .merge_pr
+                            .as_ref()
+                            .map_or(8, |s| s.preferred_content_height());
+                        self.render_framed_panel(frame, area, h)
+                    }
+                };
                 if let Some(merge_pr) = self.merge_pr.as_mut() {
                     merge_pr.tick = self.tick;
                     merge_pr.render(frame, panel);
@@ -479,7 +517,11 @@ impl App {
                     .update_pr
                     .as_ref()
                     .is_some_and(|s| s.is_updating() && s.ai_active());
-                let panel = if ai_active {
+                let in_confirm = self
+                    .update_pr
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.step(), UpdateStep::Confirm));
+                let panel = if ai_active || in_confirm {
                     self.render_framed_panel_fill(frame, area)
                 } else {
                     let h = self
@@ -1961,7 +2003,17 @@ impl App {
     }
 
     fn enter_screen(&mut self, screen: Screen, tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Delete renders the confirmation modal as an overlay on top of
+        // the dashboard. Preserve the dashboard instance across the
+        // transition so the row being deleted stays visible behind the
+        // modal instead of blanking out.
+        let preserved_dashboard = if matches!(screen, Screen::Delete) {
+            self.dashboard.take()
+        } else {
+            None
+        };
         self.clear_screen_state();
+        self.dashboard = preserved_dashboard;
         self.screen = screen;
 
         match screen {

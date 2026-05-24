@@ -3,7 +3,7 @@
 //!
 //! - `Loading` : spinner while the PR body is fetched via
 //!   `DashboardService::fetch_pr_details`.
-//! - `Confirm` : details panel on top, `ConfirmDialog` (Yes/No, **No**
+//! - `Confirm` : details panel on top, `ConfirmationModal` (Yes/No, **No**
 //!   default) on the bottom. Enter on Yes returns `MergeAction::Confirmed`.
 //! - `Merging` : spinner while `gh pr merge --squash` runs.
 //!
@@ -23,7 +23,7 @@ use crate::messages::colors;
 use crate::services::CheckStatus;
 use crate::tui::screens::dashboard::MergePullRequestRequest;
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status, StatusIndicator,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, Status, StatusIndicator,
 };
 
 const MERGE_LOADING_MESSAGE: &str = "Loading pull request details...";
@@ -52,7 +52,7 @@ pub struct MergePullRequestScreen {
     request: MergePullRequestRequest,
     body: Option<String>,
     error: Option<String>,
-    confirm: Option<ConfirmDialog>,
+    confirm: Option<ConfirmationModal>,
     step: MergeStep,
     pub tick: usize,
 }
@@ -138,7 +138,7 @@ impl MergePullRequestScreen {
             None => return MergeAction::Cancelled,
         };
         match dialog.handle_key(key) {
-            ConfirmOutcome::Confirmed => {
+            ConfirmationOutcome::Confirmed => {
                 let body = self.body.clone().unwrap_or_default();
                 MergeAction::Confirmed {
                     number: self.request.number,
@@ -146,8 +146,10 @@ impl MergePullRequestScreen {
                     body,
                 }
             }
-            ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => MergeAction::Cancelled,
-            ConfirmOutcome::Pending => MergeAction::Continue,
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                MergeAction::Cancelled
+            }
+            ConfirmationOutcome::Pending => MergeAction::Continue,
         }
     }
 
@@ -158,7 +160,7 @@ impl MergePullRequestScreen {
             MergeStep::Loading | MergeStep::Merging => 3,
             MergeStep::Confirm => {
                 // Title (1) + blank (1) + detail rows + body preview +
-                // ConfirmDialog (footprint ~8) + breathing room.
+                // ConfirmationModal (footprint ~10) + breathing room.
                 let detail_rows = self.detail_line_count() as u16;
                 let body_rows = body_preview_lines(self.body.as_deref()).len() as u16;
                 detail_rows
@@ -233,7 +235,7 @@ impl MergePullRequestScreen {
         let body_lines = body_preview_lines(self.body.as_deref());
         let detail_lines = build_detail_lines(&self.request);
 
-        let confirm_height: u16 = 8;
+        let confirm_height: u16 = 12;
         let body_height = (body_lines.len() as u16).max(1);
         let detail_height = detail_lines.len() as u16;
 
@@ -247,7 +249,7 @@ impl MergePullRequestScreen {
                 Constraint::Length(1),              // "Description:" label
                 Constraint::Length(body_height),    // body preview
                 Constraint::Length(1),              // blank
-                Constraint::Length(confirm_height), // ConfirmDialog
+                Constraint::Length(confirm_height), // ConfirmationModal
                 Constraint::Min(0),
             ])
             .split(area);
@@ -270,15 +272,18 @@ impl MergePullRequestScreen {
     }
 }
 
-fn build_confirm(request: &MergePullRequestRequest) -> ConfirmDialog {
+fn build_confirm(request: &MergePullRequestRequest) -> ConfirmationModal {
     let prompt = format!(
         "Squash-merge Pull Request #{} into its base branch?",
         request.number
     );
-    ConfirmDialog::new(format!("Merge Pull Request #{}", request.number), prompt)
-        .with_labels("Yes", "No")
-        .with_variant(ConfirmVariant::Default)
-        .with_default(ConfirmChoice::Cancel)
+    ConfirmationModal::new()
+        .with_title(format!("Merge Pull Request #{}", request.number))
+        .with_subtitle(prompt)
+        .with_confirm_text("Yes")
+        .with_cancel_text("No")
+        .with_color_value(colors::INFO)
+        .with_selected(ConfirmationChoice::Cancel)
 }
 
 fn build_detail_lines(request: &MergePullRequestRequest) -> Vec<Line<'static>> {
@@ -477,10 +482,7 @@ mod tests {
         screen.set_body("Lorem ipsum dolor sit amet.".to_string());
         assert_eq!(screen.step(), MergeStep::Confirm);
         let dialog = screen.confirm.as_ref().expect("confirm built after body");
-        assert_eq!(dialog.selected, ConfirmChoice::Cancel);
-        assert_eq!(dialog.confirm_label, "Yes");
-        assert_eq!(dialog.cancel_label, "No");
-        assert_eq!(dialog.variant, ConfirmVariant::Default);
+        assert_eq!(dialog.selected(), ConfirmationChoice::Cancel);
     }
 
     #[test]

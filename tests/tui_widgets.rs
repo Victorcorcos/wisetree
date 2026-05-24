@@ -9,9 +9,8 @@ use ratatui::Terminal;
 
 use wisetree::tui::widgets::{
     BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, CommandListProgress,
-    CommandProgress, ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, InputOutcome,
-    InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Spinner, Status, StatusIndicator,
-    SPINNER_FRAMES,
+    CommandProgress, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt,
+    Spinner, Status, StatusIndicator, SPINNER_FRAMES,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -447,55 +446,6 @@ fn select_render_uses_arrow_cursor_symbol() {
     let s = SelectPrompt::new("Pick", opts(&["alpha", "beta"]));
     let dumped = dump(60, 8, |f| s.render(f, f.area()));
     assert!(dumped.contains("➤"));
-}
-
-// -- ConfirmDialog ------------------------------------------------------------
-
-#[test]
-fn confirm_default_selection_is_cancel() {
-    let dialog = ConfirmDialog::new("Title", "msg");
-    assert_eq!(dialog.selected, ConfirmChoice::Cancel);
-}
-
-#[test]
-fn confirm_left_right_tab_toggle() {
-    let mut d = ConfirmDialog::new("T", "m");
-    matches!(d.handle_key(key(KeyCode::Right)), ConfirmOutcome::Pending);
-    assert_eq!(d.selected, ConfirmChoice::Confirm);
-    matches!(d.handle_key(key(KeyCode::Tab)), ConfirmOutcome::Pending);
-    assert_eq!(d.selected, ConfirmChoice::Cancel);
-    matches!(d.handle_key(key(KeyCode::Left)), ConfirmOutcome::Pending);
-    assert_eq!(d.selected, ConfirmChoice::Confirm);
-}
-
-#[test]
-fn confirm_y_n_shortcut_pre_selects_button() {
-    let mut d = ConfirmDialog::new("T", "m");
-    d.handle_key(key(KeyCode::Char('y')));
-    assert_eq!(d.selected, ConfirmChoice::Confirm);
-    d.handle_key(key(KeyCode::Char('n')));
-    assert_eq!(d.selected, ConfirmChoice::Cancel);
-}
-
-#[test]
-fn confirm_enter_dispatches_selected_branch() {
-    let mut d = ConfirmDialog::new("T", "m").with_default(ConfirmChoice::Confirm);
-    matches!(d.handle_key(key(KeyCode::Enter)), ConfirmOutcome::Confirmed);
-    let mut d = ConfirmDialog::new("T", "m");
-    matches!(d.handle_key(key(KeyCode::Enter)), ConfirmOutcome::Cancelled);
-}
-
-#[test]
-fn confirm_render_shows_labels_and_navigation_hint() {
-    let dialog = ConfirmDialog::new("Delete?", "Are you sure?")
-        .with_labels("Yep", "Nope")
-        .with_variant(ConfirmVariant::Danger);
-    let s = dump(60, 12, |f| dialog.render(f, f.area()));
-    assert!(s.contains("Delete?"));
-    assert!(s.contains("Are you sure"));
-    assert!(s.contains("Yep"));
-    assert!(s.contains("Nope"));
-    assert!(s.contains("Tab to navigate"));
 }
 
 // -- Spinner / Status / CommandListProgress / CommandProgress ----------------

@@ -462,13 +462,6 @@ impl DashboardScreen {
             return;
         }
 
-        if matches!(self.mode, DashboardMode::ConfirmClosePr) {
-            if let Some((modal, _)) = self.close_pr_modal.as_mut() {
-                modal.render(frame, area);
-            }
-            return;
-        }
-
         let footer_height = 10u16 + self.reviewers_footer_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -487,6 +480,16 @@ impl DashboardScreen {
         let layout = self.table_layout(chunks[4].width);
         self.render_table(frame, chunks[4], &layout);
         self.render_footer(frame, chunks[5], chunks[4].width, &layout);
+
+        // The Close PR confirmation is owned by the dashboard so the table
+        // and footer stay visible behind it. `ConfirmationModal::render`
+        // clears only its own centered rect, leaving the rest of the
+        // dashboard intact.
+        if matches!(self.mode, DashboardMode::ConfirmClosePr) {
+            if let Some((modal, _)) = self.close_pr_modal.as_mut() {
+                modal.render(frame, area);
+            }
+        }
     }
 
     fn handle_bulk_focus_key(
@@ -745,7 +748,7 @@ impl DashboardScreen {
                 self.mode = DashboardMode::Table;
                 DashboardAction::ClosePullRequest(Box::new(request))
             }
-            ConfirmationOutcome::Cancelled => {
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
                 self.close_pr_modal = None;
                 self.mode = DashboardMode::Table;
                 DashboardAction::Continue

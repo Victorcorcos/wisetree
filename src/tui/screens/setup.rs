@@ -3,8 +3,8 @@
 //!
 //! - `SelectShell` : `SelectPrompt` over zsh / bash; the detected shell is
 //!   marked "detected" in its description and pre-selected.
-//! - `Confirm`     : `ConfirmDialog` showing a preview of the block that
-//!   will be added to the user's rc file.
+//! - `Confirm`     : `ConfirmationModal` showing a preview of the block
+//!   that will be added to the user's rc file.
 //! - `Installing`  : spinner while `App` performs the install.
 //! - `Success`     : success message + reload-shell hint.
 //! - `Errored`     : error message + "Press any key to go back...".
@@ -22,7 +22,7 @@ use ratatui::Frame;
 use crate::messages::colors;
 use crate::services::{Shell, ShellIntegrationStatus};
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, SelectOption, SelectOutcome,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, SelectOption, SelectOutcome,
     SelectPrompt, Status, StatusIndicator,
 };
 
@@ -49,7 +49,7 @@ pub struct SetupScreen {
     selected: Shell,
     error: Option<String>,
     select: Option<SelectPrompt<Shell>>,
-    confirm: Option<ConfirmDialog>,
+    confirm: Option<ConfirmationModal>,
     on_macos: bool,
     pub tick: usize,
 }
@@ -140,7 +140,7 @@ impl SetupScreen {
         }
     }
 
-    fn build_confirm(&self) -> ConfirmDialog {
+    fn build_confirm(&self) -> ConfirmationModal {
         let config_file = self.config_file();
         let preview = "# Tab completions for wisetree commands\n# ...\n\n\
              # Shell wrapper for directory switching\n\
@@ -162,10 +162,13 @@ impl SetupScreen {
              After installation, run: source {config_file}\n\
              Then use: wisetree to quickly switch directories"
         );
-        ConfirmDialog::new("Install Shell Integration", message)
-            .with_labels("Install", "Cancel")
-            .with_variant(ConfirmVariant::Default)
-            .with_default(ConfirmChoice::Cancel)
+        ConfirmationModal::new()
+            .with_title("Install Shell Integration")
+            .with_subtitle(message)
+            .with_confirm_text("Install")
+            .with_cancel_text("Cancel")
+            .with_color_value(colors::INFO)
+            .with_selected(ConfirmationChoice::Cancel)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SetupAction {
@@ -210,15 +213,15 @@ impl SetupScreen {
             dialog.handle_key(key)
         };
         match outcome {
-            ConfirmOutcome::Confirmed => SetupAction::Confirmed {
+            ConfirmationOutcome::Confirmed => SetupAction::Confirmed {
                 shell: self.selected,
             },
-            ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => {
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
                 self.confirm = None;
                 self.step = SetupStep::SelectShell;
                 SetupAction::Continue
             }
-            ConfirmOutcome::Pending => SetupAction::Continue,
+            ConfirmationOutcome::Pending => SetupAction::Continue,
         }
     }
 
@@ -240,6 +243,9 @@ impl SetupScreen {
         match self.step {
             SetupStep::SelectShell => self.render_select(frame, area),
             SetupStep::Confirm => {
+                // Keep the shell picker visible behind the install
+                // confirmation so the user sees which shell they chose.
+                self.render_select(frame, area);
                 if let Some(c) = &self.confirm {
                     c.render(frame, area);
                 }
