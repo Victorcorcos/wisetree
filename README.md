@@ -91,9 +91,9 @@ After installation, confirm the binary is on your `$PATH`:
 wisetree --version
 ```
 
-### Enable the local pre-push hook (contributors)
+### Enable the local git hooks (contributors)
 
-This repository ships a tracked `githooks/pre-push` hook that mirrors the CI checks run in GitHub Actions before code is pushed.
+This repository ships tracked hooks in `githooks/` that auto-apply Rust fixes after commits and mirror the CI checks before code is pushed.
 
 After cloning, enable repo-local hooks once:
 
@@ -101,7 +101,15 @@ After cloning, enable repo-local hooks once:
 git config core.hooksPath githooks
 ```
 
-From that point on, every `git push` runs these checks locally and blocks the push if any of them fail:
+From that point on, every `git commit` runs the local auto-fix commands and creates a follow-up fix commit when they change tracked files:
+
+```rb
+cargo fix --all-targets --all-features
+cargo clippy --fix --all-targets --all-features
+cargo fmt --all
+```
+
+Every `git push` then runs these checks locally and blocks the push if any of them fail:
 
 ```rb
 cargo fmt --all -- --check
@@ -110,7 +118,7 @@ cargo build --all-targets
 cargo test --all-features
 ```
 
-If the hook reports an offense, fix it locally and push again. This keeps formatting, lint, build, and test failures from reaching CI.
+If the push hook reports an offense, fix it locally, commit it, and push again. This keeps formatting, lint, build, and test failures from reaching CI.
 
 ### Local development workflow
 
