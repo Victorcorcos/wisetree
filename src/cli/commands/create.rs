@@ -73,7 +73,7 @@ pub async fn run(args: CliArgs, service: &WorktreeService) -> Result<()> {
         new_branch: new_branch.clone(),
         base_path,
     };
-    service.create_worktree(&opts, None).await?;
+    service.create_worktree(&opts, None, None).await?;
 
     println!("{worktree_path_str}");
     println!("  source: {source}");

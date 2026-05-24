@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ "${WISETREE_SKIP_POST_COMMIT_AUTOFIX:-}" = "1" ]; then
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# `git commit` sets GIT_DIR (and friends) for hooks. Clear them before running
+# nested git commands so they resolve from the repository root normally.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+
+run_fix() {
+  local name="$1"
+  shift
+
+  printf 'post-commit: applying %s\n' "$name"
+
+  if ! "$@"; then
+    printf '\nwarning: auto-fix skipped because `%s` failed.\n' "$name" >&2
+    printf 'warning: resolve the reported issue locally before pushing.\n' >&2
+    exit 0
+  fi
+}
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  printf 'post-commit: skipping auto-fix commit because the worktree is not clean\n'
+  exit 0
+fi
+
+run_fix \
+  "cargo fix --all-targets --all-features" \
+  cargo fix --all-targets --all-features --allow-dirty --allow-staged
+
+run_fix \
+  "cargo clippy --fix --all-targets --all-features" \
+  cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged
+
+run_fix "cargo fmt --all" cargo fmt --all
+
+if ! git diff --quiet; then
+  printf 'post-commit: committing auto-formatted changes\n'
+  git add -u
+  WISETREE_SKIP_POST_COMMIT_AUTOFIX=1 \
+    git commit -m "chore: auto-format and fix (cargo fmt + clippy)"
+fi

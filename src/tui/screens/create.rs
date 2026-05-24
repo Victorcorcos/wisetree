@@ -9,10 +9,11 @@ use std::sync::Arc;
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
+use crate::files::ActivityKind;
 use crate::git::types::GitBranch;
 use crate::messages::{
     colors, CREATE_CONFIRM_TITLE, CREATE_CREATING, CREATE_DIRECTORY_PLACEHOLDER,
@@ -68,45 +69,48 @@ pub enum CreateAction {
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SummaryTone {
-    Info,
-    Success,
-    Warning,
-    Error,
-    Emphasis,
-    Muted,
-}
-
-impl SummaryTone {
-    fn style(self) -> Style {
-        match self {
-            Self::Info => Style::default()
-                .fg(colors::INFO)
-                .add_modifier(Modifier::BOLD),
-            Self::Success => Style::default().fg(colors::SUCCESS),
-            Self::Warning => Style::default().fg(colors::WARNING),
-            Self::Error => Style::default().fg(colors::ERROR),
-            Self::Emphasis => Style::default().fg(colors::EMPHASIS),
-            Self::Muted => Style::default().fg(colors::MUTED),
-        }
-    }
-}
-
+/// One row in the post-create summary table. Each row represents a single
+/// action that ran as part of `git worktree add` (Copy patterns, Link
+/// patterns, or one of the user's post-create commands) along with whether
+/// it succeeded and — if it failed — what went wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SummaryLine {
-    pub text: String,
-    pub tone: SummaryTone,
+pub struct SummaryRow {
+    pub command: String,
+    pub success: bool,
+    pub failure: Option<String>,
 }
 
-impl SummaryLine {
-    pub fn new(text: impl Into<String>, tone: SummaryTone) -> Self {
+impl SummaryRow {
+    pub fn success(command: impl Into<String>) -> Self {
         Self {
-            text: text.into(),
-            tone,
+            command: command.into(),
+            success: true,
+            failure: None,
+        }
+    }
+
+    pub fn failure(command: impl Into<String>, failure: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            success: false,
+            failure: Some(failure.into()),
         }
     }
 }
+
+/// One line in the Terminal Activity panel: a stage banner emitted by the
+/// orchestrator ("$ Copy patterns"), or a line of stdout / stderr streamed
+/// from a post-create command. The `kind` drives the color.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalLine {
+    pub text: String,
+    pub kind: ActivityKind,
+}
+
+/// Cap on retained Terminal Activity lines. `flutter pub get` and similar
+/// can produce thousands of lines — keep the most recent slice so the panel
+/// renders fast and stays useful as a tail.
+const TERMINAL_LOG_MAX_LINES: usize = 2000;
 
 pub struct CreateScreen {
     step: CreateStep,
@@ -140,7 +144,14 @@ pub struct CreateScreen {
     pub completed_commands: Vec<String>,
     pub failed_commands: Vec<String>,
     pub current_command_index: usize,
-    summary_lines: Vec<SummaryLine>,
+    summary_rows: Vec<SummaryRow>,
+
+    /// Streamed lines from the worktree-creation pipeline. Driven by
+    /// `AppEvent::CreateActivity`. Rendered as the Terminal Activity panel
+    /// below the "Creating" spinner so the user sees long-running commands
+    /// (`flutter pub get`, `bun install`) make progress instead of staring
+    /// at an opaque spinner.
+    terminal_log: Vec<TerminalLine>,
 
     pub tick: usize,
 }
@@ -167,9 +178,25 @@ impl CreateScreen {
             completed_commands: Vec::new(),
             failed_commands: Vec::new(),
             current_command_index: 0,
-            summary_lines: Vec::new(),
+            summary_rows: Vec::new(),
+            terminal_log: Vec::new(),
             tick: 0,
         }
+    }
+
+    /// Push a single line into the Terminal Activity log. Lines beyond
+    /// `TERMINAL_LOG_MAX_LINES` are dropped from the front so memory and
+    /// render cost stay bounded on noisy commands.
+    pub fn append_terminal_line(&mut self, text: String, kind: ActivityKind) {
+        self.terminal_log.push(TerminalLine { text, kind });
+        if self.terminal_log.len() > TERMINAL_LOG_MAX_LINES {
+            let drop = self.terminal_log.len() - TERMINAL_LOG_MAX_LINES;
+            self.terminal_log.drain(0..drop);
+        }
+    }
+
+    pub fn terminal_log_len(&self) -> usize {
+        self.terminal_log.len()
     }
 
     pub fn step(&self) -> CreateStep {
@@ -245,7 +272,7 @@ impl CreateScreen {
         self.created_worktree_path.as_deref()
     }
 
-    pub fn mark_complete(&mut self, summary_lines: Vec<SummaryLine>) {
+    pub fn mark_complete(&mut self, summary_rows: Vec<SummaryRow>) {
         // Mark the last running command as completed if not already.
         if let Some(cmd) = self
             .post_create_commands
@@ -256,8 +283,12 @@ impl CreateScreen {
                 self.completed_commands.push(cmd);
             }
         }
-        self.summary_lines = summary_lines;
+        self.summary_rows = summary_rows;
         self.step = CreateStep::Success;
+    }
+
+    pub fn summary_rows(&self) -> &[SummaryRow] {
+        &self.summary_rows
     }
 
     /// Compute the menu for the source-branch step. Public for tests.
@@ -502,6 +533,19 @@ impl CreateScreen {
         }
     }
 
+    /// Whether this screen should claim the full terminal height (like the
+    /// Dashboard) instead of the dynamically-sized framed panel. Returns
+    /// true for `Creating` so the Terminal Activity panel has room to show
+    /// long, scrolling output (e.g. `flutter pub get`).
+    pub fn wants_full_height(&self) -> bool {
+        !self.loading
+            && self.error.is_none()
+            && matches!(
+                self.step,
+                CreateStep::Creating | CreateStep::Confirm | CreateStep::NavigateConfirm
+            )
+    }
+
     /// Inner content height for the framed panel (excludes the rounded
     /// border).
     pub fn preferred_content_height(&self) -> u16 {
@@ -524,9 +568,25 @@ impl CreateScreen {
                 .map_or(ConfirmationModal::MIN_HEIGHT + 2, |d| {
                     d.required_height(80) + 2
                 }),
-            CreateStep::Creating => 3,
+            // Creating: spinner (3 rows) + terminal panel. The panel grows
+            // to fit recent activity, capped so we don't push the rest of
+            // the layout off-screen.
+            CreateStep::Creating => {
+                let terminal_rows = (self.terminal_log.len() as u16 + 2).clamp(5, 20);
+                3 + terminal_rows
+            }
             CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
-            CreateStep::Success => 5 + (self.summary_lines.len() as u16).min(12),
+            // Success layout = 3 (status banner) + 2 (worktree path + spacer)
+            // + table (2 chrome rows + N data rows, capped) + 1 (footer hint).
+            CreateStep::Success => {
+                let table_rows = (self.summary_rows.len() as u16).min(12);
+                let table_height = if self.summary_rows.is_empty() {
+                    1
+                } else {
+                    table_rows + 3
+                };
+                3 + 2 + table_height + 1
+            }
         }
     }
 
@@ -595,9 +655,14 @@ impl CreateScreen {
                 }
             }
             CreateStep::Creating => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(3)])
+                    .split(area);
                 StatusIndicator::new(Status::Loading, CREATE_CREATING)
                     .with_tick(self.tick)
-                    .render(frame, area);
+                    .render(frame, chunks[0]);
+                render_terminal_activity(&self.terminal_log, frame, chunks[1]);
             }
             CreateStep::RunningCommands => {
                 CommandListProgress::new(&self.post_create_commands, self.current_command_index)
@@ -611,6 +676,7 @@ impl CreateScreen {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(3),
+                        Constraint::Length(2),
                         Constraint::Min(0),
                         Constraint::Length(1),
                     ])
@@ -619,13 +685,26 @@ impl CreateScreen {
                     .without_spinner()
                     .render(frame, chunks[0]);
 
-                if !self.summary_lines.is_empty() {
-                    let lines: Vec<Line> = self
-                        .summary_lines
-                        .iter()
-                        .map(|line| Line::from(branded_line(&line.text, line.tone.style())))
-                        .collect();
-                    frame.render_widget(Paragraph::new(lines), chunks[1]);
+                if let Some(path) = self.created_worktree_path.as_deref() {
+                    let path_line = Line::from(branded_line(
+                        &format!("Worktree path: {path}"),
+                        Style::default()
+                            .fg(colors::EMPHASIS)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    frame.render_widget(Paragraph::new(path_line), chunks[1]);
+                }
+
+                if self.summary_rows.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new(
+                            "No copy, shared cache link, or post-create steps were configured.",
+                        )
+                        .style(Style::default().fg(colors::MUTED)),
+                        chunks[2],
+                    );
+                } else {
+                    render_summary_table(&self.summary_rows, frame, chunks[2]);
                 }
 
                 frame.render_widget(
@@ -634,7 +713,7 @@ impl CreateScreen {
                             .fg(colors::MUTED)
                             .add_modifier(Modifier::DIM),
                     ),
-                    chunks[2],
+                    chunks[3],
                 );
             }
         }
@@ -692,4 +771,136 @@ fn build_navigate_confirm() -> ConfirmationModal {
         .with_cancel_text("No")
         .with_color_value(colors::INFO)
         .with_selected(ConfirmationChoice::Confirm)
+}
+
+fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) {
+    let header = Row::new(vec![
+        Cell::from("Command"),
+        Cell::from("Status"),
+        Cell::from("Failure"),
+    ])
+    .style(
+        Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .map(|r| {
+            let (status_symbol, status_color) = if r.success {
+                ("✅", colors::SUCCESS)
+            } else {
+                ("❌", colors::ERROR)
+            };
+            let status_cell = Cell::from(Line::from(Span::styled(
+                status_symbol,
+                Style::default().fg(status_color),
+            )));
+            let (failure_text, failure_style) = match &r.failure {
+                Some(reason) => (truncate_failure(reason), Style::default().fg(colors::ERROR)),
+                None => ("None".to_string(), Style::default().fg(colors::MUTED)),
+            };
+            Row::new(vec![
+                Cell::from(r.command.clone()).style(Style::default().fg(colors::EMPHASIS)),
+                status_cell,
+                Cell::from(failure_text).style(failure_style),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Percentage(40),
+        Constraint::Length(8),
+        Constraint::Min(10),
+    ];
+
+    let table = Table::new(table_rows, widths)
+        .header(header)
+        .column_spacing(2)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(colors::MUTED)),
+        );
+
+    frame.render_widget(table, area);
+}
+
+/// Keep failure cells to a single line of readable text. Joins multi-line
+/// stderr on spaces and adds an ellipsis when truncated so the table never
+/// expands vertically beyond one row per action.
+fn truncate_failure(text: &str) -> String {
+    let compact = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = compact.trim();
+    let limit = 120;
+    if trimmed.chars().count() > limit {
+        let head: String = trimmed.chars().take(limit).collect();
+        format!("{head}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Render the live "Terminal Activity" panel under the Creating spinner.
+/// Mirrors the AI Activity panel's visual treatment (rounded border, bold
+/// title) but uses TEAL instead of orange to distinguish "background
+/// commands running" from "AI working on conflicts". Auto-tails the log so
+/// the most recent line is always visible.
+fn render_terminal_activity(log: &[TerminalLine], frame: &mut Frame, area: Rect) {
+    let border_style = Style::default().fg(colors::TEAL);
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "Terminal Activity",
+            Style::default()
+                .fg(colors::TEAL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if log.is_empty() {
+        let placeholder = Paragraph::new("Waiting for commands to run...").style(
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        );
+        frame.render_widget(placeholder, inner);
+        return;
+    }
+
+    let visible_rows = inner.height as usize;
+    let start = log.len().saturating_sub(visible_rows);
+    let lines: Vec<Line<'static>> = log[start..]
+        .iter()
+        .map(|line| {
+            let style = match line.kind {
+                ActivityKind::Status => Style::default()
+                    .fg(colors::TEAL)
+                    .add_modifier(Modifier::BOLD),
+                ActivityKind::Stdout => Style::default().fg(colors::EMPHASIS),
+                ActivityKind::Stderr => Style::default().fg(colors::ERROR),
+            };
+            Line::from(Span::styled(line.text.clone(), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }

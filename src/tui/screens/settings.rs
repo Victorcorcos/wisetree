@@ -3832,6 +3832,8 @@ impl SettingsScreen {
                 Constraint::Length(3),
                 Constraint::Length(1),
                 Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .split(area);
         frame.render_widget(
@@ -3851,30 +3853,20 @@ impl SettingsScreen {
 
         let editing_idx = editor.editing_index();
         let command_area = chunks[2];
-        let visible_range = editor.visible_range((command_area.height / 4) as usize);
+        let visible_range = editor.visible_range((command_area.height / 3) as usize);
         let hidden_above = visible_range.start;
         let hidden_below = editor.commands.len().saturating_sub(visible_range.end);
         let is_scrollable = hidden_above > 0 || hidden_below > 0;
-        let command_chunks: Vec<(Rect, Rect)> = (0..visible_range.len())
-            .map(|i| {
-                let base_y = command_area.y + (i as u16) * 4;
-                let rect = Rect {
-                    x: command_area.x,
-                    y: base_y,
-                    width: command_area.width,
-                    height: 3,
-                };
-                let hint = Rect {
-                    x: command_area.x,
-                    y: base_y + 3,
-                    width: command_area.width,
-                    height: 1,
-                };
-                (rect, hint)
+        let command_chunks: Vec<Rect> = (0..visible_range.len())
+            .map(|i| Rect {
+                x: command_area.x,
+                y: command_area.y + (i as u16) * 3,
+                width: command_area.width,
+                height: 3,
             })
             .collect();
 
-        for ((chunk, hint_chunk), i) in command_chunks.into_iter().zip(visible_range.clone()) {
+        for (chunk, i) in command_chunks.into_iter().zip(visible_range.clone()) {
             let cmd = &editor.commands[i];
             let status = editor.statuses[i];
             let is_selected = matches!(editor.selection, PostCmdSelection::Rect(j) if j == i);
@@ -3944,15 +3936,6 @@ impl SettingsScreen {
                 .padding(Padding::horizontal(1))
                 .title(title_line);
             frame.render_widget(Paragraph::new(inner_line).block(block), chunk);
-
-            let hint_line = Line::from(vec![
-                Span::styled("  ↳ ", muted_style),
-                Span::styled(
-                    "Shell command • $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",
-                    muted_style,
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(hint_line), hint_chunk);
         }
 
         if is_scrollable {
@@ -3972,6 +3955,31 @@ impl SettingsScreen {
         ]);
         frame.render_widget(Paragraph::new(saving_line), chunks[5]);
 
+        let var_style = Style::default().fg(colors::INFO);
+        let accent_style = Style::default().fg(colors::ACCENT);
+        let legend_intro = Line::from(vec![
+            Span::styled("Variables ", muted_style),
+            Span::styled("(usable in any post-create command)", dim_muted_style),
+            Span::styled(":", muted_style),
+        ]);
+        frame.render_widget(Paragraph::new(legend_intro), chunks[6]);
+
+        let legend_vars = Line::from(vec![
+            Span::styled("  ", muted_style),
+            Span::styled("$BASE_PATH", var_style),
+            Span::styled(" repo dir", muted_style),
+            Span::styled("  •  ", accent_style),
+            Span::styled("$WORKTREE_PATH", var_style),
+            Span::styled(" new worktree path", muted_style),
+            Span::styled("  •  ", accent_style),
+            Span::styled("$BRANCH_NAME", var_style),
+            Span::styled(" new branch", muted_style),
+            Span::styled("  •  ", accent_style),
+            Span::styled("$SOURCE_BRANCH", var_style),
+            Span::styled(" source branch", muted_style),
+        ]);
+        frame.render_widget(Paragraph::new(legend_vars), chunks[7]);
+
         let hint = if editing_idx.is_some() {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
         } else if is_scrollable {
@@ -3979,7 +3987,7 @@ impl SettingsScreen {
         } else {
             "↑↓ move • Shift+K reorder up • Shift+J reorder down • Enter edit/Create/Save • Backspace toggles delete • ←→ between buttons • Esc back"
         };
-        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[6]);
+        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[8]);
     }
 
     fn render_post_cmd_scroll_indicator(

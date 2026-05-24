@@ -63,7 +63,7 @@ async fn post_create_runs_commands_and_invokes_progress() {
         source_branch: String::new(),
     };
     let commands = vec!["echo hello > out.txt".to_string(), "false".to_string()];
-    let results = execute_post_create_commands(&commands, &vars, Some(cb_dyn)).await;
+    let results = execute_post_create_commands(&commands, &vars, Some(cb_dyn), &mut None).await;
 
     assert_eq!(results.len(), 2);
     assert!(results[0].success);
@@ -80,7 +80,8 @@ async fn post_create_runs_commands_and_invokes_progress() {
 #[tokio::test]
 async fn post_create_skips_blank_command_as_success() {
     let vars = TemplateVariables::default();
-    let results = execute_post_create_commands(&[String::new(), "   ".into()], &vars, None).await;
+    let results =
+        execute_post_create_commands(&[String::new(), "   ".into()], &vars, None, &mut None).await;
     assert_eq!(results.len(), 2);
     assert!(results[0].success);
     assert!(results[1].success);
@@ -89,7 +90,7 @@ async fn post_create_skips_blank_command_as_success() {
 #[tokio::test]
 async fn post_create_returns_empty_for_empty_input() {
     let vars = TemplateVariables::default();
-    let results = execute_post_create_commands(&[], &vars, None).await;
+    let results = execute_post_create_commands(&[], &vars, None, &mut None).await;
     assert!(results.is_empty());
 }
 
