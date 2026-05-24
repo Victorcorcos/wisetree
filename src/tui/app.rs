@@ -443,9 +443,9 @@ impl App {
             }
             Screen::Settings => {
                 let panel = match self.settings.as_ref().map(|s| s.step()) {
-                    Some(SettingsStep::Menu)
-                    | Some(SettingsStep::DeleteBranch)
-                    | None => self.render_framed_panel_fill(frame, area),
+                    Some(SettingsStep::Menu) | Some(SettingsStep::DeleteBranch) | None => {
+                        self.render_framed_panel_fill(frame, area)
+                    }
                     Some(_) => {
                         let h = self
                             .settings

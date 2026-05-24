@@ -197,7 +197,9 @@ impl ConfirmationModal {
         } else {
             area.height
         };
-        let modal_height = needed_height.min(max_height).max(Self::MIN_HEIGHT.min(area.height));
+        let modal_height = needed_height
+            .min(max_height)
+            .max(Self::MIN_HEIGHT.min(area.height));
 
         let rect = centered_rect(area, modal_width, modal_height);
         if rect.width < 6 || rect.height < 6 {

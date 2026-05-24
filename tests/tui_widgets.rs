@@ -9,8 +9,8 @@ use ratatui::Terminal;
 
 use wisetree::tui::widgets::{
     BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, CommandListProgress,
-    CommandProgress, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt,
-    Spinner, Status, StatusIndicator, SPINNER_FRAMES,
+    CommandProgress, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Spinner,
+    Status, StatusIndicator, SPINNER_FRAMES,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
