@@ -1,8 +1,9 @@
 //! Delete Worktree screen. Three-step state machine:
 //!
-//! - `Confirm` : `ConfirmDialog`. Variant=Danger when the worktree is dirty
-//!   or the branch will be deleted alongside it; Warning otherwise. The
-//!   confirm label flips to "Force Delete" when the worktree is dirty.
+//! - `Confirm` : `ConfirmationModal` (single delete) or `BulkConfirmDialog`
+//!   (bulk delete). Color=ERROR when the worktree is dirty or the branch
+//!   will be deleted alongside it; WARNING otherwise. The confirm label
+//!   flips to "Force Delete" when the worktree is dirty.
 //! - `Deleting`: spinner with `Deleting worktree... (<branch>)`.
 //! - `Success` : success message — varies based on whether the branch was
 //!   also deleted, kept, or never targeted (mirrors upstream wording).
@@ -26,8 +27,8 @@ use crate::messages::{
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    branded_line, BulkConfirmDialog, BulkConfirmItem, BulkConfirmOutcome, ConfirmChoice,
-    ConfirmDialog, ConfirmOutcome, ConfirmVariant, Status, StatusIndicator,
+    branded_line, BulkConfirmDialog, BulkConfirmItem, BulkConfirmOutcome, ConfirmVariant,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, Status, StatusIndicator,
 };
 
 const BULK_DELETE_CONFIRM_PROMPT: &str = "Are you sure you want to delete all these worktrees?";
@@ -71,7 +72,7 @@ pub struct DeleteScreen {
     delete_branch_with_worktree: bool,
     loading: bool,
     error: Option<String>,
-    confirm: Option<ConfirmDialog>,
+    confirm: Option<ConfirmationModal>,
     bulk_confirm: Option<BulkConfirmDialog>,
     outcome: Option<DeleteOutcome>,
     /// Paths queued for a bulk delete from the dashboard. Empty for
@@ -140,6 +141,17 @@ impl DeleteScreen {
 
     pub fn step(&self) -> DeleteStep {
         self.step
+    }
+
+    /// The single-target confirmation modal, when it should be drawn as
+    /// an overlay over the dashboard (versus the bulk-delete dialog, which
+    /// uses its own non-overlay layout). Returns `None` for the bulk
+    /// dialog so callers can fall through to the existing render path.
+    pub fn overlay_modal(&self) -> Option<&ConfirmationModal> {
+        if self.bulk_confirm.is_some() {
+            return None;
+        }
+        self.confirm.as_ref()
     }
 
     pub fn loading(&self) -> bool {
@@ -251,7 +263,7 @@ impl DeleteScreen {
             .and_then(|p| self.worktrees.iter().find(|w| w.path == p))
     }
 
-    fn build_confirm(&self) -> Option<ConfirmDialog> {
+    fn build_confirm(&self) -> Option<ConfirmationModal> {
         let wt = self.selected()?;
         let has_changes = !wt.is_clean;
         let will_delete_branch =
@@ -304,16 +316,19 @@ impl DeleteScreen {
         let message = lines.join("\n");
 
         let confirm_label = if has_changes { "Force Delete" } else { "Yes" };
-        let variant = if has_changes || will_delete_branch {
-            ConfirmVariant::Danger
+        let color = if has_changes || will_delete_branch {
+            colors::ERROR
         } else {
-            ConfirmVariant::Warning
+            colors::WARNING
         };
         Some(
-            ConfirmDialog::new(title, message)
-                .with_labels(confirm_label, "No")
-                .with_variant(variant)
-                .with_default(ConfirmChoice::Cancel),
+            ConfirmationModal::new()
+                .with_title(title)
+                .with_subtitle(message)
+                .with_confirm_text(confirm_label)
+                .with_cancel_text("No")
+                .with_color_value(color)
+                .with_selected(ConfirmationChoice::Cancel),
         )
     }
 
@@ -406,7 +421,7 @@ impl DeleteScreen {
             dialog.handle_key(key)
         };
         match outcome {
-            ConfirmOutcome::Confirmed => {
+            ConfirmationOutcome::Confirmed => {
                 let wt = match self.selected() {
                     Some(w) => w,
                     None => return DeleteAction::Cancelled,
@@ -415,11 +430,11 @@ impl DeleteScreen {
                 let path = wt.path.clone();
                 DeleteAction::Confirmed { path, force }
             }
-            ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => {
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
                 self.confirm = None;
                 DeleteAction::Cancelled
             }
-            ConfirmOutcome::Pending => DeleteAction::Continue,
+            ConfirmationOutcome::Pending => DeleteAction::Continue,
         }
     }
 
@@ -480,8 +495,10 @@ impl DeleteScreen {
             DeleteStep::Confirm => {
                 if let Some(bulk) = self.bulk_confirm.as_ref() {
                     bulk.preferred_content_height()
+                } else if let Some(confirm) = self.confirm.as_ref() {
+                    confirm.required_height(80) + 2
                 } else {
-                    10
+                    ConfirmationModal::MIN_HEIGHT + 2
                 }
             }
             DeleteStep::Deleting => 3,

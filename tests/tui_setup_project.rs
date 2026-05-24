@@ -15,7 +15,7 @@ use wisetree::services::presets::{catalog, discover_wise, PresetId, WisePresetDi
 use wisetree::tui::screens::setup_project::{
     PresetChoice, SetupProjectAction, SetupProjectScreen, SetupProjectStep,
 };
-use wisetree::tui::widgets::ConfirmChoice;
+use wisetree::tui::widgets::ConfirmationChoice;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -150,7 +150,7 @@ fn enter_on_catalog_preset_advances_to_confirm() {
     let action = screen.handle_key(key(KeyCode::Enter));
     assert_eq!(action, SetupProjectAction::Continue);
     assert_eq!(screen.step(), SetupProjectStep::Confirm);
-    assert_eq!(screen.confirm_choice(), ConfirmChoice::Confirm);
+    assert_eq!(screen.confirm_choice(), ConfirmationChoice::Confirm);
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn arrow_toggles_yes_no_and_no_returns_to_preset_list() {
     screen.handle_key(key(KeyCode::Enter));
 
     screen.handle_key(key(KeyCode::Right));
-    assert_eq!(screen.confirm_choice(), ConfirmChoice::Cancel);
+    assert_eq!(screen.confirm_choice(), ConfirmationChoice::Cancel);
 
     let action = screen.handle_key(key(KeyCode::Enter));
     assert_eq!(action, SetupProjectAction::Continue);
@@ -300,10 +300,10 @@ fn n_shortcut_selects_no() {
     let mut screen = SetupProjectScreen::new(Some(tmp.path()));
     screen.handle_key(key(KeyCode::Enter));
     screen.handle_key(key(KeyCode::Char('n')));
-    assert_eq!(screen.confirm_choice(), ConfirmChoice::Cancel);
+    assert_eq!(screen.confirm_choice(), ConfirmationChoice::Cancel);
 
     screen.handle_key(key(KeyCode::Char('y')));
-    assert_eq!(screen.confirm_choice(), ConfirmChoice::Confirm);
+    assert_eq!(screen.confirm_choice(), ConfirmationChoice::Confirm);
 }
 
 #[test]

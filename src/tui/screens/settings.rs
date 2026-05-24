@@ -25,8 +25,8 @@ use crate::messages::{
 };
 use crate::services::UpdateCheckResult;
 use crate::tui::widgets::{
-    branded_line, ConfirmChoice, ConfirmDialog, ConfirmVariant, InputOutcome, InputPrompt,
-    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+    branded_line, ConfirmationChoice, ConfirmationModal, InputOutcome, InputPrompt, SelectOption,
+    SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1084,7 +1084,7 @@ pub struct SettingsScreen {
     local_config_path: Option<String>,
     error: Option<String>,
     select: Option<SelectPrompt<SettingsStep>>,
-    delete_branch_dialog: Option<ConfirmDialog>,
+    delete_branch_dialog: Option<ConfirmationModal>,
     pattern_list_editor: Option<PatternListEditor>,
     post_cmd_editor: Option<PostCmdEditor>,
     post_cmd_input: Option<InputPrompt>,
@@ -2575,8 +2575,8 @@ impl SettingsScreen {
                 SettingsAction::Continue
             }
             KeyCode::Enter => SettingsAction::SetDeleteBranchWithWorktree(matches!(
-                dialog.selected,
-                ConfirmChoice::Confirm
+                dialog.selected(),
+                ConfirmationChoice::Confirm
             )),
             _ => {
                 let _ = dialog.handle_key(key);
@@ -4245,45 +4245,38 @@ impl SettingsScreen {
         frame.render_widget(save_box, cols[1]);
     }
 
-    fn build_delete_branch_dialog(&self) -> ConfirmDialog {
+    fn build_delete_branch_dialog(&self) -> ConfirmationModal {
         let default_choice = if self.config.delete_branch_with_worktree {
-            ConfirmChoice::Confirm
+            ConfirmationChoice::Confirm
         } else {
-            ConfirmChoice::Cancel
+            ConfirmationChoice::Cancel
         };
 
-        ConfirmDialog::new(
-            "Delete Branch with Worktree",
-            "Also delete the associated git branch when deleting a worktree?\n\n\
+        ConfirmationModal::new()
+            .with_title("Delete Branch with Worktree")
+            .with_subtitle(
+                "Also delete the associated git branch when deleting a worktree?\n\n\
 Safety features:\n\
   • Never deletes current or default branches\n\
   • Shows branch status (commits ahead/behind)\n\
   • Requires explicit confirmation",
-        )
-        .with_variant(ConfirmVariant::Warning)
-        .with_default(default_choice)
+            )
+            .with_confirm_text("Yes")
+            .with_cancel_text("No")
+            .with_color_value(colors::WARNING)
+            .with_selected(default_choice)
     }
 
     fn render_delete_branch(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(2)])
-            .split(area);
+        // Render the settings menu underneath so the modal floats over the
+        // list the user just navigated from.
+        self.render_menu(frame, area);
 
         if let Some(dialog) = &self.delete_branch_dialog {
-            dialog.render(frame, chunks[0]);
+            dialog.render(frame, area);
         } else {
-            self.build_delete_branch_dialog().render(frame, chunks[0]);
+            self.build_delete_branch_dialog().render(frame, area);
         }
-
-        let path_line = Line::from(vec![
-            Span::styled("Updating: ", Style::default().fg(colors::MUTED)),
-            Span::styled(
-                self.config_path.clone(),
-                Style::default().fg(colors::EMPHASIS),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(path_line), chunks[1]);
     }
 
     fn render_check_updates(&self, frame: &mut Frame, area: Rect) {

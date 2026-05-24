@@ -21,9 +21,8 @@ use crate::messages::{
     CREATE_NEW_BRANCH_PLACEHOLDER, CREATE_SOURCE_BRANCH_PROMPT, CREATE_SUCCESS, LOADING_BRANCHES,
 };
 use crate::tui::widgets::{
-    branded_line, CommandListProgress, ConfirmChoice, ConfirmDialog, ConfirmOutcome,
-    ConfirmVariant, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status,
-    StatusIndicator,
+    branded_line, CommandListProgress, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+    InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 use crate::utils::validation::{
     normalize_branch_name, validate_branch_name, validate_directory_name,
@@ -127,8 +126,8 @@ pub struct CreateScreen {
     source_select: Option<SelectPrompt<String>>,
     custom_ref_input: Option<InputPrompt>,
     new_branch_input: Option<InputPrompt>,
-    confirm_dialog: Option<ConfirmDialog>,
-    navigate_dialog: Option<ConfirmDialog>,
+    confirm_dialog: Option<ConfirmationModal>,
+    navigate_dialog: Option<ConfirmationModal>,
 
     /// User's answer to the post-confirmation "navigate into the worktree?"
     /// question. Defaults to `true` since that's the default option.
@@ -231,6 +230,12 @@ impl CreateScreen {
     /// Caller invoked after Confirmed — moves to the spinner step.
     pub fn start_creating(&mut self) {
         self.step = CreateStep::Creating;
+        // The Confirm + NavigateConfirm steps rendered the new-branch
+        // form behind their modal; drop it now that we're moving on to
+        // the spinner.
+        self.new_branch_input = None;
+        self.confirm_dialog = None;
+        self.navigate_dialog = None;
     }
 
     /// Caller invoked after the worktree exists and post-create commands are
@@ -445,7 +450,10 @@ impl CreateScreen {
                 } else {
                     self.new_branch = normalized;
                 }
-                self.new_branch_input = None;
+                // Keep `new_branch_input` populated so the Confirm /
+                // NavigateConfirm steps can render it (read-only) behind
+                // the modal as visual context. Cleared once we actually
+                // start creating the worktree.
                 self.confirm_dialog = Some(self.build_confirm());
                 self.step = CreateStep::Confirm;
                 CreateAction::Continue
@@ -455,7 +463,7 @@ impl CreateScreen {
         }
     }
 
-    fn build_confirm(&self) -> ConfirmDialog {
+    fn build_confirm(&self) -> ConfirmationModal {
         let using_existing = self.new_branch == self.source_branch;
         let message = if using_existing {
             format!(
@@ -468,9 +476,11 @@ impl CreateScreen {
                 self.directory_name, self.new_branch, self.source_branch
             )
         };
-        ConfirmDialog::new(CREATE_CONFIRM_TITLE, message)
-            .with_variant(ConfirmVariant::Default)
-            .with_default(ConfirmChoice::Confirm)
+        ConfirmationModal::new()
+            .with_title(CREATE_CONFIRM_TITLE)
+            .with_subtitle(message)
+            .with_color_value(colors::INFO)
+            .with_selected(ConfirmationChoice::Confirm)
     }
 
     fn handle_confirm(&mut self, key: KeyEvent) -> CreateAction {
@@ -479,15 +489,17 @@ impl CreateScreen {
         }
         let dialog = self.confirm_dialog.as_mut().expect("set above");
         match dialog.handle_key(key) {
-            ConfirmOutcome::Confirmed => {
+            ConfirmationOutcome::Confirmed => {
                 self.confirm_dialog = None;
                 self.navigate_dialog = Some(build_navigate_confirm());
                 self.navigate_after_create = true;
                 self.step = CreateStep::NavigateConfirm;
                 CreateAction::Continue
             }
-            ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => CreateAction::Cancelled,
-            ConfirmOutcome::Pending => CreateAction::Continue,
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                CreateAction::Cancelled
+            }
+            ConfirmationOutcome::Pending => CreateAction::Continue,
         }
     }
 
@@ -498,7 +510,7 @@ impl CreateScreen {
         let dialog = self.navigate_dialog.as_mut().expect("set above");
         let outcome = dialog.handle_key(key);
         match outcome {
-            ConfirmOutcome::Confirmed => {
+            ConfirmationOutcome::Confirmed => {
                 self.navigate_after_create = true;
                 self.navigate_dialog = None;
                 CreateAction::Confirmed {
@@ -507,7 +519,7 @@ impl CreateScreen {
                     new_branch: self.new_branch.clone(),
                 }
             }
-            ConfirmOutcome::Declined => {
+            ConfirmationOutcome::Declined => {
                 self.navigate_after_create = false;
                 self.navigate_dialog = None;
                 CreateAction::Confirmed {
@@ -516,8 +528,8 @@ impl CreateScreen {
                     new_branch: self.new_branch.clone(),
                 }
             }
-            ConfirmOutcome::Cancelled => CreateAction::Cancelled,
-            ConfirmOutcome::Pending => CreateAction::Continue,
+            ConfirmationOutcome::Cancelled => CreateAction::Cancelled,
+            ConfirmationOutcome::Pending => CreateAction::Continue,
         }
     }
 
@@ -526,7 +538,12 @@ impl CreateScreen {
     /// true for `Creating` so the Terminal Activity panel has room to show
     /// long, scrolling output (e.g. `flutter pub get`).
     pub fn wants_full_height(&self) -> bool {
-        !self.loading && self.error.is_none() && matches!(self.step, CreateStep::Creating)
+        !self.loading
+            && self.error.is_none()
+            && matches!(
+                self.step,
+                CreateStep::Creating | CreateStep::Confirm | CreateStep::NavigateConfirm
+            )
     }
 
     /// Inner content height for the framed panel (excludes the rounded
@@ -539,7 +556,18 @@ impl CreateScreen {
             CreateStep::Directory => 7,
             CreateStep::CustomRef | CreateStep::NewBranch => 6,
             CreateStep::SourceBranch => (6 + (self.branches.len() + 1).max(1) as u16).min(15),
-            CreateStep::Confirm | CreateStep::NavigateConfirm => 10,
+            CreateStep::Confirm => self
+                .confirm_dialog
+                .as_ref()
+                .map_or(ConfirmationModal::MIN_HEIGHT + 2, |d| {
+                    d.required_height(80) + 2
+                }),
+            CreateStep::NavigateConfirm => self
+                .navigate_dialog
+                .as_ref()
+                .map_or(ConfirmationModal::MIN_HEIGHT + 2, |d| {
+                    d.required_height(80) + 2
+                }),
             // Creating: spinner (3 rows) + terminal panel. The panel grows
             // to fit recent activity, capped so we don't push the rest of
             // the layout off-screen.
@@ -609,11 +637,19 @@ impl CreateScreen {
                 }
             }
             CreateStep::Confirm => {
+                // Keep the just-filled new-branch form visible behind
+                // the modal so the user sees the inputs they entered.
+                if let Some(p) = &self.new_branch_input {
+                    p.render(frame, area, self.tick);
+                }
                 if let Some(d) = &self.confirm_dialog {
                     d.render(frame, area);
                 }
             }
             CreateStep::NavigateConfirm => {
+                if let Some(p) = &self.new_branch_input {
+                    p.render(frame, area, self.tick);
+                }
                 if let Some(d) = &self.navigate_dialog {
                     d.render(frame, area);
                 }
@@ -728,10 +764,13 @@ fn custom_ref_input() -> InputPrompt {
         })
 }
 
-fn build_navigate_confirm() -> ConfirmDialog {
-    ConfirmDialog::new(CREATE_NAVIGATE_TITLE, CREATE_NAVIGATE_PROMPT)
-        .with_variant(ConfirmVariant::Default)
-        .with_default(ConfirmChoice::Confirm)
+fn build_navigate_confirm() -> ConfirmationModal {
+    ConfirmationModal::new()
+        .with_title(CREATE_NAVIGATE_TITLE)
+        .with_subtitle(CREATE_NAVIGATE_PROMPT)
+        .with_cancel_text("No")
+        .with_color_value(colors::INFO)
+        .with_selected(ConfirmationChoice::Confirm)
 }
 
 fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) {
