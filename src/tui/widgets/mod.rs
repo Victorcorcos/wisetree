@@ -7,7 +7,6 @@ pub mod border;
 pub mod bulk_confirm_dialog;
 pub mod command_list_progress;
 pub mod command_progress;
-pub mod confirm_dialog;
 pub mod confirmation_modal;
 pub mod input_prompt;
 pub mod pty_view;
@@ -20,11 +19,10 @@ pub mod welcome_header;
 
 pub use border::BorderState;
 pub use bulk_confirm_dialog::{
-    BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome,
+    BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, ConfirmVariant,
 };
 pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
-pub use confirm_dialog::{ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant};
 pub use confirmation_modal::{ConfirmationChoice, ConfirmationModal, ConfirmationOutcome};
 pub use input_prompt::{InputOutcome, InputPrompt};
 pub use pty_view::PtyView;
