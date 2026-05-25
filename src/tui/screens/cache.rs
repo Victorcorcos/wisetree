@@ -10,7 +10,7 @@ use ratatui::Frame;
 use crate::files::{CacheEntryInfo, CacheOverview};
 use crate::messages::colors;
 use crate::tui::widgets::{
-    branded_line, ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, SelectOption,
+    branded_line, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, SelectOption,
     SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
@@ -27,7 +27,7 @@ pub enum CacheAction {
 pub struct CacheScreen {
     overview: Option<CacheOverview>,
     select: Option<SelectPrompt<String>>,
-    confirm: Option<ConfirmDialog>,
+    confirm: Option<ConfirmationModal>,
     pending_delete: Option<String>,
     loading: bool,
     error: Option<String>,
@@ -82,17 +82,17 @@ impl CacheScreen {
 
         if let Some(confirm) = self.confirm.as_mut() {
             return match confirm.handle_key(key) {
-                ConfirmOutcome::Confirmed => {
+                ConfirmationOutcome::Confirmed => {
                     let target = self.pending_delete.take().unwrap_or_default();
                     self.confirm = None;
                     CacheAction::DeleteEntry(target)
                 }
-                ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => {
+                ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
                     self.confirm = None;
                     self.pending_delete = None;
                     CacheAction::Continue
                 }
-                ConfirmOutcome::Pending => CacheAction::Continue,
+                ConfirmationOutcome::Pending => CacheAction::Continue,
             };
         }
 
@@ -122,15 +122,14 @@ impl CacheScreen {
                     )
                 };
                 self.confirm = Some(
-                    ConfirmDialog::new(
-                        "Delete Cache Entry",
-                        format!(
+                    ConfirmationModal::new()
+                        .with_title("Delete Cache Entry")
+                        .with_subtitle(format!(
                             "Delete shared cache entry '{}' ?\n\n{}\nThis does not delete any worktree directories, but linked worktrees may stop working until the cache is rebuilt.",
                             relative_path, warning
-                        ),
-                    )
-                    .with_variant(ConfirmVariant::Danger)
-                    .with_default(ConfirmChoice::Cancel),
+                        ))
+                        .with_color_value(colors::ERROR)
+                        .with_selected(ConfirmationChoice::Cancel),
                 );
             }
             return CacheAction::Continue;
@@ -143,27 +142,6 @@ impl CacheScreen {
             SelectOutcome::Cancelled => CacheAction::Back,
             SelectOutcome::Selected(_, _) | SelectOutcome::Pending => CacheAction::Continue,
         }
-    }
-
-    pub fn preferred_content_height(&self) -> u16 {
-        if self.loading || self.error.is_some() {
-            return 4;
-        }
-
-        let Some(overview) = self.overview.as_ref() else {
-            return 4;
-        };
-
-        if overview.entries.is_empty() {
-            return 5;
-        }
-
-        let selected_users = self
-            .selected_entry_info()
-            .map(|entry| entry.users.len() as u16)
-            .unwrap_or(0)
-            .min(3);
-        11 + (overview.entries.len() as u16).min(10) + selected_users
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {

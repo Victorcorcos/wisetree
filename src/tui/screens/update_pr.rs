@@ -3,8 +3,9 @@
 //! - `Loading`  : spinner while `App` resolves the base ref against the
 //!   priority list (`upstream/main → upstream/master → origin/main →
 //!   origin/master`).
-//! - `Confirm`  : details panel on top, `ConfirmDialog` (Yes/No, **No**
-//!   default) on the bottom. Enter on Yes returns `UpdateAction::Confirmed`.
+//! - `Confirm`  : details panel on top, `ConfirmationModal` (Yes/No,
+//!   **No** default) on the bottom. Enter on Yes returns
+//!   `UpdateAction::Confirmed`.
 //! - `Updating` : spinner with a phase-specific label on top, plus a
 //!   bordered "AI Activity" panel that streams the opencode subprocess's
 //!   stdout/stderr lines as they arrive (auto-scrolled to the latest).
@@ -30,8 +31,7 @@ use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmOutcome, ConfirmVariant, ConfirmationChoice,
-    ConfirmationModal, ConfirmationOutcome, PtyView, Status, StatusIndicator,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, PtyView, Status, StatusIndicator,
 };
 
 const UPDATE_LOADING_MESSAGE: &str = "Resolving base ref...";
@@ -76,7 +76,7 @@ pub enum UpdateAction {
 
 pub struct UpdatePullRequestScreen {
     request: UpdatePullRequestRequest,
-    confirm: Option<ConfirmDialog>,
+    confirm: Option<ConfirmationModal>,
     /// Scroll offset from the bottom of the AI activity log. `0` means
     /// "follow the latest output". When the user wheels upward we increase
     /// this offset and preserve it as new lines arrive so the viewport stays
@@ -450,7 +450,7 @@ impl UpdatePullRequestScreen {
                 self.finalize_confirm = None;
                 self.mark_ai_done();
             }
-            ConfirmationOutcome::Cancelled => {
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
                 self.finalize_confirm = None;
             }
         }
@@ -551,9 +551,11 @@ impl UpdatePullRequestScreen {
             None => return UpdateAction::Cancelled,
         };
         match dialog.handle_key(key) {
-            ConfirmOutcome::Confirmed => UpdateAction::Confirmed,
-            ConfirmOutcome::Declined | ConfirmOutcome::Cancelled => UpdateAction::Cancelled,
-            ConfirmOutcome::Pending => UpdateAction::Continue,
+            ConfirmationOutcome::Confirmed => UpdateAction::Confirmed,
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                UpdateAction::Cancelled
+            }
+            ConfirmationOutcome::Pending => UpdateAction::Continue,
         }
     }
 
@@ -645,7 +647,7 @@ impl UpdatePullRequestScreen {
         let detail_lines = build_detail_lines(&self.request);
         let steps_lines = build_steps_lines(self.request.base_ref.as_deref().unwrap_or("?"));
 
-        let confirm_height: u16 = 8;
+        let confirm_height: u16 = 12;
         let detail_height = detail_lines.len() as u16;
         let steps_height = steps_lines.len() as u16;
 
@@ -658,7 +660,7 @@ impl UpdatePullRequestScreen {
                 Constraint::Length(1),              // blank
                 Constraint::Length(steps_height),   // steps preview
                 Constraint::Length(1),              // blank
-                Constraint::Length(confirm_height), // ConfirmDialog
+                Constraint::Length(confirm_height), // ConfirmationModal
                 Constraint::Min(0),
             ])
             .split(area);
@@ -672,16 +674,19 @@ impl UpdatePullRequestScreen {
     }
 }
 
-fn build_confirm(request: &UpdatePullRequestRequest) -> ConfirmDialog {
+fn build_confirm(request: &UpdatePullRequestRequest) -> ConfirmationModal {
     let base = request.base_ref.as_deref().unwrap_or("base");
     let prompt = format!(
         "Merge `{base}` into branch `{}` and push the update?",
         request.branch
     );
-    ConfirmDialog::new(format!("Update Pull Request #{}", request.number), prompt)
-        .with_labels("Yes", "No")
-        .with_variant(ConfirmVariant::Default)
-        .with_default(ConfirmChoice::Cancel)
+    ConfirmationModal::new()
+        .with_title(format!("Update Pull Request #{}", request.number))
+        .with_subtitle(prompt)
+        .with_confirm_text("Yes")
+        .with_cancel_text("No")
+        .with_color_value(colors::INFO)
+        .with_selected(ConfirmationChoice::Cancel)
 }
 
 impl UpdatePullRequestScreen {
@@ -1004,10 +1009,10 @@ fn button_paragraph(
     color: ratatui::style::Color,
     focused: bool,
 ) -> Paragraph<'static> {
-    // Match the canonical `ConfirmDialog` button style: the border only
-    // changes color on selection (never gains BOLD), and the label is
-    // what actually highlights — that way `BorderType::Rounded` renders
-    // identical glyphs whether the button is selected or not.
+    // Match the canonical `ConfirmationModal` button style: the border
+    // only changes color on selection (never gains BOLD), and the label
+    // is what actually highlights — that way `BorderType::Rounded`
+    // renders identical glyphs whether the button is selected or not.
     let border_color = if focused { color } else { colors::MUTED };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1650,10 +1655,7 @@ mod tests {
             .confirm
             .as_ref()
             .expect("confirm built after base ref");
-        assert_eq!(dialog.selected, ConfirmChoice::Cancel);
-        assert_eq!(dialog.confirm_label, "Yes");
-        assert_eq!(dialog.cancel_label, "No");
-        assert_eq!(dialog.variant, ConfirmVariant::Default);
+        assert_eq!(dialog.selected(), ConfirmationChoice::Cancel);
     }
 
     #[test]
