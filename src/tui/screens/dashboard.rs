@@ -12,8 +12,8 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
-    PrState, ReviewStatus,
+    AiHarness, AiHarnessState, AiStatus, AiStatusReport, CheckStatus, CommitSummary,
+    DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus, PrState, ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
@@ -174,6 +174,7 @@ pub enum DashboardAction {
 enum DashboardColumn {
     Branch,
     Status,
+    AiStatus,
     AheadBehind,
     LastCommit,
     PullRequest,
@@ -314,8 +315,8 @@ impl DashboardScreen {
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
         // 1 status + 2 search spacers + 1 search line + 1 table header + N rows
-        // + footer (10 lines, +1 when the highlighted PR has reviewers to show).
-        14 + table_rows + self.reviewers_footer_height()
+        // + footer (12 lines, +1 when the highlighted PR has reviewers to show).
+        16 + table_rows + self.reviewers_footer_height()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -469,7 +470,7 @@ impl DashboardScreen {
             return;
         }
 
-        let footer_height = 10u16 + self.reviewers_footer_height();
+        let footer_height = 12u16 + self.reviewers_footer_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -478,7 +479,7 @@ impl DashboardScreen {
                 Constraint::Length(1),             // search line
                 Constraint::Length(1),             // spacer below search
                 Constraint::Min(4),                // table
-                Constraint::Length(footer_height), // footer (notice [+ reviewers] + 3-row buttons + 6 legend lines)
+                Constraint::Length(footer_height), // footer (notice [+ reviewers] + 3-row buttons + 8 legend lines)
             ])
             .split(area);
 
@@ -1047,7 +1048,7 @@ impl DashboardScreen {
         // number of rows it actually needs — ratatui's solver can drop a
         // neighbour's row when a zero-length constraint sits inside an
         // already-saturated column.
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(9);
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(11);
         constraints.push(Constraint::Length(1)); // notice / row warning / detail
         if reviewers_height > 0 {
             constraints.push(Constraint::Length(reviewers_height));
@@ -1059,6 +1060,8 @@ impl DashboardScreen {
         constraints.push(Constraint::Length(1)); // reviews legend
         constraints.push(Constraint::Length(1)); // merges legend
         constraints.push(Constraint::Length(1)); // ahead/behind legend
+        constraints.push(Constraint::Length(1)); // ai-status legend (aggregate)
+        constraints.push(Constraint::Length(1)); // ai-status legend (harness letters)
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1088,6 +1091,16 @@ impl DashboardScreen {
         frame.render_widget(Paragraph::new(self.merges_legend_line()), chunks[idx]);
         idx += 1;
         frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[idx]);
+        idx += 1;
+        frame.render_widget(
+            Paragraph::new(self.ai_status_aggregate_legend_line()),
+            chunks[idx],
+        );
+        idx += 1;
+        frame.render_widget(
+            Paragraph::new(self.ai_status_harness_legend_line()),
+            chunks[idx],
+        );
     }
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
@@ -1285,6 +1298,43 @@ impl DashboardScreen {
                 " lines removed vs upstream/main (falls back to upstream/master, origin/main, origin/master)",
                 muted_dim,
             ),
+        ])
+    }
+
+    fn ai_status_aggregate_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("AI: ", muted_dim),
+            Span::raw("⬜ "),
+            Span::styled("pending", muted_dim),
+            Span::styled("  ", muted_dim),
+            Span::raw("🟨 "),
+            Span::styled("running", Style::default().fg(colors::ACCENT)),
+            Span::styled("  ", muted_dim),
+            Span::raw("🟩 "),
+            Span::styled("finished", Style::default().fg(colors::SUCCESS)),
+            Span::styled("  ", muted_dim),
+            Span::raw("🟥 "),
+            Span::styled("failed", Style::default().fg(colors::ERROR)),
+        ])
+    }
+
+    fn ai_status_harness_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("    ", muted_dim),
+            Span::styled("C", Style::default().fg(colors::HARNESS_CLAUDE)),
+            Span::styled(" Claude   ", muted_dim),
+            Span::styled("O", Style::default().fg(colors::HARNESS_OPENCODE)),
+            Span::styled(" Opencode   ", muted_dim),
+            Span::styled("X", Style::default().fg(colors::HARNESS_CODEX)),
+            Span::styled(" Codex   ", muted_dim),
+            Span::styled("G", Style::default().fg(colors::HARNESS_GEMINI)),
+            Span::styled(" Gemini", muted_dim),
         ])
     }
 
@@ -1553,6 +1603,7 @@ impl DashboardScreen {
                 DashboardColumn::PullRequest => {}
                 DashboardColumn::Branch
                 | DashboardColumn::Status
+                | DashboardColumn::AiStatus
                 | DashboardColumn::AheadBehind => {}
             }
         }
@@ -1616,6 +1667,7 @@ impl DashboardColumn {
         match value {
             "branch" => Some(Self::Branch),
             "status" => Some(Self::Status),
+            "ai_status" => Some(Self::AiStatus),
             "ahead_behind" => Some(Self::AheadBehind),
             "last_commit" => Some(Self::LastCommit),
             "pull_request" => Some(Self::PullRequest),
@@ -1627,6 +1679,13 @@ impl DashboardColumn {
         match self {
             Self::Branch => "Branch",
             Self::Status => "Status",
+            Self::AiStatus => {
+                if compact {
+                    "AI"
+                } else {
+                    "AI Status"
+                }
+            }
             Self::AheadBehind => {
                 if compact {
                     "A/B"
@@ -1665,6 +1724,17 @@ impl DashboardColumn {
                     13
                 } else {
                     15
+                }
+            }
+            Self::AiStatus => {
+                // Wide: glyph(2) + space + longest label "Finished"(8) +
+                // space + decoration "C O X G"(7, two cols of padding for
+                // the renderer to breathe) + margin. Compact mode drops
+                // the decoration letters.
+                if compact {
+                    13
+                } else {
+                    21
                 }
             }
             Self::AheadBehind => {
@@ -1765,8 +1835,99 @@ impl DashboardColumn {
                     Cell::from("-")
                 }
             }
+            Self::AiStatus => ai_status_cell(row.ai_status.as_ref(), compact),
         }
     }
+}
+
+fn ai_status_label(status: AiStatus) -> (&'static str, &'static str) {
+    match status {
+        AiStatus::None => ("⬜", "Pending"),
+        AiStatus::InProgress => ("🟨", "Running"),
+        AiStatus::Finished => ("🟩", "Finished"),
+        AiStatus::Failed => ("🟥", "Failed"),
+    }
+}
+
+fn ai_status_label_style(status: AiStatus) -> Style {
+    match status {
+        AiStatus::None => Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM),
+        AiStatus::InProgress => Style::default()
+            .fg(colors::ACCENT)
+            .add_modifier(Modifier::BOLD),
+        AiStatus::Finished => Style::default().fg(colors::SUCCESS),
+        AiStatus::Failed => Style::default()
+            .fg(colors::ERROR)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn harness_identity_color(harness: AiHarness) -> ratatui::style::Color {
+    match harness {
+        AiHarness::ClaudeCode => colors::HARNESS_CLAUDE,
+        AiHarness::Opencode => colors::HARNESS_OPENCODE,
+        AiHarness::CodexCli => colors::HARNESS_CODEX,
+        AiHarness::GeminiCli => colors::HARNESS_GEMINI,
+    }
+}
+
+fn harness_letter(harness: AiHarness) -> &'static str {
+    match harness {
+        AiHarness::ClaudeCode => "C",
+        AiHarness::Opencode => "O",
+        AiHarness::CodexCli => "X",
+        AiHarness::GeminiCli => "G",
+    }
+}
+
+fn harness_decoration_span(harness: AiHarness, state: AiHarnessState) -> Span<'static> {
+    let color = harness_identity_color(harness);
+    match state {
+        AiHarnessState::Running => Span::styled(
+            harness_letter(harness),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        AiHarnessState::Idle => Span::styled(harness_letter(harness), Style::default().fg(color)),
+        AiHarnessState::Failed => Span::styled(
+            harness_letter(harness),
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        AiHarnessState::Absent => Span::styled(
+            "·",
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        ),
+    }
+}
+
+fn ai_status_cell(report: Option<&AiStatusReport>, compact: bool) -> Cell<'static> {
+    let aggregated = report.map(|r| r.aggregated).unwrap_or(AiStatus::None);
+    let (glyph, label) = ai_status_label(aggregated);
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw(glyph),
+        Span::raw(" "),
+        Span::styled(label, ai_status_label_style(aggregated)),
+    ];
+
+    if !compact {
+        spans.push(Span::raw(" "));
+        for (i, harness) in AiHarness::ALL.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let state = report
+                .and_then(|r| r.per_harness.get(harness).copied())
+                .unwrap_or(AiHarnessState::Absent);
+            spans.push(harness_decoration_span(*harness, state));
+        }
+    }
+
+    Cell::from(Line::from(spans))
 }
 
 impl PrState {

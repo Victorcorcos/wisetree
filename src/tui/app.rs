@@ -4369,6 +4369,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
+                    ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4378,6 +4379,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
+                    ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4396,8 +4398,14 @@ mod tests {
             let new_dashboard = DashboardConfig {
                 refresh_interval_ms: 7000,
                 show_pull_requests: true,
-                columns: vec!["branch".into(), "status".into(), "pull_request".into()],
+                columns: vec![
+                    "branch".into(),
+                    "status".into(),
+                    "ai_status".into(),
+                    "pull_request".into(),
+                ],
                 use_ai: String::new(),
+                ai_status: Default::default(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -4428,6 +4436,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
+                    ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4445,8 +4454,9 @@ mod tests {
             let new_dashboard = DashboardConfig {
                 refresh_interval_ms: 8000,
                 show_pull_requests: true,
-                columns: vec!["branch".into(), "status".into()],
+                columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 use_ai: String::new(),
+                ai_status: Default::default(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 

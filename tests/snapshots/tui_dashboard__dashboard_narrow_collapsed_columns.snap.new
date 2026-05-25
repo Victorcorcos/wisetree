@@ -1,6 +1,6 @@
 ---
 source: tests/tui_dashboard.rs
-assertion_line: 987
+assertion_line: 1084
 expression: "dump_lines(72, 20, |f| screen.render(f, f.area()))"
 ---
 Refreshed just now - 3 worktrees, 0 dirty, 1 PR open
@@ -21,5 +21,5 @@ PR Checks: ⚪  (Pending)  🟡  (Running)  ⚠️  (Errored)  🔴  (Failed)  �
 PR Reviews: ✋  (Pending)  👎  (Changes Requested)  👍  (Approved)
 PR Merges: 📝  (Draft)  ❌  (Dirty)  🚫  (Blocked)  ❓  (Unknown)  🍂  (Behin
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls b
-AI: 🟨  running  🟩  finished  🟥  failed  ⬜  pending
+AI: ⬜  pending  🟨  running  🟩  finished  🟥  failed
     C Claude   O Opencode   X Codex   G Gemini
