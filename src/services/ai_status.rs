@@ -465,11 +465,7 @@ mod tests {
         let session_json = format!(
             r#"{{"pid":{live_pid},"sessionId":"abc","cwd":"{cwd_str}","kind":"interactive"}}"#
         );
-        fs::write(
-            sessions_root.join(format!("{live_pid}.json")),
-            session_json,
-        )
-        .unwrap();
+        fs::write(sessions_root.join(format!("{live_pid}.json")), session_json).unwrap();
 
         let svc = AiStatusService::new(&all_enabled_config(), paths);
         let index = svc.build_index();
@@ -502,11 +498,7 @@ mod tests {
         let session_json = format!(
             r#"{{"pid":{dead_pid},"sessionId":"abc","cwd":"{cwd_str}","kind":"interactive"}}"#
         );
-        fs::write(
-            sessions_root.join(format!("{dead_pid}.json")),
-            session_json,
-        )
-        .unwrap();
+        fs::write(sessions_root.join(format!("{dead_pid}.json")), session_json).unwrap();
 
         let svc = AiStatusService::new(&all_enabled_config(), paths);
         let index = svc.build_index();
