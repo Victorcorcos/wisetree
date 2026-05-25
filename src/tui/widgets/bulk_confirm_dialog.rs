@@ -30,7 +30,27 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::tui::widgets::select_prompt::branded_line;
-use crate::tui::widgets::ConfirmVariant;
+
+/// Three-tone palette for the title/confirm-button accent. Mirrors the
+/// upstream `ConfirmDialog` variant taxonomy so callers that already
+/// reason about Default/Warning/Danger semantics can carry over without
+/// learning a separate color enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmVariant {
+    Default,
+    Warning,
+    Danger,
+}
+
+impl ConfirmVariant {
+    pub fn color(self) -> Color {
+        match self {
+            ConfirmVariant::Default => colors::INFO,
+            ConfirmVariant::Warning => colors::WARNING,
+            ConfirmVariant::Danger => colors::ERROR,
+        }
+    }
+}
 
 pub const CHECKBOX_CHECKED: &str = "☒";
 pub const CHECKBOX_UNCHECKED: &str = "☐";

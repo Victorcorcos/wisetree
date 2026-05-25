@@ -14,41 +14,22 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
       GIT_PREFIX GIT_NAMESPACE GIT_QUARANTINE_PATH GIT_EXEC_PATH \
       GIT_INTERNAL_GETTEXT_SH_SCHEME
 
-run_fix() {
+run_check() {
   local name="$1"
   shift
 
-  printf 'pre-push: applying %s\n' "$name"
+  printf 'pre-push: checking %s\n' "$name"
 
   if ! "$@"; then
     printf '\nwarning: push blocked because `%s` failed.\n' "$name" >&2
-    printf 'warning: resolve the reported issue locally, then push again.\n' >&2
+    printf 'warning: resolve the reported issue locally, commit it, then push again.\n' >&2
     exit 1
   fi
 }
 
-# Apply the local autofix equivalents for CI checks where they exist.
-#
-# CI step                            Local autofix
-# cargo fmt --all -- --check         cargo fmt --all
-# cargo clippy ... -D warnings       cargo clippy --fix ...
-# cargo build --all-targets          cargo fix --all-targets --all-features
-# cargo test --all-features          no automatic fix available
-run_fix \
-  "cargo fix --all-targets --all-features" \
-  cargo fix --all-targets --all-features --allow-dirty --allow-staged
-
-run_fix \
-  "cargo clippy --fix --all-targets --all-features" \
-  cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged
-
-run_fix "cargo fmt --all" cargo fmt --all
-
-if ! git diff --quiet; then
-  printf 'pre-push: committing auto-formatted changes\n'
-  git add -u
-  git commit -m "chore: auto-format and fix (cargo fmt + clippy)"
-  printf 'pre-push: re-pushing with auto-formatted commit included\n'
-  git push --no-verify "$1" HEAD
-  exit $?
-fi
+run_check "cargo fmt --all -- --check" cargo fmt --all -- --check
+run_check \
+  "cargo clippy --all-targets --all-features -- -D warnings" \
+  cargo clippy --all-targets --all-features -- -D warnings
+run_check "cargo build --all-targets" cargo build --all-targets
+run_check "cargo test --all-features" cargo test --all-features

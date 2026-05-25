@@ -492,7 +492,7 @@ fn delete_branch_setting_renders_yes_no_toggle() {
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::DeleteBranch);
 
-    let dumped = dump(80, 14, |f| s.render(f, f.area()));
+    let dumped = dump(80, 24, |f| s.render(f, f.area()));
     assert!(dumped.contains("Delete Branch with Worktree"));
     assert!(dumped.contains("Yes"));
     assert!(dumped.contains("No"));

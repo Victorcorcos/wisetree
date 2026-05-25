@@ -2,12 +2,13 @@ use std::path::Path;
 use std::process::Command;
 
 // One-shot installer for the repo's git hooks. Sets `core.hooksPath = githooks`
-// the first time someone builds the repo after cloning, so the pre-push hook
-// that mirrors CI gets picked up automatically. Never fails the build — if
-// anything is off (no git, no .git dir, hooksPath already set), we just exit.
+// the first time someone builds the repo after cloning, so the tracked hooks get
+// picked up automatically. Never fails the build — if anything is off (no git,
+// no .git dir, hooksPath already set), we just exit.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=githooks/pre-push");
+    println!("cargo:rerun-if-changed=githooks/post-commit");
 
     let manifest_dir = match std::env::var_os("CARGO_MANIFEST_DIR") {
         Some(dir) => dir,

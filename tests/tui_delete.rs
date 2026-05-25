@@ -205,7 +205,7 @@ fn confirm_dialog_shows_branch_status_when_will_delete_branch() {
     });
     s.set_worktrees(vec![wt("/tmp/repo", "main", true, true), wt_dirty]);
     s.jump_to_confirm_path("/tmp/repo-x");
-    let dumped = dump(80, 12, |f| s.render(f, f.area()));
+    let dumped = dump(80, 20, |f| s.render(f, f.area()));
     assert!(dumped.contains("uncommitted changes"));
     assert!(dumped.contains("delete branch 'feat-x'"));
 }
