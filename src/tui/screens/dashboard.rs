@@ -1887,26 +1887,33 @@ fn harness_letter(harness: AiHarness) -> &'static str {
     }
 }
 
-fn harness_decoration_span(harness: AiHarness, state: AiHarnessState) -> Span<'static> {
+fn harness_decoration_spans(harness: AiHarness, state: AiHarnessState) -> Vec<Span<'static>> {
     let color = harness_identity_color(harness);
     match state {
-        AiHarnessState::Running => Span::styled(
+        AiHarnessState::Running => vec![
+            Span::styled("[", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                harness_letter(harness),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("]", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ],
+        AiHarnessState::Idle => vec![Span::styled(
             harness_letter(harness),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        AiHarnessState::Idle => Span::styled(harness_letter(harness), Style::default().fg(color)),
-        AiHarnessState::Failed => Span::styled(
+            Style::default().fg(color),
+        )],
+        AiHarnessState::Failed => vec![Span::styled(
             harness_letter(harness),
             Style::default()
                 .fg(color)
                 .add_modifier(Modifier::UNDERLINED),
-        ),
-        AiHarnessState::Absent => Span::styled(
+        )],
+        AiHarnessState::Absent => vec![Span::styled(
             "·",
             Style::default()
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM),
-        ),
+        )],
     }
 }
 
@@ -1928,7 +1935,7 @@ fn ai_status_cell(report: Option<&AiStatusReport>, compact: bool) -> Cell<'stati
             let state = report
                 .and_then(|r| r.per_harness.get(harness).copied())
                 .unwrap_or(AiHarnessState::Absent);
-            spans.push(harness_decoration_span(*harness, state));
+            spans.extend(harness_decoration_spans(*harness, state));
         }
     }
 
