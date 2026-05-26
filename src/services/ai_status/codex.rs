@@ -2,10 +2,14 @@
 //! `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 //!
 //! The hot path (every dashboard tick) scans only today's + yesterday's date
-//! directories — enough to catch any `Running` session within the active
-//! window and to update mtimes for sessions that wrapped recently. Older
-//! sessions still influence the aggregate via a long-tail cache populated by
-//! the cold-path background rebuild (see `AiStatusService`).
+//! directories — enough to catch any active session and to update mtimes for
+//! sessions that wrapped recently. Older sessions still influence the
+//! aggregate via a long-tail cache populated by the cold-path background
+//! rebuild (see `AiStatusService`).
+//!
+//! `Finished` is driven by transcript state, not just recency: a worktree is
+//! only `Idle` once the newest unresolved user turn in the newest rollout for
+//! that cwd has a matching assistant `final_answer`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,17 +25,44 @@ use super::util::classify_mtime;
 use super::DetectorOutput;
 
 #[derive(Deserialize)]
-struct CodexHeader {
+struct CodexHeaderPayload {
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CodexLine {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    payload: Option<CodexLinePayload>,
+}
+
+#[derive(Deserialize)]
+struct CodexLinePayload {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    phase: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
     payload: Option<CodexHeaderPayload>,
 }
 
-#[derive(Deserialize)]
-struct CodexHeaderPayload {
-    #[serde(default)]
-    cwd: Option<String>,
+#[derive(Clone, Copy)]
+struct CodexSessionState {
+    mtime: SystemTime,
+    turn_state: CodexTurnState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodexTurnState {
+    Unknown,
+    Pending,
+    Completed,
 }
 
 pub(crate) fn scan(paths: &AiStatusPaths, window: Duration) -> DetectorOutput {
@@ -40,11 +71,19 @@ pub(crate) fn scan(paths: &AiStatusPaths, window: Duration) -> DetectorOutput {
         return out;
     };
 
+    let mut sessions_by_cwd: BTreeMap<PathBuf, CodexSessionState> = BTreeMap::new();
     for date_dir in recent_date_dirs(root) {
-        let failed = scan_day_dir(&date_dir, window, &mut out.per_cwd);
+        let failed = scan_day_dir_candidates(&date_dir, &mut sessions_by_cwd);
         if failed {
             out.global_failure = true;
         }
+    }
+    for (cwd, session) in sessions_by_cwd {
+        merge(
+            &mut out.per_cwd,
+            cwd,
+            classify_turn_state(session.turn_state, session.mtime, window),
+        );
     }
     out
 }
@@ -57,6 +96,22 @@ pub fn scan_day_dir(
     day_dir: &Path,
     window: Duration,
     out: &mut BTreeMap<PathBuf, AiHarnessState>,
+) -> bool {
+    let mut sessions_by_cwd: BTreeMap<PathBuf, CodexSessionState> = BTreeMap::new();
+    let failed = scan_day_dir_candidates(day_dir, &mut sessions_by_cwd);
+    for (cwd, session) in sessions_by_cwd {
+        merge(
+            out,
+            cwd,
+            classify_turn_state(session.turn_state, session.mtime, window),
+        );
+    }
+    failed
+}
+
+fn scan_day_dir_candidates(
+    day_dir: &Path,
+    sessions_by_cwd: &mut BTreeMap<PathBuf, CodexSessionState>,
 ) -> bool {
     let mut failed = false;
     let Ok(read_dir) = fs::read_dir(day_dir) else {
@@ -74,10 +129,15 @@ pub fn scan_day_dir(
                 continue;
             }
         };
-        match read_cwd(&path) {
-            Ok(Some(cwd)) => {
+        match read_session_state(&path) {
+            Ok(Some((cwd, turn_state))) => {
                 let key = canonical_key(Path::new(&cwd));
-                merge(out, key, classify_mtime(mtime, window));
+                match sessions_by_cwd.get(&key) {
+                    Some(existing) if existing.mtime >= mtime => {}
+                    _ => {
+                        sessions_by_cwd.insert(key, CodexSessionState { mtime, turn_state });
+                    }
+                }
             }
             Ok(None) => {}
             Err(_) => {
@@ -137,27 +197,64 @@ fn ymd_from_unix(secs: i64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
-fn read_cwd(file: &Path) -> std::io::Result<Option<String>> {
+fn read_session_state(file: &Path) -> std::io::Result<Option<(String, CodexTurnState)>> {
     let f = fs::File::open(file)?;
-    let mut reader = BufReader::new(f);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    if line.trim().is_empty() {
-        return Ok(None);
-    }
-    let header: CodexHeader = match serde_json::from_str(line.trim()) {
-        Ok(h) => h,
-        Err(_) => return Ok(None),
-    };
-    if let Some(cwd) = header.cwd {
-        return Ok(Some(cwd));
-    }
-    if let Some(payload) = header.payload {
-        if let Some(cwd) = payload.cwd {
-            return Ok(Some(cwd));
+    let reader = BufReader::new(f);
+    let mut cwd: Option<String> = None;
+    let mut turn_state = CodexTurnState::Unknown;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: CodexLine = match serde_json::from_str(line.trim()) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        if parsed.kind.as_deref() == Some("session_meta") {
+            if let Some(payload) = parsed.payload {
+                if let Some(found) = payload
+                    .cwd
+                    .or_else(|| payload.payload.and_then(|nested| nested.cwd))
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    cwd = Some(found);
+                }
+            }
+            continue;
+        }
+
+        let Some(payload) = parsed.payload else {
+            continue;
+        };
+        if parsed.kind.as_deref() != Some("response_item")
+            || payload.kind.as_deref() != Some("message")
+        {
+            continue;
+        }
+        match payload.role.as_deref() {
+            Some("user") => turn_state = CodexTurnState::Pending,
+            Some("assistant") if payload.phase.as_deref() == Some("final_answer") => {
+                turn_state = CodexTurnState::Completed;
+            }
+            _ => {}
         }
     }
-    Ok(None)
+
+    Ok(cwd.map(|cwd| (cwd, turn_state)))
+}
+
+fn classify_turn_state(
+    turn_state: CodexTurnState,
+    mtime: SystemTime,
+    window: Duration,
+) -> AiHarnessState {
+    match turn_state {
+        CodexTurnState::Pending => classify_mtime(mtime, window),
+        CodexTurnState::Completed => AiHarnessState::Idle,
+        CodexTurnState::Unknown => classify_mtime(mtime, window),
+    }
 }
 
 fn merge(out: &mut BTreeMap<PathBuf, AiHarnessState>, key: PathBuf, state: AiHarnessState) {

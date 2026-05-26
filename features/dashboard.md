@@ -253,7 +253,9 @@ In case something need to be done in TUI, always remember to follow the design a
 
 The dashboard exposes an **AI Status** column that reports whether each
 worktree currently has an AI coding harness attached to it. Detection is
-100% file-based — Wisetree never inspects the process tree.
+driven primarily by local transcripts/state files, with a small Claude
+live-session PID check used only to keep long-running unresolved turns in
+`Running`.
 
 ### Aggregated states
 
@@ -262,8 +264,8 @@ by the priority rule **`Running` > `Idle` > `Failed` > `Absent`**:
 
 | Aggregate | Glyph | Meaning |
 | --- | --- | --- |
-| In progress | 🟨 running | At least one harness wrote to its session log within `aiStatus.activeWindowMs` |
-| Finished   | 🟩 finished | A harness has activity on this worktree, but no recent writes |
+| In progress | 🟨 running | At least one harness still has an unresolved prompt, with either recent transcript writes or a stronger live-session signal |
+| Finished   | 🟩 finished | A harness has activity on this worktree, and its latest prompt already reached a completed assistant turn (or only stale historical activity remains) |
 | Failed     | 🟥 failed   | Every harness with a positive signal failed; nothing is `Running` or `Idle` |
 | Pending    | ⬜ pending  | No harness has touched this worktree |
 
@@ -277,7 +279,7 @@ without expanding the row:
 C  Claude Code         (~/.claude/projects/<slug>/*.jsonl)
 O  opencode            ($XDG_DATA_HOME/opencode/opencode.db session metadata)
 X  codex-cli           (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl)
-G  gemini-cli          (~/.gemini/tmp/<sha256(cwd)>/...)
+G  gemini-cli          (~/.gemini/tmp/<basename>/.project_root + chats/*)
 ```
 
 A letter is shown bright when its harness is `Running`, dim when `Idle`,
@@ -304,10 +306,9 @@ the wire, snake_case in Rust):
   `codex_cli`, `gemini_cli`. Unknown names are dropped silently. Disabling
   a harness removes both its decoration letter and its contribution to the
   aggregated state.
-* `activeWindowMs` — how recently a harness must have written to its
-  session log to count as `Running`. Clamped to `[2000, 60000]` at load.
-  Defaults to `10000` (10 s), which comfortably covers opencode's 5 s
-  lock heartbeat and Claude Code's sub-second streaming writes.
+* `activeWindowMs` — the recency threshold used when a harness still has
+  an unresolved prompt but no stronger live-session signal. Clamped to
+  `[2000, 60000]` at load. Defaults to `10000` (10 s).
 
 ### Performance contract
 

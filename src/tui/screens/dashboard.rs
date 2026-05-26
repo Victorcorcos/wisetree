@@ -1732,14 +1732,14 @@ impl DashboardColumn {
                 }
             }
             Self::AiStatus => {
-                // Wide: glyph(2) + space + longest label "Finished"(8) +
-                // space + decoration "C O X G"(7, two cols of padding for
-                // the renderer to breathe) + margin. Compact mode drops
-                // the decoration letters.
+                // Wide: glyph(2) + space(1) + longest label "Finished"(8) +
+                // space(1) + worst-case decorations all-running "[C] [O] [X] [G]"
+                // = 3+1+3+1+3+1+3 = 15 → total 27.
+                // Compact mode drops the decoration letters.
                 if compact {
                     13
                 } else {
-                    21
+                    27
                 }
             }
             Self::AheadBehind => {

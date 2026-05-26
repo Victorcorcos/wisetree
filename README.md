@@ -329,7 +329,7 @@ Dashboard sub-fields:
 | `dashboard.columns` | `string[]` | `["branch", "status", "ai_status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. Also supports `pull_request`. |
 | `dashboard.useAi` | `string` | `""` | Provider/model passed to `opencode run -m` for AI-assisted PR conflict resolution. Blank disables AI conflict resolution. |
 | `dashboard.aiStatus.enabledHarnesses` | `string[]` | `["claude_code", "opencode", "codex_cli", "gemini_cli"]` | AI harnesses included in the dashboard's `AI Status` column. |
-| `dashboard.aiStatus.activeWindowMs` | `number` | `10000` | File-write recency threshold for reporting an AI harness as `Running`, clamped to `2000..60000`. |
+| `dashboard.aiStatus.activeWindowMs` | `number` | `10000` | Recency threshold used when a harness still has an unresolved prompt but no stronger live-session signal, clamped to `2000..60000`. |
 
 # 📟 Wisetree CLI
 

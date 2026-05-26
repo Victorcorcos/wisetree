@@ -1,8 +1,11 @@
 //! Detect opencode activity from XDG-state directories.
 //!
 //! Primary signal: `${XDG_DATA_HOME}/opencode/opencode.db`. The `session`
-//! table carries the session directory and `time_updated` heartbeat; this is
-//! the current source of truth for attributing activity to a worktree.
+//! table still attributes worktree ownership via `directory`, but the real
+//! turn-state signal lives in `message` + `part`: opencode can keep appending
+//! `reasoning` / `tool` / `text` parts long after `session.time_updated`
+//! stops moving. A worktree is only `Finished` once the newest assistant turn
+//! for its newest session reaches `step-finish` with `reason = "stop"`.
 //!
 //! Legacy/corroborating signal: `${XDG_DATA_HOME}/opencode/storage/session_diff/ses_*.json`
 //! — older versions exposed `cwd`/`directory` in this JSON. Current versions
@@ -15,12 +18,12 @@
 //! so we never let absence-of-locks downgrade a positive database/session_diff
 //! signal.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -37,6 +40,23 @@ struct SessionDiffEnvelope {
     cwd: Option<String>,
     #[serde(default)]
     directory: Option<String>,
+}
+
+struct DbSession {
+    id: String,
+    directory: String,
+    time_updated_ms: i64,
+}
+
+struct LatestMessage {
+    id: String,
+    role: String,
+    time_updated_ms: i64,
+}
+
+struct LatestPart {
+    kind: Option<String>,
+    reason: Option<String>,
 }
 
 pub(crate) fn scan(paths: &AiStatusPaths, window: Duration) -> DetectorOutput {
@@ -105,7 +125,7 @@ fn scan_database(
         return false;
     };
     let Ok(mut stmt) = conn.prepare(
-        "select directory, time_updated from session \
+        "select id, directory, time_updated from session \
          where directory is not null \
          order by time_updated desc \
          limit ?1",
@@ -113,24 +133,100 @@ fn scan_database(
         return false;
     };
     let Ok(rows) = stmt.query_map([MAX_DB_SESSIONS_PER_TICK], |row| {
-        let directory: String = row.get(0)?;
-        let time_updated_ms: i64 = row.get(1)?;
-        Ok((directory, time_updated_ms))
+        let id: String = row.get(0)?;
+        let directory: String = row.get(1)?;
+        let time_updated_ms: i64 = row.get(2)?;
+        Ok(DbSession {
+            id,
+            directory,
+            time_updated_ms,
+        })
     }) else {
         return false;
     };
 
     let mut saw_session = false;
+    let mut seen_cwds = BTreeSet::new();
     for row in rows.flatten() {
-        let (directory, time_updated_ms) = row;
-        if directory.trim().is_empty() {
+        if row.directory.trim().is_empty() {
             continue;
         }
         saw_session = true;
-        let key = canonical_key(Path::new(&directory));
-        merge(out, key, classify_unix_ms(time_updated_ms, window));
+        let key = canonical_key(Path::new(&row.directory));
+        if !seen_cwds.insert(key.clone()) {
+            continue;
+        }
+        let state = classify_session(&conn, &row, window)
+            .unwrap_or_else(|| classify_unix_ms(row.time_updated_ms, window));
+        merge(out, key, state);
     }
     saw_session
+}
+
+fn classify_session(
+    conn: &Connection,
+    session: &DbSession,
+    window: Duration,
+) -> Option<AiHarnessState> {
+    let message = latest_message(conn, &session.id)?;
+    match message.role.as_str() {
+        "user" => Some(AiHarnessState::Running),
+        "assistant" => {
+            let Some(part) = latest_part(conn, &message.id) else {
+                return Some(classify_unix_ms(message.time_updated_ms, window));
+            };
+            if part.kind.as_deref() == Some("step-finish") && part.reason.as_deref() == Some("stop")
+            {
+                Some(AiHarnessState::Idle)
+            } else {
+                Some(AiHarnessState::Running)
+            }
+        }
+        _ => Some(classify_unix_ms(message.time_updated_ms, window)),
+    }
+}
+
+fn latest_message(conn: &Connection, session_id: &str) -> Option<LatestMessage> {
+    let mut stmt = conn
+        .prepare(
+            "select id, json_extract(data, '$.role'), time_updated \
+             from message \
+             where session_id = ?1 \
+             order by time_created desc, id desc \
+             limit 1",
+        )
+        .ok()?;
+    stmt.query_row([session_id], |row| {
+        Ok(LatestMessage {
+            id: row.get(0)?,
+            role: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            time_updated_ms: row.get(2)?,
+        })
+    })
+    .optional()
+    .ok()
+    .flatten()
+}
+
+fn latest_part(conn: &Connection, message_id: &str) -> Option<LatestPart> {
+    let mut stmt = conn
+        .prepare(
+            "select json_extract(data, '$.type'), json_extract(data, '$.reason') \
+             from part \
+             where message_id = ?1 \
+             order by time_created desc, id desc \
+             limit 1",
+        )
+        .ok()?;
+    stmt.query_row([message_id], |row| {
+        Ok(LatestPart {
+            kind: row.get(0)?,
+            reason: row.get(1)?,
+        })
+    })
+    .optional()
+    .ok()
+    .flatten()
 }
 
 fn classify_unix_ms(time_updated_ms: i64, window: Duration) -> AiHarnessState {

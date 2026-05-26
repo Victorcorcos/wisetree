@@ -1,19 +1,19 @@
-//! Detect Claude Code activity by combining two complementary signals:
+//! Detect Claude Code activity by reading the latest transcript turn state for
+//! each project directory, then using live session PIDs only as a fallback.
 //!
-//! 1. **Live sessions** — Claude Code v2.x writes a JSON file per running
-//!    session to `~/.claude/sessions/<pid>.json` containing the process PID
-//!    and `cwd`. Checking PID liveness gives us a deterministic "currently
-//!    running" answer that does not depend on the streaming JSONL being
-//!    actively written. This matters because Claude Code can sit on a long
-//!    tool call (e.g. a sub-agent) for many minutes without writing to the
-//!    session JSONL, which would otherwise flip `Running` to `Idle` after
-//!    `active_window_ms` (default 10 s).
-//! 2. **Historical sessions** — for cwds without a live PID we fall back to
-//!    walking `~/.claude/projects/<slug>/*.jsonl` and reading the `cwd` field
-//!    out of the freshest file, classifying by mtime. This recovers the
-//!    `Idle` / `Finished` signal for previously-used worktrees.
+//! Primary signal: the newest `~/.claude/projects/<slug>/*.jsonl` file.
+//! - A `user` line with `promptId`, or an assistant line whose
+//!   `stop_reason == "tool_use"`, means the latest prompt is still in flight.
+//! - An assistant line with any other `stop_reason` means Claude ended its
+//!   turn, so the worktree is `Idle`/aggregate `Finished` even if the session
+//!   stays open in another terminal.
+//!
+//! Fallback: if the latest transcript still looks unresolved but its mtime has
+//! aged past `active_window_ms`, a live `~/.claude/sessions/<pid>.json` entry
+//! for the same cwd keeps it `Running`. This covers long tool calls or
+//! sub-agents that stop appending to the JSONL for minutes at a time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -32,8 +32,14 @@ const MAX_FILES_PER_TICK: usize = 200;
 
 #[derive(Deserialize)]
 struct ClaudeJsonLine {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(rename = "promptId", default)]
+    prompt_id: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,12 +49,20 @@ struct ClaudeSessionFile {
     cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeTurnState {
+    Unknown,
+    Pending,
+    Completed,
+}
+
 pub(crate) fn scan(paths: &AiStatusPaths, window: Duration) -> DetectorOutput {
     let mut out = DetectorOutput::default();
-
-    if let Some(sessions_root) = paths.claude_sessions.as_ref() {
-        scan_live_sessions(sessions_root, &mut out);
-    }
+    let live_sessions = paths
+        .claude_sessions
+        .as_ref()
+        .map(|sessions_root| scan_live_sessions(sessions_root))
+        .unwrap_or_default();
 
     let Some(projects_root) = paths.claude_projects.as_ref() else {
         return out;
@@ -66,7 +80,7 @@ pub(crate) fn scan(paths: &AiStatusPaths, window: Duration) -> DetectorOutput {
         if !path.is_dir() {
             continue;
         }
-        match scan_project_dir(&path, window) {
+        match scan_project_dir(&path, window, &live_sessions) {
             Ok(Some((cwd, state))) => {
                 merge(&mut out.per_cwd, cwd, state);
                 files_read += 1;
@@ -81,9 +95,10 @@ pub(crate) fn scan(paths: &AiStatusPaths, window: Duration) -> DetectorOutput {
     out
 }
 
-fn scan_live_sessions(sessions_root: &Path, out: &mut DetectorOutput) {
+fn scan_live_sessions(sessions_root: &Path) -> BTreeSet<PathBuf> {
+    let mut live = BTreeSet::new();
     let Ok(read_dir) = fs::read_dir(sessions_root) else {
-        return;
+        return live;
     };
     for entry in read_dir.flatten() {
         let path = entry.path();
@@ -96,15 +111,15 @@ fn scan_live_sessions(sessions_root: &Path, out: &mut DetectorOutput) {
         let Ok(parsed) = serde_json::from_str::<ClaudeSessionFile>(&contents) else {
             continue;
         };
-        let Some(cwd) = parsed.cwd else {
-            continue;
-        };
         if !pid_alive(parsed.pid) {
             continue;
         }
-        let key = canonical_key(Path::new(&cwd));
-        merge(&mut out.per_cwd, key, AiHarnessState::Running);
+        let Some(cwd) = parsed.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) else {
+            continue;
+        };
+        live.insert(canonical_key(Path::new(cwd)));
     }
+    live
 }
 
 /// Check whether `pid` refers to a running process. Used to filter stale
@@ -150,17 +165,24 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-fn scan_project_dir(dir: &Path, window: Duration) -> Result<Option<(PathBuf, AiHarnessState)>, ()> {
+fn scan_project_dir(
+    dir: &Path,
+    window: Duration,
+    live_sessions: &BTreeSet<PathBuf>,
+) -> Result<Option<(PathBuf, AiHarnessState)>, ()> {
     let newest = newest_jsonl(dir).map_err(|_| ())?;
     let Some((newest_path, mtime)) = newest else {
         return Ok(None);
     };
-    let cwd = read_cwd(&newest_path).map_err(|_| ())?;
-    let Some(cwd) = cwd else {
+    let transcript = read_session_state(&newest_path).map_err(|_| ())?;
+    let Some((cwd, turn_state)) = transcript else {
         return Ok(None);
     };
     let key = canonical_key(Path::new(&cwd));
-    let state = classify_mtime(mtime, window);
+    let Some(state) = classify_turn_state(turn_state, mtime, window, live_sessions.contains(&key))
+    else {
+        return Ok(None);
+    };
     Ok(Some((key, state)))
 }
 
@@ -181,22 +203,53 @@ fn newest_jsonl(dir: &Path) -> std::io::Result<Option<(PathBuf, SystemTime)>> {
     Ok(newest)
 }
 
-fn read_cwd(jsonl: &Path) -> std::io::Result<Option<String>> {
+fn read_session_state(jsonl: &Path) -> std::io::Result<Option<(String, ClaudeTurnState)>> {
     let file = fs::File::open(jsonl)?;
     let reader = BufReader::new(file);
     let mut last_cwd: Option<String> = None;
+    let mut turn_state = ClaudeTurnState::Unknown;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         if let Ok(parsed) = serde_json::from_str::<ClaudeJsonLine>(&line) {
-            if let Some(cwd) = parsed.cwd {
-                last_cwd = Some(cwd);
+            if let Some(cwd) = parsed.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
+                last_cwd = Some(cwd.to_string());
+            }
+            match parsed.kind.as_deref() {
+                Some("user") if parsed.prompt_id.is_some() => {
+                    turn_state = ClaudeTurnState::Pending;
+                }
+                Some("assistant") => match parsed.stop_reason.as_deref() {
+                    Some("tool_use") => turn_state = ClaudeTurnState::Pending,
+                    Some(_) => turn_state = ClaudeTurnState::Completed,
+                    None => {}
+                },
+                _ => {}
             }
         }
     }
-    Ok(last_cwd)
+    Ok(last_cwd.map(|cwd| (cwd, turn_state)))
+}
+
+fn classify_turn_state(
+    turn_state: ClaudeTurnState,
+    mtime: SystemTime,
+    window: Duration,
+    has_live_session: bool,
+) -> Option<AiHarnessState> {
+    match turn_state {
+        ClaudeTurnState::Pending => Some(
+            if has_live_session || classify_mtime(mtime, window) == AiHarnessState::Running {
+                AiHarnessState::Running
+            } else {
+                AiHarnessState::Idle
+            },
+        ),
+        ClaudeTurnState::Completed => Some(AiHarnessState::Idle),
+        ClaudeTurnState::Unknown => None,
+    }
 }
 
 fn merge(out: &mut BTreeMap<PathBuf, AiHarnessState>, key: PathBuf, state: AiHarnessState) {

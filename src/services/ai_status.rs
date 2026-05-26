@@ -275,6 +275,7 @@ impl AiStatusService {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -291,6 +292,180 @@ mod tests {
 
     fn all_enabled_config() -> AiStatusConfig {
         AiStatusConfig::default()
+    }
+
+    fn claude_only_config(active_window_ms: u64) -> AiStatusConfig {
+        AiStatusConfig {
+            enabled_harnesses: vec!["claude_code".to_string()],
+            active_window_ms,
+        }
+    }
+
+    fn write_claude_transcript(project_dir: &std::path::Path, lines: &[String]) {
+        fs::write(project_dir.join("session.jsonl"), lines.join("\n")).unwrap();
+    }
+
+    fn claude_prompt_line(cwd: &str) -> String {
+        format!(r#"{{"type":"user","promptId":"prompt-1","cwd":"{cwd}"}}"#)
+    }
+
+    fn claude_assistant_line(cwd: &str, stop_reason: &str) -> String {
+        format!(r#"{{"type":"assistant","cwd":"{cwd}","stop_reason":"{stop_reason}"}}"#)
+    }
+
+    fn write_claude_live_session(sessions_root: &std::path::Path, pid: u32, cwd: &str) {
+        let session_json =
+            format!(r#"{{"pid":{pid},"sessionId":"abc","cwd":"{cwd}","kind":"interactive"}}"#);
+        fs::write(sessions_root.join(format!("{pid}.json")), session_json).unwrap();
+    }
+
+    fn write_codex_rollout(day_dir: &Path, name: &str, lines: &[String]) {
+        fs::create_dir_all(day_dir).unwrap();
+        fs::write(day_dir.join(name), lines.join("\n")).unwrap();
+    }
+
+    fn codex_session_meta_line(cwd: &str) -> String {
+        format!(r#"{{"type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#)
+    }
+
+    fn codex_user_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    fn codex_commentary_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","phase":"commentary","content":[{{"type":"output_text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    fn codex_final_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","phase":"final_answer","content":[{{"type":"output_text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    fn write_gemini_project_root(project_dir: &Path, worktree: &Path) {
+        fs::create_dir_all(project_dir.join("chats")).unwrap();
+        fs::write(
+            project_dir.join(".project_root"),
+            worktree.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    fn write_gemini_chat(project_dir: &Path, name: &str, lines: &[String]) {
+        fs::create_dir_all(project_dir.join("chats")).unwrap();
+        fs::write(project_dir.join("chats").join(name), lines.join("\n")).unwrap();
+    }
+
+    fn gemini_session_header_line() -> String {
+        r#"{"sessionId":"session-1","kind":"main"}"#.to_string()
+    }
+
+    fn gemini_user_line(text: &str) -> String {
+        format!(r#"{{"type":"user","content":[{{"text":"{text}"}}]}}"#)
+    }
+
+    fn gemini_thinking_line() -> String {
+        r#"{"type":"gemini","content":"","thoughts":[{"subject":"Thinking","description":"Working"}]}"#
+            .to_string()
+    }
+
+    fn gemini_final_line(text: &str) -> String {
+        format!(r#"{{"type":"gemini","content":"{text}","thoughts":[]}}"#)
+    }
+
+    fn create_opencode_db(data_dir: &Path) -> rusqlite::Connection {
+        fs::create_dir_all(data_dir).unwrap();
+        let conn = rusqlite::Connection::open(data_dir.join("opencode.db")).unwrap();
+        conn.execute(
+            "create table session (
+                id text primary key,
+                directory text not null,
+                time_updated integer not null
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "create table message (
+                id text primary key,
+                session_id text not null,
+                time_created integer not null,
+                time_updated integer not null,
+                data text not null
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "create table part (
+                id text primary key,
+                message_id text not null,
+                session_id text not null,
+                time_created integer not null,
+                time_updated integer not null,
+                data text not null
+            )",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_opencode_session(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        worktree: &Path,
+        time_updated_ms: i64,
+    ) {
+        conn.execute(
+            "insert into session (id, directory, time_updated) values (?1, ?2, ?3)",
+            rusqlite::params![session_id, worktree.to_string_lossy(), time_updated_ms],
+        )
+        .unwrap();
+    }
+
+    fn insert_opencode_message(
+        conn: &rusqlite::Connection,
+        id: &str,
+        session_id: &str,
+        time_created_ms: i64,
+        time_updated_ms: i64,
+        data: &str,
+    ) {
+        conn.execute(
+            "insert into message (id, session_id, time_created, time_updated, data)
+             values (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, session_id, time_created_ms, time_updated_ms, data],
+        )
+        .unwrap();
+    }
+
+    fn insert_opencode_part(
+        conn: &rusqlite::Connection,
+        id: &str,
+        message_id: &str,
+        session_id: &str,
+        time_created_ms: i64,
+        time_updated_ms: i64,
+        data: &str,
+    ) {
+        conn.execute(
+            "insert into part (id, message_id, session_id, time_created, time_updated, data)
+             values (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                id,
+                message_id,
+                session_id,
+                time_created_ms,
+                time_updated_ms,
+                data
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -350,35 +525,44 @@ mod tests {
     }
 
     #[test]
-    fn opencode_database_session_with_recent_time_runs() {
+    fn opencode_database_thinking_uses_latest_part_not_stale_session_time() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_under(&tmp);
         let worktree = tmp.path().join("project");
         fs::create_dir_all(&worktree).unwrap();
         let data_dir = paths.opencode_data.as_ref().unwrap();
-        fs::create_dir_all(data_dir).unwrap();
-        let conn = rusqlite::Connection::open(data_dir.join("opencode.db")).unwrap();
-        conn.execute(
-            "create table session (id text primary key, directory text not null, time_updated integer not null)",
-            [],
-        )
-        .unwrap();
+        let conn = create_opencode_db(data_dir);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        conn.execute(
-            "insert into session (id, directory, time_updated) values (?1, ?2, ?3)",
-            rusqlite::params!["ses_current", worktree.to_string_lossy(), now_ms],
-        )
-        .unwrap();
-        let session_dir = data_dir.join("storage/session_diff");
-        fs::create_dir_all(&session_dir).unwrap();
-        fs::write(
-            session_dir.join("ses_current.json"),
-            r#"[{"file":"src/main.rs","status":"modified"}]"#,
-        )
-        .unwrap();
+        let stale_session_ms = now_ms - 60_000;
+        insert_opencode_session(&conn, "ses_current", &worktree, stale_session_ms);
+        insert_opencode_message(
+            &conn,
+            "msg_user",
+            "ses_current",
+            stale_session_ms,
+            stale_session_ms,
+            r#"{"role":"user"}"#,
+        );
+        insert_opencode_message(
+            &conn,
+            "msg_assistant",
+            "ses_current",
+            stale_session_ms + 1,
+            stale_session_ms + 1,
+            r#"{"role":"assistant"}"#,
+        );
+        insert_opencode_part(
+            &conn,
+            "prt_reasoning",
+            "msg_assistant",
+            "ses_current",
+            now_ms - 1,
+            now_ms,
+            r#"{"type":"reasoning","text":"still thinking"}"#,
+        );
 
         let cfg = AiStatusConfig {
             enabled_harnesses: vec!["opencode".to_string()],
@@ -391,6 +575,59 @@ mod tests {
         assert_eq!(
             report.per_harness.get(&AiHarness::Opencode),
             Some(&AiHarnessState::Running)
+        );
+    }
+
+    #[test]
+    fn opencode_database_final_stop_marks_finished_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let data_dir = paths.opencode_data.as_ref().unwrap();
+        let conn = create_opencode_db(data_dir);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        insert_opencode_session(&conn, "ses_current", &worktree, now_ms);
+        insert_opencode_message(
+            &conn,
+            "msg_user",
+            "ses_current",
+            now_ms - 2,
+            now_ms - 2,
+            r#"{"role":"user"}"#,
+        );
+        insert_opencode_message(
+            &conn,
+            "msg_assistant",
+            "ses_current",
+            now_ms - 1,
+            now_ms - 1,
+            r#"{"role":"assistant"}"#,
+        );
+        insert_opencode_part(
+            &conn,
+            "prt_stop",
+            "msg_assistant",
+            "ses_current",
+            now_ms,
+            now_ms,
+            r#"{"type":"step-finish","reason":"stop"}"#,
+        );
+
+        let cfg = AiStatusConfig {
+            enabled_harnesses: vec!["opencode".to_string()],
+            ..AiStatusConfig::default()
+        };
+        let svc = AiStatusService::new(&cfg, paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::Opencode),
+            Some(&AiHarnessState::Idle)
         );
     }
 
@@ -425,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_jsonl_classified_by_mtime() {
+    fn claude_recent_unresolved_prompt_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_under(&tmp);
         let worktree = tmp.path().join("project");
@@ -433,8 +670,7 @@ mod tests {
         let cwd_str = worktree.to_string_lossy().to_string();
         let project_dir = paths.claude_projects.as_ref().unwrap().join("dash-slug");
         fs::create_dir_all(&project_dir).unwrap();
-        let line = format!(r#"{{"type":"user","cwd":"{cwd_str}"}}"#);
-        fs::write(project_dir.join("session.jsonl"), line).unwrap();
+        write_claude_transcript(&project_dir, &[claude_prompt_line(&cwd_str)]);
 
         let svc = AiStatusService::new(&all_enabled_config(), paths);
         let index = svc.build_index();
@@ -448,32 +684,82 @@ mod tests {
 
     #[test]
     fn claude_live_session_file_running_even_when_jsonl_is_stale() {
-        // Regression: when Claude Code is busy on a long tool call (e.g. a
-        // sub-agent), the project JSONL stops being written for many minutes
-        // and the old mtime-based detector would flip the worktree from
-        // Running to Idle. The `~/.claude/sessions/<pid>.json` file is the
-        // authoritative "currently running" signal — its presence plus a
-        // live PID means the session is active.
+        // Regression: if the latest transcript turn is still unresolved but
+        // the JSONL has gone stale during a long tool call, a live Claude
+        // session PID should keep the worktree in Running.
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_under(&tmp);
         let worktree = tmp.path().join("project");
         fs::create_dir_all(&worktree).unwrap();
         let cwd_str = worktree.to_string_lossy().to_string();
+        let project_dir = paths.claude_projects.as_ref().unwrap().join("dash-slug");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_claude_transcript(&project_dir, &[claude_prompt_line(&cwd_str)]);
+        std::thread::sleep(std::time::Duration::from_millis(25));
         let sessions_root = paths.claude_sessions.as_ref().unwrap();
         fs::create_dir_all(sessions_root).unwrap();
         let live_pid = std::process::id();
-        let session_json = format!(
-            r#"{{"pid":{live_pid},"sessionId":"abc","cwd":"{cwd_str}","kind":"interactive"}}"#
-        );
-        fs::write(sessions_root.join(format!("{live_pid}.json")), session_json).unwrap();
+        write_claude_live_session(sessions_root, live_pid, &cwd_str);
 
-        let svc = AiStatusService::new(&all_enabled_config(), paths);
+        let svc = AiStatusService::new(&claude_only_config(1), paths);
         let index = svc.build_index();
         let report = svc.report_for(&index, &worktree);
         assert_eq!(report.aggregated, AiStatus::InProgress);
         assert_eq!(
             report.per_harness.get(&AiHarness::ClaudeCode),
             Some(&AiHarnessState::Running)
+        );
+    }
+
+    #[test]
+    fn claude_completed_turn_with_live_session_is_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let project_dir = paths.claude_projects.as_ref().unwrap().join("dash-slug");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_claude_transcript(
+            &project_dir,
+            &[
+                claude_prompt_line(&cwd_str),
+                claude_assistant_line(&cwd_str, "end_turn"),
+            ],
+        );
+        let sessions_root = paths.claude_sessions.as_ref().unwrap();
+        fs::create_dir_all(sessions_root).unwrap();
+        write_claude_live_session(sessions_root, std::process::id(), &cwd_str);
+
+        let svc = AiStatusService::new(&claude_only_config(1), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::ClaudeCode),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn claude_stale_unresolved_prompt_without_live_session_is_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let project_dir = paths.claude_projects.as_ref().unwrap().join("dash-slug");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_claude_transcript(&project_dir, &[claude_prompt_line(&cwd_str)]);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let svc = AiStatusService::new(&claude_only_config(1), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::ClaudeCode),
+            Some(&AiHarnessState::Idle)
         );
     }
 
@@ -495,10 +781,7 @@ mod tests {
         // 0x7FFFFFFE — well beyond any realistic OS PID — gives ESRCH on both
         // macOS (PID_MAX 99999) and Linux (default 32768, max 4194304).
         let dead_pid: u32 = 0x7FFF_FFFE;
-        let session_json = format!(
-            r#"{{"pid":{dead_pid},"sessionId":"abc","cwd":"{cwd_str}","kind":"interactive"}}"#
-        );
-        fs::write(sessions_root.join(format!("{dead_pid}.json")), session_json).unwrap();
+        write_claude_live_session(sessions_root, dead_pid, &cwd_str);
 
         let svc = AiStatusService::new(&all_enabled_config(), paths);
         let index = svc.build_index();
@@ -510,19 +793,22 @@ mod tests {
     }
 
     #[test]
-    fn gemini_basename_dir_with_project_root_running() {
+    fn gemini_unresolved_prompt_with_recent_activity_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_under(&tmp);
         let worktree = tmp.path().join("ai-status");
         fs::create_dir_all(&worktree).unwrap();
         let project_dir = paths.gemini_tmp.as_ref().unwrap().join("ai-status");
-        fs::create_dir_all(project_dir.join("chats")).unwrap();
-        fs::write(
-            project_dir.join(".project_root"),
-            worktree.to_string_lossy().as_bytes(),
-        )
-        .unwrap();
-        fs::write(project_dir.join("chats/session.jsonl"), "{}").unwrap();
+        write_gemini_project_root(&project_dir, &worktree);
+        write_gemini_chat(
+            &project_dir,
+            "session.jsonl",
+            &[
+                gemini_session_header_line(),
+                gemini_user_line("fix the footer"),
+                gemini_thinking_line(),
+            ],
+        );
 
         let svc = AiStatusService::new(&all_enabled_config(), paths);
         let index = svc.build_index();
@@ -532,6 +818,101 @@ mod tests {
             report.per_harness.get(&AiHarness::GeminiCli),
             Some(&AiHarnessState::Running)
         );
+    }
+
+    #[test]
+    fn gemini_non_empty_response_marks_finished_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("ai-status");
+        fs::create_dir_all(&worktree).unwrap();
+        let project_dir = paths.gemini_tmp.as_ref().unwrap().join("ai-status");
+        write_gemini_project_root(&project_dir, &worktree);
+        write_gemini_chat(
+            &project_dir,
+            "session.jsonl",
+            &[
+                gemini_session_header_line(),
+                gemini_user_line("fix the footer"),
+                gemini_final_line("Done."),
+            ],
+        );
+
+        let svc = AiStatusService::new(&all_enabled_config(), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::GeminiCli),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn gemini_stale_unresolved_prompt_without_reply_is_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("ai-status");
+        fs::create_dir_all(&worktree).unwrap();
+        let project_dir = paths.gemini_tmp.as_ref().unwrap().join("ai-status");
+        write_gemini_project_root(&project_dir, &worktree);
+        write_gemini_chat(
+            &project_dir,
+            "session.jsonl",
+            &[
+                gemini_session_header_line(),
+                gemini_user_line("fix the footer"),
+            ],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let cfg = AiStatusConfig {
+            enabled_harnesses: vec!["gemini_cli".to_string()],
+            active_window_ms: 1,
+        };
+        let svc = AiStatusService::new(&cfg, paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::GeminiCli),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn gemini_stale_pending_with_live_process_runs() {
+        // Regression: gemini-cli stops writing to its JSONL while a long
+        // "Thinking…" step is in flight (we've observed gaps of several
+        // minutes on slow models). The mtime-only fallback then ages past
+        // `active_window_ms` and flips the worktree to Idle even though the
+        // process is alive. A live `gemini` cwd must override that.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("ai-status");
+        fs::create_dir_all(&worktree).unwrap();
+        let project_dir = paths.gemini_tmp.as_ref().unwrap().join("ai-status");
+        write_gemini_project_root(&project_dir, &worktree);
+        write_gemini_chat(
+            &project_dir,
+            "session.jsonl",
+            &[
+                gemini_session_header_line(),
+                gemini_user_line("investigate this repo"),
+            ],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let mut live_cwds = std::collections::BTreeSet::new();
+        live_cwds.insert(canonical_key(&worktree));
+
+        let out = gemini::scan_with_live_cwds_for_test(
+            &paths,
+            std::time::Duration::from_millis(1),
+            &live_cwds,
+        );
+        let state = out.per_cwd.get(&canonical_key(&worktree)).copied();
+        assert_eq!(state, Some(AiHarnessState::Running));
     }
 
     #[test]
@@ -549,7 +930,11 @@ mod tests {
             .unwrap()
             .join("a82356f93285589653d2c37a1f993603bf7335d0c35341f4396eae079aa2227c");
         fs::create_dir_all(project_dir.join("chats")).unwrap();
-        fs::write(project_dir.join("chats/session.jsonl"), "{}").unwrap();
+        fs::write(
+            project_dir.join("chats/session.jsonl"),
+            gemini_session_header_line(),
+        )
+        .unwrap();
 
         let svc = AiStatusService::new(&all_enabled_config(), paths);
         let index = svc.build_index();
@@ -578,9 +963,15 @@ mod tests {
         // covers it; only the long-tail cache can surface it.
         let two_weeks_ago = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 14);
         let old_day = codex::date_dir_for(&sessions_root, two_weeks_ago).unwrap();
-        fs::create_dir_all(&old_day).unwrap();
-        let header = format!(r#"{{"cwd":"{cwd_str}","type":"session_meta"}}"#);
-        fs::write(old_day.join("rollout-old.jsonl"), header).unwrap();
+        write_codex_rollout(
+            &old_day,
+            "rollout-old.jsonl",
+            &[
+                codex_session_meta_line(&cwd_str),
+                codex_user_line("hello"),
+                codex_final_line("done"),
+            ],
+        );
 
         let svc = AiStatusService::new(&all_enabled_config(), paths);
         let index = svc.build_index();
@@ -593,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_today_directory_running() {
+    fn codex_unresolved_prompt_with_commentary_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_under(&tmp);
         let worktree = tmp.path().join("project");
@@ -601,9 +992,15 @@ mod tests {
         let cwd_str = worktree.to_string_lossy().to_string();
         let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
         let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
-        fs::create_dir_all(&today).unwrap();
-        let header = format!(r#"{{"cwd":"{cwd_str}","type":"session_meta"}}"#);
-        fs::write(today.join("rollout-1.jsonl"), header).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-1.jsonl",
+            &[
+                codex_session_meta_line(&cwd_str),
+                codex_user_line("hello"),
+                codex_commentary_line("checking the code"),
+            ],
+        );
 
         let svc = AiStatusService::new(&all_enabled_config(), paths);
         let index = svc.build_index();
@@ -612,6 +1009,79 @@ mod tests {
         assert_eq!(
             report.per_harness.get(&AiHarness::CodexCli),
             Some(&AiHarnessState::Running)
+        );
+    }
+
+    #[test]
+    fn codex_final_answer_marks_finished_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-1.jsonl",
+            &[
+                codex_session_meta_line(&cwd_str),
+                codex_user_line("hello"),
+                codex_final_line("done"),
+            ],
+        );
+
+        let svc = AiStatusService::new(&all_enabled_config(), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::CodexCli),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn codex_newer_finished_rollout_beats_older_running_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let yesterday = codex::date_dir_for(
+            &sessions_root,
+            SystemTime::now() - Duration::from_secs(86_400),
+        )
+        .unwrap();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &yesterday,
+            "rollout-yesterday.jsonl",
+            &[
+                codex_session_meta_line(&cwd_str),
+                codex_user_line("older request"),
+                codex_commentary_line("still thinking"),
+            ],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        write_codex_rollout(
+            &today,
+            "rollout-today.jsonl",
+            &[
+                codex_session_meta_line(&cwd_str),
+                codex_user_line("newer request"),
+                codex_final_line("done"),
+            ],
+        );
+
+        let svc = AiStatusService::new(&all_enabled_config(), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::CodexCli),
+            Some(&AiHarnessState::Idle)
         );
     }
 
