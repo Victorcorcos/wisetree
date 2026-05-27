@@ -19,5 +19,5 @@ Delete worktrees with status: │ Merged │  │ Closed │  │ Open │
 Status: Mother = main worktree (protected)  Dirty = has uncommitted chan
 PR Checks: ⚪  (Pending)  🟡  (Running)  ⚠️  (Errored)  🔴  (Failed)  🟢  (Pa
 PR Reviews: ✋  (Pending)  👎  (Changes Requested)  👍  (Approved)
-PR Merges: 📝  (Draft)  ❌  (Dirty)  🚫  (Blocked)  ❓  (Unknown)  🍂  (Behin
+PR Merges: 📝  (Draft)  ❌  (Dirty)  🚫  (Blocked)  ❓  (Unknown)  🔄  (Behin
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls b
