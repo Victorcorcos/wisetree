@@ -348,7 +348,21 @@ impl App {
 
         match self.phase {
             InitPhase::Loading => {
-                screens::loading::draw(frame, area, self.tick, self.screen.as_str());
+                // Render the WelcomeHeader on top of the loading splash so
+                // the user (and integration tests) can immediately see which
+                // screen is loading. Menu has its own header so we skip the
+                // outer one in that case.
+                if matches!(self.screen, Screen::Menu) {
+                    screens::loading::draw(frame, area, self.tick, self.screen.as_str());
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(4), Constraint::Min(0)])
+                        .split(area);
+                    let cwd = self.git_root.as_deref().unwrap_or("");
+                    WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+                    screens::loading::draw(frame, chunks[1], self.tick, self.screen.as_str());
+                }
             }
             InitPhase::Errored => {
                 let msg = self.error.as_deref().unwrap_or("Unknown error");
