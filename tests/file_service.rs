@@ -29,7 +29,10 @@ async fn copy_files_does_not_dereference_symlinks() {
     let report = copy_files(src.path(), dst.path(), &config).await;
 
     assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
-    assert!(!dst.path().join(".env").exists(), "symlinked .env was copied");
+    assert!(
+        !dst.path().join(".env").exists(),
+        "symlinked .env was copied"
+    );
     assert!(
         !dst.path().join(".vscode/secret").exists(),
         "nested symlink was copied"
