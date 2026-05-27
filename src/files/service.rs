@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::config::WorktreeConfig;
 use crate::files::patterns::{match_files, should_ignore_file};
-use crate::utils::path::{resolve_template, TemplateVariables};
+use crate::utils::path::{resolve_template_shell, TemplateVariables};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CopyReport {
@@ -84,8 +84,15 @@ pub async fn copy_files(
         let source_path = source_dir.join(&rel);
         let target_path = target_dir.join(&rel);
 
-        match tokio::fs::metadata(&source_path).await {
+        // Inspect metadata without following symlinks so a symlink pointing
+        // outside the source tree (e.g. `.env` → `~/.ssh/id_rsa` in a hostile
+        // repo) is not silently dereferenced and copied.
+        match tokio::fs::symlink_metadata(&source_path).await {
             Err(_) => {
+                report.skipped.push(rel);
+                continue;
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
                 report.skipped.push(rel);
                 continue;
             }
@@ -170,7 +177,10 @@ async fn copy_directory_recursive(
     }
 
     for (source_path, target_path, relative) in sub {
-        match tokio::fs::metadata(&source_path).await {
+        match tokio::fs::symlink_metadata(&source_path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                report.skipped.push(relative);
+            }
             Ok(meta) if meta.is_dir() => {
                 Box::pin(copy_directory_recursive(
                     &source_path,
@@ -223,7 +233,7 @@ pub async fn execute_post_create_commands(
             cb(command, idx + 1, total);
         }
 
-        let resolved = resolve_template(command, variables);
+        let resolved = resolve_template_shell(command, variables);
         if let Some(cb) = on_activity.as_deref_mut() {
             cb(&format!("$ {resolved}"), ActivityKind::Status);
         }
@@ -420,11 +430,26 @@ pub fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// Return true when `url` starts with a scheme we trust the system opener
+/// to handle. Anything else (`file://`, `javascript:`, `data:`, custom URI
+/// handlers, unschemed strings) is rejected by `open_url` so a malicious
+/// remote URL cannot pivot through the browser into local-file access or
+/// scheme-handler abuse.
+fn is_safe_browser_url(url: &str) -> bool {
+    let lowered = url.trim_start().to_ascii_lowercase();
+    lowered.starts_with("http://") || lowered.starts_with("https://")
+}
+
 /// Open `url` in the user's default browser, detached. Returns the spawn
 /// error (if any) so the caller can surface a toast. Picks the
 /// platform-appropriate launcher: `open` on macOS, `cmd /C start ""` on
 /// Windows, `xdg-open` on Linux/BSD.
 pub fn open_url(url: &str) -> Result<(), String> {
+    if !is_safe_browser_url(url) {
+        return Err(format!(
+            "Refusing to open URL with unsupported scheme: {url}"
+        ));
+    }
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
         c.arg(url);
@@ -464,7 +489,7 @@ pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLau
         branch_name: String::new(),
         source_branch: String::new(),
     };
-    let resolved = resolve_template(terminal_command, &variables);
+    let resolved = resolve_template_shell(terminal_command, &variables);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("cmd");
