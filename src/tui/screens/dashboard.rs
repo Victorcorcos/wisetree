@@ -1270,7 +1270,7 @@ impl DashboardScreen {
             Span::styled("  ❌ (Dirty)", muted_dim),
             Span::styled("  🚫 (Blocked)", muted_dim),
             Span::styled("  ❓ (Unknown)", muted_dim),
-            Span::styled("  🍂 (Behind)", muted_dim),
+            Span::styled("  🔄 (Behind)", muted_dim),
             Span::styled("  ⏳ (Has Hooks)", muted_dim),
             Span::styled("  🏚️ (Unstable)", muted_dim),
             Span::styled("  ✅ (Clean)", muted_dim),
@@ -1660,7 +1660,7 @@ impl DashboardColumn {
                 }
             }
             Self::Status => {
-                // Wide enough to render "Opened 🟡 👍 🍂" without truncating
+                // Wide enough to render "Opened 🟡 👍 🔄" without truncating
                 // any emoji. Emoji codepoints are 1 grapheme but
                 // ratatui counts them as 2 columns wide, so we budget
                 // label (6) + space (1) + check emoji (2) + space (1)
@@ -1979,7 +1979,7 @@ fn merge_status_emoji(status: MergeStatus) -> &'static str {
         MergeStatus::Dirty => "❌",
         MergeStatus::Blocked => "🚫",
         MergeStatus::Unknown => "❓",
-        MergeStatus::Behind => "🍂",
+        MergeStatus::Behind => "🔄",
         MergeStatus::HasHooks => "⏳",
         MergeStatus::Unstable => "🏚️",
         MergeStatus::Clean => "✅",
