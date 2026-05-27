@@ -2,8 +2,62 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 
 use wisetree::config::WorktreeConfig;
-use wisetree::files::service::{copy_files, execute_post_create_commands, open_terminal};
+use wisetree::files::service::{copy_files, execute_post_create_commands, open_terminal, open_url};
 use wisetree::utils::path::TemplateVariables;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn copy_files_does_not_dereference_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().expect("outside");
+    let secret_path = outside.path().join("secret.txt");
+    fs::write(&secret_path, "TOP SECRET").unwrap();
+
+    let src = tempfile::tempdir().expect("src");
+    let dst = tempfile::tempdir().expect("dst");
+
+    // Top-level symlink matched by the `.env*` default pattern.
+    symlink(&secret_path, src.path().join(".env")).unwrap();
+
+    // Symlink nested inside a recursively-copied directory.
+    fs::create_dir_all(src.path().join(".vscode")).unwrap();
+    symlink(&secret_path, src.path().join(".vscode/secret")).unwrap();
+    fs::write(src.path().join(".vscode/settings.json"), "{}").unwrap();
+
+    let config = WorktreeConfig::default();
+    let report = copy_files(src.path(), dst.path(), &config).await;
+
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert!(
+        !dst.path().join(".env").exists(),
+        "symlinked .env was copied"
+    );
+    assert!(
+        !dst.path().join(".vscode/secret").exists(),
+        "nested symlink was copied"
+    );
+    assert!(dst.path().join(".vscode/settings.json").exists());
+}
+
+#[test]
+fn open_url_rejects_non_http_schemes() {
+    for url in [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "data:text/html,<script>x</script>",
+        "ftp://example.com/foo",
+        "mailto:victim@example.com",
+        "",
+        "not-a-url",
+    ] {
+        let err = open_url(url).expect_err("expected scheme rejection");
+        assert!(
+            err.contains("unsupported scheme"),
+            "url {url:?} produced unexpected error {err}"
+        );
+    }
+}
 
 #[tokio::test]
 async fn copy_files_copies_matched_set_and_skips_ignored() {

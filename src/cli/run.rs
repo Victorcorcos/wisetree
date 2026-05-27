@@ -89,6 +89,18 @@ fn run_tui(parsed: ParsedArgs) -> Result<ExitCode, anyhow::Error> {
             // Write to *real* stdout (the inherited pipe) so the wrapper's
             // `local dir=$(...)` captures exactly the path. Match branchlet's
             // trailing newline.
+            //
+            // Reject anything containing control bytes or embedded newlines
+            // before we print it: the wrapper interpolates the value into
+            // `builtin cd "$dir"`, and a path with a newline could split
+            // into a second command line for the shell to evaluate.
+            if path
+                .chars()
+                .any(|c| c == '\n' || c == '\r' || (c.is_control() && c != '\t'))
+            {
+                eprintln!("Error: refusing to emit worktree path with control characters");
+                return Ok(ExitCode::from(1));
+            }
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{path}");
