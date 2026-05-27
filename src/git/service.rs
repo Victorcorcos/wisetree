@@ -308,9 +308,10 @@ impl GitService {
             .any(|wt| wt.path == worktree_path))
     }
 
-    /// Run `git worktree add [-b <newBranch>] <path> <sourceBranch>`. Omits
-    /// `-b` when the new branch matches the source (a checkout, not a new
-    /// branch).
+    /// Run `git worktree add [-b <newBranch>] -- <path> <sourceBranch>`.
+    /// Omits `-b` when the new branch matches the source (a checkout, not a
+    /// new branch). The `--` separator keeps git from interpreting a `-`-
+    /// leading path or ref as a flag.
     pub async fn create_worktree(&self, options: &WorktreeCreateOptions) -> Result<()> {
         let worktree_path = format!("{}/{}", options.base_path, options.name);
 
@@ -319,6 +320,7 @@ impl GitService {
             args.push("-b");
             args.push(&options.new_branch);
         }
+        args.push("--");
         args.push(&worktree_path);
         args.push(&options.source_branch);
 
@@ -329,14 +331,15 @@ impl GitService {
         Ok(())
     }
 
-    /// Run `git worktree remove [--force] <path>`. On a non-force failure
-    /// where stderr mentions a submodule, retries with `--force` (mirrors
-    /// upstream submodule handling).
+    /// Run `git worktree remove [--force] -- <path>`. On a non-force
+    /// failure where stderr mentions a submodule, retries with `--force`
+    /// (mirrors upstream submodule handling).
     pub async fn delete_worktree(&self, options: &WorktreeDeleteOptions) -> Result<()> {
         let mut args: Vec<&str> = vec!["worktree", "remove"];
         if options.force {
             args.push("--force");
         }
+        args.push("--");
         args.push(&options.path);
 
         let result = execute_git_command(&args, Some(&self.git_root)).await;
@@ -346,7 +349,7 @@ impl GitService {
 
         if !options.force && result.stderr.contains("submodule") {
             let force_result = execute_git_command(
-                &["worktree", "remove", "--force", &options.path],
+                &["worktree", "remove", "--force", "--", &options.path],
                 Some(&self.git_root),
             )
             .await;
@@ -359,8 +362,8 @@ impl GitService {
         Err(handle_git_error(&result.stderr, "delete worktree"))
     }
 
-    /// Run `git branch [-d|-D] <name>`. Refuses to delete the current branch
-    /// or the default branch (matches upstream guard).
+    /// Run `git branch [-d|-D] -- <name>`. Refuses to delete the current
+    /// branch or the default branch (matches upstream guard).
     pub async fn delete_branch(&self, branch_name: &str, force: bool) -> Result<()> {
         let current = self.current_branch().await;
         let default = self.default_branch().await;
@@ -377,7 +380,7 @@ impl GitService {
         }
 
         let flag = if force { "-D" } else { "-d" };
-        let args = ["branch", flag, branch_name];
+        let args = ["branch", flag, "--", branch_name];
         let result = execute_git_command(&args, Some(&self.git_root)).await;
         if !result.success {
             return Err(handle_git_error(&result.stderr, "delete branch"));
