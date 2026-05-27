@@ -370,7 +370,6 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
 
     let now = now_unix_ms();
     let grace_ms = ORPHAN_GRACE_PERIOD.as_millis() as u64;
-    let mut retained_patterns = Vec::new();
 
     for pattern in patterns {
         let Some(entry_path) = cache_entry_path(cache_dir, &pattern) else {
@@ -386,7 +385,6 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
         let entry_users = active_users_for_entry(cache_dir, &pattern, &users)?;
         if !entry_users.is_empty() {
             skipped.push(format!("{pattern}: cache still has active worktrees"));
-            retained_patterns.push(pattern);
             continue;
         }
 
@@ -398,7 +396,6 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
         let last_seen = metadata.entry_last_seen.get(&pattern).copied().unwrap_or(0);
         if now.saturating_sub(last_seen) < grace_ms {
             skipped.push(format!("{pattern}: used within the last 14 days"));
-            retained_patterns.push(pattern);
             continue;
         }
 
@@ -407,7 +404,6 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
         removed.push(pattern);
     }
 
-    metadata.patterns = retained_patterns;
     metadata.normalize();
     write_metadata(cache_dir, &metadata).await?;
 
