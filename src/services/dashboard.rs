@@ -1179,8 +1179,14 @@ impl DashboardService {
         .ok()?;
         let Ok(output) = result else { return None };
         let mut parts = output.split_whitespace();
-        let behind = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        let ahead = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let behind = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let ahead = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         Some(BranchStatus {
             ahead,
             behind,
