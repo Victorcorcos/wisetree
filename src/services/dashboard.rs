@@ -500,6 +500,11 @@ struct PrCacheState {
     rate_limited_until: Option<Instant>,
     rate_limit_notice_sent: bool,
     loaded_from_disk: bool,
+    /// Set whenever `entries` is mutated by application code (PR insert,
+    /// prune-on-branch-disappear). `save_cache` checks this flag and skips
+    /// the read-merge-write cycle when nothing has changed since the last
+    /// persist — avoiding unnecessary disk I/O on every refresh tick.
+    dirty: bool,
     notice_tx: Option<mpsc::Sender<DashboardNotice>>,
 }
 
@@ -1280,6 +1285,9 @@ impl DashboardService {
                         },
                     );
                 }
+                if !to_fetch.is_empty() {
+                    state.dirty = true;
+                }
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
@@ -1442,9 +1450,13 @@ impl DashboardService {
 
     fn prune_cache(&self, live_branches: &HashSet<String>) {
         let mut state = self.pr_state.lock().expect("pr_state poisoned");
+        let before = state.entries.len();
         state
             .entries
             .retain(|branch, _| live_branches.contains(branch));
+        if state.entries.len() != before {
+            state.dirty = true;
+        }
     }
 
     fn save_cache(&self) {
@@ -1454,6 +1466,13 @@ impl DashboardService {
         let key = self.git_root.to_string_lossy().to_string();
         let entries = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
+            // Skip the read-merge-write cycle entirely when nothing has
+            // changed since the last persist. Without this guard the cache
+            // file is rewritten on every refresh tick (3–5s) even when no
+            // PR entry actually moved.
+            if !state.dirty {
+                return;
+            }
             state.entries.clone()
         };
 
@@ -1472,7 +1491,10 @@ impl DashboardService {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&disk) {
-            let _ = std::fs::write(&path, json);
+            if std::fs::write(&path, json).is_ok() {
+                let mut state = self.pr_state.lock().expect("pr_state poisoned");
+                state.dirty = false;
+            }
         }
     }
 }
