@@ -122,7 +122,8 @@ impl WorktreeService {
             &config.worktree_path_template,
             Some(&options.new_branch),
             Some(&options.source_branch),
-        );
+        )
+        .map_err(|e| WisetreeError::validation(e.to_string()))?;
         let worktree_path_str = worktree_path.to_string_lossy().into_owned();
 
         if self.git_service.worktree_exists(&worktree_path_str).await? {

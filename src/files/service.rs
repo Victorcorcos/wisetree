@@ -3,7 +3,7 @@
 //!
 //! Mirrors `branchlet/src/services/file-service.ts`.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::config::WorktreeConfig;
 use crate::files::patterns::{match_files, should_ignore_file};
-use crate::utils::path::{resolve_template, TemplateVariables};
+use crate::utils::path::{resolve_template_shell, TemplateVariables};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CopyReport {
@@ -84,25 +84,29 @@ pub async fn copy_files(
         let source_path = source_dir.join(&rel);
         let target_path = target_dir.join(&rel);
 
-        // `symlink_metadata` does not follow links, so we can detect and
-        // preserve symlinked entries instead of recursing into whatever
-        // they point at (which may be outside the repo root).
+        // Inspect metadata without following symlinks so links that point
+        // outside the source tree are skipped instead of being dereferenced.
         match tokio::fs::symlink_metadata(&source_path).await {
             Err(_) => {
                 report.skipped.push(rel);
                 continue;
             }
             Ok(meta) if meta.file_type().is_symlink() => {
-                if let Some(parent) = target_path.parent() {
-                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                        report.errors.push(format!("{rel}: {e}"));
-                        continue;
+                if symlink_points_within_root(&source_path, source_dir).await {
+                    if let Some(parent) = target_path.parent() {
+                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                            report.errors.push(format!("{rel}: {e}"));
+                            continue;
+                        }
                     }
+                    match copy_symlink(&source_path, &target_path).await {
+                        Ok(_) => report.copied.push(rel),
+                        Err(e) => report.errors.push(format!("{rel}: {e}")),
+                    }
+                } else {
+                    report.skipped.push(rel);
                 }
-                match copy_symlink(&source_path, &target_path).await {
-                    Ok(_) => report.copied.push(rel),
-                    Err(e) => report.errors.push(format!("{rel}: {e}")),
-                }
+                continue;
             }
             Ok(meta) if meta.is_dir() => {
                 copy_directory_recursive(
@@ -159,6 +163,41 @@ async fn copy_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
     }
 }
 
+async fn symlink_points_within_root(source: &Path, base_root: &Path) -> bool {
+    let Ok(link_target) = tokio::fs::read_link(source).await else {
+        return false;
+    };
+
+    let resolved = if link_target.is_absolute() {
+        normalize_lexical_path(&link_target)
+    } else {
+        let Some(parent) = source.parent() else {
+            return false;
+        };
+        normalize_lexical_path(&parent.join(link_target))
+    };
+
+    resolved.starts_with(normalize_lexical_path(base_root))
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
 async fn copy_directory_recursive(
     source_dir: &Path,
     target_dir: &Path,
@@ -212,14 +251,15 @@ async fn copy_directory_recursive(
     }
 
     for (source_path, target_path, relative) in sub {
-        // `symlink_metadata` keeps us from chasing symlinks out of the
-        // source tree — a matched symlinked directory should be copied
-        // as a link, not recursively cloned from wherever it points.
         match tokio::fs::symlink_metadata(&source_path).await {
             Ok(meta) if meta.file_type().is_symlink() => {
-                match copy_symlink(&source_path, &target_path).await {
-                    Ok(_) => report.copied.push(relative),
-                    Err(e) => report.errors.push(format!("{relative}: {e}")),
+                if symlink_points_within_root(&source_path, base_root).await {
+                    match copy_symlink(&source_path, &target_path).await {
+                        Ok(_) => report.copied.push(relative),
+                        Err(e) => report.errors.push(format!("{relative}: {e}")),
+                    }
+                } else {
+                    report.skipped.push(relative);
                 }
             }
             Ok(meta) if meta.is_dir() => {
@@ -274,7 +314,7 @@ pub async fn execute_post_create_commands(
             cb(command, idx + 1, total);
         }
 
-        let resolved = resolve_template(command, variables);
+        let resolved = resolve_template_shell(command, variables);
         if let Some(cb) = on_activity.as_deref_mut() {
             cb(&format!("$ {resolved}"), ActivityKind::Status);
         }
@@ -480,11 +520,26 @@ pub fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// Return true when `url` starts with a scheme we trust the system opener
+/// to handle. Anything else (`file://`, `javascript:`, `data:`, custom URI
+/// handlers, unschemed strings) is rejected by `open_url` so a malicious
+/// remote URL cannot pivot through the browser into local-file access or
+/// scheme-handler abuse.
+fn is_safe_browser_url(url: &str) -> bool {
+    let lowered = url.trim_start().to_ascii_lowercase();
+    lowered.starts_with("http://") || lowered.starts_with("https://")
+}
+
 /// Open `url` in the user's default browser, detached. Returns the spawn
 /// error (if any) so the caller can surface a toast. Picks the
 /// platform-appropriate launcher: `open` on macOS, `cmd /C start ""` on
 /// Windows, `xdg-open` on Linux/BSD.
 pub fn open_url(url: &str) -> Result<(), String> {
+    if !is_safe_browser_url(url) {
+        return Err(format!(
+            "Refusing to open URL with unsupported scheme: {url}"
+        ));
+    }
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
         c.arg(url);
@@ -523,7 +578,7 @@ pub fn open_terminal(terminal_command: &str, variables: &TemplateVariables) -> T
         };
     }
 
-    let resolved = resolve_template(terminal_command, variables);
+    let resolved = resolve_template_shell(terminal_command, variables);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("cmd");
