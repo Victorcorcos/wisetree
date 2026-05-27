@@ -66,7 +66,8 @@ pub async fn run(args: CliArgs, service: &WorktreeService) -> Result<()> {
         &config.worktree_path_template,
         Some(&new_branch),
         Some(source),
-    );
+    )
+    .map_err(|e| WisetreeError::other(e.to_string()))?;
     let worktree_path_str = worktree_path.to_string_lossy().into_owned();
     let base_path = worktree_path
         .parent()

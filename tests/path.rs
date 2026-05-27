@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use wisetree::utils::path::{
     get_worktree_path, repository_base_name, resolve_template, resolve_template_shell,
-    shell_escape_cmd, shell_escape_posix, TemplateVariables,
+    shell_escape_cmd, shell_escape_posix, validate_resolved_path_template, PathTemplateError,
+    TemplateVariables,
 };
 
 fn vars(base: &str, worktree: &str, branch: &str, source: &str) -> TemplateVariables {
@@ -51,8 +52,44 @@ fn worktree_path_uses_default_template() {
         "$BASE_PATH.worktree",
         Some("feat-x"),
         Some("main"),
-    );
+    )
+    .expect("safe template");
     assert_eq!(path, PathBuf::from("/repos/myrepo.worktree/feat-x"));
+}
+
+#[test]
+fn worktree_path_rejects_absolute_template() {
+    let git_root = PathBuf::from("/repos/myrepo");
+    let err = get_worktree_path(
+        &git_root,
+        "feat-x",
+        "/Users/victim/.ssh",
+        Some("feat-x"),
+        Some("main"),
+    )
+    .expect_err("absolute template must be rejected");
+    assert_eq!(err, PathTemplateError::Absolute);
+}
+
+#[test]
+fn worktree_path_rejects_parent_dir_traversal() {
+    let git_root = PathBuf::from("/repos/myrepo");
+    let err = get_worktree_path(
+        &git_root,
+        "feat-x",
+        "../../etc/wisetree",
+        Some("feat-x"),
+        Some("main"),
+    )
+    .expect_err(".. template must be rejected");
+    assert_eq!(err, PathTemplateError::ParentTraversal);
+}
+
+#[test]
+fn validate_resolved_path_template_accepts_safe_relatives() {
+    assert!(validate_resolved_path_template("myrepo.worktree").is_ok());
+    assert!(validate_resolved_path_template("nested/dir").is_ok());
+    assert!(validate_resolved_path_template("./prefix").is_ok());
 }
 
 #[test]
@@ -104,6 +141,7 @@ fn worktree_path_with_branch_template() {
         "$BASE_PATH-$BRANCH_NAME",
         Some("feature/foo"),
         Some("main"),
-    );
+    )
+    .expect("safe template");
     assert_eq!(path, PathBuf::from("/repos/myrepo-feature/foo/feature-foo"));
 }
