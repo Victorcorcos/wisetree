@@ -119,7 +119,7 @@ fn branch_dash_or_dot_edges() {
 fn branch_invalid_chars() {
     for s in [
         "foo bar", "foo~bar", "foo^bar", "foo:bar", "foo?bar", "foo*bar", "foo[bar", "foo]bar",
-        "foo\\bar", "foo@bar",
+        "foo{bar", "foo}bar", "foo\\bar", "foo@bar",
     ] {
         assert_eq!(
             validate_branch_name(s),
