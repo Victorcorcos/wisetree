@@ -309,12 +309,12 @@ The variables `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, and `$SOURCE_BRANC
 
 | Field | Type | Default | Purpose |
 | --- | --- | --- | --- |
-| `worktreeCopyPatterns` | `string[]` | `[".env*", ".vscode/**"]` | Glob patterns of files to copy from the source repo into a brand-new worktree. |
+| `worktreeCopyPatterns` | `string[]` | `[".env*", ".vscode/**"]` | Glob patterns of files to copy from the source repo into a brand-new worktree. Symbolic links matched by the patterns are skipped rather than dereferenced, so the copy step cannot be coaxed into reading files outside the repo. |
 | `worktreeCopyIgnores` | `string[]` | `["**/node_modules/**", "**/dist/**", "**/.git/**", "**/Thumbs.db", "**/.DS_Store"]` | Glob patterns to skip during the copy step. |
 | `worktreeLinkPatterns` | `string[]` | `[]` | Directory patterns to symlink into new worktrees from the shared dependency cache. |
 | `worktreeLinkStrategy` | `string` | `"CreateEmpty"` | How to prepare a cache entry before linking it: `CreateEmpty`, `SeedFromSource`, or `SeedIfPresent`. |
 | `worktreeLinkCacheDir` | `string \| null` | `null` | Optional override for the per-repository shared cache root. |
-| `worktreePathTemplate` | `string` | `"$BASE_PATH.worktree"` | Template that decides where new worktrees live on disk, relative to the repo's parent directory. |
+| `worktreePathTemplate` | `string` | `"$BASE_PATH.worktree"` | Template that decides where new worktrees live on disk, relative to the repo's parent directory. Must resolve to a relative path; absolute paths and `..` traversal are rejected. |
 | `postCreateCmd` | `string[]` | `[]` | Ordered list of shell commands executed inside the new worktree, with live progress in the TUI. |
 | `terminalCommand` | `string` | `""` | Optional command spawned right after creation (e.g. `code $WORKTREE_PATH`) to open an editor or terminal. |
 | `deleteBranchWithWorktree` | `boolean` | `false` | When `true`, deleting a worktree also deletes its associated branch. |
