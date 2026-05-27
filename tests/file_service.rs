@@ -53,7 +53,11 @@ async fn copy_files_preserves_internal_symlinks() {
 
     fs::create_dir_all(src.path().join(".vscode")).unwrap();
     fs::write(src.path().join(".vscode/settings.json"), "{}").unwrap();
-    symlink("settings.json", src.path().join(".vscode/settings-link.json")).unwrap();
+    symlink(
+        "settings.json",
+        src.path().join(".vscode/settings-link.json"),
+    )
+    .unwrap();
 
     let config = WorktreeConfig::default();
     let report = copy_files(src.path(), dst.path(), &config).await;
@@ -64,10 +68,12 @@ async fn copy_files_preserves_internal_symlinks() {
         .file_type()
         .is_symlink());
     assert_eq!(fs::read_to_string(dst.path().join(".env")).unwrap(), "A=1");
-    assert!(fs::symlink_metadata(dst.path().join(".vscode/settings-link.json"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        fs::symlink_metadata(dst.path().join(".vscode/settings-link.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         fs::read_to_string(dst.path().join(".vscode/settings-link.json")).unwrap(),
         "{}"
