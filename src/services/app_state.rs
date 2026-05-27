@@ -38,8 +38,15 @@ impl AppStateService {
     }
 
     fn try_save(&self) -> std::io::Result<()> {
-        fs::create_dir_all(global_config_dir())?;
-        let path = app_state_file();
+        // Honor whatever path `load` captured. Falling back to
+        // `app_state_file()` here would write to the wrong location if the
+        // configured path ever changes between load and save.
+        let path = self.path.clone().unwrap_or_else(app_state_file);
+        let parent = path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(global_config_dir);
+        fs::create_dir_all(&parent)?;
         let json = serde_json::to_string_pretty(&self.state)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         fs::write(path, json)
