@@ -84,10 +84,25 @@ pub async fn copy_files(
         let source_path = source_dir.join(&rel);
         let target_path = target_dir.join(&rel);
 
-        match tokio::fs::metadata(&source_path).await {
+        // `symlink_metadata` does not follow links, so we can detect and
+        // preserve symlinked entries instead of recursing into whatever
+        // they point at (which may be outside the repo root).
+        match tokio::fs::symlink_metadata(&source_path).await {
             Err(_) => {
                 report.skipped.push(rel);
                 continue;
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if let Some(parent) = target_path.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        report.errors.push(format!("{rel}: {e}"));
+                        continue;
+                    }
+                }
+                match copy_symlink(&source_path, &target_path).await {
+                    Ok(_) => report.copied.push(rel),
+                    Err(e) => report.errors.push(format!("{rel}: {e}")),
+                }
             }
             Ok(meta) if meta.is_dir() => {
                 copy_directory_recursive(
@@ -115,6 +130,33 @@ pub async fn copy_files(
     }
 
     report
+}
+
+async fn copy_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    let link_target = tokio::fs::read_link(source).await?;
+    // Replace any existing entry at the target so re-runs are idempotent.
+    match tokio::fs::symlink_metadata(target).await {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            tokio::fs::remove_dir_all(target).await?;
+        }
+        Ok(_) => {
+            tokio::fs::remove_file(target).await?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    #[cfg(unix)]
+    {
+        tokio::fs::symlink(link_target, target).await
+    }
+    #[cfg(windows)]
+    {
+        let meta = tokio::fs::metadata(source).await;
+        match meta {
+            Ok(m) if m.is_dir() => tokio::fs::symlink_dir(link_target, target).await,
+            _ => tokio::fs::symlink_file(link_target, target).await,
+        }
+    }
 }
 
 async fn copy_directory_recursive(
@@ -170,7 +212,16 @@ async fn copy_directory_recursive(
     }
 
     for (source_path, target_path, relative) in sub {
-        match tokio::fs::metadata(&source_path).await {
+        // `symlink_metadata` keeps us from chasing symlinks out of the
+        // source tree — a matched symlinked directory should be copied
+        // as a link, not recursively cloned from wherever it points.
+        match tokio::fs::symlink_metadata(&source_path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                match copy_symlink(&source_path, &target_path).await {
+                    Ok(_) => report.copied.push(relative),
+                    Err(e) => report.errors.push(format!("{relative}: {e}")),
+                }
+            }
             Ok(meta) if meta.is_dir() => {
                 Box::pin(copy_directory_recursive(
                     &source_path,
