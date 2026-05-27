@@ -852,6 +852,19 @@ impl App {
         match action {
             UpdateAction::Continue => {}
             UpdateAction::Cancelled => {
+                // If the merge was already in flight (conflicts detected and
+                // AI handed control back to the user), leaving without
+                // `git merge --abort` strands the worktree with conflict
+                // markers and a half-applied merge. Run the same cleanup
+                // path as AiCancel before we navigate away.
+                if let Some(screen) = self.update_pr.as_ref() {
+                    if screen.ai_active() {
+                        let request = screen.request().clone();
+                        let git_root = self.git_root.clone();
+                        let dashboard_config = self.current_dashboard_config();
+                        kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
+                    }
+                }
                 self.update_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
