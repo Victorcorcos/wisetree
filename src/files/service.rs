@@ -454,9 +454,13 @@ pub fn strip_ansi(input: &str) -> String {
                             break;
                         }
                         if next == '\x1b' {
-                            // ESC '\\' string terminator — eat the
-                            // backslash too.
-                            chars.next();
+                            // OSC terminator is `ESC '\\'`. Only consume the
+                            // backslash if it's actually there; otherwise
+                            // this ESC starts a new control sequence and the
+                            // outer loop should keep parsing.
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
                             break;
                         }
                     }
@@ -546,5 +550,44 @@ pub fn open_terminal(terminal_command: &str, variables: &TemplateVariables) -> T
             command: resolved,
             error: Some(e.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strip_ansi_keeps_plain_text() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_color_codes() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_terminated_by_bel() {
+        assert_eq!(strip_ansi("\x1b]0;title\x07after"), "after");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_terminated_by_st() {
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\after"), "after");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_byte_when_osc_followed_by_stray_esc() {
+        // OSC body contains a bare ESC that is NOT followed by '\\'. The old
+        // implementation blindly consumed the next char after the ESC,
+        // dropping the 'X' that belongs to the visible output. The terminator
+        // must only swallow `ESC \\`.
+        let input = "\x1b]0;title\x1bX visible";
+        let out = strip_ansi(input);
+        assert!(
+            out.contains("X visible"),
+            "expected 'X visible' to survive, got {out:?}"
+        );
     }
 }
