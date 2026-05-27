@@ -390,11 +390,12 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
             continue;
         }
 
-        let last_seen = metadata
-            .entry_last_seen
-            .get(&pattern)
-            .copied()
-            .unwrap_or_else(now_unix_ms);
+        // A missing `last_seen` means we never recorded a touch for this
+        // cache entry, so we treat it as ancient (epoch 0) and let the
+        // grace check expire it immediately. Defaulting to `now` instead
+        // would make `now - now = 0 < grace`, so unknown orphans would be
+        // kept forever.
+        let last_seen = metadata.entry_last_seen.get(&pattern).copied().unwrap_or(0);
         if now.saturating_sub(last_seen) < grace_ms {
             skipped.push(format!("{pattern}: used within the last 14 days"));
             retained_patterns.push(pattern);
