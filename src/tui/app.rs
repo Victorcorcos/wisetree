@@ -2800,7 +2800,7 @@ fn install_termination_listener() -> Arc<AtomicBool> {
                         return;
                     }
 
-                    if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    if pfd.revents != 0 {
                         // PTY master closed. crossterm may be stuck in an EIO
                         // spin on Linux so we cannot rely on the cooperative
                         // shutdown path. Restore the terminal ourselves and
