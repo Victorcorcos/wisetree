@@ -420,11 +420,26 @@ pub fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// Return true when `url` starts with a scheme we trust the system opener
+/// to handle. Anything else (`file://`, `javascript:`, `data:`, custom URI
+/// handlers, unschemed strings) is rejected by `open_url` so a malicious
+/// remote URL cannot pivot through the browser into local-file access or
+/// scheme-handler abuse.
+fn is_safe_browser_url(url: &str) -> bool {
+    let lowered = url.trim_start().to_ascii_lowercase();
+    lowered.starts_with("http://") || lowered.starts_with("https://")
+}
+
 /// Open `url` in the user's default browser, detached. Returns the spawn
 /// error (if any) so the caller can surface a toast. Picks the
 /// platform-appropriate launcher: `open` on macOS, `cmd /C start ""` on
 /// Windows, `xdg-open` on Linux/BSD.
 pub fn open_url(url: &str) -> Result<(), String> {
+    if !is_safe_browser_url(url) {
+        return Err(format!(
+            "Refusing to open URL with unsupported scheme: {url}"
+        ));
+    }
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
         c.arg(url);

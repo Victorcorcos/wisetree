@@ -2,8 +2,27 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 
 use wisetree::config::WorktreeConfig;
-use wisetree::files::service::{copy_files, execute_post_create_commands, open_terminal};
+use wisetree::files::service::{copy_files, execute_post_create_commands, open_terminal, open_url};
 use wisetree::utils::path::TemplateVariables;
+
+#[test]
+fn open_url_rejects_non_http_schemes() {
+    for url in [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "data:text/html,<script>x</script>",
+        "ftp://example.com/foo",
+        "mailto:victim@example.com",
+        "",
+        "not-a-url",
+    ] {
+        let err = open_url(url).expect_err("expected scheme rejection");
+        assert!(
+            err.contains("unsupported scheme"),
+            "url {url:?} produced unexpected error {err}"
+        );
+    }
+}
 
 #[tokio::test]
 async fn copy_files_copies_matched_set_and_skips_ignored() {
