@@ -201,7 +201,7 @@ The dashboard is the single most impactful upgrade over raw `git worktree`. Wher
 | **Worktree** | Filesystem path of the worktree, with the home directory folded to `~` for readability. A trailing `[!]` flags any row whose refresh produced a warning, so you can spot data-staleness at a glance. |
 | **Branch** | The branch currently checked out in that worktree. |
 | **Status** | A coloured label — **`Clean`** (no uncommitted changes), **`Dirty`** (has uncommitted changes), **`Opened`** (a PR is open for the branch), or **`Merged`** (the PR has been merged). The labels combine local working-tree state and remote PR state into a single column, so you can immediately tell a worktree apart that is "done and merged, safe to delete" from one that is "dirty, careful". |
-| **Ahead/Behind** | `+N -N` versus the upstream tracking branch (falls back to `upstream/main`, `upstream/master`, `origin/main`, `origin/master`). `=0` when the branch is fully in sync. Green for ahead, red for behind. |
+| **Ahead/Behind** | Commit counts `+N -N` versus the upstream tracking branch (falls back to `upstream/main`, `upstream/master`, `upstream/develop`, `origin/main`, `origin/master`, `origin/develop`). `=0` when the branch is fully in sync. Green for ahead, red for behind. |
 | **Last Commit** | Short SHA plus the commit's summary line. The column dynamically grabs leftover horizontal space, so commit messages stay readable on wide terminals instead of being truncated. |
 | **PR** | When the GitHub CLI (`gh`) is installed and `dashboard.showPullRequests` is enabled, the row is enriched with the PR number, state (`Open`, `Draft`, `Merged`, `Closed`), and title. PR fetches are batched, cached on disk at `~/.wisetree/dashboard_prs.json`, refreshed when the branch SHA changes, and automatically back-off for 5 minutes after a `gh` rate-limit error, so the dashboard stays useful even on busy repositories. |
 
@@ -291,7 +291,7 @@ Dashboard sub-fields:
 
 | Field | Type | Default | Purpose |
 | --- | --- | --- | --- |
-| `dashboard.refreshIntervalMs` | `number` | `3000` | Poll interval in milliseconds, clamped to `500..60000` when loaded. |
+| `dashboard.refreshIntervalMs` | `number` | `5000` | Poll interval in milliseconds, clamped to `5000..60000` when loaded. |
 | `dashboard.showPullRequests` | `boolean` | `false` | Enables `gh pr list` enrichment when the GitHub CLI is installed. |
 | `dashboard.columns` | `string[]` | `["branch", "status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. |
 
