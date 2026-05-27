@@ -1316,13 +1316,13 @@ impl DashboardScreen {
             Span::styled("Pending", muted_dim),
             Span::styled("  ", muted_dim),
             Span::raw("🟨 "),
-            Span::styled("Running", Style::default().fg(colors::ACCENT)),
+            Span::styled("Running", muted_dim),
             Span::styled("  ", muted_dim),
             Span::raw("🟩 "),
-            Span::styled("Finished", Style::default().fg(colors::SUCCESS)),
+            Span::styled("Finished", muted_dim),
             Span::styled("  ", muted_dim),
             Span::raw("🟥 "),
-            Span::styled("Failed", Style::default().fg(colors::ERROR)),
+            Span::styled("Failed", muted_dim),
         ])
     }
 
