@@ -264,16 +264,16 @@ fn ai_status_column_renders_each_aggregate_state() {
 
     assert!(dumped.contains("AI"), "expected AI column header");
     assert!(
-        dumped.contains("running"),
+        dumped.contains("Running"),
         "expected running label in legend"
     );
     assert!(
-        dumped.contains("finished"),
+        dumped.contains("Finished"),
         "expected finished label in legend"
     );
-    assert!(dumped.contains("failed"), "expected failed label in legend");
+    assert!(dumped.contains("Failed"), "expected failed label in legend");
     assert!(
-        dumped.contains("pending"),
+        dumped.contains("Pending"),
         "expected pending label in legend"
     );
     assert!(dumped.contains("C Claude"));

@@ -1313,16 +1313,16 @@ impl DashboardScreen {
         Line::from(vec![
             Span::styled("AI: ", muted_dim),
             Span::raw("⬜ "),
-            Span::styled("pending", muted_dim),
+            Span::styled("Pending", muted_dim),
             Span::styled("  ", muted_dim),
             Span::raw("🟨 "),
-            Span::styled("running", Style::default().fg(colors::ACCENT)),
+            Span::styled("Running", Style::default().fg(colors::ACCENT)),
             Span::styled("  ", muted_dim),
             Span::raw("🟩 "),
-            Span::styled("finished", Style::default().fg(colors::SUCCESS)),
+            Span::styled("Finished", Style::default().fg(colors::SUCCESS)),
             Span::styled("  ", muted_dim),
             Span::raw("🟥 "),
-            Span::styled("failed", Style::default().fg(colors::ERROR)),
+            Span::styled("Failed", Style::default().fg(colors::ERROR)),
         ])
     }
 
