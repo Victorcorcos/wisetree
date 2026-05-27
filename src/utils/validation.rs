@@ -134,10 +134,7 @@ pub fn validate_source_ref(name: &str) -> Option<&'static str> {
         return Some("Ref contains invalid characters");
     }
 
-    if trimmed
-        .chars()
-        .any(|c| SHELL_DANGEROUS_CHARS.contains(&c))
-    {
+    if trimmed.chars().any(|c| SHELL_DANGEROUS_CHARS.contains(&c)) {
         return Some("Ref contains invalid characters");
     }
 
