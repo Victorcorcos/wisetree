@@ -423,4 +423,49 @@ mod unix_shutdown {
         }
         Ok(())
     }
+
+    #[test]
+    #[ignore]
+    fn debug_what_tty_emits() -> io::Result<()> {
+        let _serial = acquire_serial_lock();
+        let mut session = spawn_wrapper_process()?;
+        set_nonblocking(&session.master)?;
+        let started = Instant::now();
+        let mut buf = Vec::new();
+        let mut last_print = Instant::now();
+        while started.elapsed() < Duration::from_secs(15) {
+            let _ = read_available(&session.master, &mut buf);
+            if last_print.elapsed() > Duration::from_millis(500) {
+                let printable: String = buf
+                    .iter()
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                eprintln!(
+                    "t={:.1}s bytes={} tail={}",
+                    started.elapsed().as_secs_f32(),
+                    buf.len(),
+                    &printable[printable.len().saturating_sub(300)..]
+                );
+                last_print = Instant::now();
+            }
+            if contains_bytes(&buf, b"Dashboard") {
+                eprintln!("FOUND Dashboard at {:.1}s", started.elapsed().as_secs_f32());
+                break;
+            }
+            if session.child.try_wait()?.is_some() {
+                eprintln!("child exited at {:.1}s", started.elapsed().as_secs_f32());
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        drop(session.master);
+        terminate_child(&mut session.child);
+        Ok(())
+    }
 }
