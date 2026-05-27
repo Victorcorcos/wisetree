@@ -492,17 +492,13 @@ impl UpdatePullRequestScreen {
                 }
                 if self.pty_focused {
                     if let Some(pty) = self.pty.as_mut() {
-                        // opencode runs on the alt-screen, so vt100's
-                        // own scrollback is always empty — we can't
-                        // intercept arrows and scroll from the outside.
-                        // Instead remap plain Up/Down to PageUp/PageDown
-                        // (opencode's own scroll bindings) so the user's
-                        // expectation of "arrow keys scroll history"
-                        // works. Modified arrows still pass through so
-                        // opencode's prompt-history navigation keeps
-                        // working when explicitly requested.
-                        let effective = remap_pty_scroll_key(&key);
-                        if let Some(bytes) = key_event_to_pty_bytes(&effective) {
+                        // Forward keystrokes verbatim so opencode's own
+                        // context-aware bindings (menu navigation in
+                        // pickers like Ctrl+P, prompt-history in the
+                        // chat input, PgUp/PgDn for scroll) all work as
+                        // they would in a standalone terminal. Outer
+                        // focus has its own line-by-line scroll path.
+                        if let Some(bytes) = key_event_to_pty_bytes(&key) {
                             pty.send_input(&bytes);
                         }
                     }
@@ -1475,28 +1471,6 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
 /// opencode actually cares about (printable chars, control combos, arrow
 /// keys, function keys, navigation). Tab is intentionally not mapped —
 /// callers reserve it as the focus-toggle shortcut.
-/// Translate plain (unmodified) Up/Down arrow keys into PageUp/PageDown
-/// before forwarding to the embedded opencode subprocess. opencode binds
-/// pageup/pagedown to "scroll message history" but uses plain up/down for
-/// prompt-history navigation, so this remap is what makes "press arrow to
-/// scroll" actually move the chat view. Modified arrow keys (Shift / Ctrl
-/// / Alt) pass through unchanged so users who *want* prompt history can
-/// still reach it.
-fn remap_pty_scroll_key(key: &KeyEvent) -> KeyEvent {
-    if !key.modifiers.is_empty() {
-        return *key;
-    }
-    let remapped = match key.code {
-        KeyCode::Up => Some(KeyCode::PageUp),
-        KeyCode::Down => Some(KeyCode::PageDown),
-        _ => None,
-    };
-    match remapped {
-        Some(code) => KeyEvent { code, ..*key },
-        None => *key,
-    }
-}
-
 fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);

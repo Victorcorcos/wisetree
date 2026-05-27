@@ -131,6 +131,7 @@ enum AppEvent {
     /// Result of the background `opencode models opencode` shell-out that
     /// powers the Dashboard footer's free-model quick-pick.
     FreeOpencodeModelsFetched(Result<Vec<String>, String>),
+    ShellIntegrationDetected(ShellIntegrationStatus),
 }
 
 struct MergePrDetailsPayload {
@@ -1650,6 +1651,9 @@ impl App {
                     }
                 }
             }
+            AppEvent::ShellIntegrationDetected(status) => {
+                self.shell_integration_status = Some(status);
+            }
         }
     }
 
@@ -2030,7 +2034,11 @@ impl App {
         match outcome.result {
             Ok(service) => {
                 self.worktree_service = Some(service);
-                self.shell_integration_status = Some(detect_shell_integration());
+                let tx2 = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let status = detect_shell_integration();
+                    let _ = tx2.send(AppEvent::ShellIntegrationDetected(status));
+                });
                 self.error = None;
                 self.phase = InitPhase::Ready;
                 self.enter_screen(self.screen, tx);
@@ -2854,7 +2862,7 @@ fn install_termination_listener() -> Arc<AtomicBool> {
                         return;
                     }
 
-                    if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
                         // PTY master closed. crossterm may be stuck in an EIO
                         // spin on Linux so we cannot rely on the cooperative
                         // shutdown path. Restore the terminal ourselves and
