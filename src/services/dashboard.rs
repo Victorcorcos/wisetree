@@ -34,11 +34,13 @@ const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
-pub const BASE_REF_PRIORITY: [&str; 4] = [
+pub const BASE_REF_PRIORITY: [&str; 6] = [
     "upstream/main",
     "upstream/master",
+    "upstream/develop",
     "origin/main",
     "origin/master",
+    "origin/develop",
 ];
 /// How often the service refetches PR data when branches are otherwise idle.
 /// Catches remote-only changes (merge, close, title edit) without hammering
