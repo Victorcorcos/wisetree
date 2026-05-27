@@ -151,7 +151,10 @@ pub enum DashboardAction {
     Back,
     Refresh,
     NavigateTo(String),
-    OpenTerminal(String),
+    OpenTerminal {
+        path: String,
+        branch: String,
+    },
     JumpToDelete(String),
     BulkDelete(BulkDeleteStatus, Vec<String>),
     CopyPath(String),
@@ -685,7 +688,10 @@ impl DashboardScreen {
                     }
                     ActionChoice::OpenWithCommand => {
                         self.mode = DashboardMode::Table;
-                        DashboardAction::OpenTerminal(path)
+                        DashboardAction::OpenTerminal {
+                            path,
+                            branch: row.worktree.branch.clone(),
+                        }
                     }
                     ActionChoice::CopyPath => {
                         self.mode = DashboardMode::Table;

@@ -96,7 +96,11 @@ async fn post_create_returns_empty_for_empty_input() {
 
 #[test]
 fn open_terminal_noop_for_empty_command() {
-    let res = open_terminal("", "/tmp");
+    let vars = TemplateVariables {
+        worktree_path: "/tmp".to_string(),
+        ..TemplateVariables::default()
+    };
+    let res = open_terminal("", &vars);
     assert!(res.success);
     assert!(res.command.is_empty());
 }
@@ -104,7 +108,25 @@ fn open_terminal_noop_for_empty_command() {
 #[test]
 fn open_terminal_resolves_template_and_spawns() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let res = open_terminal("true", tmp.path().to_str().unwrap());
+    let vars = TemplateVariables {
+        worktree_path: tmp.path().to_string_lossy().into_owned(),
+        ..TemplateVariables::default()
+    };
+    let res = open_terminal("true", &vars);
     assert!(res.success);
     assert_eq!(res.command, "true");
+}
+
+#[test]
+fn open_terminal_substitutes_base_path_and_branch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vars = TemplateVariables {
+        base_path: "myrepo".to_string(),
+        worktree_path: tmp.path().to_string_lossy().into_owned(),
+        branch_name: "feat/x".to_string(),
+        source_branch: "main".to_string(),
+    };
+    let res = open_terminal("echo $BASE_PATH/$BRANCH_NAME", &vars);
+    assert!(res.success);
+    assert_eq!(res.command, "echo myrepo/feat/x");
 }

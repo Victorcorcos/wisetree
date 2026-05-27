@@ -502,10 +502,15 @@ pub fn open_url(url: &str) -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Spawn `terminal_command` detached in `worktree_path`. Empty command is a
-/// no-op. The child's stdio is ignored and the process is not awaited
-/// (matches branchlet's `child.unref()`).
-pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLaunch {
+/// Spawn `terminal_command` detached in `variables.worktree_path`. Empty
+/// command is a no-op. The child's stdio is ignored and the process is not
+/// awaited (matches branchlet's `child.unref()`).
+///
+/// `variables` should be populated with whatever the caller knows — at a
+/// minimum `worktree_path`. Other fields default to empty if unknown, which
+/// matches the historical behaviour for templates that only reference
+/// `$WORKTREE_PATH`.
+pub fn open_terminal(terminal_command: &str, variables: &TemplateVariables) -> TerminalLaunch {
     if terminal_command.trim().is_empty() {
         return TerminalLaunch {
             success: true,
@@ -514,13 +519,7 @@ pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLau
         };
     }
 
-    let variables = TemplateVariables {
-        base_path: String::new(),
-        worktree_path: worktree_path.to_string(),
-        branch_name: String::new(),
-        source_branch: String::new(),
-    };
-    let resolved = resolve_template(terminal_command, &variables);
+    let resolved = resolve_template(terminal_command, variables);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("cmd");
@@ -531,7 +530,7 @@ pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLau
         c.arg("-c").arg(&resolved);
         c
     };
-    cmd.current_dir(worktree_path);
+    cmd.current_dir(&variables.worktree_path);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
