@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use ratatui::buffer::Cell as BufferCell;
@@ -309,10 +310,25 @@ impl Drop for PtyView {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
-            let _ = child.wait();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    _ => break,
+                }
+            }
         }
         if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }
