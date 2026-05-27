@@ -1158,28 +1158,32 @@ impl DashboardService {
         Ok((!dirty, branch_status))
     }
 
-    /// Compute the line-level diff (insertions/deletions) of HEAD relative to
-    /// the first reachable ref in `upstream/main`, `upstream/master`,
-    /// `origin/main`, `origin/master`. Insertions are stored in `ahead` and
-    /// deletions in `behind` so the renderer can show `+<ins> -<del>`.
-    /// Returns `None` when none of those remote refs are reachable.
+    /// Compute the commit-level ahead/behind of HEAD relative to the first
+    /// reachable ref in `upstream/main`, `upstream/master`, `origin/main`,
+    /// `origin/master`. Uses `git rev-list --left-right --count` so the
+    /// returned numbers match the other `BranchStatus` producer in
+    /// `GitService::branch_status`. Returns `None` when none of those
+    /// remote refs are reachable.
     async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
         let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd).await?;
+        let spec = format!("{upstream}...HEAD");
         let result = time::timeout(
             COMMAND_TIMEOUT,
             run_command(
                 &self.git_binary,
-                &["diff", "--shortstat", &upstream],
+                &["rev-list", "--left-right", "--count", &spec],
                 Some(cwd),
             ),
         )
         .await
         .ok()?;
         let Ok(output) = result else { return None };
-        let (insertions, deletions) = parse_shortstat(&output);
+        let mut parts = output.split_whitespace();
+        let behind = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let ahead = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         Some(BranchStatus {
-            ahead: insertions,
-            behind: deletions,
+            ahead,
+            behind,
             upstream_branch: Some(upstream),
         })
     }
@@ -1982,24 +1986,6 @@ fn classify_merge_output(base_ref: String, stdout: &str) -> UpdateBranchOutcome 
     } else {
         UpdateBranchOutcome::Merged { base_ref, summary }
     }
-}
-
-fn parse_shortstat(output: &str) -> (u64, u64) {
-    let mut insertions = 0u64;
-    let mut deletions = 0u64;
-    let tokens: Vec<&str> = output.split_whitespace().collect();
-    for window in tokens.windows(2) {
-        let Ok(num) = window[0].parse::<u64>() else {
-            continue;
-        };
-        let label = window[1].trim_end_matches(',');
-        if label.starts_with("insertion") {
-            insertions = num;
-        } else if label.starts_with("deletion") {
-            deletions = num;
-        }
-    }
-    (insertions, deletions)
 }
 
 async fn run_command(
