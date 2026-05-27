@@ -305,6 +305,11 @@ async fn execute_shell_command(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Tie the post-create command's lifetime to ours. Long-running
+    // installers (`bundle install`, `npm install`, …) would otherwise
+    // outlive a wisetree panic or abrupt exit and orphan themselves.
+    // `execute_git_command` already does the same.
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
