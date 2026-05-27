@@ -1733,13 +1733,13 @@ impl DashboardColumn {
             }
             Self::AiStatus => {
                 // Wide: glyph(2) + space(1) + longest label "Finished"(8) +
-                // space(1) + worst-case decorations all-running "[C] [O] [X] [G]"
-                // = 3+1+3+1+3+1+3 = 15 → total 27.
+                // space(1) + decorations "C O X G"
+                // = 1+1+1+1+1+1+1 = 7 → total 19.
                 // Compact mode drops the decoration letters.
                 if compact {
                     13
                 } else {
-                    27
+                    19
                 }
             }
             Self::AheadBehind => {
@@ -1847,10 +1847,10 @@ impl DashboardColumn {
 
 fn ai_status_label(status: AiStatus) -> (&'static str, &'static str) {
     match status {
-        AiStatus::None => ("⬜", "Pending"),
-        AiStatus::InProgress => ("🟨", "Running"),
+        AiStatus::None => ("⬜", "Pending "),
+        AiStatus::InProgress => ("🟨", "Running "),
         AiStatus::Finished => ("🟩", "Finished"),
-        AiStatus::Failed => ("🟥", "Failed"),
+        AiStatus::Failed => ("🟥", "Failed  "),
     }
 }
 
@@ -1890,14 +1890,12 @@ fn harness_letter(harness: AiHarness) -> &'static str {
 fn harness_decoration_spans(harness: AiHarness, state: AiHarnessState) -> Vec<Span<'static>> {
     let color = harness_identity_color(harness);
     match state {
-        AiHarnessState::Running => vec![
-            Span::styled("[", Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                harness_letter(harness),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("]", Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        ],
+        AiHarnessState::Running => vec![Span::styled(
+            harness_letter(harness),
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )],
         AiHarnessState::Idle => vec![Span::styled(
             harness_letter(harness),
             Style::default().fg(color),
