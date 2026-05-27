@@ -367,8 +367,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn spawn_echo() -> PtyView {
-        PtyView::spawn(Path::new("/bin/echo"), &["hello".to_string()], None, &[])
-            .expect("spawn /bin/echo")
+        let echo = if Path::new("/bin/echo").exists() {
+            Path::new("/bin/echo")
+        } else {
+            Path::new("/usr/bin/echo")
+        };
+        PtyView::spawn(echo, &["hello".to_string()], None, &[]).expect("spawn echo")
     }
 
     fn wait_for_exit(pty: &mut PtyView) {
