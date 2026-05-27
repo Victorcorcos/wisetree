@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::config::WorktreeConfig;
 use crate::files::patterns::{match_files, should_ignore_file};
-use crate::utils::path::{resolve_template, TemplateVariables};
+use crate::utils::path::{resolve_template_shell, TemplateVariables};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CopyReport {
@@ -223,7 +223,7 @@ pub async fn execute_post_create_commands(
             cb(command, idx + 1, total);
         }
 
-        let resolved = resolve_template(command, variables);
+        let resolved = resolve_template_shell(command, variables);
         if let Some(cb) = on_activity.as_deref_mut() {
             cb(&format!("$ {resolved}"), ActivityKind::Status);
         }
@@ -464,7 +464,7 @@ pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLau
         branch_name: String::new(),
         source_branch: String::new(),
     };
-    let resolved = resolve_template(terminal_command, &variables);
+    let resolved = resolve_template_shell(terminal_command, &variables);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("cmd");

