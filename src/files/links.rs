@@ -745,7 +745,15 @@ fn copy_directory_into_cache(source_dir: &Path, target_dir: &Path) -> Result<()>
 async fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(target, link_path)?;
+        // `std::os::unix::fs::symlink` is a blocking syscall. Surrounding
+        // cache operations use `tokio::fs` for I/O, so hop to a blocking
+        // thread here to keep the same convention and avoid stalling a
+        // tokio worker on an unexpectedly slow filesystem.
+        let target = target.to_path_buf();
+        let link_path = link_path.to_path_buf();
+        tokio::task::spawn_blocking(move || std::os::unix::fs::symlink(target, link_path))
+            .await
+            .map_err(|err| WisetreeError::other(err.to_string()))??;
         Ok(())
     }
 
@@ -753,7 +761,15 @@ async fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
     {
         use tokio::process::Command;
 
-        match std::os::windows::fs::symlink_dir(target, link_path) {
+        let target_buf = target.to_path_buf();
+        let link_buf = link_path.to_path_buf();
+        let symlink_result = tokio::task::spawn_blocking(move || {
+            std::os::windows::fs::symlink_dir(&target_buf, &link_buf)
+        })
+        .await
+        .map_err(|err| WisetreeError::other(err.to_string()))?;
+
+        match symlink_result {
             Ok(()) => Ok(()),
             Err(err) if err.raw_os_error() == Some(WINDOWS_PRIVILEGE_NOT_HELD) => {
                 let status = Command::new("cmd")
