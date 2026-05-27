@@ -25,7 +25,7 @@ use crate::tui::widgets::{
     InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 use crate::utils::validation::{
-    normalize_branch_name, validate_branch_name, validate_directory_name,
+    normalize_branch_name, validate_branch_name, validate_directory_name, validate_source_ref,
 };
 
 const CUSTOM_REF_VALUE: &str = "__CUSTOM_REF__";
@@ -758,9 +758,10 @@ fn custom_ref_input() -> InputPrompt {
     InputPrompt::new("Enter a branch name, tag, or commit SHA:")
         .with_placeholder("origin/feature/foo, v1.0.0, abc123f")
         .with_validator(|v| {
-            v.trim()
-                .is_empty()
-                .then(|| "Please enter a ref".to_string())
+            if v.trim().is_empty() {
+                return Some("Please enter a ref".to_string());
+            }
+            validate_source_ref(v).map(|e| e.to_string())
         })
 }
 

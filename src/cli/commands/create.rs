@@ -6,7 +6,7 @@ use crate::errors::{Result, WisetreeError};
 use crate::git::types::WorktreeCreateOptions;
 use crate::utils::path::get_worktree_path;
 use crate::utils::validation::{
-    normalize_branch_name, validate_branch_name, validate_directory_name,
+    normalize_branch_name, validate_branch_name, validate_directory_name, validate_source_ref,
 };
 use crate::worktree::WorktreeService;
 
@@ -34,6 +34,12 @@ pub async fn run(args: CliArgs, service: &WorktreeService) -> Result<()> {
         if let Some(err) = validate_branch_name(&normalized) {
             return Err(WisetreeError::other(format!("Invalid branch name: {err}")));
         }
+    }
+
+    if let Some(err) = validate_source_ref(source) {
+        return Err(WisetreeError::other(format!(
+            "Invalid source branch: {err}"
+        )));
     }
 
     let git_service = service.git_service();

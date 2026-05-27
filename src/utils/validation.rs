@@ -58,6 +58,20 @@ pub fn validate_directory_name(name: &str) -> Option<&'static str> {
     None
 }
 
+/// Characters that git's refname rules permit but that are dangerous when
+/// a value flows into a shell-interpolated command. Rejecting them at the
+/// input layer is defense-in-depth on top of `resolve_template_shell`'s
+/// escaping: it stops a malicious refname from reaching the substitution
+/// site in the first place, and keeps error messages local to where the
+/// user typed (or selected) the name.
+const SHELL_DANGEROUS_CHARS: &[char] = &[
+    '$', '`', ';', '&', '|', '(', ')', '<', '>', '\'', '"', '\\', '{', '}', '!', '\n', '\r', '\0',
+];
+
+fn has_control_char(name: &str) -> bool {
+    name.chars().any(|c| c != '\t' && (c as u32) <= 0x1f)
+}
+
 /// Validate a git branch name. Returns `Some(error)` on failure.
 pub fn validate_branch_name(name: &str) -> Option<&'static str> {
     if name.trim().is_empty() {
@@ -83,8 +97,48 @@ pub fn validate_branch_name(name: &str) -> Option<&'static str> {
         return Some("Branch name contains invalid characters");
     }
 
+    if name.chars().any(|c| SHELL_DANGEROUS_CHARS.contains(&c)) || has_control_char(name) {
+        return Some("Branch name contains invalid characters");
+    }
+
     if name == "HEAD" {
         return Some("Branch name cannot be HEAD");
+    }
+
+    None
+}
+
+/// Validate a source ref entered by the user (branch, tag, or commit SHA).
+///
+/// Looser than `validate_branch_name` — accepts `HEAD` and remote-prefixed
+/// branches — but still rejects shell metacharacters and control bytes so
+/// the value is safe to pass to shell-interpolated post-create commands.
+pub fn validate_source_ref(name: &str) -> Option<&'static str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Some("Ref cannot be empty");
+    }
+
+    if trimmed.starts_with('-') {
+        return Some("Ref cannot start with -");
+    }
+
+    if trimmed.contains("..") {
+        return Some("Ref cannot contain ..");
+    }
+
+    if trimmed.chars().any(|c| c.is_whitespace() && c != ' ')
+        || has_control_char(trimmed)
+        || trimmed.contains(' ')
+    {
+        return Some("Ref contains invalid characters");
+    }
+
+    if trimmed
+        .chars()
+        .any(|c| SHELL_DANGEROUS_CHARS.contains(&c))
+    {
+        return Some("Ref contains invalid characters");
     }
 
     None
