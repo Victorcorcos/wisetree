@@ -100,8 +100,14 @@ impl GitService {
             worktrees.push(current);
         }
 
-        if let Some(first) = worktrees.first_mut() {
-            first.is_main = true;
+        // `bare` worktrees self-identify during parsing. Only fall back to
+        // "first entry is main" when no worktree has already been marked,
+        // otherwise we can overwrite a bare main with a feature worktree
+        // and accidentally protect the feature worktree from deletion.
+        if !worktrees.iter().any(|w| w.is_main) {
+            if let Some(first) = worktrees.first_mut() {
+                first.is_main = true;
+            }
         }
 
         // `default_branch`/`current_branch` query the main repo, not each
