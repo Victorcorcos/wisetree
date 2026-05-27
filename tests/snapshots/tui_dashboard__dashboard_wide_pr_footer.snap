@@ -19,7 +19,7 @@ Delete worktrees with status: │ Merged │  │ Closed │  │ Open │  │ 
 Status: Mother = main worktree (protected)  Dirty = has uncommitted changes  Clean = no uncommitted changes  O
 PR Checks: ⚪  (Pending)  🟡  (Running)  ⚠️  (Errored)  🔴  (Failed)  🟢  (Passed)
 PR Reviews: ✋  (Pending)  👎  (Changes Requested)  👍  (Approved)
-PR Merges: 📝  (Draft)  ❌  (Dirty)  🚫  (Blocked)  ❓  (Unknown)  🍂  (Behind)  ⏳  (Has Hooks)  🏚️  (Unstable)  ✅
+PR Merges: 📝  (Draft)  ❌  (Dirty)  🚫  (Blocked)  ❓  (Unknown)  🔄  (Behind)  ⏳  (Has Hooks)  🏚️  (Unstable)  ✅
 Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls back to upstream/master, origin/main, o
 AI: ⬜  Pending  🟨  Running  🟩  Finished  🟥  Failed
     C Claude   O Opencode   X Codex   G Gemini
