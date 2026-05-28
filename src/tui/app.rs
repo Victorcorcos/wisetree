@@ -14,7 +14,7 @@ use libc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
@@ -690,14 +690,7 @@ impl App {
                     kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
                     return;
                 }
-                if matches!(self.screen, Screen::Dashboard) {
-                    let action = self
-                        .dashboard
-                        .as_mut()
-                        .map(|dashboard| dashboard.handle_mouse_click(raw_position))
-                        .unwrap_or(DashboardAction::Continue);
-                    self.apply_dashboard_action(action, tx);
-                }
+                self.handle_screen_mouse_click(raw_position, tx);
             }
             MouseEventKind::ScrollUp => {
                 // Web-page semantics: wheel scrolls the screen's active
@@ -775,6 +768,384 @@ impl App {
                 }
             }
             Screen::AiModelPicker => self.handle_ai_model_picker_key(key, tx),
+        }
+    }
+
+    fn handle_screen_mouse_click(
+        &mut self,
+        position: Position,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match self.screen {
+            Screen::Menu => {
+                if self.menu.is_none() {
+                    self.menu = Some(self.build_menu_screen());
+                }
+                let Some(menu) = self.menu.as_mut() else {
+                    return;
+                };
+                match menu.handle_mouse_click(position) {
+                    MenuOutcome::Selected(choice, idx) => {
+                        self.last_menu_index = idx;
+                        match choice {
+                            MenuChoice::Exit => self.quit_requested = true,
+                            MenuChoice::SetupProject => self.enter_screen(Screen::SetupProject, tx),
+                            MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
+                            MenuChoice::Create => self.enter_screen(Screen::Create, tx),
+                            MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
+                            MenuChoice::Cache => self.enter_screen(Screen::Cache, tx),
+                            MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
+                        }
+                    }
+                    MenuOutcome::Cancelled => self.quit_requested = true,
+                    MenuOutcome::Pending => {}
+                }
+            }
+            Screen::Dashboard => {
+                let action = self
+                    .dashboard
+                    .as_mut()
+                    .map(|dashboard| dashboard.handle_mouse_click(position))
+                    .unwrap_or(DashboardAction::Continue);
+                self.apply_dashboard_action(action, tx);
+            }
+            Screen::Cache => {
+                let action = self
+                    .cache
+                    .as_mut()
+                    .map(|cache| cache.handle_mouse_click(position))
+                    .unwrap_or(CacheScreenAction::Continue);
+                match action {
+                    CacheScreenAction::Continue => {}
+                    CacheScreenAction::Back => self.back_to_menu(),
+                    CacheScreenAction::Refresh => {
+                        if let Some(cache) = self.cache.as_mut() {
+                            cache.start_loading();
+                        }
+                        kick_off_cache_load(self.git_root.clone(), tx.clone());
+                    }
+                    CacheScreenAction::DeleteEntry(relative_path) => {
+                        if let Some(cache) = self.cache.as_mut() {
+                            cache.start_loading();
+                        }
+                        kick_off_cache_entry_delete(self.git_root.clone(), relative_path, tx.clone());
+                    }
+                }
+            }
+            Screen::Create => {
+                let action = self
+                    .create
+                    .as_mut()
+                    .map(|create| create.handle_mouse_click(position))
+                    .unwrap_or(CreateAction::Continue);
+                match action {
+                    CreateAction::Continue => {}
+                    CreateAction::Cancelled => self.back_to_menu(),
+                    CreateAction::Confirmed {
+                        directory_name,
+                        source_branch,
+                        new_branch,
+                    } => {
+                        if let Some(create) = self.create.as_mut() {
+                            create.start_creating();
+                        }
+
+                        let options = WorktreeCreateOptions {
+                            name: directory_name,
+                            source_branch,
+                            new_branch,
+                            base_path: self.git_root.clone().unwrap_or_default(),
+                        };
+                        kick_off_create_worktree(self.git_root.clone(), options, tx.clone());
+                    }
+                    CreateAction::Done => self.finish_create_success(),
+                }
+            }
+            Screen::Delete => {
+                let action = self
+                    .delete
+                    .as_mut()
+                    .map(|delete| delete.handle_mouse_click(position))
+                    .unwrap_or(DeleteAction::Continue);
+                match action {
+                    DeleteAction::Continue => {}
+                    DeleteAction::Cancelled => {
+                        self.bulk_delete_queue.clear();
+                        self.leave_delete_screen(tx);
+                    }
+                    DeleteAction::Confirmed { path, force } => {
+                        if let Some(delete) = self.delete.as_mut() {
+                            delete.start_deleting();
+                        }
+                        kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
+                    }
+                    DeleteAction::BulkConfirmed { items } => {
+                        self.bulk_delete_queue = items;
+                        if let Some(delete) = self.delete.as_mut() {
+                            delete.start_deleting();
+                        }
+                        self.dispatch_next_bulk_delete(tx);
+                    }
+                    DeleteAction::Done => self.leave_delete_screen(tx),
+                }
+            }
+            Screen::Settings => {
+                let action = self
+                    .settings
+                    .as_mut()
+                    .map(|settings| settings.handle_mouse_click(position))
+                    .unwrap_or(SettingsAction::Continue);
+                match action {
+                    SettingsAction::Continue => {}
+                    SettingsAction::Back => self.back_to_menu(),
+                    SettingsAction::CopySettingsFilePath => {
+                        let path = self.settings_edit_file_path().display().to_string();
+                        kick_off_clipboard_copy(path, SETTINGS_PATH_COPIED_MESSAGE.to_string(), tx.clone());
+                    }
+                    SettingsAction::CheckUpdates => {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings.start_checking_updates();
+                        }
+                        kick_off_update_check(tx.clone());
+                    }
+                    SettingsAction::SetDeleteBranchWithWorktree(enabled) => {
+                        if let Err(err) = self.save_delete_branch_with_worktree(enabled) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to update configuration: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::Reset => {
+                        if let Err(err) = self.reset_settings_config() {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to reset configuration: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SaveCopyPatterns(patterns) => {
+                        if let Err(err) = self.save_copy_patterns(patterns) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save copy patterns: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SaveIgnorePatterns(patterns) => {
+                        if let Err(err) = self.save_ignore_patterns(patterns) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save ignore patterns: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SaveLinkPatterns(patterns) => {
+                        if let Err(err) = self.save_link_patterns(patterns) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save link patterns: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::CopySettings(direction) => {
+                        if let Err(err) = self.copy_settings(direction) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to copy settings: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SavePostCreateCommands(commands) => {
+                        if let Err(err) = self.save_post_create_commands(commands) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save post-create commands: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SaveTerminalCommand(command) => {
+                        if let Err(err) = self.save_terminal_command(command) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save terminal command: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SavePathTemplate(template) => {
+                        if let Err(err) = self.save_path_template(template) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save path template: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SaveLinkStrategy(strategy) => {
+                        if let Err(err) = self.save_link_strategy(strategy) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save link strategy: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SaveLinkCacheDir(cache_dir) => {
+                        if let Err(err) = self.save_link_cache_dir(cache_dir) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save link cache dir: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::SaveDashboard(dashboard) => {
+                        if let Err(err) = self.save_dashboard(dashboard) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!("Failed to save dashboard settings: {err}"));
+                            }
+                        }
+                    }
+                    SettingsAction::OpenAiModelPicker(current_use_ai) => {
+                        self.open_ai_model_picker(current_use_ai, tx);
+                    }
+                    SettingsAction::FetchFreeModels => {
+                        kick_off_fetch_free_opencode_models(tx.clone());
+                    }
+                }
+            }
+            Screen::Setup => {
+                let action = self
+                    .setup
+                    .as_mut()
+                    .map(|setup| setup.handle_mouse_click(position))
+                    .unwrap_or(SetupAction::Continue);
+                match action {
+                    SetupAction::Continue => {}
+                    SetupAction::Cancelled => self.back_to_menu(),
+                    SetupAction::Confirmed { shell } => {
+                        if let Some(setup) = self.setup.as_mut() {
+                            setup.start_installing();
+                        }
+                        kick_off_setup_install(shell, tx.clone());
+                    }
+                    SetupAction::Done => self.back_to_menu(),
+                }
+            }
+            Screen::SetupProject => {
+                let action = self
+                    .setup_project
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(SetupProjectAction::Continue);
+                match action {
+                    SetupProjectAction::Continue => {}
+                    SetupProjectAction::Cancelled => self.back_to_menu(),
+                    SetupProjectAction::DiscoverWise => self.start_wise_preset_discovery(tx),
+                    SetupProjectAction::Apply(preset) => self.apply_setup_project_preset(preset),
+                }
+            }
+            Screen::MergePullRequest => {
+                let action = self
+                    .merge_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(MergeAction::Continue);
+                match action {
+                    MergeAction::Continue => {}
+                    MergeAction::Cancelled => {
+                        self.merge_pr = None;
+                        self.enter_screen(Screen::Dashboard, tx);
+                    }
+                    MergeAction::Confirmed { number, title, body } => {
+                        if let Some(screen) = self.merge_pr.as_mut() {
+                            screen.start_merging();
+                        }
+                        kick_off_merge_pull_request(
+                            self.git_root.clone(),
+                            self.current_dashboard_config(),
+                            number,
+                            title,
+                            body,
+                            tx.clone(),
+                        );
+                    }
+                }
+            }
+            Screen::UpdatePullRequest => {
+                let action = self
+                    .update_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(UpdateAction::Continue);
+                match action {
+                    UpdateAction::Continue => {}
+                    UpdateAction::Cancelled => {
+                        if let Some(screen) = self.update_pr.as_ref() {
+                            if screen.ai_active() {
+                                let request = screen.request().clone();
+                                let git_root = self.git_root.clone();
+                                let dashboard_config = self.current_dashboard_config();
+                                kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
+                            }
+                        }
+                        self.update_pr = None;
+                        self.enter_screen(Screen::Dashboard, tx);
+                    }
+                    UpdateAction::Confirmed => {
+                        let Some(screen) = self.update_pr.as_mut() else {
+                            return;
+                        };
+                        let request = screen.request().clone();
+                        screen.start_updating();
+                        kick_off_update_pull_request(
+                            self.git_root.clone(),
+                            self.current_dashboard_config(),
+                            request,
+                            tx.clone(),
+                        );
+                    }
+                    UpdateAction::AiComplete => {
+                        let dashboard_config = self.current_dashboard_config();
+                        let git_root = self.git_root.clone();
+                        let Some(screen) = self.update_pr.as_mut() else {
+                            return;
+                        };
+                        let request = screen.request().clone();
+                        let use_ai = dashboard_config.use_ai.clone();
+                        let base_ref = request
+                            .base_ref
+                            .clone()
+                            .unwrap_or_else(|| "upstream/main".to_string());
+                        screen.set_phase_message("Committing and pushing AI resolution...");
+                        kick_off_commit_and_push(
+                            git_root,
+                            dashboard_config,
+                            request,
+                            use_ai,
+                            base_ref,
+                            tx.clone(),
+                        );
+                    }
+                    UpdateAction::AiCancel => {
+                        let dashboard_config = self.current_dashboard_config();
+                        let git_root = self.git_root.clone();
+                        let Some(screen) = self.update_pr.as_mut() else {
+                            return;
+                        };
+                        let request = screen.request().clone();
+                        screen.set_phase_message("Aborting merge and discarding AI changes...");
+                        kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
+                    }
+                }
+            }
+            Screen::UpdateBranch => {}
+            Screen::AiModelPicker => {
+                let action = match self.ai_model_picker.as_mut() {
+                    Some(picker) => picker.handle_mouse_click(position),
+                    None => {
+                        self.close_ai_model_picker();
+                        return;
+                    }
+                };
+
+                match action {
+                    AiModelPickerAction::Continue => {}
+                    AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
+                    AiModelPickerAction::Selected(model) => {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings.apply_use_ai_selection(model);
+                        }
+                        self.close_ai_model_picker();
+                    }
+                }
+            }
         }
     }
 

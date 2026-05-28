@@ -4,7 +4,7 @@
 //! active repository.
 
 use crossterm::event::KeyEvent;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -108,6 +108,14 @@ impl MenuScreen {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> MenuOutcome {
         match self.select.handle_key(key) {
+            SelectOutcome::Selected(idx, choice) => MenuOutcome::Selected(choice, idx),
+            SelectOutcome::Cancelled => MenuOutcome::Cancelled,
+            SelectOutcome::Pending => MenuOutcome::Pending,
+        }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> MenuOutcome {
+        match self.select.handle_mouse_click(position) {
             SelectOutcome::Selected(idx, choice) => MenuOutcome::Selected(choice, idx),
             SelectOutcome::Cancelled => MenuOutcome::Cancelled,
             SelectOutcome::Pending => MenuOutcome::Pending,

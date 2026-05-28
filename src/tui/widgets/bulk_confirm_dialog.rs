@@ -21,8 +21,10 @@
 //! returns a `preferred_content_height` so callers can size the
 //! surrounding frame, mirroring `ConfirmDialog`.
 
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
@@ -109,6 +111,7 @@ pub struct BulkConfirmDialog {
     pub items: Vec<BulkConfirmItem>,
     pub focus: BulkConfirmFocus,
     last_list_focus: usize,
+    button_rects: Cell<[Rect; 2]>,
 }
 
 impl BulkConfirmDialog {
@@ -139,6 +142,7 @@ impl BulkConfirmDialog {
             items,
             focus,
             last_list_focus: 0,
+            button_rects: Cell::new([Rect::default(); 2]),
         }
     }
 
@@ -241,6 +245,19 @@ impl BulkConfirmDialog {
         }
     }
 
+    pub fn handle_mouse_click(&mut self, position: Position) -> BulkConfirmOutcome {
+        let [confirm_rect, cancel_rect] = self.button_rects.get();
+        if contains_position(confirm_rect, position) {
+            self.focus = BulkConfirmFocus::Confirm;
+            return self.activate();
+        }
+        if contains_position(cancel_rect, position) {
+            self.focus = BulkConfirmFocus::Cancel;
+            return self.activate();
+        }
+        BulkConfirmOutcome::Pending
+    }
+
     fn activate(&self) -> BulkConfirmOutcome {
         match self.focus {
             BulkConfirmFocus::Cancel => BulkConfirmOutcome::Cancelled,
@@ -282,6 +299,7 @@ impl BulkConfirmDialog {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        self.button_rects.set([Rect::default(); 2]);
         let item_rows = self.items.len() as u16;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -443,5 +461,13 @@ impl BulkConfirmDialog {
             ),
             cols[3],
         );
+        self.button_rects.set([cols[1], cols[3]]);
     }
+}
+
+fn contains_position(area: Rect, position: Position) -> bool {
+    position.x >= area.left()
+        && position.x < area.right()
+        && position.y >= area.top()
+        && position.y < area.bottom()
 }

@@ -266,6 +266,9 @@ pub struct DashboardScreen {
     /// Captured during render so mouse clicks on the footer buttons can
     /// be hit-tested by the app.
     bulk_button_rects: Vec<(BulkDeleteStatus, Rect)>,
+    /// Captured during render so mouse clicks on table rows can select
+    /// the clicked row and open its action menu (same as pressing Enter).
+    row_rects: Vec<(usize, Rect)>,
     close_pr_modal: Option<(ConfirmationModal, ClosePullRequestRequest)>,
     pub tick: usize,
 }
@@ -302,6 +305,7 @@ impl DashboardScreen {
             pr_enrichment_enabled,
             bulk_focus: None,
             bulk_button_rects: Vec::new(),
+            row_rects: Vec::new(),
             close_pr_modal: None,
             tick: 0,
         }
@@ -480,6 +484,7 @@ impl DashboardScreen {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.bulk_button_rects.clear();
+        self.row_rects.clear();
 
         if self.loading {
             StatusIndicator::new(Status::Loading, "Loading dashboard...")
@@ -600,6 +605,116 @@ impl DashboardScreen {
     /// Hit-test a mouse position against the latest captured button
     /// rects. Public so `App::handle_mouse` can dispatch clicks.
     pub fn handle_mouse_click(&mut self, position: Position) -> DashboardAction {
+        if matches!(self.mode, DashboardMode::ConfirmClosePr) {
+            let outcome = match self.close_pr_modal.as_mut() {
+                Some((modal, _)) => modal.handle_mouse_click(position),
+                None => return DashboardAction::Continue,
+            };
+            return match outcome {
+                ConfirmationOutcome::Confirmed => {
+                    let (_, request) = self.close_pr_modal.take().unwrap();
+                    self.mode = DashboardMode::Table;
+                    DashboardAction::ClosePullRequest(Box::new(request))
+                }
+                ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                    self.close_pr_modal = None;
+                    self.mode = DashboardMode::Table;
+                    DashboardAction::Continue
+                }
+                ConfirmationOutcome::Pending => DashboardAction::Continue,
+            };
+        }
+        if matches!(self.mode, DashboardMode::ActionMenu) {
+            let outcome = match self.action_select.as_mut() {
+                Some(select) => select.handle_mouse_click(position),
+                None => return DashboardAction::Continue,
+            };
+            return match outcome {
+                SelectOutcome::Selected(_, choice) => {
+                    let Some(index) = self.action_target else {
+                        self.mode = DashboardMode::Table;
+                        self.action_select = None;
+                        return DashboardAction::Continue;
+                    };
+                    let row = &self.rows[index];
+                    let path = row.worktree.path.clone();
+                    let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
+                    let merge_request = build_merge_request(row);
+                    let update_request = build_update_request(row);
+                    let close_request = build_close_request(row);
+                    self.action_select = None;
+                    self.action_target = None;
+                    match choice {
+                        ActionChoice::Navigate => {
+                            self.mode = DashboardMode::Table;
+                            DashboardAction::NavigateTo(path)
+                        }
+                        ActionChoice::OpenWithCommand => {
+                            self.mode = DashboardMode::Table;
+                            DashboardAction::OpenTerminal {
+                                path,
+                                branch: row.worktree.branch.clone(),
+                            }
+                        }
+                        ActionChoice::CopyPath => {
+                            self.mode = DashboardMode::Table;
+                            DashboardAction::CopyPath(path)
+                        }
+                        ActionChoice::OpenPullRequest => {
+                            self.mode = DashboardMode::Table;
+                            pr_url
+                                .map(DashboardAction::OpenPullRequest)
+                                .unwrap_or(DashboardAction::Continue)
+                        }
+                        ActionChoice::MergePullRequest => {
+                            self.mode = DashboardMode::Table;
+                            merge_request
+                                .map(|request| DashboardAction::MergePullRequest(Box::new(request)))
+                                .unwrap_or(DashboardAction::Continue)
+                        }
+                        ActionChoice::UpdatePullRequest => {
+                            self.mode = DashboardMode::Table;
+                            update_request
+                                .map(|request| DashboardAction::UpdatePullRequest(Box::new(request)))
+                                .unwrap_or(DashboardAction::Continue)
+                        }
+                        ActionChoice::ClosePullRequest => match close_request {
+                            Some(request) => {
+                                self.close_pr_modal = Some((build_close_pr_modal(), request));
+                                self.mode = DashboardMode::ConfirmClosePr;
+                                DashboardAction::Continue
+                            }
+                            None => {
+                                self.mode = DashboardMode::Table;
+                                DashboardAction::Continue
+                            }
+                        },
+                        ActionChoice::UpdateBranch => {
+                            self.mode = DashboardMode::Table;
+                            DashboardAction::UpdateBranch(path)
+                        }
+                    }
+                }
+                SelectOutcome::Cancelled | SelectOutcome::Pending => DashboardAction::Continue,
+            };
+        }
+        for (filtered_idx, rect) in &self.row_rects {
+            if position.x >= rect.left()
+                && position.x < rect.right()
+                && position.y >= rect.top()
+                && position.y < rect.bottom()
+            {
+                self.selected = *filtered_idx;
+                let Some(index) = self.selected_row_index() else {
+                    return DashboardAction::Continue;
+                };
+                let row = self.rows[index].clone();
+                self.action_select = Some(self.build_action_select(&row));
+                self.action_target = Some(index);
+                self.mode = DashboardMode::ActionMenu;
+                return DashboardAction::Continue;
+            }
+        }
         for (status, rect) in self.bulk_button_rects.clone() {
             if position.x >= rect.left()
                 && position.x < rect.right()
@@ -951,7 +1066,7 @@ impl DashboardScreen {
         Line::from(spans)
     }
 
-    fn render_table(&self, frame: &mut Frame, area: Rect, layout: &DashboardTableLayout) {
+    fn render_table(&mut self, frame: &mut Frame, area: Rect, layout: &DashboardTableLayout) {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
             let message = if self.rows.is_empty() {
@@ -975,17 +1090,21 @@ impl DashboardScreen {
 
         let mut rows: Vec<Row> = Vec::new();
 
+        let mut data_y = area.y + 1;
+
         if viewport.show_above_overflow {
             rows.push(self.overflow_row(format!("↑ {hidden_above} more above"), true));
+            data_y += 1;
         }
 
         // When focus is on the bulk-delete buttons row, hide the
         // worktree selection (no highlight, no ➤ marker) so the user
         // sees a single active focus indicator at a time.
         let show_selection = self.bulk_focus.is_none();
-        rows.extend(visible.iter().enumerate().map(|(offset, index)| {
+        for (offset, index) in visible.iter().enumerate() {
             let row = &self.rows[*index];
-            let is_selected = show_selection && viewport.start + offset == self.selected;
+            let filtered_idx = viewport.start + offset;
+            let is_selected = show_selection && filtered_idx == self.selected;
             let style = if is_selected {
                 Style::default()
                     .bg(colors::MENU_SELECTION_BG)
@@ -993,8 +1112,17 @@ impl DashboardScreen {
             } else {
                 Style::default()
             };
-            Row::new(self.row_cells(row, layout, is_selected)).style(style)
-        }));
+            rows.push(Row::new(self.row_cells(row, layout, is_selected)).style(style));
+            self.row_rects.push((
+                filtered_idx,
+                Rect {
+                    x: area.x,
+                    y: data_y + offset as u16,
+                    width: area.width,
+                    height: 1,
+                },
+            ));
+        }
 
         if viewport.show_below_overflow {
             rows.push(self.overflow_row(format!("↓ {hidden_below} more below"), true));
