@@ -842,7 +842,12 @@ mod tests {
     }
 
     #[test]
-    fn gemini_unresolved_prompt_with_recent_activity_runs() {
+    fn gemini_unresolved_prompt_with_live_process_runs() {
+        // Pending user turn + a live `gemini` process at this cwd is the only
+        // combination that surfaces as Running. The previous version of this
+        // test relied on the JSONL mtime alone (via a `fresh_or_alive`
+        // fallback), which kept the worktree stuck in Running for the full
+        // active window after the process was killed (Bug 2).
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_under(&tmp);
         let worktree = tmp.path().join("ai-status");
@@ -859,14 +864,106 @@ mod tests {
             ],
         );
 
-        let svc = AiStatusService::new(&all_enabled_config(), paths);
-        let index = svc.build_index();
-        let report = svc.report_for(&index, &worktree);
-        assert_eq!(report.aggregated, AiStatus::InProgress);
-        assert_eq!(
-            report.per_harness.get(&AiHarness::GeminiCli),
-            Some(&AiHarnessState::Running)
+        let mut live_cwds = BTreeSet::new();
+        live_cwds.insert(canonical_key(&worktree));
+        let out = gemini::scan_with_live_cwds_for_test(
+            &paths,
+            std::time::Duration::from_millis(10_000),
+            &live_cwds,
         );
+        let state = out.per_cwd.get(&canonical_key(&worktree)).copied();
+        assert_eq!(state, Some(AiHarnessState::Running));
+    }
+
+    #[test]
+    fn gemini_just_opened_repl_with_live_process_is_idle() {
+        // Regression for Bug 1: opening gemini-cli at the REPL (no prompt
+        // submitted yet) used to flip the worktree to Running purely because
+        // a live `gemini` process existed. With only the JSONL header line
+        // written, the turn-state stays `Unknown` and the correct surface
+        // state is Idle (the column should show a plain "G", not reversed).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("ai-status");
+        fs::create_dir_all(&worktree).unwrap();
+        let project_dir = paths.gemini_tmp.as_ref().unwrap().join("ai-status");
+        write_gemini_project_root(&project_dir, &worktree);
+        write_gemini_chat(
+            &project_dir,
+            "session.jsonl",
+            &[gemini_session_header_line()],
+        );
+
+        let mut live_cwds = BTreeSet::new();
+        live_cwds.insert(canonical_key(&worktree));
+        let out = gemini::scan_with_live_cwds_for_test(
+            &paths,
+            std::time::Duration::from_millis(10_000),
+            &live_cwds,
+        );
+        let state = out.per_cwd.get(&canonical_key(&worktree)).copied();
+        assert_eq!(state, Some(AiHarnessState::Idle));
+    }
+
+    #[test]
+    fn gemini_no_chat_file_with_live_process_is_idle() {
+        // A `.project_root` may exist before gemini-cli has flushed any chat
+        // file (or the user may have manually deleted `chats/`). A live
+        // process at that cwd must not flip the worktree to Running.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("ai-status");
+        fs::create_dir_all(&worktree).unwrap();
+        let project_dir = paths.gemini_tmp.as_ref().unwrap().join("ai-status");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join(".project_root"),
+            worktree.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        let mut live_cwds = BTreeSet::new();
+        live_cwds.insert(canonical_key(&worktree));
+        let out = gemini::scan_with_live_cwds_for_test(
+            &paths,
+            std::time::Duration::from_millis(10_000),
+            &live_cwds,
+        );
+        let state = out.per_cwd.get(&canonical_key(&worktree)).copied();
+        assert_eq!(state, Some(AiHarnessState::Idle));
+    }
+
+    #[test]
+    fn gemini_killed_mid_prompt_with_fresh_mtime_is_idle() {
+        // Regression for Bug 2: Ctrl+C while gemini was processing leaves a
+        // Pending user turn AND a fresh JSONL mtime, but the process is
+        // gone. The earlier `fresh_or_alive` mtime fallback kept the
+        // worktree Running for the entire active window (5–10s) after the
+        // kill. With live-process as the sole Running qualifier, the
+        // transition to Idle happens on the very next dashboard tick.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("ai-status");
+        fs::create_dir_all(&worktree).unwrap();
+        let project_dir = paths.gemini_tmp.as_ref().unwrap().join("ai-status");
+        write_gemini_project_root(&project_dir, &worktree);
+        write_gemini_chat(
+            &project_dir,
+            "session.jsonl",
+            &[
+                gemini_session_header_line(),
+                gemini_user_line("fix the footer"),
+                gemini_thinking_line(),
+            ],
+        );
+
+        let out = gemini::scan_with_live_cwds_for_test(
+            &paths,
+            std::time::Duration::from_millis(10_000),
+            &BTreeSet::new(),
+        );
+        let state = out.per_cwd.get(&canonical_key(&worktree)).copied();
+        assert_eq!(state, Some(AiHarnessState::Idle));
     }
 
     #[test]

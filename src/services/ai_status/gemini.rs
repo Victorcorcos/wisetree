@@ -10,28 +10,30 @@
 //! Legacy hash-named directories from older gemini-cli versions lack
 //! `.project_root` and are silently skipped.
 //!
-//! `Finished` is driven by the newest chat transcript: a worktree only flips
-//! to `Idle` once the newest unresolved user turn has a non-empty Gemini
-//! response. For unresolved turns, gemini-cli writes no live-session PID/lock
-//! of its own, so we walk the process table for live `gemini`/`gemini-cli`
-//! invocations and use each process's cwd as the live-session signal. A long
-//! "Thinking…" step can pause JSONL flushes for minutes; without this
-//! fallback the mtime ages past `active_window_ms` and the worktree
-//! incorrectly flips to `Idle` mid-turn.
+//! Running detection rule: a worktree is `Running` only when (a) the newest
+//! chat transcript shows a `Pending` user turn (a user prompt without a
+//! resolved Gemini response), AND (b) a live `gemini`/`gemini-cli` process is
+//! currently running with that worktree as its cwd. Either condition alone is
+//! insufficient: the JSONL mtime is not a Running signal on its own — a
+//! freshly-killed `gemini` process leaves a fresh mtime behind, and treating
+//! that as Running keeps the column stuck on "G reversed" for the full
+//! `active_window_ms` after Ctrl+C. The live-process check is the
+//! authoritative signal; the transcript decides whether the live process is
+//! at the prompt (`Unknown`/`Completed` → `Idle`) or mid-turn (`Pending` →
+//! `Running`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::paths::{canonical_key, AiStatusPaths};
 use super::state::AiHarnessState;
-use super::util::classify_mtime;
 use super::DetectorOutput;
 
 const MAX_DIRS_PER_TICK: usize = 200;
@@ -51,16 +53,12 @@ enum GeminiTurnState {
     Completed,
 }
 
-pub(crate) fn scan(paths: &AiStatusPaths, window: Duration) -> DetectorOutput {
+pub(crate) fn scan(paths: &AiStatusPaths, _window: Duration) -> DetectorOutput {
     let live_cwds = scan_live_gemini_cwds();
-    scan_with_live_cwds(paths, window, &live_cwds)
+    scan_with_live_cwds(paths, &live_cwds)
 }
 
-fn scan_with_live_cwds(
-    paths: &AiStatusPaths,
-    window: Duration,
-    live_cwds: &BTreeSet<PathBuf>,
-) -> DetectorOutput {
+fn scan_with_live_cwds(paths: &AiStatusPaths, live_cwds: &BTreeSet<PathBuf>) -> DetectorOutput {
     let mut out = DetectorOutput::default();
     let Some(tmp_root) = paths.gemini_tmp.as_ref() else {
         return out;
@@ -79,7 +77,7 @@ fn scan_with_live_cwds(
         if !meta.is_dir() {
             continue;
         }
-        match scan_project_dir(&project_dir, window, live_cwds) {
+        match scan_project_dir(&project_dir, live_cwds) {
             Ok(Some((cwd, state))) => {
                 merge(&mut out.per_cwd, cwd, state);
                 dirs_processed += 1;
@@ -96,7 +94,6 @@ fn scan_with_live_cwds(
 
 fn scan_project_dir(
     dir: &Path,
-    window: Duration,
     live_cwds: &BTreeSet<PathBuf>,
 ) -> Result<Option<(PathBuf, AiHarnessState)>, ()> {
     let project_root_file = dir.join(".project_root");
@@ -110,36 +107,20 @@ fn scan_project_dir(
     }
     let key = canonical_key(Path::new(&cwd));
     let has_live_process = live_cwds.contains(&key);
-    let activity_mtime = match newest_mtime(dir) {
-        Ok(mtime) => mtime,
+    let turn_state = match newest_chat_file(&dir.join("chats")) {
+        Ok(Some(chat_file)) => read_session_state(&chat_file).map_err(|_| ())?,
+        Ok(None) => GeminiTurnState::Unknown,
         Err(_) => return Err(()),
     };
-    let state = match newest_chat_file(&dir.join("chats")) {
-        Ok(Some((chat_file, chat_mtime))) => {
-            let turn_state = read_session_state(&chat_file).map_err(|_| ())?;
-            let mtime = activity_mtime.unwrap_or(chat_mtime);
-            classify_turn_state(turn_state, mtime, window, has_live_process)
-        }
-        Ok(None) => {
-            if has_live_process {
-                AiHarnessState::Running
-            } else {
-                match activity_mtime {
-                    Some(mtime) => classify_mtime(mtime, window),
-                    None => AiHarnessState::Idle,
-                }
-            }
-        }
-        Err(_) => return Err(()),
-    };
+    let state = classify_turn_state(turn_state, has_live_process);
     Ok(Some((key, state)))
 }
 
-fn newest_chat_file(chats_dir: &Path) -> std::io::Result<Option<(PathBuf, SystemTime)>> {
+fn newest_chat_file(chats_dir: &Path) -> std::io::Result<Option<PathBuf>> {
     let Ok(read_dir) = fs::read_dir(chats_dir) else {
         return Ok(None);
     };
-    let mut newest: Option<(PathBuf, SystemTime)> = None;
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in read_dir {
         let entry = entry?;
         let path = entry.path();
@@ -153,7 +134,7 @@ fn newest_chat_file(chats_dir: &Path) -> std::io::Result<Option<(PathBuf, System
             _ => newest = Some((path, mtime)),
         }
     }
-    Ok(newest)
+    Ok(newest.map(|(path, _)| path))
 }
 
 fn read_session_state(file: &Path) -> std::io::Result<GeminiTurnState> {
@@ -183,53 +164,26 @@ fn read_session_state(file: &Path) -> std::io::Result<GeminiTurnState> {
     Ok(turn_state)
 }
 
-fn classify_turn_state(
-    turn_state: GeminiTurnState,
-    mtime: SystemTime,
-    window: Duration,
-    has_live_process: bool,
-) -> AiHarnessState {
-    let fresh_or_alive =
-        || has_live_process || classify_mtime(mtime, window) == AiHarnessState::Running;
+/// Classify a (turn-state, live-process) pair into the surface state.
+///
+/// `Pending` means the transcript ends with an unresolved user prompt — a
+/// turn that gemini-cli is meant to be processing. A live `gemini` process
+/// at this cwd confirms the harness is in fact processing it, so the
+/// worktree surfaces `Running`. Without a live process, the turn is either
+/// abandoned (the user killed gemini-cli before the response landed) or
+/// stranded after a crash; either way the harness is no longer working,
+/// so we surface `Idle` (column shows the harness as Finished, not running).
+///
+/// `Unknown` is the just-opened-REPL case: the JSONL has only a header
+/// line, no user/gemini turns yet. The process may be alive, but it is
+/// sitting at the prompt waiting for input — `Idle`, never `Running`.
+fn classify_turn_state(turn_state: GeminiTurnState, has_live_process: bool) -> AiHarnessState {
     match turn_state {
-        GeminiTurnState::Pending => {
-            if fresh_or_alive() {
-                AiHarnessState::Running
-            } else {
-                AiHarnessState::Idle
-            }
-        }
-        GeminiTurnState::Completed => AiHarnessState::Idle,
-        GeminiTurnState::Unknown => {
-            if fresh_or_alive() {
-                AiHarnessState::Running
-            } else {
-                AiHarnessState::Idle
-            }
+        GeminiTurnState::Pending if has_live_process => AiHarnessState::Running,
+        GeminiTurnState::Pending | GeminiTurnState::Completed | GeminiTurnState::Unknown => {
+            AiHarnessState::Idle
         }
     }
-}
-
-fn newest_mtime(dir: &Path) -> std::io::Result<Option<SystemTime>> {
-    let mut newest: Option<SystemTime> = None;
-    walk(dir, &mut |mtime| match newest {
-        Some(prev) if prev >= mtime => {}
-        _ => newest = Some(mtime),
-    })?;
-    Ok(newest)
-}
-
-fn walk(dir: &Path, visit: &mut dyn FnMut(SystemTime)) -> std::io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            walk(&entry.path(), visit)?;
-        } else if let Ok(mtime) = metadata.modified() {
-            visit(mtime);
-        }
-    }
-    Ok(())
 }
 
 fn merge(out: &mut BTreeMap<PathBuf, AiHarnessState>, key: PathBuf, state: AiHarnessState) {
@@ -372,10 +326,10 @@ fn fetch_cwds(_pids: &[u32]) -> BTreeMap<u32, PathBuf> {
 #[cfg(test)]
 pub(super) fn scan_with_live_cwds_for_test(
     paths: &AiStatusPaths,
-    window: Duration,
+    _window: Duration,
     live_cwds: &BTreeSet<PathBuf>,
 ) -> DetectorOutput {
-    scan_with_live_cwds(paths, window, live_cwds)
+    scan_with_live_cwds(paths, live_cwds)
 }
 
 #[cfg(test)]
