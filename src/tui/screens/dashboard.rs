@@ -183,6 +183,38 @@ enum DashboardColumn {
     PullRequest,
 }
 
+/// One row of the dashboard footer. Each variant owns both its height (via
+/// [`FooterRow::height`]) and its render dispatch (via
+/// [`DashboardScreen::render_footer_row`]), so adding a new footer row is a
+/// three-step change: add a variant, give it a height if non-default, and
+/// add a render arm. Outer layout sizing flows automatically from
+/// [`DashboardScreen::footer_height`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterRow {
+    Notice,
+    Reviewers,
+    BulkDelete,
+    Shortcuts,
+    StatusLegend,
+    ChecksLegend,
+    ReviewsLegend,
+    MergesLegend,
+    AheadBehindLegend,
+    DiffLegend,
+}
+
+impl FooterRow {
+    fn height(self) -> u16 {
+        match self {
+            // The bulk-delete buttons sit inside a bordered block, so they
+            // need top border + content + bottom border. Every other row is
+            // a single line of text.
+            Self::BulkDelete => 3,
+            _ => 1,
+        }
+    }
+}
+
 struct DashboardTableLayout {
     worktree_width: u16,
     visible_columns: Vec<DashboardColumn>,
@@ -317,10 +349,10 @@ impl DashboardScreen {
             return 11;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
-        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows
-        // + footer (10 lines, +1 when the highlighted PR has reviewers to show,
-        // +1 when the Diff column is configured so the diff legend can render).
-        14 + table_rows + self.reviewers_footer_height() + self.diff_legend_height()
+        // 1 status banner + 2 search spacers + 1 search line + N rows + footer
+        // (sized from FooterRow::height summed across footer_rows so adding a
+        // new footer row propagates here automatically).
+        4 + table_rows + self.footer_height()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -467,16 +499,15 @@ impl DashboardScreen {
             return;
         }
 
-        let footer_height = 10u16 + self.reviewers_footer_height() + self.diff_legend_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),             // status banner
-                Constraint::Length(1),             // spacer above search
-                Constraint::Length(1),             // search line
-                Constraint::Length(1),             // spacer below search
-                Constraint::Min(4),                // table
-                Constraint::Length(footer_height), // footer (notice [+ reviewers] + 3-row buttons + 6 legend lines [+ diff legend])
+                Constraint::Length(1),                    // status banner
+                Constraint::Length(1),                    // spacer above search
+                Constraint::Length(1),                    // search line
+                Constraint::Length(1),                    // spacer below search
+                Constraint::Min(4),                       // table
+                Constraint::Length(self.footer_height()), // footer (sized from FooterRow::height summed across footer_rows)
             ])
             .split(area);
 
@@ -1058,6 +1089,34 @@ impl DashboardScreen {
         widths
     }
 
+    /// Ordered list of footer rows that should render for the current state.
+    /// Single source of truth: both the outer layout (which reserves the
+    /// vertical strip for the footer) and `render_footer` derive their sizes
+    /// and dispatch from this list, so adding a new row only requires
+    /// extending `FooterRow` and inserting one entry here.
+    fn footer_rows(&self) -> Vec<FooterRow> {
+        let mut rows = Vec::with_capacity(10);
+        rows.push(FooterRow::Notice);
+        if self.reviewers_footer_height() > 0 {
+            rows.push(FooterRow::Reviewers);
+        }
+        rows.push(FooterRow::BulkDelete);
+        rows.push(FooterRow::Shortcuts);
+        rows.push(FooterRow::StatusLegend);
+        rows.push(FooterRow::ChecksLegend);
+        rows.push(FooterRow::ReviewsLegend);
+        rows.push(FooterRow::MergesLegend);
+        rows.push(FooterRow::AheadBehindLegend);
+        if self.diff_legend_height() > 0 {
+            rows.push(FooterRow::DiffLegend);
+        }
+        rows
+    }
+
+    fn footer_height(&self) -> u16 {
+        self.footer_rows().iter().map(|row| row.height()).sum()
+    }
+
     fn render_footer(
         &mut self,
         frame: &mut Frame,
@@ -1065,60 +1124,57 @@ impl DashboardScreen {
         table_width: u16,
         layout: &DashboardTableLayout,
     ) {
-        let reviewers_height = self.reviewers_footer_height();
-        let shows_diff_legend = self.diff_legend_height() > 0;
-
-        // Build constraints conditionally so the layout has exactly the
-        // number of rows it actually needs — ratatui's solver can drop a
-        // neighbour's row when a zero-length constraint sits inside an
-        // already-saturated column.
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(10);
-        constraints.push(Constraint::Length(1)); // notice / row warning / detail
-        if reviewers_height > 0 {
-            constraints.push(Constraint::Length(reviewers_height));
-        }
-        constraints.push(Constraint::Length(3)); // bulk delete buttons row (bordered)
-        constraints.push(Constraint::Length(1)); // navigate / shortcuts
-        constraints.push(Constraint::Length(1)); // status legend
-        constraints.push(Constraint::Length(1)); // checks legend
-        constraints.push(Constraint::Length(1)); // reviews legend
-        constraints.push(Constraint::Length(1)); // merges legend
-        constraints.push(Constraint::Length(1)); // ahead/behind legend
-        if shows_diff_legend {
-            constraints.push(Constraint::Length(1)); // diff legend
-        }
-
+        let rows = self.footer_rows();
+        let constraints: Vec<Constraint> = rows
+            .iter()
+            .map(|row| Constraint::Length(row.height()))
+            .collect();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
-
-        let mut idx = 0;
-        frame.render_widget(
-            Paragraph::new(self.notice_line(table_width, layout)),
-            chunks[idx],
-        );
-        idx += 1;
-        if reviewers_height > 0 {
-            frame.render_widget(Paragraph::new(self.reviewers_line()), chunks[idx]);
-            idx += 1;
+        for (row, rect) in rows.iter().zip(chunks.iter()) {
+            self.render_footer_row(*row, frame, *rect, table_width, layout);
         }
-        self.render_bulk_delete_buttons(frame, chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.shortcuts_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.reviews_legend_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.merges_legend_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[idx]);
-        if shows_diff_legend {
-            idx += 1;
-            frame.render_widget(Paragraph::new(self.diff_legend_line()), chunks[idx]);
+    }
+
+    fn render_footer_row(
+        &mut self,
+        row: FooterRow,
+        frame: &mut Frame,
+        rect: Rect,
+        table_width: u16,
+        layout: &DashboardTableLayout,
+    ) {
+        match row {
+            FooterRow::Notice => {
+                frame.render_widget(Paragraph::new(self.notice_line(table_width, layout)), rect)
+            }
+            FooterRow::Reviewers => {
+                frame.render_widget(Paragraph::new(self.reviewers_line()), rect)
+            }
+            FooterRow::BulkDelete => self.render_bulk_delete_buttons(frame, rect),
+            FooterRow::Shortcuts => {
+                frame.render_widget(Paragraph::new(self.shortcuts_line()), rect)
+            }
+            FooterRow::StatusLegend => {
+                frame.render_widget(Paragraph::new(self.status_legend_line()), rect)
+            }
+            FooterRow::ChecksLegend => {
+                frame.render_widget(Paragraph::new(self.checks_legend_line()), rect)
+            }
+            FooterRow::ReviewsLegend => {
+                frame.render_widget(Paragraph::new(self.reviews_legend_line()), rect)
+            }
+            FooterRow::MergesLegend => {
+                frame.render_widget(Paragraph::new(self.merges_legend_line()), rect)
+            }
+            FooterRow::AheadBehindLegend => {
+                frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), rect)
+            }
+            FooterRow::DiffLegend => {
+                frame.render_widget(Paragraph::new(self.diff_legend_line()), rect)
+            }
         }
     }
 
