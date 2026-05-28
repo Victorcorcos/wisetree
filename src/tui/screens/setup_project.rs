@@ -1159,7 +1159,12 @@ impl SetupProjectScreen {
             );
         }
 
-        render_yes_no(frame, chunks[7], editor.selection, &self.confirm_button_rects);
+        render_yes_no(
+            frame,
+            chunks[7],
+            editor.selection,
+            &self.confirm_button_rects,
+        );
 
         let hint_text = if editor.editing.is_some() {
             "Enter newline • Ctrl+←→ word • Ctrl+W/Alt+D del word • Ctrl+U/K kill line • Ctrl+A/E start/end • Esc finish"

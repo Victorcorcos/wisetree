@@ -675,7 +675,9 @@ impl DashboardScreen {
                         ActionChoice::UpdatePullRequest => {
                             self.mode = DashboardMode::Table;
                             update_request
-                                .map(|request| DashboardAction::UpdatePullRequest(Box::new(request)))
+                                .map(|request| {
+                                    DashboardAction::UpdatePullRequest(Box::new(request))
+                                })
                                 .unwrap_or(DashboardAction::Continue)
                         }
                         ActionChoice::ClosePullRequest => match close_request {

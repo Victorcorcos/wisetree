@@ -828,7 +828,11 @@ impl App {
                         if let Some(cache) = self.cache.as_mut() {
                             cache.start_loading();
                         }
-                        kick_off_cache_entry_delete(self.git_root.clone(), relative_path, tx.clone());
+                        kick_off_cache_entry_delete(
+                            self.git_root.clone(),
+                            relative_path,
+                            tx.clone(),
+                        );
                     }
                 }
             }
@@ -900,7 +904,11 @@ impl App {
                     SettingsAction::Back => self.back_to_menu(),
                     SettingsAction::CopySettingsFilePath => {
                         let path = self.settings_edit_file_path().display().to_string();
-                        kick_off_clipboard_copy(path, SETTINGS_PATH_COPIED_MESSAGE.to_string(), tx.clone());
+                        kick_off_clipboard_copy(
+                            path,
+                            SETTINGS_PATH_COPIED_MESSAGE.to_string(),
+                            tx.clone(),
+                        );
                     }
                     SettingsAction::CheckUpdates => {
                         if let Some(settings) = self.settings.as_mut() {
@@ -911,7 +919,8 @@ impl App {
                     SettingsAction::SetDeleteBranchWithWorktree(enabled) => {
                         if let Err(err) = self.save_delete_branch_with_worktree(enabled) {
                             if let Some(settings) = self.settings.as_mut() {
-                                settings.set_error(format!("Failed to update configuration: {err}"));
+                                settings
+                                    .set_error(format!("Failed to update configuration: {err}"));
                             }
                         }
                     }
@@ -932,7 +941,8 @@ impl App {
                     SettingsAction::SaveIgnorePatterns(patterns) => {
                         if let Err(err) = self.save_ignore_patterns(patterns) {
                             if let Some(settings) = self.settings.as_mut() {
-                                settings.set_error(format!("Failed to save ignore patterns: {err}"));
+                                settings
+                                    .set_error(format!("Failed to save ignore patterns: {err}"));
                             }
                         }
                     }
@@ -953,14 +963,17 @@ impl App {
                     SettingsAction::SavePostCreateCommands(commands) => {
                         if let Err(err) = self.save_post_create_commands(commands) {
                             if let Some(settings) = self.settings.as_mut() {
-                                settings.set_error(format!("Failed to save post-create commands: {err}"));
+                                settings.set_error(format!(
+                                    "Failed to save post-create commands: {err}"
+                                ));
                             }
                         }
                     }
                     SettingsAction::SaveTerminalCommand(command) => {
                         if let Err(err) = self.save_terminal_command(command) {
                             if let Some(settings) = self.settings.as_mut() {
-                                settings.set_error(format!("Failed to save terminal command: {err}"));
+                                settings
+                                    .set_error(format!("Failed to save terminal command: {err}"));
                             }
                         }
                     }
@@ -988,7 +1001,8 @@ impl App {
                     SettingsAction::SaveDashboard(dashboard) => {
                         if let Err(err) = self.save_dashboard(dashboard) {
                             if let Some(settings) = self.settings.as_mut() {
-                                settings.set_error(format!("Failed to save dashboard settings: {err}"));
+                                settings
+                                    .set_error(format!("Failed to save dashboard settings: {err}"));
                             }
                         }
                     }
@@ -1043,7 +1057,11 @@ impl App {
                         self.merge_pr = None;
                         self.enter_screen(Screen::Dashboard, tx);
                     }
-                    MergeAction::Confirmed { number, title, body } => {
+                    MergeAction::Confirmed {
+                        number,
+                        title,
+                        body,
+                    } => {
                         if let Some(screen) = self.merge_pr.as_mut() {
                             screen.start_merging();
                         }
@@ -1072,7 +1090,12 @@ impl App {
                                 let request = screen.request().clone();
                                 let git_root = self.git_root.clone();
                                 let dashboard_config = self.current_dashboard_config();
-                                kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
+                                kick_off_abort_ai_merge(
+                                    git_root,
+                                    dashboard_config,
+                                    request,
+                                    tx.clone(),
+                                );
                             }
                         }
                         self.update_pr = None;

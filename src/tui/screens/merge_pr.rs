@@ -154,7 +154,10 @@ impl MergePullRequestScreen {
     }
 
     pub fn handle_mouse_click(&mut self, position: Position) -> MergeAction {
-        if matches!(self.step, MergeStep::Merging) || self.error.is_some() || matches!(self.step, MergeStep::Loading) {
+        if matches!(self.step, MergeStep::Merging)
+            || self.error.is_some()
+            || matches!(self.step, MergeStep::Loading)
+        {
             return MergeAction::Continue;
         }
         let Some(dialog) = self.confirm.as_mut() else {

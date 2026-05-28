@@ -412,7 +412,11 @@ impl DeleteScreen {
     pub fn handle_mouse_click(&mut self, position: Position) -> DeleteAction {
         if matches!(self.step, DeleteStep::Confirm) {
             if self.bulk_confirm.is_some() {
-                return match self.bulk_confirm.as_mut().map(|d| d.handle_mouse_click(position)) {
+                return match self
+                    .bulk_confirm
+                    .as_mut()
+                    .map(|d| d.handle_mouse_click(position))
+                {
                     Some(BulkConfirmOutcome::Confirmed(indices)) => {
                         let selected_paths: Vec<String> = indices
                             .iter()
@@ -446,7 +450,11 @@ impl DeleteScreen {
                     _ => DeleteAction::Continue,
                 };
             }
-            return match self.confirm.as_mut().map(|d| d.handle_mouse_click(position)) {
+            return match self
+                .confirm
+                .as_mut()
+                .map(|d| d.handle_mouse_click(position))
+            {
                 Some(ConfirmationOutcome::Confirmed) => {
                     let wt = match self.selected() {
                         Some(w) => w,

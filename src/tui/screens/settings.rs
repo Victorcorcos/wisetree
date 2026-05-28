@@ -1534,7 +1534,8 @@ impl SettingsScreen {
                             ));
                         }
                         if matches!(value, SettingsStep::Dashboard) {
-                            self.dashboard_editor = Some(DashboardEditor::new(&self.config.dashboard));
+                            self.dashboard_editor =
+                                Some(DashboardEditor::new(&self.config.dashboard));
                             self.free_models = None;
                             return SettingsAction::FetchFreeModels;
                         }
@@ -1555,7 +1556,9 @@ impl SettingsScreen {
                     }
                 };
                 match select.handle_mouse_click(position) {
-                    SelectOutcome::Selected(_, direction) => SettingsAction::CopySettings(direction),
+                    SelectOutcome::Selected(_, direction) => {
+                        SettingsAction::CopySettings(direction)
+                    }
                     SelectOutcome::Cancelled | SelectOutcome::Pending => SettingsAction::Continue,
                 }
             }
