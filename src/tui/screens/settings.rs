@@ -10,13 +10,15 @@
 //! reset-to-defaults flow and delete-branch toggle persistence are signalled
 //! back to `App`.
 
+use std::cell::RefCell;
+use std::ops::Range;
+
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
-use std::ops::Range;
 
 use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
 use crate::messages::{
@@ -25,8 +27,8 @@ use crate::messages::{
 };
 use crate::services::UpdateCheckResult;
 use crate::tui::widgets::{
-    branded_line, ConfirmationChoice, ConfirmationModal, InputOutcome, InputPrompt, SelectOption,
-    SelectOutcome, SelectPrompt, Status, StatusIndicator,
+    branded_line, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
+    InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -999,6 +1001,18 @@ pub enum DashboardSelection {
     Save,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsMouseTarget {
+    PatternListSave,
+    PostCmdCreate,
+    PostCmdSave,
+    TerminalCmdSave,
+    LinkStrategySave,
+    LinkCacheDirSave,
+    DashboardSave,
+    PathTemplateSave,
+}
+
 /// State for the inline dashboard settings editor surfaced when the user
 /// drills into the `Dashboard` setting from the menu. Mirrors `PostCmdEditor`
 /// but has a fixed list of rectangles (one per dashboard field) and no
@@ -1107,6 +1121,7 @@ pub struct SettingsScreen {
     copy_settings_select: Option<SelectPrompt<CopyDirection>>,
     update_result: Option<UpdateCheckResult>,
     checking_updates: bool,
+    mouse_targets: RefCell<Vec<(SettingsMouseTarget, Rect)>>,
     pub tick: usize,
 }
 
@@ -1137,6 +1152,7 @@ impl SettingsScreen {
             copy_settings_select: None,
             update_result: None,
             checking_updates: false,
+            mouse_targets: RefCell::new(Vec::new()),
             tick: 0,
         };
         s.select = Some(s.build_menu());
@@ -1458,6 +1474,183 @@ impl SettingsScreen {
             SettingsStep::PathTemplate => self.handle_path_template(key),
             SettingsStep::Dashboard => self.handle_dashboard(key),
         }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> SettingsAction {
+        if self.error.is_some() {
+            return SettingsAction::Continue;
+        }
+
+        match self.step {
+            SettingsStep::Menu => {
+                let select = match self.select.as_mut() {
+                    Some(select) => select,
+                    None => return SettingsAction::Back,
+                };
+                match select.handle_mouse_click(position) {
+                    SelectOutcome::Selected(_, value) => {
+                        self.step = value;
+                        if matches!(value, SettingsStep::CheckUpdates) {
+                            return SettingsAction::CheckUpdates;
+                        }
+                        if matches!(value, SettingsStep::DeleteBranch) {
+                            self.delete_branch_dialog = Some(self.build_delete_branch_dialog());
+                        }
+                        if matches!(value, SettingsStep::PostCmd) {
+                            self.post_cmd_editor =
+                                Some(PostCmdEditor::new(self.config.post_create_cmd.clone()));
+                        }
+                        if matches!(value, SettingsStep::CopyPatterns) {
+                            self.pattern_list_editor = Some(PatternListEditor::new(
+                                self.config.worktree_copy_patterns.clone(),
+                            ));
+                        }
+                        if matches!(value, SettingsStep::IgnorePatterns) {
+                            self.pattern_list_editor = Some(PatternListEditor::new(
+                                self.config.worktree_copy_ignores.clone(),
+                            ));
+                        }
+                        if matches!(value, SettingsStep::LinkPatterns) {
+                            self.pattern_list_editor = Some(PatternListEditor::new(
+                                self.config.worktree_link_patterns.clone(),
+                            ));
+                        }
+                        if matches!(value, SettingsStep::TerminalCmd) {
+                            self.terminal_cmd_editor =
+                                Some(TerminalCmdEditor::new(self.config.terminal_command.clone()));
+                        }
+                        if matches!(value, SettingsStep::LinkStrategy) {
+                            self.link_strategy_editor =
+                                Some(LinkStrategyEditor::new(self.config.worktree_link_strategy));
+                        }
+                        if matches!(value, SettingsStep::LinkCacheDir) {
+                            self.link_cache_dir_editor = Some(LinkCacheDirEditor::new(
+                                self.config.worktree_link_cache_dir.clone(),
+                            ));
+                        }
+                        if matches!(value, SettingsStep::PathTemplate) {
+                            self.path_template_editor = Some(PathTemplateEditor::new(
+                                self.config.worktree_path_template.clone(),
+                            ));
+                        }
+                        if matches!(value, SettingsStep::Dashboard) {
+                            self.dashboard_editor =
+                                Some(DashboardEditor::new(&self.config.dashboard));
+                            self.free_models = None;
+                            return SettingsAction::FetchFreeModels;
+                        }
+                        if matches!(value, SettingsStep::CopySettings) {
+                            self.copy_settings_select = Some(self.build_copy_settings_select());
+                        }
+                        SettingsAction::Continue
+                    }
+                    SelectOutcome::Cancelled | SelectOutcome::Pending => SettingsAction::Continue,
+                }
+            }
+            SettingsStep::CopySettings => {
+                let select = match self.copy_settings_select.as_mut() {
+                    Some(select) => select,
+                    None => {
+                        self.step = SettingsStep::Menu;
+                        return SettingsAction::Continue;
+                    }
+                };
+                match select.handle_mouse_click(position) {
+                    SelectOutcome::Selected(_, direction) => {
+                        SettingsAction::CopySettings(direction)
+                    }
+                    SelectOutcome::Cancelled | SelectOutcome::Pending => SettingsAction::Continue,
+                }
+            }
+            SettingsStep::DeleteBranch => {
+                if self.delete_branch_dialog.is_none() {
+                    self.delete_branch_dialog = Some(self.build_delete_branch_dialog());
+                }
+                let Some(dialog) = self.delete_branch_dialog.as_mut() else {
+                    return SettingsAction::Continue;
+                };
+                match dialog.handle_mouse_click(position) {
+                    ConfirmationOutcome::Confirmed => {
+                        SettingsAction::SetDeleteBranchWithWorktree(true)
+                    }
+                    ConfirmationOutcome::Declined => {
+                        SettingsAction::SetDeleteBranchWithWorktree(false)
+                    }
+                    ConfirmationOutcome::Cancelled | ConfirmationOutcome::Pending => {
+                        SettingsAction::Continue
+                    }
+                }
+            }
+            _ => self.handle_custom_button_click(position),
+        }
+    }
+
+    fn handle_custom_button_click(&mut self, position: Position) -> SettingsAction {
+        let Some((target, _)) = self
+            .mouse_targets
+            .borrow()
+            .iter()
+            .copied()
+            .find(|(_, rect)| contains_position(*rect, position))
+        else {
+            return SettingsAction::Continue;
+        };
+
+        let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        match target {
+            SettingsMouseTarget::PatternListSave => {
+                if let Some(editor) = self.pattern_list_editor.as_mut() {
+                    editor.selection = PatternListSelection::Save;
+                }
+                self.handle_pattern_list(enter)
+            }
+            SettingsMouseTarget::PostCmdCreate => {
+                if let Some(editor) = self.post_cmd_editor.as_mut() {
+                    editor.selection = PostCmdSelection::Create;
+                }
+                self.handle_post_cmd(enter)
+            }
+            SettingsMouseTarget::PostCmdSave => {
+                if let Some(editor) = self.post_cmd_editor.as_mut() {
+                    editor.selection = PostCmdSelection::Save;
+                }
+                self.handle_post_cmd(enter)
+            }
+            SettingsMouseTarget::TerminalCmdSave => {
+                if let Some(editor) = self.terminal_cmd_editor.as_mut() {
+                    editor.selection = TerminalCmdSelection::Save;
+                }
+                self.handle_terminal_cmd(enter)
+            }
+            SettingsMouseTarget::LinkStrategySave => {
+                if let Some(editor) = self.link_strategy_editor.as_mut() {
+                    editor.selection = LinkStrategySelection::Save;
+                }
+                self.handle_link_strategy(enter)
+            }
+            SettingsMouseTarget::LinkCacheDirSave => {
+                if let Some(editor) = self.link_cache_dir_editor.as_mut() {
+                    editor.selection = LinkCacheDirSelection::Save;
+                }
+                self.handle_link_cache_dir(enter)
+            }
+            SettingsMouseTarget::DashboardSave => {
+                if let Some(editor) = self.dashboard_editor.as_mut() {
+                    editor.selection = DashboardSelection::Save;
+                }
+                self.handle_dashboard(enter)
+            }
+            SettingsMouseTarget::PathTemplateSave => {
+                if let Some(editor) = self.path_template_editor.as_mut() {
+                    editor.selection = PathTemplateSelection::Save;
+                }
+                self.handle_path_template(enter)
+            }
+        }
+    }
+
+    fn push_mouse_target(&self, target: SettingsMouseTarget, rect: Rect) {
+        self.mouse_targets.borrow_mut().push((target, rect));
     }
 
     fn handle_menu(&mut self, key: KeyEvent) -> SettingsAction {
@@ -2681,6 +2874,7 @@ impl SettingsScreen {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        self.mouse_targets.borrow_mut().clear();
         if let Some(err) = &self.error {
             self.render_error(frame, area, err);
             return;
@@ -3197,6 +3391,7 @@ impl SettingsScreen {
                 .padding(Padding::horizontal(1)),
         );
         frame.render_widget(save_box, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::LinkStrategySave, cols[1]);
     }
 
     fn render_link_cache_dir_save_button(
@@ -3235,6 +3430,7 @@ impl SettingsScreen {
                 .padding(Padding::horizontal(1)),
         );
         frame.render_widget(save_box, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::LinkCacheDirSave, cols[1]);
     }
 
     fn render_pattern_list_save_button(
@@ -3273,6 +3469,7 @@ impl SettingsScreen {
                 .padding(Padding::horizontal(1)),
         );
         frame.render_widget(save_box, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::PatternListSave, cols[1]);
     }
 
     fn render_dashboard(&self, frame: &mut Frame, area: Rect) {
@@ -3568,6 +3765,7 @@ impl SettingsScreen {
                 .padding(Padding::horizontal(1)),
         );
         frame.render_widget(save_box, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::DashboardSave, cols[1]);
     }
 
     fn render_path_template(&self, frame: &mut Frame, area: Rect) {
@@ -3752,6 +3950,7 @@ impl SettingsScreen {
                 .padding(Padding::horizontal(1)),
         );
         frame.render_widget(save_box, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::PathTemplateSave, cols[1]);
     }
 
     fn render_copy_settings(&self, frame: &mut Frame, area: Rect) {
@@ -4090,6 +4289,8 @@ impl SettingsScreen {
         );
         frame.render_widget(create_box, cols[1]);
         frame.render_widget(save_box, cols[3]);
+        self.push_mouse_target(SettingsMouseTarget::PostCmdCreate, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::PostCmdSave, cols[3]);
     }
 
     fn render_terminal_cmd(&self, frame: &mut Frame, area: Rect) {
@@ -4243,6 +4444,7 @@ impl SettingsScreen {
                 .padding(Padding::horizontal(1)),
         );
         frame.render_widget(save_box, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::TerminalCmdSave, cols[1]);
     }
 
     fn build_delete_branch_dialog(&self) -> ConfirmationModal {
@@ -4535,6 +4737,13 @@ fn starting_chip_index(editor: &DashboardEditor, chips: &[String]) -> usize {
         return 0;
     }
     chips.iter().position(|m| m == current).unwrap_or(0)
+}
+
+fn contains_position(area: Rect, position: Position) -> bool {
+    position.x >= area.left()
+        && position.x < area.right()
+        && position.y >= area.top()
+        && position.y < area.bottom()
 }
 
 fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {

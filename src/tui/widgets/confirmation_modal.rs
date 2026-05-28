@@ -14,8 +14,10 @@
 //! button red on select, hint line muted) is fixed so every modal in
 //! the app reads as the same component.
 
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
@@ -58,6 +60,7 @@ pub struct ConfirmationModal {
     cancel_text: String,
     color: Color,
     selected: ConfirmationChoice,
+    button_rects: Cell<[Rect; 2]>,
 }
 
 impl Default for ConfirmationModal {
@@ -69,6 +72,7 @@ impl Default for ConfirmationModal {
             cancel_text: DEFAULT_CANCEL.to_string(),
             color: parse_hex_color(DEFAULT_COLOR_HEX).unwrap_or(colors::WARNING),
             selected: ConfirmationChoice::Confirm,
+            button_rects: Cell::new([Rect::default(); 2]),
         }
     }
 }
@@ -152,6 +156,19 @@ impl ConfirmationModal {
         }
     }
 
+    pub fn handle_mouse_click(&mut self, position: Position) -> ConfirmationOutcome {
+        let [confirm_rect, cancel_rect] = self.button_rects.get();
+        if contains_position(confirm_rect, position) {
+            self.selected = ConfirmationChoice::Confirm;
+            return ConfirmationOutcome::Confirmed;
+        }
+        if contains_position(cancel_rect, position) {
+            self.selected = ConfirmationChoice::Cancel;
+            return ConfirmationOutcome::Declined;
+        }
+        ConfirmationOutcome::Pending
+    }
+
     /// Minimum total rows a `ConfirmationModal` ever needs to render
     /// without clipping the buttons or hint line (assumes a 1-line
     /// subtitle). Callers that decide a panel height up front should
@@ -182,6 +199,7 @@ impl ConfirmationModal {
     /// the entire area height (no centering padding) so the buttons and
     /// hint line stay visible.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        self.button_rects.set([Rect::default(); 2]);
         // Modal is at most 60 cols wide, clamped to the terminal.
         let modal_width = 60u16.min(area.width.saturating_sub(4)).max(20);
         // Inner text width: modal minus borders (2) minus horizontal padding (2).
@@ -278,6 +296,7 @@ impl ConfirmationModal {
             button_paragraph(&self.cancel_text, colors::ERROR, cancel_selected),
             cols[3],
         );
+        self.button_rects.set([cols[1], cols[3]]);
 
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -295,6 +314,13 @@ impl ConfirmationModal {
 fn button_width(label: &str) -> u16 {
     // Border (2) + 2-cell padding each side (4) + label.
     label.chars().count() as u16 + 6
+}
+
+fn contains_position(area: Rect, position: Position) -> bool {
+    position.x >= area.left()
+        && position.x < area.right()
+        && position.y >= area.top()
+        && position.y < area.bottom()
 }
 
 fn button_paragraph(label: &str, color: Color, focused: bool) -> Paragraph<'static> {

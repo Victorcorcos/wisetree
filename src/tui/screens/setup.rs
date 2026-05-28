@@ -13,7 +13,7 @@
 //! and feeds the outcome via `mark_complete` / `set_error`.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -181,6 +181,44 @@ impl SetupScreen {
                 _ => SetupAction::Continue,
             },
             SetupStep::Errored => SetupAction::Cancelled,
+        }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> SetupAction {
+        match self.step {
+            SetupStep::SelectShell => {
+                let Some(select) = self.select.as_mut() else {
+                    return SetupAction::Cancelled;
+                };
+                match select.handle_mouse_click(position) {
+                    SelectOutcome::Selected(_, shell) => {
+                        self.selected = shell;
+                        self.confirm = Some(self.build_confirm());
+                        self.step = SetupStep::Confirm;
+                        SetupAction::Continue
+                    }
+                    SelectOutcome::Cancelled => SetupAction::Cancelled,
+                    SelectOutcome::Pending => SetupAction::Continue,
+                }
+            }
+            SetupStep::Confirm => {
+                let outcome = match self.confirm.as_mut() {
+                    Some(dialog) => dialog.handle_mouse_click(position),
+                    None => return SetupAction::Continue,
+                };
+                match outcome {
+                    ConfirmationOutcome::Confirmed => SetupAction::Confirmed {
+                        shell: self.selected,
+                    },
+                    ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                        self.confirm = None;
+                        self.step = SetupStep::SelectShell;
+                        SetupAction::Continue
+                    }
+                    ConfirmationOutcome::Pending => SetupAction::Continue,
+                }
+            }
+            _ => SetupAction::Continue,
         }
     }
 

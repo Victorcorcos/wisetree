@@ -523,6 +523,7 @@ pub struct SetupProjectScreen {
     select: SelectPrompt<PresetChoice>,
     confirm: Option<ConfirmEditor>,
     confirm_block_rects: Cell<[Rect; CONFIRM_BLOCK_COUNT]>,
+    confirm_button_rects: Cell<[Rect; 2]>,
     pub tick: usize,
 }
 
@@ -575,6 +576,7 @@ impl SetupProjectScreen {
             select,
             confirm: None,
             confirm_block_rects: Cell::new([Rect::default(); CONFIRM_BLOCK_COUNT]),
+            confirm_button_rects: Cell::new([Rect::default(); 2]),
             tick: 0,
         }
     }
@@ -660,6 +662,49 @@ impl SetupProjectScreen {
                 true
             }
             _ => false,
+        }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> SetupProjectAction {
+        match self.step {
+            SetupProjectStep::PresetList => match self.select.handle_mouse_click(position) {
+                SelectOutcome::Selected(_, choice) => {
+                    self.selected_choice = choice;
+                    match choice {
+                        PresetChoice::Wise => {
+                            self.confirm = None;
+                            self.step = SetupProjectStep::Discovering;
+                            SetupProjectAction::DiscoverWise
+                        }
+                        PresetChoice::Catalog(id) => {
+                            let values = SetupProjectPresetValues::from_preset(self.preset(id));
+                            self.confirm = Some(ConfirmEditor::from_values(values));
+                            self.step = SetupProjectStep::Confirm;
+                            SetupProjectAction::Continue
+                        }
+                    }
+                }
+                SelectOutcome::Cancelled | SelectOutcome::Pending => SetupProjectAction::Continue,
+            },
+            SetupProjectStep::Confirm => {
+                let [yes_rect, no_rect] = self.confirm_button_rects.get();
+                let Some(editor) = self.confirm.as_mut() else {
+                    return SetupProjectAction::Continue;
+                };
+                if editor.editing.is_some() {
+                    return SetupProjectAction::Continue;
+                }
+                if contains_position(yes_rect, position) {
+                    editor.selection = ConfirmSelection::Yes;
+                    return SetupProjectAction::Apply(editor.to_values());
+                }
+                if contains_position(no_rect, position) {
+                    editor.selection = ConfirmSelection::No;
+                    self.step = SetupProjectStep::PresetList;
+                }
+                SetupProjectAction::Continue
+            }
+            SetupProjectStep::Discovering => SetupProjectAction::Continue,
         }
     }
 
@@ -915,6 +960,7 @@ impl SetupProjectScreen {
     fn render_preset_list(&self, frame: &mut Frame, area: Rect) {
         self.confirm_block_rects
             .set([Rect::default(); CONFIRM_BLOCK_COUNT]);
+        self.confirm_button_rects.set([Rect::default(); 2]);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -989,6 +1035,7 @@ impl SetupProjectScreen {
     fn render_discovering(&self, frame: &mut Frame, area: Rect) {
         self.confirm_block_rects
             .set([Rect::default(); CONFIRM_BLOCK_COUNT]);
+        self.confirm_button_rects.set([Rect::default(); 2]);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1112,7 +1159,12 @@ impl SetupProjectScreen {
             );
         }
 
-        render_yes_no(frame, chunks[7], editor.selection);
+        render_yes_no(
+            frame,
+            chunks[7],
+            editor.selection,
+            &self.confirm_button_rects,
+        );
 
         let hint_text = if editor.editing.is_some() {
             "Enter newline • Ctrl+←→ word • Ctrl+W/Alt+D del word • Ctrl+U/K kill line • Ctrl+A/E start/end • Esc finish"
@@ -1277,7 +1329,12 @@ fn contains_position(area: Rect, position: Position) -> bool {
         && position.y < area.bottom()
 }
 
-fn render_yes_no(frame: &mut Frame, area: Rect, selection: ConfirmSelection) {
+fn render_yes_no(
+    frame: &mut Frame,
+    area: Rect,
+    selection: ConfirmSelection,
+    button_rects: &Cell<[Rect; 2]>,
+) {
     let confirm_label = "Yes";
     let cancel_label = "No";
     let confirm_width = confirm_label.chars().count() as u16 + 4;
@@ -1347,6 +1404,7 @@ fn render_yes_no(frame: &mut Frame, area: Rect, selection: ConfirmSelection) {
     );
     frame.render_widget(confirm_box, cols[1]);
     frame.render_widget(cancel_box, cols[3]);
+    button_rects.set([cols[1], cols[3]]);
 }
 
 /// Map the active selection to a plain `ConfirmationChoice` so callers

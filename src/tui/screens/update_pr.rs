@@ -16,10 +16,11 @@
 //! Async work is owned by `App`; this screen is purely a presentation
 //! state machine.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -119,6 +120,7 @@ pub struct UpdatePullRequestScreen {
     finalize_confirm: Option<ConfirmationModal>,
     error: Option<String>,
     step: UpdateStep,
+    ai_button_rects: Cell<[Rect; 2]>,
     pub tick: usize,
 }
 
@@ -147,6 +149,7 @@ impl UpdatePullRequestScreen {
             finalize_confirm: None,
             error: None,
             step,
+            ai_button_rects: Cell::new([Rect::default(); 2]),
             tick: 0,
         }
     }
@@ -555,6 +558,51 @@ impl UpdatePullRequestScreen {
         }
     }
 
+    pub fn handle_mouse_click(&mut self, position: Position) -> UpdateAction {
+        if self.error.is_some() || matches!(self.step, UpdateStep::Loading) {
+            return UpdateAction::Continue;
+        }
+        if matches!(self.step, UpdateStep::Updating) {
+            if let Some(modal) = self.finalize_confirm.as_mut() {
+                return match modal.handle_mouse_click(position) {
+                    ConfirmationOutcome::Pending => UpdateAction::Continue,
+                    ConfirmationOutcome::Confirmed => {
+                        self.finalize_confirm = None;
+                        self.mark_ai_done();
+                        UpdateAction::Continue
+                    }
+                    ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                        self.finalize_confirm = None;
+                        UpdateAction::Continue
+                    }
+                };
+            }
+            if !self.ai_done {
+                return UpdateAction::Continue;
+            }
+            let [complete_rect, cancel_rect] = self.ai_button_rects.get();
+            if contains_position(complete_rect, position) {
+                self.ai_button = AiButton::Complete;
+                return UpdateAction::AiComplete;
+            }
+            if contains_position(cancel_rect, position) {
+                self.ai_button = AiButton::Cancel;
+                return UpdateAction::AiCancel;
+            }
+            return UpdateAction::Continue;
+        }
+        let Some(dialog) = self.confirm.as_mut() else {
+            return UpdateAction::Cancelled;
+        };
+        match dialog.handle_mouse_click(position) {
+            ConfirmationOutcome::Confirmed => UpdateAction::Confirmed,
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                UpdateAction::Cancelled
+            }
+            ConfirmationOutcome::Pending => UpdateAction::Continue,
+        }
+    }
+
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
             UpdateStep::Loading => 3,
@@ -687,6 +735,7 @@ fn build_confirm(request: &UpdatePullRequestRequest) -> ConfirmationModal {
 
 impl UpdatePullRequestScreen {
     fn render_updating(&mut self, frame: &mut Frame, area: Rect) {
+        self.ai_button_rects.set([Rect::default(); 2]);
         // Pre-conflict (or "no conflict at all") runs render as just a
         // spinner — the AI Activity panel is reserved for the post-
         // `ConflictsDetected` portion of the pipeline. We also fall back
@@ -997,7 +1046,15 @@ impl UpdatePullRequestScreen {
             ),
             chunks[3],
         );
+        self.ai_button_rects.set([chunks[1], chunks[3]]);
     }
+}
+
+fn contains_position(area: Rect, position: Position) -> bool {
+    position.x >= area.left()
+        && position.x < area.right()
+        && position.y >= area.top()
+        && position.y < area.bottom()
 }
 
 fn button_paragraph(

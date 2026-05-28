@@ -13,7 +13,7 @@
 //! dashboard once the merge resolves (the toast is shown by `App`).
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -138,6 +138,32 @@ impl MergePullRequestScreen {
             None => return MergeAction::Cancelled,
         };
         match dialog.handle_key(key) {
+            ConfirmationOutcome::Confirmed => {
+                let body = self.body.clone().unwrap_or_default();
+                MergeAction::Confirmed {
+                    number: self.request.number,
+                    title: self.request.title.clone(),
+                    body,
+                }
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                MergeAction::Cancelled
+            }
+            ConfirmationOutcome::Pending => MergeAction::Continue,
+        }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> MergeAction {
+        if matches!(self.step, MergeStep::Merging)
+            || self.error.is_some()
+            || matches!(self.step, MergeStep::Loading)
+        {
+            return MergeAction::Continue;
+        }
+        let Some(dialog) = self.confirm.as_mut() else {
+            return MergeAction::Cancelled;
+        };
+        match dialog.handle_mouse_click(position) {
             ConfirmationOutcome::Confirmed => {
                 let body = self.body.clone().unwrap_or_default();
                 MergeAction::Confirmed {
