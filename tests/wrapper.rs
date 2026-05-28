@@ -272,7 +272,8 @@ mod unix_shutdown {
         let _ = wait_for_exit(&mut session.child, Duration::from_secs(3))?;
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "wrapper process lingered too long after dashboard terminal close"
+            "wrapper process lingered too long after dashboard terminal close: {:?}",
+            started.elapsed()
         );
         Ok(())
     }

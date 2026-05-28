@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use tempfile::TempDir;
 use wisetree::config::schema::{
     clamp_dashboard_refresh_interval, default_copy_ignores, default_copy_patterns,
-    default_path_template, LinkStrategy,
+    default_path_template, AiStatusConfig, LinkStrategy,
 };
 use wisetree::config::{ConfigService, WorktreeConfig};
 
@@ -225,6 +225,7 @@ fn dashboard_config_round_trips_json() {
             show_pull_requests: true,
             columns: vec!["status".into(), "branch".into(), "pull_request".into()],
             use_ai: String::new(),
+            ai_status: Default::default(),
         },
         ..WorktreeConfig::default()
     };
@@ -256,6 +257,44 @@ fn dashboard_refresh_interval_is_clamped_on_load() {
 }
 
 #[test]
+fn ai_status_config_round_trips_and_clamps() {
+    let cfg = AiStatusConfig {
+        enabled_harnesses: vec![
+            "claude_code".to_string(),
+            "opencode".to_string(),
+            "codex_cli".to_string(),
+            "gemini_cli".to_string(),
+        ],
+        active_window_ms: 7_500,
+    };
+    let raw = serde_json::to_string(&cfg).unwrap();
+    let parsed: AiStatusConfig = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed, cfg);
+
+    // Clamping: below the floor is bumped up, above the ceiling is capped.
+    let mut low = AiStatusConfig {
+        enabled_harnesses: vec!["claude_code".into()],
+        active_window_ms: 100,
+    };
+    low.clamp();
+    assert!(low.active_window_ms >= 2_000);
+
+    let mut high = AiStatusConfig {
+        enabled_harnesses: vec!["claude_code".into()],
+        active_window_ms: 1_000_000,
+    };
+    high.clamp();
+    assert!(high.active_window_ms <= 60_000);
+}
+
+#[test]
+fn ai_status_config_rejects_unknown_field() {
+    let raw = r#"{"enabledHarnesses": ["claude_code"], "bogus": 1}"#;
+    let parsed: Result<AiStatusConfig, _> = serde_json::from_str(raw);
+    assert!(parsed.is_err(), "deny_unknown_fields should reject");
+}
+
+#[test]
 fn dashboard_unknown_field_is_rejected() {
     let raw = r#"{
   "dashboard": {
@@ -279,10 +318,34 @@ fn invalid_dashboard_columns_are_dropped_at_load_with_warning() {
 
         let mut svc = ConfigService::new();
         let loaded = svc.load(Some(project.path())).expect("load");
-        assert_eq!(loaded.dashboard.columns, vec!["branch", "status"]);
+        assert_eq!(
+            loaded.dashboard.columns,
+            vec!["branch", "status", "ai_status"]
+        );
         assert!(svc
             .warnings()
             .iter()
             .any(|warning| warning.contains("Unknown dashboard column 'bogus'")));
+    });
+}
+
+#[test]
+fn ai_status_column_auto_add_does_not_warn() {
+    with_home(|_home| {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let raw = r#"{
+  "dashboard": {
+    "columns": ["branch", "status"]
+  }
+}"#;
+        fs::write(project.path().join(".wisetree.json"), raw).unwrap();
+
+        let mut svc = ConfigService::new();
+        let loaded = svc.load(Some(project.path())).expect("load");
+        assert_eq!(
+            loaded.dashboard.columns,
+            vec!["branch", "status", "ai_status"]
+        );
+        assert!(svc.warnings().is_empty());
     });
 }

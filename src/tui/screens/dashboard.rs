@@ -12,8 +12,8 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
-    PrState, ReviewStatus,
+    AiHarness, AiHarnessState, AiStatus, AiStatusReport, CheckStatus, CommitSummary,
+    DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus, PrState, ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
@@ -177,6 +177,7 @@ pub enum DashboardAction {
 enum DashboardColumn {
     Branch,
     Status,
+    AiStatus,
     AheadBehind,
     Diff,
     LastCommit,
@@ -201,6 +202,8 @@ enum FooterRow {
     MergesLegend,
     AheadBehindLegend,
     DiffLegend,
+    AiStatusAggregateLegend,
+    AiStatusHarnessLegend,
 }
 
 impl FooterRow {
@@ -1240,6 +1243,8 @@ impl DashboardScreen {
         if self.diff_legend_height() > 0 {
             rows.push(FooterRow::DiffLegend);
         }
+        rows.push(FooterRow::AiStatusAggregateLegend);
+        rows.push(FooterRow::AiStatusHarnessLegend);
         rows
     }
 
@@ -1304,6 +1309,12 @@ impl DashboardScreen {
             }
             FooterRow::DiffLegend => {
                 frame.render_widget(Paragraph::new(self.diff_legend_line()), rect)
+            }
+            FooterRow::AiStatusAggregateLegend => {
+                frame.render_widget(Paragraph::new(self.ai_status_aggregate_legend_line()), rect)
+            }
+            FooterRow::AiStatusHarnessLegend => {
+                frame.render_widget(Paragraph::new(self.ai_status_harness_legend_line()), rect)
             }
         }
     }
@@ -1533,6 +1544,43 @@ impl DashboardScreen {
             Span::styled(" lines added  ", muted_dim),
             Span::styled("-N", Style::default().fg(colors::ERROR)),
             Span::styled(" lines removed vs the same base ref", muted_dim),
+        ])
+    }
+
+    fn ai_status_aggregate_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("AI: ", muted_dim),
+            Span::raw("⬜ "),
+            Span::styled("Pending", muted_dim),
+            Span::styled("  ", muted_dim),
+            Span::raw("🟨 "),
+            Span::styled("Running", muted_dim),
+            Span::styled("  ", muted_dim),
+            Span::raw("🟩 "),
+            Span::styled("Finished", muted_dim),
+            Span::styled("  ", muted_dim),
+            Span::raw("🟥 "),
+            Span::styled("Failed", muted_dim),
+        ])
+    }
+
+    fn ai_status_harness_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("    ", muted_dim),
+            Span::styled("C", Style::default().fg(colors::HARNESS_CLAUDE)),
+            Span::styled(" Claude   ", muted_dim),
+            Span::styled("O", Style::default().fg(colors::HARNESS_OPENCODE)),
+            Span::styled(" Opencode   ", muted_dim),
+            Span::styled("X", Style::default().fg(colors::HARNESS_CODEX)),
+            Span::styled(" Codex   ", muted_dim),
+            Span::styled("G", Style::default().fg(colors::HARNESS_GEMINI)),
+            Span::styled(" Gemini", muted_dim),
         ])
     }
 
@@ -1801,6 +1849,7 @@ impl DashboardScreen {
                 DashboardColumn::PullRequest => {}
                 DashboardColumn::Branch
                 | DashboardColumn::Status
+                | DashboardColumn::AiStatus
                 | DashboardColumn::AheadBehind
                 | DashboardColumn::Diff => {}
             }
@@ -1865,6 +1914,7 @@ impl DashboardColumn {
         match value {
             "branch" => Some(Self::Branch),
             "status" => Some(Self::Status),
+            "ai_status" => Some(Self::AiStatus),
             "ahead_behind" => Some(Self::AheadBehind),
             "diff" => Some(Self::Diff),
             "last_commit" => Some(Self::LastCommit),
@@ -1877,6 +1927,13 @@ impl DashboardColumn {
         match self {
             Self::Branch => "Branch",
             Self::Status => "Status",
+            Self::AiStatus => {
+                if compact {
+                    "AI"
+                } else {
+                    "AI Status"
+                }
+            }
             Self::AheadBehind => {
                 if compact {
                     "A/B"
@@ -1916,6 +1973,17 @@ impl DashboardColumn {
                     13
                 } else {
                     15
+                }
+            }
+            Self::AiStatus => {
+                // Wide: glyph(2) + space(1) + longest label "Finished"(8) +
+                // space(1) + decorations "C O X G"
+                // = 1+1+1+1+1+1+1 = 7 → total 19.
+                // Compact mode drops the decoration letters.
+                if compact {
+                    13
+                } else {
+                    19
                 }
             }
             Self::AheadBehind => {
@@ -2046,8 +2114,104 @@ impl DashboardColumn {
                     Cell::from("-")
                 }
             }
+            Self::AiStatus => ai_status_cell(row.ai_status.as_ref(), compact),
         }
     }
+}
+
+fn ai_status_label(status: AiStatus) -> (&'static str, &'static str) {
+    match status {
+        AiStatus::None => ("⬜", "Pending "),
+        AiStatus::InProgress => ("🟨", "Running "),
+        AiStatus::Finished => ("🟩", "Finished"),
+        AiStatus::Failed => ("🟥", "Failed  "),
+    }
+}
+
+fn ai_status_label_style(status: AiStatus) -> Style {
+    match status {
+        AiStatus::None => Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM),
+        AiStatus::InProgress => Style::default()
+            .fg(colors::ACCENT)
+            .add_modifier(Modifier::BOLD),
+        AiStatus::Finished => Style::default().fg(colors::SUCCESS),
+        AiStatus::Failed => Style::default()
+            .fg(colors::ERROR)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn harness_identity_color(harness: AiHarness) -> ratatui::style::Color {
+    match harness {
+        AiHarness::ClaudeCode => colors::HARNESS_CLAUDE,
+        AiHarness::Opencode => colors::HARNESS_OPENCODE,
+        AiHarness::CodexCli => colors::HARNESS_CODEX,
+        AiHarness::GeminiCli => colors::HARNESS_GEMINI,
+    }
+}
+
+fn harness_letter(harness: AiHarness) -> &'static str {
+    match harness {
+        AiHarness::ClaudeCode => "C",
+        AiHarness::Opencode => "O",
+        AiHarness::CodexCli => "X",
+        AiHarness::GeminiCli => "G",
+    }
+}
+
+fn harness_decoration_spans(harness: AiHarness, state: AiHarnessState) -> Vec<Span<'static>> {
+    let color = harness_identity_color(harness);
+    match state {
+        AiHarnessState::Running => vec![Span::styled(
+            harness_letter(harness),
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )],
+        AiHarnessState::Idle => vec![Span::styled(
+            harness_letter(harness),
+            Style::default().fg(color),
+        )],
+        AiHarnessState::Failed => vec![Span::styled(
+            harness_letter(harness),
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::UNDERLINED),
+        )],
+        AiHarnessState::Absent => vec![Span::styled(
+            "·",
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        )],
+    }
+}
+
+fn ai_status_cell(report: Option<&AiStatusReport>, compact: bool) -> Cell<'static> {
+    let aggregated = report.map(|r| r.aggregated).unwrap_or(AiStatus::None);
+    let (glyph, label) = ai_status_label(aggregated);
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw(glyph),
+        Span::raw(" "),
+        Span::styled(label, ai_status_label_style(aggregated)),
+    ];
+
+    if !compact {
+        spans.push(Span::raw(" "));
+        for (i, harness) in AiHarness::ALL.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let state = report
+                .and_then(|r| r.per_harness.get(harness).copied())
+                .unwrap_or(AiHarnessState::Absent);
+            spans.extend(harness_decoration_spans(*harness, state));
+        }
+    }
+
+    Cell::from(Line::from(spans))
 }
 
 impl PrState {

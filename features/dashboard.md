@@ -246,3 +246,74 @@ Run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo t
 In case something need to be done in TUI, always remember to follow the design and color pallete we already have, documented in:
 
 * design/pallete.md
+
+---
+
+## 11. AI Status column
+
+The dashboard exposes an **AI Status** column that reports whether each
+worktree currently has an AI coding harness attached to it. Detection is
+driven primarily by local transcripts/state files, with a small Claude
+live-session PID check used only to keep long-running unresolved turns in
+`Running`.
+
+### Aggregated states
+
+A worktree's aggregated AI status falls into one of four buckets, decided
+by the priority rule **`Running` > `Idle` > `Failed` > `Absent`**:
+
+| Aggregate | Glyph | Meaning |
+| --- | --- | --- |
+| In progress | 🟨 running | At least one harness still has an unresolved prompt, with either recent transcript writes or a stronger live-session signal |
+| Finished   | 🟩 finished | A harness has activity on this worktree, and its latest prompt already reached a completed assistant turn (or only stale historical activity remains) |
+| Failed     | 🟥 failed   | Every harness with a positive signal failed; nothing is `Running` or `Idle` |
+| Pending    | ⬜ pending  | No harness has touched this worktree |
+
+### Per-harness decoration
+
+The cell also renders a short identity strip — one capital letter per
+enabled harness — so you can tell at a glance which harness is active
+without expanding the row:
+
+```
+C  Claude Code         (~/.claude/projects/<slug>/*.jsonl)
+O  opencode            ($XDG_DATA_HOME/opencode/opencode.db session metadata)
+X  codex-cli           (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl)
+G  gemini-cli          (~/.gemini/tmp/<basename>/.project_root + chats/*)
+```
+
+A letter is shown bright when its harness is `Running`, dim when `Idle`,
+underlined when `Failed`, and hidden when `Absent`.
+
+### Config flags
+
+The behavior is tuneable via the `dashboard.aiStatus` block (camelCase on
+the wire, snake_case in Rust):
+
+```jsonc
+{
+  "dashboard": {
+    "columns": ["branch", "status", "ai_status", "ahead_behind", "last_commit"],
+    "aiStatus": {
+      "enabledHarnesses": ["claude_code", "opencode", "codex_cli", "gemini_cli"],
+      "activeWindowMs": 10000
+    }
+  }
+}
+```
+
+* `enabledHarnesses` — any subset of `claude_code`, `opencode`,
+  `codex_cli`, `gemini_cli`. Unknown names are dropped silently. Disabling
+  a harness removes both its decoration letter and its contribution to the
+  aggregated state.
+* `activeWindowMs` — the recency threshold used when a harness still has
+  an unresolved prompt but no stronger live-session signal. Clamped to
+  `[2000, 60000]` at load. Defaults to `10000` (10 s).
+
+### Performance contract
+
+Each dashboard tick does **one** global scan per enabled harness, then an
+O(log N) lookup per worktree. The whole AI Status pass runs inside a
+200 ms `tokio::time::timeout` wrapping `tokio::task::spawn_blocking`, so
+unexpectedly slow filesystems can never stall the dashboard refresh; on
+timeout the column simply renders `⬜ pending` until the next tick.

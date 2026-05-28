@@ -2,11 +2,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifi
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+use std::collections::BTreeMap;
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::messages::colors;
+
 use wisetree::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
-    PrState, PullRequest, ReviewStatus, ReviewerSummary,
+    AiHarness, AiHarnessState, AiStatus, AiStatusReport, CheckStatus, CommitSummary,
+    DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus, PrState, PullRequest,
+    ReviewStatus, ReviewerSummary,
 };
 use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
 
@@ -78,6 +81,7 @@ fn row(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
             author: "Test".into(),
         }),
         pull_request: None,
+        ai_status: None,
         error: None,
     }
 }
@@ -184,6 +188,100 @@ fn table_renders_configured_columns_in_order() {
     let ahead = dumped.find("Ahead/Behind").unwrap();
     let last_commit = dumped.find("Last Commit").unwrap();
     assert!(branch < status && status < ahead && ahead < last_commit);
+}
+
+fn ai_status_report(states: &[(AiHarness, AiHarnessState)]) -> AiStatusReport {
+    let mut per_harness: BTreeMap<AiHarness, AiHarnessState> = BTreeMap::new();
+    for h in AiHarness::ALL {
+        per_harness.insert(h, AiHarnessState::Absent);
+    }
+    for (h, s) in states {
+        per_harness.insert(*h, *s);
+    }
+    let aggregated = AiStatusReport::aggregate(&per_harness);
+    AiStatusReport {
+        aggregated,
+        per_harness,
+    }
+}
+
+fn row_with_ai(path: &str, branch: &str, report: AiStatusReport) -> DashboardRow {
+    let mut row = row(path, branch, true);
+    row.ai_status = Some(report);
+    row
+}
+
+fn ai_status_screen(rows: Vec<DashboardRow>) -> DashboardScreen {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into(), "ai_status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(rows);
+    screen
+}
+
+#[test]
+fn ai_status_column_renders_each_aggregate_state() {
+    let rows = vec![
+        row_with_ai("/tmp/repo-pending", "feat-a", ai_status_report(&[])),
+        row_with_ai(
+            "/tmp/repo-running",
+            "feat-b",
+            ai_status_report(&[(AiHarness::ClaudeCode, AiHarnessState::Running)]),
+        ),
+        row_with_ai(
+            "/tmp/repo-finished",
+            "feat-c",
+            ai_status_report(&[(AiHarness::Opencode, AiHarnessState::Idle)]),
+        ),
+        row_with_ai(
+            "/tmp/repo-failed",
+            "feat-d",
+            ai_status_report(&[(AiHarness::CodexCli, AiHarnessState::Failed)]),
+        ),
+    ];
+    assert_eq!(
+        rows[0].ai_status.as_ref().unwrap().aggregated,
+        AiStatus::None
+    );
+    assert_eq!(
+        rows[1].ai_status.as_ref().unwrap().aggregated,
+        AiStatus::InProgress
+    );
+    assert_eq!(
+        rows[2].ai_status.as_ref().unwrap().aggregated,
+        AiStatus::Finished
+    );
+    assert_eq!(
+        rows[3].ai_status.as_ref().unwrap().aggregated,
+        AiStatus::Failed
+    );
+
+    let mut screen = ai_status_screen(rows);
+    let dumped = dump(160, 20, |f| screen.render(f, f.area()));
+
+    assert!(dumped.contains("AI"), "expected AI column header");
+    assert!(
+        dumped.contains("Running"),
+        "expected running label in legend"
+    );
+    assert!(
+        dumped.contains("Finished"),
+        "expected finished label in legend"
+    );
+    assert!(dumped.contains("Failed"), "expected failed label in legend");
+    assert!(
+        dumped.contains("Pending"),
+        "expected pending label in legend"
+    );
+    assert!(dumped.contains("C Claude"));
+    assert!(dumped.contains("O Opencode"));
+    assert!(dumped.contains("X Codex"));
+    assert!(dumped.contains("G Gemini"));
 }
 
 #[test]
@@ -791,9 +889,9 @@ fn table_uses_available_height_before_scrolling() {
     screen.set_rows(rows);
 
     // Height must fit exactly: 4 (banner/search) + 13 (header + 12 rows)
-    // + 10 (10-line footer with bordered bulk-delete buttons row and all legends,
-    // including PR merges).
-    let dumped = dump(120, 27, |f| screen.render(f, f.area()));
+    // + 12 (12-line footer with bordered bulk-delete buttons row, all legends
+    // including PR merges, and the two AI Status legend rows).
+    let dumped = dump(120, 29, |f| screen.render(f, f.area()));
     assert!(dumped.contains("repo-11"));
     assert!(!dumped.contains("more above"));
     assert!(!dumped.contains("more below"));
@@ -958,7 +1056,7 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
 
     insta::assert_snapshot!(
         "dashboard_wide_pr_footer",
-        dump_lines(110, 18, |f| screen.render(f, f.area()))
+        dump_lines(110, 20, |f| screen.render(f, f.area()))
     );
 }
 
@@ -987,7 +1085,7 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
 
     insta::assert_snapshot!(
         "dashboard_narrow_collapsed_columns",
-        dump_lines(72, 18, |f| screen.render(f, f.area()))
+        dump_lines(72, 20, |f| screen.render(f, f.area()))
     );
 }
 
