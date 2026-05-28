@@ -1180,14 +1180,12 @@ impl DashboardScreen {
             FooterRow::DiffLegend => {
                 frame.render_widget(Paragraph::new(self.diff_legend_line()), rect)
             }
-            FooterRow::AiStatusAggregateLegend => frame.render_widget(
-                Paragraph::new(self.ai_status_aggregate_legend_line()),
-                rect,
-            ),
-            FooterRow::AiStatusHarnessLegend => frame.render_widget(
-                Paragraph::new(self.ai_status_harness_legend_line()),
-                rect,
-            ),
+            FooterRow::AiStatusAggregateLegend => {
+                frame.render_widget(Paragraph::new(self.ai_status_aggregate_legend_line()), rect)
+            }
+            FooterRow::AiStatusHarnessLegend => {
+                frame.render_widget(Paragraph::new(self.ai_status_harness_legend_line()), rect)
+            }
         }
     }
 
