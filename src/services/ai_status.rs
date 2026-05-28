@@ -352,6 +352,18 @@ mod tests {
         )
     }
 
+    fn codex_task_started_line() -> String {
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}"#.to_string()
+    }
+
+    fn codex_task_complete_line() -> String {
+        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}"#.to_string()
+    }
+
+    fn codex_turn_aborted_line() -> String {
+        r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t-1"}}"#.to_string()
+    }
+
     fn write_gemini_project_root(project_dir: &Path, worktree: &Path) {
         fs::create_dir_all(project_dir.join("chats")).unwrap();
         fs::write(
@@ -1120,6 +1132,224 @@ mod tests {
             report.per_harness.get(&AiHarness::CodexCli),
             Some(&AiHarnessState::Idle)
         );
+    }
+
+    #[test]
+    fn codex_session_meta_only_is_idle_not_running() {
+        // Regression for CODEX_IMPROVEMENT.md: a freshly-opened codex window
+        // writes the `session_meta` header immediately, giving the rollout
+        // file a fresh mtime. The user hasn't typed yet — no `task_started`
+        // event, no `response_item` user line — so the harness is sitting at
+        // the prompt waiting for input. That must surface as `Idle`. The
+        // earlier code fell through to `classify_mtime` here and incorrectly
+        // showed `Running` for `active_window_ms` after every codex launch.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-fresh.jsonl",
+            &[codex_session_meta_line(&cwd_str)],
+        );
+
+        let svc = AiStatusService::new(&all_enabled_config(), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::CodexCli),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn codex_task_started_without_complete_is_running() {
+        // Authoritative path: `event_msg` with `task_started` payload marks
+        // the start of a turn. If `task_complete`/`turn_aborted` hasn't
+        // appeared yet, the worktree is `Running` regardless of which
+        // `response_item` messages were emitted in between.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-1.jsonl",
+            &[codex_session_meta_line(&cwd_str), codex_task_started_line()],
+        );
+
+        let svc = AiStatusService::new(&all_enabled_config(), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::InProgress);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::CodexCli),
+            Some(&AiHarnessState::Running)
+        );
+    }
+
+    #[test]
+    fn codex_task_complete_marks_idle_even_with_fresh_mtime() {
+        // `task_complete` after `task_started` ends the turn. The file mtime
+        // is fresh (just written) but the harness is back at the prompt — so
+        // `Idle`, not `Running`.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-1.jsonl",
+            &[
+                codex_session_meta_line(&cwd_str),
+                codex_task_started_line(),
+                codex_task_complete_line(),
+            ],
+        );
+
+        let svc = AiStatusService::new(&all_enabled_config(), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::CodexCli),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn codex_turn_aborted_marks_idle() {
+        // `turn_aborted` is a terminal lifecycle event (Ctrl-C or guardrail
+        // abort). Same effect as `task_complete`: turn over, harness idle.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-1.jsonl",
+            &[
+                codex_session_meta_line(&cwd_str),
+                codex_task_started_line(),
+                codex_turn_aborted_line(),
+            ],
+        );
+
+        let svc = AiStatusService::new(&all_enabled_config(), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::CodexCli),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn codex_stale_pending_with_live_process_runs() {
+        // Long shell/tool calls can pause JSONL writes for minutes — the
+        // mtime ages past `active_window_ms` even though codex is still
+        // chewing on the turn. A live `codex` process at this cwd must keep
+        // the worktree `Running`. Mirrors `gemini_stale_pending_with_live_process_runs`.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-1.jsonl",
+            &[codex_session_meta_line(&cwd_str), codex_task_started_line()],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let mut live_cwds = BTreeSet::new();
+        live_cwds.insert(canonical_key(&worktree));
+
+        let out = codex::scan_with_live_cwds_for_test(
+            &paths,
+            std::time::Duration::from_millis(1),
+            &live_cwds,
+        );
+        let state = out.per_cwd.get(&canonical_key(&worktree)).copied();
+        assert_eq!(state, Some(AiHarnessState::Running));
+    }
+
+    #[test]
+    fn codex_completed_with_live_process_is_idle_at_prompt() {
+        // Even when the codex process is still alive at this cwd, a closed
+        // turn (`task_complete`) means the user is back at the prompt. The
+        // harness is `Idle`, not `Running`.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-1.jsonl",
+            &[
+                codex_session_meta_line(&cwd_str),
+                codex_task_started_line(),
+                codex_task_complete_line(),
+            ],
+        );
+
+        let mut live_cwds = BTreeSet::new();
+        live_cwds.insert(canonical_key(&worktree));
+
+        let out = codex::scan_with_live_cwds_for_test(
+            &paths,
+            std::time::Duration::from_millis(10_000),
+            &live_cwds,
+        );
+        let state = out.per_cwd.get(&canonical_key(&worktree)).copied();
+        assert_eq!(state, Some(AiHarnessState::Idle));
+    }
+
+    #[test]
+    fn codex_stale_pending_without_live_process_is_idle() {
+        // Without a live codex process AND with a stale mtime, a Pending
+        // transcript was likely abandoned (process crashed, terminal closed).
+        // Surface as `Idle` — there's no evidence anyone is actively working.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let sessions_root = paths.codex_sessions.as_ref().unwrap().clone();
+        let today = codex::date_dir_for(&sessions_root, SystemTime::now()).unwrap();
+        write_codex_rollout(
+            &today,
+            "rollout-1.jsonl",
+            &[codex_session_meta_line(&cwd_str), codex_task_started_line()],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let out = codex::scan_with_live_cwds_for_test(
+            &paths,
+            std::time::Duration::from_millis(1),
+            &BTreeSet::new(),
+        );
+        let state = out.per_cwd.get(&canonical_key(&worktree)).copied();
+        assert_eq!(state, Some(AiHarnessState::Idle));
     }
 
     #[test]
