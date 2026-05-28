@@ -12,6 +12,16 @@
 
 It is purpose-built for developers who run **multiple AI coding agents in parallel**, including `Claude Code`, `Codex CLI`, `Gemini CLI`, `Opencode`, `Cursor`, `Aider`, and friends, each on its own branch, each in its own isolated checkout, all stacked on top of the same repository.
 
+## The 3 developer wins
+
+If you only skim one section, this is why `wisetree` exists:
+
+| What developers want | Wisetree functionality | Why it matters |
+| --- | --- | --- |
+| **Spin up a ready-to-code checkout in seconds** | `wisetree create` creates an isolated worktree, can copy local-only files (`.env*`, `.vscode/**`, keys, editor settings), can link heavy dependency folders from a shared cache, can run setup commands, can open your editor, and can drop your shell straight into the new directory. | Every branch, experiment, bugfix, or AI-agent task starts from a runnable checkout instead of a checklist of `git worktree add`, file copying, installs, and `cd` commands. |
+| **See every branch, PR, and AI agent at a glance** | `wisetree dashboard` is a live worktree command center with dirty/clean state, ahead/behind, last commit, optional GitHub PR status, CI/review/merge signals, and an `AI Status` column for Claude Code, Codex CLI, Gemini CLI, and Opencode activity. | When several humans or agents are working in parallel, you can scan one screen to decide what needs attention instead of visiting every directory by hand. |
+| **Clean up finished work without breaking flow** | Dashboard actions let you navigate, open, copy, update, merge, close, or delete a worktree from the selected row. Bulk-delete buttons remove groups like `Merged`, `Closed`, `Clean`, or `Dirty`, and `wisetree cache` lets you inspect, prune, or clear shared dependency caches. | Finished experiments stop piling up as stale directories and branches, while expensive dependency installs stay reusable across future worktrees. |
+
 # 🤔 Why?
 
 A `git worktree` lets a single repository have **multiple working directories checked out at the same time**, each pointing to a different branch. No stashing, no `git checkout` dance, and no losing your place. Just a clean, parallel copy of the codebase.
@@ -30,21 +40,13 @@ If you have ever tried to spin up three or four agents at once, you have probabl
 
 `wisetree` collapses all of that into a single interactive session. It is opinionated where it helps you, and configurable where you need it.
 
-The three features that make it especially powerful for AI-assisted development are:
-
-| Feature | What it does | Why it matters for AI agents |
-| --- | --- | --- |
-| **Copy Patterns** (`worktreeCopyPatterns` / `worktreeCopyIgnores`) | Glob-based file copying from the source repo into the freshly created worktree, with an explicit ignore list. | Untracked-but-required files (`.env*`, `.vscode/**`, local credentials, editor settings) land in the new worktree automatically, so the agent can run, test, and inspect the code without any manual seeding step. |
-| **Post-Create Commands** (`postCreateCmd`) | An ordered list of shell commands executed inside the new worktree right after it is created, with progress reporting in the TUI. | Bootstraps the environment with commands like `bundle install`, `npm install`, `docker compose up -d`, `rails db:prepare`, and `make seed`, so by the time you hand control over to the agent, the project is already runnable. |
-| **Dashboard** (`wisetree dashboard`) | A live, auto-refreshing table of every worktree in the repo, with branch, dirty/clean status, ahead/behind vs upstream, last commit, and PR state — plus instant search, row actions, and a one-keystroke delete shortcut. | When several agents are working in parallel, you need a single screen that answers "what is the state of *all* my worktrees right now?". The dashboard turns the mental model from "remember every directory" into "scan a table" and is the fastest way to triage which agent to look at next. |
-
 Combined with the optional **`terminalCommand`** (e.g. `code $WORKTREE_PATH`, `cursor $WORKTREE_PATH`, `idea $WORKTREE_PATH`) and the **shell integration** (which `cd`s your current shell into the selected worktree the moment you confirm), the loop becomes:
 
 1. Run `wisetree`.
 2. Pick a source branch and a name.
-3. The new worktree is created, the relevant files are copied in, the setup commands run, your editor opens on it, and your shell is already inside it.
+3. The new worktree is created and, when configured, the relevant files are copied in, shared dependency folders are linked, setup commands run, your editor opens on it, and your shell is already inside it.
 4. Launch your AI agent. Code.
-5. Done? Run `wisetree` again, pick `Delete`, and remove the worktree and, if you want, its branch too.
+5. Done? Run `wisetree dashboard`, delete the selected worktree or a whole status group, and remove branches too when `deleteBranchWithWorktree` is enabled.
 
 That is the productivity delta `wisetree` is built to deliver.
 
@@ -181,10 +183,11 @@ You land on the main menu, where the available actions are:
 
 | Menu entry | What it does |
 | --- | --- |
+| **Setup Project Config** | Creates a repo-local `.wisetree.json` when the project does not have one yet, so team defaults can live next to the code. |
 | **Setup Shell Integration** | One-time installer for the shell wrapper + completions (only shown when integration is not yet installed). |
-| **Create** | Guided flow: pick a source branch, name the directory, optionally name a new branch, confirm. Copy patterns, post-create commands, and terminal launch run automatically afterwards. |
-| **Dashboard** | Live, auto-refreshing table of every worktree. See [Dashboard](#-dashboard) for the full feature breakdown — status, ahead/behind, last commit, PR state, fuzzy search, row actions, and the one-keystroke delete shortcut. |
-| **Delete** | Pick a worktree, confirm, and it is gone. Optionally deletes the matching branch (`deleteBranchWithWorktree`). Falls back to manual cleanup for corrupted worktrees. |
+| **Create** | Guided flow: pick a source branch, name the directory, optionally name a new branch, confirm. Copy patterns, shared-cache links, post-create commands, and terminal launch run automatically afterwards when configured. |
+| **Dashboard** | Live, auto-refreshing table of every worktree. See [Dashboard](#-dashboard) for the full feature breakdown — status, AI status, ahead/behind, last commit, PR state, fuzzy search, row actions, and bulk delete. |
+| **Shared cache** | Inspect and clean the per-repository dependency cache used by `worktreeLinkPatterns`. |
 | **Settings** | Inspect and edit the active configuration (project-local or global), reset to defaults, and toggle integration. |
 | **Exit** | Close the TUI without changing anything. |
 
@@ -201,9 +204,10 @@ The dashboard is the single most impactful upgrade over raw `git worktree`. Wher
 | **Worktree** | Filesystem path of the worktree, with the home directory folded to `~` for readability. A trailing `[!]` flags any row whose refresh produced a warning, so you can spot data-staleness at a glance. |
 | **Branch** | The branch currently checked out in that worktree. |
 | **Status** | A coloured label — **`Clean`** (no uncommitted changes), **`Dirty`** (has uncommitted changes), **`Opened`** (a PR is open for the branch), or **`Merged`** (the PR has been merged). The labels combine local working-tree state and remote PR state into a single column, so you can immediately tell a worktree apart that is "done and merged, safe to delete" from one that is "dirty, careful". |
+| **AI Status** | Aggregate activity for supported AI coding tools. It reports `Pending`, `Running`, `Finished`, or `Failed`, with per-harness markers for Claude Code, Opencode, Codex CLI, and Gemini CLI when enabled. |
 | **Ahead/Behind** | Commit counts `+N -N` versus the upstream tracking branch (falls back to `upstream/main`, `upstream/master`, `upstream/develop`, `origin/main`, `origin/master`, `origin/develop`). `=0` when the branch is fully in sync. Green for ahead, red for behind. |
 | **Last Commit** | Short SHA plus the commit's summary line. The column dynamically grabs leftover horizontal space, so commit messages stay readable on wide terminals instead of being truncated. |
-| **PR** | When the GitHub CLI (`gh`) is installed and `dashboard.showPullRequests` is enabled, the row is enriched with the PR number, state (`Open`, `Draft`, `Merged`, `Closed`), and title. PR fetches are batched, cached on disk at `~/.wisetree/dashboard_prs.json`, refreshed when the branch SHA changes, and automatically back-off for 5 minutes after a `gh` rate-limit error, so the dashboard stays useful even on busy repositories. |
+| **PR** | When the GitHub CLI (`gh`) is installed and `dashboard.showPullRequests` is enabled, the row is enriched with the PR number, state (`Open`, `Draft`, `Merged`, `Closed`), title, CI status, review status, and merge readiness. PR fetches are batched, cached on disk at `~/.wisetree/dashboard_prs.json`, refreshed when the branch SHA changes, and automatically back-off for 5 minutes after a `gh` rate-limit error, so the dashboard stays useful even on busy repositories. |
 
 A status banner at the top of the screen shows the last refresh time, the total number of worktrees, how many are dirty, and how many have an open PR — a one-line health check across all your parallel agents.
 
@@ -214,14 +218,14 @@ A status banner at the top of the screen shows the last refresh time, the total 
 | `↑` / `↓` | Move the selection up and down the table. |
 | `Type any character` | Live fuzzy search across path, branch, commit SHA, commit message, status label, ahead/behind, PR title, and PR URL. The match is incremental — every keystroke re-filters the table. |
 | `Esc` | Clear the active search if there is one, otherwise return to the previous screen. |
-| `↵` (Enter) | Open the **row actions** menu for the selected worktree: `Navigate to Directory` (your shell `cd`s into it via the wrapper), `Open with Command` (runs your configured `terminalCommand`, e.g. `code $WORKTREE_PATH`), and `Copy path to clipboard`. |
+| `↵` (Enter) | Open the **row actions** menu for the selected worktree: navigate to the directory, open it with `terminalCommand`, copy the path, open/update/merge/close the PR when PR data is available, or update the main branch row. |
 | `⌫` (Backspace, when the search is empty) | Jump straight into the **delete** confirmation for the highlighted worktree, skipping the picker. While you are typing into the search, Backspace edits the query instead — the binding only fires on an empty search. |
 | `Tab` / `Shift+Tab` | Move focus into and through the **bulk-delete buttons** row in the footer (see below). `↑` at the first table row and `↓` at the last table row also land on the buttons; `↑` / `↓` from the buttons return focus to the worktree list. |
 | `Ctrl+R` | Force an immediate refresh, on top of the configured polling interval. |
 
 #### Bulk delete by status
 
-Above the footer the dashboard renders four colour-coded buttons — **`Merged`**, **`Opened`**, **`Clean`**, **`Dirty`** — that mirror the values of the `Status` column. Activating a button (with `Enter` on the focused button, or by clicking it) opens a single multi-target confirmation dialog that lists every worktree currently matching that status and, on `Yes`, deletes them sequentially with live `(i of N)` progress in the same screen. The main repository checkout is never offered for deletion.
+Above the footer the dashboard renders colour-coded buttons — **`Merged`**, **`Closed`**, **`Open`**, **`Clean`**, **`Dirty`** — that mirror the values of the `Status` column. Activating a button (with `Enter` on the focused button, or by clicking it) opens a single multi-target confirmation dialog that lists every worktree currently matching that status and, on `Yes`, deletes them sequentially with live `(i of N)` progress in the same screen. The main repository checkout is never offered for deletion.
 
 The confirmation has two variants driven by `deleteBranchWithWorktree`:
 
@@ -237,6 +241,24 @@ The dashboard inspects the available width and either renders the full table or 
 #### Why this matters when running multiple agents
 
 Without the dashboard, the only way to answer "which of my five agents has something interesting going on?" is to `cd` into each worktree, run `git status`, `git log -1`, and possibly `gh pr view`, then write the result down somewhere because you will forget by the time you check the fifth. The dashboard collapses that loop into a single always-fresh screen — and the row actions let you go from "I see something I want to check" to "I am in the right directory with my editor open" in one keystroke. For parallel AI workflows, that is the difference between *managing* the agents and *being managed by* them.
+
+### Advanced Features
+
+These capabilities are implemented in `wisetree` and are especially useful once you are managing real projects, pull requests, and multiple agent runs at the same time:
+
+| Advanced feature | Where to use it | What it does | Why developers care |
+| --- | --- | --- | --- |
+| **Wise project setup presets** | Main menu → `Setup Project Config` | Scans the repository, detects known stacks, and writes a project-local `.wisetree.json` with copy patterns, ignore patterns, shared-cache links, and post-create commands. The preset catalog includes Rails, Django, FastAPI, Flask, Next.js, React, Vue/Nuxt, Angular, Svelte, Astro, Remix, Express, NestJS, Flutter, Spring Boot, .NET, Go, Rust, Laravel, Phoenix, Android, iOS, and Generic. | New projects get sensible `wisetree` defaults without hand-authoring every glob and setup command. Monorepos benefit because Wise discovery merges nested app presets into one de-duplicated config. |
+| **Shared dependency cache** | `worktreeLinkPatterns`, `worktreeLinkStrategy`, `wisetree cache` | Links heavy directories such as `node_modules`, `target`, `.venv`, `vendor/bundle`, `Pods`, or `.gradle` from a per-repository cache instead of duplicating them in every worktree. Cache entries can be created empty, seeded from the source checkout, inspected, pruned, cleared, or printed as a path. | Creating worktrees stops meaning "download every dependency again"; repeated agent branches can share expensive install/build output safely. |
+| **Dashboard PR control plane** | `wisetree dashboard` row actions | With `gh` available and `dashboard.showPullRequests` enabled, dashboard rows expose PR actions: open in browser, squash-merge with fetched title/body, update a PR branch from the first reachable base ref, or close the PR. Rows also show CI, review, and merge-readiness signals. | Common PR maintenance happens from the same table where you decide which worktree needs attention. |
+| **AI-assisted PR conflict resolution** | Dashboard → `Update Pull Request`; configure `dashboard.useAi` | When updating a PR hits merge conflicts, `wisetree` can hand the conflicted worktree to `opencode` with a generated merge-resolution prompt, stream the embedded AI activity in the TUI, then let you complete and push or cancel and abort the merge. | PR branches can be brought up to date without leaving the dashboard, while the final commit/push decision stays under human control. |
+| **AI model picker** | Settings → Dashboard → `useAi` | Fetches provider/model pairs for `opencode` from the public models catalog and can also surface locally available free `opencode` models. Selecting one writes the exact `provider/model` value used for AI conflict resolution. | Developers do not need to memorize model IDs or edit JSON by hand to enable the AI merge workflow. |
+| **AI harness activity detection** | Dashboard `AI Status` column | Detects Claude Code, Opencode, Codex CLI, and Gemini CLI activity from their on-disk session/state files, then aggregates each worktree as `Pending`, `Running`, `Finished`, or `Failed`. Detection is file-based and cross-platform. | When several agents are running, the dashboard can show which worktrees are still active and which are ready for review. |
+| **Safe bulk cleanup** | Dashboard footer buttons | Bulk-delete by status group (`Merged`, `Closed`, `Open`, `Clean`, `Dirty`) with a confirmation dialog, protected main checkout, optional branch deletion through `deleteBranchWithWorktree`, and per-item warnings after the run. | Cleanup becomes a deliberate batch operation instead of a risky sequence of manual `rm`, `git worktree remove`, and `git branch -d` commands. |
+| **Config editor and config sync** | Settings | The TUI edits copy patterns, ignore patterns, link patterns, link strategy, cache directory, post-create commands, terminal command, path template, dashboard settings, and branch-deletion behavior. It can also copy the full config between global settings and the repo-local `.wisetree.json`. | Team defaults and personal defaults can be moved or tuned without manually editing nested JSON. |
+| **Scriptable dashboard snapshots** | `wisetree dashboard --json` / `--watch` | Emits one dashboard snapshot as JSON or streams snapshots as JSON Lines. Rows include worktree, git, PR, and AI-status fields when those enrichments are enabled. | CI scripts, local automation, status bars, and custom dashboards can consume the same state the TUI uses. |
+| **Shell integration and row navigation** | `Setup Shell Integration`, dashboard row actions | Installs a shell wrapper and completions so `wisetree` can change the parent shell into a selected worktree. Dashboard actions can also open the configured editor/terminal command or copy the path. | Moving from "I found the worktree" to "I am inside it and ready to work" becomes one action. |
+| **Deletion safety and recovery** | Dashboard delete, bulk delete, worktree deletion service | Refuses dirty deletions unless forced, protects current/default branches, can delete the matching branch when configured, retries submodule-related worktree removal safely, unlinks shared-cache directories before removal, and falls back to manual cleanup plus `git worktree prune` for corrupted worktrees. | Destructive operations are guarded around the failure modes developers actually hit in long-running worktree-heavy repos. |
 
 ### Configuration
 
@@ -259,6 +281,9 @@ A complete configuration example:
     "**/Thumbs.db",
     "**/.DS_Store"
   ],
+  "worktreeLinkPatterns": ["node_modules", "target"],
+  "worktreeLinkStrategy": "SeedIfPresent",
+  "worktreeLinkCacheDir": null,
   "worktreePathTemplate": "$BASE_PATH.worktree",
   "postCreateCmd": [
     "bundle install",
@@ -268,9 +293,14 @@ A complete configuration example:
   "terminalCommand": "code $WORKTREE_PATH",
   "deleteBranchWithWorktree": true,
   "dashboard": {
-    "refreshIntervalMs": 3000,
+    "refreshIntervalMs": 5000,
     "showPullRequests": false,
-    "columns": ["branch", "status", "ahead_behind", "last_commit"]
+    "columns": ["branch", "status", "ai_status", "ahead_behind", "last_commit"],
+    "useAi": "anthropic/claude-sonnet-4-5",
+    "aiStatus": {
+      "enabledHarnesses": ["claude_code", "opencode", "codex_cli", "gemini_cli"],
+      "activeWindowMs": 10000
+    }
   }
 }
 ```
@@ -281,7 +311,10 @@ The variables `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, and `$SOURCE_BRANC
 | --- | --- | --- | --- |
 | `worktreeCopyPatterns` | `string[]` | `[".env*", ".vscode/**"]` | Glob patterns of files to copy from the source repo into a brand-new worktree. Symbolic links matched by the patterns are skipped rather than dereferenced, so the copy step cannot be coaxed into reading files outside the repo. |
 | `worktreeCopyIgnores` | `string[]` | `["**/node_modules/**", "**/dist/**", "**/.git/**", "**/Thumbs.db", "**/.DS_Store"]` | Glob patterns to skip during the copy step. |
-| `worktreePathTemplate` | `string` | `"$BASE_PATH.worktree"` | Template that decides where new worktrees live on disk, relative to the repo's parent directory. Must resolve to a relative path — absolute paths and `..` traversal are rejected. |
+| `worktreeLinkPatterns` | `string[]` | `[]` | Directory patterns to symlink into new worktrees from the shared dependency cache. |
+| `worktreeLinkStrategy` | `string` | `"CreateEmpty"` | How to prepare a cache entry before linking it: `CreateEmpty`, `SeedFromSource`, or `SeedIfPresent`. |
+| `worktreeLinkCacheDir` | `string \| null` | `null` | Optional override for the per-repository shared cache root. |
+| `worktreePathTemplate` | `string` | `"$BASE_PATH.worktree"` | Template that decides where new worktrees live on disk, relative to the repo's parent directory. Must resolve to a relative path; absolute paths and `..` traversal are rejected. |
 | `postCreateCmd` | `string[]` | `[]` | Ordered list of shell commands executed inside the new worktree, with live progress in the TUI. |
 | `terminalCommand` | `string` | `""` | Optional command spawned right after creation (e.g. `code $WORKTREE_PATH`) to open an editor or terminal. |
 | `deleteBranchWithWorktree` | `boolean` | `false` | When `true`, deleting a worktree also deletes its associated branch. |
@@ -293,7 +326,10 @@ Dashboard sub-fields:
 | --- | --- | --- | --- |
 | `dashboard.refreshIntervalMs` | `number` | `5000` | Poll interval in milliseconds, clamped to `5000..60000` when loaded. |
 | `dashboard.showPullRequests` | `boolean` | `false` | Enables `gh pr list` enrichment when the GitHub CLI is installed. |
-| `dashboard.columns` | `string[]` | `["branch", "status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. Valid entries: `branch`, `status`, `ahead_behind` (commit counts), `diff` (line additions/removals vs base), `last_commit`, `pull_request`. |
+| `dashboard.columns` | `string[]` | `["branch", "status", "ai_status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. Valid entries: `branch`, `status`, `ai_status`, `ahead_behind` (commit counts), `diff` (line additions/removals vs base), `last_commit`, `pull_request`. |
+| `dashboard.useAi` | `string` | `""` | Provider/model passed to `opencode run -m` for AI-assisted PR conflict resolution. Blank disables AI conflict resolution. |
+| `dashboard.aiStatus.enabledHarnesses` | `string[]` | `["claude_code", "opencode", "codex_cli", "gemini_cli"]` | AI harnesses included in the dashboard's `AI Status` column. |
+| `dashboard.aiStatus.activeWindowMs` | `number` | `10000` | Recency threshold used when a harness still has an unresolved prompt but no stronger live-session signal, clamped to `2000..60000`. |
 
 # 📟 Wisetree CLI
 
@@ -312,7 +348,10 @@ wisetree [command] [options]
 | `(no command)` | Open the interactive main menu. |
 | `create` | Create a new worktree (interactive unless flags are supplied). |
 | `dashboard` | Open the live dashboard, print one JSON snapshot, or stream JSON Lines. |
-| `delete` | Delete an existing worktree (interactive unless flags are supplied). |
+| `cache list` | Show shared dependency cache entries, size, and active worktree users. |
+| `cache prune` | Remove orphaned shared cache entries older than 14 days. |
+| `cache clear` | Delete this repository's shared cache. Requires `--force`. |
+| `cache path` | Print the shared cache root path. |
 | `settings` | Open the settings screen to inspect and edit configuration. |
 
 ### Global / interactive options
@@ -321,18 +360,17 @@ wisetree [command] [options]
 | --- | --- | --- |
 | `--help` | `-h` | Show the built-in help screen. |
 | `--version` | `-v` | Print the installed version. |
-| `--mode <mode>` | `-m` | Land directly on a specific screen (`menu`, `create`, `dashboard`, `delete`, `settings`). |
+| `--mode <mode>` | `-m` | Land directly on a specific screen (`menu`, `create`, `dashboard`, `cache`, `settings`). |
 | `--from-wrapper` | `None` | Used internally by the shell wrapper so `wisetree` can print the selected path on stdout for the parent shell to `cd` into. |
 
 ### Non-interactive options
 
 | Flag | Alias | Applies to | Description |
 | --- | --- | --- | --- |
-| `--name <name>` | `-n` | `create`, `delete` | Worktree directory name. |
+| `--name <name>` | `-n` | `create` | Worktree directory name. |
 | `--source <branch>` | `-s` | `create` | Source branch to fork the new worktree from. |
 | `--branch <branch>` | `-b` | `create` | New branch name; defaults to the directory name. |
-| `--path <path>` | `-p` | `delete` | Worktree path (alternative to `--name`). |
-| `--force` | `-f` | `delete` | Force-delete even when the worktree has uncommitted changes. |
+| `--force` | `-f` | `cache clear` | Confirm destructive cache clearing in non-interactive mode. |
 | `--json` | `None` | `dashboard` | Emit JSON suitable for piping into `jq`. |
 | `--watch` | `-w` | `dashboard` | Stream dashboard snapshots as JSON Lines until `Ctrl+C`. |
 
@@ -342,7 +380,7 @@ wisetree [command] [options]
 wisetree                # Open the main menu
 wisetree create         # Jump straight into the create flow
 wisetree dashboard      # Open the live dashboard
-wisetree delete         # Jump straight into the delete flow
+wisetree cache          # Open the shared cache screen
 wisetree settings       # Open the settings screen
 ```
 
@@ -353,8 +391,8 @@ wisetree create -n my-feature -s main                  # Create a worktree off m
 wisetree create -n my-feature -s main -b feat/payments # Create with an explicit new branch
 wisetree dashboard --json                              # Print one dashboard snapshot as JSON
 wisetree dashboard --watch                             # Stream dashboard snapshots as JSON Lines
-wisetree delete -n my-feature                          # Delete by directory name
-wisetree delete -p /path/to/worktree -f                # Force-delete by full path
+wisetree cache list --json                             # Print shared cache details as JSON
+wisetree cache clear --force                           # Remove this repo's shared cache
 ```
 
 ### Update checks

@@ -17,6 +17,7 @@ use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
 use crate::git::exec::execute_git_command;
 use crate::git::types::{BranchStatus, GitWorktree};
+use crate::services::ai_status::{AiStatusIndex, AiStatusPaths, AiStatusReport, AiStatusService};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// `gh api graphql` may include the network round-trip — give it more headroom
@@ -46,6 +47,10 @@ pub const BASE_REF_PRIORITY: [&str; 6] = [
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API. The Status column countdown is driven by the same timer.
 pub const PR_REFRESH_PERIOD_MS: u64 = 30 * 1000;
+/// Per-tick budget for the global AI-status scan. When exceeded, the index
+/// degrades to empty for this tick and every worktree renders `⬜ Pending`
+/// rather than blocking the whole dashboard refresh.
+pub const AI_STATUS_BUDGET_MS: u64 = 200;
 /// How long to suspend PR fetches after a rate-limit error.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
@@ -398,6 +403,11 @@ pub struct DashboardRow {
     pub last_commit: Option<CommitSummary>,
     #[serde(rename = "pullRequest", skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequest>,
+    /// AI harness activity for this worktree. `None` when ai_status detection
+    /// hasn't run yet (e.g. the first git-only emission, or the per-tick
+    /// scan exhausted its budget).
+    #[serde(rename = "aiStatus", default, skip_serializing_if = "Option::is_none")]
+    pub ai_status: Option<AiStatusReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -520,6 +530,7 @@ pub struct DashboardService {
     opencode_binary: PathBuf,
     cache_path: Option<PathBuf>,
     pr_state: Arc<Mutex<PrCacheState>>,
+    ai_status: AiStatusService,
 }
 
 impl DashboardService {
@@ -528,6 +539,7 @@ impl DashboardService {
         let git_binary = PathBuf::from("git");
         let gh_binary = PathBuf::from("gh");
         let gh_available = binary_available(&gh_binary);
+        let ai_status = AiStatusService::new(&config.ai_status, AiStatusPaths::detect());
         Self {
             git_root,
             config,
@@ -537,7 +549,15 @@ impl DashboardService {
             opencode_binary: PathBuf::from(crate::constants::OPENCODE_CLI_BINARY),
             cache_path: Some(dashboard_pr_cache_file()),
             pr_state: Arc::new(Mutex::new(PrCacheState::default())),
+            ai_status,
         }
+    }
+
+    /// Override the `AiStatusService` for hermetic tests so we can point
+    /// detection at a `TempDir` instead of the developer's real `$HOME`.
+    pub fn with_ai_status(mut self, ai_status: AiStatusService) -> Self {
+        self.ai_status = ai_status;
+        self
     }
 
     pub fn with_git_binary(mut self, git_binary: PathBuf) -> Self {
@@ -1057,9 +1077,31 @@ impl DashboardService {
         self.prune_cache(&live_branches);
 
         self.apply_cached_prs(&mut rows);
+        self.apply_ai_status(&mut rows).await;
 
         rows.sort_by_key(|row| (!row.worktree.is_main, row.worktree.path.clone()));
         Ok(rows)
+    }
+
+    /// Run one global AI-status scan (off the async runtime) and apply the
+    /// per-worktree report to every row. On timeout or panic we degrade to
+    /// an empty index so every row reports `Pending` instead of blocking
+    /// the dashboard refresh.
+    async fn apply_ai_status(&self, rows: &mut [DashboardRow]) {
+        let svc = self.ai_status.clone();
+        let scan = tokio::task::spawn_blocking(move || svc.build_index());
+        let index: AiStatusIndex =
+            match tokio::time::timeout(Duration::from_millis(AI_STATUS_BUDGET_MS), scan).await {
+                Ok(Ok(index)) => index,
+                Ok(Err(_join_err)) => AiStatusIndex::default(),
+                Err(_elapsed) => AiStatusIndex::default(),
+            };
+        for row in rows.iter_mut() {
+            let report: AiStatusReport = self
+                .ai_status
+                .report_for(&index, Path::new(&row.worktree.path));
+            row.ai_status = Some(report);
+        }
     }
 
     async fn list_worktrees_basic(&self) -> Result<Vec<GitWorktree>> {
@@ -1138,6 +1180,7 @@ impl DashboardService {
             worktree,
             last_commit,
             pull_request: None,
+            ai_status: None,
             error: (!errors.is_empty()).then(|| errors.join("; ")),
         }
     }

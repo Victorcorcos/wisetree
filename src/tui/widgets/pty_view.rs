@@ -323,6 +323,8 @@ impl Drop for PtyView {
         }
         if let Some(handle) = self.reader_handle.take() {
             let deadline = Instant::now() + Duration::from_millis(500);
+            // Drop the handle if the reader thread hasn't finished by the deadline.
+            // The process is exiting anyway so the thread will be cleaned up by the OS.
             while !handle.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(20));
             }

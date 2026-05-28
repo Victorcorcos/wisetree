@@ -3243,26 +3243,38 @@ fn install_termination_listener() -> Arc<AtomicBool> {
                 loop {
                     let mut pfd = libc::pollfd {
                         fd: libc::STDIN_FILENO,
-                        // events = 0: POLLHUP is always reported in revents
-                        // regardless of the events mask, so we need not request
-                        // POLLIN. Avoiding POLLIN prevents the inner crossterm
-                        // read-loop from being confused by this thread's poll.
-                        events: 0,
+                        // events = POLLIN: macOS's poll only reports POLLHUP
+                        // when at least one event flag is requested. With
+                        // events = 0 the slave-end of a closed-master PTY
+                        // never surfaces POLLHUP, so the watchdog can't see
+                        // the hangup. POLLIN is harmless — the main
+                        // crossterm loop has its own read on STDIN_FILENO
+                        // and they coexist (multiple pollers on the same fd
+                        // is supported by every Unix).
+                        events: libc::POLLIN,
                         revents: 0,
                     };
                     unsafe { libc::poll(&mut pfd, 1, 250) };
 
-                    if flag_for_watchdog.load(Ordering::Relaxed) {
-                        return;
-                    }
-
+                    // Order matters: check POLLHUP *before* the quit flag.
+                    // The cooperative SIGHUP handler also sets the flag, and
+                    // when both the signal and the hangup fire together
+                    // (terminal closes → both POLLHUP on stdin AND SIGHUP
+                    // on the controlling tty), an "if flag, return" check
+                    // first would defer to the cooperative path, which is
+                    // gated behind the sync `event::poll` inside the event
+                    // loop and can take seconds to wake. We must force-exit
+                    // on POLLHUP unconditionally so dashboard renders never
+                    // outlive their terminal.
                     if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                        // PTY master closed. crossterm may be stuck in an EIO
-                        // spin on Linux so we cannot rely on the cooperative
-                        // shutdown path. Restore the terminal ourselves and
-                        // force-exit so the parent shell is not left in raw mode.
                         let _ = crossterm::terminal::disable_raw_mode();
                         std::process::exit(0);
+                    }
+
+                    // Cooperative quit (user pressed q, etc.) already drove
+                    // a clean shutdown — stop polling so we don't burn CPU.
+                    if flag_for_watchdog.load(Ordering::Relaxed) {
+                        return;
                     }
                 }
             });
@@ -4829,6 +4841,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
+                    ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4838,6 +4851,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
+                    ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4856,8 +4870,14 @@ mod tests {
             let new_dashboard = DashboardConfig {
                 refresh_interval_ms: 7000,
                 show_pull_requests: true,
-                columns: vec!["branch".into(), "status".into(), "pull_request".into()],
+                columns: vec![
+                    "branch".into(),
+                    "status".into(),
+                    "ai_status".into(),
+                    "pull_request".into(),
+                ],
                 use_ai: String::new(),
+                ai_status: Default::default(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -4888,6 +4908,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
+                    ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
             };
@@ -4905,8 +4926,9 @@ mod tests {
             let new_dashboard = DashboardConfig {
                 refresh_interval_ms: 8000,
                 show_pull_requests: true,
-                columns: vec!["branch".into(), "status".into()],
+                columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 use_ai: String::new(),
+                ai_status: Default::default(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 

@@ -178,4 +178,20 @@ pub mod colors {
     pub const STATUS_BG: Color = BG_SELECTED;
     /// Status bar foreground.
     pub const STATUS_TEXT: Color = GRAY_LIGHT;
+
+    // ── AI Status column ───────────────────────────────────────────────
+    //
+    // Identity colors for the per-harness decoration letters in the new
+    // AI Status column. Each harness keeps a stable color regardless of
+    // its current state so the eye can pick out which harness is which
+    // even when the row is dim. See PLAN.md §2.
+
+    /// `C` — Claude Code identity color.
+    pub const HARNESS_CLAUDE: Color = Color::Rgb(0xe0, 0x7a, 0x5f);
+    /// `O` — Opencode identity color.
+    pub const HARNESS_OPENCODE: Color = Color::Rgb(0x9d, 0x7c, 0xd8);
+    /// `X` — Codex identity color (intentionally the same gray as `MUTED`).
+    pub const HARNESS_CODEX: Color = GRAY_DARK;
+    /// `G` — Gemini identity color.
+    pub const HARNESS_GEMINI: Color = Color::Rgb(0xe8, 0x79, 0xa6);
 }

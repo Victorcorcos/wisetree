@@ -47,9 +47,27 @@ pub fn default_columns() -> Vec<String> {
     vec![
         "branch".to_string(),
         "status".to_string(),
+        "ai_status".to_string(),
         "ahead_behind".to_string(),
         "last_commit".to_string(),
     ]
+}
+
+pub fn default_enabled_harnesses() -> Vec<String> {
+    vec![
+        "claude_code".to_string(),
+        "opencode".to_string(),
+        "codex_cli".to_string(),
+        "gemini_cli".to_string(),
+    ]
+}
+
+pub fn default_active_window_ms() -> u64 {
+    10_000
+}
+
+pub fn clamp_active_window_ms(value: u64) -> u64 {
+    value.clamp(2_000, 60_000)
 }
 
 pub fn clamp_dashboard_refresh_interval(value: u64) -> u64 {
@@ -64,7 +82,13 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
         let normalized = column.trim().to_ascii_lowercase();
         let known = matches!(
             normalized.as_str(),
-            "branch" | "status" | "ahead_behind" | "diff" | "last_commit" | "pull_request"
+            "branch"
+                | "status"
+                | "ai_status"
+                | "ahead_behind"
+                | "diff"
+                | "last_commit"
+                | "pull_request"
         );
 
         if !known {
@@ -101,6 +125,9 @@ pub struct DashboardConfig {
     /// asked to resolve conflicts manually.
     #[serde(rename = "useAi", default)]
     pub use_ai: String,
+
+    #[serde(rename = "aiStatus", default)]
+    pub ai_status: AiStatusConfig,
 }
 
 impl Default for DashboardConfig {
@@ -110,6 +137,7 @@ impl Default for DashboardConfig {
             show_pull_requests: false,
             columns: default_columns(),
             use_ai: String::new(),
+            ai_status: AiStatusConfig::default(),
         }
     }
 }
@@ -117,12 +145,54 @@ impl Default for DashboardConfig {
 impl DashboardConfig {
     pub fn clamp(&mut self) {
         self.refresh_interval_ms = clamp_dashboard_refresh_interval(self.refresh_interval_ms);
+        self.ai_status.clamp();
     }
 
     pub fn normalize_columns(&mut self) -> Vec<String> {
-        let (columns, warnings) = normalize_dashboard_columns(&self.columns);
+        let (mut columns, warnings) = normalize_dashboard_columns(&self.columns);
+        if !self.ai_status.enabled_harnesses.is_empty() && !columns.iter().any(|c| c == "ai_status")
+        {
+            let pos = columns
+                .iter()
+                .position(|c| c == "status")
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            columns.insert(pos, "ai_status".to_string());
+        }
         self.columns = columns;
         warnings
+    }
+}
+
+/// Live `AI Status` column configuration.
+///
+/// Defaults: every supported harness enabled, 10 s active window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiStatusConfig {
+    /// Per-harness enable list. Supported names:
+    /// `claude_code`, `opencode`, `codex_cli`, `gemini_cli`.
+    #[serde(rename = "enabledHarnesses", default = "default_enabled_harnesses")]
+    pub enabled_harnesses: Vec<String>,
+
+    /// File-write recency threshold for the `Running` state. Clamped to
+    /// [2 000, 60 000] ms at load time.
+    #[serde(rename = "activeWindowMs", default = "default_active_window_ms")]
+    pub active_window_ms: u64,
+}
+
+impl Default for AiStatusConfig {
+    fn default() -> Self {
+        Self {
+            enabled_harnesses: default_enabled_harnesses(),
+            active_window_ms: default_active_window_ms(),
+        }
+    }
+}
+
+impl AiStatusConfig {
+    pub fn clamp(&mut self) {
+        self.active_window_ms = clamp_active_window_ms(self.active_window_ms);
     }
 }
 
