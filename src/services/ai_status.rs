@@ -310,7 +310,13 @@ mod tests {
     }
 
     fn claude_assistant_line(cwd: &str, stop_reason: &str) -> String {
-        format!(r#"{{"type":"assistant","cwd":"{cwd}","stop_reason":"{stop_reason}"}}"#)
+        // Mirror the real Claude Code v2.x transcript shape: `stop_reason`
+        // lives under `message`, not at the top level. A previous version of
+        // this helper inlined `stop_reason` at the top level, which matched a
+        // buggy parser but never the actual transcripts on disk.
+        format!(
+            r#"{{"type":"assistant","cwd":"{cwd}","message":{{"role":"assistant","stop_reason":"{stop_reason}"}}}}"#
+        )
     }
 
     fn write_claude_live_session(sessions_root: &std::path::Path, pid: u32, cwd: &str) {
@@ -702,6 +708,37 @@ mod tests {
         write_claude_live_session(sessions_root, live_pid, &cwd_str);
 
         let svc = AiStatusService::new(&claude_only_config(1), paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::InProgress);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::ClaudeCode),
+            Some(&AiHarnessState::Running)
+        );
+    }
+
+    #[test]
+    fn claude_tool_use_with_recent_mtime_runs() {
+        // Real Claude Code v2.x writes `message.stop_reason: "tool_use"` while
+        // the assistant is waiting on a tool call. The latest assistant line
+        // in that case is NOT a finished turn — the worktree must stay
+        // Running, not flip to Idle/Finished.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let cwd_str = worktree.to_string_lossy().to_string();
+        let project_dir = paths.claude_projects.as_ref().unwrap().join("dash-slug");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_claude_transcript(
+            &project_dir,
+            &[
+                claude_prompt_line(&cwd_str),
+                claude_assistant_line(&cwd_str, "tool_use"),
+            ],
+        );
+
+        let svc = AiStatusService::new(&claude_only_config(10_000), paths);
         let index = svc.build_index();
         let report = svc.report_for(&index, &worktree);
         assert_eq!(report.aggregated, AiStatus::InProgress);

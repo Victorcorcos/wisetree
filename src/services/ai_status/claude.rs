@@ -3,15 +3,23 @@
 //!
 //! Primary signal: the newest `~/.claude/projects/<slug>/*.jsonl` file.
 //! - A `user` line with `promptId`, or an assistant line whose
-//!   `stop_reason == "tool_use"`, means the latest prompt is still in flight.
-//! - An assistant line with any other `stop_reason` means Claude ended its
-//!   turn, so the worktree is `Idle`/aggregate `Finished` even if the session
-//!   stays open in another terminal.
+//!   `message.stop_reason == "tool_use"`, means the latest prompt is still in
+//!   flight.
+//! - An assistant line with any other `message.stop_reason` (`end_turn`,
+//!   `stop_sequence`, `max_tokens`, etc.) means Claude ended its turn, so the
+//!   worktree is `Idle`/aggregate `Finished` even if the session stays open
+//!   in another terminal.
 //!
 //! Fallback: if the latest transcript still looks unresolved but its mtime has
 //! aged past `active_window_ms`, a live `~/.claude/sessions/<pid>.json` entry
 //! for the same cwd keeps it `Running`. This covers long tool calls or
 //! sub-agents that stop appending to the JSONL for minutes at a time.
+//!
+//! Schema confirmed against Claude Code v2.1.114 transcripts: `stop_reason`
+//! lives at `message.stop_reason`, NOT at the top level. A previous version
+//! of this file parsed it from the top level and never saw any value, which
+//! left every finished turn stuck in `Pending` and forced the live-PID
+//! fallback to keep idle sessions falsely Running.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -38,6 +46,15 @@ struct ClaudeJsonLine {
     cwd: Option<String>,
     #[serde(rename = "promptId", default)]
     prompt_id: Option<String>,
+    /// Real Claude Code transcripts nest the Anthropic API response body under
+    /// `"message"`, with `stop_reason` inside it. Parsing it at the top level
+    /// (as an earlier version of this file did) silently always sees `None`.
+    #[serde(default)]
+    message: Option<ClaudeMessagePayload>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeMessagePayload {
     #[serde(default)]
     stop_reason: Option<String>,
 }
@@ -217,11 +234,15 @@ fn read_session_state(jsonl: &Path) -> std::io::Result<Option<(String, ClaudeTur
             if let Some(cwd) = parsed.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
                 last_cwd = Some(cwd.to_string());
             }
+            let stop_reason = parsed
+                .message
+                .as_ref()
+                .and_then(|m| m.stop_reason.as_deref());
             match parsed.kind.as_deref() {
                 Some("user") if parsed.prompt_id.is_some() => {
                     turn_state = ClaudeTurnState::Pending;
                 }
-                Some("assistant") => match parsed.stop_reason.as_deref() {
+                Some("assistant") => match stop_reason {
                     Some("tool_use") => turn_state = ClaudeTurnState::Pending,
                     Some(_) => turn_state = ClaudeTurnState::Completed,
                     None => {}
