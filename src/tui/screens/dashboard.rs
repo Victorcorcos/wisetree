@@ -467,8 +467,7 @@ impl DashboardScreen {
             return;
         }
 
-        let footer_height =
-            10u16 + self.reviewers_footer_height() + self.diff_legend_height();
+        let footer_height = 10u16 + self.reviewers_footer_height() + self.diff_legend_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
