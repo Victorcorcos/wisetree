@@ -3,7 +3,7 @@
 //!
 //! Mirrors `branchlet/src/services/file-service.ts`.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -84,16 +84,28 @@ pub async fn copy_files(
         let source_path = source_dir.join(&rel);
         let target_path = target_dir.join(&rel);
 
-        // Inspect metadata without following symlinks so a symlink pointing
-        // outside the source tree (e.g. `.env` → `~/.ssh/id_rsa` in a hostile
-        // repo) is not silently dereferenced and copied.
+        // Inspect metadata without following symlinks so links that point
+        // outside the source tree are skipped instead of being dereferenced.
         match tokio::fs::symlink_metadata(&source_path).await {
             Err(_) => {
                 report.skipped.push(rel);
                 continue;
             }
             Ok(meta) if meta.file_type().is_symlink() => {
-                report.skipped.push(rel);
+                if symlink_points_within_root(&source_path, source_dir).await {
+                    if let Some(parent) = target_path.parent() {
+                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                            report.errors.push(format!("{rel}: {e}"));
+                            continue;
+                        }
+                    }
+                    match copy_symlink(&source_path, &target_path).await {
+                        Ok(_) => report.copied.push(rel),
+                        Err(e) => report.errors.push(format!("{rel}: {e}")),
+                    }
+                } else {
+                    report.skipped.push(rel);
+                }
                 continue;
             }
             Ok(meta) if meta.is_dir() => {
@@ -122,6 +134,68 @@ pub async fn copy_files(
     }
 
     report
+}
+
+async fn copy_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    let link_target = tokio::fs::read_link(source).await?;
+    // Replace any existing entry at the target so re-runs are idempotent.
+    match tokio::fs::symlink_metadata(target).await {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            tokio::fs::remove_dir_all(target).await?;
+        }
+        Ok(_) => {
+            tokio::fs::remove_file(target).await?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    #[cfg(unix)]
+    {
+        tokio::fs::symlink(link_target, target).await
+    }
+    #[cfg(windows)]
+    {
+        let meta = tokio::fs::metadata(source).await;
+        match meta {
+            Ok(m) if m.is_dir() => tokio::fs::symlink_dir(link_target, target).await,
+            _ => tokio::fs::symlink_file(link_target, target).await,
+        }
+    }
+}
+
+async fn symlink_points_within_root(source: &Path, base_root: &Path) -> bool {
+    let Ok(link_target) = tokio::fs::read_link(source).await else {
+        return false;
+    };
+
+    let resolved = if link_target.is_absolute() {
+        normalize_lexical_path(&link_target)
+    } else {
+        let Some(parent) = source.parent() else {
+            return false;
+        };
+        normalize_lexical_path(&parent.join(link_target))
+    };
+
+    resolved.starts_with(normalize_lexical_path(base_root))
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 async fn copy_directory_recursive(
@@ -179,7 +253,14 @@ async fn copy_directory_recursive(
     for (source_path, target_path, relative) in sub {
         match tokio::fs::symlink_metadata(&source_path).await {
             Ok(meta) if meta.file_type().is_symlink() => {
-                report.skipped.push(relative);
+                if symlink_points_within_root(&source_path, base_root).await {
+                    match copy_symlink(&source_path, &target_path).await {
+                        Ok(_) => report.copied.push(relative),
+                        Err(e) => report.errors.push(format!("{relative}: {e}")),
+                    }
+                } else {
+                    report.skipped.push(relative);
+                }
             }
             Ok(meta) if meta.is_dir() => {
                 Box::pin(copy_directory_recursive(
@@ -264,6 +345,11 @@ async fn execute_shell_command(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Tie the post-create command's lifetime to ours. Long-running
+    // installers (`bundle install`, `npm install`, …) would otherwise
+    // outlive a wisetree panic or abrupt exit and orphan themselves.
+    // `execute_git_command` already does the same.
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -408,9 +494,13 @@ pub fn strip_ansi(input: &str) -> String {
                             break;
                         }
                         if next == '\x1b' {
-                            // ESC '\\' string terminator — eat the
-                            // backslash too.
-                            chars.next();
+                            // OSC terminator is `ESC '\\'`. Only consume the
+                            // backslash if it's actually there; otherwise
+                            // this ESC starts a new control sequence and the
+                            // outer loop should keep parsing.
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
                             break;
                         }
                     }
@@ -471,10 +561,15 @@ pub fn open_url(url: &str) -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Spawn `terminal_command` detached in `worktree_path`. Empty command is a
-/// no-op. The child's stdio is ignored and the process is not awaited
-/// (matches branchlet's `child.unref()`).
-pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLaunch {
+/// Spawn `terminal_command` detached in `variables.worktree_path`. Empty
+/// command is a no-op. The child's stdio is ignored and the process is not
+/// awaited (matches branchlet's `child.unref()`).
+///
+/// `variables` should be populated with whatever the caller knows — at a
+/// minimum `worktree_path`. Other fields default to empty if unknown, which
+/// matches the historical behaviour for templates that only reference
+/// `$WORKTREE_PATH`.
+pub fn open_terminal(terminal_command: &str, variables: &TemplateVariables) -> TerminalLaunch {
     if terminal_command.trim().is_empty() {
         return TerminalLaunch {
             success: true,
@@ -483,13 +578,7 @@ pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLau
         };
     }
 
-    let variables = TemplateVariables {
-        base_path: String::new(),
-        worktree_path: worktree_path.to_string(),
-        branch_name: String::new(),
-        source_branch: String::new(),
-    };
-    let resolved = resolve_template_shell(terminal_command, &variables);
+    let resolved = resolve_template_shell(terminal_command, variables);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("cmd");
@@ -500,7 +589,7 @@ pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLau
         c.arg("-c").arg(&resolved);
         c
     };
-    cmd.current_dir(worktree_path);
+    cmd.current_dir(&variables.worktree_path);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
@@ -516,5 +605,44 @@ pub fn open_terminal(terminal_command: &str, worktree_path: &str) -> TerminalLau
             command: resolved,
             error: Some(e.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strip_ansi_keeps_plain_text() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_color_codes() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_terminated_by_bel() {
+        assert_eq!(strip_ansi("\x1b]0;title\x07after"), "after");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_terminated_by_st() {
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\after"), "after");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_byte_when_osc_followed_by_stray_esc() {
+        // OSC body contains a bare ESC that is NOT followed by '\\'. The old
+        // implementation blindly consumed the next char after the ESC,
+        // dropping the 'X' that belongs to the visible output. The terminator
+        // must only swallow `ESC \\`.
+        let input = "\x1b]0;title\x1bX visible";
+        let out = strip_ansi(input);
+        assert!(
+            out.contains("X visible"),
+            "expected 'X visible' to survive, got {out:?}"
+        );
     }
 }

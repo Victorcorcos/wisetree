@@ -70,38 +70,16 @@ impl GitService {
             return Err(handle_git_error(&result.stderr, "list worktrees"));
         }
 
-        let mut worktrees: Vec<GitWorktree> = Vec::new();
-        let mut current = GitWorktree::default();
-        let mut have_current = false;
+        let mut worktrees = parse_worktree_porcelain(&result.stdout);
 
-        for line in result.stdout.split('\n') {
-            if let Some(p) = line.strip_prefix("worktree ") {
-                if have_current {
-                    worktrees.push(std::mem::take(&mut current));
-                }
-                current = GitWorktree {
-                    path: p.to_string(),
-                    ..GitWorktree::default()
-                };
-                have_current = true;
-            } else if let Some(c) = line.strip_prefix("HEAD ") {
-                current.commit = c.to_string();
-            } else if let Some(b) = line.strip_prefix("branch ") {
-                current.branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
-            } else if line == "bare" {
-                current.is_main = true;
-            } else if line.is_empty() && have_current {
-                worktrees.push(std::mem::take(&mut current));
-                have_current = false;
+        // `bare` worktrees self-identify during parsing. Only fall back to
+        // "first entry is main" when no worktree has already been marked,
+        // otherwise we can overwrite a bare main with a feature worktree
+        // and accidentally protect the feature worktree from deletion.
+        if !worktrees.iter().any(|w| w.is_main) {
+            if let Some(first) = worktrees.first_mut() {
+                first.is_main = true;
             }
-        }
-
-        if have_current {
-            worktrees.push(current);
-        }
-
-        if let Some(first) = worktrees.first_mut() {
-            first.is_main = true;
         }
 
         // `default_branch`/`current_branch` query the main repo, not each
@@ -415,6 +393,8 @@ impl GitService {
                     ahead,
                     behind,
                     upstream_branch: Some(compare),
+                    insertions: None,
+                    deletions: None,
                 });
             }
         }
@@ -474,8 +454,87 @@ async fn compute_branch_status(
                 ahead,
                 behind,
                 upstream_branch: Some(compare.to_string()),
+                insertions: None,
+                deletions: None,
             });
         }
     }
     None
+}
+
+/// Parse the output of `git worktree list --porcelain` into a vec of
+/// `GitWorktree`. Records are separated by blank lines per the format
+/// spec, but we also push whatever trailing record is in-flight at EOF
+/// so the last entry is never lost when git omits the final blank.
+/// `\r` is stripped so CRLF-terminated output (Windows shells, some
+/// piping setups) parses correctly.
+pub(crate) fn parse_worktree_porcelain(stdout: &str) -> Vec<GitWorktree> {
+    let mut worktrees: Vec<GitWorktree> = Vec::new();
+    let mut current = GitWorktree::default();
+    let mut have_current = false;
+
+    for raw in stdout.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if have_current {
+                worktrees.push(std::mem::take(&mut current));
+            }
+            current = GitWorktree {
+                path: p.to_string(),
+                ..GitWorktree::default()
+            };
+            have_current = true;
+        } else if let Some(c) = line.strip_prefix("HEAD ") {
+            current.commit = c.to_string();
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            current.branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
+        } else if line == "bare" {
+            current.is_main = true;
+        } else if line.is_empty() && have_current {
+            worktrees.push(std::mem::take(&mut current));
+            have_current = false;
+        }
+    }
+
+    if have_current {
+        worktrees.push(current);
+    }
+
+    worktrees
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_records_separated_by_blank_lines() {
+        let stdout = "worktree /a\nHEAD aaaa\nbranch refs/heads/main\n\nworktree /b\nHEAD bbbb\nbranch refs/heads/feat\n\n";
+        let parsed = parse_worktree_porcelain(stdout);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].path, "/a");
+        assert_eq!(parsed[0].branch, "main");
+        assert_eq!(parsed[1].path, "/b");
+        assert_eq!(parsed[1].branch, "feat");
+    }
+
+    #[test]
+    fn captures_trailing_record_without_blank_separator() {
+        let stdout = "worktree /a\nHEAD aaaa\nbranch refs/heads/main\n\nworktree /b\nHEAD bbbb\nbranch refs/heads/feat";
+        let parsed = parse_worktree_porcelain(stdout);
+        assert_eq!(parsed.len(), 2, "trailing record must not be dropped");
+        assert_eq!(parsed[1].path, "/b");
+        assert_eq!(parsed[1].branch, "feat");
+    }
+
+    #[test]
+    fn tolerates_crlf_line_endings() {
+        let stdout =
+            "worktree /bare\r\nbare\r\n\r\nworktree /wt\r\nHEAD cccc\r\nbranch refs/heads/feat\r\n";
+        let parsed = parse_worktree_porcelain(stdout);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].is_main, "bare flag must survive CRLF");
+        assert_eq!(parsed[1].path, "/wt");
+        assert_eq!(parsed[1].branch, "feat");
+    }
 }

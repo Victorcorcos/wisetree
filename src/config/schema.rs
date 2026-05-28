@@ -82,7 +82,13 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
         let normalized = column.trim().to_ascii_lowercase();
         let known = matches!(
             normalized.as_str(),
-            "branch" | "status" | "ahead_behind" | "last_commit" | "pull_request" | "ai_status"
+            "branch"
+                | "status"
+                | "ai_status"
+                | "ahead_behind"
+                | "diff"
+                | "last_commit"
+                | "pull_request"
         );
 
         if !known {

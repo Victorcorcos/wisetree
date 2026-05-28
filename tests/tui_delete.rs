@@ -202,6 +202,8 @@ fn confirm_dialog_shows_branch_status_when_will_delete_branch() {
         ahead: 2,
         behind: 1,
         upstream_branch: Some("origin/feat-x".into()),
+        insertions: None,
+        deletions: None,
     });
     s.set_worktrees(vec![wt("/tmp/repo", "main", true, true), wt_dirty]);
     s.jump_to_confirm_path("/tmp/repo-x");

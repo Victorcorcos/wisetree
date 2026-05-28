@@ -222,7 +222,13 @@ impl WorktreeService {
         }
 
         if !config.terminal_command.trim().is_empty() {
-            let launch = open_terminal(&config.terminal_command, &worktree_path_str);
+            let variables = TemplateVariables {
+                base_path: repository_base_name(&git_root),
+                worktree_path: worktree_path_str.clone(),
+                branch_name: options.new_branch.clone(),
+                source_branch: options.source_branch.clone(),
+            };
+            let launch = open_terminal(&config.terminal_command, &variables);
             outcome.terminal_launch = Some(launch);
         }
 

@@ -205,7 +205,7 @@ The dashboard is the single most impactful upgrade over raw `git worktree`. Wher
 | **Branch** | The branch currently checked out in that worktree. |
 | **Status** | A coloured label — **`Clean`** (no uncommitted changes), **`Dirty`** (has uncommitted changes), **`Opened`** (a PR is open for the branch), or **`Merged`** (the PR has been merged). The labels combine local working-tree state and remote PR state into a single column, so you can immediately tell a worktree apart that is "done and merged, safe to delete" from one that is "dirty, careful". |
 | **AI Status** | Aggregate activity for supported AI coding tools. It reports `Pending`, `Running`, `Finished`, or `Failed`, with per-harness markers for Claude Code, Opencode, Codex CLI, and Gemini CLI when enabled. |
-| **Ahead/Behind** | `+N -N` versus the upstream tracking branch (falls back to `upstream/main`, `upstream/master`, `origin/main`, `origin/master`). `=0` when the branch is fully in sync. Green for ahead, red for behind. |
+| **Ahead/Behind** | Commit counts `+N -N` versus the upstream tracking branch (falls back to `upstream/main`, `upstream/master`, `upstream/develop`, `origin/main`, `origin/master`, `origin/develop`). `=0` when the branch is fully in sync. Green for ahead, red for behind. |
 | **Last Commit** | Short SHA plus the commit's summary line. The column dynamically grabs leftover horizontal space, so commit messages stay readable on wide terminals instead of being truncated. |
 | **PR** | When the GitHub CLI (`gh`) is installed and `dashboard.showPullRequests` is enabled, the row is enriched with the PR number, state (`Open`, `Draft`, `Merged`, `Closed`), title, CI status, review status, and merge readiness. PR fetches are batched, cached on disk at `~/.wisetree/dashboard_prs.json`, refreshed when the branch SHA changes, and automatically back-off for 5 minutes after a `gh` rate-limit error, so the dashboard stays useful even on busy repositories. |
 
@@ -326,7 +326,7 @@ Dashboard sub-fields:
 | --- | --- | --- | --- |
 | `dashboard.refreshIntervalMs` | `number` | `5000` | Poll interval in milliseconds, clamped to `5000..60000` when loaded. |
 | `dashboard.showPullRequests` | `boolean` | `false` | Enables `gh pr list` enrichment when the GitHub CLI is installed. |
-| `dashboard.columns` | `string[]` | `["branch", "status", "ai_status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. Also supports `pull_request`. |
+| `dashboard.columns` | `string[]` | `["branch", "status", "ai_status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. Valid entries: `branch`, `status`, `ai_status`, `ahead_behind` (commit counts), `diff` (line additions/removals vs base), `last_commit`, `pull_request`. |
 | `dashboard.useAi` | `string` | `""` | Provider/model passed to `opencode run -m` for AI-assisted PR conflict resolution. Blank disables AI conflict resolution. |
 | `dashboard.aiStatus.enabledHarnesses` | `string[]` | `["claude_code", "opencode", "codex_cli", "gemini_cli"]` | AI harnesses included in the dashboard's `AI Status` column. |
 | `dashboard.aiStatus.activeWindowMs` | `number` | `10000` | Recency threshold used when a harness still has an unresolved prompt but no stronger live-session signal, clamped to `2000..60000`. |
