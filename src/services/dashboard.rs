@@ -1167,10 +1167,12 @@ impl DashboardService {
 
     /// Compute the commit-level ahead/behind of HEAD relative to the first
     /// reachable ref in `upstream/main`, `upstream/master`, `origin/main`,
-    /// `origin/master`. Uses `git rev-list --left-right --count` so the
-    /// returned numbers match the other `BranchStatus` producer in
-    /// `GitService::branch_status`. Returns `None` when none of those
-    /// remote refs are reachable.
+    /// `origin/master`. `ahead`/`behind` come from
+    /// `git rev-list --left-right --count` (matching `GitService::branch_status`),
+    /// and `insertions`/`deletions` come from a follow-up
+    /// `git diff --shortstat <upstream>` so the "Diff" column can render the
+    /// line-level change set. Returns `None` when none of those remote refs are
+    /// reachable.
     async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
         let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd).await?;
         let spec = format!("{upstream}...HEAD");
@@ -1194,10 +1196,33 @@ impl DashboardService {
             .next()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
+
+        // `git diff --shortstat` is best-effort: a timeout or non-zero exit
+        // leaves the line counts as `None` so the Diff column renders "-"
+        // instead of a misleading "+0 -0".
+        let (insertions, deletions) = match time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["diff", "--shortstat", &upstream],
+                Some(cwd),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(stdout)) => {
+                let (ins, del) = parse_shortstat(&stdout);
+                (Some(ins), Some(del))
+            }
+            _ => (None, None),
+        };
+
         Some(BranchStatus {
             ahead,
             behind,
             upstream_branch: Some(upstream),
+            insertions,
+            deletions,
         })
     }
 
@@ -2016,6 +2041,29 @@ fn classify_merge_output(base_ref: String, stdout: &str) -> UpdateBranchOutcome 
     } else {
         UpdateBranchOutcome::Merged { base_ref, summary }
     }
+}
+
+/// Pull `(insertions, deletions)` out of `git diff --shortstat` output.
+/// Shortstat looks like ` 4 files changed, 12 insertions(+), 3 deletions(-)`.
+/// Either count can be absent — a pure-additions diff prints only
+/// `insertions(+)`, a deletions-only diff only `deletions(-)`, and an empty
+/// diff prints nothing at all (which we report as `(0, 0)`).
+fn parse_shortstat(output: &str) -> (u64, u64) {
+    let mut insertions = 0u64;
+    let mut deletions = 0u64;
+    let tokens: Vec<&str> = output.split_whitespace().collect();
+    for window in tokens.windows(2) {
+        let Ok(num) = window[0].parse::<u64>() else {
+            continue;
+        };
+        let label = window[1].trim_end_matches(',');
+        if label.starts_with("insertion") {
+            insertions = num;
+        } else if label.starts_with("deletion") {
+            deletions = num;
+        }
+    }
+    (insertions, deletions)
 }
 
 async fn run_command(

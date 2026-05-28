@@ -794,6 +794,8 @@ fn row_with(merge_status: Option<MergeStatus>, behind: Option<u64>) -> Dashboard
                 ahead: 0,
                 behind: b,
                 upstream_branch: Some("upstream/main".into()),
+                insertions: None,
+                deletions: None,
             }),
         },
         last_commit: None,

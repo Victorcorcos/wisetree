@@ -293,7 +293,7 @@ Dashboard sub-fields:
 | --- | --- | --- | --- |
 | `dashboard.refreshIntervalMs` | `number` | `5000` | Poll interval in milliseconds, clamped to `5000..60000` when loaded. |
 | `dashboard.showPullRequests` | `boolean` | `false` | Enables `gh pr list` enrichment when the GitHub CLI is installed. |
-| `dashboard.columns` | `string[]` | `["branch", "status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. |
+| `dashboard.columns` | `string[]` | `["branch", "status", "ahead_behind", "last_commit"]` | Column order for the live dashboard table. Valid entries: `branch`, `status`, `ahead_behind` (commit counts), `diff` (line additions/removals vs base), `last_commit`, `pull_request`. |
 
 # 📟 Wisetree CLI
 
