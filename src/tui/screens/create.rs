@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
@@ -352,6 +352,87 @@ impl CreateScreen {
             CreateStep::NavigateConfirm => self.handle_navigate_confirm(key),
             CreateStep::Creating | CreateStep::RunningCommands => CreateAction::Continue,
             CreateStep::Success => CreateAction::Done,
+        }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> CreateAction {
+        if self.error.is_some() || self.loading {
+            return CreateAction::Continue;
+        }
+
+        match self.step {
+            CreateStep::SourceBranch => {
+                let Some(select) = self.source_select.as_mut() else {
+                    return CreateAction::Continue;
+                };
+                match select.handle_mouse_click(position) {
+                    SelectOutcome::Selected(_, value) => {
+                        if value == CUSTOM_REF_VALUE {
+                            self.source_select = None;
+                            self.custom_ref_input = Some(custom_ref_input());
+                            self.step = CreateStep::CustomRef;
+                        } else {
+                            self.source_branch = value;
+                            self.new_branch.clear();
+                            self.source_select = None;
+                            self.new_branch_input = Some(self.build_new_branch_input());
+                            self.step = CreateStep::NewBranch;
+                        }
+                        CreateAction::Continue
+                    }
+                    SelectOutcome::Cancelled => CreateAction::Cancelled,
+                    SelectOutcome::Pending => CreateAction::Continue,
+                }
+            }
+            CreateStep::Confirm => {
+                let outcome = match self.confirm_dialog.as_mut() {
+                    Some(dialog) => dialog.handle_mouse_click(position),
+                    None => return CreateAction::Continue,
+                };
+                match outcome {
+                    ConfirmationOutcome::Confirmed => {
+                        self.confirm_dialog = None;
+                        self.navigate_dialog = Some(build_navigate_confirm());
+                        self.navigate_after_create = true;
+                        self.step = CreateStep::NavigateConfirm;
+                        CreateAction::Continue
+                    }
+                    ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                        CreateAction::Cancelled
+                    }
+                    ConfirmationOutcome::Pending => CreateAction::Continue,
+                }
+            }
+            CreateStep::NavigateConfirm => {
+                let outcome = match self.navigate_dialog.as_mut() {
+                    Some(dialog) => dialog.handle_mouse_click(position),
+                    None => return CreateAction::Continue,
+                };
+                match outcome {
+                    ConfirmationOutcome::Confirmed => {
+                        self.navigate_after_create = true;
+                        self.navigate_dialog = None;
+                        CreateAction::Confirmed {
+                            directory_name: self.directory_name.clone(),
+                            source_branch: self.source_branch.clone(),
+                            new_branch: self.new_branch.clone(),
+                        }
+                    }
+                    ConfirmationOutcome::Declined => {
+                        self.navigate_after_create = false;
+                        self.navigate_dialog = None;
+                        CreateAction::Confirmed {
+                            directory_name: self.directory_name.clone(),
+                            source_branch: self.source_branch.clone(),
+                            new_branch: self.new_branch.clone(),
+                        }
+                    }
+                    ConfirmationOutcome::Cancelled | ConfirmationOutcome::Pending => {
+                        CreateAction::Continue
+                    }
+                }
+            }
+            _ => CreateAction::Continue,
         }
     }
 
