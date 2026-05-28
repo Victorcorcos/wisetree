@@ -18,7 +18,7 @@
 //! result.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -102,6 +102,17 @@ impl AiModelPickerScreen {
                     AiModelPickerAction::Continue
                 }
             }
+        }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> AiModelPickerAction {
+        match &mut self.state {
+            PickerState::Loaded(prompt) => match prompt.handle_mouse_click(position) {
+                SelectOutcome::Selected(_, value) => AiModelPickerAction::Selected(value),
+                SelectOutcome::Cancelled => AiModelPickerAction::Cancelled,
+                SelectOutcome::Pending => AiModelPickerAction::Continue,
+            },
+            _ => AiModelPickerAction::Continue,
         }
     }
 

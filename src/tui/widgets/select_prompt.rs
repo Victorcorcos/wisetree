@@ -3,8 +3,10 @@
 //! visible window with `↑ N more above` / `↓ N more below` indicators, and
 //! the empty-state message when filters eliminate every option.
 
+use std::cell::RefCell;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
@@ -21,6 +23,13 @@ struct SelectViewport {
     end: usize,
     show_above_overflow: bool,
     show_below_overflow: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectClickTarget {
+    visible_idx: usize,
+    original_idx: usize,
+    rect: Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +101,7 @@ pub struct SelectPrompt<T: Clone> {
     pub style: SelectStyle,
     pub show_hint: bool,
     pub footer_spacer: bool,
+    visible_option_rects: RefCell<Vec<SelectClickTarget>>,
 }
 
 impl<T: Clone> SelectPrompt<T> {
@@ -105,6 +115,7 @@ impl<T: Clone> SelectPrompt<T> {
             style: SelectStyle::Plain,
             show_hint: true,
             footer_spacer: false,
+            visible_option_rects: RefCell::new(Vec::new()),
         }
     }
 
@@ -251,6 +262,20 @@ impl<T: Clone> SelectPrompt<T> {
         SelectOutcome::Pending
     }
 
+    pub fn handle_mouse_click(&mut self, position: Position) -> SelectOutcome<T> {
+        for target in self.visible_option_rects.borrow().iter().copied() {
+            if contains_position(target.rect, position) {
+                self.selected = target.visible_idx;
+                let option = &self.options[target.original_idx];
+                if option.disabled {
+                    return SelectOutcome::Pending;
+                }
+                return SelectOutcome::Selected(target.original_idx, option.value.clone());
+            }
+        }
+        SelectOutcome::Pending
+    }
+
     fn visible_window(&self, total: usize, max_visible: usize) -> (usize, usize) {
         if total <= max_visible {
             return (0, total);
@@ -339,6 +364,7 @@ impl<T: Clone> SelectPrompt<T> {
     /// inner padding); `Plain` callers pass `false` because the host screen
     /// already pre-padded the area inside its outer rounded panel.
     fn render_themed_body(&self, frame: &mut Frame, area: Rect, inset: bool) {
+        self.visible_option_rects.borrow_mut().clear();
         let panel_style = Style::default().bg(colors::MENU_BG);
         let filtered = self.filtered_indices();
         let viewport = self.viewport(filtered.len(), area.height);
@@ -501,6 +527,13 @@ impl<T: Clone> SelectPrompt<T> {
 
                 let row = Paragraph::new(Line::from(spans)).style(Style::default().bg(row_bg));
                 frame.render_widget(row, chunks[idx]);
+                self.visible_option_rects
+                    .borrow_mut()
+                    .push(SelectClickTarget {
+                        visible_idx,
+                        original_idx,
+                        rect: chunks[idx],
+                    });
                 idx += 1;
             }
         }
@@ -598,4 +631,11 @@ pub fn branded_spans(text: &str, base_style: Style, brand_style: Style) -> Vec<S
         spans.push(Span::styled(text.to_string(), base_style));
     }
     spans
+}
+
+fn contains_position(area: Rect, position: Position) -> bool {
+    position.x >= area.left()
+        && position.x < area.right()
+        && position.y >= area.top()
+        && position.y < area.bottom()
 }

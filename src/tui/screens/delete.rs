@@ -14,7 +14,7 @@
 //! `mark_complete(outcome)` (or `set_error`) when done.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -407,6 +407,71 @@ impl DeleteScreen {
             DeleteStep::Deleting => DeleteAction::Continue,
             DeleteStep::Success => DeleteAction::Continue,
         }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> DeleteAction {
+        if matches!(self.step, DeleteStep::Confirm) {
+            if self.bulk_confirm.is_some() {
+                return match self
+                    .bulk_confirm
+                    .as_mut()
+                    .map(|d| d.handle_mouse_click(position))
+                {
+                    Some(BulkConfirmOutcome::Confirmed(indices)) => {
+                        let selected_paths: Vec<String> = indices
+                            .iter()
+                            .filter_map(|i| self.bulk_paths.get(*i).cloned())
+                            .collect();
+                        let items: Vec<(String, bool)> = selected_paths
+                            .iter()
+                            .filter_map(|p| {
+                                self.worktrees
+                                    .iter()
+                                    .find(|w| &w.path == p)
+                                    .map(|w| (w.path.clone(), !w.is_clean))
+                            })
+                            .collect();
+                        if items.is_empty() {
+                            self.bulk_confirm = None;
+                            self.bulk_paths.clear();
+                            self.bulk_total = 0;
+                            return DeleteAction::Cancelled;
+                        }
+                        self.bulk_paths = selected_paths;
+                        self.bulk_total = self.bulk_paths.len();
+                        self.bulk_completed = 0;
+                        self.bulk_confirm = None;
+                        DeleteAction::BulkConfirmed { items }
+                    }
+                    Some(BulkConfirmOutcome::Cancelled) => {
+                        self.bulk_confirm = None;
+                        DeleteAction::Cancelled
+                    }
+                    _ => DeleteAction::Continue,
+                };
+            }
+            return match self
+                .confirm
+                .as_mut()
+                .map(|d| d.handle_mouse_click(position))
+            {
+                Some(ConfirmationOutcome::Confirmed) => {
+                    let wt = match self.selected() {
+                        Some(w) => w,
+                        None => return DeleteAction::Cancelled,
+                    };
+                    let force = !wt.is_clean;
+                    let path = wt.path.clone();
+                    DeleteAction::Confirmed { path, force }
+                }
+                Some(ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled) => {
+                    self.confirm = None;
+                    DeleteAction::Cancelled
+                }
+                _ => DeleteAction::Continue,
+            };
+        }
+        DeleteAction::Continue
     }
 
     fn handle_confirm(&mut self, key: KeyEvent) -> DeleteAction {

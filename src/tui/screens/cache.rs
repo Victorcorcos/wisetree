@@ -1,7 +1,7 @@
 //! Shared cache inspection screen.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -139,6 +139,35 @@ impl CacheScreen {
             return CacheAction::Back;
         };
         match select.handle_key(key) {
+            SelectOutcome::Cancelled => CacheAction::Back,
+            SelectOutcome::Selected(_, _) | SelectOutcome::Pending => CacheAction::Continue,
+        }
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> CacheAction {
+        if self.error.is_some() || self.loading {
+            return CacheAction::Continue;
+        }
+        if let Some(confirm) = self.confirm.as_mut() {
+            return match confirm.handle_mouse_click(position) {
+                ConfirmationOutcome::Confirmed => {
+                    let target = self.pending_delete.take().unwrap_or_default();
+                    self.confirm = None;
+                    CacheAction::DeleteEntry(target)
+                }
+                ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                    self.confirm = None;
+                    self.pending_delete = None;
+                    CacheAction::Continue
+                }
+                ConfirmationOutcome::Pending => CacheAction::Continue,
+            };
+        }
+
+        let Some(select) = self.select.as_mut() else {
+            return CacheAction::Continue;
+        };
+        match select.handle_mouse_click(position) {
             SelectOutcome::Cancelled => CacheAction::Back,
             SelectOutcome::Selected(_, _) | SelectOutcome::Pending => CacheAction::Continue,
         }
