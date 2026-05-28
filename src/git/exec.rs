@@ -92,28 +92,35 @@ pub async fn get_default_branch(path: Option<&Path>) -> String {
     "main".to_string()
 }
 
-/// Absolute path of the repository's working-tree root, mirroring the
-/// upstream `getGitRoot` strategy.
+/// Absolute path of the repository root.
+///
+/// For non-bare repos this is the working-tree top (`--show-toplevel`).
+/// For bare repos the working tree doesn't exist, so we return the absolute
+/// path of the git directory itself (e.g. `/srv/repos/foo.git`) — that's the
+/// only sensible "root" callers can anchor on.
 pub async fn get_git_root(path: Option<&Path>) -> Option<String> {
-    let result = execute_git_command(
+    let toplevel = execute_git_command(
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        path,
+    )
+    .await;
+    if toplevel.success && !toplevel.stdout.is_empty() {
+        return Some(toplevel.stdout);
+    }
+
+    let bare = execute_git_command(&["rev-parse", "--is-bare-repository"], path).await;
+    if !bare.success || bare.stdout != "true" {
+        return None;
+    }
+
+    let git_dir = execute_git_command(
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         path,
     )
     .await;
-
-    if !result.success {
-        return None;
-    }
-
-    let git_dir = result.stdout;
-    if let Some(stripped) = git_dir.strip_suffix("/.git") {
-        return Some(stripped.to_string());
-    }
-
-    // Bare or non-standard layout — strip the trailing component.
-    let parent = git_dir.rsplit_once('/').map(|(p, _)| p.to_string());
-    match parent {
-        Some(p) if !p.is_empty() => Some(p),
-        _ => None,
+    if git_dir.success && !git_dir.stdout.is_empty() {
+        Some(git_dir.stdout)
+    } else {
+        None
     }
 }

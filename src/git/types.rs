@@ -11,6 +11,14 @@ pub struct BranchStatus {
     pub behind: u64,
     #[serde(rename = "upstreamBranch")]
     pub upstream_branch: Option<String>,
+    /// Line insertions vs the resolved upstream ref. `None` when the
+    /// producer didn't compute a `git diff --shortstat`, so consumers can
+    /// distinguish "zero lines" from "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insertions: Option<u64>,
+    /// Line deletions vs the resolved upstream ref. Paired with `insertions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

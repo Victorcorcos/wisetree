@@ -34,11 +34,13 @@ const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
-pub const BASE_REF_PRIORITY: [&str; 4] = [
+pub const BASE_REF_PRIORITY: [&str; 6] = [
     "upstream/main",
     "upstream/master",
+    "upstream/develop",
     "origin/main",
     "origin/master",
+    "origin/develop",
 ];
 /// How often the service refetches PR data when branches are otherwise idle.
 /// Catches remote-only changes (merge, close, title edit) without hammering
@@ -498,6 +500,11 @@ struct PrCacheState {
     rate_limited_until: Option<Instant>,
     rate_limit_notice_sent: bool,
     loaded_from_disk: bool,
+    /// Set whenever `entries` is mutated by application code (PR insert,
+    /// prune-on-branch-disappear). `save_cache` checks this flag and skips
+    /// the read-merge-write cycle when nothing has changed since the last
+    /// persist — avoiding unnecessary disk I/O on every refresh tick.
+    dirty: bool,
     notice_tx: Option<mpsc::Sender<DashboardNotice>>,
 }
 
@@ -1158,14 +1165,42 @@ impl DashboardService {
         Ok((!dirty, branch_status))
     }
 
-    /// Compute the line-level diff (insertions/deletions) of HEAD relative to
-    /// the first reachable ref in `upstream/main`, `upstream/master`,
-    /// `origin/main`, `origin/master`. Insertions are stored in `ahead` and
-    /// deletions in `behind` so the renderer can show `+<ins> -<del>`.
-    /// Returns `None` when none of those remote refs are reachable.
+    /// Compute the commit-level ahead/behind of HEAD relative to the first
+    /// reachable ref in `upstream/main`, `upstream/master`, `origin/main`,
+    /// `origin/master`. `ahead`/`behind` come from
+    /// `git rev-list --left-right --count` (matching `GitService::branch_status`),
+    /// and `insertions`/`deletions` come from a follow-up
+    /// `git diff --shortstat <upstream>` so the "Diff" column can render the
+    /// line-level change set. Returns `None` when none of those remote refs are
+    /// reachable.
     async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
         let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd).await?;
+        let spec = format!("{upstream}...HEAD");
         let result = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["rev-list", "--left-right", "--count", &spec],
+                Some(cwd),
+            ),
+        )
+        .await
+        .ok()?;
+        let Ok(output) = result else { return None };
+        let mut parts = output.split_whitespace();
+        let behind = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let ahead = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        // `git diff --shortstat` is best-effort: a timeout or non-zero exit
+        // leaves the line counts as `None` so the Diff column renders "-"
+        // instead of a misleading "+0 -0".
+        let (insertions, deletions) = match time::timeout(
             COMMAND_TIMEOUT,
             run_command(
                 &self.git_binary,
@@ -1174,13 +1209,20 @@ impl DashboardService {
             ),
         )
         .await
-        .ok()?;
-        let Ok(output) = result else { return None };
-        let (insertions, deletions) = parse_shortstat(&output);
+        {
+            Ok(Ok(stdout)) => {
+                let (ins, del) = parse_shortstat(&stdout);
+                (Some(ins), Some(del))
+            }
+            _ => (None, None),
+        };
+
         Some(BranchStatus {
-            ahead: insertions,
-            behind: deletions,
+            ahead,
+            behind,
             upstream_branch: Some(upstream),
+            insertions,
+            deletions,
         })
     }
 
@@ -1267,6 +1309,9 @@ impl DashboardService {
                             pull_request: pr,
                         },
                     );
+                }
+                if !to_fetch.is_empty() {
+                    state.dirty = true;
                 }
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
@@ -1430,9 +1475,13 @@ impl DashboardService {
 
     fn prune_cache(&self, live_branches: &HashSet<String>) {
         let mut state = self.pr_state.lock().expect("pr_state poisoned");
+        let before = state.entries.len();
         state
             .entries
             .retain(|branch, _| live_branches.contains(branch));
+        if state.entries.len() != before {
+            state.dirty = true;
+        }
     }
 
     fn save_cache(&self) {
@@ -1442,6 +1491,13 @@ impl DashboardService {
         let key = self.git_root.to_string_lossy().to_string();
         let entries = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
+            // Skip the read-merge-write cycle entirely when nothing has
+            // changed since the last persist. Without this guard the cache
+            // file is rewritten on every refresh tick (3–5s) even when no
+            // PR entry actually moved.
+            if !state.dirty {
+                return;
+            }
             state.entries.clone()
         };
 
@@ -1460,7 +1516,10 @@ impl DashboardService {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&disk) {
-            let _ = std::fs::write(&path, json);
+            if std::fs::write(&path, json).is_ok() {
+                let mut state = self.pr_state.lock().expect("pr_state poisoned");
+                state.dirty = false;
+            }
         }
     }
 }
@@ -1984,6 +2043,11 @@ fn classify_merge_output(base_ref: String, stdout: &str) -> UpdateBranchOutcome 
     }
 }
 
+/// Pull `(insertions, deletions)` out of `git diff --shortstat` output.
+/// Shortstat looks like ` 4 files changed, 12 insertions(+), 3 deletions(-)`.
+/// Either count can be absent — a pure-additions diff prints only
+/// `insertions(+)`, a deletions-only diff only `deletions(-)`, and an empty
+/// diff prints nothing at all (which we report as `(0, 0)`).
 fn parse_shortstat(output: &str) -> (u64, u64) {
     let mut insertions = 0u64;
     let mut deletions = 0u64;

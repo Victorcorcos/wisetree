@@ -65,6 +65,7 @@ use crate::tui::selection::{
 };
 use crate::tui::terminal;
 use crate::tui::widgets::{render_toast, ToastState, ToastVariant, WelcomeHeader};
+use crate::utils::path::{repository_base_name, TemplateVariables};
 use crate::worktree::service::{
     CreateOutcome as ServiceCreateOutcome, DeleteOutcome as ServiceDeleteOutcome,
 };
@@ -348,7 +349,21 @@ impl App {
 
         match self.phase {
             InitPhase::Loading => {
-                screens::loading::draw(frame, area, self.tick, self.screen.as_str());
+                // Render the WelcomeHeader on top of the loading splash so
+                // the user (and integration tests) can immediately see which
+                // screen is loading. Menu has its own header so we skip the
+                // outer one in that case.
+                if matches!(self.screen, Screen::Menu) {
+                    screens::loading::draw(frame, area, self.tick, self.screen.as_str());
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(4), Constraint::Min(0)])
+                        .split(area);
+                    let cwd = self.git_root.as_deref().unwrap_or("");
+                    WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+                    screens::loading::draw(frame, chunks[1], self.tick, self.screen.as_str());
+                }
             }
             InitPhase::Errored => {
                 let msg = self.error.as_deref().unwrap_or("Unknown error");
@@ -852,6 +867,19 @@ impl App {
         match action {
             UpdateAction::Continue => {}
             UpdateAction::Cancelled => {
+                // If the merge was already in flight (conflicts detected and
+                // AI handed control back to the user), leaving without
+                // `git merge --abort` strands the worktree with conflict
+                // markers and a half-applied merge. Run the same cleanup
+                // path as AiCancel before we navigate away.
+                if let Some(screen) = self.update_pr.as_ref() {
+                    if screen.ai_active() {
+                        let request = screen.request().clone();
+                        let git_root = self.git_root.clone();
+                        let dashboard_config = self.current_dashboard_config();
+                        kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
+                    }
+                }
                 self.update_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
@@ -953,9 +981,10 @@ impl App {
                     self.quit_requested = true;
                 }
             }
-            DashboardAction::OpenTerminal(path) => {
+            DashboardAction::OpenTerminal { path, branch } => {
                 if let Some(config) = self.current_config() {
-                    let launch = open_terminal(&config.terminal_command, &path);
+                    let variables = self.terminal_template_variables(&path, &branch);
+                    let launch = open_terminal(&config.terminal_command, &variables);
                     if launch.success {
                         self.show_toast(
                             ToastVariant::Info,
@@ -2204,9 +2233,16 @@ impl App {
                     self.quit_requested = true;
                     return;
                 }
+                let (new_branch, source_branch) = self
+                    .create
+                    .as_ref()
+                    .map(|c| (c.new_branch.clone(), c.source_branch.clone()))
+                    .unwrap_or_default();
                 if let Some(config) = self.current_config() {
                     if !config.terminal_command.trim().is_empty() {
-                        let _ = open_terminal(&config.terminal_command, &path);
+                        let mut variables = self.terminal_template_variables(&path, &new_branch);
+                        variables.source_branch = source_branch;
+                        let _ = open_terminal(&config.terminal_command, &variables);
                     }
                 }
             }
@@ -2285,6 +2321,24 @@ impl App {
         self.worktree_service
             .as_ref()
             .map(|service| service.config_service().config())
+    }
+
+    /// Build the `TemplateVariables` for spawning the user's `terminalCommand`
+    /// outside of the create flow. `branch` may be empty when the caller
+    /// doesn't have it (e.g. a detached worktree).
+    fn terminal_template_variables(&self, worktree_path: &str, branch: &str) -> TemplateVariables {
+        let base_path = self
+            .git_root
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(repository_base_name)
+            .unwrap_or_default();
+        TemplateVariables {
+            base_path,
+            worktree_path: worktree_path.to_string(),
+            branch_name: branch.to_string(),
+            source_branch: String::new(),
+        }
     }
 
     fn current_config_warnings(&self) -> Vec<String> {

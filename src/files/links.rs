@@ -370,7 +370,6 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
 
     let now = now_unix_ms();
     let grace_ms = ORPHAN_GRACE_PERIOD.as_millis() as u64;
-    let mut retained_patterns = Vec::new();
 
     for pattern in patterns {
         let Some(entry_path) = cache_entry_path(cache_dir, &pattern) else {
@@ -386,18 +385,17 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
         let entry_users = active_users_for_entry(cache_dir, &pattern, &users)?;
         if !entry_users.is_empty() {
             skipped.push(format!("{pattern}: cache still has active worktrees"));
-            retained_patterns.push(pattern);
             continue;
         }
 
-        let last_seen = metadata
-            .entry_last_seen
-            .get(&pattern)
-            .copied()
-            .unwrap_or_else(now_unix_ms);
+        // A missing `last_seen` means we never recorded a touch for this
+        // cache entry, so we treat it as ancient (epoch 0) and let the
+        // grace check expire it immediately. Defaulting to `now` instead
+        // would make `now - now = 0 < grace`, so unknown orphans would be
+        // kept forever.
+        let last_seen = metadata.entry_last_seen.get(&pattern).copied().unwrap_or(0);
         if now.saturating_sub(last_seen) < grace_ms {
             skipped.push(format!("{pattern}: used within the last 14 days"));
-            retained_patterns.push(pattern);
             continue;
         }
 
@@ -406,7 +404,6 @@ pub async fn prune_cache(cache_dir: &Path) -> Result<CachePruneReport> {
         removed.push(pattern);
     }
 
-    metadata.patterns = retained_patterns;
     metadata.normalize();
     write_metadata(cache_dir, &metadata).await?;
 
@@ -748,7 +745,15 @@ fn copy_directory_into_cache(source_dir: &Path, target_dir: &Path) -> Result<()>
 async fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(target, link_path)?;
+        // `std::os::unix::fs::symlink` is a blocking syscall. Surrounding
+        // cache operations use `tokio::fs` for I/O, so hop to a blocking
+        // thread here to keep the same convention and avoid stalling a
+        // tokio worker on an unexpectedly slow filesystem.
+        let target = target.to_path_buf();
+        let link_path = link_path.to_path_buf();
+        tokio::task::spawn_blocking(move || std::os::unix::fs::symlink(target, link_path))
+            .await
+            .map_err(|err| WisetreeError::other(err.to_string()))??;
         Ok(())
     }
 
@@ -756,7 +761,15 @@ async fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
     {
         use tokio::process::Command;
 
-        match std::os::windows::fs::symlink_dir(target, link_path) {
+        let target_buf = target.to_path_buf();
+        let link_buf = link_path.to_path_buf();
+        let symlink_result = tokio::task::spawn_blocking(move || {
+            std::os::windows::fs::symlink_dir(&target_buf, &link_buf)
+        })
+        .await
+        .map_err(|err| WisetreeError::other(err.to_string()))?;
+
+        match symlink_result {
             Ok(()) => Ok(()),
             Err(err) if err.raw_os_error() == Some(WINDOWS_PRIVILEGE_NOT_HELD) => {
                 let status = Command::new("cmd")
