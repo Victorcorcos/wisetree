@@ -151,7 +151,10 @@ pub enum DashboardAction {
     Back,
     Refresh,
     NavigateTo(String),
-    OpenTerminal(String),
+    OpenTerminal {
+        path: String,
+        branch: String,
+    },
     JumpToDelete(String),
     BulkDelete(BulkDeleteStatus, Vec<String>),
     CopyPath(String),
@@ -175,8 +178,41 @@ enum DashboardColumn {
     Branch,
     Status,
     AheadBehind,
+    Diff,
     LastCommit,
     PullRequest,
+}
+
+/// One row of the dashboard footer. Each variant owns both its height (via
+/// [`FooterRow::height`]) and its render dispatch (via
+/// [`DashboardScreen::render_footer_row`]), so adding a new footer row is a
+/// three-step change: add a variant, give it a height if non-default, and
+/// add a render arm. Outer layout sizing flows automatically from
+/// [`DashboardScreen::footer_height`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterRow {
+    Notice,
+    Reviewers,
+    BulkDelete,
+    Shortcuts,
+    StatusLegend,
+    ChecksLegend,
+    ReviewsLegend,
+    MergesLegend,
+    AheadBehindLegend,
+    DiffLegend,
+}
+
+impl FooterRow {
+    fn height(self) -> u16 {
+        match self {
+            // The bulk-delete buttons sit inside a bordered block, so they
+            // need top border + content + bottom border. Every other row is
+            // a single line of text.
+            Self::BulkDelete => 3,
+            _ => 1,
+        }
+    }
 }
 
 struct DashboardTableLayout {
@@ -313,9 +349,10 @@ impl DashboardScreen {
             return 11;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
-        // 1 status + 2 search spacers + 1 search line + 1 table header + N rows
-        // + footer (10 lines, +1 when the highlighted PR has reviewers to show).
-        14 + table_rows + self.reviewers_footer_height()
+        // 1 status banner + 2 search spacers + 1 search line + N rows + footer
+        // (sized from FooterRow::height summed across footer_rows so adding a
+        // new footer row propagates here automatically).
+        4 + table_rows + self.footer_height()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -462,16 +499,15 @@ impl DashboardScreen {
             return;
         }
 
-        let footer_height = 10u16 + self.reviewers_footer_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),             // status banner
-                Constraint::Length(1),             // spacer above search
-                Constraint::Length(1),             // search line
-                Constraint::Length(1),             // spacer below search
-                Constraint::Min(4),                // table
-                Constraint::Length(footer_height), // footer (notice [+ reviewers] + 3-row buttons + 6 legend lines)
+                Constraint::Length(1),                    // status banner
+                Constraint::Length(1),                    // spacer above search
+                Constraint::Length(1),                    // search line
+                Constraint::Length(1),                    // spacer below search
+                Constraint::Min(4),                       // table
+                Constraint::Length(self.footer_height()), // footer (sized from FooterRow::height summed across footer_rows)
             ])
             .split(area);
 
@@ -685,7 +721,10 @@ impl DashboardScreen {
                     }
                     ActionChoice::OpenWithCommand => {
                         self.mode = DashboardMode::Table;
-                        DashboardAction::OpenTerminal(path)
+                        DashboardAction::OpenTerminal {
+                            path,
+                            branch: row.worktree.branch.clone(),
+                        }
                     }
                     ActionChoice::CopyPath => {
                         self.mode = DashboardMode::Table;
@@ -819,6 +858,17 @@ impl DashboardScreen {
                     "ahead {} behind {}",
                     branch_status.ahead, branch_status.behind
                 ));
+            }
+            // Diff column text — same shape as Ahead/Behind so the rendered
+            // "+N -N" / "=0" form filters identically.
+            if let Some((insertions, deletions)) =
+                branch_status.insertions.zip(branch_status.deletions)
+            {
+                if insertions == 0 && deletions == 0 {
+                    haystacks.push("=0".into());
+                } else {
+                    haystacks.push(format!("+{insertions} -{deletions}"));
+                }
             }
         }
         if let Some(commit) = &row.last_commit {
@@ -1039,6 +1089,34 @@ impl DashboardScreen {
         widths
     }
 
+    /// Ordered list of footer rows that should render for the current state.
+    /// Single source of truth: both the outer layout (which reserves the
+    /// vertical strip for the footer) and `render_footer` derive their sizes
+    /// and dispatch from this list, so adding a new row only requires
+    /// extending `FooterRow` and inserting one entry here.
+    fn footer_rows(&self) -> Vec<FooterRow> {
+        let mut rows = Vec::with_capacity(10);
+        rows.push(FooterRow::Notice);
+        if self.reviewers_footer_height() > 0 {
+            rows.push(FooterRow::Reviewers);
+        }
+        rows.push(FooterRow::BulkDelete);
+        rows.push(FooterRow::Shortcuts);
+        rows.push(FooterRow::StatusLegend);
+        rows.push(FooterRow::ChecksLegend);
+        rows.push(FooterRow::ReviewsLegend);
+        rows.push(FooterRow::MergesLegend);
+        rows.push(FooterRow::AheadBehindLegend);
+        if self.diff_legend_height() > 0 {
+            rows.push(FooterRow::DiffLegend);
+        }
+        rows
+    }
+
+    fn footer_height(&self) -> u16 {
+        self.footer_rows().iter().map(|row| row.height()).sum()
+    }
+
     fn render_footer(
         &mut self,
         frame: &mut Frame,
@@ -1046,53 +1124,58 @@ impl DashboardScreen {
         table_width: u16,
         layout: &DashboardTableLayout,
     ) {
-        let reviewers_height = self.reviewers_footer_height();
-
-        // Build constraints conditionally so the layout has exactly the
-        // number of rows it actually needs — ratatui's solver can drop a
-        // neighbour's row when a zero-length constraint sits inside an
-        // already-saturated column.
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(9);
-        constraints.push(Constraint::Length(1)); // notice / row warning / detail
-        if reviewers_height > 0 {
-            constraints.push(Constraint::Length(reviewers_height));
-        }
-        constraints.push(Constraint::Length(3)); // bulk delete buttons row (bordered)
-        constraints.push(Constraint::Length(1)); // navigate / shortcuts
-        constraints.push(Constraint::Length(1)); // status legend
-        constraints.push(Constraint::Length(1)); // checks legend
-        constraints.push(Constraint::Length(1)); // reviews legend
-        constraints.push(Constraint::Length(1)); // merges legend
-        constraints.push(Constraint::Length(1)); // ahead/behind legend
-
+        let rows = self.footer_rows();
+        let constraints: Vec<Constraint> = rows
+            .iter()
+            .map(|row| Constraint::Length(row.height()))
+            .collect();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
-
-        let mut idx = 0;
-        frame.render_widget(
-            Paragraph::new(self.notice_line(table_width, layout)),
-            chunks[idx],
-        );
-        idx += 1;
-        if reviewers_height > 0 {
-            frame.render_widget(Paragraph::new(self.reviewers_line()), chunks[idx]);
-            idx += 1;
+        for (row, rect) in rows.iter().zip(chunks.iter()) {
+            self.render_footer_row(*row, frame, *rect, table_width, layout);
         }
-        self.render_bulk_delete_buttons(frame, chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.shortcuts_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.status_legend_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.checks_legend_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.reviews_legend_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.merges_legend_line()), chunks[idx]);
-        idx += 1;
-        frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), chunks[idx]);
+    }
+
+    fn render_footer_row(
+        &mut self,
+        row: FooterRow,
+        frame: &mut Frame,
+        rect: Rect,
+        table_width: u16,
+        layout: &DashboardTableLayout,
+    ) {
+        match row {
+            FooterRow::Notice => {
+                frame.render_widget(Paragraph::new(self.notice_line(table_width, layout)), rect)
+            }
+            FooterRow::Reviewers => {
+                frame.render_widget(Paragraph::new(self.reviewers_line()), rect)
+            }
+            FooterRow::BulkDelete => self.render_bulk_delete_buttons(frame, rect),
+            FooterRow::Shortcuts => {
+                frame.render_widget(Paragraph::new(self.shortcuts_line()), rect)
+            }
+            FooterRow::StatusLegend => {
+                frame.render_widget(Paragraph::new(self.status_legend_line()), rect)
+            }
+            FooterRow::ChecksLegend => {
+                frame.render_widget(Paragraph::new(self.checks_legend_line()), rect)
+            }
+            FooterRow::ReviewsLegend => {
+                frame.render_widget(Paragraph::new(self.reviews_legend_line()), rect)
+            }
+            FooterRow::MergesLegend => {
+                frame.render_widget(Paragraph::new(self.merges_legend_line()), rect)
+            }
+            FooterRow::AheadBehindLegend => {
+                frame.render_widget(Paragraph::new(self.ahead_behind_legend_line()), rect)
+            }
+            FooterRow::DiffLegend => {
+                frame.render_widget(Paragraph::new(self.diff_legend_line()), rect)
+            }
+        }
     }
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
@@ -1126,6 +1209,23 @@ impl DashboardScreen {
             }
         }
         Line::from("")
+    }
+
+    /// `1` when the dashboard is configured to show the Diff column (and
+    /// therefore needs the extra legend line below Ahead/Behind), `0` when
+    /// it isn't. Reads from `self.columns` rather than the resolved
+    /// `visible_columns` so the outer footer height stays stable even when
+    /// the column gets squeezed off the narrow-view table.
+    fn diff_legend_height(&self) -> u16 {
+        if self
+            .columns
+            .iter()
+            .any(|c| matches!(c, DashboardColumn::Diff))
+        {
+            1
+        } else {
+            0
+        }
     }
 
     /// `1` when the highlighted row has reviewer data to surface, `0`
@@ -1284,12 +1384,25 @@ impl DashboardScreen {
         Line::from(vec![
             Span::styled("Ahead/Behind: ", muted_dim),
             Span::styled("+N", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" lines added  ", muted_dim),
+            Span::styled(" commits ahead  ", muted_dim),
             Span::styled("-N", Style::default().fg(colors::ERROR)),
             Span::styled(
-                " lines removed vs upstream/main (falls back to upstream/master, origin/main, origin/master)",
+                " commits behind vs upstream/main (falls back to upstream/master, origin/main, origin/master)",
                 muted_dim,
             ),
+        ])
+    }
+
+    fn diff_legend_line(&self) -> Line<'static> {
+        let muted_dim = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        Line::from(vec![
+            Span::styled("Diff: ", muted_dim),
+            Span::styled("+N", Style::default().fg(colors::SUCCESS)),
+            Span::styled(" lines added  ", muted_dim),
+            Span::styled("-N", Style::default().fg(colors::ERROR)),
+            Span::styled(" lines removed vs the same base ref", muted_dim),
         ])
     }
 
@@ -1558,7 +1671,8 @@ impl DashboardScreen {
                 DashboardColumn::PullRequest => {}
                 DashboardColumn::Branch
                 | DashboardColumn::Status
-                | DashboardColumn::AheadBehind => {}
+                | DashboardColumn::AheadBehind
+                | DashboardColumn::Diff => {}
             }
         }
 
@@ -1622,6 +1736,7 @@ impl DashboardColumn {
             "branch" => Some(Self::Branch),
             "status" => Some(Self::Status),
             "ahead_behind" => Some(Self::AheadBehind),
+            "diff" => Some(Self::Diff),
             "last_commit" => Some(Self::LastCommit),
             "pull_request" => Some(Self::PullRequest),
             _ => None,
@@ -1639,6 +1754,7 @@ impl DashboardColumn {
                     "Ahead/Behind"
                 }
             }
+            Self::Diff => "Diff",
             Self::LastCommit => {
                 if compact {
                     "Commit"
@@ -1673,6 +1789,13 @@ impl DashboardColumn {
                 }
             }
             Self::AheadBehind => {
+                if compact {
+                    10
+                } else {
+                    12
+                }
+            }
+            Self::Diff => {
                 if compact {
                     10
                 } else {
@@ -1735,6 +1858,29 @@ impl DashboardColumn {
                         format!("-{}", branch_status.behind),
                         Style::default().fg(colors::ERROR),
                     ),
+                ])),
+                None => Cell::from(Line::from(Span::styled(
+                    "-",
+                    Style::default().fg(colors::MUTED),
+                ))),
+            },
+            Self::Diff => match row
+                .worktree
+                .branch_status
+                .as_ref()
+                .and_then(|s| s.insertions.zip(s.deletions))
+            {
+                Some((0, 0)) => Cell::from(Line::from(Span::styled(
+                    "=0",
+                    Style::default().fg(colors::MUTED),
+                ))),
+                Some((insertions, deletions)) => Cell::from(Line::from(vec![
+                    Span::styled(
+                        format!("+{insertions}"),
+                        Style::default().fg(colors::SUCCESS),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(format!("-{deletions}"), Style::default().fg(colors::ERROR)),
                 ])),
                 None => Cell::from(Line::from(Span::styled(
                     "-",

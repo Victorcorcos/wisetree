@@ -91,7 +91,11 @@ pub fn validate_branch_name(name: &str) -> Option<&'static str> {
     }
 
     let has_invalid = name.chars().any(|c| {
-        c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | ']' | '\\' | '@')
+        c.is_whitespace()
+            || matches!(
+                c,
+                '~' | '^' | ':' | '?' | '*' | '[' | ']' | '{' | '}' | '\\' | '@'
+            )
     });
     if has_invalid {
         return Some("Branch name contains invalid characters");

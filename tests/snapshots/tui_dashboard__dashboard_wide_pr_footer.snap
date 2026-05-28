@@ -1,6 +1,6 @@
 ---
 source: tests/tui_dashboard.rs
-assertion_line: 873
+assertion_line: 959
 expression: "dump_lines(110, 18, |f| screen.render(f, f.area()))"
 ---
 Refreshed just now - 2 worktrees, 0 dirty, 1 PR open
@@ -20,4 +20,4 @@ Status: Mother = main worktree (protected)  Dirty = has uncommitted changes  Cle
 PR Checks: ⚪  (Pending)  🟡  (Running)  ⚠️  (Errored)  🔴  (Failed)  🟢  (Passed)
 PR Reviews: ✋  (Pending)  👎  (Changes Requested)  👍  (Approved)
 PR Merges: 📝  (Draft)  ❌  (Dirty)  🚫  (Blocked)  ❓  (Unknown)  🔄  (Behind)  ⏳  (Has Hooks)  🏚️  (Unstable)  ✅
-Ahead/Behind: +N lines added  -N lines removed vs upstream/main (falls back to upstream/master, origin/main, o
+Ahead/Behind: +N commits ahead  -N commits behind vs upstream/main (falls back to upstream/master, origin/main

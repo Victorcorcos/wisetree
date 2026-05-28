@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use wisetree::config::WorktreeConfig;
 use wisetree::files::service::{copy_files, execute_post_create_commands, open_terminal, open_url};
-use wisetree::utils::path::TemplateVariables;
+use wisetree::utils::path::{resolve_template_shell, TemplateVariables};
 
 #[cfg(unix)]
 #[tokio::test]
@@ -38,6 +38,46 @@ async fn copy_files_does_not_dereference_symlinks() {
         "nested symlink was copied"
     );
     assert!(dst.path().join(".vscode/settings.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn copy_files_preserves_internal_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let src = tempfile::tempdir().expect("src");
+    let dst = tempfile::tempdir().expect("dst");
+
+    fs::write(src.path().join(".env.local"), "A=1").unwrap();
+    symlink(".env.local", src.path().join(".env")).unwrap();
+
+    fs::create_dir_all(src.path().join(".vscode")).unwrap();
+    fs::write(src.path().join(".vscode/settings.json"), "{}").unwrap();
+    symlink(
+        "settings.json",
+        src.path().join(".vscode/settings-link.json"),
+    )
+    .unwrap();
+
+    let config = WorktreeConfig::default();
+    let report = copy_files(src.path(), dst.path(), &config).await;
+
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert!(fs::symlink_metadata(dst.path().join(".env"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(dst.path().join(".env")).unwrap(), "A=1");
+    assert!(
+        fs::symlink_metadata(dst.path().join(".vscode/settings-link.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_to_string(dst.path().join(".vscode/settings-link.json")).unwrap(),
+        "{}"
+    );
 }
 
 #[test]
@@ -150,7 +190,11 @@ async fn post_create_returns_empty_for_empty_input() {
 
 #[test]
 fn open_terminal_noop_for_empty_command() {
-    let res = open_terminal("", "/tmp");
+    let vars = TemplateVariables {
+        worktree_path: "/tmp".to_string(),
+        ..TemplateVariables::default()
+    };
+    let res = open_terminal("", &vars);
     assert!(res.success);
     assert!(res.command.is_empty());
 }
@@ -158,7 +202,28 @@ fn open_terminal_noop_for_empty_command() {
 #[test]
 fn open_terminal_resolves_template_and_spawns() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let res = open_terminal("true", tmp.path().to_str().unwrap());
+    let vars = TemplateVariables {
+        worktree_path: tmp.path().to_string_lossy().into_owned(),
+        ..TemplateVariables::default()
+    };
+    let res = open_terminal("true", &vars);
     assert!(res.success);
     assert_eq!(res.command, "true");
+}
+
+#[test]
+fn open_terminal_substitutes_base_path_and_branch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vars = TemplateVariables {
+        base_path: "myrepo".to_string(),
+        worktree_path: tmp.path().to_string_lossy().into_owned(),
+        branch_name: "feat/x".to_string(),
+        source_branch: "main".to_string(),
+    };
+    let res = open_terminal("echo $BASE_PATH/$BRANCH_NAME", &vars);
+    assert!(res.success);
+    assert_eq!(
+        res.command,
+        resolve_template_shell("echo $BASE_PATH/$BRANCH_NAME", &vars)
+    );
 }

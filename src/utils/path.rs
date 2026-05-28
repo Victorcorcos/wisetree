@@ -31,11 +31,30 @@ impl TemplateVariables {
 
 /// Replace every `$KEY` occurrence in `template` with the matching value.
 /// Unknown keys are left as-is (matches upstream).
+///
+/// Single-pass scan: when a `$` is followed by a recognised key we substitute
+/// the value verbatim into the output, then continue from the character after
+/// the key. This makes substitution order-independent — values may safely
+/// contain `$OTHER_KEY` literals without being re-expanded by a later
+/// iteration.
 pub fn resolve_template(template: &str, vars: &TemplateVariables) -> String {
-    let mut out = template.to_string();
-    for (key, value) in vars.pairs() {
-        let needle = format!("${key}");
-        out = out.replace(&needle, value);
+    let pairs = vars.pairs();
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let rest = &template[i + 1..];
+            if let Some((key, value)) = pairs.iter().find(|(k, _)| rest.starts_with(*k)) {
+                out.push_str(value);
+                i += 1 + key.len();
+                continue;
+            }
+        }
+        // Push a full UTF-8 char (templates may contain multi-byte chars).
+        let ch = template[i..].chars().next().expect("non-empty slice");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -197,4 +216,60 @@ pub fn get_worktree_path(
     let resolved = resolve_template(template, &vars);
     validate_resolved_path_template(&resolved)?;
     Ok(parent_dir.join(resolved).join(directory_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars(
+        base_path: &str,
+        worktree_path: &str,
+        branch_name: &str,
+        source_branch: &str,
+    ) -> TemplateVariables {
+        TemplateVariables {
+            base_path: base_path.to_string(),
+            worktree_path: worktree_path.to_string(),
+            branch_name: branch_name.to_string(),
+            source_branch: source_branch.to_string(),
+        }
+    }
+
+    #[test]
+    fn substitutes_known_keys_and_leaves_unknown_ones_alone() {
+        let v = vars("/repo", "/repo/wt", "feat/x", "main");
+        let out = resolve_template("$BASE_PATH | $WORKTREE_PATH | $UNKNOWN", &v);
+        assert_eq!(out, "/repo | /repo/wt | $UNKNOWN");
+    }
+
+    #[test]
+    fn does_not_recurse_into_substituted_values() {
+        // BRANCH_NAME contains the literal `$SOURCE_BRANCH`. The previous
+        // implementation expanded it in a later pass because substitutions
+        // ran sequentially. Single-pass scanning keeps the value verbatim.
+        let v = vars("", "", "$SOURCE_BRANCH", "main");
+        let out = resolve_template("$BRANCH_NAME", &v);
+        assert_eq!(out, "$SOURCE_BRANCH");
+    }
+
+    #[test]
+    fn value_with_dollar_other_key_is_not_reexpanded() {
+        let v = vars("a$WORKTREE_PATHb", "WTVAL", "", "");
+        let out = resolve_template("$BASE_PATH", &v);
+        assert_eq!(out, "a$WORKTREE_PATHb");
+    }
+
+    #[test]
+    fn handles_adjacent_and_repeated_keys() {
+        let v = vars("X", "Y", "Z", "Q");
+        let out = resolve_template("$BASE_PATH$BASE_PATH$WORKTREE_PATH", &v);
+        assert_eq!(out, "XXY");
+    }
+
+    #[test]
+    fn bare_dollar_is_preserved() {
+        let v = vars("", "", "", "");
+        assert_eq!(resolve_template("$ alone $", &v), "$ alone $");
+    }
 }

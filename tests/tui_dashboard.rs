@@ -67,6 +67,8 @@ fn row(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
                 ahead: if branch == "bug" { 1 } else { 0 },
                 behind: 0,
                 upstream_branch: Some("origin/main".into()),
+                insertions: None,
+                deletions: None,
             }),
         },
         last_commit: Some(CommitSummary {
@@ -1112,6 +1114,8 @@ fn behind_row_via_branch_status(path: &str, branch: &str) -> DashboardRow {
         ahead: 1,
         behind: 3,
         upstream_branch: Some("upstream/main".into()),
+        insertions: None,
+        deletions: None,
     });
     row
 }
@@ -1269,6 +1273,8 @@ fn action_menu_hides_update_option_when_no_pr_present() {
         ahead: 0,
         behind: 5,
         upstream_branch: Some("upstream/main".into()),
+        insertions: None,
+        deletions: None,
     });
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_no_pr]);
 

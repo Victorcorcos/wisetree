@@ -974,7 +974,7 @@ impl DashboardField {
             DashboardField::RefreshIntervalMs => "5000..60000 (ms)",
             DashboardField::ShowPullRequests => "Press Enter to toggle",
             DashboardField::Columns => {
-                "Comma-separated: branch, status, ahead_behind, last_commit, pull_request"
+                "Comma-separated: branch, status, ahead_behind, diff, last_commit, pull_request"
             }
             DashboardField::UseAi => {
                 "Provider/model for opencode (e.g. anthropic/claude-sonnet-4-5). Blank disables AI."
@@ -4711,7 +4711,7 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
     let placeholder = match field {
         DashboardField::RefreshIntervalMs => "Refresh interval in ms (5000..60000)",
         DashboardField::ShowPullRequests => "true or false",
-        DashboardField::Columns => "branch, status, ahead_behind, last_commit, pull_request",
+        DashboardField::Columns => "branch, status, ahead_behind, diff, last_commit, pull_request",
         DashboardField::UseAi => "provider/model (e.g. anthropic/claude-sonnet-4-5)",
     };
     InputPrompt::new("")
