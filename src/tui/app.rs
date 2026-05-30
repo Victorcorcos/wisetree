@@ -433,6 +433,13 @@ impl App {
                     .as_ref()
                     .filter(|d| matches!(d.step(), DeleteStep::Confirm))
                     .and_then(|d| d.overlay_modal().cloned());
+                // While the worktree list is still loading for a single-path
+                // delete (Backspace shortcut), the confirm modal isn't built
+                // yet, so overlay_modal is None. Keep the dashboard visible
+                // during that window to avoid a ~1 s blink before the modal
+                // appears.
+                let loading_single = self.pending_delete_path.is_some()
+                    && self.delete.as_ref().map(|d| d.loading()).unwrap_or(false);
                 if let Some(modal) = overlay_modal {
                     let panel = self.render_framed_panel_fill(frame, area);
                     if let Some(dashboard) = self.dashboard.as_mut() {
@@ -440,6 +447,12 @@ impl App {
                         dashboard.render(frame, panel);
                     }
                     modal.render(frame, panel);
+                } else if loading_single {
+                    let panel = self.render_framed_panel_fill(frame, area);
+                    if let Some(dashboard) = self.dashboard.as_mut() {
+                        dashboard.tick = self.tick;
+                        dashboard.render(frame, panel);
+                    }
                 } else {
                     let panel = match self.delete.as_ref().map(|s| s.step()) {
                         Some(DeleteStep::Confirm) => self.render_framed_panel_fill(frame, area),
@@ -874,8 +887,7 @@ impl App {
                 match action {
                     DeleteAction::Continue => {}
                     DeleteAction::Cancelled => {
-                        self.bulk_delete_queue.clear();
-                        self.leave_delete_screen(tx);
+                        self.cancel_delete_screen(tx);
                     }
                     DeleteAction::Confirmed { path, force } => {
                         if let Some(delete) = self.delete.as_mut() {
@@ -1581,8 +1593,7 @@ impl App {
         match action {
             DeleteAction::Continue => {}
             DeleteAction::Cancelled => {
-                self.bulk_delete_queue.clear();
-                self.leave_delete_screen(tx);
+                self.cancel_delete_screen(tx);
             }
             DeleteAction::Confirmed { path, force } => {
                 if let Some(delete) = self.delete.as_mut() {
@@ -1641,6 +1652,46 @@ impl App {
             || !self.pending_bulk_delete_paths.is_empty();
         if (from_dashboard_single || from_dashboard_bulk) && self.git_root.is_some() {
             self.enter_screen(Screen::Dashboard, tx);
+        } else {
+            self.back_to_menu();
+        }
+    }
+
+    /// Cancel the Delete screen and return to the preserved dashboard. Unlike
+    /// `leave_delete_screen` (which re-creates the dashboard from scratch after
+    /// a completed deletion), this path keeps the existing `self.dashboard`
+    /// instance so the user's row selection, scroll position, and any other
+    /// in-flight state survive the round-trip.
+    fn cancel_delete_screen(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let from_dashboard_single = self.pending_delete_path.take().is_some();
+        let from_dashboard_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false)
+            || !self.pending_bulk_delete_paths.is_empty();
+
+        if (from_dashboard_single || from_dashboard_bulk) && self.git_root.is_some() {
+            if self.dashboard.is_some() {
+                // A dashboard instance was preserved when we entered the delete
+                // screen. Restore it directly to keep selection state intact.
+                self.delete = None;
+                self.pending_bulk_delete_paths.clear();
+                self.bulk_delete_queue.clear();
+                self.screen = Screen::Dashboard;
+                // The watch was dropped when we entered the delete screen.
+                // Restore it so the dashboard keeps receiving live updates.
+                if self.dashboard_watch.is_none() {
+                    if let Some(git_root) = self.git_root.as_ref().map(std::path::PathBuf::from) {
+                        let config = self
+                            .current_config()
+                            .map(|cfg| cfg.dashboard.clone())
+                            .unwrap_or_default();
+                        let service = DashboardService::new(git_root, config);
+                        self.dashboard_watch = Some(service.watch());
+                    }
+                }
+            } else {
+                // No preserved dashboard (e.g. delete was opened from the menu
+                // rather than the Backspace shortcut). Fall back to a fresh one.
+                self.enter_screen(Screen::Dashboard, tx);
+            }
         } else {
             self.back_to_menu();
         }
