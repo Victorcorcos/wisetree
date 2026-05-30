@@ -802,7 +802,6 @@ impl App {
                         self.last_menu_index = idx;
                         match choice {
                             MenuChoice::Exit => self.quit_requested = true,
-                            MenuChoice::SetupProject => self.enter_screen(Screen::SetupProject, tx),
                             MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                             MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                             MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
@@ -1023,6 +1022,9 @@ impl App {
                     }
                     SettingsAction::FetchFreeModels => {
                         kick_off_fetch_free_opencode_models(tx.clone());
+                    }
+                    SettingsAction::OpenSetupProject => {
+                        self.enter_screen(Screen::SetupProject, tx);
                     }
                 }
             }
@@ -1347,7 +1349,6 @@ impl App {
                 self.last_menu_index = idx;
                 match choice {
                     MenuChoice::Exit => self.quit_requested = true,
-                    MenuChoice::SetupProject => self.enter_screen(Screen::SetupProject, tx),
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                     MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
@@ -1805,6 +1806,9 @@ impl App {
             }
             SettingsAction::FetchFreeModels => {
                 kick_off_fetch_free_opencode_models(tx.clone());
+            }
+            SettingsAction::OpenSetupProject => {
+                self.enter_screen(Screen::SetupProject, tx);
             }
         }
     }
@@ -2563,17 +2567,20 @@ impl App {
             Screen::Settings => {
                 let local_path = self.local_config_path_str();
                 let global_path = global_config_file().display().to_string();
+                let has_setup_project = self.git_root.is_some() && !self.has_local_config();
                 let settings = match self.settings_snapshot() {
                     Ok((config, config_path)) => SettingsScreen::new(config, config_path)
                         .with_global_config_path(global_path)
-                        .with_local_config_path(local_path),
+                        .with_local_config_path(local_path)
+                        .with_has_setup_project(has_setup_project),
                     Err(err) => {
                         let mut settings = SettingsScreen::new(
                             WorktreeConfig::default(),
                             global_config_file().display().to_string(),
                         )
                         .with_global_config_path(global_config_file().display().to_string())
-                        .with_local_config_path(local_path);
+                        .with_local_config_path(local_path)
+                        .with_has_setup_project(has_setup_project);
                         settings.set_error(err);
                         settings
                     }
@@ -2746,16 +2753,12 @@ impl App {
             self.shell_integration_status
                 .as_ref()
                 .map(|status| status.is_installed),
-            self.has_local_config(),
             self.current_config()
                 .map(|config| !config.worktree_link_patterns.is_empty())
                 .unwrap_or(false),
         )
     }
 
-    /// True when the active project already has a `.wisetree.json`. The
-    /// menu uses this to decide whether to surface the one-keystroke
-    /// "Setup Project Config" entry.
     fn has_local_config(&self) -> bool {
         self.local_config_path()
             .map(|p| p.exists())
@@ -4183,6 +4186,11 @@ mod tests {
     #[test]
     fn settings_delete_branch_toggle_updates_global_config_file_when_local_missing() {
         with_home(|home| {
+            // Use a repo dir inside the temp home so has_local_config() is
+            // deterministically false (no .wisetree.json there).
+            let repo_root = home.path().join("repo_no_local");
+            fs::create_dir_all(&repo_root).unwrap();
+
             let mut config_service = ConfigService::new();
             let global_path = home.path().join(".wisetree").join("settings.json");
             let initial = WorktreeConfig {
@@ -4199,11 +4207,11 @@ mod tests {
             app.phase = InitPhase::Ready;
             app.screen = Screen::Settings;
             app.worktree_service = Some(service);
-            app.git_root = Some("/tmp/repo".into());
+            app.git_root = Some(repo_root.display().to_string());
 
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -4444,7 +4452,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..8 {
+            for _ in 0..10 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -4504,7 +4512,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..8 {
+            for _ in 0..9 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
