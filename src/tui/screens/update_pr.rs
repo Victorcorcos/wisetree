@@ -1341,9 +1341,7 @@ impl UpdatePullRequestScreen {
     fn render_terminal_header(&self, frame: &mut Frame, area: Rect) {
         let lines: Vec<Line<'static>> = terminal_error_lines(self.terminal_header_text())
             .into_iter()
-            .map(|line| {
-                Line::from(Span::styled(line, Style::default().fg(colors::ERROR)))
-            })
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(colors::ERROR))))
             .collect();
         let block = Block::default()
             .borders(Borders::ALL)
@@ -2835,7 +2833,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                f.render_widget(button_paragraph("Accept & Push", colors::SUCCESS, true), f.area());
+                f.render_widget(
+                    button_paragraph("Accept & Push", colors::SUCCESS, true),
+                    f.area(),
+                );
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -2844,7 +2845,9 @@ mod tests {
         let symbols: Vec<String> = (0..19)
             .map(|x| buffer[(x, 1)].symbol().to_string())
             .collect();
-        let first_text = (1..18).find(|&x| symbols[x] != " ").expect("label rendered");
+        let first_text = (1..18)
+            .find(|&x| symbols[x] != " ")
+            .expect("label rendered");
         let last_text = (1..18)
             .rev()
             .find(|&x| symbols[x] != " ")
