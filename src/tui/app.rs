@@ -529,21 +529,22 @@ impl App {
                 }
             }
             Screen::UpdatePullRequest => {
-                // Once the AI is actively streaming the conflict resolution
-                // we want the entire bottom region of the screen so the
-                // AI Activity panel — the longest-running, scroll-heavy view
-                // in the app — has room to breathe. The Confirm and pre-AI
-                // phases (Fetching, Merging) stay in the compact framed
-                // panel so they don't look lost in a huge empty area.
-                let ai_active = self
+                // Once the AI is actively streaming the conflict resolution —
+                // or the push failed and the interactive Terminal Activity
+                // shell is up — we want the entire bottom region of the
+                // screen so these long-running, scroll-heavy panels have room
+                // to breathe. The Confirm and pre-AI phases (Fetching,
+                // Merging) stay in the compact framed panel so they don't look
+                // lost in a huge empty area.
+                let wants_fill = self
                     .update_pr
                     .as_ref()
-                    .is_some_and(|s| s.is_updating() && s.ai_active());
+                    .is_some_and(|s| s.is_updating() && (s.ai_active() || s.terminal_active()));
                 let in_confirm = self
                     .update_pr
                     .as_ref()
                     .is_some_and(|s| matches!(s.step(), UpdateStep::Confirm));
-                let panel = if ai_active || in_confirm {
+                let panel = if wants_fill || in_confirm {
                     self.render_framed_panel_fill(frame, area)
                 } else {
                     let h = self

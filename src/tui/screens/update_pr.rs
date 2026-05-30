@@ -24,7 +24,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::Frame;
 
@@ -492,8 +492,17 @@ impl UpdatePullRequestScreen {
         if !matches!(self.step, UpdateStep::Updating) || !(self.ai_active || self.terminal_active) {
             return false;
         }
+        let terminal = self.terminal_active;
         if let Some(pty) = self.pty.as_mut() {
-            pty.send_input(PTY_PAGE_UP);
+            if terminal {
+                // The recovery shell runs on the *main* screen, so vt100 keeps
+                // a real scrollback buffer — scroll it directly. Forwarding a
+                // PageUp keystroke instead would just be echoed by the shell
+                // as literal `~` characters.
+                pty.scroll_up(lines);
+            } else {
+                pty.send_input(PTY_PAGE_UP);
+            }
         } else {
             self.ai_scroll = self.ai_scroll.saturating_add(lines);
         }
@@ -507,8 +516,16 @@ impl UpdatePullRequestScreen {
         if !matches!(self.step, UpdateStep::Updating) || !(self.ai_active || self.terminal_active) {
             return false;
         }
+        let terminal = self.terminal_active;
         if let Some(pty) = self.pty.as_mut() {
-            pty.send_input(PTY_PAGE_DOWN);
+            if terminal {
+                // See `handle_mouse_scroll_up`: the shell's vt100 scrollback is
+                // real, so scroll it directly rather than feeding the shell a
+                // PageDown it would echo as literal `~`.
+                pty.scroll_down(lines);
+            } else {
+                pty.send_input(PTY_PAGE_DOWN);
+            }
         } else {
             self.ai_scroll = self.ai_scroll.saturating_sub(lines);
         }
@@ -1270,25 +1287,26 @@ impl UpdatePullRequestScreen {
         self.ai_button_rects.set([chunks[1], chunks[3]]);
     }
 
-    /// Render the Terminal Activity recovery layout: a one-line error
-    /// header, the embedded shell panel, a shortcuts row, and the
-    /// Accept/Discard decision buttons.
+    /// Render the Terminal Activity recovery layout: a bordered "Push error"
+    /// box (sized to the wrapped error so nothing is truncated), the embedded
+    /// shell panel, a shortcuts row, and the Accept/Discard decision buttons.
     fn render_terminal(&mut self, frame: &mut Frame, area: Rect) {
-        if area.height < 5 {
+        if area.height < 7 {
             StatusIndicator::new(Status::Loading, UPDATE_PUSH_FAILED_MESSAGE)
                 .with_tick(self.tick)
                 .render(frame, area);
             return;
         }
+        let header_h = self.terminal_header_height(area.width);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // error header
-                Constraint::Length(1), // blank
-                Constraint::Min(3),    // Terminal Activity panel
-                Constraint::Length(1), // shortcuts hint
-                Constraint::Length(1), // blank
-                Constraint::Length(3), // Accept / Discard buttons
+                Constraint::Length(header_h), // Push error box
+                Constraint::Length(1),        // blank
+                Constraint::Min(3),           // Terminal Activity panel
+                Constraint::Length(1),        // shortcuts hint
+                Constraint::Length(1),        // blank
+                Constraint::Length(3),        // Accept / Discard buttons
             ])
             .split(area);
 
@@ -1298,19 +1316,49 @@ impl UpdatePullRequestScreen {
         self.render_terminal_buttons(frame, chunks[5]);
     }
 
-    fn render_terminal_header(&self, frame: &mut Frame, area: Rect) {
-        let detail = if self.terminal_error.is_empty() {
-            UPDATE_PUSH_FAILED_MESSAGE.to_string()
+    /// Height (borders included) for the "Push error" box: sized to the
+    /// wrapped error text and capped so a long git error never crowds out the
+    /// shell below it.
+    fn terminal_header_height(&self, width: u16) -> u16 {
+        const MAX_CONTENT_LINES: usize = 6;
+        let inner = width.saturating_sub(2).max(1) as usize;
+        let content = terminal_error_lines(self.terminal_header_text())
+            .iter()
+            .map(|line| line.chars().count().max(1).div_ceil(inner))
+            .sum::<usize>()
+            .clamp(1, MAX_CONTENT_LINES);
+        content as u16 + 2
+    }
+
+    fn terminal_header_text(&self) -> &str {
+        if self.terminal_error.is_empty() {
+            UPDATE_PUSH_FAILED_MESSAGE
         } else {
-            format!("Push failed: {}", self.terminal_error)
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                detail,
+            self.terminal_error.as_str()
+        }
+    }
+
+    fn render_terminal_header(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line<'static>> = terminal_error_lines(self.terminal_header_text())
+            .into_iter()
+            .map(|line| {
+                Line::from(Span::styled(line, Style::default().fg(colors::ERROR)))
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(colors::ERROR))
+            .title(Line::from(Span::styled(
+                " Push error ".to_string(),
                 Style::default()
                     .fg(colors::ERROR)
                     .add_modifier(Modifier::BOLD),
-            ))),
+            )));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
             area,
         );
     }
@@ -1469,20 +1517,29 @@ impl UpdatePullRequestScreen {
     }
 
     fn render_terminal_buttons(&self, frame: &mut Frame, area: Rect) {
+        // Each button hugs its own label instead of sharing a fixed width, so
+        // the short "Discard" doesn't render as a wide, mostly-empty box. Width
+        // = label + 2 borders + 2 padding cells each side; both labels are
+        // odd-length, so the even padding keeps the text centered with equal
+        // space on both sides (bare labels — `button_paragraph` centers, so
+        // any manual padding would just push the text off-center).
+        let accept = "Accept & Push";
+        let discard = "Discard";
+        let button_width = |label: &str| label.len() as u16 + 6;
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(0),
-                Constraint::Length(18),
+                Constraint::Length(button_width(accept)),
                 Constraint::Length(2),
-                Constraint::Length(18),
+                Constraint::Length(button_width(discard)),
                 Constraint::Min(0),
             ])
             .split(area);
 
         frame.render_widget(
             button_paragraph(
-                "  Accept & Push ",
+                accept,
                 colors::SUCCESS,
                 matches!(self.terminal_button, TermButton::Accept),
             ),
@@ -1490,13 +1547,31 @@ impl UpdatePullRequestScreen {
         );
         frame.render_widget(
             button_paragraph(
-                "  Discard  ",
+                discard,
                 colors::ERROR,
                 matches!(self.terminal_button, TermButton::Discard),
             ),
             chunks[3],
         );
         self.terminal_button_rects.set([chunks[1], chunks[3]]);
+    }
+}
+
+/// Split a (possibly multi-line) push error into trimmed, non-empty display
+/// lines for the "Push error" box. git writes its push rejection across
+/// several lines (`To <remote>` / `! [rejected] ...` / `error: ...` /
+/// `hint: ...`), and `run_command` keeps those newlines, so this preserves
+/// the structure instead of mashing it onto one truncated row.
+fn terminal_error_lines(text: &str) -> Vec<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        vec![text.trim().to_string()]
+    } else {
+        lines
     }
 }
 
@@ -2712,6 +2787,73 @@ mod tests {
         assert!(
             dumped.contains("Accept") && dumped.contains("Discard"),
             "expected Accept/Discard buttons in:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn terminal_error_lines_splits_multiline_git_error() {
+        let err = "To github.com:me/repo.git\n ! [rejected]   HEAD -> main (fetch first)\nerror: failed to push some refs to 'github.com:me/repo.git'";
+        let lines = terminal_error_lines(err);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "To github.com:me/repo.git");
+        assert!(lines[2].starts_with("error: failed to push"));
+    }
+
+    #[test]
+    fn terminal_error_box_shows_full_error_wrapped_not_truncated() {
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        // A realistic multi-line git push rejection. A nonexistent shell makes
+        // the spawn fail (pty = None) without affecting the error-box render.
+        screen.start_terminal_recovery(
+            std::path::PathBuf::from("/nonexistent-shell-xyz"),
+            Vec::new(),
+            std::env::temp_dir(),
+            "To github.com:me/repo.git\n ! [rejected] HEAD -> main (fetch first)\n\
+             error: failed to push some refs to 'github.com:me/repo.git'"
+                .to_string(),
+        );
+        let dumped = render_dump(&mut screen, 100, 30);
+        assert!(
+            dumped.contains("Push error"),
+            "expected dedicated error box title:\n{dumped}"
+        );
+        // The tail of the error (previously cut off at "...some re") must now
+        // be fully visible.
+        assert!(
+            dumped.contains("failed to push some refs"),
+            "full error must not be truncated:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn terminal_button_label_is_horizontally_centered() {
+        // Render a focused button into a 19-wide cell (matches
+        // `render_terminal_buttons`) and assert the label sits with equal
+        // padding on both sides — i.e. no asymmetric manual padding sneaks
+        // back into the label.
+        let backend = TestBackend::new(19, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(button_paragraph("Accept & Push", colors::SUCCESS, true), f.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // Row 1 sits between the top/bottom borders; cols 0 and 18 are the
+        // side borders, so the usable inner span is cols 1..=17.
+        let symbols: Vec<String> = (0..19)
+            .map(|x| buffer[(x, 1)].symbol().to_string())
+            .collect();
+        let first_text = (1..18).find(|&x| symbols[x] != " ").expect("label rendered");
+        let last_text = (1..18)
+            .rev()
+            .find(|&x| symbols[x] != " ")
+            .expect("label rendered");
+        let left_pad = first_text - 1;
+        let right_pad = 17 - last_text;
+        assert_eq!(
+            left_pad, right_pad,
+            "button label not centered (left {left_pad} vs right {right_pad}): {symbols:?}"
         );
     }
 
