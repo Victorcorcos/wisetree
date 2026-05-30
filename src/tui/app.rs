@@ -1101,19 +1101,7 @@ impl App {
                         self.update_pr = None;
                         self.enter_screen(Screen::Dashboard, tx);
                     }
-                    UpdateAction::Confirmed => {
-                        let Some(screen) = self.update_pr.as_mut() else {
-                            return;
-                        };
-                        let request = screen.request().clone();
-                        screen.start_updating();
-                        kick_off_update_pull_request(
-                            self.git_root.clone(),
-                            self.current_dashboard_config(),
-                            request,
-                            tx.clone(),
-                        );
-                    }
+                    UpdateAction::Confirmed => self.confirm_update_pr(tx),
                     UpdateAction::AiComplete => {
                         let dashboard_config = self.current_dashboard_config();
                         let git_root = self.git_root.clone();
@@ -1146,6 +1134,8 @@ impl App {
                         screen.set_phase_message("Aborting merge and discarding AI changes...");
                         kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
                     }
+                    UpdateAction::TerminalAccept => self.terminal_accept_push(tx),
+                    UpdateAction::TerminalDiscard => self.terminal_discard(tx),
                 }
             }
             Screen::UpdateBranch => {}
@@ -1277,19 +1267,7 @@ impl App {
                 self.update_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
-            UpdateAction::Confirmed => {
-                let Some(screen) = self.update_pr.as_mut() else {
-                    return;
-                };
-                let request = screen.request().clone();
-                screen.start_updating();
-                kick_off_update_pull_request(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
-                    request,
-                    tx.clone(),
-                );
-            }
+            UpdateAction::Confirmed => self.confirm_update_pr(tx),
             UpdateAction::AiComplete => {
                 let dashboard_config = self.current_dashboard_config();
                 let git_root = self.git_root.clone();
@@ -1322,6 +1300,71 @@ impl App {
                 screen.set_phase_message("Aborting merge and discarding AI changes...");
                 kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
             }
+            UpdateAction::TerminalAccept => self.terminal_accept_push(tx),
+            UpdateAction::TerminalDiscard => self.terminal_discard(tx),
+        }
+    }
+
+    /// Shared dispatch for confirming the update/push confirmation dialog.
+    /// Push-only screens re-route to the push pipeline; everything else
+    /// runs the full fetch/merge/push update.
+    fn confirm_update_pr(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.update_pr.as_mut() else {
+            return;
+        };
+        let request = screen.request().clone();
+        let push_only = screen.is_push_only();
+        screen.start_updating();
+        if push_only {
+            screen.set_phase_message("Pushing to origin...");
+            kick_off_push_pull_request(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                request,
+                tx.clone(),
+            );
+        } else {
+            kick_off_update_pull_request(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                request,
+                tx.clone(),
+            );
+        }
+    }
+
+    /// The user pressed Accept in the Terminal Activity recovery panel:
+    /// re-run `git push origin HEAD` and report the real outcome. A repeat
+    /// failure simply re-opens the terminal (via `apply_update_pr_finished`).
+    fn terminal_accept_push(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.update_pr.as_mut() else {
+            return;
+        };
+        let request = screen.request().clone();
+        screen.set_phase_message("Re-attempting push...");
+        kick_off_push_pull_request(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request,
+            tx.clone(),
+        );
+    }
+
+    /// The user pressed Discard/Esc in the Terminal Activity recovery panel:
+    /// leave the worktree as-is (the local merge is intact) and return to the
+    /// dashboard with an explanatory toast.
+    fn terminal_discard(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let number = self.update_pr.as_ref().map(|s| s.request().number);
+        self.update_pr = None;
+        self.enter_screen(Screen::Dashboard, tx);
+        if let Some(number) = number {
+            self.show_toast(
+                ToastVariant::Warning,
+                format!(
+                    "Left PR #{number} without confirming a push — the local merge is \
+                     intact; push when ready."
+                ),
+            );
         }
     }
 
@@ -1422,6 +1465,9 @@ impl App {
             DashboardAction::UpdatePullRequest(request) => {
                 self.start_update_pr_flow(*request, tx);
             }
+            DashboardAction::PushPullRequest(request) => {
+                self.start_push_pr_flow(*request, tx);
+            }
             DashboardAction::UpdateBranch(path) => {
                 self.start_update_branch_flow(path, tx);
             }
@@ -1498,6 +1544,19 @@ impl App {
         self.update_pr = Some(UpdatePullRequestScreen::new(request));
         self.screen = Screen::UpdatePullRequest;
         kick_off_resolve_base_ref(worktree_path, number, tx.clone());
+    }
+
+    /// Mount the push-only confirmation screen. A push needs no base ref,
+    /// so — unlike `start_update_pr_flow` — there's no resolver kick-off;
+    /// the screen lands straight on the Confirm step. Confirmation routes
+    /// to `kick_off_push_pull_request` (see `handle_update_pr_key`).
+    fn start_push_pr_flow(
+        &mut self,
+        request: UpdatePullRequestRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.update_pr = Some(UpdatePullRequestScreen::new_push(request));
+        self.screen = Screen::UpdatePullRequest;
     }
 
     fn start_close_pr_flow(
@@ -2251,6 +2310,24 @@ impl App {
                 return;
             }
         }
+        // A failed `git push` (clean-merge push, AI commit+push, or the
+        // dedicated Push action) does NOT dead-end on a toast. We hand off
+        // to the interactive Terminal Activity recovery panel — a real
+        // shell rooted at the worktree — so the user can diagnose and fix
+        // it, then Accept (re-push) or Discard. Only falls through to the
+        // toast below if the screen was already torn down.
+        if let Ok(UpdatePrSuccess {
+            outcome: UpdatePullRequestOutcome::PushFailed(err),
+            ..
+        }) = &result
+        {
+            if let Some(screen) = self.update_pr.as_mut() {
+                let (shell, args) = resolve_recovery_shell();
+                let cwd = PathBuf::from(&screen.request().worktree_path);
+                screen.start_terminal_recovery(shell, args, cwd, err.clone());
+                return;
+            }
+        }
         match result {
             Ok(UpdatePrSuccess {
                 number,
@@ -2267,6 +2344,12 @@ impl App {
                     self.show_toast(
                         ToastVariant::Success,
                         format!("Pull Request #{number} updated with `{base_ref}` and pushed."),
+                    );
+                }
+                UpdatePullRequestOutcome::Pushed => {
+                    self.show_toast(
+                        ToastVariant::Success,
+                        format!("Pull Request #{number} pushed to origin."),
                     );
                 }
                 UpdatePullRequestOutcome::MergedWithAiResolution => {
@@ -3723,6 +3806,63 @@ fn kick_off_update_pull_request(
         };
         let _ = tx.send(AppEvent::UpdatePrFinished(event));
     });
+}
+
+/// Push-only counterpart to `kick_off_update_pull_request`: runs
+/// `git push origin HEAD` against the worktree and reports `Pushed` /
+/// `PushFailed`. Powers both the dashboard's "Push Pull Request" action and
+/// the Terminal Activity panel's "Accept" re-push. A `PushFailed` result is
+/// handled by `apply_update_pr_finished`, which re-opens the recovery panel.
+fn kick_off_push_pull_request(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    request: UpdatePullRequestRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let number = request.number;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
+            number,
+            message: "Could not resolve git root for push.".to_string(),
+        })));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .push_pull_request_with_progress(&request.worktree_path, None)
+            .await;
+        let event = match result {
+            Ok(outcome) => Ok(UpdatePrSuccess {
+                number,
+                // A push has no base ref; the `Pushed` toast doesn't use it.
+                base_ref: String::new(),
+                outcome,
+            }),
+            Err(err) => Err(UpdatePrFailure {
+                number,
+                message: user_friendly_message(&err),
+            }),
+        };
+        let _ = tx.send(AppEvent::UpdatePrFinished(event));
+    });
+}
+
+/// Resolve a shell to host the Terminal Activity recovery panel. Prefers
+/// `$SHELL`, falling back to bash then sh. Interactive shells need no extra
+/// args once they own a PTY, so the args vector is always empty.
+fn resolve_recovery_shell() -> (PathBuf, Vec<String>) {
+    if let Ok(shell) = std::env::var("SHELL") {
+        if !shell.trim().is_empty() {
+            return (PathBuf::from(shell), Vec::new());
+        }
+    }
+    for candidate in ["/bin/bash", "/bin/sh"] {
+        if std::path::Path::new(candidate).exists() {
+            return (PathBuf::from(candidate), Vec::new());
+        }
+    }
+    (PathBuf::from("/bin/sh"), Vec::new())
 }
 
 fn kick_off_setup_install(shell: Shell, tx: mpsc::UnboundedSender<AppEvent>) {
