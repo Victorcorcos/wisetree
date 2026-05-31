@@ -1701,6 +1701,10 @@ impl App {
             // bulk markers that `leave_delete_screen` inspects.
             self.pending_delete_path = None;
             self.pending_bulk_delete_paths.clear();
+            self.maybe_redirect_git_root_to_mother();
+            if self.quit_requested {
+                return;
+            }
             if self.git_root.is_some() {
                 self.enter_screen(Screen::Dashboard, tx);
             } else {
@@ -1720,10 +1724,44 @@ impl App {
         let from_dashboard_single = self.pending_delete_path.take().is_some();
         let from_dashboard_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false)
             || !self.pending_bulk_delete_paths.is_empty();
+        self.maybe_redirect_git_root_to_mother();
+        if self.quit_requested {
+            return;
+        }
         if (from_dashboard_single || from_dashboard_bulk) && self.git_root.is_some() {
             self.enter_screen(Screen::Dashboard, tx);
         } else {
             self.back_to_menu();
+        }
+    }
+
+    /// If the current `git_root` directory no longer exists on disk (e.g. the
+    /// user just deleted the worktree they launched wisetree from), redirect
+    /// to the main/mother worktree: update `git_root`, change this process's
+    /// cwd, and — in wrapper mode — quit so the shell lands in the mother path.
+    fn maybe_redirect_git_root_to_mother(&mut self) {
+        let needs_redirect = self
+            .git_root
+            .as_deref()
+            .map(|p| !std::path::Path::new(p).exists())
+            .unwrap_or(false);
+        if !needs_redirect {
+            return;
+        }
+        let Some(main_path) = self
+            .dashboard
+            .as_ref()
+            .and_then(|d| d.main_worktree_path())
+        else {
+            return;
+        };
+        self.git_root = Some(main_path.clone());
+        // Update the process cwd so git commands executed from here resolve
+        // correctly even if the caller stays in the TUI (non-wrapper mode).
+        let _ = std::env::set_current_dir(&main_path);
+        if self.is_from_wrapper {
+            self.selected_path = Some(main_path);
+            self.quit_requested = true;
         }
     }
 

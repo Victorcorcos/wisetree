@@ -351,6 +351,15 @@ impl DashboardScreen {
         !self.rows.is_empty()
     }
 
+    /// Returns the path of the main (mother) worktree from the loaded rows,
+    /// or `None` if the rows haven't been populated yet.
+    pub fn main_worktree_path(&self) -> Option<String> {
+        self.rows
+            .iter()
+            .find(|row| row.worktree.is_main)
+            .map(|row| row.worktree.path.clone())
+    }
+
     pub fn preferred_content_height(&self) -> u16 {
         if self.loading {
             return 4;
