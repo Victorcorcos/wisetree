@@ -36,8 +36,8 @@ use crate::services::{
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
     parse_pull_request_md, resolve_dashboard_columns, AppStateService, DashboardService,
     DashboardUpdate, DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest,
-    OpencodeModel, Shell,
-    ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult, UpdatePhase, UpdateProgress,
+    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult,
+    UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
