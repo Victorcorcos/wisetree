@@ -341,6 +341,10 @@ pub enum UpdatePullRequestOutcome {
     AlreadyUpToDate,
     /// `git merge` succeeded with no conflicts; the result has been pushed.
     MergedCleanly,
+    /// A push-only run (`Push Pull Request` action, or the Terminal recovery
+    /// re-push) sent `git push origin HEAD` and it succeeded. No merge was
+    /// attempted — the branch was already ahead-but-not-behind.
+    Pushed,
     /// Conflicts were detected, `useAi` is set, opencode is on PATH, and
     /// the merge is paused mid-flight (index has conflict markers). The
     /// UI takes over from here: it spawns opencode inside an embedded
@@ -1007,6 +1011,34 @@ impl DashboardService {
         }
 
         Ok(UpdatePullRequestOutcome::MergedCleanly)
+    }
+
+    /// Push-only counterpart to the update pipeline: just runs
+    /// `git push origin HEAD` against `worktree_path`. Powers the dashboard's
+    /// "Push Pull Request" action (for branches that are ahead-but-not-behind,
+    /// e.g. a local merge that never got pushed) and the Terminal recovery
+    /// panel's "Accept" re-push. Returns `Pushed` on success or `PushFailed`
+    /// on failure — the exact same failure variant the merge pipeline emits,
+    /// so both paths hand off to the same recovery UI.
+    pub async fn push_pull_request_with_progress(
+        &self,
+        worktree_path: &str,
+        progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
+    ) -> Result<UpdatePullRequestOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+        if let Some(tx) = progress.as_ref() {
+            let _ = tx.send(UpdateProgress::Phase(UpdatePhase::Pushing));
+        }
+        let push = time::timeout(
+            UPDATE_PUSH_TIMEOUT,
+            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+        match push {
+            Ok(_) => Ok(UpdatePullRequestOutcome::Pushed),
+            Err(err) => Ok(UpdatePullRequestOutcome::PushFailed(err)),
+        }
     }
 
     /// Fetch the remote and merge the worktree at `worktree_path` with

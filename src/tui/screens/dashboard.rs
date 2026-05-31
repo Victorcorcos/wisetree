@@ -48,6 +48,7 @@ enum ActionChoice {
     FillPullRequest,
     MergePullRequest,
     UpdatePullRequest,
+    PushPullRequest,
     ClosePullRequest,
     UpdateBranch,
 }
@@ -185,6 +186,11 @@ pub enum DashboardAction {
     /// pull request. Offered on any non-mother worktree that either has an
     /// open PR or has commits ahead of its base ref.
     FillPullRequest(Box<FillPullRequestRequest>),
+    /// Push the branch's local commits to origin (`git push origin HEAD`).
+    /// Offered when the PR is Open and the branch is ahead-but-not-behind —
+    /// the "merged-but-not-pushed" state a failed push can leave behind.
+    /// Reuses the `UpdatePullRequestRequest` payload.
+    PushPullRequest(Box<UpdatePullRequestRequest>),
     ClosePullRequest(Box<ClosePullRequestRequest>),
     /// Fetch the remote and merge the mother branch with the first
     /// reachable ref in `BASE_REF_PRIORITY` (upstream/main →
@@ -669,6 +675,7 @@ impl DashboardScreen {
                     let merge_request = build_merge_request(row);
                     let update_request = build_update_request(row);
                     let fill_request = build_fill_request(row);
+                    let push_request = build_push_request(row);
                     let close_request = build_close_request(row);
                     self.action_select = None;
                     self.action_target = None;
@@ -712,6 +719,12 @@ impl DashboardScreen {
                             self.mode = DashboardMode::Table;
                             fill_request
                                 .map(|request| DashboardAction::FillPullRequest(Box::new(request)))
+                                .unwrap_or(DashboardAction::Continue)
+                        }
+                        ActionChoice::PushPullRequest => {
+                            self.mode = DashboardMode::Table;
+                            push_request
+                                .map(|request| DashboardAction::PushPullRequest(Box::new(request)))
                                 .unwrap_or(DashboardAction::Continue)
                         }
                         ActionChoice::ClosePullRequest => match close_request {
@@ -831,6 +844,22 @@ impl DashboardScreen {
                 ActionChoice::UpdatePullRequest,
             ));
         }
+        // Push appears when the PR is Open and the branch is ahead of its
+        // base but *not* behind — i.e. it has local commits that aren't on
+        // the remote yet. This is the "merged-but-not-pushed" state a failed
+        // push leaves behind, and it's mutually exclusive with Update (which
+        // requires the branch to be behind).
+        if row
+            .pull_request
+            .as_ref()
+            .is_some_and(|pr| matches!(pr.state, PrState::Open))
+            && row_has_unpushed(row)
+        {
+            options.push(
+                SelectOption::new("Push Pull Request", ActionChoice::PushPullRequest)
+                    .with_description("Push local commits to origin (branch is ahead, not behind)"),
+            );
+        }
         if row
             .pull_request
             .as_ref()
@@ -874,6 +903,7 @@ impl DashboardScreen {
                 let merge_request = build_merge_request(row);
                 let update_request = build_update_request(row);
                 let fill_request = build_fill_request(row);
+                let push_request = build_push_request(row);
                 let close_request = build_close_request(row);
                 self.action_select = None;
                 self.action_target = None;
@@ -918,6 +948,13 @@ impl DashboardScreen {
                         self.mode = DashboardMode::Table;
                         match fill_request {
                             Some(request) => DashboardAction::FillPullRequest(Box::new(request)),
+                            None => DashboardAction::Continue,
+                        }
+                    }
+                    ActionChoice::PushPullRequest => {
+                        self.mode = DashboardMode::Table;
+                        match push_request {
+                            Some(request) => DashboardAction::PushPullRequest(Box::new(request)),
                             None => DashboardAction::Continue,
                         }
                     }
@@ -2319,6 +2356,23 @@ pub(crate) fn row_is_behind(row: &DashboardRow) -> bool {
     merge_says_behind || git_says_behind
 }
 
+/// True when the row's branch has local commits that aren't on the remote
+/// yet — ahead of its base but *not* behind. This is the
+/// "merged-but-not-pushed" signal a failed push leaves behind (the local
+/// merge landed, so `behind` dropped to 0, but `ahead` is still positive).
+/// Mutually exclusive with [`row_is_behind`], so Update and Push never both
+/// appear. Used to gate the "Push Pull Request" menu entry.
+pub(crate) fn row_has_unpushed(row: &DashboardRow) -> bool {
+    if row_is_behind(row) {
+        return false;
+    }
+    row.worktree
+        .branch_status
+        .as_ref()
+        .map(|s| s.ahead > 0 && s.behind == 0)
+        .unwrap_or(false)
+}
+
 /// Assemble the payload the update confirmation screen needs. Returns
 /// `None` when the row's PR is missing/not Open or the branch isn't
 /// behind — mirrors the guard in `build_action_select`.
@@ -2396,6 +2450,36 @@ fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
             })
         }
     }
+}
+/// Assemble the payload for the push-only flow. Returns `None` unless the
+/// row's PR is Open and the branch is ahead-but-not-behind — mirrors the
+/// `row_has_unpushed` guard in `build_action_select`. Reuses the
+/// `UpdatePullRequestRequest` struct; `base_ref` stays `None` because a push
+/// needs no base ref.
+fn build_push_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    if !row_has_unpushed(row) {
+        return None;
+    }
+    let (ahead, behind) = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .map(|s| (s.ahead, s.behind))
+        .unwrap_or((0, 0));
+    Some(UpdatePullRequestRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+        ahead,
+        behind,
+        base_ref: None,
+    })
 }
 
 /// Assemble the payload the merge confirmation screen needs from a row.
@@ -2653,4 +2737,149 @@ fn truncate(value: &str, max_chars: usize) -> String {
         .iter()
         .collect::<String>()
         + "..."
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::types::{BranchStatus, GitWorktree};
+    use crate::services::{PullRequest, ReviewerSummary};
+
+    fn branch_status(ahead: u64, behind: u64) -> BranchStatus {
+        BranchStatus {
+            ahead,
+            behind,
+            upstream_branch: Some("origin/main".to_string()),
+            insertions: None,
+            deletions: None,
+        }
+    }
+
+    fn open_pr() -> PullRequest {
+        PullRequest {
+            number: 42,
+            state: PrState::Open,
+            url: "https://github.com/example/repo/pull/42".to_string(),
+            title: "Add feature".to_string(),
+            checks_status: None,
+            review_status: None,
+            merge_status: None,
+            reviewers: ReviewerSummary::default(),
+        }
+    }
+
+    fn row(pr: Option<PullRequest>, status: Option<BranchStatus>) -> DashboardRow {
+        DashboardRow {
+            worktree: GitWorktree {
+                path: "/tmp/repo-feature".to_string(),
+                branch: "feature".to_string(),
+                commit: "abc123".to_string(),
+                is_main: false,
+                is_clean: true,
+                branch_status: status,
+            },
+            last_commit: None,
+            pull_request: pr,
+            ai_status: None,
+            error: None,
+        }
+    }
+
+    fn action_labels(row: &DashboardRow) -> Vec<String> {
+        let screen = DashboardScreen::new(false, false, false, Vec::new(), Vec::new(), true);
+        screen
+            .build_action_select(row)
+            .options
+            .iter()
+            .map(|opt| opt.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn row_has_unpushed_true_when_ahead_and_not_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 0)));
+        assert!(row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_when_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 2)));
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_without_branch_status() {
+        let r = row(Some(open_pr()), None);
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_when_not_ahead() {
+        let r = row(Some(open_pr()), Some(branch_status(0, 0)));
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_when_merge_status_says_behind() {
+        // GitHub's merge_status reports Behind even though git's local count
+        // is 0 — `row_is_behind` wins, so Push must not appear (Update does).
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Behind);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn push_action_appears_for_ahead_not_behind_open_pr() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 0)));
+        let labels = action_labels(&r);
+        assert!(
+            labels.iter().any(|l| l == "Push Pull Request"),
+            "expected Push Pull Request in {labels:?}"
+        );
+        // The merged-but-not-pushed state is not behind, so Update is absent.
+        assert!(
+            !labels.iter().any(|l| l == "Update Pull Request"),
+            "Update should not show alongside Push: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn push_action_absent_when_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 2)));
+        let labels = action_labels(&r);
+        assert!(
+            !labels.iter().any(|l| l == "Push Pull Request"),
+            "Push must not show when behind: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "Update Pull Request"),
+            "Update should show when behind: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn build_push_request_returns_payload_for_ahead_not_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 0)));
+        let request = build_push_request(&r).expect("push request built");
+        assert_eq!(request.number, 42);
+        assert_eq!(request.branch, "feature");
+        assert_eq!(request.ahead, 3);
+        assert_eq!(request.behind, 0);
+        assert!(request.base_ref.is_none());
+    }
+
+    #[test]
+    fn build_push_request_none_when_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 2)));
+        assert!(build_push_request(&r).is_none());
+    }
+
+    #[test]
+    fn build_push_request_none_when_pr_not_open() {
+        let mut pr = open_pr();
+        pr.state = PrState::Merged;
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        assert!(build_push_request(&r).is_none());
+    }
 }
