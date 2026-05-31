@@ -312,4 +312,49 @@ mod tests {
             "substituted value was re-expanded, got {out:?}"
         );
     }
+
+    #[test]
+    fn posix_escape_wraps_plain_value_in_single_quotes() {
+        assert_eq!(shell_escape_posix("main"), "'main'");
+        assert_eq!(shell_escape_posix(""), "''");
+    }
+
+    #[test]
+    fn posix_escape_neutralizes_shell_metacharacters() {
+        // Inside single quotes, POSIX shells perform no expansion at all, so
+        // command substitution, parameter expansion, and globbing are inert.
+        assert_eq!(shell_escape_posix("$(rm -rf ~)"), "'$(rm -rf ~)'");
+        assert_eq!(shell_escape_posix("a; b | c & d"), "'a; b | c & d'");
+        assert_eq!(shell_escape_posix("`whoami`"), "'`whoami`'");
+    }
+
+    #[test]
+    fn posix_escape_rewrites_embedded_single_quote() {
+        // The only character that cannot live inside single quotes is `'`
+        // itself; it is closed, escaped as a literal, then reopened.
+        assert_eq!(shell_escape_posix("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn cmd_escape_wraps_plain_value_in_double_quotes() {
+        assert_eq!(shell_escape_cmd("main"), "\"main\"");
+    }
+
+    #[test]
+    fn cmd_escape_caret_escapes_metacharacters_and_doubles_quotes() {
+        assert_eq!(shell_escape_cmd("a&b"), "\"a^&b\"");
+        assert_eq!(shell_escape_cmd("%PATH%"), "\"^%PATH^%\"");
+        assert_eq!(shell_escape_cmd("a|b<c>d"), "\"a^|b^<c^>d\"");
+        assert_eq!(shell_escape_cmd("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn shell_resolution_neutralizes_dangerous_value_end_to_end() {
+        // A value carrying a command substitution must land fully single-quoted
+        // so `/bin/sh -c` reads it as one inert literal argument.
+        let v = vars("", "", "main$(touch /tmp/pwned)", "");
+        let out = resolve_template_shell("echo $BRANCH_NAME", &v);
+        assert_eq!(out, "echo 'main$(touch /tmp/pwned)'");
+    }
 }
