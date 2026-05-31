@@ -17,7 +17,7 @@ pub use dashboard::{
     default_dashboard_warning, is_behind, parse_pull_request_md, resolve_base_ref,
     resolve_dashboard_columns, CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel,
     DashboardRow, DashboardService, DashboardUpdate, DashboardWatch, FillPreparation,
-    FillSubmitOutcome, MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewStatus,
+    FillSubmitOutcome, FillSubmitRequest, MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewStatus,
     ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdatePullRequestOutcome,
     AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };

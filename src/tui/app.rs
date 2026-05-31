@@ -35,7 +35,8 @@ use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
     parse_pull_request_md, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, FillPreparation, FillSubmitOutcome, OpencodeModel, Shell,
+    DashboardUpdate, DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest,
+    OpencodeModel, Shell,
     ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult, UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
@@ -1502,16 +1503,19 @@ impl App {
                     self.enter_screen(Screen::Dashboard, tx);
                     return;
                 };
-                let body = screen.draft_body().map(str::to_string).unwrap_or_default();
-                let labels = screen.draft_labels().to_vec();
+                let submit = FillSubmitRequest {
+                    worktree_path: request.worktree_path.clone(),
+                    branch: request.branch.clone(),
+                    number: request.number,
+                    title,
+                    body: screen.draft_body().map(str::to_string).unwrap_or_default(),
+                    labels: screen.draft_labels().to_vec(),
+                };
                 screen.start_opening();
                 kick_off_submit_pull_request(
                     self.git_root.clone(),
                     self.current_dashboard_config(),
-                    request,
-                    title,
-                    body,
-                    labels,
+                    submit,
                     tx.clone(),
                 );
             }
@@ -4045,10 +4049,7 @@ fn kick_off_prepare_fill(
 fn kick_off_submit_pull_request(
     git_root: Option<String>,
     config: DashboardConfig,
-    request: FillPullRequestRequest,
-    title: String,
-    body: String,
-    labels: Vec<String>,
+    params: FillSubmitRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -4071,15 +4072,7 @@ fn kick_off_submit_pull_request(
 
         let service = DashboardService::new(root, config);
         let event = match service
-            .submit_pull_request(
-                &request.worktree_path,
-                &request.branch,
-                request.number,
-                &title,
-                &body,
-                &labels,
-                Some(&activity_tx),
-            )
+            .submit_pull_request(&params, Some(&activity_tx))
             .await
         {
             Ok(outcome) => Ok(outcome),

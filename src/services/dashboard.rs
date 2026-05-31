@@ -438,6 +438,17 @@ pub enum FillPreparation {
     AiUnavailable,
 }
 
+/// Parameters for opening or updating a pull request via `submit_pull_request`.
+pub struct FillSubmitRequest {
+    pub worktree_path: String,
+    pub branch: String,
+    /// `Some` → update an existing PR; `None` → push + create a new one.
+    pub number: Option<u64>,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+}
+
 /// Outcome of submitting the drafted PR (`submit_pull_request`): either a
 /// brand-new PR was created or the existing one's title/body were updated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1211,18 +1222,22 @@ impl DashboardService {
     /// `number` is `Some`, the existing PR's title/body are edited (with any
     /// media from the old body re-inserted under `# Overview`). When `None`,
     /// the branch is pushed and a new PR is created.
-    /// `labels` are applied via `--label`/`--add-label`; the PR is always
-    /// self-assigned via `--assignee "@me"` / `--add-assignee "@me"`.
+    /// Open or update the pull request described by `params`. Labels are
+    /// applied via `--label`/`--add-label`; the PR is always self-assigned
+    /// via `--assignee "@me"` / `--add-assignee "@me"`.
     pub async fn submit_pull_request(
         &self,
-        worktree_path: &str,
-        branch: &str,
-        number: Option<u64>,
-        title: &str,
-        body: &str,
-        labels: &[String],
+        params: &FillSubmitRequest,
         activity: Option<&mpsc::UnboundedSender<(String, ActivityKind)>>,
     ) -> Result<FillSubmitOutcome> {
+        let FillSubmitRequest {
+            worktree_path,
+            branch,
+            number,
+            title,
+            body,
+            labels,
+        } = params;
         if !self.gh_available {
             return Err(WisetreeError::other(
                 "gh CLI not found — install `gh` to open pull requests.",
@@ -1240,7 +1255,7 @@ impl DashboardService {
             // Update the existing PR's description, preserving any media
             // (screenshots / videos) GitHub already had in the old body.
             Some(number) => {
-                let body = match self.fetch_pr_details(number).await {
+                let body = match self.fetch_pr_details(*number).await {
                     Ok(details) => preserve_media(&details.body, body),
                     // If we can't read the old body, push the new body as-is
                     // rather than blocking the update entirely.
@@ -1273,7 +1288,7 @@ impl DashboardService {
                 .await
                 .map_err(|_| WisetreeError::other("gh pr edit timed out after 60s"))?;
                 match edit {
-                    Ok(_) => Ok(FillSubmitOutcome::Updated { number }),
+                    Ok(_) => Ok(FillSubmitOutcome::Updated { number: *number }),
                     Err(err) => Ok(FillSubmitOutcome::SubmitFailed(err)),
                 }
             }
