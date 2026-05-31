@@ -597,9 +597,10 @@ impl App {
                 // The Filling step (live opencode PTY) and the Confirm
                 // explanation both want the full bottom region; the compact
                 // Loading / Review / Opening steps stay in a sized panel.
-                let expand = self.fill_pr.as_ref().is_some_and(|s| {
-                    s.is_filling() || matches!(s.step(), FillStep::Confirm)
-                });
+                let expand = self
+                    .fill_pr
+                    .as_ref()
+                    .is_some_and(|s| s.is_filling() || matches!(s.step(), FillStep::Confirm));
                 let panel = if expand {
                     self.render_framed_panel_fill(frame, area)
                 } else {
@@ -2617,12 +2618,7 @@ impl App {
                     ..
                 } => {
                     if let Some(screen) = self.fill_pr.as_mut() {
-                        screen.spawn_opencode_pty(
-                            opencode_binary,
-                            opencode_args,
-                            cwd,
-                            Vec::new(),
-                        );
+                        screen.spawn_opencode_pty(opencode_binary, opencode_args, cwd, Vec::new());
                     }
                 }
                 FillPreparation::NothingToDescribe => {
@@ -2695,13 +2691,19 @@ impl App {
             Ok(FillSubmitOutcome::SubmitFailed(detail)) => {
                 self.show_toast(
                     ToastVariant::Error,
-                    format!("Failed to submit the pull request: {}", truncate_error(&detail)),
+                    format!(
+                        "Failed to submit the pull request: {}",
+                        truncate_error(&detail)
+                    ),
                 );
             }
             Err(message) => {
                 self.show_toast(
                     ToastVariant::Error,
-                    format!("Failed to submit the pull request: {}", truncate_error(&message)),
+                    format!(
+                        "Failed to submit the pull request: {}",
+                        truncate_error(&message)
+                    ),
                 );
             }
         }

@@ -568,13 +568,13 @@ impl FillPullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),                          // title
-                Constraint::Length(1),                          // blank
-                Constraint::Length(detail_lines.len() as u16),  // labeled rows
-                Constraint::Length(1),                          // blank
-                Constraint::Length(steps_lines.len() as u16),   // steps preview
-                Constraint::Length(1),                          // blank
-                Constraint::Length(12),                         // ConfirmationModal
+                Constraint::Length(1),                         // title
+                Constraint::Length(1),                         // blank
+                Constraint::Length(detail_lines.len() as u16), // labeled rows
+                Constraint::Length(1),                         // blank
+                Constraint::Length(steps_lines.len() as u16),  // steps preview
+                Constraint::Length(1),                         // blank
+                Constraint::Length(12),                        // ConfirmationModal
                 Constraint::Min(0),
             ])
             .split(area);
@@ -734,7 +734,10 @@ impl FillPullRequestScreen {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(separator.clone());
-        spans.push(Span::styled("Tab ".to_string(), Style::default().fg(colors::BRAND)));
+        spans.push(Span::styled(
+            "Tab ".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
         spans.push(Span::styled(
             if focused_inner {
                 "Switch to Wisetree"
@@ -754,10 +757,16 @@ impl FillPullRequestScreen {
             ));
         } else {
             spans.push(separator.clone());
-            spans.push(Span::styled("↵ ".to_string(), Style::default().fg(colors::SUCCESS)));
+            spans.push(Span::styled(
+                "↵ ".to_string(),
+                Style::default().fg(colors::SUCCESS),
+            ));
             spans.push(Span::styled("Draft ready".to_string(), muted));
             spans.push(separator.clone());
-            spans.push(Span::styled("Esc ".to_string(), Style::default().fg(colors::ERROR)));
+            spans.push(Span::styled(
+                "Esc ".to_string(),
+                Style::default().fg(colors::ERROR),
+            ));
             spans.push(Span::styled("Cancel".to_string(), muted));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -895,9 +904,9 @@ fn confirm_title(request: &FillPullRequestRequest) -> String {
 
 fn build_confirm(request: &FillPullRequestRequest) -> ConfirmationModal {
     let subtitle = match request.number {
-        Some(number) => format!(
-            "Draft a fresh description with AI and update pull request #{number}?"
-        ),
+        Some(number) => {
+            format!("Draft a fresh description with AI and update pull request #{number}?")
+        }
         None => format!(
             "Draft a title + description with AI and open a pull request for `{}`?",
             request.branch
@@ -1031,7 +1040,10 @@ fn build_steps_lines(request: &FillPullRequestRequest) -> Vec<Line<'static>> {
         Line::from(Span::styled("Will run:".to_string(), header_style)),
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
-            Span::styled("gather commit log + diff vs base ref".to_string(), bullet_style),
+            Span::styled(
+                "gather commit log + diff vs base ref".to_string(),
+                bullet_style,
+            ),
         ]),
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
@@ -1042,7 +1054,10 @@ fn build_steps_lines(request: &FillPullRequestRequest) -> Vec<Line<'static>> {
         ]),
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
-            Span::styled("you review the draft, then Open/Update or Finish".to_string(), bullet_style),
+            Span::styled(
+                "you review the draft, then Open/Update or Finish".to_string(),
+                bullet_style,
+            ),
         ]),
         Line::from(vec![
             Span::styled("  • ".to_string(), muted),
@@ -1145,7 +1160,10 @@ mod tests {
     fn enter_on_no_returns_cancelled() {
         let mut screen = FillPullRequestScreen::new(create_request());
         screen.set_base_ref("upstream/main".to_string());
-        assert_eq!(screen.handle_key(key(KeyCode::Enter)), FillAction::Cancelled);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            FillAction::Cancelled
+        );
     }
 
     #[test]
@@ -1153,7 +1171,10 @@ mod tests {
         let mut screen = FillPullRequestScreen::new(create_request());
         screen.set_base_ref("upstream/main".to_string());
         assert_eq!(screen.handle_key(key(KeyCode::Tab)), FillAction::Continue);
-        assert_eq!(screen.handle_key(key(KeyCode::Enter)), FillAction::Confirmed);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            FillAction::Confirmed
+        );
     }
 
     #[test]
@@ -1238,7 +1259,10 @@ mod tests {
     fn set_error_shows_error_view() {
         let mut screen = FillPullRequestScreen::new(create_request());
         screen.set_error("boom".to_string());
-        assert_eq!(screen.handle_key(key(KeyCode::Char('x'))), FillAction::Cancelled);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('x'))),
+            FillAction::Cancelled
+        );
         let dump = render_dump(&mut screen, 80, 6);
         assert!(dump.contains("Cannot fill pull request"), "{dump}");
     }

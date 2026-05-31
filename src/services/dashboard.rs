@@ -1124,12 +1124,7 @@ impl DashboardService {
             FILL_CONTEXT_TIMEOUT,
             run_command(
                 &self.git_binary,
-                &[
-                    "log",
-                    &log_range,
-                    "--reverse",
-                    "--format=### %s%n%n%b",
-                ],
+                &["log", &log_range, "--reverse", "--format=### %s%n%n%b"],
                 Some(&cwd),
             ),
         )
@@ -2522,8 +2517,7 @@ Step-by-step process to test the changes related to this Pull Request
 /// skills: acronym `DIGIT` or `DPMS` (case-insensitive), an optional
 /// hyphen, then digits — normalized to uppercase `ACRONYM-NUM`.
 fn extract_ticket(branch: &str) -> Option<String> {
-    static TICKET: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?i)(DIGIT|DPMS)-?(\d+)").unwrap());
+    static TICKET: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(DIGIT|DPMS)-?(\d+)").unwrap());
     let caps = TICKET.captures(branch)?;
     let acronym = caps.get(1)?.as_str().to_uppercase();
     let number = caps.get(2)?.as_str();
@@ -3482,9 +3476,15 @@ mod tests {
 
     #[test]
     fn extract_ticket_normalizes_acronym_and_hyphen() {
-        assert_eq!(extract_ticket("digit3131-add-retry"), Some("DIGIT-3131".into()));
+        assert_eq!(
+            extract_ticket("digit3131-add-retry"),
+            Some("DIGIT-3131".into())
+        );
         assert_eq!(extract_ticket("DIGIT-42-fix"), Some("DIGIT-42".into()));
-        assert_eq!(extract_ticket("feature/dpms-9-thing"), Some("DPMS-9".into()));
+        assert_eq!(
+            extract_ticket("feature/dpms-9-thing"),
+            Some("DPMS-9".into())
+        );
         assert_eq!(extract_ticket("just-a-branch"), None);
     }
 

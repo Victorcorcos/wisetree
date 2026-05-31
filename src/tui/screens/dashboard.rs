@@ -711,9 +711,7 @@ impl DashboardScreen {
                         ActionChoice::FillPullRequest => {
                             self.mode = DashboardMode::Table;
                             fill_request
-                                .map(|request| {
-                                    DashboardAction::FillPullRequest(Box::new(request))
-                                })
+                                .map(|request| DashboardAction::FillPullRequest(Box::new(request)))
                                 .unwrap_or(DashboardAction::Continue)
                         }
                         ActionChoice::ClosePullRequest => match close_request {
