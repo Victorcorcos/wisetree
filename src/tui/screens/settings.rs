@@ -2820,14 +2820,14 @@ impl SettingsScreen {
     }
 
     fn post_cmd_preferred_height(&self) -> u16 {
-        // Title + description + N rectangles (3 rows each + 1 hint row each)
-        // + spacer + buttons (3 rows) + footer hint + saving-to line.
         let n = self
             .post_cmd_editor
             .as_ref()
             .map(|e| e.commands.len() as u16)
             .unwrap_or(0);
-        2 + n.saturating_mul(4) + 1 + 3 + 2
+        // title + subtitle + commands (3 rows each, min 3) + scroll + buttons + saving + vars_intro + vars + hints
+        let command_rows = n.saturating_mul(3).max(3);
+        2 + command_rows + 1 + 3 + 1 + 1 + 1 + 1
     }
 
     fn terminal_cmd_preferred_height(&self) -> u16 {
@@ -4027,7 +4027,7 @@ impl SettingsScreen {
             .constraints([
                 Constraint::Length(1),
                 Constraint::Length(1),
-                Constraint::Min(0),
+                Constraint::Min(3),
                 Constraint::Length(1),
                 Constraint::Length(3),
                 Constraint::Length(1),

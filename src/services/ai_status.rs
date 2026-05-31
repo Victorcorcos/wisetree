@@ -680,6 +680,149 @@ mod tests {
     }
 
     #[test]
+    fn opencode_interrupted_assistant_turn_decays_to_idle() {
+        // Regression: opencode killed mid-turn (e.g. Ctrl+C) never writes the
+        // terminal `step-finish` / `stop` part, so the newest part freezes on
+        // a non-terminal kind (`patch`, `text`, `reasoning`, …). The detector
+        // used to return `Running` unconditionally for any non-stop part,
+        // pinning the worktree to `Running` forever. With the window gate, an
+        // assistant turn whose newest part has gone stale must surface as
+        // `Idle` (= aggregate `Finished`).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let data_dir = paths.opencode_data.as_ref().unwrap();
+        let conn = create_opencode_db(data_dir);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        // Everything frozen 60s ago — well outside the default 10s window.
+        let stale_ms = now_ms - 60_000;
+        insert_opencode_session(&conn, "ses_current", &worktree, stale_ms);
+        insert_opencode_message(
+            &conn,
+            "msg_user",
+            "ses_current",
+            stale_ms - 2,
+            stale_ms - 2,
+            r#"{"role":"user"}"#,
+        );
+        insert_opencode_message(
+            &conn,
+            "msg_assistant",
+            "ses_current",
+            stale_ms - 1,
+            stale_ms - 1,
+            r#"{"role":"assistant"}"#,
+        );
+        insert_opencode_part(
+            &conn,
+            "prt_patch",
+            "msg_assistant",
+            "ses_current",
+            stale_ms,
+            stale_ms,
+            r#"{"type":"patch"}"#,
+        );
+
+        let cfg = AiStatusConfig {
+            enabled_harnesses: vec!["opencode".to_string()],
+            ..AiStatusConfig::default()
+        };
+        let svc = AiStatusService::new(&cfg, paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::Opencode),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn opencode_stale_pending_user_turn_is_idle() {
+        // A user prompt whose assistant reply never arrived (process killed
+        // before the assistant message row was written) goes stale and must
+        // decay to `Idle`, matching the stale-prompt fallback of the other
+        // three harnesses. The `user` branch used to return `Running`
+        // unconditionally.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let data_dir = paths.opencode_data.as_ref().unwrap();
+        let conn = create_opencode_db(data_dir);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let stale_ms = now_ms - 60_000;
+        insert_opencode_session(&conn, "ses_current", &worktree, stale_ms);
+        insert_opencode_message(
+            &conn,
+            "msg_user",
+            "ses_current",
+            stale_ms,
+            stale_ms,
+            r#"{"role":"user"}"#,
+        );
+
+        let cfg = AiStatusConfig {
+            enabled_harnesses: vec!["opencode".to_string()],
+            ..AiStatusConfig::default()
+        };
+        let svc = AiStatusService::new(&cfg, paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::Finished);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::Opencode),
+            Some(&AiHarnessState::Idle)
+        );
+    }
+
+    #[test]
+    fn opencode_recent_pending_user_turn_runs() {
+        // The counterpart to the stale-prompt test: a freshly submitted user
+        // prompt (assistant row not written yet) must still surface as
+        // `Running` while it's within the active window.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_under(&tmp);
+        let worktree = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        let data_dir = paths.opencode_data.as_ref().unwrap();
+        let conn = create_opencode_db(data_dir);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        insert_opencode_session(&conn, "ses_current", &worktree, now_ms);
+        insert_opencode_message(
+            &conn,
+            "msg_user",
+            "ses_current",
+            now_ms,
+            now_ms,
+            r#"{"role":"user"}"#,
+        );
+
+        let cfg = AiStatusConfig {
+            enabled_harnesses: vec!["opencode".to_string()],
+            ..AiStatusConfig::default()
+        };
+        let svc = AiStatusService::new(&cfg, paths);
+        let index = svc.build_index();
+        let report = svc.report_for(&index, &worktree);
+        assert_eq!(report.aggregated, AiStatus::InProgress);
+        assert_eq!(
+            report.per_harness.get(&AiHarness::Opencode),
+            Some(&AiHarnessState::Running)
+        );
+    }
+
+    #[test]
     fn claude_recent_unresolved_prompt_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_under(&tmp);

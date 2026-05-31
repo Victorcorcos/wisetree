@@ -4,8 +4,12 @@
 //! table still attributes worktree ownership via `directory`, but the real
 //! turn-state signal lives in `message` + `part`: opencode can keep appending
 //! `reasoning` / `tool` / `text` parts long after `session.time_updated`
-//! stops moving. A worktree is only `Finished` once the newest assistant turn
-//! for its newest session reaches `step-finish` with `reason = "stop"`.
+//! stops moving, so we classify against the newest part's own timestamp. A
+//! worktree is `Finished` once the newest assistant turn for its newest
+//! session reaches `step-finish` with `reason = "stop"`, OR once an unfinished
+//! turn's newest part ages past the active window — opencode killed mid-turn
+//! (e.g. Ctrl+C) never writes the terminal `stop` part, so without the window
+//! check such a worktree would report `Running` forever.
 //!
 //! Legacy/corroborating signal: `${XDG_DATA_HOME}/opencode/storage/session_diff/ses_*.json`
 //! — older versions exposed `cwd`/`directory` in this JSON. Current versions
@@ -57,6 +61,7 @@ struct LatestMessage {
 struct LatestPart {
     kind: Option<String>,
     reason: Option<String>,
+    time_updated_ms: i64,
 }
 
 pub(crate) fn scan(paths: &AiStatusPaths, window: Duration) -> DetectorOutput {
@@ -170,7 +175,11 @@ fn classify_session(
 ) -> Option<AiHarnessState> {
     let message = latest_message(conn, &session.id)?;
     match message.role.as_str() {
-        "user" => Some(AiHarnessState::Running),
+        // A pending user turn only counts as `Running` while it's fresh. An
+        // interrupted/abandoned prompt (process killed before the assistant
+        // started) goes stale and must decay to `Idle`, mirroring the other
+        // three harnesses.
+        "user" => Some(classify_unix_ms(message.time_updated_ms, window)),
         "assistant" => {
             let Some(part) = latest_part(conn, &message.id) else {
                 return Some(classify_unix_ms(message.time_updated_ms, window));
@@ -179,7 +188,13 @@ fn classify_session(
             {
                 Some(AiHarnessState::Idle)
             } else {
-                Some(AiHarnessState::Running)
+                // An unfinished assistant turn is only `Running` while its
+                // newest part keeps moving. When opencode is killed mid-turn
+                // (e.g. Ctrl+C) it never writes the terminal `step-finish` /
+                // `stop` part, so the part timestamp freezes — gating on the
+                // window lets the worktree decay to `Idle` instead of showing
+                // `Running` forever.
+                Some(classify_unix_ms(part.time_updated_ms, window))
             }
         }
         _ => Some(classify_unix_ms(message.time_updated_ms, window)),
@@ -211,7 +226,7 @@ fn latest_message(conn: &Connection, session_id: &str) -> Option<LatestMessage> 
 fn latest_part(conn: &Connection, message_id: &str) -> Option<LatestPart> {
     let mut stmt = conn
         .prepare(
-            "select json_extract(data, '$.type'), json_extract(data, '$.reason') \
+            "select json_extract(data, '$.type'), json_extract(data, '$.reason'), time_updated \
              from part \
              where message_id = ?1 \
              order by time_created desc, id desc \
@@ -222,6 +237,7 @@ fn latest_part(conn: &Connection, message_id: &str) -> Option<LatestPart> {
         Ok(LatestPart {
             kind: row.get(0)?,
             reason: row.get(1)?,
+            time_updated_ms: row.get(2)?,
         })
     })
     .optional()
