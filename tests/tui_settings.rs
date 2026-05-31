@@ -160,13 +160,18 @@ fn ready_with_link_settings(
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
-const IGNORE_PATTERNS_INDEX: usize = 1;
-const LINK_STRATEGY_INDEX: usize = 3;
-const LINK_CACHE_DIR_INDEX: usize = 4;
-const POST_CMD_INDEX: usize = 5;
-const TERMINAL_CMD_INDEX: usize = 6;
-const PATH_TEMPLATE_INDEX: usize = 7;
-const COPY_SETTINGS_INDEX: usize = 8;
+// Menu order: Dashboard(0), Copy Patterns(1), Ignore Patterns(2),
+// Link Patterns(3), Link Strategy(4), Link Cache Dir(5),
+// Post-Create Commands(6), Terminal Command(7), Path Template(8),
+// Copy Settings(9), Delete Branch(10), Check for Updates(11).
+const COPY_PATTERNS_INDEX: usize = 1;
+const IGNORE_PATTERNS_INDEX: usize = 2;
+const LINK_STRATEGY_INDEX: usize = 4;
+const LINK_CACHE_DIR_INDEX: usize = 5;
+const POST_CMD_INDEX: usize = 6;
+const TERMINAL_CMD_INDEX: usize = 7;
+const PATH_TEMPLATE_INDEX: usize = 8;
+const COPY_SETTINGS_INDEX: usize = 9;
 const DELETE_BRANCH_INDEX: usize = 10;
 const CHECK_UPDATES_INDEX: usize = 11;
 
@@ -193,6 +198,43 @@ fn esc_on_menu_returns_back() {
 }
 
 #[test]
+fn setup_project_entry_hidden_by_default() {
+    let s = ready();
+    let dumped = dump(80, 20, |f| s.render(f, f.area()));
+    assert!(!dumped.contains("Setup Project Config"));
+}
+
+#[test]
+fn setup_project_entry_visible_when_enabled() {
+    let s = ready().with_has_setup_project(true);
+    let dumped = dump(80, 22, |f| s.render(f, f.area()));
+    assert!(dumped.contains("Setup Project Config"));
+}
+
+#[test]
+fn selecting_setup_project_entry_emits_open_action() {
+    let mut s = ready().with_has_setup_project(true);
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::OpenSetupProject);
+}
+
+#[test]
+fn setup_project_entry_at_index_zero_when_present() {
+    let mut s = ready().with_has_setup_project(true);
+    // Enter at position 0 should emit OpenSetupProject, not navigate into another sub-step.
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::OpenSetupProject);
+    // Dashboard is now at position 1; navigating there still works.
+    let mut s2 = ready().with_has_setup_project(true);
+    s2.handle_key(key(KeyCode::Down));
+    // Down again to reach Copy Patterns (position 2).
+    s2.handle_key(key(KeyCode::Down));
+    let action2 = s2.handle_key(key(KeyCode::Enter));
+    assert_eq!(action2, SettingsAction::Continue); // enters CopyPatterns sub-step
+    assert_eq!(s2.step(), SettingsStep::CopyPatterns);
+}
+
+#[test]
 fn selecting_copy_patterns_shows_editor_view() {
     let mut s = ready();
     enter_copy_patterns(&mut s);
@@ -205,6 +247,9 @@ fn selecting_copy_patterns_shows_editor_view() {
 }
 
 fn enter_copy_patterns(s: &mut SettingsScreen) {
+    for _ in 0..COPY_PATTERNS_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::CopyPatterns);
 }
