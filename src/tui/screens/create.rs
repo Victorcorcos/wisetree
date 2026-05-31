@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -153,6 +153,11 @@ pub struct CreateScreen {
     /// at an opaque spinner.
     terminal_log: Vec<TerminalLine>,
 
+    /// Scroll offset from the bottom of `terminal_log`, in lines. `0` follows
+    /// the live tail (default); a positive value holds the view in place as
+    /// new output streams in so the user can read earlier command output.
+    terminal_scroll: u16,
+
     pub tick: usize,
 }
 
@@ -180,6 +185,7 @@ impl CreateScreen {
             current_command_index: 0,
             summary_rows: Vec::new(),
             terminal_log: Vec::new(),
+            terminal_scroll: 0,
             tick: 0,
         }
     }
@@ -188,11 +194,35 @@ impl CreateScreen {
     /// `TERMINAL_LOG_MAX_LINES` are dropped from the front so memory and
     /// render cost stay bounded on noisy commands.
     pub fn append_terminal_line(&mut self, text: String, kind: ActivityKind) {
+        // When the user has scrolled up, keep the same lines on screen as new
+        // output arrives by tracking the growing distance from the tail.
+        if self.terminal_scroll > 0 {
+            self.terminal_scroll = self.terminal_scroll.saturating_add(1);
+        }
         self.terminal_log.push(TerminalLine { text, kind });
         if self.terminal_log.len() > TERMINAL_LOG_MAX_LINES {
             let drop = self.terminal_log.len() - TERMINAL_LOG_MAX_LINES;
             self.terminal_log.drain(0..drop);
+            // Dropping from the front shrinks how far we can scroll up.
+            self.terminal_scroll = self.terminal_scroll.saturating_sub(drop as u16);
         }
+    }
+
+    /// Scroll the Terminal Activity panel up (toward older output) by `lines`.
+    /// Over-scrolling is clamped at render time. Only meaningful while the
+    /// "Creating" panel is on screen.
+    pub fn scroll_terminal_up(&mut self, lines: u16) {
+        self.terminal_scroll = self.terminal_scroll.saturating_add(lines);
+    }
+
+    /// Scroll the Terminal Activity panel down (toward the live tail).
+    pub fn scroll_terminal_down(&mut self, lines: u16) {
+        self.terminal_scroll = self.terminal_scroll.saturating_sub(lines);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_scroll(&self) -> u16 {
+        self.terminal_scroll
     }
 
     pub fn terminal_log_len(&self) -> usize {
@@ -350,9 +380,27 @@ impl CreateScreen {
             CreateStep::NewBranch => self.handle_new_branch(key),
             CreateStep::Confirm => self.handle_confirm(key),
             CreateStep::NavigateConfirm => self.handle_navigate_confirm(key),
-            CreateStep::Creating | CreateStep::RunningCommands => CreateAction::Continue,
+            CreateStep::Creating => self.handle_creating_scroll(key),
+            CreateStep::RunningCommands => CreateAction::Continue,
             CreateStep::Success => CreateAction::Done,
         }
+    }
+
+    /// Keyboard scrolling for the "Creating" step's Terminal Activity panel.
+    /// Everything is swallowed as `Continue` — the create pipeline drives the
+    /// step transitions, so keys never advance the flow here.
+    fn handle_creating_scroll(&mut self, key: KeyEvent) -> CreateAction {
+        const PAGE: u16 = 10;
+        match key.code {
+            KeyCode::Up => self.scroll_terminal_up(1),
+            KeyCode::Down => self.scroll_terminal_down(1),
+            KeyCode::PageUp => self.scroll_terminal_up(PAGE),
+            KeyCode::PageDown => self.scroll_terminal_down(PAGE),
+            KeyCode::Home => self.scroll_terminal_up(u16::MAX),
+            KeyCode::End => self.scroll_terminal_down(u16::MAX),
+            _ => {}
+        }
+        CreateAction::Continue
     }
 
     pub fn handle_mouse_click(&mut self, position: Position) -> CreateAction {
@@ -743,7 +791,12 @@ impl CreateScreen {
                 StatusIndicator::new(Status::Loading, CREATE_CREATING)
                     .with_tick(self.tick)
                     .render(frame, chunks[0]);
-                render_terminal_activity(&self.terminal_log, frame, chunks[1]);
+                render_terminal_activity(
+                    &self.terminal_log,
+                    self.terminal_scroll,
+                    frame,
+                    chunks[1],
+                );
             }
             CreateStep::RunningCommands => {
                 CommandListProgress::new(&self.post_create_commands, self.current_command_index)
@@ -935,7 +988,7 @@ fn truncate_failure(text: &str) -> String {
 /// title) but uses TEAL instead of orange to distinguish "background
 /// commands running" from "AI working on conflicts". Auto-tails the log so
 /// the most recent line is always visible.
-fn render_terminal_activity(log: &[TerminalLine], frame: &mut Frame, area: Rect) {
+fn render_terminal_activity(log: &[TerminalLine], scroll: u16, frame: &mut Frame, area: Rect) {
     let border_style = Style::default().fg(colors::TEAL);
     let title = Line::from(vec![
         Span::raw(" "),
@@ -970,8 +1023,13 @@ fn render_terminal_activity(log: &[TerminalLine], frame: &mut Frame, area: Rect)
     }
 
     let visible_rows = inner.height as usize;
-    let start = log.len().saturating_sub(visible_rows);
-    let lines: Vec<Line<'static>> = log[start..]
+    // `scroll` is lines-from-the-tail; clamp it to the available history so
+    // over-scrolling (Home / wheel spam) parks cleanly at the oldest line.
+    let max_scroll = log.len().saturating_sub(visible_rows);
+    let scroll = (scroll as usize).min(max_scroll);
+    let end = log.len() - scroll;
+    let start = end.saturating_sub(visible_rows);
+    let lines: Vec<Line<'static>> = log[start..end]
         .iter()
         .map(|line| {
             let style = match line.kind {
@@ -984,5 +1042,71 @@ fn render_terminal_activity(log: &[TerminalLine], frame: &mut Frame, area: Rect)
             Line::from(Span::styled(line.text.clone(), style))
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+
+    // Reserve the rightmost column for the scrollbar when there's overflow so
+    // the thumb never paints over the last character of a line.
+    let has_overflow = max_scroll > 0;
+    let text_area = if has_overflow {
+        Rect {
+            width: inner.width.saturating_sub(1),
+            ..inner
+        }
+    } else {
+        inner
+    };
+    frame.render_widget(Paragraph::new(lines), text_area);
+    if has_overflow {
+        crate::tui::widgets::render_vertical_scrollbar(frame, inner, max_scroll, scroll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen_with_log(lines: usize) -> CreateScreen {
+        let mut screen = CreateScreen::new();
+        for i in 0..lines {
+            screen.append_terminal_line(format!("line {i}"), ActivityKind::Stdout);
+        }
+        screen
+    }
+
+    #[test]
+    fn terminal_starts_pinned_to_the_tail() {
+        let screen = screen_with_log(100);
+        assert_eq!(screen.terminal_scroll(), 0);
+    }
+
+    #[test]
+    fn scrolling_up_then_down_moves_the_offset() {
+        let mut screen = screen_with_log(100);
+        screen.scroll_terminal_up(5);
+        assert_eq!(screen.terminal_scroll(), 5);
+        screen.scroll_terminal_down(2);
+        assert_eq!(screen.terminal_scroll(), 3);
+        // Over-scrolling down clamps back to the live tail.
+        screen.scroll_terminal_down(99);
+        assert_eq!(screen.terminal_scroll(), 0);
+    }
+
+    #[test]
+    fn appending_while_scrolled_up_keeps_the_view_in_place() {
+        let mut screen = screen_with_log(50);
+        screen.scroll_terminal_up(10);
+        assert_eq!(screen.terminal_scroll(), 10);
+        // Each new streamed line grows the distance from the tail by one so the
+        // same content stays on screen instead of scrolling away.
+        screen.append_terminal_line("new".to_string(), ActivityKind::Stdout);
+        screen.append_terminal_line("new".to_string(), ActivityKind::Stdout);
+        assert_eq!(screen.terminal_scroll(), 12);
+    }
+
+    #[test]
+    fn appending_at_the_tail_keeps_following_the_tail() {
+        let mut screen = screen_with_log(50);
+        assert_eq!(screen.terminal_scroll(), 0);
+        screen.append_terminal_line("new".to_string(), ActivityKind::Stdout);
+        assert_eq!(screen.terminal_scroll(), 0, "tail-following must not start scrolling");
+    }
 }

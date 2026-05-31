@@ -697,10 +697,15 @@ impl App {
                 // Web-page semantics: wheel scrolls the screen's active
                 // scrollable region. On Update Pull Request that is either
                 // the live AI Activity panel (during conflict resolution) or
-                // the review diff panel (after the AI creates a merge commit).
+                // the review diff panel (after the AI creates a merge commit);
+                // on Create it's the "Creating" Terminal Activity log.
                 if matches!(self.screen, Screen::UpdatePullRequest) {
                     if let Some(screen) = self.update_pr.as_mut() {
                         screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
+                    }
+                } else if matches!(self.screen, Screen::Create) {
+                    if let Some(screen) = self.create.as_mut() {
+                        screen.scroll_terminal_up(WHEEL_LINES_PER_TICK);
                     }
                 }
             }
@@ -708,6 +713,10 @@ impl App {
                 if matches!(self.screen, Screen::UpdatePullRequest) {
                     if let Some(screen) = self.update_pr.as_mut() {
                         screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
+                    }
+                } else if matches!(self.screen, Screen::Create) {
+                    if let Some(screen) = self.create.as_mut() {
+                        screen.scroll_terminal_down(WHEEL_LINES_PER_TICK);
                     }
                 }
             }
@@ -2302,12 +2311,11 @@ impl App {
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                screen.spawn_opencode_pty(
-                    opencode_binary.clone(),
-                    opencode_args.clone(),
-                    cwd.clone(),
-                    Vec::new(),
-                );
+                // Launch opencode *through* the user's login shell so it runs
+                // with the same profile-sourced environment as a freshly
+                // opened terminal (matching the recovery shell below).
+                let (shell, wrapped_args) = login_shell_command(opencode_binary, opencode_args);
+                screen.spawn_opencode_pty(shell, wrapped_args, cwd.clone(), Vec::new());
                 return;
             }
         }
@@ -2323,7 +2331,7 @@ impl App {
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                let (shell, args) = resolve_recovery_shell();
+                let (shell, args) = login_shell();
                 let cwd = PathBuf::from(&screen.request().worktree_path);
                 screen.start_terminal_recovery(shell, args, cwd, err.clone());
                 return;
@@ -3849,21 +3857,78 @@ fn kick_off_push_pull_request(
     });
 }
 
-/// Resolve a shell to host the Terminal Activity recovery panel. Prefers
-/// `$SHELL`, falling back to bash then sh. Interactive shells need no extra
-/// args once they own a PTY, so the args vector is always empty.
-fn resolve_recovery_shell() -> (PathBuf, Vec<String>) {
-    if let Ok(shell) = std::env::var("SHELL") {
-        if !shell.trim().is_empty() {
-            return (PathBuf::from(shell), Vec::new());
+/// Resolve the user's interactive login shell plus the args that make it
+/// source their profile (`~/.bash_profile`, `~/.zprofile`, …) — i.e. behave
+/// like a freshly opened terminal. Prefers `$SHELL` (the user's actual login
+/// shell), falling back to common shells. Shared by every embedded inner
+/// terminal so they all start from the same environment.
+fn login_shell() -> (PathBuf, Vec<String>) {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            ["/bin/zsh", "/bin/bash", "/bin/sh"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|p| p.exists())
+        })
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let args = shell_login_args(&shell);
+    (shell, args)
+}
+
+/// Wrap `program` + `args` so they run *inside* the user's login shell — so a
+/// non-shell inner terminal (e.g. the opencode conflict resolver) still starts
+/// from a profile-sourced environment (PATH, env vars, functions), exactly as
+/// if the user had launched it from a freshly opened terminal.
+///
+/// Uses the `exec "$@"` idiom: the wrapped argv is handed to the shell as
+/// positional parameters and expanded verbatim, never re-parsed — so an
+/// AI-merge prompt containing backticks, `$(...)`, quotes, etc. can't be
+/// interpreted by the shell (no quoting pitfalls, no injection surface).
+fn login_shell_command(program: &std::path::Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    let (shell, mut shell_args) = login_shell();
+    shell_args.push("-c".to_string());
+    shell_args.push("exec \"$@\"".to_string());
+    // $0 — a conventional label for the execed process.
+    shell_args.push(
+        shell
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sh")
+            .to_string(),
+    );
+    // $1.. — the real program and its args, passed through untouched.
+    shell_args.push(program.to_string_lossy().into_owned());
+    shell_args.extend(args.iter().cloned());
+    (shell, shell_args)
+}
+
+/// Build login + interactive args so the recovery shell sources the user's
+/// profile (`~/.bash_profile`, `~/.zprofile`, `~/.zshrc`, …) — making their
+/// custom functions and aliases (e.g. an `update()` defined in
+/// `~/.bash_profile`) available, exactly as a freshly opened terminal would.
+/// `-l` (login) is what pulls in the profile; `-i` forces interactive mode.
+/// This keys off the shell's name rather than the OS, so it works wherever
+/// the user's `$SHELL` points. POSIX `sh`/`dash` reject `-l`, so they only
+/// receive `-i`.
+fn shell_login_args(shell: &std::path::Path) -> Vec<String> {
+    let name = shell
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        // Some environments report `$SHELL` (or argv0) as e.g. `-bash`.
+        .trim_start_matches('-');
+    match name {
+        "bash" | "zsh" | "fish" | "ksh" | "ksh93" | "mksh" | "tcsh" | "csh" => {
+            vec!["-l".to_string(), "-i".to_string()]
         }
+        // sh / dash and anything unrecognized: interactive only (no `-l`,
+        // which dash treats as an illegal option).
+        _ => vec!["-i".to_string()],
     }
-    for candidate in ["/bin/bash", "/bin/sh"] {
-        if std::path::Path::new(candidate).exists() {
-            return (PathBuf::from(candidate), Vec::new());
-        }
-    }
-    (PathBuf::from("/bin/sh"), Vec::new())
 }
 
 fn kick_off_setup_install(shell: Shell, tx: mpsc::UnboundedSender<AppEvent>) {
@@ -4162,6 +4227,54 @@ mod tests {
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
+    }
+
+    #[test]
+    fn shell_login_args_are_login_interactive_for_common_shells() {
+        let expected: Vec<String> = vec!["-l".into(), "-i".into()];
+        for path in [
+            "/bin/bash",
+            "/usr/bin/zsh",
+            "/opt/homebrew/bin/bash",
+            "/usr/local/bin/fish",
+        ] {
+            assert_eq!(
+                shell_login_args(std::path::Path::new(path)),
+                expected,
+                "expected login+interactive args for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_login_args_skip_login_flag_for_posix_sh() {
+        // dash rejects `-l`, so sh/dash and unknown shells get interactive only.
+        let expected: Vec<String> = vec!["-i".into()];
+        for path in ["/bin/sh", "/bin/dash", "/usr/bin/some-exotic-shell"] {
+            assert_eq!(shell_login_args(std::path::Path::new(path)), expected);
+        }
+    }
+
+    #[test]
+    fn login_shell_command_uses_exec_idiom_and_passes_args_verbatim() {
+        // A program + an arg containing shell metacharacters that must NOT be
+        // interpreted (the AI-merge prompt can contain backticks, $(), etc.).
+        let dangerous = "resolve `rm -rf /` and $(whoami)".to_string();
+        let (_shell, args) = login_shell_command(
+            std::path::Path::new("/usr/local/bin/opencode"),
+            &["--prompt".to_string(), dangerous.clone(), "-m".to_string()],
+        );
+        // The shell receives `... -c 'exec "$@"' <$0> <program> <args...>`.
+        let c_idx = args.iter().position(|a| a == "-c").expect("-c present");
+        assert_eq!(args[c_idx + 1], "exec \"$@\"");
+        // $0 is a label, then the program, then the args passed through as-is.
+        assert_eq!(args[c_idx + 3], "/usr/local/bin/opencode");
+        assert_eq!(args[c_idx + 4], "--prompt");
+        assert_eq!(
+            args[c_idx + 5], dangerous,
+            "prompt arg must be forwarded verbatim, never re-parsed"
+        );
+        assert_eq!(args[c_idx + 6], "-m");
     }
 
     fn with_home<F: FnOnce(&TempDir)>(f: F) {

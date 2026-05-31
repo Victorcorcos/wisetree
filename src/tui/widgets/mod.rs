@@ -10,6 +10,7 @@ pub mod command_progress;
 pub mod confirmation_modal;
 pub mod input_prompt;
 pub mod pty_view;
+pub mod scrollbar;
 pub mod select_prompt;
 pub mod spinner;
 pub mod status_indicator;
@@ -26,6 +27,7 @@ pub use command_progress::CommandProgress;
 pub use confirmation_modal::{ConfirmationChoice, ConfirmationModal, ConfirmationOutcome};
 pub use input_prompt::{InputOutcome, InputPrompt};
 pub use pty_view::PtyView;
+pub use scrollbar::render_vertical_scrollbar;
 pub use select_prompt::{
     branded_line, branded_spans, SelectOption, SelectOutcome, SelectPrompt, SelectStyle,
     SELECT_CURSOR,

@@ -23,9 +23,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::messages::colors;
@@ -1083,22 +1081,7 @@ impl UpdatePullRequestScreen {
         if let Some(pty) = self.pty.as_mut() {
             pty.resize(inner.height, inner.width);
             pty.render(frame, inner);
-            let scrollback_len = pty.scrollback_len();
-            if scrollback_len > 0 {
-                // Position: 0 = top of scrollback (oldest), len = bottom
-                // (live tail). vt100's offset is "rows back from tail",
-                // so invert to keep the thumb intuitive.
-                let offset = pty.scrollback_offset();
-                let position = scrollback_len.saturating_sub(offset);
-                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .style(Style::default().fg(colors::MUTED))
-                    .thumb_style(Style::default().fg(colors::INFO));
-                let mut state =
-                    ScrollbarState::new(scrollback_len.saturating_add(inner.height as usize))
-                        .viewport_content_length(inner.height as usize)
-                        .position(position);
-                frame.render_stateful_widget(scrollbar, inner, &mut state);
-            }
+            render_pty_scrollbar(frame, inner, pty);
             return;
         }
 
@@ -1417,19 +1400,7 @@ impl UpdatePullRequestScreen {
         if let Some(pty) = self.pty.as_mut() {
             pty.resize(inner.height, inner.width);
             pty.render(frame, inner);
-            let scrollback_len = pty.scrollback_len();
-            if scrollback_len > 0 {
-                let offset = pty.scrollback_offset();
-                let position = scrollback_len.saturating_sub(offset);
-                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .style(Style::default().fg(colors::MUTED))
-                    .thumb_style(Style::default().fg(colors::INFO));
-                let mut state =
-                    ScrollbarState::new(scrollback_len.saturating_add(inner.height as usize))
-                        .viewport_content_length(inner.height as usize)
-                        .position(position);
-                frame.render_stateful_widget(scrollbar, inner, &mut state);
-            }
+            render_pty_scrollbar(frame, inner, pty);
             return;
         }
 
@@ -1571,6 +1542,29 @@ fn terminal_error_lines(text: &str) -> Vec<String> {
     } else {
         lines
     }
+}
+
+/// Render the vertical scrollbar for an embedded PTY that keeps a real vt100
+/// scrollback buffer. No-op when there's no scrollback yet.
+///
+/// vt100's offset is "rows back from the live tail" (0 = bottom). ratatui's
+/// scrollbar, however, lands the thumb flush at the bottom of the track only
+/// when `position == content_length - 1`. The intuitive mapping is therefore
+/// `content_length = scrollback_len + 1` with `position = scrollback_len -
+/// offset`: at the live tail (offset 0) `position` hits that maximum so the
+/// thumb sits exactly at the bottom. (The earlier `scrollback_len + height`
+/// content length left the thumb floating `height - 1` rows short of the
+/// bottom even when fully scrolled down.) `viewport_content_length = height`
+/// keeps the thumb sized to the visible fraction of the content.
+fn render_pty_scrollbar(frame: &mut Frame, inner: Rect, pty: &PtyView) {
+    // vt100's offset is "rows back from the live tail" (0 = bottom), which is
+    // exactly the tail-anchored model the shared scrollbar expects.
+    crate::tui::widgets::render_vertical_scrollbar(
+        frame,
+        inner,
+        pty.scrollback_len(),
+        pty.scrollback_offset(),
+    );
 }
 
 fn contains_position(area: Rect, position: Position) -> bool {
