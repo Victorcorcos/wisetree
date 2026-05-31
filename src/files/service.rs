@@ -337,7 +337,29 @@ async fn execute_shell_command(
         c.arg("/C").arg(resolved);
         c
     } else {
-        let mut c = Command::new("/bin/sh");
+        // Use the user's login shell so their profile is sourced on startup
+        // (making shell functions, aliases, and PATH additions available,
+        // just like a freshly opened terminal). `-l` (login) is what pulls
+        // in the profile; we omit `-i` (interactive) because stdin is null
+        // and there is no PTY. Keys off the shell name, not the OS, so this
+        // works on macOS, Linux, and any Unix where $SHELL is set. POSIX
+        // sh/dash reject `-l`, so they fall back to plain `-c` only.
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_string());
+        let shell_name = std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sh")
+            .trim_start_matches('-');
+        let mut c = Command::new(&shell);
+        if matches!(
+            shell_name,
+            "bash" | "zsh" | "fish" | "ksh" | "ksh93" | "mksh" | "tcsh" | "csh"
+        ) {
+            c.arg("-l");
+        }
         c.arg("-c").arg(resolved);
         c
     };
