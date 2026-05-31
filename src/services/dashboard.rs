@@ -326,6 +326,10 @@ pub enum UpdatePullRequestOutcome {
     AlreadyUpToDate,
     /// `git merge` succeeded with no conflicts; the result has been pushed.
     MergedCleanly,
+    /// A push-only run (`Push Pull Request` action, or the Terminal recovery
+    /// re-push) sent `git push origin HEAD` and it succeeded. No merge was
+    /// attempted — the branch was already ahead-but-not-behind.
+    Pushed,
     /// Conflicts were detected, `useAi` is set, opencode is on PATH, and
     /// the merge is paused mid-flight (index has conflict markers). The
     /// UI takes over from here: it spawns opencode inside an embedded
@@ -531,6 +535,11 @@ pub struct DashboardService {
     cache_path: Option<PathBuf>,
     pr_state: Arc<Mutex<PrCacheState>>,
     ai_status: AiStatusService,
+    /// Last successful AI-status index. When a per-tick scan exceeds
+    /// `AI_STATUS_BUDGET_MS` or panics, we fall back to this instead of an
+    /// empty index so rows keep their previous values instead of flickering
+    /// to `⬜ Pending` and back on the next successful tick.
+    last_ai_index: Arc<Mutex<Option<AiStatusIndex>>>,
 }
 
 impl DashboardService {
@@ -550,6 +559,7 @@ impl DashboardService {
             cache_path: Some(dashboard_pr_cache_file()),
             pr_state: Arc::new(Mutex::new(PrCacheState::default())),
             ai_status,
+            last_ai_index: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -951,6 +961,34 @@ impl DashboardService {
         Ok(UpdatePullRequestOutcome::MergedCleanly)
     }
 
+    /// Push-only counterpart to the update pipeline: just runs
+    /// `git push origin HEAD` against `worktree_path`. Powers the dashboard's
+    /// "Push Pull Request" action (for branches that are ahead-but-not-behind,
+    /// e.g. a local merge that never got pushed) and the Terminal recovery
+    /// panel's "Accept" re-push. Returns `Pushed` on success or `PushFailed`
+    /// on failure — the exact same failure variant the merge pipeline emits,
+    /// so both paths hand off to the same recovery UI.
+    pub async fn push_pull_request_with_progress(
+        &self,
+        worktree_path: &str,
+        progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
+    ) -> Result<UpdatePullRequestOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+        if let Some(tx) = progress.as_ref() {
+            let _ = tx.send(UpdateProgress::Phase(UpdatePhase::Pushing));
+        }
+        let push = time::timeout(
+            UPDATE_PUSH_TIMEOUT,
+            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+        match push {
+            Ok(_) => Ok(UpdatePullRequestOutcome::Pushed),
+            Err(err) => Ok(UpdatePullRequestOutcome::PushFailed(err)),
+        }
+    }
+
     /// Fetch the remote and merge the worktree at `worktree_path` with
     /// the first reachable ref in `BASE_REF_PRIORITY` (upstream/main →
     /// upstream/master → origin/main → origin/master). Powers the
@@ -1084,17 +1122,28 @@ impl DashboardService {
     }
 
     /// Run one global AI-status scan (off the async runtime) and apply the
-    /// per-worktree report to every row. On timeout or panic we degrade to
-    /// an empty index so every row reports `Pending` instead of blocking
-    /// the dashboard refresh.
+    /// per-worktree report to every row. On timeout or panic we fall back to
+    /// the last successful index so rows keep their previous values instead
+    /// of flickering to `⬜ Pending` on every slow tick. The very first tick
+    /// (no cached index yet) still degrades to empty so the column doesn't
+    /// block the dashboard refresh.
     async fn apply_ai_status(&self, rows: &mut [DashboardRow]) {
         let svc = self.ai_status.clone();
         let scan = tokio::task::spawn_blocking(move || svc.build_index());
         let index: AiStatusIndex =
             match tokio::time::timeout(Duration::from_millis(AI_STATUS_BUDGET_MS), scan).await {
-                Ok(Ok(index)) => index,
-                Ok(Err(_join_err)) => AiStatusIndex::default(),
-                Err(_elapsed) => AiStatusIndex::default(),
+                Ok(Ok(fresh)) => {
+                    if let Ok(mut cached) = self.last_ai_index.lock() {
+                        *cached = Some(fresh.clone());
+                    }
+                    fresh
+                }
+                _ => self
+                    .last_ai_index
+                    .lock()
+                    .ok()
+                    .and_then(|cached| cached.clone())
+                    .unwrap_or_default(),
             };
         for row in rows.iter_mut() {
             let report: AiStatusReport = self
