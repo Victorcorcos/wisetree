@@ -8,7 +8,6 @@ pub const WELCOME: &str = "Wisetree - Git Worktree Manager";
 
 // Menu options
 pub const MENU_TITLE: &str = "Choose wisely...";
-pub const MENU_SETUP_PROJECT: &str = "Setup Project Config";
 pub const MENU_SETUP: &str = "Setup Shell Integration";
 pub const MENU_CREATE: &str = "Create";
 pub const MENU_DASHBOARD: &str = "Dashboard";

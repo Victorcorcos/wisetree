@@ -34,6 +34,7 @@ use crate::tui::widgets::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsStep {
     Menu,
+    SetupProject,
     CopyPatterns,
     LinkPatterns,
     LinkStrategy,
@@ -99,6 +100,8 @@ pub enum SettingsAction {
     FetchFreeModels,
     /// Copy the active config from one location to the other.
     CopySettings(CopyDirection),
+    /// Navigate to the SetupProject screen to bootstrap a project config.
+    OpenSetupProject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1097,6 +1100,9 @@ pub struct SettingsScreen {
     /// Optional path of the project-local config the post-create commands
     /// editor will write to. Shown to the user while they edit.
     local_config_path: Option<String>,
+    /// When true, the settings menu shows a "Setup Project Config" entry at
+    /// the top — visible only when no project-local config exists yet.
+    has_setup_project: bool,
     error: Option<String>,
     select: Option<SelectPrompt<SettingsStep>>,
     delete_branch_dialog: Option<ConfirmationModal>,
@@ -1134,6 +1140,7 @@ impl SettingsScreen {
             config_path,
             global_config_path: None,
             local_config_path: None,
+            has_setup_project: false,
             error: None,
             select: None,
             delete_branch_dialog: None,
@@ -1164,6 +1171,15 @@ impl SettingsScreen {
     /// Stored verbatim and surfaced in the editor footer.
     pub fn with_local_config_path(mut self, path: Option<String>) -> Self {
         self.local_config_path = path;
+        self
+    }
+
+    /// Show or hide the "Setup Project Config" entry at the top of the menu.
+    /// Pass `true` when no project-local config exists yet and a git root is
+    /// in scope.
+    pub fn with_has_setup_project(mut self, value: bool) -> Self {
+        self.has_setup_project = value;
+        self.select = Some(self.build_menu());
         self
     }
 
@@ -1386,7 +1402,19 @@ impl SettingsScreen {
     }
 
     fn build_menu(&self) -> SelectPrompt<SettingsStep> {
-        let opts: Vec<SelectOption<SettingsStep>> = vec![
+        let mut opts: Vec<SelectOption<SettingsStep>> = Vec::new();
+        if self.has_setup_project {
+            opts.push(
+                SelectOption::new("Setup Project Config", SettingsStep::SetupProject)
+                    .with_description("Initialize project-local config"),
+            );
+        }
+        opts.extend([
+            SelectOption::new("Dashboard", SettingsStep::Dashboard).with_description(format!(
+                "{}ms refresh, {} columns",
+                self.config.dashboard.refresh_interval_ms,
+                self.config.dashboard.columns.len()
+            )),
             SelectOption::new("Copy Patterns", SettingsStep::CopyPatterns).with_description(
                 format!("{} patterns", self.config.worktree_copy_patterns.len()),
             ),
@@ -1417,11 +1445,6 @@ impl SettingsScreen {
                 .with_description(self.config.worktree_path_template.clone()),
             SelectOption::new("Copy Settings", SettingsStep::CopySettings)
                 .with_description("Sync global and local config"),
-            SelectOption::new("Dashboard", SettingsStep::Dashboard).with_description(format!(
-                "{}ms refresh, {} columns",
-                self.config.dashboard.refresh_interval_ms,
-                self.config.dashboard.columns.len()
-            )),
             SelectOption::new("Delete Branch with Worktree", SettingsStep::DeleteBranch)
                 .with_description(if self.config.delete_branch_with_worktree {
                     "enabled"
@@ -1430,7 +1453,7 @@ impl SettingsScreen {
                 }),
             SelectOption::new(UPDATE_CHECK_MENU, SettingsStep::CheckUpdates)
                 .with_description("Check npm for latest version"),
-        ];
+        ]);
         SelectPrompt::new("Select setting to view:", opts)
             .searchable()
             .with_footer_spacer()
@@ -1462,6 +1485,7 @@ impl SettingsScreen {
         }
         match self.step {
             SettingsStep::Menu => self.handle_menu(key),
+            SettingsStep::SetupProject => SettingsAction::OpenSetupProject,
             SettingsStep::CopyPatterns
             | SettingsStep::LinkPatterns
             | SettingsStep::IgnorePatterns => self.handle_pattern_list(key),
@@ -1491,6 +1515,9 @@ impl SettingsScreen {
                 match select.handle_mouse_click(position) {
                     SelectOutcome::Selected(_, value) => {
                         self.step = value;
+                        if matches!(value, SettingsStep::SetupProject) {
+                            return SettingsAction::OpenSetupProject;
+                        }
                         if matches!(value, SettingsStep::CheckUpdates) {
                             return SettingsAction::CheckUpdates;
                         }
@@ -1662,6 +1689,9 @@ impl SettingsScreen {
         match select.handle_key(key) {
             SelectOutcome::Selected(_, value) => {
                 self.step = value;
+                if matches!(value, SettingsStep::SetupProject) {
+                    return SettingsAction::OpenSetupProject;
+                }
                 if matches!(value, SettingsStep::CheckUpdates) {
                     return SettingsAction::CheckUpdates;
                 }
@@ -2804,6 +2834,7 @@ impl SettingsScreen {
         }
         match self.step {
             SettingsStep::Menu => 22,
+            SettingsStep::SetupProject => 6,
             SettingsStep::CheckUpdates => 6,
             SettingsStep::CopyPatterns => self.pattern_list_preferred_height(),
             SettingsStep::LinkPatterns => self.pattern_list_preferred_height(),
@@ -2882,6 +2913,7 @@ impl SettingsScreen {
         }
         match self.step {
             SettingsStep::Menu => self.render_menu(frame, area),
+            SettingsStep::SetupProject => self.render_menu(frame, area),
             SettingsStep::CopyPatterns => self.render_copy_patterns(frame, area),
             SettingsStep::LinkPatterns => self.render_link_patterns(frame, area),
             SettingsStep::LinkStrategy => self.render_link_strategy(frame, area),
