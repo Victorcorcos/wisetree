@@ -4387,6 +4387,7 @@ mod tests {
     #[test]
     fn settings_delete_branch_toggle_updates_global_config_file_when_local_missing() {
         with_home(|home| {
+            let repo_root = home.path().join("repo");
             let mut config_service = ConfigService::new();
             let global_path = home.path().join(".wisetree").join("settings.json");
             let initial = WorktreeConfig {
@@ -4403,7 +4404,7 @@ mod tests {
             app.phase = InitPhase::Ready;
             app.screen = Screen::Settings;
             app.worktree_service = Some(service);
-            app.git_root = Some("/tmp/repo".into());
+            app.git_root = Some(repo_root.display().to_string());
 
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
