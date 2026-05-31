@@ -1211,6 +1211,8 @@ impl DashboardService {
     /// `number` is `Some`, the existing PR's title/body are edited (with any
     /// media from the old body re-inserted under `# Overview`). When `None`,
     /// the branch is pushed and a new PR is created.
+    /// `labels` are applied via `--label`/`--add-label`; the PR is always
+    /// self-assigned via `--assignee "@me"` / `--add-assignee "@me"`.
     pub async fn submit_pull_request(
         &self,
         worktree_path: &str,
@@ -1218,6 +1220,7 @@ impl DashboardService {
         number: Option<u64>,
         title: &str,
         body: &str,
+        labels: &[String],
         activity: Option<&mpsc::UnboundedSender<(String, ActivityKind)>>,
     ) -> Result<FillSubmitOutcome> {
         if !self.gh_available {
@@ -1245,13 +1248,29 @@ impl DashboardService {
                 };
                 let number_arg = number.to_string();
                 emit(&format!(
-                    "$ gh pr edit #{number} --title <title> --body <body>"
+                    "$ gh pr edit #{number} --title <title> --body <body> --add-assignee @me"
                 ));
+                let mut edit_args: Vec<String> = vec![
+                    "pr".into(),
+                    "edit".into(),
+                    number_arg.clone(),
+                    "--title".into(),
+                    title.into(),
+                    "--body".into(),
+                    body.clone(),
+                    "--add-assignee".into(),
+                    "@me".into(),
+                ];
+                for label in labels {
+                    edit_args.push("--add-label".into());
+                    edit_args.push(label.clone());
+                }
+                let edit_args_ref: Vec<&str> = edit_args.iter().map(String::as_str).collect();
                 let edit = time::timeout(
                     FILL_SUBMIT_TIMEOUT,
                     run_command_streamed(
                         &self.gh_binary,
-                        &["pr", "edit", &number_arg, "--title", title, "--body", &body],
+                        &edit_args_ref,
                         Some(&cwd),
                         activity,
                     ),
@@ -1297,15 +1316,30 @@ impl DashboardService {
                     None => branch.to_string(),
                 };
                 emit(&format!(
-                    "$ gh pr create --title <title> --body <body> --head {head}"
+                    "$ gh pr create --title <title> --body <body> --head {head} --assignee @me"
                 ));
+                let mut create_args: Vec<String> = vec![
+                    "pr".into(),
+                    "create".into(),
+                    "--title".into(),
+                    title.into(),
+                    "--body".into(),
+                    body.to_string(),
+                    "--head".into(),
+                    head.clone(),
+                    "--assignee".into(),
+                    "@me".into(),
+                ];
+                for label in labels {
+                    create_args.push("--label".into());
+                    create_args.push(label.clone());
+                }
+                let create_args_ref: Vec<&str> = create_args.iter().map(String::as_str).collect();
                 let create = time::timeout(
                     FILL_SUBMIT_TIMEOUT,
                     run_command_streamed(
                         &self.gh_binary,
-                        &[
-                            "pr", "create", "--title", title, "--body", body, "--head", &head,
-                        ],
+                        &create_args_ref,
                         Some(&cwd),
                         activity,
                     ),
@@ -2711,18 +2745,46 @@ fn truncate_for_prompt(text: &str, max_bytes: usize) -> String {
 }
 
 /// Parse a drafted `pull_request.md`: the first non-empty line is the PR
-/// title (any leading `# ` is stripped), and everything after it (leading
-/// blank lines trimmed) is the body. Returns `None` when there is no title.
-pub fn parse_pull_request_md(content: &str) -> Option<(String, String)> {
+/// title (any leading `# ` is stripped), everything after it (leading blank
+/// lines trimmed) is the body, and any `<!-- wisetree-labels: ... -->` comment
+/// is extracted as the label list (and stripped from the body).
+/// Returns `None` when there is no title.
+pub fn parse_pull_request_md(content: &str) -> Option<(String, String, Vec<String>)> {
     let mut lines = content.lines();
     let title_line = lines.by_ref().find(|line| !line.trim().is_empty())?;
     let title = title_line.trim().trim_start_matches('#').trim().to_string();
     if title.is_empty() {
         return None;
     }
-    let body = lines.collect::<Vec<_>>().join("\n");
-    let body = body.trim_start().to_string();
-    Some((title, body))
+    let raw_body = lines.collect::<Vec<_>>().join("\n");
+    let raw_body = raw_body.trim_start().to_string();
+    let (body, labels) = extract_wisetree_labels(&raw_body);
+    Some((title, body, labels))
+}
+
+/// Extract `<!-- wisetree-labels: label1, label2 -->` from a PR body,
+/// returning the cleaned body (comment stripped) and the parsed label list.
+fn extract_wisetree_labels(body: &str) -> (String, Vec<String>) {
+    static LABELS_COMMENT: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?m)^[ \t]*<!--\s*wisetree-labels:\s*([^-]*?)-->\s*\n?").unwrap()
+    });
+    match LABELS_COMMENT.captures(body) {
+        Some(cap) => {
+            let labels_str = cap[1].trim();
+            let labels = if labels_str.is_empty() {
+                vec![]
+            } else {
+                labels_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            let clean = LABELS_COMMENT.replace(body, "").trim_start().to_string();
+            (clean, labels)
+        }
+        None => (body.to_string(), vec![]),
+    }
 }
 
 /// Pull every media reference out of a PR body in first-seen order:
@@ -3614,23 +3676,41 @@ mod tests {
     #[test]
     fn parse_pull_request_md_splits_title_and_body() {
         let md = "DIGIT-3131 Add payment retry logic\n\n# Description ✍️\n\nDetails here.";
-        let (title, body) = parse_pull_request_md(md).expect("parsed");
+        let (title, body, labels) = parse_pull_request_md(md).expect("parsed");
         assert_eq!(title, "DIGIT-3131 Add payment retry logic");
         assert!(body.starts_with("# Description ✍️"));
         assert!(body.contains("Details here."));
+        assert!(labels.is_empty());
     }
 
     #[test]
     fn parse_pull_request_md_strips_heading_marker_from_title() {
         let md = "# My title line\n\nbody";
-        let (title, body) = parse_pull_request_md(md).expect("parsed");
+        let (title, body, labels) = parse_pull_request_md(md).expect("parsed");
         assert_eq!(title, "My title line");
         assert_eq!(body, "body");
+        assert!(labels.is_empty());
     }
 
     #[test]
     fn parse_pull_request_md_returns_none_when_empty() {
         assert!(parse_pull_request_md("\n\n   \n").is_none());
+    }
+
+    #[test]
+    fn parse_pull_request_md_extracts_wisetree_labels() {
+        let md = "Fix login crash\n<!-- wisetree-labels: bug 🐛, security 🛡️ -->\n\n# Description\n\nDetails.";
+        let (title, body, labels) = parse_pull_request_md(md).expect("parsed");
+        assert_eq!(title, "Fix login crash");
+        assert!(!body.contains("wisetree-labels"), "comment should be stripped from body");
+        assert_eq!(labels, vec!["bug 🐛", "security 🛡️"]);
+    }
+
+    #[test]
+    fn parse_pull_request_md_handles_single_label() {
+        let md = "Add docs\n<!-- wisetree-labels: documentation 📖 -->\n\n# Description\n\nBody.";
+        let (_, _, labels) = parse_pull_request_md(md).expect("parsed");
+        assert_eq!(labels, vec!["documentation 📖"]);
     }
 
     #[test]

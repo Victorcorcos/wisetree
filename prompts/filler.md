@@ -32,6 +32,19 @@ Create (or overwrite) `pull_request.md` at the repository root with EXACTLY this
 3. **One blank line.**
 4. **The PR description (body)** — fill in the provided template, starting from its first section heading (e.g. `# Description ✍️`).
 
+## Label selection
+
+Analyse the diff and commit log and choose **all** labels that apply from this list (use the exact strings including emoji):
+
+- `user story 💬` — a new end-user-facing feature or user-journey change
+- `bug 🐛` — fixes a defect or incorrect behaviour
+- `technical debt 🛠️` — refactoring, cleanup, or internal improvement with no user-visible change
+- `documentation 📖` — doc-only changes (README, comments, changelogs)
+- `architecture 🏰` — structural/design changes that affect how the system is built
+- `security 🛡️` — security hardening, vulnerability fixes, or auth/permission changes
+
+Multiple labels are allowed and encouraged when a PR spans several categories (e.g. a bug fix that also improves architecture). At least one label must always be chosen.
+
 ## Rules for the body
 
 1. Follow the template's section structure exactly; fill in every section from the diff and commit log.

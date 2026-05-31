@@ -110,10 +110,11 @@ pub struct FillPullRequestScreen {
     pty_focused: bool,
     /// Overlay confirming the draft is ready, opened by Enter on outer focus.
     finalize_confirm: Option<ConfirmationModal>,
-    /// Drafted title + body parsed from `pull_request.md`, populated when the
-    /// App transitions us into Review.
+    /// Drafted title, body, and labels parsed from `pull_request.md`,
+    /// populated when the App transitions us into Review.
     draft_title: Option<String>,
     draft_body: Option<String>,
+    draft_labels: Vec<String>,
     review_button: ReviewButton,
     review_button_rects: Cell<[Rect; 2]>,
     error: Option<String>,
@@ -148,6 +149,7 @@ impl FillPullRequestScreen {
             finalize_confirm: None,
             draft_title: None,
             draft_body: None,
+            draft_labels: Vec::new(),
             review_button: ReviewButton::Submit,
             review_button_rects: Cell::new([Rect::default(); 2]),
             error: None,
@@ -183,14 +185,18 @@ impl FillPullRequestScreen {
         self.pty_focused
     }
 
-    /// The drafted title/body parsed from `pull_request.md` (available once
-    /// the screen has entered Review).
+    /// The drafted title/body/labels parsed from `pull_request.md` (available
+    /// once the screen has entered Review).
     pub fn draft_title(&self) -> Option<&str> {
         self.draft_title.as_deref()
     }
 
     pub fn draft_body(&self) -> Option<&str> {
         self.draft_body.as_deref()
+    }
+
+    pub fn draft_labels(&self) -> &[String] {
+        &self.draft_labels
     }
 
     /// Called by `App` once the background resolver picks a reachable base
@@ -261,9 +267,10 @@ impl FillPullRequestScreen {
 
     /// Transition into the Review step with the parsed draft. Drops the PTY
     /// (killing opencode if it is still alive after a finalize-confirm).
-    pub fn enter_review(&mut self, title: String, body: String) {
+    pub fn enter_review(&mut self, title: String, body: String, labels: Vec<String>) {
         self.draft_title = Some(title);
         self.draft_body = Some(body);
+        self.draft_labels = labels;
         self.review_button = ReviewButton::Submit;
         self.pty = None;
         self.finalize_confirm = None;
@@ -1347,7 +1354,7 @@ mod tests {
     fn review_buttons_drive_submit_and_finish() {
         let mut screen = FillPullRequestScreen::new(create_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.enter_review("My title".to_string(), "# Description".to_string());
+        screen.enter_review("My title".to_string(), "# Description".to_string(), vec![]);
         assert_eq!(screen.step(), FillStep::Review);
         // Default focus is the submit button.
         assert_eq!(screen.handle_key(key(KeyCode::Enter)), FillAction::Submit);
@@ -1362,7 +1369,7 @@ mod tests {
     fn review_shows_title_and_open_button_for_new_pr() {
         let mut screen = FillPullRequestScreen::new(create_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.enter_review("DIGIT-3131 Add retry".to_string(), "body".to_string());
+        screen.enter_review("DIGIT-3131 Add retry".to_string(), "body".to_string(), vec![]);
         let dump = render_dump(&mut screen, 100, 20);
         assert!(dump.contains("DIGIT-3131 Add retry"), "{dump}");
         assert!(dump.contains("Open PR"), "{dump}");
@@ -1373,7 +1380,7 @@ mod tests {
     fn review_shows_update_button_for_existing_pr() {
         let mut screen = FillPullRequestScreen::new(update_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.enter_review("New title".to_string(), "body".to_string());
+        screen.enter_review("New title".to_string(), "body".to_string(), vec![]);
         let dump = render_dump(&mut screen, 100, 20);
         assert!(dump.contains("Update PR"), "{dump}");
         assert!(dump.contains("Update pull request #42"), "{dump}");

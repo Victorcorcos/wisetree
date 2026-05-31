@@ -1503,6 +1503,7 @@ impl App {
                     return;
                 };
                 let body = screen.draft_body().map(str::to_string).unwrap_or_default();
+                let labels = screen.draft_labels().to_vec();
                 screen.start_opening();
                 kick_off_submit_pull_request(
                     self.git_root.clone(),
@@ -1510,6 +1511,7 @@ impl App {
                     request,
                     title,
                     body,
+                    labels,
                     tx.clone(),
                 );
             }
@@ -1538,7 +1540,7 @@ impl App {
         let path = PathBuf::from(&screen.request().worktree_path).join("pull_request.md");
         match std::fs::read_to_string(&path) {
             Ok(content) => match parse_pull_request_md(&content) {
-                Some((title, body)) => screen.enter_review(title, body),
+                Some((title, body, labels)) => screen.enter_review(title, body, labels),
                 None => screen.set_error(
                     "pull_request.md has no title line yet — let opencode finish, then retry."
                         .to_string(),
@@ -4046,6 +4048,7 @@ fn kick_off_submit_pull_request(
     request: FillPullRequestRequest,
     title: String,
     body: String,
+    labels: Vec<String>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -4074,6 +4077,7 @@ fn kick_off_submit_pull_request(
                 request.number,
                 &title,
                 &body,
+                &labels,
                 Some(&activity_tx),
             )
             .await
