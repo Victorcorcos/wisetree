@@ -80,12 +80,19 @@ mod tests {
         // thumb flush at the bottom when position == content_length - 1, so
         // this is exactly the invariant that fixes the "phantom room below".
         let (content, pos, vp) = scrollbar_metrics(50, 0, viewport).unwrap();
-        assert_eq!(pos, content - 1, "at the live tail the thumb must be flush bottom");
+        assert_eq!(
+            pos,
+            content - 1,
+            "at the live tail the thumb must be flush bottom"
+        );
         assert_eq!(vp, viewport);
 
         // Oldest line (offset == scrollable_rows, fully scrolled up) → top.
         let (_content, pos_top, _vp) = scrollbar_metrics(50, 50, viewport).unwrap();
-        assert_eq!(pos_top, 0, "scrolled all the way up the thumb must be at the top");
+        assert_eq!(
+            pos_top, 0,
+            "scrolled all the way up the thumb must be at the top"
+        );
 
         // Halfway back.
         let (_c, pos_mid, _v) = scrollbar_metrics(50, 25, viewport).unwrap();

@@ -4271,7 +4271,8 @@ mod tests {
         assert_eq!(args[c_idx + 3], "/usr/local/bin/opencode");
         assert_eq!(args[c_idx + 4], "--prompt");
         assert_eq!(
-            args[c_idx + 5], dangerous,
+            args[c_idx + 5],
+            dangerous,
             "prompt arg must be forwarded verbatim, never re-parsed"
         );
         assert_eq!(args[c_idx + 6], "-m");

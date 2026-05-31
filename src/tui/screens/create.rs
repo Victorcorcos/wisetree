@@ -1107,6 +1107,10 @@ mod tests {
         let mut screen = screen_with_log(50);
         assert_eq!(screen.terminal_scroll(), 0);
         screen.append_terminal_line("new".to_string(), ActivityKind::Stdout);
-        assert_eq!(screen.terminal_scroll(), 0, "tail-following must not start scrolling");
+        assert_eq!(
+            screen.terminal_scroll(),
+            0,
+            "tail-following must not start scrolling"
+        );
     }
 }
