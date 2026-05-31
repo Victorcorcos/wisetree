@@ -1369,7 +1369,11 @@ mod tests {
     fn review_shows_title_and_open_button_for_new_pr() {
         let mut screen = FillPullRequestScreen::new(create_request());
         screen.set_base_ref("upstream/main".to_string());
-        screen.enter_review("DIGIT-3131 Add retry".to_string(), "body".to_string(), vec![]);
+        screen.enter_review(
+            "DIGIT-3131 Add retry".to_string(),
+            "body".to_string(),
+            vec![],
+        );
         let dump = render_dump(&mut screen, 100, 20);
         assert!(dump.contains("DIGIT-3131 Add retry"), "{dump}");
         assert!(dump.contains("Open PR"), "{dump}");

@@ -1268,12 +1268,7 @@ impl DashboardService {
                 let edit_args_ref: Vec<&str> = edit_args.iter().map(String::as_str).collect();
                 let edit = time::timeout(
                     FILL_SUBMIT_TIMEOUT,
-                    run_command_streamed(
-                        &self.gh_binary,
-                        &edit_args_ref,
-                        Some(&cwd),
-                        activity,
-                    ),
+                    run_command_streamed(&self.gh_binary, &edit_args_ref, Some(&cwd), activity),
                 )
                 .await
                 .map_err(|_| WisetreeError::other("gh pr edit timed out after 60s"))?;
@@ -1337,12 +1332,7 @@ impl DashboardService {
                 let create_args_ref: Vec<&str> = create_args.iter().map(String::as_str).collect();
                 let create = time::timeout(
                     FILL_SUBMIT_TIMEOUT,
-                    run_command_streamed(
-                        &self.gh_binary,
-                        &create_args_ref,
-                        Some(&cwd),
-                        activity,
-                    ),
+                    run_command_streamed(&self.gh_binary, &create_args_ref, Some(&cwd), activity),
                 )
                 .await
                 .map_err(|_| WisetreeError::other("gh pr create timed out after 60s"))?;
@@ -3702,7 +3692,10 @@ mod tests {
         let md = "Fix login crash\n<!-- wisetree-labels: bug 🐛, security 🛡️ -->\n\n# Description\n\nDetails.";
         let (title, body, labels) = parse_pull_request_md(md).expect("parsed");
         assert_eq!(title, "Fix login crash");
-        assert!(!body.contains("wisetree-labels"), "comment should be stripped from body");
+        assert!(
+            !body.contains("wisetree-labels"),
+            "comment should be stripped from body"
+        );
         assert_eq!(labels, vec!["bug 🐛", "security 🛡️"]);
     }
 
