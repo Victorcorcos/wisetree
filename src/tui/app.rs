@@ -542,21 +542,22 @@ impl App {
                 }
             }
             Screen::UpdatePullRequest => {
-                // Once the AI is actively streaming the conflict resolution
-                // we want the entire bottom region of the screen so the
-                // AI Activity panel — the longest-running, scroll-heavy view
-                // in the app — has room to breathe. The Confirm and pre-AI
-                // phases (Fetching, Merging) stay in the compact framed
-                // panel so they don't look lost in a huge empty area.
-                let ai_active = self
+                // Once the AI is actively streaming the conflict resolution —
+                // or the push failed and the interactive Terminal Activity
+                // shell is up — we want the entire bottom region of the
+                // screen so these long-running, scroll-heavy panels have room
+                // to breathe. The Confirm and pre-AI phases (Fetching,
+                // Merging) stay in the compact framed panel so they don't look
+                // lost in a huge empty area.
+                let wants_fill = self
                     .update_pr
                     .as_ref()
-                    .is_some_and(|s| s.is_updating() && s.ai_active());
+                    .is_some_and(|s| s.is_updating() && (s.ai_active() || s.terminal_active()));
                 let in_confirm = self
                     .update_pr
                     .as_ref()
                     .is_some_and(|s| matches!(s.step(), UpdateStep::Confirm));
-                let panel = if ai_active || in_confirm {
+                let panel = if wants_fill || in_confirm {
                     self.render_framed_panel_fill(frame, area)
                 } else {
                     let h = self
@@ -709,10 +710,15 @@ impl App {
                 // Web-page semantics: wheel scrolls the screen's active
                 // scrollable region. On Update Pull Request that is either
                 // the live AI Activity panel (during conflict resolution) or
-                // the review diff panel (after the AI creates a merge commit).
+                // the review diff panel (after the AI creates a merge commit);
+                // on Create it's the "Creating" Terminal Activity log.
                 if matches!(self.screen, Screen::UpdatePullRequest) {
                     if let Some(screen) = self.update_pr.as_mut() {
                         screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
+                    }
+                } else if matches!(self.screen, Screen::Create) {
+                    if let Some(screen) = self.create.as_mut() {
+                        screen.scroll_terminal_up(WHEEL_LINES_PER_TICK);
                     }
                 }
             }
@@ -720,6 +726,10 @@ impl App {
                 if matches!(self.screen, Screen::UpdatePullRequest) {
                     if let Some(screen) = self.update_pr.as_mut() {
                         screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
+                    }
+                } else if matches!(self.screen, Screen::Create) {
+                    if let Some(screen) = self.create.as_mut() {
+                        screen.scroll_terminal_down(WHEEL_LINES_PER_TICK);
                     }
                 }
             }
@@ -1115,19 +1125,7 @@ impl App {
                         self.update_pr = None;
                         self.enter_screen(Screen::Dashboard, tx);
                     }
-                    UpdateAction::Confirmed => {
-                        let Some(screen) = self.update_pr.as_mut() else {
-                            return;
-                        };
-                        let request = screen.request().clone();
-                        screen.start_updating();
-                        kick_off_update_pull_request(
-                            self.git_root.clone(),
-                            self.current_dashboard_config(),
-                            request,
-                            tx.clone(),
-                        );
-                    }
+                    UpdateAction::Confirmed => self.confirm_update_pr(tx),
                     UpdateAction::AiComplete => {
                         let dashboard_config = self.current_dashboard_config();
                         let git_root = self.git_root.clone();
@@ -1160,6 +1158,8 @@ impl App {
                         screen.set_phase_message("Aborting merge and discarding AI changes...");
                         kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
                     }
+                    UpdateAction::TerminalAccept => self.terminal_accept_push(tx),
+                    UpdateAction::TerminalDiscard => self.terminal_discard(tx),
                 }
             }
             Screen::UpdateBranch => {}
@@ -1291,19 +1291,7 @@ impl App {
                 self.update_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
-            UpdateAction::Confirmed => {
-                let Some(screen) = self.update_pr.as_mut() else {
-                    return;
-                };
-                let request = screen.request().clone();
-                screen.start_updating();
-                kick_off_update_pull_request(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
-                    request,
-                    tx.clone(),
-                );
-            }
+            UpdateAction::Confirmed => self.confirm_update_pr(tx),
             UpdateAction::AiComplete => {
                 let dashboard_config = self.current_dashboard_config();
                 let git_root = self.git_root.clone();
@@ -1336,6 +1324,71 @@ impl App {
                 screen.set_phase_message("Aborting merge and discarding AI changes...");
                 kick_off_abort_ai_merge(git_root, dashboard_config, request, tx.clone());
             }
+            UpdateAction::TerminalAccept => self.terminal_accept_push(tx),
+            UpdateAction::TerminalDiscard => self.terminal_discard(tx),
+        }
+    }
+
+    /// Shared dispatch for confirming the update/push confirmation dialog.
+    /// Push-only screens re-route to the push pipeline; everything else
+    /// runs the full fetch/merge/push update.
+    fn confirm_update_pr(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.update_pr.as_mut() else {
+            return;
+        };
+        let request = screen.request().clone();
+        let push_only = screen.is_push_only();
+        screen.start_updating();
+        if push_only {
+            screen.set_phase_message("Pushing to origin...");
+            kick_off_push_pull_request(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                request,
+                tx.clone(),
+            );
+        } else {
+            kick_off_update_pull_request(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                request,
+                tx.clone(),
+            );
+        }
+    }
+
+    /// The user pressed Accept in the Terminal Activity recovery panel:
+    /// re-run `git push origin HEAD` and report the real outcome. A repeat
+    /// failure simply re-opens the terminal (via `apply_update_pr_finished`).
+    fn terminal_accept_push(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.update_pr.as_mut() else {
+            return;
+        };
+        let request = screen.request().clone();
+        screen.set_phase_message("Re-attempting push...");
+        kick_off_push_pull_request(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request,
+            tx.clone(),
+        );
+    }
+
+    /// The user pressed Discard/Esc in the Terminal Activity recovery panel:
+    /// leave the worktree as-is (the local merge is intact) and return to the
+    /// dashboard with an explanatory toast.
+    fn terminal_discard(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let number = self.update_pr.as_ref().map(|s| s.request().number);
+        self.update_pr = None;
+        self.enter_screen(Screen::Dashboard, tx);
+        if let Some(number) = number {
+            self.show_toast(
+                ToastVariant::Warning,
+                format!(
+                    "Left PR #{number} without confirming a push — the local merge is \
+                     intact; push when ready."
+                ),
+            );
         }
     }
 
@@ -1435,6 +1488,9 @@ impl App {
             DashboardAction::UpdatePullRequest(request) => {
                 self.start_update_pr_flow(*request, tx);
             }
+            DashboardAction::PushPullRequest(request) => {
+                self.start_push_pr_flow(*request, tx);
+            }
             DashboardAction::UpdateBranch(path) => {
                 self.start_update_branch_flow(path, tx);
             }
@@ -1511,6 +1567,19 @@ impl App {
         self.update_pr = Some(UpdatePullRequestScreen::new(request));
         self.screen = Screen::UpdatePullRequest;
         kick_off_resolve_base_ref(worktree_path, number, tx.clone());
+    }
+
+    /// Mount the push-only confirmation screen. A push needs no base ref,
+    /// so — unlike `start_update_pr_flow` — there's no resolver kick-off;
+    /// the screen lands straight on the Confirm step. Confirmation routes
+    /// to `kick_off_push_pull_request` (see `handle_update_pr_key`).
+    fn start_push_pr_flow(
+        &mut self,
+        request: UpdatePullRequestRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.update_pr = Some(UpdatePullRequestScreen::new_push(request));
+        self.screen = Screen::UpdatePullRequest;
     }
 
     fn start_close_pr_flow(
@@ -2297,12 +2366,29 @@ impl App {
         }) = &result
         {
             if let Some(screen) = self.update_pr.as_mut() {
-                screen.spawn_opencode_pty(
-                    opencode_binary.clone(),
-                    opencode_args.clone(),
-                    cwd.clone(),
-                    Vec::new(),
-                );
+                // Launch opencode *through* the user's login shell so it runs
+                // with the same profile-sourced environment as a freshly
+                // opened terminal (matching the recovery shell below).
+                let (shell, wrapped_args) = login_shell_command(opencode_binary, opencode_args);
+                screen.spawn_opencode_pty(shell, wrapped_args, cwd.clone(), Vec::new());
+                return;
+            }
+        }
+        // A failed `git push` (clean-merge push, AI commit+push, or the
+        // dedicated Push action) does NOT dead-end on a toast. We hand off
+        // to the interactive Terminal Activity recovery panel — a real
+        // shell rooted at the worktree — so the user can diagnose and fix
+        // it, then Accept (re-push) or Discard. Only falls through to the
+        // toast below if the screen was already torn down.
+        if let Ok(UpdatePrSuccess {
+            outcome: UpdatePullRequestOutcome::PushFailed(err),
+            ..
+        }) = &result
+        {
+            if let Some(screen) = self.update_pr.as_mut() {
+                let (shell, args) = login_shell();
+                let cwd = PathBuf::from(&screen.request().worktree_path);
+                screen.start_terminal_recovery(shell, args, cwd, err.clone());
                 return;
             }
         }
@@ -2322,6 +2408,12 @@ impl App {
                     self.show_toast(
                         ToastVariant::Success,
                         format!("Pull Request #{number} updated with `{base_ref}` and pushed."),
+                    );
+                }
+                UpdatePullRequestOutcome::Pushed => {
+                    self.show_toast(
+                        ToastVariant::Success,
+                        format!("Pull Request #{number} pushed to origin."),
                     );
                 }
                 UpdatePullRequestOutcome::MergedWithAiResolution => {
@@ -2831,9 +2923,13 @@ impl App {
 
         let mut reader = ConfigService::new();
         let mut config = if target_path.exists() {
-            reader
-                .load(target_path.parent())
-                .map_err(|e| e.to_string())?
+            if target_path == global_config_file() {
+                reader.load_global().map_err(|e| e.to_string())?
+            } else {
+                reader
+                    .load(target_path.parent())
+                    .map_err(|e| e.to_string())?
+            }
         } else {
             WorktreeConfig::default()
         };
@@ -3779,6 +3875,120 @@ fn kick_off_update_pull_request(
     });
 }
 
+/// Push-only counterpart to `kick_off_update_pull_request`: runs
+/// `git push origin HEAD` against the worktree and reports `Pushed` /
+/// `PushFailed`. Powers both the dashboard's "Push Pull Request" action and
+/// the Terminal Activity panel's "Accept" re-push. A `PushFailed` result is
+/// handled by `apply_update_pr_finished`, which re-opens the recovery panel.
+fn kick_off_push_pull_request(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    request: UpdatePullRequestRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let number = request.number;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
+            number,
+            message: "Could not resolve git root for push.".to_string(),
+        })));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .push_pull_request_with_progress(&request.worktree_path, None)
+            .await;
+        let event = match result {
+            Ok(outcome) => Ok(UpdatePrSuccess {
+                number,
+                // A push has no base ref; the `Pushed` toast doesn't use it.
+                base_ref: String::new(),
+                outcome,
+            }),
+            Err(err) => Err(UpdatePrFailure {
+                number,
+                message: user_friendly_message(&err),
+            }),
+        };
+        let _ = tx.send(AppEvent::UpdatePrFinished(event));
+    });
+}
+
+/// Resolve the user's interactive login shell plus the args that make it
+/// source their profile (`~/.bash_profile`, `~/.zprofile`, …) — i.e. behave
+/// like a freshly opened terminal. Prefers `$SHELL` (the user's actual login
+/// shell), falling back to common shells. Shared by every embedded inner
+/// terminal so they all start from the same environment.
+fn login_shell() -> (PathBuf, Vec<String>) {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            ["/bin/zsh", "/bin/bash", "/bin/sh"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|p| p.exists())
+        })
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let args = shell_login_args(&shell);
+    (shell, args)
+}
+
+/// Wrap `program` + `args` so they run *inside* the user's login shell — so a
+/// non-shell inner terminal (e.g. the opencode conflict resolver) still starts
+/// from a profile-sourced environment (PATH, env vars, functions), exactly as
+/// if the user had launched it from a freshly opened terminal.
+///
+/// Uses the `exec "$@"` idiom: the wrapped argv is handed to the shell as
+/// positional parameters and expanded verbatim, never re-parsed — so an
+/// AI-merge prompt containing backticks, `$(...)`, quotes, etc. can't be
+/// interpreted by the shell (no quoting pitfalls, no injection surface).
+fn login_shell_command(program: &std::path::Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    let (shell, mut shell_args) = login_shell();
+    shell_args.push("-c".to_string());
+    shell_args.push("exec \"$@\"".to_string());
+    // $0 — a conventional label for the execed process.
+    shell_args.push(
+        shell
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sh")
+            .to_string(),
+    );
+    // $1.. — the real program and its args, passed through untouched.
+    shell_args.push(program.to_string_lossy().into_owned());
+    shell_args.extend(args.iter().cloned());
+    (shell, shell_args)
+}
+
+/// Build login + interactive args so the recovery shell sources the user's
+/// profile (`~/.bash_profile`, `~/.zprofile`, `~/.zshrc`, …) — making their
+/// custom functions and aliases (e.g. an `update()` defined in
+/// `~/.bash_profile`) available, exactly as a freshly opened terminal would.
+/// `-l` (login) is what pulls in the profile; `-i` forces interactive mode.
+/// This keys off the shell's name rather than the OS, so it works wherever
+/// the user's `$SHELL` points. POSIX `sh`/`dash` reject `-l`, so they only
+/// receive `-i`.
+fn shell_login_args(shell: &std::path::Path) -> Vec<String> {
+    let name = shell
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        // Some environments report `$SHELL` (or argv0) as e.g. `-bash`.
+        .trim_start_matches('-');
+    match name {
+        "bash" | "zsh" | "fish" | "ksh" | "ksh93" | "mksh" | "tcsh" | "csh" => {
+            vec!["-l".to_string(), "-i".to_string()]
+        }
+        // sh / dash and anything unrecognized: interactive only (no `-l`,
+        // which dash treats as an illegal option).
+        _ => vec!["-i".to_string()],
+    }
+}
+
 fn kick_off_setup_install(shell: Shell, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
@@ -4075,6 +4285,55 @@ mod tests {
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
+    }
+
+    #[test]
+    fn shell_login_args_are_login_interactive_for_common_shells() {
+        let expected: Vec<String> = vec!["-l".into(), "-i".into()];
+        for path in [
+            "/bin/bash",
+            "/usr/bin/zsh",
+            "/opt/homebrew/bin/bash",
+            "/usr/local/bin/fish",
+        ] {
+            assert_eq!(
+                shell_login_args(std::path::Path::new(path)),
+                expected,
+                "expected login+interactive args for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_login_args_skip_login_flag_for_posix_sh() {
+        // dash rejects `-l`, so sh/dash and unknown shells get interactive only.
+        let expected: Vec<String> = vec!["-i".into()];
+        for path in ["/bin/sh", "/bin/dash", "/usr/bin/some-exotic-shell"] {
+            assert_eq!(shell_login_args(std::path::Path::new(path)), expected);
+        }
+    }
+
+    #[test]
+    fn login_shell_command_uses_exec_idiom_and_passes_args_verbatim() {
+        // A program + an arg containing shell metacharacters that must NOT be
+        // interpreted (the AI-merge prompt can contain backticks, $(), etc.).
+        let dangerous = "resolve `rm -rf /` and $(whoami)".to_string();
+        let (_shell, args) = login_shell_command(
+            std::path::Path::new("/usr/local/bin/opencode"),
+            &["--prompt".to_string(), dangerous.clone(), "-m".to_string()],
+        );
+        // The shell receives `... -c 'exec "$@"' <$0> <program> <args...>`.
+        let c_idx = args.iter().position(|a| a == "-c").expect("-c present");
+        assert_eq!(args[c_idx + 1], "exec \"$@\"");
+        // $0 is a label, then the program, then the args passed through as-is.
+        assert_eq!(args[c_idx + 3], "/usr/local/bin/opencode");
+        assert_eq!(args[c_idx + 4], "--prompt");
+        assert_eq!(
+            args[c_idx + 5],
+            dangerous,
+            "prompt arg must be forwarded verbatim, never re-parsed"
+        );
+        assert_eq!(args[c_idx + 6], "-m");
     }
 
     fn with_home<F: FnOnce(&TempDir)>(f: F) {
