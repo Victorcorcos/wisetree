@@ -6,6 +6,8 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -32,6 +34,19 @@ const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_MERGE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeouts for the "Fill Pull Request" pipeline. Gathering the diff/log is
+/// read-only but can be large on a long branch; push + `gh pr create/edit`
+/// talk to the network.
+const FILL_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
+const FILL_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+const FILL_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Soft cap on the embedded diff size inside the AI prompt. opencode
+/// receives the whole prompt as a single argv entry, so an unbounded diff
+/// risks exceeding the OS argument-length limit and failing to spawn.
+/// Diffs above this are truncated with a marker so the launch always
+/// succeeds; the AI still has the commit log + the bulk of the diff to work
+/// from.
+const FILL_DIFF_MAX_BYTES: usize = 120_000;
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -393,6 +408,43 @@ pub enum UpdateBranchOutcome {
     /// `git merge {base_ref}` failed for any reason (conflicts, dirty
     /// tree, refusal). stderr included.
     MergeFailed { base_ref: String, message: String },
+}
+
+/// Result of the read-only preparation phase of the "Fill Pull Request"
+/// pipeline (`prepare_fill`). On `HandedOffToUi` the UI spawns opencode in
+/// its embedded PTY to draft `pull_request.md`; the other variants are
+/// terminal and map straight to a toast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillPreparation {
+    /// Diff/log gathered, prompt built, `useAi` set and `opencode` on PATH.
+    /// The UI owns the PTY lifecycle from here; once opencode finishes the
+    /// screen reads `pull_request.md` and offers to open/update the PR.
+    HandedOffToUi {
+        opencode_binary: PathBuf,
+        opencode_args: Vec<String>,
+        cwd: PathBuf,
+        model: String,
+    },
+    /// No commits ahead of the base ref → there is nothing to describe.
+    NothingToDescribe,
+    /// `useAi` is blank in `DashboardConfig` — no model configured to draft.
+    AiNotConfigured,
+    /// `useAi` is set but the `opencode` binary is not on PATH.
+    AiUnavailable,
+}
+
+/// Outcome of submitting the drafted PR (`submit_pull_request`): either a
+/// brand-new PR was created or the existing one's title/body were updated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillSubmitOutcome {
+    /// `gh pr create` succeeded. `url` is parsed from gh's stdout.
+    Created { number: u64, url: String },
+    /// `gh pr edit` succeeded for the existing PR.
+    Updated { number: u64 },
+    /// `git push` failed before the PR could be created. stderr included.
+    PushFailed(String),
+    /// `gh pr create` / `gh pr edit` failed. stderr included.
+    SubmitFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1048,6 +1100,182 @@ impl DashboardService {
         match abort {
             Ok(_) => Ok(UpdatePullRequestOutcome::DiscardedAiMerge),
             Err(err) => Ok(UpdatePullRequestOutcome::AbortFailed(err)),
+        }
+    }
+
+    /// Read-only preparation for the "Fill Pull Request" flow. Gathers the
+    /// commit log + diff against `base_ref`, extracts the ticket from the
+    /// branch name, reads the repo's PR template (falling back to the
+    /// embedded one), and renders `prompts/filler.md` into the opencode
+    /// command the UI will spawn. No git mutation happens here — the AI's
+    /// only job is to write `pull_request.md`.
+    pub async fn prepare_fill(
+        &self,
+        worktree_path: &str,
+        branch: &str,
+        base_ref: &str,
+    ) -> Result<FillPreparation> {
+        let cwd = PathBuf::from(worktree_path);
+
+        // Commit log (oldest first) and full diff against the base ref.
+        let log_range = format!("{base_ref}..HEAD");
+        let diff_range = format!("{base_ref}...HEAD");
+        let git_log = time::timeout(
+            FILL_CONTEXT_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &[
+                    "log",
+                    &log_range,
+                    "--reverse",
+                    "--format=### %s%n%n%b",
+                ],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git log timed out after 30s"))?
+        .unwrap_or_default();
+        let git_diff = time::timeout(
+            FILL_CONTEXT_TIMEOUT,
+            run_command(&self.git_binary, &["diff", &diff_range], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git diff timed out after 30s"))?
+        .unwrap_or_default();
+
+        if git_diff.trim().is_empty() && git_log.trim().is_empty() {
+            return Ok(FillPreparation::NothingToDescribe);
+        }
+
+        let use_ai = self.config.use_ai.trim().to_string();
+        if use_ai.is_empty() {
+            return Ok(FillPreparation::AiNotConfigured);
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Ok(FillPreparation::AiUnavailable);
+        }
+
+        let ticket = extract_ticket(branch).unwrap_or_default();
+        let template = read_pr_template(&cwd).await;
+        let prompt = build_fill_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
+
+        // Invoke opencode's default TUI (no subcommand) with `--prompt` so
+        // the filler instructions auto-send on launch and `-m <model>` so
+        // the user's configured model is honored — mirrors the merge flow.
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            use_ai.clone(),
+            cwd.to_string_lossy().to_string(),
+        ];
+
+        Ok(FillPreparation::HandedOffToUi {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+            model: use_ai,
+        })
+    }
+
+    /// Open or update the pull request from the drafted title + body. When
+    /// `number` is `Some`, the existing PR's title/body are edited (with any
+    /// media from the old body re-inserted under `# Overview`). When `None`,
+    /// the branch is pushed and a new PR is created.
+    pub async fn submit_pull_request(
+        &self,
+        worktree_path: &str,
+        branch: &str,
+        number: Option<u64>,
+        title: &str,
+        body: &str,
+    ) -> Result<FillSubmitOutcome> {
+        if !self.gh_available {
+            return Err(WisetreeError::other(
+                "gh CLI not found — install `gh` to open pull requests.",
+            ));
+        }
+        let cwd = PathBuf::from(worktree_path);
+
+        match number {
+            // Update the existing PR's description, preserving any media
+            // (screenshots / videos) GitHub already had in the old body.
+            Some(number) => {
+                let body = match self.fetch_pr_details(number).await {
+                    Ok(details) => preserve_media(&details.body, body),
+                    // If we can't read the old body, push the new body as-is
+                    // rather than blocking the update entirely.
+                    Err(_) => body.to_string(),
+                };
+                let number_arg = number.to_string();
+                let edit = time::timeout(
+                    FILL_SUBMIT_TIMEOUT,
+                    run_command(
+                        &self.gh_binary,
+                        &["pr", "edit", &number_arg, "--title", title, "--body", &body],
+                        Some(&cwd),
+                    ),
+                )
+                .await
+                .map_err(|_| WisetreeError::other("gh pr edit timed out after 60s"))?;
+                match edit {
+                    Ok(_) => Ok(FillSubmitOutcome::Updated { number }),
+                    Err(err) => Ok(FillSubmitOutcome::SubmitFailed(err)),
+                }
+            }
+            // Create a brand-new PR: push the branch, then `gh pr create`.
+            None => {
+                let push = time::timeout(
+                    FILL_PUSH_TIMEOUT,
+                    run_command(
+                        &self.git_binary,
+                        &["push", "-u", "origin", branch],
+                        Some(&cwd),
+                    ),
+                )
+                .await
+                .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+                if let Err(err) = push {
+                    return Ok(FillSubmitOutcome::PushFailed(err));
+                }
+
+                // `--head owner:branch` keeps `gh` from aborting when the
+                // worktree has uncommitted files; fall back to the bare
+                // branch if the owner lookup fails.
+                let owner = run_command(
+                    &self.gh_binary,
+                    &["repo", "view", "--json", "owner", "--jq", ".owner.login"],
+                    Some(&cwd),
+                )
+                .await
+                .ok()
+                .filter(|o| !o.trim().is_empty());
+                let head = match owner {
+                    Some(owner) => format!("{}:{branch}", owner.trim()),
+                    None => branch.to_string(),
+                };
+                let create = time::timeout(
+                    FILL_SUBMIT_TIMEOUT,
+                    run_command(
+                        &self.gh_binary,
+                        &[
+                            "pr", "create", "--title", title, "--body", body, "--head", &head,
+                        ],
+                        Some(&cwd),
+                    ),
+                )
+                .await
+                .map_err(|_| WisetreeError::other("gh pr create timed out after 60s"))?;
+                match create {
+                    Ok(out) => {
+                        let url = pr_url_from_output(&out);
+                        let number = pr_number_from_url(&url).unwrap_or(0);
+                        Ok(FillSubmitOutcome::Created { number, url })
+                    }
+                    Err(err) => Ok(FillSubmitOutcome::SubmitFailed(err)),
+                }
+            }
         }
     }
 
@@ -2267,6 +2495,198 @@ fn build_merge_prompt(base_ref: &str, conflicts: &[String]) -> String {
         .replace("CONFLICTED_FILES", &bulleted)
 }
 
+/// Fallback PR template used when the repo ships none of the well-known
+/// template files. Mirrors the `filler` skill's reference template so the
+/// native flow produces the same section layout the team is used to.
+const FILL_TEMPLATE_FALLBACK: &str = "# Description ✍️
+
+Brief explanation of the PR purpose
+
+
+# Overview 🔍
+
+Overview of the feature if possible (screenshot, gif, etc)
+
+
+# Test Guidance 🦮
+
+Step-by-step process to test the changes related to this Pull Request
+
+
+# Ticket 🎫
+
+[{{ACRONYM}}-{{NUMBER}}](link/to/{{ACRONYM}}-{{NUMBER}})
+";
+
+/// Extract a ticket id from a branch name. Matches the `filler`/`creator`
+/// skills: acronym `DIGIT` or `DPMS` (case-insensitive), an optional
+/// hyphen, then digits — normalized to uppercase `ACRONYM-NUM`.
+fn extract_ticket(branch: &str) -> Option<String> {
+    static TICKET: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)(DIGIT|DPMS)-?(\d+)").unwrap());
+    let caps = TICKET.captures(branch)?;
+    let acronym = caps.get(1)?.as_str().to_uppercase();
+    let number = caps.get(2)?.as_str();
+    Some(format!("{acronym}-{number}"))
+}
+
+/// Read the repository's PR template, trying the well-known locations in
+/// order and falling back to the embedded default. Searched relative to the
+/// worktree so each checkout's `.github/` is honored.
+async fn read_pr_template(cwd: &Path) -> String {
+    const CANDIDATES: [&str; 7] = [
+        ".github/pull_request_template.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        ".github/PULL_REQUEST_TEMPLATE/pull_request_template.md",
+        "docs/pull_request_template.md",
+        "docs/PULL_REQUEST_TEMPLATE.md",
+        "pull_request_template.md",
+        "PULL_REQUEST_TEMPLATE.md",
+    ];
+    for rel in CANDIDATES {
+        if let Ok(content) = tokio::fs::read_to_string(cwd.join(rel)).await {
+            if !content.trim().is_empty() {
+                return content;
+            }
+        }
+    }
+    FILL_TEMPLATE_FALLBACK.to_string()
+}
+
+/// Render `prompts/filler.md` into a concrete prompt by substituting the
+/// harness-gathered inputs. The diff is embedded last (and truncated if
+/// huge) so the earlier placeholder substitutions never scan the diff body.
+fn build_fill_prompt(
+    base_ref: &str,
+    branch: &str,
+    ticket: &str,
+    git_log: &str,
+    git_diff: &str,
+    template: &str,
+) -> String {
+    const FILLER_PROMPT: &str = include_str!("../../prompts/filler.md");
+    let diff = truncate_for_prompt(git_diff, FILL_DIFF_MAX_BYTES);
+    FILLER_PROMPT
+        .replace("BASE_REF", base_ref)
+        .replace("CURRENT_BRANCH", branch)
+        .replace("TICKET", ticket)
+        .replace("PR_TEMPLATE", template)
+        .replace("GIT_LOG", git_log)
+        .replace("GIT_DIFF", &diff)
+}
+
+/// Truncate `text` to at most `max_bytes` on a UTF-8 char boundary,
+/// appending a marker so the reader knows the content was clipped.
+fn truncate_for_prompt(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[... diff truncated at ~{} KB — describe the overall change; \
+         the full diff exceeds the prompt budget ...]",
+        &text[..end],
+        max_bytes / 1000
+    )
+}
+
+/// Parse a drafted `pull_request.md`: the first non-empty line is the PR
+/// title (any leading `# ` is stripped), and everything after it (leading
+/// blank lines trimmed) is the body. Returns `None` when there is no title.
+pub fn parse_pull_request_md(content: &str) -> Option<(String, String)> {
+    let mut lines = content.lines();
+    let title_line = lines.by_ref().find(|line| !line.trim().is_empty())?;
+    let title = title_line.trim().trim_start_matches('#').trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let body = lines.collect::<Vec<_>>().join("\n");
+    let body = body.trim_start().to_string();
+    Some((title, body))
+}
+
+/// Pull every media reference out of a PR body in first-seen order:
+/// markdown images, `<img>`/`<video>` tags, and bare GitHub asset URLs
+/// (`.../assets/...`, `user-images.githubusercontent.com/...`). Used to
+/// carry screenshots/videos across a description rewrite.
+fn extract_media(body: &str) -> Vec<String> {
+    static MEDIA: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?is)!\[[^\]]*\]\([^)]*\)|<img[^>]*>|<video[^>]*>.*?</video>|<video[^>]*/?>|https?://github\.com/[^\s)]+/assets/[^\s)]+|https?://user-images\.githubusercontent\.com/[^\s)]+",
+        )
+        .unwrap()
+    });
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for m in MEDIA.find_iter(body) {
+        let snippet = m.as_str().trim().to_string();
+        if !snippet.is_empty() && seen.insert(snippet.clone()) {
+            out.push(snippet);
+        }
+    }
+    out
+}
+
+/// Re-insert media from `old_body` into `new_body` immediately under the
+/// `# Overview` heading, skipping anything already present. When the new
+/// body has no Overview section the media is appended under a fresh one.
+fn preserve_media(old_body: &str, new_body: &str) -> String {
+    let fresh: Vec<String> = extract_media(old_body)
+        .into_iter()
+        .filter(|m| !new_body.contains(m.as_str()))
+        .collect();
+    if fresh.is_empty() {
+        return new_body.to_string();
+    }
+    let block = fresh.join("\n\n");
+    let lines: Vec<&str> = new_body.lines().collect();
+    let overview = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('#') && trimmed.to_lowercase().contains("overview")
+    });
+    match overview {
+        Some(idx) => {
+            let insert_at = idx + 1;
+            let mut result = lines[..insert_at].join("\n");
+            result.push_str("\n\n");
+            result.push_str(&block);
+            if insert_at < lines.len() {
+                result.push('\n');
+                result.push('\n');
+                result.push_str(&lines[insert_at..].join("\n"));
+            } else {
+                result.push('\n');
+            }
+            result
+        }
+        None => format!("{}\n\n# Overview 🔍\n\n{block}\n", new_body.trim_end()),
+    }
+}
+
+/// First http(s) URL on the last non-empty line of `gh pr create` output —
+/// gh prints the new PR's URL as the final line on success.
+fn pr_url_from_output(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.split_whitespace()
+                .find(|token| token.starts_with("http"))
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the numeric PR id from a `.../pull/<n>` GitHub URL.
+fn pr_number_from_url(url: &str) -> Option<u64> {
+    let tail = url.rsplit("/pull/").next()?;
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().ok()
+}
+
 pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -> Option<String> {
     if config.show_pull_requests && !gh_available {
         Some("gh CLI not found - PR column hidden.".to_string())
@@ -3058,5 +3478,108 @@ mod tests {
             subject_with_pr_reference("Add merge action (#99)", 7),
             "Add merge action (#99) (#7)"
         );
+    }
+
+    #[test]
+    fn extract_ticket_normalizes_acronym_and_hyphen() {
+        assert_eq!(extract_ticket("digit3131-add-retry"), Some("DIGIT-3131".into()));
+        assert_eq!(extract_ticket("DIGIT-42-fix"), Some("DIGIT-42".into()));
+        assert_eq!(extract_ticket("feature/dpms-9-thing"), Some("DPMS-9".into()));
+        assert_eq!(extract_ticket("just-a-branch"), None);
+    }
+
+    #[test]
+    fn parse_pull_request_md_splits_title_and_body() {
+        let md = "DIGIT-3131 Add payment retry logic\n\n# Description ✍️\n\nDetails here.";
+        let (title, body) = parse_pull_request_md(md).expect("parsed");
+        assert_eq!(title, "DIGIT-3131 Add payment retry logic");
+        assert!(body.starts_with("# Description ✍️"));
+        assert!(body.contains("Details here."));
+    }
+
+    #[test]
+    fn parse_pull_request_md_strips_heading_marker_from_title() {
+        let md = "# My title line\n\nbody";
+        let (title, body) = parse_pull_request_md(md).expect("parsed");
+        assert_eq!(title, "My title line");
+        assert_eq!(body, "body");
+    }
+
+    #[test]
+    fn parse_pull_request_md_returns_none_when_empty() {
+        assert!(parse_pull_request_md("\n\n   \n").is_none());
+    }
+
+    #[test]
+    fn build_fill_prompt_substitutes_all_inputs() {
+        let prompt = build_fill_prompt(
+            "upstream/main",
+            "digit-3131-retry",
+            "DIGIT-3131",
+            "### Add retry\n\nbody",
+            "diff --git a/x b/x",
+            "# Description ✍️",
+        );
+        assert!(!prompt.contains("BASE_REF"));
+        assert!(!prompt.contains("GIT_DIFF"));
+        assert!(!prompt.contains("GIT_LOG"));
+        assert!(!prompt.contains("PR_TEMPLATE"));
+        assert!(prompt.contains("upstream/main"));
+        assert!(prompt.contains("DIGIT-3131"));
+        assert!(prompt.contains("diff --git a/x b/x"));
+    }
+
+    #[test]
+    fn truncate_for_prompt_caps_oversized_diff() {
+        let big = "x".repeat(10);
+        let out = truncate_for_prompt(&big, 4);
+        assert!(out.starts_with("xxxx"));
+        assert!(out.contains("truncated"));
+        let small = "tiny";
+        assert_eq!(truncate_for_prompt(small, 100), "tiny");
+    }
+
+    #[test]
+    fn preserve_media_reinserts_under_overview() {
+        let old = "# Description\n\nstuff\n\n# Overview\n\n![shot](https://user-images.githubusercontent.com/1/a.png)\n";
+        let new = "# Description ✍️\n\nNew description\n\n# Overview 🔍\n\nplaceholder\n\n# Test Guidance\n\nsteps";
+        let merged = preserve_media(old, new);
+        assert!(merged.contains("![shot](https://user-images.githubusercontent.com/1/a.png)"));
+        let overview_idx = merged.find("# Overview").unwrap();
+        let media_idx = merged.find("![shot]").unwrap();
+        let guidance_idx = merged.find("# Test Guidance").unwrap();
+        // Media lands after the Overview heading but before Test Guidance.
+        assert!(overview_idx < media_idx && media_idx < guidance_idx);
+    }
+
+    #[test]
+    fn preserve_media_no_media_returns_body_unchanged() {
+        let old = "# Overview\n\njust text, no media";
+        let new = "# Overview 🔍\n\nfresh";
+        assert_eq!(preserve_media(old, new), new);
+    }
+
+    #[test]
+    fn preserve_media_skips_media_already_present() {
+        let token = "![s](https://github.com/o/r/assets/1/2)";
+        let old = format!("# Overview\n\n{token}");
+        let new = format!("# Overview 🔍\n\n{token}");
+        // Already present in the new body → not duplicated.
+        assert_eq!(preserve_media(&old, &new), new);
+    }
+
+    #[test]
+    fn pr_number_from_url_parses_pull_path() {
+        assert_eq!(
+            pr_number_from_url("https://github.com/o/r/pull/321"),
+            Some(321)
+        );
+        assert_eq!(pr_number_from_url("https://github.com/o/r"), None);
+    }
+
+    #[test]
+    fn pr_url_from_output_finds_last_url_line() {
+        let out = "Warning: 3 uncommitted changes\nhttps://github.com/o/r/pull/9";
+        assert_eq!(pr_url_from_output(out), "https://github.com/o/r/pull/9");
     }
 }

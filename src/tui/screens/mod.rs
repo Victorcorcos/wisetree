@@ -7,6 +7,7 @@ pub mod create;
 pub mod dashboard;
 pub mod delete;
 pub mod error;
+pub mod fill_pr;
 pub mod loading;
 pub mod menu;
 pub mod merge_pr;

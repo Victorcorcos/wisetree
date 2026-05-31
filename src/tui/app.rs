@@ -34,9 +34,9 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
-    resolve_dashboard_columns, AppStateService, DashboardService, DashboardUpdate, DashboardWatch,
-    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult,
-    UpdatePhase, UpdateProgress,
+    parse_pull_request_md, resolve_dashboard_columns, AppStateService, DashboardService,
+    DashboardUpdate, DashboardWatch, FillPreparation, FillSubmitOutcome, OpencodeModel, Shell,
+    ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult, UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -46,11 +46,12 @@ use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryRow};
 use crate::tui::screens::dashboard::{
     BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
-    MergePullRequestRequest, UpdatePullRequestRequest,
+    FillPullRequestRequest, MergePullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
 };
+use crate::tui::screens::fill_pr::{FillAction, FillPullRequestScreen, FillStep};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen, SettingsStep};
@@ -125,6 +126,15 @@ enum AppEvent {
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
     UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
+    /// Base ref resolved for the "Fill Pull Request" flow.
+    FillPrBaseRefResolved {
+        base_ref: Option<String>,
+    },
+    /// Read-only preparation finished — either the opencode spawn params
+    /// (`HandedOffToUi`) or a terminal non-handoff variant.
+    FillPrPrepared(Result<Box<FillPreparation>, String>),
+    /// The drafted PR was submitted (created or updated).
+    FillPrSubmitted(Result<FillSubmitOutcome, String>),
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
@@ -178,6 +188,7 @@ pub struct App {
     setup_project: Option<SetupProjectScreen>,
     merge_pr: Option<MergePullRequestScreen>,
     update_pr: Option<UpdatePullRequestScreen>,
+    fill_pr: Option<FillPullRequestScreen>,
     update_branch: Option<UpdateBranchScreen>,
     /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
     /// top of the Settings screen — when active the Settings state is
@@ -223,6 +234,7 @@ impl App {
             setup_project: None,
             merge_pr: None,
             update_pr: None,
+            fill_pr: None,
             update_branch: None,
             ai_model_picker: None,
             shell_integration_status: None,
@@ -315,6 +327,17 @@ impl App {
                         // child-exit detection. `None` keeps the PTY at
                         // its last known size between resize events.
                         screen.tick_pty(None);
+                    }
+                    // Same for the Fill PR PTY — but here a child exit means
+                    // opencode finished drafting `pull_request.md`, so read
+                    // the file and flip the screen into Review.
+                    let fill_exited = self
+                        .fill_pr
+                        .as_mut()
+                        .map(|screen| screen.tick_pty(None))
+                        .unwrap_or(false);
+                    if fill_exited {
+                        self.on_fill_ready_to_review(&tx);
                     }
                 }
                 Event::Resize(width, height) => {
@@ -570,6 +593,27 @@ impl App {
                     update_pr.render(frame, panel);
                 }
             }
+            Screen::FillPullRequest => {
+                // The Filling step (live opencode PTY) and the Confirm
+                // explanation both want the full bottom region; the compact
+                // Loading / Review / Opening steps stay in a sized panel.
+                let expand = self.fill_pr.as_ref().is_some_and(|s| {
+                    s.is_filling() || matches!(s.step(), FillStep::Confirm)
+                });
+                let panel = if expand {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .fill_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
+                if let Some(fill_pr) = self.fill_pr.as_mut() {
+                    fill_pr.tick = self.tick;
+                    fill_pr.render(frame, panel);
+                }
+            }
             Screen::UpdateBranch => {
                 let h = self
                     .update_branch
@@ -715,10 +759,20 @@ impl App {
                         screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
                     }
                 }
+                if matches!(self.screen, Screen::FillPullRequest) {
+                    if let Some(screen) = self.fill_pr.as_mut() {
+                        screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
+                    }
+                }
             }
             MouseEventKind::ScrollDown => {
                 if matches!(self.screen, Screen::UpdatePullRequest) {
                     if let Some(screen) = self.update_pr.as_mut() {
+                        screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
+                    }
+                }
+                if matches!(self.screen, Screen::FillPullRequest) {
+                    if let Some(screen) = self.fill_pr.as_mut() {
                         screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
                     }
                 }
@@ -775,6 +829,7 @@ impl App {
             Screen::SetupProject => self.handle_setup_project_key(key, tx),
             Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
             Screen::UpdatePullRequest => self.handle_update_pr_key(key, tx),
+            Screen::FillPullRequest => self.handle_fill_pr_key(key, tx),
             Screen::UpdateBranch => {
                 if let Some(screen) = self.update_branch.as_mut() {
                     screen.handle_key(key);
@@ -1160,6 +1215,14 @@ impl App {
                     }
                 }
             }
+            Screen::FillPullRequest => {
+                let action = self
+                    .fill_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(FillAction::Continue);
+                self.apply_fill_action(action, tx);
+            }
             Screen::UpdateBranch => {}
             Screen::AiModelPicker => {
                 let action = match self.ai_model_picker.as_mut() {
@@ -1337,6 +1400,93 @@ impl App {
         }
     }
 
+    fn handle_fill_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.fill_pr.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+        self.apply_fill_action(action, tx);
+    }
+
+    /// Single handler for `FillAction`s arriving from either keyboard or
+    /// mouse. Drives the screen transitions and kicks off the async pipeline
+    /// stages (prepare → spawn opencode → submit).
+    fn apply_fill_action(&mut self, action: FillAction, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match action {
+            FillAction::Continue => {}
+            FillAction::Cancelled => {
+                self.fill_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+            FillAction::Confirmed => {
+                let Some(screen) = self.fill_pr.as_mut() else {
+                    return;
+                };
+                let request = screen.request().clone();
+                screen.start_filling();
+                kick_off_prepare_fill(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    request,
+                    tx.clone(),
+                );
+            }
+            FillAction::ReadyToReview => self.on_fill_ready_to_review(tx),
+            FillAction::Submit => {
+                let Some(screen) = self.fill_pr.as_mut() else {
+                    return;
+                };
+                let request = screen.request().clone();
+                let Some(title) = screen.draft_title().map(str::to_string) else {
+                    self.fill_pr = None;
+                    self.enter_screen(Screen::Dashboard, tx);
+                    return;
+                };
+                let body = screen.draft_body().map(str::to_string).unwrap_or_default();
+                screen.start_opening();
+                kick_off_submit_pull_request(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    request,
+                    title,
+                    body,
+                    tx.clone(),
+                );
+            }
+            FillAction::Finish => {
+                self.show_toast(
+                    ToastVariant::Info,
+                    "Draft saved to pull_request.md — no pull request was opened.".to_string(),
+                );
+                self.fill_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+        }
+    }
+
+    /// opencode finished drafting: read `pull_request.md` from the worktree,
+    /// parse the title + body, and move the screen into Review. A missing or
+    /// empty file surfaces an error (the AI likely didn't finish).
+    fn on_fill_ready_to_review(&mut self, _tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.fill_pr.as_mut() else {
+            return;
+        };
+        let path = PathBuf::from(&screen.request().worktree_path).join("pull_request.md");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match parse_pull_request_md(&content) {
+                Some((title, body)) => screen.enter_review(title, body),
+                None => screen.set_error(
+                    "pull_request.md has no title line yet — let opencode finish, then retry."
+                        .to_string(),
+                ),
+            },
+            Err(_) => screen.set_error(format!(
+                "pull_request.md not found at {}. Wait for opencode to write it before confirming.",
+                path.display()
+            )),
+        }
+    }
+
     fn handle_menu_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         if self.menu.is_none() {
             self.menu = Some(self.build_menu_screen());
@@ -1434,6 +1584,9 @@ impl App {
             DashboardAction::UpdatePullRequest(request) => {
                 self.start_update_pr_flow(*request, tx);
             }
+            DashboardAction::FillPullRequest(request) => {
+                self.start_fill_pr_flow(*request, tx);
+            }
             DashboardAction::UpdateBranch(path) => {
                 self.start_update_branch_flow(path, tx);
             }
@@ -1510,6 +1663,19 @@ impl App {
         self.update_pr = Some(UpdatePullRequestScreen::new(request));
         self.screen = Screen::UpdatePullRequest;
         kick_off_resolve_base_ref(worktree_path, number, tx.clone());
+    }
+
+    fn start_fill_pr_flow(
+        &mut self,
+        request: FillPullRequestRequest,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let worktree_path = request.worktree_path.clone();
+        // Mount with `base_ref = None` so the confirm panel renders straight
+        // away; the resolver populates the field in the background.
+        self.fill_pr = Some(FillPullRequestScreen::new(request));
+        self.screen = Screen::FillPullRequest;
+        kick_off_resolve_fill_base_ref(worktree_path, tx.clone());
     }
 
     fn start_close_pr_flow(
@@ -2073,6 +2239,11 @@ impl App {
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
             AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
+            AppEvent::FillPrBaseRefResolved { base_ref } => {
+                self.apply_fill_pr_base_ref(base_ref);
+            }
+            AppEvent::FillPrPrepared(result) => self.apply_fill_pr_prepared(result, tx),
+            AppEvent::FillPrSubmitted(result) => self.apply_fill_pr_submitted(result, tx),
             AppEvent::AiModelsFetched(result) => {
                 // The fetch is best-effort: by the time it returns the user may
                 // have already closed the picker. Silently drop the result in
@@ -2412,6 +2583,132 @@ impl App {
         self.enter_screen(Screen::Dashboard, tx);
     }
 
+    fn apply_fill_pr_base_ref(&mut self, base_ref: Option<String>) {
+        let Some(screen) = self.fill_pr.as_mut() else {
+            return;
+        };
+        match base_ref {
+            Some(base_ref) => screen.set_base_ref(base_ref),
+            None => screen.set_error(
+                "No base ref reachable (looked for upstream/main, upstream/master, \
+                 origin/main, origin/master)."
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Handle the read-only preparation result. `HandedOffToUi` spawns
+    /// opencode inside the screen's PTY; every other variant is terminal and
+    /// toasts back to the dashboard.
+    fn apply_fill_pr_prepared(
+        &mut self,
+        result: Result<Box<FillPreparation>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.fill_pr.is_none() {
+            return;
+        }
+        match result {
+            Ok(prep) => match *prep {
+                FillPreparation::HandedOffToUi {
+                    opencode_binary,
+                    opencode_args,
+                    cwd,
+                    ..
+                } => {
+                    if let Some(screen) = self.fill_pr.as_mut() {
+                        screen.spawn_opencode_pty(
+                            opencode_binary,
+                            opencode_args,
+                            cwd,
+                            Vec::new(),
+                        );
+                    }
+                }
+                FillPreparation::NothingToDescribe => {
+                    self.show_toast(
+                        ToastVariant::Info,
+                        "No commits ahead of the base ref — nothing to describe yet.".to_string(),
+                    );
+                    self.fill_pr = None;
+                    self.enter_screen(Screen::Dashboard, tx);
+                }
+                FillPreparation::AiNotConfigured => {
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        "Set the `useAi` setting so we can draft the PR description with AI."
+                            .to_string(),
+                    );
+                    self.fill_pr = None;
+                    self.enter_screen(Screen::Dashboard, tx);
+                }
+                FillPreparation::AiUnavailable => {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        "`opencode` CLI is not on PATH — install it from \
+                         https://opencode.ai then retry."
+                            .to_string(),
+                    );
+                    self.fill_pr = None;
+                    self.enter_screen(Screen::Dashboard, tx);
+                }
+            },
+            Err(message) => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to prepare PR draft: {}", truncate_error(&message)),
+                );
+                self.fill_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+        }
+    }
+
+    fn apply_fill_pr_submitted(
+        &mut self,
+        result: Result<FillSubmitOutcome, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match result {
+            Ok(FillSubmitOutcome::Created { number, url }) => {
+                let message = if number > 0 {
+                    format!("Opened pull request #{number}.")
+                } else if !url.is_empty() {
+                    format!("Opened pull request: {url}")
+                } else {
+                    "Opened pull request.".to_string()
+                };
+                self.show_toast(ToastVariant::Success, message);
+            }
+            Ok(FillSubmitOutcome::Updated { number }) => {
+                self.show_toast(
+                    ToastVariant::Success,
+                    format!("Updated pull request #{number} description."),
+                );
+            }
+            Ok(FillSubmitOutcome::PushFailed(detail)) => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to push the branch: {}", truncate_error(&detail)),
+                );
+            }
+            Ok(FillSubmitOutcome::SubmitFailed(detail)) => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to submit the pull request: {}", truncate_error(&detail)),
+                );
+            }
+            Err(message) => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to submit the pull request: {}", truncate_error(&message)),
+                );
+            }
+        }
+        self.fill_pr = None;
+        self.enter_screen(Screen::Dashboard, tx);
+    }
+
     fn apply_merge_pr_finished(
         &mut self,
         result: Result<u64, MergePrFailure>,
@@ -2604,6 +2901,13 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::FillPullRequest => {
+                // Only reachable through `start_fill_pr_flow`, which seeds
+                // `fill_pr` before flipping the screen.
+                if self.fill_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
             Screen::UpdateBranch => {
                 // Only reachable through `start_update_branch_flow`,
                 // which seeds `update_branch` before flipping the
@@ -2644,6 +2948,7 @@ impl App {
         self.setup_project = None;
         self.merge_pr = None;
         self.update_pr = None;
+        self.fill_pr = None;
         self.update_branch = None;
         self.ai_model_picker = None;
         self.mouse_selection = None;
@@ -3616,6 +3921,80 @@ fn kick_off_resolve_base_ref(
         let base_ref =
             crate::services::dashboard::resolve_base_ref(&PathBuf::from(&worktree_path)).await;
         let _ = tx.send(AppEvent::UpdatePrBaseRefResolved { number, base_ref });
+    });
+}
+
+fn kick_off_resolve_fill_base_ref(worktree_path: String, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let base_ref =
+            crate::services::dashboard::resolve_base_ref(&PathBuf::from(&worktree_path)).await;
+        let _ = tx.send(AppEvent::FillPrBaseRefResolved { base_ref });
+    });
+}
+
+fn kick_off_prepare_fill(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    request: FillPullRequestRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::FillPrPrepared(Err(
+            "Could not resolve git root for the PR draft.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        // `base_ref` is populated by the resolver before the user can
+        // confirm; guard anyway so a race can't blow up the worker.
+        let Some(base_ref) = request.base_ref.clone() else {
+            let _ = tx.send(AppEvent::FillPrPrepared(Err(
+                "Base ref was not resolved before confirmation.".to_string(),
+            )));
+            return;
+        };
+        let service = DashboardService::new(root, config);
+        let event = match service
+            .prepare_fill(&request.worktree_path, &request.branch, &base_ref)
+            .await
+        {
+            Ok(prep) => Ok(Box::new(prep)),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::FillPrPrepared(event));
+    });
+}
+
+fn kick_off_submit_pull_request(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    request: FillPullRequestRequest,
+    title: String,
+    body: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::FillPrSubmitted(Err(
+            "Could not resolve git root for the pull request.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let event = match service
+            .submit_pull_request(
+                &request.worktree_path,
+                &request.branch,
+                request.number,
+                &title,
+                &body,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::FillPrSubmitted(event));
     });
 }
 
