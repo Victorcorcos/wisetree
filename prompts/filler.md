@@ -28,8 +28,9 @@ PR_TEMPLATE
 Create (or overwrite) `pull_request.md` at the repository root with EXACTLY this layout:
 
 1. **Line 1 — the PR title.** A single line, imperative mood, max 72 characters. If `TICKET` is non-empty, prefix it: `TICKET Short description` (e.g. `DIGIT-3131 Add payment retry logic`). Do not wrap the title in markdown heading syntax — just the plain title text on the first line.
-2. **One blank line.**
-3. **The PR description (body)** — fill in the provided template, starting from its first section heading (e.g. `# Description ✍️`).
+2. **Line 2 — the label comment.** A single `<!-- wisetree-labels: ... -->` comment listing the applicable labels (see **Label selection** below). Example: `<!-- wisetree-labels: bug 🐛, user story 💬 -->`. This line is invisible when the PR is rendered.
+3. **One blank line.**
+4. **The PR description (body)** — fill in the provided template, starting from its first section heading (e.g. `# Description ✍️`).
 
 ## Rules for the body
 

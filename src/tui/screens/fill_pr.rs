@@ -662,10 +662,9 @@ impl FillPullRequestScreen {
                 Status::Success,
                 format!("Pull request #{number} updated successfully!"),
             ),
-            Some(FillSubmitOutcome::PushFailed(_)) => (
-                Status::Error,
-                "Failed to push the branch.".to_string(),
-            ),
+            Some(FillSubmitOutcome::PushFailed(_)) => {
+                (Status::Error, "Failed to push the branch.".to_string())
+            }
             Some(FillSubmitOutcome::SubmitFailed(_)) => (
                 Status::Error,
                 "Failed to submit the pull request.".to_string(),
