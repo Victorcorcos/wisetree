@@ -1748,11 +1748,7 @@ impl App {
         if !needs_redirect {
             return;
         }
-        let Some(main_path) = self
-            .dashboard
-            .as_ref()
-            .and_then(|d| d.main_worktree_path())
-        else {
+        let Some(main_path) = self.dashboard.as_ref().and_then(|d| d.main_worktree_path()) else {
             return;
         };
         self.git_root = Some(main_path.clone());
