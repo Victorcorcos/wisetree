@@ -17,6 +17,7 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::config::schema::{normalize_dashboard_columns, DashboardConfig};
 use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
+use crate::files::ActivityKind;
 use crate::git::exec::execute_git_command;
 use crate::git::types::{BranchStatus, GitWorktree};
 use crate::services::ai_status::{AiStatusIndex, AiStatusPaths, AiStatusReport, AiStatusService};
@@ -1217,6 +1218,7 @@ impl DashboardService {
         number: Option<u64>,
         title: &str,
         body: &str,
+        activity: Option<&mpsc::UnboundedSender<(String, ActivityKind)>>,
     ) -> Result<FillSubmitOutcome> {
         if !self.gh_available {
             return Err(WisetreeError::other(
@@ -1224,6 +1226,12 @@ impl DashboardService {
             ));
         }
         let cwd = PathBuf::from(worktree_path);
+
+        let emit = |text: &str| {
+            if let Some(tx) = activity {
+                let _ = tx.send((text.to_string(), ActivityKind::Status));
+            }
+        };
 
         match number {
             // Update the existing PR's description, preserving any media
@@ -1236,12 +1244,16 @@ impl DashboardService {
                     Err(_) => body.to_string(),
                 };
                 let number_arg = number.to_string();
+                emit(&format!(
+                    "$ gh pr edit #{number} --title <title> --body <body>"
+                ));
                 let edit = time::timeout(
                     FILL_SUBMIT_TIMEOUT,
-                    run_command(
+                    run_command_streamed(
                         &self.gh_binary,
                         &["pr", "edit", &number_arg, "--title", title, "--body", &body],
                         Some(&cwd),
+                        activity,
                     ),
                 )
                 .await
@@ -1253,12 +1265,14 @@ impl DashboardService {
             }
             // Create a brand-new PR: push the branch, then `gh pr create`.
             None => {
+                emit(&format!("$ git push -u origin {branch}"));
                 let push = time::timeout(
                     FILL_PUSH_TIMEOUT,
-                    run_command(
+                    run_command_streamed(
                         &self.git_binary,
                         &["push", "-u", "origin", branch],
                         Some(&cwd),
+                        activity,
                     ),
                 )
                 .await
@@ -1282,14 +1296,18 @@ impl DashboardService {
                     Some(owner) => format!("{}:{branch}", owner.trim()),
                     None => branch.to_string(),
                 };
+                emit(&format!(
+                    "$ gh pr create --title <title> --body <body> --head {head}"
+                ));
                 let create = time::timeout(
                     FILL_SUBMIT_TIMEOUT,
-                    run_command(
+                    run_command_streamed(
                         &self.gh_binary,
                         &[
                             "pr", "create", "--title", title, "--body", body, "--head", &head,
                         ],
                         Some(&cwd),
+                        activity,
                     ),
                 )
                 .await
@@ -2401,6 +2419,79 @@ async fn run_command(
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Run a command and stream each line of stdout/stderr through `activity` as
+/// it arrives. Returns stdout on success or stderr on failure, same as
+/// `run_command`. When `activity` is `None` the function falls back to the
+/// non-streaming `run_command` path.
+async fn run_command_streamed(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    activity: Option<&mpsc::UnboundedSender<(String, ActivityKind)>>,
+) -> std::result::Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let Some(tx) = activity else {
+        return run_command(binary, args, cwd).await;
+    };
+
+    let mut cmd = Command::new(binary);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let mut out_lines = BufReader::new(stdout).lines();
+    let mut err_lines = BufReader::new(stderr).lines();
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+    let mut out_done = false;
+    let mut err_done = false;
+
+    while !out_done || !err_done {
+        tokio::select! {
+            line = out_lines.next_line(), if !out_done => {
+                match line {
+                    Ok(Some(l)) => {
+                        let clean = l.trim_end_matches('\r').to_string();
+                        if !clean.is_empty() {
+                            let _ = tx.send((clean, ActivityKind::Stdout));
+                        }
+                        stdout_buf.push_str(&l);
+                        stdout_buf.push('\n');
+                    }
+                    _ => out_done = true,
+                }
+            }
+            line = err_lines.next_line(), if !err_done => {
+                match line {
+                    Ok(Some(l)) => {
+                        let clean = l.trim_end_matches('\r').to_string();
+                        if !clean.is_empty() {
+                            let _ = tx.send((clean, ActivityKind::Stderr));
+                        }
+                        stderr_buf.push_str(&l);
+                        stderr_buf.push('\n');
+                    }
+                    _ => err_done = true,
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(stdout_buf.trim().to_string())
+    } else {
+        Err(stderr_buf.trim().to_string())
     }
 }
 

@@ -29,8 +29,10 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use crate::files::ActivityKind;
 use crate::messages::colors;
-use crate::services::dashboard::AiActivityEvent;
+use crate::services::dashboard::{AiActivityEvent, FillSubmitOutcome};
+use crate::tui::screens::create::{render_terminal_activity, TerminalLine};
 use crate::tui::screens::dashboard::FillPullRequestRequest;
 use crate::tui::screens::update_pr::{
     ai_activity_event_to_line, button_paragraph, contains_position, key_event_to_pty_bytes,
@@ -58,6 +60,9 @@ pub enum FillStep {
     Filling,
     Review,
     Opening,
+    /// Commands finished — shows the result (success URL / error) before
+    /// returning to the dashboard on any keypress.
+    Done,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +86,8 @@ pub enum FillAction {
     Submit,
     /// Review step: keep `pull_request.md` and return to the dashboard.
     Finish,
+    /// Done page: user pressed a key; caller should return to dashboard.
+    Done,
 }
 
 pub struct FillPullRequestScreen {
@@ -112,6 +119,13 @@ pub struct FillPullRequestScreen {
     error: Option<String>,
     step: FillStep,
     pub tick: usize,
+    /// Streamed lines from git push / gh pr create — shown in the Terminal
+    /// Activity panel during Opening and retained on the Done page.
+    terminal_log: Vec<TerminalLine>,
+    /// Scroll offset (lines from tail). `0` = live tail; positive = scrolled up.
+    terminal_scroll: u16,
+    /// Stored outcome of the submission — used to render the Done page header.
+    submit_outcome: Option<FillSubmitOutcome>,
 }
 
 impl FillPullRequestScreen {
@@ -139,6 +153,9 @@ impl FillPullRequestScreen {
             error: None,
             step,
             tick: 0,
+            terminal_log: Vec::new(),
+            terminal_scroll: 0,
+            submit_outcome: None,
         }
     }
 
@@ -254,7 +271,7 @@ impl FillPullRequestScreen {
         self.step = FillStep::Review;
     }
 
-    /// Move into the Opening step (spinner) while the App submits the PR.
+    /// Move into the Opening step (spinner + Terminal Activity) while the App submits the PR.
     pub fn start_opening(&mut self) {
         self.step = FillStep::Opening;
         self.phase_message = if self.request.number.is_some() {
@@ -262,6 +279,40 @@ impl FillPullRequestScreen {
         } else {
             "Opening pull request...".to_string()
         };
+        self.terminal_log.clear();
+        self.terminal_scroll = 0;
+        self.submit_outcome = None;
+    }
+
+    /// Push one line into the Terminal Activity panel (Opening step).
+    pub fn append_terminal_line(&mut self, text: String, kind: ActivityKind) {
+        if self.terminal_scroll > 0 {
+            self.terminal_scroll = self.terminal_scroll.saturating_add(1);
+        }
+        self.terminal_log.push(TerminalLine { text, kind });
+        const MAX_LINES: usize = 1024;
+        if self.terminal_log.len() > MAX_LINES {
+            let drop = self.terminal_log.len() - MAX_LINES;
+            self.terminal_log.drain(0..drop);
+            self.terminal_scroll = self.terminal_scroll.saturating_sub(drop as u16);
+        }
+    }
+
+    /// Scroll the Terminal Activity panel up (toward older output).
+    pub fn scroll_terminal_up(&mut self, lines: u16) {
+        self.terminal_scroll = self.terminal_scroll.saturating_add(lines);
+    }
+
+    /// Scroll the Terminal Activity panel down (toward the live tail).
+    pub fn scroll_terminal_down(&mut self, lines: u16) {
+        self.terminal_scroll = self.terminal_scroll.saturating_sub(lines);
+    }
+
+    /// Transition from Opening → Done once the submission finishes.
+    pub fn enter_done(&mut self, outcome: FillSubmitOutcome) {
+        self.submit_outcome = Some(outcome);
+        self.terminal_scroll = 0;
+        self.step = FillStep::Done;
     }
 
     pub fn set_phase_message(&mut self, message: impl Into<String>) {
@@ -290,6 +341,10 @@ impl FillPullRequestScreen {
     }
 
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
+        if matches!(self.step, FillStep::Opening | FillStep::Done) {
+            self.scroll_terminal_up(lines);
+            return true;
+        }
         if !self.is_filling() {
             return false;
         }
@@ -302,6 +357,10 @@ impl FillPullRequestScreen {
     }
 
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
+        if matches!(self.step, FillStep::Opening | FillStep::Done) {
+            self.scroll_terminal_down(lines);
+            return true;
+        }
         if !self.is_filling() {
             return false;
         }
@@ -378,7 +437,18 @@ impl FillPullRequestScreen {
                 KeyCode::Esc => FillAction::Cancelled,
                 _ => FillAction::Continue,
             },
-            FillStep::Opening => FillAction::Continue,
+            FillStep::Opening => match key.code {
+                KeyCode::PageUp | KeyCode::Up => {
+                    self.scroll_terminal_up(Self::KEYBOARD_PAGE_SCROLL);
+                    FillAction::Continue
+                }
+                KeyCode::PageDown | KeyCode::Down => {
+                    self.scroll_terminal_down(Self::KEYBOARD_PAGE_SCROLL);
+                    FillAction::Continue
+                }
+                _ => FillAction::Continue,
+            },
+            FillStep::Done => FillAction::Done,
             FillStep::Filling => self.handle_filling_key(key),
             FillStep::Review => self.handle_review_key(key),
             FillStep::Confirm => {
@@ -446,7 +516,12 @@ impl FillPullRequestScreen {
     }
 
     pub fn handle_mouse_click(&mut self, position: Position) -> FillAction {
-        if self.error.is_some() || matches!(self.step, FillStep::Loading | FillStep::Opening) {
+        if self.error.is_some()
+            || matches!(
+                self.step,
+                FillStep::Loading | FillStep::Opening | FillStep::Done
+            )
+        {
             return FillAction::Continue;
         }
         match self.step {
@@ -491,13 +566,14 @@ impl FillPullRequestScreen {
                     ConfirmationOutcome::Pending => FillAction::Continue,
                 }
             }
-            FillStep::Loading | FillStep::Opening => FillAction::Continue,
+            FillStep::Loading | FillStep::Opening | FillStep::Done => FillAction::Continue,
         }
     }
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
-            FillStep::Loading | FillStep::Opening => 3,
+            FillStep::Loading => 3,
+            FillStep::Opening | FillStep::Done => 22,
             FillStep::Filling => 25,
             FillStep::Review => {
                 let body_rows = self.draft_body.is_some() as u16 * 4;
@@ -544,15 +620,82 @@ impl FillPullRequestScreen {
                     .with_tick(self.tick)
                     .render(frame, area);
             }
-            FillStep::Opening => {
-                StatusIndicator::new(Status::Loading, self.phase_message.clone())
-                    .with_tick(self.tick)
-                    .render(frame, area);
-            }
+            FillStep::Opening => self.render_opening(frame, area),
+            FillStep::Done => self.render_done(frame, area),
             FillStep::Filling => self.render_filling(frame, area),
             FillStep::Review => self.render_review(frame, area),
             FillStep::Confirm => self.render_confirm(frame, area),
         }
+    }
+
+    fn render_opening(&self, frame: &mut Frame, area: Rect) {
+        if area.height < 5 {
+            StatusIndicator::new(Status::Loading, self.phase_message.clone())
+                .with_tick(self.tick)
+                .render(frame, area);
+            return;
+        }
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(area);
+        StatusIndicator::new(Status::Loading, self.phase_message.clone())
+            .with_tick(self.tick)
+            .render(frame, chunks[0]);
+        render_terminal_activity(&self.terminal_log, self.terminal_scroll, frame, chunks[1]);
+    }
+
+    fn render_done(&self, frame: &mut Frame, area: Rect) {
+        let outcome = self.submit_outcome.as_ref();
+        let (status, headline) = match outcome {
+            Some(FillSubmitOutcome::Created { number, url }) => {
+                let msg = if *number > 0 {
+                    format!("Pull request #{number} opened successfully!")
+                } else if !url.is_empty() {
+                    format!("Pull request opened: {url}")
+                } else {
+                    "Pull request opened successfully!".to_string()
+                };
+                (Status::Success, msg)
+            }
+            Some(FillSubmitOutcome::Updated { number }) => (
+                Status::Success,
+                format!("Pull request #{number} updated successfully!"),
+            ),
+            Some(FillSubmitOutcome::PushFailed(_)) => (
+                Status::Error,
+                "Failed to push the branch.".to_string(),
+            ),
+            Some(FillSubmitOutcome::SubmitFailed(_)) => (
+                Status::Error,
+                "Failed to submit the pull request.".to_string(),
+            ),
+            None => (Status::Loading, "Processing...".to_string()),
+        };
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // status indicator
+                Constraint::Min(3),    // terminal log
+                Constraint::Length(1), // press-any-key hint
+            ])
+            .split(area);
+
+        StatusIndicator::new(status, headline)
+            .without_spinner()
+            .render(frame, chunks[0]);
+
+        render_terminal_activity(&self.terminal_log, self.terminal_scroll, frame, chunks[1]);
+
+        frame.render_widget(
+            Paragraph::new("Press any key to continue").style(
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+            chunks[2],
+        );
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
@@ -863,7 +1006,7 @@ impl FillPullRequestScreen {
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(0),
-                Constraint::Length(18),
+                Constraint::Length(15),
                 Constraint::Length(2),
                 Constraint::Length(14),
                 Constraint::Min(0),
@@ -871,9 +1014,9 @@ impl FillPullRequestScreen {
             .split(area);
 
         let submit_label = if self.request.number.is_some() {
-            " Update PR "
+            "Update PR"
         } else {
-            "  Open PR  "
+            "Open PR"
         };
         frame.render_widget(
             button_paragraph(

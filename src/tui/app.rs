@@ -135,6 +135,12 @@ enum AppEvent {
     FillPrPrepared(Result<Box<FillPreparation>, String>),
     /// The drafted PR was submitted (created or updated).
     FillPrSubmitted(Result<FillSubmitOutcome, String>),
+    /// A line of terminal output from the git push / gh pr create pipeline.
+    /// Routed into the Terminal Activity panel under the Opening step.
+    FillPrActivity {
+        text: String,
+        kind: crate::files::ActivityKind,
+    },
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
@@ -1515,6 +1521,10 @@ impl App {
                 self.fill_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
+            FillAction::Done => {
+                self.fill_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
         }
     }
 
@@ -2313,6 +2323,11 @@ impl App {
             }
             AppEvent::FillPrPrepared(result) => self.apply_fill_pr_prepared(result, tx),
             AppEvent::FillPrSubmitted(result) => self.apply_fill_pr_submitted(result, tx),
+            AppEvent::FillPrActivity { text, kind } => {
+                if let Some(screen) = self.fill_pr.as_mut() {
+                    screen.append_terminal_line(text, kind);
+                }
+            }
             AppEvent::AiModelsFetched(result) => {
                 // The fetch is best-effort: by the time it returns the user may
                 // have already closed the picker. Silently drop the result in
@@ -2754,52 +2769,15 @@ impl App {
     fn apply_fill_pr_submitted(
         &mut self,
         result: Result<FillSubmitOutcome, String>,
-        tx: &mpsc::UnboundedSender<AppEvent>,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        match result {
-            Ok(FillSubmitOutcome::Created { number, url }) => {
-                let message = if number > 0 {
-                    format!("Opened pull request #{number}.")
-                } else if !url.is_empty() {
-                    format!("Opened pull request: {url}")
-                } else {
-                    "Opened pull request.".to_string()
-                };
-                self.show_toast(ToastVariant::Success, message);
-            }
-            Ok(FillSubmitOutcome::Updated { number }) => {
-                self.show_toast(
-                    ToastVariant::Success,
-                    format!("Updated pull request #{number} description."),
-                );
-            }
-            Ok(FillSubmitOutcome::PushFailed(detail)) => {
-                self.show_toast(
-                    ToastVariant::Error,
-                    format!("Failed to push the branch: {}", truncate_error(&detail)),
-                );
-            }
-            Ok(FillSubmitOutcome::SubmitFailed(detail)) => {
-                self.show_toast(
-                    ToastVariant::Error,
-                    format!(
-                        "Failed to submit the pull request: {}",
-                        truncate_error(&detail)
-                    ),
-                );
-            }
-            Err(message) => {
-                self.show_toast(
-                    ToastVariant::Error,
-                    format!(
-                        "Failed to submit the pull request: {}",
-                        truncate_error(&message)
-                    ),
-                );
-            }
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(message) => FillSubmitOutcome::SubmitFailed(message),
+        };
+        if let Some(screen) = self.fill_pr.as_mut() {
+            screen.enter_done(outcome);
         }
-        self.fill_pr = None;
-        self.enter_screen(Screen::Dashboard, tx);
     }
 
     fn apply_merge_pr_finished(
@@ -4077,6 +4055,17 @@ fn kick_off_submit_pull_request(
         return;
     };
     tokio::spawn(async move {
+        let (activity_tx, mut activity_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, crate::files::ActivityKind)>();
+
+        // Forward terminal-activity lines into the main event loop.
+        let forward_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some((text, kind)) = activity_rx.recv().await {
+                let _ = forward_tx.send(AppEvent::FillPrActivity { text, kind });
+            }
+        });
+
         let service = DashboardService::new(root, config);
         let event = match service
             .submit_pull_request(
@@ -4085,6 +4074,7 @@ fn kick_off_submit_pull_request(
                 request.number,
                 &title,
                 &body,
+                Some(&activity_tx),
             )
             .await
         {
