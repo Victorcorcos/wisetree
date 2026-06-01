@@ -929,8 +929,7 @@ impl DashboardService {
             // pushed — in that case the PR on GitHub still shows "behind"
             // even though local HEAD is up to date. Check for unpushed
             // commits and push them before declaring AlreadyUpToDate.
-            let ahead_of_origin =
-                local_ahead_of_tracking(&self.git_binary, &cwd).await;
+            let ahead_of_origin = local_ahead_of_tracking(&self.git_binary, &cwd).await;
             if ahead_of_origin > 0 {
                 send_phase(UpdatePhase::NoConflicts);
                 send_phase(UpdatePhase::Pushing);
