@@ -2,6 +2,13 @@
 
 Terminal-first Git worktree manager built in Rust + Ratatui. Lets developers create, survey, and delete worktrees with single keystrokes. Designed for running multiple AI coding agents (Claude Code, Opencode, Codex, Gemini) in parallel on isolated checkouts.
 
+## Guidelines
+
+1. **Think before coding.** State your assumptions out loud. If the request is ambiguous, ask. If a simpler approach exists, push back. Stop when you are confused, name what is unclear, do not just pick one interpretation and run.
+2. **Simplicity first.** Write the minimum code that solves the problem. No speculative abstractions. No flexibility nobody asked for. The test: would a senior engineer call this overcomplicated.
+3. **Surgical changes.** Touch only what the task requires. Do not improve neighboring code. Do not refactor what is not broken. Every changed line should trace back to the request.
+4. **Goal-driven execution.** Turn vague instructions into verifiable targets before writing a line. "Add validation" becomes "write tests for invalid inputs, then make them pass."
+
 ## Build & Test
 
 ```bash
@@ -29,7 +36,7 @@ src/
 │   ├── app.rs                 # central App state machine; screen routing + async channels
 │   ├── router.rs              # Screen enum (Menu, Create, Dashboard, Settings, …)
 │   ├── event.rs               # crossterm input loop → AppEvent channel
-│   ├── screens/               # ~12 screens; each owns state + handle_key() + render()
+│   ├── screens/               # ~15 screens; each owns state + handle_key() + render()
 │   └── widgets/               # reusable UI components (SelectPrompt, PTY view, toast, …)
 ├── services/
 │   ├── dashboard.rs           # live polling: git status, gh PR queries, AI status
@@ -53,6 +60,7 @@ src/
 - **Error handling**: propagate with `?`; map git stderr substrings to `GitErrorCode` variants for branching logic.
 - **PTY rendering**: `portable-pty` spawns shells; `vt100` parses escape sequences for ratatui display.
 - **AI status detection**: file-based; reads session/state files from each harness on disk (capped at 200 ms/tick).
+- **Entry point**: bare `wisetree` opens the TUI on the Menu screen; `--mode <create|dashboard|cache|settings>` (or a positional like `wisetree dashboard`) lands on another screen. A subcommand runs **non-interactively** only when paired with flags/actions (`create --name …`, `cache prune`); otherwise it just opens that TUI screen. Parsing lives in `cli/args.rs`.
 
 ## Important Gotchas
 
