@@ -1350,16 +1350,21 @@ impl DashboardService {
                 // `--head owner:branch` keeps `gh` from aborting when the
                 // worktree has uncommitted files; fall back to the bare
                 // branch if the owner lookup fails.
-                let owner = run_command(
-                    &self.gh_binary,
-                    &["repo", "view", "--json", "owner", "--jq", ".owner.login"],
+                // Parse owner from `origin` URL so that forks point to the
+                // correct user (not the upstream org that `gh repo view` returns).
+                let origin_url = run_command(
+                    &self.git_binary,
+                    &["remote", "get-url", "origin"],
                     Some(&cwd),
                 )
                 .await
-                .ok()
-                .filter(|o| !o.trim().is_empty());
+                .ok();
+                let owner = origin_url
+                    .as_deref()
+                    .and_then(parse_github_slug)
+                    .map(|(o, _)| o);
                 let head = match owner {
-                    Some(owner) => format!("{}:{branch}", owner.trim()),
+                    Some(owner) => format!("{owner}:{branch}"),
                     None => branch.to_string(),
                 };
                 emit(&format!(
