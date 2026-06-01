@@ -1279,16 +1279,18 @@ impl DashboardService {
                 emit(&format!(
                     "$ gh pr edit #{number} --title {emit_title} --body <body> --add-assignee @me{emit_labels}"
                 ));
-                let mut edit_args: Vec<String> = vec![
-                    "pr".into(),
-                    "edit".into(),
-                    number_arg.clone(),
-                ];
+                let mut edit_args: Vec<String> =
+                    vec!["pr".into(), "edit".into(), number_arg.clone()];
                 if !skip_title {
                     edit_args.push("--title".into());
                     edit_args.push(title.into());
                 }
-                edit_args.extend(["--body".into(), body.clone(), "--add-assignee".into(), "@me".into()]);
+                edit_args.extend([
+                    "--body".into(),
+                    body.clone(),
+                    "--add-assignee".into(),
+                    "@me".into(),
+                ]);
                 if !skip_labels {
                     for label in labels {
                         edit_args.push("--add-label".into());
