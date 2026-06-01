@@ -47,12 +47,22 @@ fn build_matchers(patterns: &[String]) -> Vec<GlobMatcher> {
         .collect()
 }
 
+/// Compile `ignore_patterns` into a reusable matcher.
+///
+/// Callers that test many paths against the same ignore list (e.g. the
+/// recursive copy, which checks every entry it walks) should build the set
+/// once with this and reuse it. `should_ignore_file` is a convenience wrapper
+/// that rebuilds the set on each call, which is fine for a one-off check but
+/// quadratic across a large tree.
+pub fn compile_ignore_set(ignore_patterns: &[String]) -> GlobSet {
+    build_glob_set(&normalize_patterns(ignore_patterns))
+}
+
 /// True when `file_path` (relative) matches any pattern in
 /// `ignore_patterns`. Used by the recursive copy to drop entries inside
 /// matched directories.
 pub fn should_ignore_file(file_path: &str, ignore_patterns: &[String]) -> bool {
-    let normalized = normalize_patterns(ignore_patterns);
-    build_glob_set(&normalized).is_match(file_path)
+    compile_ignore_set(ignore_patterns).is_match(file_path)
 }
 
 /// Walk `base_dir` and return the relative paths matching at least one
