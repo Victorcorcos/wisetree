@@ -1264,6 +1264,7 @@ mod tests {
             number: None,
             title: None,
             url: None,
+            existing_labels: vec![],
         }
     }
 
@@ -1275,6 +1276,7 @@ mod tests {
             number: Some(42),
             title: Some("Existing title".to_string()),
             url: Some("https://github.com/o/r/pull/42".to_string()),
+            existing_labels: vec![],
         }
     }
 

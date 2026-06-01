@@ -93,6 +93,7 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
         state: PrState::Open,
         url: "https://github.com/example/repo/pull/42".into(),
         title: "Improve dashboard footer details for live workflows".into(),
+        labels: vec![],
         checks_status: None,
         review_status: None,
         merge_status: None,

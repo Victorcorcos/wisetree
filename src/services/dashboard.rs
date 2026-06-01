@@ -129,6 +129,8 @@ pub struct PullRequest {
     pub state: PrState,
     pub url: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     #[serde(
         rename = "checksStatus",
         default,
@@ -447,6 +449,12 @@ pub struct FillSubmitRequest {
     pub title: String,
     pub body: String,
     pub labels: Vec<String>,
+    /// Title the PR already has on GitHub (update path only). When non-empty,
+    /// `--title` is omitted from `gh pr edit` so the existing title is preserved.
+    pub existing_title: Option<String>,
+    /// Labels the PR already has on GitHub (update path only). When non-empty,
+    /// `--add-label` is omitted from `gh pr edit` so existing labels are preserved.
+    pub existing_labels: Vec<String>,
 }
 
 /// Outcome of submitting the drafted PR (`submit_pull_request`): either a
@@ -1237,6 +1245,8 @@ impl DashboardService {
             title,
             body,
             labels,
+            existing_title,
+            existing_labels,
         } = params;
         if !self.gh_available {
             return Err(WisetreeError::other(
@@ -1262,23 +1272,28 @@ impl DashboardService {
                     Err(_) => body.to_string(),
                 };
                 let number_arg = number.to_string();
+                let skip_title = existing_title.as_ref().is_some_and(|t| !t.is_empty());
+                let skip_labels = !existing_labels.is_empty();
+                let emit_title = if skip_title { "(skipped)" } else { "<title>" };
+                let emit_labels = if skip_labels { " (labels skipped)" } else { "" };
                 emit(&format!(
-                    "$ gh pr edit #{number} --title <title> --body <body> --add-assignee @me"
+                    "$ gh pr edit #{number} --title {emit_title} --body <body> --add-assignee @me{emit_labels}"
                 ));
                 let mut edit_args: Vec<String> = vec![
                     "pr".into(),
                     "edit".into(),
                     number_arg.clone(),
-                    "--title".into(),
-                    title.into(),
-                    "--body".into(),
-                    body.clone(),
-                    "--add-assignee".into(),
-                    "@me".into(),
                 ];
-                for label in labels {
-                    edit_args.push("--add-label".into());
-                    edit_args.push(label.clone());
+                if !skip_title {
+                    edit_args.push("--title".into());
+                    edit_args.push(title.into());
+                }
+                edit_args.extend(["--body".into(), body.clone(), "--add-assignee".into(), "@me".into()]);
+                if !skip_labels {
+                    for label in labels {
+                        edit_args.push("--add-label".into());
+                        edit_args.push(label.clone());
+                    }
                 }
                 let edit_args_ref: Vec<&str> = edit_args.iter().map(String::as_str).collect();
                 let edit = time::timeout(
@@ -1946,7 +1961,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft mergeStateStatus reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -2094,11 +2109,19 @@ fn parse_graphql_response(
                     Some("CLEAN") => Some(MergeStatus::Clean),
                     _ => None,
                 };
+                let labels = node
+                    .labels
+                    .nodes
+                    .into_iter()
+                    .filter(|l| !l.name.is_empty())
+                    .map(|l| l.name)
+                    .collect();
                 PullRequest {
                     number: node.number,
                     state,
                     url: node.url,
                     title: node.title,
+                    labels,
                     checks_status,
                     review_status,
                     merge_status,
@@ -2194,6 +2217,16 @@ struct GhReviewAuthor {
     #[serde(default)]
     login: Option<String>,
 }
+#[derive(Deserialize, Default)]
+struct GhLabelNode {
+    #[serde(default)]
+    name: String,
+}
+#[derive(Deserialize, Default)]
+struct GhLabels {
+    #[serde(default)]
+    nodes: Vec<GhLabelNode>,
+}
 #[derive(Deserialize)]
 struct GhNode {
     number: u64,
@@ -2206,6 +2239,8 @@ struct GhNode {
     merge_state_status: Option<String>,
     #[serde(rename = "reviewDecision", default)]
     review_decision: Option<String>,
+    #[serde(default)]
+    labels: GhLabels,
     #[serde(rename = "reviewRequests", default)]
     review_requests: GhReviewRequests,
     #[serde(rename = "latestOpinionatedReviews", default)]

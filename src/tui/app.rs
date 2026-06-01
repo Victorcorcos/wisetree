@@ -1512,6 +1512,8 @@ impl App {
                     title,
                     body: screen.draft_body().map(str::to_string).unwrap_or_default(),
                     labels: screen.draft_labels().to_vec(),
+                    existing_title: request.title.clone(),
+                    existing_labels: request.existing_labels.clone(),
                 };
                 screen.start_opening();
                 kick_off_submit_pull_request(

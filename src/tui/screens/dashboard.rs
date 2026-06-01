@@ -111,6 +111,9 @@ pub struct FillPullRequestRequest {
     /// updating. Both `None` when creating a brand-new PR.
     pub title: Option<String>,
     pub url: Option<String>,
+    /// Labels the PR already has on GitHub. Non-empty only for open PRs.
+    /// Used to skip `--add-label` in `gh pr edit` when labels are already set.
+    pub existing_labels: Vec<String>,
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
@@ -2435,6 +2438,7 @@ fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
             number: Some(pr.number),
             title: Some(pr.title.clone()),
             url: Some(pr.url.clone()),
+            existing_labels: pr.labels.clone(),
         }),
         // Closed / merged PR → don't resurrect it from this action.
         Some(_) => None,
@@ -2456,6 +2460,7 @@ fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
                 number: None,
                 title: None,
                 url: None,
+                existing_labels: vec![],
             })
         }
     }
@@ -2770,6 +2775,7 @@ mod tests {
             state: PrState::Open,
             url: "https://github.com/example/repo/pull/42".to_string(),
             title: "Add feature".to_string(),
+            labels: vec![],
             checks_status: None,
             review_status: None,
             merge_status: None,
