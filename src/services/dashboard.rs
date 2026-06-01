@@ -924,6 +924,27 @@ impl DashboardService {
         // 2. recheck behind
         let behind = behind_against_base(&self.git_binary, &cwd, base_ref).await;
         if matches!(behind, Some(0)) {
+            // Local branch already contains all upstream changes. However
+            // the user may have already merged upstream locally but never
+            // pushed — in that case the PR on GitHub still shows "behind"
+            // even though local HEAD is up to date. Check for unpushed
+            // commits and push them before declaring AlreadyUpToDate.
+            let ahead_of_origin =
+                local_ahead_of_tracking(&self.git_binary, &cwd).await;
+            if ahead_of_origin > 0 {
+                send_phase(UpdatePhase::NoConflicts);
+                send_phase(UpdatePhase::Pushing);
+                let push = time::timeout(
+                    UPDATE_PUSH_TIMEOUT,
+                    run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+                )
+                .await
+                .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+                if let Err(err) = push {
+                    return Ok(UpdatePullRequestOutcome::PushFailed(err));
+                }
+                return Ok(UpdatePullRequestOutcome::Pushed);
+            }
             send_phase(UpdatePhase::AlreadyUpToDate);
             return Ok(UpdatePullRequestOutcome::AlreadyUpToDate);
         }
@@ -2625,6 +2646,22 @@ pub fn is_behind(row: &DashboardRow) -> bool {
         .map(|status| status.behind > 0)
         .unwrap_or(false);
     merge_says_behind || git_says_behind
+}
+
+/// Number of commits that local HEAD has that the tracking remote
+/// (`@{upstream}`) does not. Returns 0 when the tracking ref is not
+/// configured or the count cannot be parsed — a safe fallback that
+/// avoids a spurious push when the tracking state is unknown.
+async fn local_ahead_of_tracking(git_binary: &Path, cwd: &Path) -> u64 {
+    run_command(
+        git_binary,
+        &["rev-list", "--count", "@{upstream}..HEAD"],
+        Some(cwd),
+    )
+    .await
+    .ok()
+    .and_then(|out| out.trim().parse::<u64>().ok())
+    .unwrap_or(0)
 }
 
 /// Count of commits HEAD is behind `base_ref`. `None` when the count
