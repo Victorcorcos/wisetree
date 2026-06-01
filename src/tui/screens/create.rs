@@ -988,7 +988,12 @@ fn truncate_failure(text: &str) -> String {
 /// title) but uses TEAL instead of orange to distinguish "background
 /// commands running" from "AI working on conflicts". Auto-tails the log so
 /// the most recent line is always visible.
-fn render_terminal_activity(log: &[TerminalLine], scroll: u16, frame: &mut Frame, area: Rect) {
+pub(crate) fn render_terminal_activity(
+    log: &[TerminalLine],
+    scroll: u16,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let border_style = Style::default().fg(colors::TEAL);
     let title = Line::from(vec![
         Span::raw(" "),

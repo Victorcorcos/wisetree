@@ -45,6 +45,7 @@ enum ActionChoice {
     OpenWithCommand,
     CopyPath,
     OpenPullRequest,
+    FillPullRequest,
     MergePullRequest,
     UpdatePullRequest,
     PushPullRequest,
@@ -91,6 +92,25 @@ pub struct ClosePullRequestRequest {
     pub url: String,
     pub branch: String,
     pub worktree_path: String,
+}
+
+/// Payload the dashboard hands to the "Fill Pull Request" screen. The AI
+/// drafts a title + description into `pull_request.md`; the harness then
+/// either creates a new PR (`number == None`) or updates the existing one
+/// (`number == Some`). `base_ref` is resolved by the app layer before the
+/// pipeline runs, exactly like `UpdatePullRequestRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillPullRequestRequest {
+    pub branch: String,
+    pub worktree_path: String,
+    pub base_ref: Option<String>,
+    /// `Some(n)` when an open PR already exists for the branch → the draft
+    /// updates PR #n. `None` when no PR exists yet → the draft opens one.
+    pub number: Option<u64>,
+    /// Existing PR title/url, shown on the confirm + review panels when
+    /// updating. Both `None` when creating a brand-new PR.
+    pub title: Option<String>,
+    pub url: Option<String>,
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
@@ -162,6 +182,10 @@ pub enum DashboardAction {
     OpenPullRequest(String),
     MergePullRequest(Box<MergePullRequestRequest>),
     UpdatePullRequest(Box<UpdatePullRequestRequest>),
+    /// Draft a PR title + description with the AI and open (or update) the
+    /// pull request. Offered on any non-mother worktree that either has an
+    /// open PR or has commits ahead of its base ref.
+    FillPullRequest(Box<FillPullRequestRequest>),
     /// Push the branch's local commits to origin (`git push origin HEAD`).
     /// Offered when the PR is Open and the branch is ahead-but-not-behind —
     /// the "merged-but-not-pushed" state a failed push can leave behind.
@@ -659,6 +683,7 @@ impl DashboardScreen {
                     let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
                     let merge_request = build_merge_request(row);
                     let update_request = build_update_request(row);
+                    let fill_request = build_fill_request(row);
                     let push_request = build_push_request(row);
                     let close_request = build_close_request(row);
                     self.action_select = None;
@@ -697,6 +722,12 @@ impl DashboardScreen {
                                 .map(|request| {
                                     DashboardAction::UpdatePullRequest(Box::new(request))
                                 })
+                                .unwrap_or(DashboardAction::Continue)
+                        }
+                        ActionChoice::FillPullRequest => {
+                            self.mode = DashboardMode::Table;
+                            fill_request
+                                .map(|request| DashboardAction::FillPullRequest(Box::new(request)))
                                 .unwrap_or(DashboardAction::Continue)
                         }
                         ActionChoice::PushPullRequest => {
@@ -784,6 +815,17 @@ impl DashboardScreen {
                 ActionChoice::OpenPullRequest,
             ));
         }
+        // Fill Pull Request drafts a title + description from the diff with
+        // the AI, then opens a brand-new PR (no PR yet, branch ahead of
+        // base) or refreshes the existing open PR's description. The
+        // `build_fill_request` guard keeps the menu and dispatch in
+        // lockstep, exactly like the merge/update entries.
+        if build_fill_request(row).is_some() {
+            options.push(
+                SelectOption::new("Fill Pull Request", ActionChoice::FillPullRequest)
+                    .with_description("Draft a PR title + description with AI, then open/update"),
+            );
+        }
         // Merge is only meaningful for PRs still in the Open state — a
         // Merged / Closed / Draft PR can't be squash-merged again.
         if row
@@ -869,6 +911,7 @@ impl DashboardScreen {
                 let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
                 let merge_request = build_merge_request(row);
                 let update_request = build_update_request(row);
+                let fill_request = build_fill_request(row);
                 let push_request = build_push_request(row);
                 let close_request = build_close_request(row);
                 self.action_select = None;
@@ -907,6 +950,13 @@ impl DashboardScreen {
                         self.mode = DashboardMode::Table;
                         match update_request {
                             Some(request) => DashboardAction::UpdatePullRequest(Box::new(request)),
+                            None => DashboardAction::Continue,
+                        }
+                    }
+                    ActionChoice::FillPullRequest => {
+                        self.mode = DashboardMode::Table;
+                        match fill_request {
+                            Some(request) => DashboardAction::FillPullRequest(Box::new(request)),
                             None => DashboardAction::Continue,
                         }
                     }
@@ -2363,6 +2413,53 @@ fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> 
     })
 }
 
+/// Assemble the payload the "Fill Pull Request" screen needs. Returns
+/// `None` (so the menu entry is hidden) on the mother worktree, or on a
+/// worktree that has neither an open PR to refresh nor any commits ahead
+/// of its base to describe. When an open PR exists the draft updates it
+/// (`number = Some`); otherwise a branch that is ahead opens a new one
+/// (`number = None`).
+fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
+    // The mother worktree never owns a PR of its own.
+    if row.worktree.is_main {
+        return None;
+    }
+    let branch = row.worktree.branch.clone();
+    let worktree_path = row.worktree.path.clone();
+    match row.pull_request.as_ref() {
+        // Open PR → refresh its description.
+        Some(pr) if matches!(pr.state, PrState::Open) => Some(FillPullRequestRequest {
+            branch,
+            worktree_path,
+            base_ref: None,
+            number: Some(pr.number),
+            title: Some(pr.title.clone()),
+            url: Some(pr.url.clone()),
+        }),
+        // Closed / merged PR → don't resurrect it from this action.
+        Some(_) => None,
+        // No PR yet → only offer when there are commits to describe.
+        None => {
+            let ahead = row
+                .worktree
+                .branch_status
+                .as_ref()
+                .map(|s| s.ahead)
+                .unwrap_or(0);
+            if ahead == 0 {
+                return None;
+            }
+            Some(FillPullRequestRequest {
+                branch,
+                worktree_path,
+                base_ref: None,
+                number: None,
+                title: None,
+                url: None,
+            })
+        }
+    }
+}
 /// Assemble the payload for the push-only flow. Returns `None` unless the
 /// row's PR is Open and the branch is ahead-but-not-behind — mirrors the
 /// `row_has_unpushed` guard in `build_action_select`. Reuses the
