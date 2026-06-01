@@ -314,8 +314,7 @@ impl WorktreeService {
         let mut branch_deleted = false;
         let mut branch_delete_error = None;
         if let Some(name) = &branch_name {
-            let branch_git =
-                GitService::new(main_worktree_path.or_else(|| self.git_root.clone()));
+            let branch_git = GitService::new(main_worktree_path.or_else(|| self.git_root.clone()));
             match branch_git.delete_branch(name, true).await {
                 Ok(()) => branch_deleted = true,
                 Err(e) => {
