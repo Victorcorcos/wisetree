@@ -964,11 +964,44 @@ impl DashboardScreen {
 
     /// Keyboard handling while a PR command button owns the focus: Left /
     /// Right move between buttons, Enter runs the focused action, Esc
-    /// dismisses the whole menu.
+    /// dismisses the whole menu. Letter shortcuts (O/F/U/P/M/C) trigger the
+    /// matching PR command directly without needing to navigate to it first.
     fn handle_pr_command_key(&mut self, key: KeyEvent) -> DashboardAction {
         if self.pr_commands.is_empty() {
             self.action_pr_focus = None;
             return DashboardAction::Continue;
+        }
+        // Letter shortcuts: map each key to its ActionChoice, then fire the
+        // first matching command that is actually present in the button row.
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            let shortcut_choice = match key.code {
+                KeyCode::Char('o') | KeyCode::Char('O') => Some(ActionChoice::OpenPullRequest),
+                KeyCode::Char('f') | KeyCode::Char('F') => Some(ActionChoice::FillPullRequest),
+                KeyCode::Char('u') | KeyCode::Char('U') => Some(ActionChoice::UpdatePullRequest),
+                KeyCode::Char('p') | KeyCode::Char('P') => Some(ActionChoice::PushPullRequest),
+                KeyCode::Char('m') | KeyCode::Char('M') => Some(ActionChoice::MergePullRequest),
+                KeyCode::Char('c') | KeyCode::Char('C') => Some(ActionChoice::ClosePullRequest),
+                _ => None,
+            };
+            if let Some(target_choice) = shortcut_choice {
+                if let Some(cmd) = self
+                    .pr_commands
+                    .iter()
+                    .find(|cmd| cmd.choice == target_choice)
+                {
+                    let choice = cmd.choice;
+                    let Some(index) = self.action_target else {
+                        self.reset_action_menu();
+                        self.mode = DashboardMode::Table;
+                        return DashboardAction::Continue;
+                    };
+                    return self.dispatch_action_choice(choice, index);
+                }
+                return DashboardAction::Continue;
+            }
         }
         match key.code {
             KeyCode::Esc => {
