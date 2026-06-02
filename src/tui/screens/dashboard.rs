@@ -308,6 +308,12 @@ pub struct DashboardScreen {
     /// focus; `None` keeps focus on the searchable General Commands list.
     /// Tab toggles between the two sections.
     action_pr_focus: Option<usize>,
+    /// Remembers the PR button that was focused when Tab moved back to the
+    /// General Commands list, so the next Tab into the PR section resumes
+    /// from there instead of jumping to the first button. Mirrors how the
+    /// General Commands `SelectPrompt` retains its selection across toggles.
+    /// Reset to 0 each time the action menu opens.
+    last_pr_focus: usize,
     /// Captured during render so mouse clicks on PR command buttons can be
     /// hit-tested by the app.
     pr_button_rects: Vec<(usize, Rect)>,
@@ -320,10 +326,16 @@ pub struct DashboardScreen {
     refreshed_at: Option<Instant>,
     next_pr_fetch_at: Option<Instant>,
     pr_enrichment_enabled: bool,
-    /// `Some` while the bulk-delete buttons row owns the keyboard focus.
-    /// Tab moves through buttons in `BulkDeleteStatus::ALL` order; Esc
-    /// returns focus to the table.
+    /// `Some` while the bulk-delete buttons row owns the keyboard focus,
+    /// `None` while the worktree table does. Tab toggles between the two
+    /// sections; Left/Right move between buttons; Esc returns focus to the
+    /// table.
     bulk_focus: Option<BulkDeleteStatus>,
+    /// Remembers the bulk-delete button that was focused when Tab moved back
+    /// to the worktree table, so the next Tab into the buttons resumes from
+    /// there instead of jumping to the first button. Mirrors how the table
+    /// keeps its selected row across the same toggle.
+    last_bulk_focus: BulkDeleteStatus,
     /// Captured during render so mouse clicks on the footer buttons can
     /// be hit-tested by the app.
     bulk_button_rects: Vec<(BulkDeleteStatus, Rect)>,
@@ -354,6 +366,7 @@ impl DashboardScreen {
             action_target: None,
             pr_commands: Vec::new(),
             action_pr_focus: None,
+            last_pr_focus: 0,
             pr_button_rects: Vec::new(),
             is_from_wrapper,
             has_terminal_command,
@@ -368,6 +381,7 @@ impl DashboardScreen {
             next_pr_fetch_at: None,
             pr_enrichment_enabled,
             bulk_focus: None,
+            last_bulk_focus: BulkDeleteStatus::ALL[0],
             bulk_button_rects: Vec::new(),
             row_rects: Vec::new(),
             close_pr_modal: None,
@@ -468,15 +482,14 @@ impl DashboardScreen {
             return DashboardAction::Refresh;
         }
 
-        // Tab cycles through the bulk-delete buttons (and back to the
-        // table). BackTab cycles in reverse. Available even while the
-        // search query has text — Tab is never typeable into the search.
-        if matches!(key.code, KeyCode::Tab) {
-            self.bulk_focus = next_bulk_focus(self.bulk_focus, true);
-            return DashboardAction::Continue;
-        }
-        if matches!(key.code, KeyCode::BackTab) {
-            self.bulk_focus = next_bulk_focus(self.bulk_focus, false);
+        // Tab toggles focus between the worktree table and the bulk-delete
+        // buttons; BackTab does the same since there are only two sections.
+        // Each side keeps its selection across the round trip (the table its
+        // highlighted row, the buttons their focused status). Available even
+        // while the search query has text — Tab is never typeable into the
+        // search. Left/Right still move between individual buttons.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.toggle_bulk_focus();
             return DashboardAction::Continue;
         }
 
@@ -525,6 +538,7 @@ impl DashboardScreen {
                 self.action_select = Some(self.build_action_select(&row));
                 self.pr_commands = self.build_pr_commands(&row);
                 self.action_pr_focus = None;
+                self.last_pr_focus = 0;
                 self.action_target = Some(index);
                 self.mode = DashboardMode::ActionMenu;
                 DashboardAction::Continue
@@ -608,6 +622,21 @@ impl DashboardScreen {
         if matches!(self.mode, DashboardMode::ConfirmClosePr) {
             if let Some((modal, _)) = self.close_pr_modal.as_mut() {
                 modal.render(frame, area);
+            }
+        }
+    }
+
+    /// Tab toggles focus between the worktree table (`None`) and the
+    /// bulk-delete buttons. Moving into the buttons resumes on the status
+    /// that was focused last (`last_bulk_focus`); moving back to the table
+    /// remembers the focused status so the round trip preserves the
+    /// selection.
+    fn toggle_bulk_focus(&mut self) {
+        match self.bulk_focus {
+            None => self.bulk_focus = Some(self.last_bulk_focus),
+            Some(status) => {
+                self.last_bulk_focus = status;
+                self.bulk_focus = None;
             }
         }
     }
@@ -751,6 +780,7 @@ impl DashboardScreen {
                 self.action_select = Some(self.build_action_select(&row));
                 self.pr_commands = self.build_pr_commands(&row);
                 self.action_pr_focus = None;
+                self.last_pr_focus = 0;
                 self.action_target = Some(index);
                 self.mode = DashboardMode::ActionMenu;
                 return DashboardAction::Continue;
@@ -919,15 +949,22 @@ impl DashboardScreen {
     }
 
     /// Tab toggles focus between the General Commands list (`None`) and the
-    /// PR command buttons (`Some(0)`). A no-op when there are no PR buttons.
+    /// PR command buttons. Moving into the PR section resumes on the button
+    /// that was focused last (`last_pr_focus`, clamped to the current button
+    /// count); moving back to General remembers the focused button so the
+    /// round trip preserves the selection. A no-op when there are no PR
+    /// buttons.
     fn toggle_action_focus(&mut self) {
         if self.pr_commands.is_empty() {
             self.action_pr_focus = None;
             return;
         }
         self.action_pr_focus = match self.action_pr_focus {
-            None => Some(0),
-            Some(_) => None,
+            None => Some(self.last_pr_focus.min(self.pr_commands.len() - 1)),
+            Some(idx) => {
+                self.last_pr_focus = idx;
+                None
+            }
         };
     }
 

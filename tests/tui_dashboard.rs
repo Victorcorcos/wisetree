@@ -1323,10 +1323,11 @@ fn bulk_delete_drafted_targets_only_draft_pr_rows() {
         row_with_pr_state("/tmp/repo-open", "open", false, PrState::Open),
     ]);
 
-    // Tab cycles None → Merged → Closed → Drafted.
-    for _ in 0..3 {
-        screen.handle_key(key(KeyCode::Tab));
-    }
+    // Tab moves focus from the table onto the buttons (landing on the first,
+    // Merged); Right then steps Merged → Closed → Drafted.
+    screen.handle_key(key(KeyCode::Tab));
+    screen.handle_key(key(KeyCode::Right));
+    screen.handle_key(key(KeyCode::Right));
     let action = screen.handle_key(key(KeyCode::Enter));
 
     match action {
