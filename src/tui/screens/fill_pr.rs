@@ -37,6 +37,7 @@ use crate::tui::screens::dashboard::FillPullRequestRequest;
 use crate::tui::screens::update_pr::{
     ai_activity_event_to_line, button_paragraph, contains_position, key_event_to_pty_bytes,
 };
+use crate::tui::widgets::{render_summary_table, SummaryRow};
 use crate::tui::widgets::{
     ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, PtyView, Status, StatusIndicator,
 };
@@ -127,6 +128,9 @@ pub struct FillPullRequestScreen {
     terminal_scroll: u16,
     /// Stored outcome of the submission — used to render the Done page header.
     submit_outcome: Option<FillSubmitOutcome>,
+    /// Summary rows built from the terminal log when the submission finishes.
+    /// Shown as a table on the Done page (mirrors the create-worktree success page).
+    summary_rows: Vec<SummaryRow>,
 }
 
 impl FillPullRequestScreen {
@@ -158,6 +162,7 @@ impl FillPullRequestScreen {
             terminal_log: Vec::new(),
             terminal_scroll: 0,
             submit_outcome: None,
+            summary_rows: Vec::new(),
         }
     }
 
@@ -317,6 +322,53 @@ impl FillPullRequestScreen {
 
     /// Transition from Opening → Done once the submission finishes.
     pub fn enter_done(&mut self, outcome: FillSubmitOutcome) {
+        // Collect the command labels emitted during Opening (Status lines
+        // starting with `$`) so we can build the summary table.
+        let commands: Vec<String> = self
+            .terminal_log
+            .iter()
+            .filter(|l| l.kind == ActivityKind::Status && l.text.starts_with('$'))
+            .map(|l| l.text.clone())
+            .collect();
+
+        self.summary_rows = match &outcome {
+            FillSubmitOutcome::Created { .. } | FillSubmitOutcome::Updated { .. } => commands
+                .iter()
+                .map(|c| SummaryRow::success(c.clone()))
+                .collect(),
+            FillSubmitOutcome::PushFailed(err) => {
+                // Only the push ran and it failed; any trailing commands
+                // (there shouldn't be any) are marked as not reached.
+                commands
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if i == 0 {
+                            SummaryRow::failure(c.clone(), err.clone())
+                        } else {
+                            SummaryRow::success(c.clone())
+                        }
+                    })
+                    .collect()
+            }
+            FillSubmitOutcome::SubmitFailed(err) => {
+                // Everything before the last command succeeded; the last one
+                // failed (git push OK but gh pr create/edit failed).
+                let n = commands.len();
+                commands
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if i + 1 == n {
+                            SummaryRow::failure(c.clone(), err.clone())
+                        } else {
+                            SummaryRow::success(c.clone())
+                        }
+                    })
+                    .collect()
+            }
+        };
+
         self.submit_outcome = Some(outcome);
         self.terminal_scroll = 0;
         self.step = FillStep::Done;
@@ -580,7 +632,17 @@ impl FillPullRequestScreen {
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
             FillStep::Loading => 3,
-            FillStep::Opening | FillStep::Done => 22,
+            FillStep::Opening => 22,
+            FillStep::Done => {
+                // 3 (status indicator) + table + 1 (footer hint)
+                let table_rows = (self.summary_rows.len() as u16).min(12);
+                let table_height = if self.summary_rows.is_empty() {
+                    5
+                } else {
+                    table_rows + 3 // border top + header + N rows + border bottom
+                };
+                (3 + table_height + 1).max(10)
+            }
             FillStep::Filling => 25,
             FillStep::Review => {
                 let body_rows = self.draft_body.is_some() as u16 * 4;
@@ -683,7 +745,7 @@ impl FillPullRequestScreen {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3), // status indicator
-                Constraint::Min(3),    // terminal log
+                Constraint::Min(3),    // summary table
                 Constraint::Length(1), // press-any-key hint
             ])
             .split(area);
@@ -692,7 +754,11 @@ impl FillPullRequestScreen {
             .without_spinner()
             .render(frame, chunks[0]);
 
-        render_terminal_activity(&self.terminal_log, self.terminal_scroll, frame, chunks[1]);
+        if self.summary_rows.is_empty() {
+            render_terminal_activity(&self.terminal_log, self.terminal_scroll, frame, chunks[1]);
+        } else {
+            render_summary_table(&self.summary_rows, frame, chunks[1]);
+        }
 
         frame.render_widget(
             Paragraph::new("Press any key to continue").style(
@@ -1420,5 +1486,43 @@ mod tests {
         );
         let dump = render_dump(&mut screen, 80, 6);
         assert!(dump.contains("Cannot fill pull request"), "{dump}");
+    }
+
+    #[test]
+    fn done_renders_summary_table_on_success() {
+        let mut screen = FillPullRequestScreen::new(update_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_opening();
+        screen.append_terminal_line(
+            "$ gh pr edit #42 --title (skipped) --body <body> --add-assignee @me".to_string(),
+            ActivityKind::Status,
+        );
+        screen.enter_done(FillSubmitOutcome::Updated { number: 42 });
+        let dump = render_dump(&mut screen, 100, 15);
+        assert!(
+            dump.contains("Pull request #42 updated successfully!"),
+            "{dump}"
+        );
+        assert!(dump.contains("gh pr edit"), "{dump}");
+        assert!(dump.contains("Status"), "{dump}");
+        assert!(dump.contains("Press any key"), "{dump}");
+    }
+
+    #[test]
+    fn done_renders_summary_table_on_push_failure() {
+        let mut screen = FillPullRequestScreen::new(create_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_opening();
+        screen.append_terminal_line(
+            "$ git push -u origin digit-3131-retry".to_string(),
+            ActivityKind::Status,
+        );
+        screen.enter_done(FillSubmitOutcome::PushFailed(
+            "authentication failed".to_string(),
+        ));
+        let dump = render_dump(&mut screen, 100, 15);
+        assert!(dump.contains("Failed to push the branch."), "{dump}");
+        assert!(dump.contains("git push"), "{dump}");
+        assert!(dump.contains("authentication failed"), "{dump}");
     }
 }
