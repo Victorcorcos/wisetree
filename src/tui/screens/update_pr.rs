@@ -1567,14 +1567,14 @@ fn render_pty_scrollbar(frame: &mut Frame, inner: Rect, pty: &PtyView) {
     );
 }
 
-fn contains_position(area: Rect, position: Position) -> bool {
+pub(crate) fn contains_position(area: Rect, position: Position) -> bool {
     position.x >= area.left()
         && position.x < area.right()
         && position.y >= area.top()
         && position.y < area.bottom()
 }
 
-fn button_paragraph(
+pub(crate) fn button_paragraph(
     label: &str,
     color: ratatui::style::Color,
     focused: bool,
@@ -1600,7 +1600,7 @@ fn button_paragraph(
         .alignment(ratatui::layout::Alignment::Center)
 }
 
-fn ai_activity_event_to_line(event: &AiActivityEvent) -> Line<'static> {
+pub(crate) fn ai_activity_event_to_line(event: &AiActivityEvent) -> Line<'static> {
     match event {
         AiActivityEvent::SessionStart { model } => Line::from(vec![
             Span::styled("[session started] ".to_string(), muted_bold()),
@@ -2047,7 +2047,7 @@ fn build_steps_lines(base_ref: &str, push_only: bool) -> Vec<Line<'static>> {
 /// opencode actually cares about (printable chars, control combos, arrow
 /// keys, function keys, navigation). Tab is intentionally not mapped —
 /// callers reserve it as the focus-toggle shortcut.
-fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+pub(crate) fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 

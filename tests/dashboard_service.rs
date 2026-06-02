@@ -804,6 +804,7 @@ fn row_with(merge_status: Option<MergeStatus>, behind: Option<u64>) -> Dashboard
             state: PrState::Open,
             url: "u".into(),
             title: "t".into(),
+            labels: vec![],
             checks_status: Some(CheckStatus::Passed),
             review_status: None,
             merge_status: Some(status),
