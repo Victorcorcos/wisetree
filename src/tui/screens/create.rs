@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::files::ActivityKind;
@@ -21,8 +21,9 @@ use crate::messages::{
     CREATE_NEW_BRANCH_PLACEHOLDER, CREATE_SOURCE_BRANCH_PROMPT, CREATE_SUCCESS, LOADING_BRANCHES,
 };
 use crate::tui::widgets::{
-    branded_line, CommandListProgress, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
-    InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+    branded_line, render_summary_table, CommandListProgress, ConfirmationChoice, ConfirmationModal,
+    ConfirmationOutcome, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt,
+    Status, StatusIndicator, SummaryRow,
 };
 use crate::utils::validation::{
     normalize_branch_name, validate_branch_name, validate_directory_name, validate_source_ref,
@@ -67,35 +68,6 @@ pub enum CreateAction {
     },
     /// Success step is done (Enter / Esc); caller should pop screen.
     Done,
-}
-
-/// One row in the post-create summary table. Each row represents a single
-/// action that ran as part of `git worktree add` (Copy patterns, Link
-/// patterns, or one of the user's post-create commands) along with whether
-/// it succeeded and — if it failed — what went wrong.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SummaryRow {
-    pub command: String,
-    pub success: bool,
-    pub failure: Option<String>,
-}
-
-impl SummaryRow {
-    pub fn success(command: impl Into<String>) -> Self {
-        Self {
-            command: command.into(),
-            success: true,
-            failure: None,
-        }
-    }
-
-    pub fn failure(command: impl Into<String>, failure: impl Into<String>) -> Self {
-        Self {
-            command: command.into(),
-            success: false,
-            failure: Some(failure.into()),
-        }
-    }
 }
 
 /// One line in the Terminal Activity panel: a stage banner emitted by the
@@ -906,81 +878,6 @@ fn build_navigate_confirm() -> ConfirmationModal {
         .with_cancel_text("No")
         .with_color_value(colors::INFO)
         .with_selected(ConfirmationChoice::Confirm)
-}
-
-fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) {
-    let header = Row::new(vec![
-        Cell::from("Command"),
-        Cell::from("Status"),
-        Cell::from("Failure"),
-    ])
-    .style(
-        Style::default()
-            .fg(colors::INFO)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    let table_rows: Vec<Row> = rows
-        .iter()
-        .map(|r| {
-            let (status_symbol, status_color) = if r.success {
-                ("✅", colors::SUCCESS)
-            } else {
-                ("❌", colors::ERROR)
-            };
-            let status_cell = Cell::from(Line::from(Span::styled(
-                status_symbol,
-                Style::default().fg(status_color),
-            )));
-            let (failure_text, failure_style) = match &r.failure {
-                Some(reason) => (truncate_failure(reason), Style::default().fg(colors::ERROR)),
-                None => ("None".to_string(), Style::default().fg(colors::MUTED)),
-            };
-            Row::new(vec![
-                Cell::from(r.command.clone()).style(Style::default().fg(colors::EMPHASIS)),
-                status_cell,
-                Cell::from(failure_text).style(failure_style),
-            ])
-        })
-        .collect();
-
-    let widths = [
-        Constraint::Percentage(40),
-        Constraint::Length(8),
-        Constraint::Min(10),
-    ];
-
-    let table = Table::new(table_rows, widths)
-        .header(header)
-        .column_spacing(2)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(colors::MUTED)),
-        );
-
-    frame.render_widget(table, area);
-}
-
-/// Keep failure cells to a single line of readable text. Joins multi-line
-/// stderr on spaces and adds an ellipsis when truncated so the table never
-/// expands vertically beyond one row per action.
-fn truncate_failure(text: &str) -> String {
-    let compact = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let trimmed = compact.trim();
-    let limit = 120;
-    if trimmed.chars().count() > limit {
-        let head: String = trimmed.chars().take(limit).collect();
-        format!("{head}…")
-    } else {
-        trimmed.to_string()
-    }
 }
 
 /// Render the live "Terminal Activity" panel under the Creating spinner.

@@ -44,7 +44,8 @@ use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
-use crate::tui::screens::create::{CreateAction, CreateScreen, SummaryRow};
+use crate::tui::screens::create::{CreateAction, CreateScreen};
+use crate::tui::widgets::SummaryRow;
 use crate::tui::screens::dashboard::{
     BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
     FillPullRequestRequest, MergePullRequestRequest, UpdatePullRequestRequest,
@@ -582,7 +583,10 @@ impl App {
                 let wants_fill = self
                     .update_pr
                     .as_ref()
-                    .is_some_and(|s| s.is_updating() && (s.ai_active() || s.terminal_active()));
+                    .is_some_and(|s| {
+                        (s.is_updating() && (s.ai_active() || s.terminal_active()))
+                            || s.commit_push_running()
+                    });
                 let in_confirm = self
                     .update_pr
                     .as_ref()
@@ -1191,7 +1195,6 @@ impl App {
                     UpdateAction::Confirmed => self.confirm_update_pr(tx),
                     UpdateAction::AiComplete => {
                         let dashboard_config = self.current_dashboard_config();
-                        let git_root = self.git_root.clone();
                         let Some(screen) = self.update_pr.as_mut() else {
                             return;
                         };
@@ -1201,14 +1204,20 @@ impl App {
                             .base_ref
                             .clone()
                             .unwrap_or_else(|| "upstream/main".to_string());
-                        screen.set_phase_message("Committing and pushing AI resolution...");
-                        kick_off_commit_and_push(
-                            git_root,
-                            dashboard_config,
-                            request,
-                            use_ai,
-                            base_ref,
-                            tx.clone(),
+                        let cwd = PathBuf::from(&request.worktree_path);
+                        let message = format!(
+                            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
+                            crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
+                        );
+                        let script = "git add -A && git commit -m \"$COMMIT_MSG\" && { git push upstream HEAD || git push origin HEAD; }".to_string();
+                        let sh = PathBuf::from("/bin/sh");
+                        let (shell, shell_args) =
+                            login_shell_command(&sh, &["-c".to_string(), script]);
+                        screen.start_commit_push_pty(
+                            shell,
+                            shell_args,
+                            cwd,
+                            vec![("COMMIT_MSG".to_string(), message)],
                         );
                     }
                     UpdateAction::AiCancel => {
@@ -1365,7 +1374,6 @@ impl App {
             UpdateAction::Confirmed => self.confirm_update_pr(tx),
             UpdateAction::AiComplete => {
                 let dashboard_config = self.current_dashboard_config();
-                let git_root = self.git_root.clone();
                 let Some(screen) = self.update_pr.as_mut() else {
                     return;
                 };
@@ -1375,14 +1383,20 @@ impl App {
                     .base_ref
                     .clone()
                     .unwrap_or_else(|| "upstream/main".to_string());
-                screen.set_phase_message("Committing and pushing AI resolution...");
-                kick_off_commit_and_push(
-                    git_root,
-                    dashboard_config,
-                    request,
-                    use_ai,
-                    base_ref,
-                    tx.clone(),
+                let cwd = PathBuf::from(&request.worktree_path);
+                let message = format!(
+                    "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
+                    crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
+                );
+                let script = "git add -A && git commit -m \"$COMMIT_MSG\" && { git push upstream HEAD || git push origin HEAD; }".to_string();
+                let sh = PathBuf::from("/bin/sh");
+                let (shell, shell_args) =
+                    login_shell_command(&sh, &["-c".to_string(), script]);
+                screen.start_commit_push_pty(
+                    shell,
+                    shell_args,
+                    cwd,
+                    vec![("COMMIT_MSG".to_string(), message)],
                 );
             }
             UpdateAction::AiCancel => {
@@ -4136,43 +4150,6 @@ fn kick_off_update_branch(
             Err(err) => Err(user_friendly_message(&err)),
         };
         let _ = tx.send(AppEvent::UpdateBranchFinished(event));
-    });
-}
-
-fn kick_off_commit_and_push(
-    git_root: Option<String>,
-    config: DashboardConfig,
-    request: UpdatePullRequestRequest,
-    use_ai: String,
-    base_ref: String,
-    tx: mpsc::UnboundedSender<AppEvent>,
-) {
-    let number = request.number;
-    let Some(root) = git_root.map(PathBuf::from) else {
-        let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
-            number,
-            message: "Could not resolve git root for push.".to_string(),
-        })));
-        return;
-    };
-    let report_base = base_ref.clone();
-    tokio::spawn(async move {
-        let service = DashboardService::new(root, config);
-        let result = service
-            .commit_and_push_ai_merge(&request.worktree_path, &base_ref, &use_ai)
-            .await;
-        let event = match result {
-            Ok(outcome) => Ok(UpdatePrSuccess {
-                number,
-                base_ref: report_base,
-                outcome,
-            }),
-            Err(err) => Err(UpdatePrFailure {
-                number,
-                message: user_friendly_message(&err),
-            }),
-        };
-        let _ = tx.send(AppEvent::UpdatePrFinished(event));
     });
 }
 
