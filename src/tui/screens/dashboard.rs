@@ -127,21 +127,23 @@ pub struct FillPullRequestRequest {
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
-/// footer. `button_label` can differ from the row label when a shorter
-/// footer caption keeps narrow layouts readable.
+/// footer. The button caption matches the status-column label exactly so
+/// the two surfaces stay in lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkDeleteStatus {
     Merged,
     Opened,
+    Drafted,
     Closed,
     Clean,
     Dirty,
 }
 
 impl BulkDeleteStatus {
-    pub const ALL: [BulkDeleteStatus; 5] = [
+    pub const ALL: [BulkDeleteStatus; 6] = [
         BulkDeleteStatus::Merged,
         BulkDeleteStatus::Closed,
+        BulkDeleteStatus::Drafted,
         BulkDeleteStatus::Opened,
         BulkDeleteStatus::Clean,
         BulkDeleteStatus::Dirty,
@@ -154,24 +156,26 @@ impl BulkDeleteStatus {
     pub fn button_label(self) -> &'static str {
         match self {
             BulkDeleteStatus::Merged => "Merged",
-            BulkDeleteStatus::Opened => "Open",
+            BulkDeleteStatus::Opened => "Opened",
+            BulkDeleteStatus::Drafted => "Drafted",
             BulkDeleteStatus::Closed => "Closed",
             BulkDeleteStatus::Clean => "Clean",
             BulkDeleteStatus::Dirty => "Dirty",
         }
     }
 
+    /// Status-column label this button filters on. Identical to
+    /// [`Self::button_label`] — the two are kept as separate methods so the
+    /// matching site reads as intent ("rows whose label equals this").
     fn row_label(self) -> &'static str {
-        match self {
-            BulkDeleteStatus::Opened => "Opened",
-            _ => self.button_label(),
-        }
+        self.button_label()
     }
 
     fn color(self) -> ratatui::style::Color {
         match self {
             BulkDeleteStatus::Merged => colors::SUCCESS,
             BulkDeleteStatus::Opened => colors::INFO,
+            BulkDeleteStatus::Drafted => colors::GRAY_MEDIUM,
             BulkDeleteStatus::Closed => colors::GRAY_LIGHT,
             BulkDeleteStatus::Clean => colors::ACCENT,
             BulkDeleteStatus::Dirty => colors::ERROR,
@@ -810,15 +814,16 @@ impl DashboardScreen {
     /// buttons), so arrow navigation only ever lands on a valid action.
     fn build_pr_commands(&self, row: &DashboardRow) -> Vec<PrCommand> {
         let mut commands = Vec::new();
-        let is_open = row
-            .pull_request
-            .as_ref()
-            .is_some_and(|pr| matches!(pr.state, PrState::Open));
-        if row
-            .pull_request
-            .as_ref()
-            .is_some_and(|pr| matches!(pr.state, PrState::Open | PrState::Merged))
-        {
+        let state = row.pull_request.as_ref().map(|pr| pr.state);
+        let is_open = matches!(state, Some(PrState::Open));
+        // Draft PRs are live PRs, so they share every lifecycle command an
+        // open PR exposes *except* Merge — GitHub refuses to merge a PR
+        // while it's still in draft.
+        let is_active = matches!(state, Some(PrState::Open | PrState::Draft));
+        if matches!(
+            state,
+            Some(PrState::Open | PrState::Draft | PrState::Merged)
+        ) {
             commands.push(PrCommand {
                 label: "Open",
                 choice: ActionChoice::OpenPullRequest,
@@ -826,7 +831,7 @@ impl DashboardScreen {
             });
         }
         // Fill drafts a title + description with the AI, then opens a new PR
-        // (branch ahead, none yet) or refreshes the open PR's description.
+        // (branch ahead, none yet) or refreshes an open/draft PR's description.
         if build_fill_request(row).is_some() {
             commands.push(PrCommand {
                 label: "Fill",
@@ -836,7 +841,7 @@ impl DashboardScreen {
         }
         // Update only when the branch is behind its base (merge_status or
         // local behind count). Mutually exclusive with Push.
-        if is_open && row_is_behind(row) {
+        if is_active && row_is_behind(row) {
             commands.push(PrCommand {
                 label: "Update",
                 choice: ActionChoice::UpdatePullRequest,
@@ -845,14 +850,15 @@ impl DashboardScreen {
         }
         // Push when the branch is ahead but not behind — local commits not
         // yet on the remote (the "merged-but-not-pushed" state).
-        if is_open && row_has_unpushed(row) {
+        if is_active && row_has_unpushed(row) {
             commands.push(PrCommand {
                 label: "Push",
                 choice: ActionChoice::PushPullRequest,
                 color: colors::ACCENT,
             });
         }
-        // Merge is only meaningful while the PR is still Open.
+        // Merge is only meaningful while the PR is Open — a draft must be
+        // marked ready for review before GitHub will accept the merge.
         if is_open {
             commands.push(PrCommand {
                 label: "Merge",
@@ -860,7 +866,7 @@ impl DashboardScreen {
                 color: colors::SUCCESS,
             });
         }
-        if is_open {
+        if is_active {
             commands.push(PrCommand {
                 label: "Close",
                 choice: ActionChoice::ClosePullRequest,
@@ -1679,10 +1685,12 @@ impl DashboardScreen {
             Span::styled(" = no uncommitted changes  ", muted_dim),
             Span::styled("Opened", Style::default().fg(colors::INFO)),
             Span::styled(" = PR open  ", muted_dim),
-            Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" = PR merged  ", muted_dim),
+            Span::styled("Drafted", Style::default().fg(colors::GRAY_MEDIUM)),
+            Span::styled(" = PR draft  ", muted_dim),
             Span::styled("Closed", Style::default().fg(colors::GRAY_LIGHT)),
-            Span::styled(" = PR closed", muted_dim),
+            Span::styled(" = PR closed  ", muted_dim),
+            Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
+            Span::styled(" = PR merged", muted_dim),
         ])
     }
 
@@ -2589,12 +2597,20 @@ pub(crate) fn row_has_unpushed(row: &DashboardRow) -> bool {
         .unwrap_or(false)
 }
 
+/// True for PR states that still accept the non-merge lifecycle commands
+/// (Fill / Update / Push / Close). Open and Draft both qualify; Merged and
+/// Closed are terminal. Merge stays Open-only (see [`build_merge_request`])
+/// because GitHub refuses to merge a draft until it's marked ready.
+fn pr_accepts_lifecycle_commands(state: PrState) -> bool {
+    matches!(state, PrState::Open | PrState::Draft)
+}
+
 /// Assemble the payload the update confirmation screen needs. Returns
-/// `None` when the row's PR is missing/not Open or the branch isn't
+/// `None` when the row's PR is missing/terminal or the branch isn't
 /// behind — mirrors the guard in `build_action_select`.
 fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
     let pr = row.pull_request.as_ref()?;
-    if !matches!(pr.state, PrState::Open) {
+    if !pr_accepts_lifecycle_commands(pr.state) {
         return None;
     }
     if !row_is_behind(row) {
@@ -2634,8 +2650,8 @@ fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
     let branch = row.worktree.branch.clone();
     let worktree_path = row.worktree.path.clone();
     match row.pull_request.as_ref() {
-        // Open PR → refresh its description.
-        Some(pr) if matches!(pr.state, PrState::Open) => Some(FillPullRequestRequest {
+        // Open or draft PR → refresh its description.
+        Some(pr) if pr_accepts_lifecycle_commands(pr.state) => Some(FillPullRequestRequest {
             branch,
             worktree_path,
             base_ref: None,
@@ -2676,7 +2692,7 @@ fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
 /// needs no base ref.
 fn build_push_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
     let pr = row.pull_request.as_ref()?;
-    if !matches!(pr.state, PrState::Open) {
+    if !pr_accepts_lifecycle_commands(pr.state) {
         return None;
     }
     if !row_has_unpushed(row) {
@@ -2728,7 +2744,7 @@ fn build_merge_request(row: &DashboardRow) -> Option<MergePullRequestRequest> {
 
 fn build_close_request(row: &DashboardRow) -> Option<ClosePullRequestRequest> {
     let pr = row.pull_request.as_ref()?;
-    if !matches!(pr.state, PrState::Open) {
+    if !pr_accepts_lifecycle_commands(pr.state) {
         return None;
     }
     Some(ClosePullRequestRequest {
@@ -2761,6 +2777,11 @@ fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
     match row.pull_request.as_ref().map(|pr| pr.state) {
         Some(PrState::Merged) => ("Merged", Style::default().fg(colors::SUCCESS)),
         Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),
+        // A draft PR is a real, active PR — it gets its own label so the
+        // worktree no longer masquerades as "Clean". `GRAY_MEDIUM` sits
+        // between the footer's `MUTED` gray and the `GRAY_LIGHT` used by
+        // "Closed", so "Drafted" reads as distinct from both.
+        Some(PrState::Draft) => ("Drafted", Style::default().fg(colors::GRAY_MEDIUM)),
         Some(PrState::Closed) => ("Closed", Style::default().fg(colors::GRAY_LIGHT)),
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),

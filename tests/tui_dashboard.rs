@@ -11,7 +11,7 @@ use wisetree::services::{
     DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus, PrState, PullRequest,
     ReviewStatus, ReviewerSummary,
 };
-use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
+use wisetree::tui::screens::dashboard::{BulkDeleteStatus, DashboardAction, DashboardScreen};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -537,6 +537,45 @@ fn merged_pr_row_renders_merged_status_in_success_palette() {
 
     let dumped = dump(120, 12, |f| screen.render(f, f.area()));
     assert!(dumped.contains("Merged"));
+}
+
+#[test]
+fn draft_pr_row_renders_drafted_status_in_gray_medium_palette() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    // A draft PR must no longer masquerade as "Clean": even on a clean
+    // worktree it renders its own "Drafted" label in the medium gray —
+    // distinct from the lighter gray "Closed" uses.
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Draft),
+    ]);
+
+    let backend = TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let drafted_cell = buffer
+        .content
+        .iter()
+        .find(|cell| cell.symbol() == "D" && cell.fg == colors::GRAY_MEDIUM)
+        .expect("drafted cell with gray-medium color");
+    assert_eq!(drafted_cell.fg, colors::GRAY_MEDIUM);
+    assert_ne!(
+        drafted_cell.fg,
+        colors::GRAY_LIGHT,
+        "Drafted must not reuse the Closed gray"
+    );
+
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Drafted"));
 }
 
 #[test]
@@ -1225,6 +1264,81 @@ fn action_menu_hides_merge_option_for_draft_pr_row() {
 }
 
 #[test]
+fn action_menu_shows_pr_commands_for_draft_pr_row() {
+    // A draft-PR worktree must expose the same Pull Request Commands as an
+    // open one — Open, Fill, Push (ahead-not-behind), Close — with Merge
+    // the only omission (GitHub won't merge a draft).
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        // The "bug" row helper is ahead 1 / behind 0, so Push is offered.
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Draft),
+    ]);
+
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        labels.iter().any(|l| l == "Open"),
+        "draft PR should expose Open: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "Fill"),
+        "draft PR should expose Fill: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "Push"),
+        "draft PR ahead of its base should expose Push: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "Close"),
+        "draft PR should expose Close: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l == "Merge"),
+        "draft PR must not expose Merge: {labels:?}"
+    );
+}
+
+#[test]
+fn bulk_delete_drafted_targets_only_draft_pr_rows() {
+    // The "Drafted" bulk-delete button must collect exactly the draft-PR
+    // worktrees (never the mother, an open PR, or anything else).
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-draft", "draft", true, PrState::Draft),
+        row_with_pr_state("/tmp/repo-open", "open", false, PrState::Open),
+    ]);
+
+    // Tab cycles None → Merged → Closed → Drafted.
+    for _ in 0..3 {
+        screen.handle_key(key(KeyCode::Tab));
+    }
+    let action = screen.handle_key(key(KeyCode::Enter));
+
+    match action {
+        DashboardAction::BulkDelete(status, paths) => {
+            assert_eq!(status, BulkDeleteStatus::Drafted);
+            assert_eq!(paths, vec!["/tmp/repo-draft".to_string()]);
+        }
+        other => panic!("expected BulkDelete(Drafted, …), got {other:?}"),
+    }
+}
+
+#[test]
 fn action_menu_hides_merge_option_when_no_pr_present() {
     let mut screen = DashboardScreen::new(
         true,
@@ -1381,7 +1495,9 @@ fn action_menu_hides_update_option_for_closed_pr() {
 }
 
 #[test]
-fn action_menu_hides_update_option_for_draft_pr() {
+fn action_menu_shows_update_option_for_draft_pr_behind() {
+    // A draft PR is a live PR, so it shares the Open PR's lifecycle
+    // commands — including Update when the branch is behind its base.
     let mut screen = DashboardScreen::new(
         true,
         true,
@@ -1397,7 +1513,10 @@ fn action_menu_hides_update_option_for_draft_pr() {
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_draft]);
 
     let labels = open_action_menu_for_second_row(&mut screen);
-    assert!(!labels.iter().any(|l| l == "Update"));
+    assert!(
+        labels.iter().any(|l| l == "Update"),
+        "expected `Update` button for a behind draft PR row: {labels:?}"
+    );
 }
 
 #[test]
