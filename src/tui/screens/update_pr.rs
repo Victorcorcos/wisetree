@@ -576,8 +576,7 @@ impl UpdatePullRequestScreen {
         // the main vt100 screen (not alt-screen), so scroll the vt100 buffer
         // directly. The opencode PTY uses alt-screen, so we forward PageUp as
         // a keystroke and opencode handles its own scroll.
-        let use_direct_scroll =
-            self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
+        let use_direct_scroll = self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
         if let Some(pty) = self.pty.as_mut() {
             if use_direct_scroll {
                 pty.scroll_up(lines);
@@ -599,8 +598,7 @@ impl UpdatePullRequestScreen {
         if !scrollable {
             return false;
         }
-        let use_direct_scroll =
-            self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
+        let use_direct_scroll = self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
         if let Some(pty) = self.pty.as_mut() {
             if use_direct_scroll {
                 pty.scroll_down(lines);

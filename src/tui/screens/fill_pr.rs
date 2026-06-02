@@ -33,11 +33,11 @@ use crate::files::ActivityKind;
 use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, FillSubmitOutcome};
 use crate::tui::screens::create::{render_terminal_activity, TerminalLine};
-use crate::tui::widgets::{render_summary_table, SummaryRow};
 use crate::tui::screens::dashboard::FillPullRequestRequest;
 use crate::tui::screens::update_pr::{
     ai_activity_event_to_line, button_paragraph, contains_position, key_event_to_pty_bytes,
 };
+use crate::tui::widgets::{render_summary_table, SummaryRow};
 use crate::tui::widgets::{
     ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, PtyView, Status, StatusIndicator,
 };
@@ -332,9 +332,10 @@ impl FillPullRequestScreen {
             .collect();
 
         self.summary_rows = match &outcome {
-            FillSubmitOutcome::Created { .. } | FillSubmitOutcome::Updated { .. } => {
-                commands.iter().map(|c| SummaryRow::success(c.clone())).collect()
-            }
+            FillSubmitOutcome::Created { .. } | FillSubmitOutcome::Updated { .. } => commands
+                .iter()
+                .map(|c| SummaryRow::success(c.clone()))
+                .collect(),
             FillSubmitOutcome::PushFailed(err) => {
                 // Only the push ran and it failed; any trailing commands
                 // (there shouldn't be any) are marked as not reached.
@@ -1498,7 +1499,10 @@ mod tests {
         );
         screen.enter_done(FillSubmitOutcome::Updated { number: 42 });
         let dump = render_dump(&mut screen, 100, 15);
-        assert!(dump.contains("Pull request #42 updated successfully!"), "{dump}");
+        assert!(
+            dump.contains("Pull request #42 updated successfully!"),
+            "{dump}"
+        );
         assert!(dump.contains("gh pr edit"), "{dump}");
         assert!(dump.contains("Status"), "{dump}");
         assert!(dump.contains("Press any key"), "{dump}");
@@ -1513,7 +1517,9 @@ mod tests {
             "$ git push -u origin digit-3131-retry".to_string(),
             ActivityKind::Status,
         );
-        screen.enter_done(FillSubmitOutcome::PushFailed("authentication failed".to_string()));
+        screen.enter_done(FillSubmitOutcome::PushFailed(
+            "authentication failed".to_string(),
+        ));
         let dump = render_dump(&mut screen, 100, 15);
         assert!(dump.contains("Failed to push the branch."), "{dump}");
         assert!(dump.contains("git push"), "{dump}");

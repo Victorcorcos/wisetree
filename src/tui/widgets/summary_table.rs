@@ -6,7 +6,7 @@ use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Row, Table};
-use ratatui::{Frame, layout::Rect};
+use ratatui::{layout::Rect, Frame};
 
 use crate::messages::colors;
 

@@ -45,7 +45,6 @@ use crate::tui::screens;
 use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
-use crate::tui::widgets::SummaryRow;
 use crate::tui::screens::dashboard::{
     BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
     FillPullRequestRequest, MergePullRequestRequest, UpdatePullRequestRequest,
@@ -67,6 +66,7 @@ use crate::tui::selection::{
     clamp_position, contains_position, extract_text, MouseSelection, SelectionOverlay,
 };
 use crate::tui::terminal;
+use crate::tui::widgets::SummaryRow;
 use crate::tui::widgets::{render_toast, ToastState, ToastVariant, WelcomeHeader};
 use crate::utils::path::{repository_base_name, TemplateVariables};
 use crate::worktree::service::{
@@ -580,13 +580,10 @@ impl App {
                 // to breathe. The Confirm and pre-AI phases (Fetching,
                 // Merging) stay in the compact framed panel so they don't look
                 // lost in a huge empty area.
-                let wants_fill = self
-                    .update_pr
-                    .as_ref()
-                    .is_some_and(|s| {
-                        (s.is_updating() && (s.ai_active() || s.terminal_active()))
-                            || s.commit_push_running()
-                    });
+                let wants_fill = self.update_pr.as_ref().is_some_and(|s| {
+                    (s.is_updating() && (s.ai_active() || s.terminal_active()))
+                        || s.commit_push_running()
+                });
                 let in_confirm = self
                     .update_pr
                     .as_ref()
@@ -1390,8 +1387,7 @@ impl App {
                 );
                 let script = "git add -A && git commit -m \"$COMMIT_MSG\" && { git push upstream HEAD || git push origin HEAD; }".to_string();
                 let sh = PathBuf::from("/bin/sh");
-                let (shell, shell_args) =
-                    login_shell_command(&sh, &["-c".to_string(), script]);
+                let (shell, shell_args) = login_shell_command(&sh, &["-c".to_string(), script]);
                 screen.start_commit_push_pty(
                     shell,
                     shell_args,
