@@ -1090,10 +1090,53 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
     );
 }
 
-fn open_action_menu_for_second_row(screen: &mut DashboardScreen) -> String {
+fn open_action_menu_for_second_row(screen: &mut DashboardScreen) -> Vec<String> {
     screen.handle_key(key(KeyCode::Down));
     screen.handle_key(key(KeyCode::Enter));
-    dump(120, 14, |f| screen.render(f, f.area()))
+    // Render once so the action menu (and its PR command buttons) is laid
+    // out, then read the button labels straight from the screen rather than
+    // scraping the rendered text — the short labels (Open/Merge/…) would
+    // otherwise collide with general entries like "Open with Command".
+    let _ = dump(120, 14, |f| screen.render(f, f.area()));
+    screen.pr_command_labels()
+}
+
+#[test]
+fn action_menu_renders_general_and_pull_request_sections() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open),
+    ]);
+
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Enter));
+    let dumped = dump(120, 16, |f| screen.render(f, f.area()));
+
+    assert!(
+        dumped.contains("General Commands"),
+        "expected the General Commands heading: {dumped}"
+    );
+    assert!(
+        dumped.contains("Pull Request Commands"),
+        "expected the Pull Request Commands heading: {dumped}"
+    );
+    // The PR command buttons render their short labels.
+    assert!(
+        dumped.contains("Merge"),
+        "expected a Merge button: {dumped}"
+    );
+    assert!(
+        dumped.contains("Close"),
+        "expected a Close button: {dumped}"
+    );
 }
 
 #[test]
@@ -1111,12 +1154,12 @@ fn action_menu_shows_merge_option_for_open_pr_row() {
         row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        dumped.contains("Merge Pull Request"),
-        "expected `Merge Pull Request` for an Open PR row: {dumped}"
+        labels.iter().any(|l| l == "Merge"),
+        "expected `Merge` button for an Open PR row: {labels:?}"
     );
-    assert!(dumped.contains("Open Pull Request"));
+    assert!(labels.iter().any(|l| l == "Open"));
 }
 
 #[test]
@@ -1134,13 +1177,13 @@ fn action_menu_hides_merge_option_for_merged_pr_row() {
         row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Merged),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        !dumped.contains("Merge Pull Request"),
-        "Merge Pull Request must not appear for a Merged PR row: {dumped}"
+        !labels.iter().any(|l| l == "Merge"),
+        "Merge must not appear for a Merged PR row: {labels:?}"
     );
-    // Already-merged PRs should still expose the `Open Pull Request` link.
-    assert!(dumped.contains("Open Pull Request"));
+    // Already-merged PRs should still expose the `Open` button.
+    assert!(labels.iter().any(|l| l == "Open"));
 }
 
 #[test]
@@ -1158,8 +1201,8 @@ fn action_menu_hides_merge_option_for_closed_pr_row() {
         row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Closed),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Merge Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Merge"));
 }
 
 #[test]
@@ -1177,8 +1220,8 @@ fn action_menu_hides_merge_option_for_draft_pr_row() {
         row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Draft),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Merge Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Merge"));
 }
 
 #[test]
@@ -1196,9 +1239,9 @@ fn action_menu_hides_merge_option_when_no_pr_present() {
         row("/tmp/repo-bug", "bug", false),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Merge Pull Request"));
-    assert!(!dumped.contains("Open Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Merge"));
+    assert!(!labels.iter().any(|l| l == "Open"));
 }
 
 // ---- "Update Pull Request" visibility ----------------------------------
@@ -1242,10 +1285,10 @@ fn action_menu_shows_update_option_for_open_pr_behind_via_branch_status() {
         behind_row_via_branch_status("/tmp/repo-bug", "bug"),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        dumped.contains("Update Pull Request"),
-        "expected `Update Pull Request` for Open+behind row: {dumped}"
+        labels.iter().any(|l| l == "Update"),
+        "expected `Update` button for Open+behind row: {labels:?}"
     );
 }
 
@@ -1264,10 +1307,10 @@ fn action_menu_shows_update_option_for_open_pr_behind_via_merge_status() {
         behind_row_via_merge_status("/tmp/repo-bug", "bug"),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        dumped.contains("Update Pull Request"),
-        "expected `Update Pull Request` when merge_status==Behind: {dumped}"
+        labels.iter().any(|l| l == "Update"),
+        "expected `Update` button when merge_status==Behind: {labels:?}"
     );
 }
 
@@ -1288,13 +1331,13 @@ fn action_menu_hides_update_option_for_open_pr_when_up_to_date() {
         row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Open),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        !dumped.contains("Update Pull Request"),
-        "Update Pull Request must hide when branch is up to date: {dumped}"
+        !labels.iter().any(|l| l == "Update"),
+        "Update must hide when branch is up to date: {labels:?}"
     );
-    // Merge Pull Request must still appear (Open and up to date is fine to merge).
-    assert!(dumped.contains("Merge Pull Request"));
+    // Merge must still appear (Open and up to date is fine to merge).
+    assert!(labels.iter().any(|l| l == "Merge"));
 }
 
 #[test]
@@ -1313,8 +1356,8 @@ fn action_menu_hides_update_option_for_merged_pr_even_if_behind() {
     }
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_merged]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Update Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Update"));
 }
 
 #[test]
@@ -1333,8 +1376,8 @@ fn action_menu_hides_update_option_for_closed_pr() {
     }
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_closed]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Update Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Update"));
 }
 
 #[test]
@@ -1353,8 +1396,8 @@ fn action_menu_hides_update_option_for_draft_pr() {
     }
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_draft]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Update Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Update"));
 }
 
 #[test]
@@ -1377,8 +1420,8 @@ fn action_menu_hides_update_option_when_no_pr_present() {
     });
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_no_pr]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Update Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Update"));
 }
 
 // ---- "Update Branch" visibility -----------------------------------------
@@ -1429,7 +1472,9 @@ fn action_menu_hides_update_branch_on_non_main_row() {
         row("/tmp/repo-bug", "bug", true),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Enter));
+    let dumped = dump(120, 14, |f| screen.render(f, f.area()));
     assert!(
         !dumped.contains("Update Branch"),
         "Update Branch must not appear on non-main rows: {dumped}"

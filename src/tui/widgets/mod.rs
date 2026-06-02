@@ -14,6 +14,7 @@ pub mod scrollbar;
 pub mod select_prompt;
 pub mod spinner;
 pub mod status_indicator;
+pub mod summary_table;
 pub mod toast;
 pub mod update_banner;
 pub mod welcome_header;
@@ -34,6 +35,7 @@ pub use select_prompt::{
 };
 pub use spinner::{spinner_frame, Spinner, SPINNER_FRAMES};
 pub use status_indicator::{Status, StatusIndicator};
+pub use summary_table::{render_summary_table, SummaryRow};
 pub use toast::{render_toast, ToastSnapshot, ToastState, ToastVariant};
 pub use update_banner::UpdateBanner;
 pub use welcome_header::WelcomeHeader;

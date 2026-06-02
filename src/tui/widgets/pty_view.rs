@@ -259,6 +259,13 @@ impl PtyView {
         }
     }
 
+    /// Returns the exit code recorded when the child exited. `None` when the
+    /// child is still running or the kill/wait path was taken (status
+    /// unavailable). Only meaningful after `poll_exited` has returned `true`.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_status.lock().ok().and_then(|slot| *slot)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
