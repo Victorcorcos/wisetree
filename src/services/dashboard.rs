@@ -2454,15 +2454,16 @@ fn parse_graphql_response(
             .and_then(|v| serde_json::from_value::<GhConnection>(v.clone()).ok())
             .and_then(|conn| conn.nodes.into_iter().next())
             .map(|node| {
-                let state = if node.is_draft {
-                    PrState::Draft
-                } else {
-                    match node.state.as_str() {
-                        "OPEN" => PrState::Open,
-                        "MERGED" => PrState::Merged,
-                        "CLOSED" => PrState::Closed,
-                        _ => PrState::Closed,
-                    }
+                // GitHub keeps `isDraft = true` on a PR that was closed while
+                // still a draft, so the terminal states must win over the draft
+                // flag — otherwise a closed draft keeps reading as "Drafted".
+                // Priority: Merged > Closed > Drafted > Opened.
+                let state = match node.state.as_str() {
+                    "MERGED" => PrState::Merged,
+                    "CLOSED" => PrState::Closed,
+                    "OPEN" if node.is_draft => PrState::Draft,
+                    "OPEN" => PrState::Open,
+                    _ => PrState::Closed,
                 };
                 let checks_status = node
                     .commits
@@ -4213,6 +4214,57 @@ so the intent reads clearly.
         let out = parse_graphql_response(body, &["feat", "fix"]).unwrap();
         assert_eq!(out.get("feat").unwrap().as_ref().unwrap().number, 7);
         assert!(out.get("fix").unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_closed_draft_pr_as_closed_not_drafted() {
+        // GitHub leaves `isDraft = true` on a PR closed while still a draft;
+        // the terminal CLOSED state must win so it doesn't read as "Drafted".
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{"number": 9, "state": "CLOSED", "url": "u", "title": "t", "isDraft": true}]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        assert_eq!(
+            out.get("feat").unwrap().as_ref().unwrap().state,
+            PrState::Closed
+        );
+    }
+
+    #[test]
+    fn parses_merged_draft_pr_as_merged_not_drafted() {
+        // A draft can be merged via admin merge; MERGED still outranks the flag.
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{"number": 9, "state": "MERGED", "url": "u", "title": "t", "isDraft": true}]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        assert_eq!(
+            out.get("feat").unwrap().as_ref().unwrap().state,
+            PrState::Merged
+        );
+    }
+
+    #[test]
+    fn parses_open_draft_pr_as_drafted() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{"number": 9, "state": "OPEN", "url": "u", "title": "t", "isDraft": true}]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        assert_eq!(
+            out.get("feat").unwrap().as_ref().unwrap().state,
+            PrState::Draft
+        );
     }
 
     #[test]
