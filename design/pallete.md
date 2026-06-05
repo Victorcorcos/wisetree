@@ -18,3 +18,11 @@ Orange (creative → be free to add it whenever you think it would look a good d
 Brown (darker → main background color): #282922
 Brown (lighter → selected background color): #3e3d31
 Brown (even lighter → for other texts that needs focus): #75705b
+
+## New Colors
+Red: #f92672
+Cyan: #a8d8ff
+Blue: #74b8ff
+Gold: #ffcc44
+Lavender: #c9b7ff
+Dim Teal: #1a6b7a
