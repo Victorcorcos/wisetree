@@ -905,13 +905,15 @@ impl DashboardScreen {
                 color: colors::WARNING,
             });
         }
-        // Push when the branch is ahead but not behind — local commits not
-        // yet on the remote (the "merged-but-not-pushed" state).
+        // Upload when the branch is ahead but not behind — local commits not
+        // yet on the remote (the "merged-but-not-pushed" state). Mutually
+        // exclusive with Update, so they share the yellow color and 'u'
+        // shortcut without ever colliding.
         if is_active && row_has_unpushed(row) {
             commands.push(PrCommand {
-                label: "Push",
+                label: "Upload",
                 choice: ActionChoice::PushPullRequest,
-                color: colors::ACCENT,
+                color: colors::WARNING,
             });
         }
         // Merge is only meaningful while the PR is Open — a draft must be
@@ -1047,21 +1049,26 @@ impl DashboardScreen {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            let shortcut_choice = match key.code {
-                KeyCode::Char('o') | KeyCode::Char('O') => Some(ActionChoice::OpenPullRequest),
-                KeyCode::Char('e') | KeyCode::Char('E') => Some(ActionChoice::EnrichPullRequest),
-                KeyCode::Char('f') | KeyCode::Char('F') => Some(ActionChoice::FixPullRequest),
-                KeyCode::Char('u') | KeyCode::Char('U') => Some(ActionChoice::UpdatePullRequest),
-                KeyCode::Char('p') | KeyCode::Char('P') => Some(ActionChoice::PushPullRequest),
-                KeyCode::Char('m') | KeyCode::Char('M') => Some(ActionChoice::MergePullRequest),
-                KeyCode::Char('c') | KeyCode::Char('C') => Some(ActionChoice::ClosePullRequest),
-                _ => None,
+            // Each key maps to its candidate choice(s); we fire the first one
+            // actually present in the button row. Update and Upload are mutually
+            // exclusive, so 'u' covers whichever the row exposes.
+            let shortcut_choices: &[ActionChoice] = match key.code {
+                KeyCode::Char('o') | KeyCode::Char('O') => &[ActionChoice::OpenPullRequest],
+                KeyCode::Char('e') | KeyCode::Char('E') => &[ActionChoice::EnrichPullRequest],
+                KeyCode::Char('f') | KeyCode::Char('F') => &[ActionChoice::FixPullRequest],
+                KeyCode::Char('u') | KeyCode::Char('U') => &[
+                    ActionChoice::UpdatePullRequest,
+                    ActionChoice::PushPullRequest,
+                ],
+                KeyCode::Char('m') | KeyCode::Char('M') => &[ActionChoice::MergePullRequest],
+                KeyCode::Char('c') | KeyCode::Char('C') => &[ActionChoice::ClosePullRequest],
+                _ => &[],
             };
-            if let Some(target_choice) = shortcut_choice {
+            if !shortcut_choices.is_empty() {
                 if let Some(cmd) = self
                     .pr_commands
                     .iter()
-                    .find(|cmd| cmd.choice == target_choice)
+                    .find(|cmd| shortcut_choices.contains(&cmd.choice))
                 {
                     let choice = cmd.choice;
                     let Some(index) = self.action_target else {
@@ -3165,8 +3172,8 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         let labels = pr_labels(&r);
         assert!(
-            labels.iter().any(|l| l == "Push"),
-            "expected Push command in {labels:?}"
+            labels.iter().any(|l| l == "Upload"),
+            "expected Upload command in {labels:?}"
         );
         // The merged-but-not-pushed state is not behind, so Update is absent.
         assert!(
@@ -3180,8 +3187,8 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 2)));
         let labels = pr_labels(&r);
         assert!(
-            !labels.iter().any(|l| l == "Push"),
-            "Push must not show when behind: {labels:?}"
+            !labels.iter().any(|l| l == "Upload"),
+            "Upload must not show when behind: {labels:?}"
         );
         assert!(
             labels.iter().any(|l| l == "Update"),
@@ -3248,7 +3255,7 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Enrich", "Fix", "Push", "Merge", "Close"]
+            vec!["Open", "Enrich", "Fix", "Upload", "Merge", "Close"]
         );
     }
 
