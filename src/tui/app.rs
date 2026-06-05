@@ -1218,7 +1218,9 @@ impl App {
                             "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
                             crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
                         );
-                        let script = "git add -A && git commit -m \"$COMMIT_MSG\" && { git push upstream HEAD || git push origin HEAD; }".to_string();
+                        let script =
+                            "git add -A && git commit -m \"$COMMIT_MSG\" && git push origin HEAD"
+                                .to_string();
                         let sh = PathBuf::from("/bin/sh");
                         let (shell, shell_args) =
                             login_shell_command(&sh, &["-c".to_string(), script]);
@@ -1397,7 +1399,8 @@ impl App {
                     "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
                     crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
                 );
-                let script = "git add -A && git commit -m \"$COMMIT_MSG\" && { git push upstream HEAD || git push origin HEAD; }".to_string();
+                let script = "git add -A && git commit -m \"$COMMIT_MSG\" && git push origin HEAD"
+                    .to_string();
                 let sh = PathBuf::from("/bin/sh");
                 let (shell, shell_args) = login_shell_command(&sh, &["-c".to_string(), script]);
                 screen.start_commit_push_pty(

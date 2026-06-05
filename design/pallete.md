@@ -6,6 +6,7 @@ This is the color pallete of this `wisetree` system (hugely inspired by my `mono
 Purple (specifically for `worktree`/`worktrees` and `wisetree` words): #b47eff
 White (basic → main font color): #f8f8f1
 Gray (darker → for annotation texts like `Version 1.0.0 | Active Repo:`): #90918a
+Gray (medium → between darker and lighter; for the `Drafted` PR status): #b4b5ae
 Gray (lighter → for more important annotation texts like `~/Desktop/repositories/wisetree`): #d9d9d2
 Pink (error → for error messages and similar things): #ff0071
 Green (success → for success messages and similar things): #94e400

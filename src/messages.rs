@@ -96,6 +96,10 @@ pub mod colors {
     /// Gray darker `#90918a` — annotation text such as
     /// `Version 1.0.0 | Active Repo:`.
     pub const GRAY_DARK: Color = Color::Rgb(0x90, 0x91, 0x8a);
+    /// Gray medium `#b4b5ae` — sits between [`GRAY_DARK`] and
+    /// [`GRAY_LIGHT`]. Used for the `Drafted` PR status so it reads as
+    /// distinct from `Closed` (which uses [`GRAY_LIGHT`]).
+    pub const GRAY_MEDIUM: Color = Color::Rgb(0xb4, 0xb5, 0xae);
     /// Gray lighter `#d9d9d2` — emphasized annotation text such as the
     /// active repository path.
     pub const GRAY_LIGHT: Color = Color::Rgb(0xd9, 0xd9, 0xd2);
