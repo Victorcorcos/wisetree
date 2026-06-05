@@ -34,10 +34,11 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates, default_dashboard_warning, detect_shell_integration,
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, AppStateService, DashboardService,
-    DashboardUpdate, DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest,
-    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult,
-    UpdatePhase, UpdateProgress,
+    parse_pull_request_md, resolve_dashboard_columns, AppStateService, CommentGroup,
+    DashboardService, DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome,
+    EnrichSubmitRequest, FixApplyHandoff, FixPlan, FixPreparation, FixVerdict, OpencodeModel,
+    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult, UpdatePhase,
+    UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -47,12 +48,14 @@ use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
-    FillPullRequestRequest, MergePullRequestRequest, UpdatePullRequestRequest,
+    EnrichPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
+    UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
 };
-use crate::tui::screens::fill_pr::{FillAction, FillPullRequestScreen, FillStep};
+use crate::tui::screens::enrich_pr::{EnrichAction, EnrichPullRequestScreen, EnrichStep};
+use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
 use crate::tui::screens::settings::{CopyDirection, SettingsAction, SettingsScreen, SettingsStep};
@@ -128,21 +131,46 @@ enum AppEvent {
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
     UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
-    /// Base ref resolved for the "Fill Pull Request" flow.
-    FillPrBaseRefResolved {
+    /// Base ref resolved for the "Enrich Pull Request" flow.
+    EnrichPrBaseRefResolved {
         base_ref: Option<String>,
     },
     /// Read-only preparation finished — either the opencode spawn params
     /// (`HandedOffToUi`) or a terminal non-handoff variant.
-    FillPrPrepared(Result<Box<FillPreparation>, String>),
+    EnrichPrPrepared(Result<Box<EnrichPreparation>, String>),
     /// The drafted PR was submitted (created or updated).
-    FillPrSubmitted(Result<FillSubmitOutcome, String>),
+    EnrichPrSubmitted(Result<EnrichSubmitOutcome, String>),
     /// A line of terminal output from the git push / gh pr create pipeline.
     /// Routed into the Terminal Activity panel under the Opening step.
-    FillPrActivity {
+    EnrichPrActivity {
         text: String,
         kind: crate::files::ActivityKind,
     },
+    /// "Fix Pull Request": sync + fetch + group review comments finished.
+    FixPrPrepared(Result<Box<FixPreparation>, String>),
+    /// One comment group's captured planning call finished. `index` lets the
+    /// handler ignore a result that arrives after the user moved on.
+    FixPrPlanned {
+        index: usize,
+        result: Result<FixVerdict, String>,
+    },
+    /// A non-actionable reply was posted (the `reply` verdict).
+    FixPrReplied {
+        index: usize,
+        result: Result<(), String>,
+    },
+    /// Apply spawn params are ready — spawn opencode into the AI panel.
+    FixPrApplyReady {
+        index: usize,
+        result: Result<Box<FixApplyHandoff>, String>,
+    },
+    /// An applied fix was committed + the reviewer replied to.
+    FixPrCommitted {
+        index: usize,
+        result: Result<(), String>,
+    },
+    /// The final `git push` finished; show the results page.
+    FixPrPushed(Result<(), String>),
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
@@ -196,7 +224,8 @@ pub struct App {
     setup_project: Option<SetupProjectScreen>,
     merge_pr: Option<MergePullRequestScreen>,
     update_pr: Option<UpdatePullRequestScreen>,
-    fill_pr: Option<FillPullRequestScreen>,
+    enrich_pr: Option<EnrichPullRequestScreen>,
+    fix_pr: Option<FixPullRequestScreen>,
     update_branch: Option<UpdateBranchScreen>,
     /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
     /// top of the Settings screen — when active the Settings state is
@@ -242,7 +271,8 @@ impl App {
             setup_project: None,
             merge_pr: None,
             update_pr: None,
-            fill_pr: None,
+            enrich_pr: None,
+            fix_pr: None,
             update_branch: None,
             ai_model_picker: None,
             shell_integration_status: None,
@@ -336,16 +366,26 @@ impl App {
                         // its last known size between resize events.
                         screen.tick_pty(None);
                     }
-                    // Same for the Fill PR PTY — but here a child exit means
+                    // Same for the Enrich PR PTY — but here a child exit means
                     // opencode finished drafting `pull_request.md`, so read
                     // the file and flip the screen into Review.
-                    let fill_exited = self
-                        .fill_pr
+                    let enrich_exited = self
+                        .enrich_pr
                         .as_mut()
                         .map(|screen| screen.tick_pty(None))
                         .unwrap_or(false);
-                    if fill_exited {
-                        self.on_fill_ready_to_review(&tx);
+                    if enrich_exited {
+                        self.on_enrich_ready_to_review(&tx);
+                    }
+                    // Same for the Fix PR apply PTY — a child exit means
+                    // opencode finished editing, so commit + reply now.
+                    let fix_exited = self
+                        .fix_pr
+                        .as_mut()
+                        .map(|screen| screen.tick_pty(None))
+                        .unwrap_or(false);
+                    if fix_exited {
+                        self.on_fix_apply_done(&tx);
                     }
                 }
                 Event::Resize(width, height) => {
@@ -602,26 +642,45 @@ impl App {
                     update_pr.render(frame, panel);
                 }
             }
-            Screen::FillPullRequest => {
-                // The Filling step (live opencode PTY) and the Confirm
+            Screen::EnrichPullRequest => {
+                // The Enriching step (live opencode PTY) and the Confirm
                 // explanation both want the full bottom region; the compact
                 // Loading / Review / Opening steps stay in a sized panel.
                 let expand = self
-                    .fill_pr
+                    .enrich_pr
                     .as_ref()
-                    .is_some_and(|s| s.is_filling() || matches!(s.step(), FillStep::Confirm));
+                    .is_some_and(|s| s.is_enriching() || matches!(s.step(), EnrichStep::Confirm));
                 let panel = if expand {
                     self.render_framed_panel_fill(frame, area)
                 } else {
                     let h = self
-                        .fill_pr
+                        .enrich_pr
                         .as_ref()
                         .map_or(8, |s| s.preferred_content_height());
                     self.render_framed_panel(frame, area, h)
                 };
-                if let Some(fill_pr) = self.fill_pr.as_mut() {
-                    fill_pr.tick = self.tick;
-                    fill_pr.render(frame, panel);
+                if let Some(enrich_pr) = self.enrich_pr.as_mut() {
+                    enrich_pr.tick = self.tick;
+                    enrich_pr.render(frame, panel);
+                }
+            }
+            Screen::FixPullRequest => {
+                // Full-panel steps (the live apply PTY, the decision view, the
+                // confirm explanation, the "Other" box) want the whole bottom
+                // region; the compact Working / Done steps stay sized.
+                let expand = self.fix_pr.as_ref().is_some_and(|s| s.wants_full_panel());
+                let panel = if expand {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .fix_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
+                if let Some(fix_pr) = self.fix_pr.as_mut() {
+                    fix_pr.tick = self.tick;
+                    fix_pr.render(frame, panel);
                 }
             }
             Screen::UpdateBranch => {
@@ -774,8 +833,13 @@ impl App {
                         screen.scroll_terminal_up(WHEEL_LINES_PER_TICK);
                     }
                 }
-                if matches!(self.screen, Screen::FillPullRequest) {
-                    if let Some(screen) = self.fill_pr.as_mut() {
+                if matches!(self.screen, Screen::EnrichPullRequest) {
+                    if let Some(screen) = self.enrich_pr.as_mut() {
+                        screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
+                    }
+                }
+                if matches!(self.screen, Screen::FixPullRequest) {
+                    if let Some(screen) = self.fix_pr.as_mut() {
                         screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
                     }
                 }
@@ -790,8 +854,13 @@ impl App {
                         screen.scroll_terminal_down(WHEEL_LINES_PER_TICK);
                     }
                 }
-                if matches!(self.screen, Screen::FillPullRequest) {
-                    if let Some(screen) = self.fill_pr.as_mut() {
+                if matches!(self.screen, Screen::EnrichPullRequest) {
+                    if let Some(screen) = self.enrich_pr.as_mut() {
+                        screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
+                    }
+                }
+                if matches!(self.screen, Screen::FixPullRequest) {
+                    if let Some(screen) = self.fix_pr.as_mut() {
                         screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
                     }
                 }
@@ -848,7 +917,8 @@ impl App {
             Screen::SetupProject => self.handle_setup_project_key(key, tx),
             Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
             Screen::UpdatePullRequest => self.handle_update_pr_key(key, tx),
-            Screen::FillPullRequest => self.handle_fill_pr_key(key, tx),
+            Screen::EnrichPullRequest => self.handle_enrich_pr_key(key, tx),
+            Screen::FixPullRequest => self.handle_fix_pr_key(key, tx),
             Screen::UpdateBranch => {
                 if let Some(screen) = self.update_branch.as_mut() {
                     screen.handle_key(key);
@@ -1233,13 +1303,21 @@ impl App {
                     UpdateAction::TerminalDiscard => self.terminal_discard(tx),
                 }
             }
-            Screen::FillPullRequest => {
+            Screen::EnrichPullRequest => {
                 let action = self
-                    .fill_pr
+                    .enrich_pr
                     .as_mut()
                     .map(|screen| screen.handle_mouse_click(position))
-                    .unwrap_or(FillAction::Continue);
-                self.apply_fill_action(action, tx);
+                    .unwrap_or(EnrichAction::Continue);
+                self.apply_enrich_action(action, tx);
+            }
+            Screen::FixPullRequest => {
+                let action = self
+                    .fix_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(FixAction::Continue);
+                self.apply_fix_action(action, tx);
             }
             Screen::UpdateBranch => {}
             Screen::AiModelPicker => {
@@ -1476,49 +1554,49 @@ impl App {
         }
     }
 
-    fn handle_fill_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
-        let action = match self.fill_pr.as_mut() {
+    fn handle_enrich_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.enrich_pr.as_mut() {
             Some(screen) => screen.handle_key(key),
             None => return,
         };
-        self.apply_fill_action(action, tx);
+        self.apply_enrich_action(action, tx);
     }
 
-    /// Single handler for `FillAction`s arriving from either keyboard or
+    /// Single handler for `EnrichAction`s arriving from either keyboard or
     /// mouse. Drives the screen transitions and kicks off the async pipeline
     /// stages (prepare → spawn opencode → submit).
-    fn apply_fill_action(&mut self, action: FillAction, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn apply_enrich_action(&mut self, action: EnrichAction, tx: &mpsc::UnboundedSender<AppEvent>) {
         match action {
-            FillAction::Continue => {}
-            FillAction::Cancelled => {
-                self.fill_pr = None;
+            EnrichAction::Continue => {}
+            EnrichAction::Cancelled => {
+                self.enrich_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
-            FillAction::Confirmed => {
-                let Some(screen) = self.fill_pr.as_mut() else {
+            EnrichAction::Confirmed => {
+                let Some(screen) = self.enrich_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
-                screen.start_filling();
-                kick_off_prepare_fill(
+                screen.start_enriching();
+                kick_off_prepare_enrich(
                     self.git_root.clone(),
                     self.current_dashboard_config(),
                     request,
                     tx.clone(),
                 );
             }
-            FillAction::ReadyToReview => self.on_fill_ready_to_review(tx),
-            FillAction::Submit => {
-                let Some(screen) = self.fill_pr.as_mut() else {
+            EnrichAction::ReadyToReview => self.on_enrich_ready_to_review(tx),
+            EnrichAction::Submit => {
+                let Some(screen) = self.enrich_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
                 let Some(title) = screen.draft_title().map(str::to_string) else {
-                    self.fill_pr = None;
+                    self.enrich_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
                     return;
                 };
-                let submit = FillSubmitRequest {
+                let submit = EnrichSubmitRequest {
                     worktree_path: request.worktree_path.clone(),
                     branch: request.branch.clone(),
                     number: request.number,
@@ -1536,16 +1614,16 @@ impl App {
                     tx.clone(),
                 );
             }
-            FillAction::Finish => {
+            EnrichAction::Finish => {
                 self.show_toast(
                     ToastVariant::Info,
                     "Draft saved to pull_request.md — no pull request was opened.".to_string(),
                 );
-                self.fill_pr = None;
+                self.enrich_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
-            FillAction::Done => {
-                self.fill_pr = None;
+            EnrichAction::Done => {
+                self.enrich_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
         }
@@ -1554,8 +1632,8 @@ impl App {
     /// opencode finished drafting: read `pull_request.md` from the worktree,
     /// parse the title + body, and move the screen into Review. A missing or
     /// empty file surfaces an error (the AI likely didn't finish).
-    fn on_fill_ready_to_review(&mut self, _tx: &mpsc::UnboundedSender<AppEvent>) {
-        let Some(screen) = self.fill_pr.as_mut() else {
+    fn on_enrich_ready_to_review(&mut self, _tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.enrich_pr.as_mut() else {
             return;
         };
         let path = PathBuf::from(&screen.request().worktree_path).join("pull_request.md");
@@ -1572,6 +1650,398 @@ impl App {
                 path.display()
             )),
         }
+    }
+
+    // ── "Fix Pull Request" orchestration ───────────────────────────────
+
+    fn start_fix_pr_flow(
+        &mut self,
+        request: FixPullRequestRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // Lands on the Confirm step immediately — no base ref to resolve. The
+        // prepare pipeline only runs once the user confirms.
+        self.fix_pr = Some(FixPullRequestScreen::new(request));
+        self.screen = Screen::FixPullRequest;
+    }
+
+    fn handle_fix_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.fix_pr.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+        self.apply_fix_action(action, tx);
+    }
+
+    /// Single handler for `FixAction`s from keyboard or mouse. Drives the
+    /// screen transitions and kicks off each async stage of the per-comment
+    /// loop (prepare → plan → apply → commit/reply → push).
+    fn apply_fix_action(&mut self, action: FixAction, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match action {
+            FixAction::Continue => {}
+            FixAction::Cancelled => {
+                self.fix_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+            FixAction::Confirmed => {
+                let Some(screen) = self.fix_pr.as_mut() else {
+                    return;
+                };
+                let number = screen.request().number;
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_preparing();
+                kick_off_prepare_fix(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    number,
+                    tx.clone(),
+                );
+            }
+            FixAction::Apply => {
+                let Some(screen) = self.fix_pr.as_mut() else {
+                    return;
+                };
+                let (Some(group), Some(plan)) = (screen.current_group(), screen.current_plan())
+                else {
+                    return;
+                };
+                let index = screen.current_index();
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_applying();
+                kick_off_prepare_apply(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    FixApplyRequest {
+                        worktree_path,
+                        group,
+                        plan,
+                        index,
+                    },
+                    tx.clone(),
+                );
+            }
+            FixAction::Other => {
+                if let Some(screen) = self.fix_pr.as_mut() {
+                    screen.show_other_input();
+                }
+            }
+            FixAction::Skip => {
+                if let Some(screen) = self.fix_pr.as_mut() {
+                    screen.record_outcome(FixRowOutcome::Skipped("you skipped"));
+                }
+                self.advance_fix(tx);
+            }
+            FixAction::Replan(feedback) => {
+                let previous_plan = self.fix_pr.as_ref().and_then(|s| s.previous_plan_text());
+                self.plan_current_fix(tx, Some(feedback), previous_plan);
+            }
+            FixAction::ApplyReady => self.on_fix_apply_done(tx),
+            FixAction::Done => {
+                self.fix_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+        }
+    }
+
+    /// Plan (or re-plan, when `feedback` is set) the current comment group.
+    fn plan_current_fix(
+        &mut self,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+        feedback: Option<String>,
+        previous_plan: Option<String>,
+    ) {
+        let Some(screen) = self.fix_pr.as_mut() else {
+            return;
+        };
+        let Some(group) = screen.current_group() else {
+            return;
+        };
+        let index = screen.current_index();
+        let total = screen.groups_len();
+        let worktree_path = screen.request().worktree_path.clone();
+        screen.start_planning(index + 1, total);
+        kick_off_plan_comment(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            FixPlanRequest {
+                worktree_path,
+                group,
+                feedback,
+                previous_plan,
+                index,
+            },
+            tx.clone(),
+        );
+    }
+
+    /// Advance to the next comment group, or push + finish when the loop ends.
+    /// A failure on one comment never aborts the loop — it's already recorded
+    /// as a Failed row by the caller.
+    fn advance_fix(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let has_next = match self.fix_pr.as_mut() {
+            Some(screen) => screen.advance(),
+            None => return,
+        };
+        if has_next {
+            self.plan_current_fix(tx, None, None);
+        } else if let Some(screen) = self.fix_pr.as_mut() {
+            let worktree_path = screen.request().worktree_path.clone();
+            screen.start_pushing();
+            kick_off_push_fix(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                worktree_path,
+                tx.clone(),
+            );
+        }
+    }
+
+    /// opencode finished editing: commit the change and reply to the reviewer.
+    fn on_fix_apply_done(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.fix_pr.as_mut() else {
+            return;
+        };
+        let (Some(group), Some(plan)) = (screen.current_group(), screen.current_plan()) else {
+            return;
+        };
+        let index = screen.current_index();
+        let owner = screen.owner().to_string();
+        let repo = screen.repo().to_string();
+        let number = screen.request().number;
+        let pr_url = screen.request().url.clone();
+        let worktree_path = screen.request().worktree_path.clone();
+        screen.start_committing();
+        kick_off_commit_and_reply(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            FixCommitRequest {
+                worktree_path,
+                owner,
+                repo,
+                number,
+                pr_url,
+                comment_index: index + 1,
+                index,
+                group,
+                plan,
+            },
+            tx.clone(),
+        );
+    }
+
+    /// Surface a terminal failure and return to the dashboard, dropping the
+    /// fix screen. Shared by every non-recoverable prepare-stage outcome.
+    fn fail_fix(
+        &mut self,
+        variant: ToastVariant,
+        message: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.show_toast(variant, message);
+        self.fix_pr = None;
+        self.enter_screen(Screen::Dashboard, tx);
+    }
+
+    fn apply_fix_pr_prepared(
+        &mut self,
+        result: Result<Box<FixPreparation>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.fix_pr.is_none() {
+            return;
+        }
+        match result {
+            Ok(prep) => match *prep {
+                FixPreparation::Ready {
+                    groups,
+                    owner,
+                    repo,
+                } => {
+                    if let Some(screen) = self.fix_pr.as_mut() {
+                        screen.set_groups(groups, owner, repo);
+                    }
+                    self.plan_current_fix(tx, None, None);
+                }
+                FixPreparation::NoComments => self.fail_fix(
+                    ToastVariant::Info,
+                    "No unresolved review comments to fix on this PR.".to_string(),
+                    tx,
+                ),
+                FixPreparation::GhUnavailable => self.fail_fix(
+                    ToastVariant::Error,
+                    "gh CLI not found — install `gh` and run `gh auth login` to fix review \
+                     comments."
+                        .to_string(),
+                    tx,
+                ),
+                FixPreparation::AiNotConfigured => self.fail_fix(
+                    ToastVariant::Warning,
+                    "Set the `useAi` setting so the AI can plan review fixes.".to_string(),
+                    tx,
+                ),
+                FixPreparation::AiUnavailable => self.fail_fix(
+                    ToastVariant::Error,
+                    "`opencode` CLI is not on PATH — install it from https://opencode.ai then \
+                     retry."
+                        .to_string(),
+                    tx,
+                ),
+                FixPreparation::SyncFailed(err) => self.fail_fix(
+                    ToastVariant::Error,
+                    format!("Could not sync the branch: {}", truncate_error(&err)),
+                    tx,
+                ),
+            },
+            Err(message) => self.fail_fix(
+                ToastVariant::Error,
+                format!(
+                    "Failed to fetch review comments: {}",
+                    truncate_error(&message)
+                ),
+                tx,
+            ),
+        }
+    }
+
+    fn apply_fix_pr_planned(
+        &mut self,
+        index: usize,
+        result: Result<FixVerdict, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.fix_at_index(index) {
+            return;
+        }
+        match result {
+            Ok(FixVerdict::Praise) => {
+                if let Some(s) = self.fix_pr.as_mut() {
+                    s.record_outcome(FixRowOutcome::Skipped("praise"));
+                }
+                self.advance_fix(tx);
+            }
+            Ok(FixVerdict::Reply(text)) => {
+                let Some(screen) = self.fix_pr.as_mut() else {
+                    return;
+                };
+                let Some(group) = screen.current_group() else {
+                    return;
+                };
+                let owner = screen.owner().to_string();
+                let repo = screen.repo().to_string();
+                let number = screen.request().number;
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_posting_reply();
+                kick_off_post_reply(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    FixReplyRequest {
+                        worktree_path,
+                        owner,
+                        repo,
+                        number,
+                        group,
+                        text,
+                        index,
+                    },
+                    tx.clone(),
+                );
+            }
+            Ok(FixVerdict::Fix(plan)) => {
+                if let Some(s) = self.fix_pr.as_mut() {
+                    s.show_decision(plan);
+                }
+            }
+            Err(msg) => {
+                if let Some(s) = self.fix_pr.as_mut() {
+                    s.record_outcome(FixRowOutcome::Failed(format!(
+                        "planning failed: {}",
+                        truncate_error(&msg)
+                    )));
+                }
+                self.advance_fix(tx);
+            }
+        }
+    }
+
+    fn apply_fix_pr_replied(
+        &mut self,
+        index: usize,
+        result: Result<(), String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.fix_at_index(index) {
+            return;
+        }
+        if let Some(s) = self.fix_pr.as_mut() {
+            match result {
+                Ok(()) => s.record_outcome(FixRowOutcome::Replied),
+                Err(msg) => s.record_outcome(FixRowOutcome::Failed(format!(
+                    "reply failed: {}",
+                    truncate_error(&msg)
+                ))),
+            }
+        }
+        self.advance_fix(tx);
+    }
+
+    fn apply_fix_pr_apply_ready(
+        &mut self,
+        index: usize,
+        result: Result<Box<FixApplyHandoff>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.fix_at_index(index) {
+            return;
+        }
+        match result {
+            Ok(handoff) => {
+                let handoff = *handoff;
+                if let Some(s) = self.fix_pr.as_mut() {
+                    s.spawn_opencode_pty(
+                        handoff.opencode_binary,
+                        handoff.opencode_args,
+                        handoff.cwd,
+                        Vec::new(),
+                    );
+                }
+            }
+            Err(msg) => {
+                if let Some(s) = self.fix_pr.as_mut() {
+                    s.record_outcome(FixRowOutcome::Failed(format!(
+                        "could not start the editor: {}",
+                        truncate_error(&msg)
+                    )));
+                }
+                self.advance_fix(tx);
+            }
+        }
+    }
+
+    fn apply_fix_pr_committed(
+        &mut self,
+        index: usize,
+        result: Result<(), String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.fix_at_index(index) {
+            return;
+        }
+        if let Some(s) = self.fix_pr.as_mut() {
+            match result {
+                Ok(()) => s.record_outcome(FixRowOutcome::Applied),
+                Err(msg) => s.record_outcome(FixRowOutcome::Failed(truncate_error(&msg))),
+            }
+        }
+        self.advance_fix(tx);
+    }
+
+    /// `true` when the fix screen is still processing comment `index` — guards
+    /// every async result against a late arrival after the user moved on.
+    fn fix_at_index(&self, index: usize) -> bool {
+        self.fix_pr
+            .as_ref()
+            .is_some_and(|s| s.current_index() == index)
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -1670,8 +2140,11 @@ impl App {
             DashboardAction::UpdatePullRequest(request) => {
                 self.start_update_pr_flow(*request, tx);
             }
-            DashboardAction::FillPullRequest(request) => {
-                self.start_fill_pr_flow(*request, tx);
+            DashboardAction::EnrichPullRequest(request) => {
+                self.start_enrich_pr_flow(*request, tx);
+            }
+            DashboardAction::FixPullRequest(request) => {
+                self.start_fix_pr_flow(*request, tx);
             }
             DashboardAction::PushPullRequest(request) => {
                 self.start_push_pr_flow(*request, tx);
@@ -1754,17 +2227,17 @@ impl App {
         kick_off_resolve_base_ref(worktree_path, number, tx.clone());
     }
 
-    fn start_fill_pr_flow(
+    fn start_enrich_pr_flow(
         &mut self,
-        request: FillPullRequestRequest,
+        request: EnrichPullRequestRequest,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let worktree_path = request.worktree_path.clone();
         // Mount with `base_ref = None` so the confirm panel renders straight
         // away; the resolver populates the field in the background.
-        self.fill_pr = Some(FillPullRequestScreen::new(request));
-        self.screen = Screen::FillPullRequest;
-        kick_off_resolve_fill_base_ref(worktree_path, tx.clone());
+        self.enrich_pr = Some(EnrichPullRequestScreen::new(request));
+        self.screen = Screen::EnrichPullRequest;
+        kick_off_resolve_enrich_base_ref(worktree_path, tx.clone());
     }
     /// Mount the push-only confirmation screen. A push needs no base ref,
     /// so — unlike `start_update_pr_flow` — there's no resolver kick-off;
@@ -2377,14 +2850,32 @@ impl App {
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
             AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
-            AppEvent::FillPrBaseRefResolved { base_ref } => {
-                self.apply_fill_pr_base_ref(base_ref);
+            AppEvent::EnrichPrBaseRefResolved { base_ref } => {
+                self.apply_enrich_pr_base_ref(base_ref);
             }
-            AppEvent::FillPrPrepared(result) => self.apply_fill_pr_prepared(result, tx),
-            AppEvent::FillPrSubmitted(result) => self.apply_fill_pr_submitted(result, tx),
-            AppEvent::FillPrActivity { text, kind } => {
-                if let Some(screen) = self.fill_pr.as_mut() {
+            AppEvent::EnrichPrPrepared(result) => self.apply_enrich_pr_prepared(result, tx),
+            AppEvent::EnrichPrSubmitted(result) => self.apply_enrich_pr_submitted(result, tx),
+            AppEvent::EnrichPrActivity { text, kind } => {
+                if let Some(screen) = self.enrich_pr.as_mut() {
                     screen.append_terminal_line(text, kind);
+                }
+            }
+            AppEvent::FixPrPrepared(result) => self.apply_fix_pr_prepared(result, tx),
+            AppEvent::FixPrPlanned { index, result } => {
+                self.apply_fix_pr_planned(index, result, tx)
+            }
+            AppEvent::FixPrReplied { index, result } => {
+                self.apply_fix_pr_replied(index, result, tx)
+            }
+            AppEvent::FixPrApplyReady { index, result } => {
+                self.apply_fix_pr_apply_ready(index, result, tx)
+            }
+            AppEvent::FixPrCommitted { index, result } => {
+                self.apply_fix_pr_committed(index, result, tx)
+            }
+            AppEvent::FixPrPushed(result) => {
+                if let Some(screen) = self.fix_pr.as_mut() {
+                    screen.enter_done(result);
                 }
             }
             AppEvent::AiModelsFetched(result) => {
@@ -2749,8 +3240,8 @@ impl App {
         self.enter_screen(Screen::Dashboard, tx);
     }
 
-    fn apply_fill_pr_base_ref(&mut self, base_ref: Option<String>) {
-        let Some(screen) = self.fill_pr.as_mut() else {
+    fn apply_enrich_pr_base_ref(&mut self, base_ref: Option<String>) {
+        let Some(screen) = self.enrich_pr.as_mut() else {
             return;
         };
         match base_ref {
@@ -2766,51 +3257,51 @@ impl App {
     /// Handle the read-only preparation result. `HandedOffToUi` spawns
     /// opencode inside the screen's PTY; every other variant is terminal and
     /// toasts back to the dashboard.
-    fn apply_fill_pr_prepared(
+    fn apply_enrich_pr_prepared(
         &mut self,
-        result: Result<Box<FillPreparation>, String>,
+        result: Result<Box<EnrichPreparation>, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        if self.fill_pr.is_none() {
+        if self.enrich_pr.is_none() {
             return;
         }
         match result {
             Ok(prep) => match *prep {
-                FillPreparation::HandedOffToUi {
+                EnrichPreparation::HandedOffToUi {
                     opencode_binary,
                     opencode_args,
                     cwd,
                     ..
                 } => {
-                    if let Some(screen) = self.fill_pr.as_mut() {
+                    if let Some(screen) = self.enrich_pr.as_mut() {
                         screen.spawn_opencode_pty(opencode_binary, opencode_args, cwd, Vec::new());
                     }
                 }
-                FillPreparation::NothingToDescribe => {
+                EnrichPreparation::NothingToDescribe => {
                     self.show_toast(
                         ToastVariant::Info,
                         "No commits ahead of the base ref — nothing to describe yet.".to_string(),
                     );
-                    self.fill_pr = None;
+                    self.enrich_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
                 }
-                FillPreparation::AiNotConfigured => {
+                EnrichPreparation::AiNotConfigured => {
                     self.show_toast(
                         ToastVariant::Warning,
                         "Set the `useAi` setting so we can draft the PR description with AI."
                             .to_string(),
                     );
-                    self.fill_pr = None;
+                    self.enrich_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
                 }
-                FillPreparation::AiUnavailable => {
+                EnrichPreparation::AiUnavailable => {
                     self.show_toast(
                         ToastVariant::Error,
                         "`opencode` CLI is not on PATH — install it from \
                          https://opencode.ai then retry."
                             .to_string(),
                     );
-                    self.fill_pr = None;
+                    self.enrich_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
                 }
             },
@@ -2819,22 +3310,22 @@ impl App {
                     ToastVariant::Error,
                     format!("Failed to prepare PR draft: {}", truncate_error(&message)),
                 );
-                self.fill_pr = None;
+                self.enrich_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
         }
     }
 
-    fn apply_fill_pr_submitted(
+    fn apply_enrich_pr_submitted(
         &mut self,
-        result: Result<FillSubmitOutcome, String>,
+        result: Result<EnrichSubmitOutcome, String>,
         _tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let outcome = match result {
             Ok(outcome) => outcome,
-            Err(message) => FillSubmitOutcome::SubmitFailed(message),
+            Err(message) => EnrichSubmitOutcome::SubmitFailed(message),
         };
-        if let Some(screen) = self.fill_pr.as_mut() {
+        if let Some(screen) = self.enrich_pr.as_mut() {
             screen.enter_done(outcome);
         }
     }
@@ -3034,10 +3525,17 @@ impl App {
                     self.back_to_menu();
                 }
             }
-            Screen::FillPullRequest => {
-                // Only reachable through `start_fill_pr_flow`, which seeds
-                // `fill_pr` before flipping the screen.
-                if self.fill_pr.is_none() {
+            Screen::EnrichPullRequest => {
+                // Only reachable through `start_enrich_pr_flow`, which seeds
+                // `enrich_pr` before flipping the screen.
+                if self.enrich_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
+            Screen::FixPullRequest => {
+                // Only reachable through `start_fix_pr_flow`, which seeds
+                // `fix_pr` before flipping the screen.
+                if self.fix_pr.is_none() {
                     self.back_to_menu();
                 }
             }
@@ -3081,7 +3579,8 @@ impl App {
         self.setup_project = None;
         self.merge_pr = None;
         self.update_pr = None;
-        self.fill_pr = None;
+        self.enrich_pr = None;
+        self.fix_pr = None;
         self.update_branch = None;
         self.ai_model_picker = None;
         self.mouse_selection = None;
@@ -4057,22 +4556,22 @@ fn kick_off_resolve_base_ref(
     });
 }
 
-fn kick_off_resolve_fill_base_ref(worktree_path: String, tx: mpsc::UnboundedSender<AppEvent>) {
+fn kick_off_resolve_enrich_base_ref(worktree_path: String, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let base_ref =
             crate::services::dashboard::resolve_base_ref(&PathBuf::from(&worktree_path)).await;
-        let _ = tx.send(AppEvent::FillPrBaseRefResolved { base_ref });
+        let _ = tx.send(AppEvent::EnrichPrBaseRefResolved { base_ref });
     });
 }
 
-fn kick_off_prepare_fill(
+fn kick_off_prepare_enrich(
     git_root: Option<String>,
     config: DashboardConfig,
-    request: FillPullRequestRequest,
+    request: EnrichPullRequestRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
-        let _ = tx.send(AppEvent::FillPrPrepared(Err(
+        let _ = tx.send(AppEvent::EnrichPrPrepared(Err(
             "Could not resolve git root for the PR draft.".to_string(),
         )));
         return;
@@ -4081,31 +4580,31 @@ fn kick_off_prepare_fill(
         // `base_ref` is populated by the resolver before the user can
         // confirm; guard anyway so a race can't blow up the worker.
         let Some(base_ref) = request.base_ref.clone() else {
-            let _ = tx.send(AppEvent::FillPrPrepared(Err(
+            let _ = tx.send(AppEvent::EnrichPrPrepared(Err(
                 "Base ref was not resolved before confirmation.".to_string(),
             )));
             return;
         };
         let service = DashboardService::new(root, config);
         let event = match service
-            .prepare_fill(&request.worktree_path, &request.branch, &base_ref)
+            .prepare_enrich(&request.worktree_path, &request.branch, &base_ref)
             .await
         {
             Ok(prep) => Ok(Box::new(prep)),
             Err(err) => Err(user_friendly_message(&err)),
         };
-        let _ = tx.send(AppEvent::FillPrPrepared(event));
+        let _ = tx.send(AppEvent::EnrichPrPrepared(event));
     });
 }
 
 fn kick_off_submit_pull_request(
     git_root: Option<String>,
     config: DashboardConfig,
-    params: FillSubmitRequest,
+    params: EnrichSubmitRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
-        let _ = tx.send(AppEvent::FillPrSubmitted(Err(
+        let _ = tx.send(AppEvent::EnrichPrSubmitted(Err(
             "Could not resolve git root for the pull request.".to_string(),
         )));
         return;
@@ -4118,7 +4617,7 @@ fn kick_off_submit_pull_request(
         let forward_tx = tx.clone();
         tokio::spawn(async move {
             while let Some((text, kind)) = activity_rx.recv().await {
-                let _ = forward_tx.send(AppEvent::FillPrActivity { text, kind });
+                let _ = forward_tx.send(AppEvent::EnrichPrActivity { text, kind });
             }
         });
 
@@ -4130,7 +4629,214 @@ fn kick_off_submit_pull_request(
             Ok(outcome) => Ok(outcome),
             Err(err) => Err(user_friendly_message(&err)),
         };
-        let _ = tx.send(AppEvent::FillPrSubmitted(event));
+        let _ = tx.send(AppEvent::EnrichPrSubmitted(event));
+    });
+}
+
+// ── "Fix Pull Request" async stages ────────────────────────────────────
+
+/// Inputs for one captured planning call. `index` rides along so the result
+/// handler can ignore a stale response.
+struct FixPlanRequest {
+    worktree_path: String,
+    group: CommentGroup,
+    feedback: Option<String>,
+    previous_plan: Option<String>,
+    index: usize,
+}
+
+/// Inputs for building the live-apply spawn parameters.
+struct FixApplyRequest {
+    worktree_path: String,
+    group: CommentGroup,
+    plan: FixPlan,
+    index: usize,
+}
+
+/// Inputs for the commit + reply that follow a live apply.
+struct FixCommitRequest {
+    worktree_path: String,
+    owner: String,
+    repo: String,
+    number: u64,
+    pr_url: String,
+    comment_index: usize,
+    index: usize,
+    group: CommentGroup,
+    plan: FixPlan,
+}
+
+/// Inputs for a non-actionable reply (the `reply` verdict).
+struct FixReplyRequest {
+    worktree_path: String,
+    owner: String,
+    repo: String,
+    number: u64,
+    group: CommentGroup,
+    text: String,
+    index: usize,
+}
+
+fn kick_off_prepare_fix(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    number: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::FixPrPrepared(Err(
+            "Could not resolve git root for the fix.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let event = match service.prepare_fix(&worktree_path, number).await {
+            Ok(prep) => Ok(Box::new(prep)),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::FixPrPrepared(event));
+    });
+}
+
+fn kick_off_plan_comment(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: FixPlanRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let index = req.index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::FixPrPlanned {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .plan_comment(
+                &req.worktree_path,
+                &req.group,
+                req.feedback.as_deref(),
+                req.previous_plan.as_deref(),
+            )
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::FixPrPlanned { index, result });
+    });
+}
+
+fn kick_off_prepare_apply(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: FixApplyRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let index = req.index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::FixPrApplyReady {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .prepare_apply(&req.worktree_path, &req.group, &req.plan)
+            .await
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::FixPrApplyReady { index, result });
+    });
+}
+
+fn kick_off_commit_and_reply(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: FixCommitRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let index = req.index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::FixPrCommitted {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .commit_and_reply(
+                &req.worktree_path,
+                &req.owner,
+                &req.repo,
+                req.number,
+                &req.pr_url,
+                req.comment_index,
+                &req.group,
+                &req.plan,
+            )
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::FixPrCommitted { index, result });
+    });
+}
+
+fn kick_off_post_reply(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: FixReplyRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let index = req.index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::FixPrReplied {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .post_reply(
+                &req.worktree_path,
+                &req.owner,
+                &req.repo,
+                req.number,
+                &req.group,
+                &req.text,
+            )
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::FixPrReplied { index, result });
+    });
+}
+
+fn kick_off_push_fix(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::FixPrPushed(Err(
+            "Could not resolve git root.".to_string()
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .push_fix(&worktree_path)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::FixPrPushed(result));
     });
 }
 

@@ -116,6 +116,10 @@ pub mod colors {
     /// Orange `#ff8f00` — creative accent, used sparingly for highlights
     /// like progress headers and "running" states.
     pub const ORANGE: Color = Color::Rgb(0xff, 0x8f, 0x00);
+    /// Cyan `#a8d8ff` — soft blue accent from the extended palette. Used for
+    /// the "Fix" PR command button so it reads distinct from the teal/purple
+    /// lifecycle buttons next to it.
+    pub const CYAN: Color = Color::Rgb(0xa8, 0xd8, 0xff);
 
     // ── Background colors ───────────────────────────────────────────────
 
