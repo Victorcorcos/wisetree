@@ -109,6 +109,10 @@ pub struct FixPullRequestScreen {
     request: FixPullRequestRequest,
     confirm: Option<ConfirmationModal>,
     phase_message: String,
+    /// True only during the "Analyzing comment #N…" planning phase, so the
+    /// Working view shows the reviewer comment being judged in a panel below
+    /// the spinner. Cleared by every other Working transition.
+    analyzing: bool,
     /// Repository owner / name resolved during preparation; used by `App` for
     /// the reply API calls.
     owner: String,
@@ -143,6 +147,7 @@ impl FixPullRequestScreen {
             confirm: Some(build_confirm(&request)),
             request,
             phase_message: String::new(),
+            analyzing: false,
             owner: String::new(),
             repo: String::new(),
             groups: Vec::new(),
@@ -212,6 +217,7 @@ impl FixPullRequestScreen {
     pub fn start_preparing(&mut self) {
         self.step = FixStep::Working;
         self.phase_message = "Syncing the branch and fetching review comments...".to_string();
+        self.analyzing = false;
         self.confirm = None;
     }
 
@@ -227,23 +233,27 @@ impl FixPullRequestScreen {
     pub fn start_planning(&mut self, n: usize, total: usize) {
         self.step = FixStep::Working;
         self.phase_message = format!("Analyzing comment #{n} of {total}...");
+        self.analyzing = true;
         self.current_plan = None;
     }
 
     pub fn start_posting_reply(&mut self) {
         self.step = FixStep::Working;
         self.phase_message = "Posting reply to the reviewer...".to_string();
+        self.analyzing = false;
     }
 
     pub fn start_committing(&mut self) {
         self.step = FixStep::Working;
         self.phase_message = "Committing the fix and replying...".to_string();
+        self.analyzing = false;
         self.pty = None;
     }
 
     pub fn start_pushing(&mut self) {
         self.step = FixStep::Working;
         self.phase_message = "Pushing review-fix commits to origin...".to_string();
+        self.analyzing = false;
     }
 
     /// Present an actionable plan with the Apply / Other / Skip buttons.
@@ -612,7 +622,12 @@ impl FixPullRequestScreen {
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
-            FixStep::Working => 3,
+            FixStep::Working => match self.analyzing_group() {
+                // spinner + blank + bordered comment panel (content capped so
+                // a long comment can't swallow the whole screen).
+                Some(group) => (build_comment_lines(group).len() as u16).clamp(1, 14) + 4,
+                None => 3,
+            },
             FixStep::Done => {
                 let table_rows = (self.summary_rows.len() as u16).min(14);
                 let table_height = if self.summary_rows.is_empty() {
@@ -653,16 +668,44 @@ impl FixPullRequestScreen {
         }
         match self.step {
             FixStep::Confirm => self.render_confirm(frame, area),
-            FixStep::Working => {
-                StatusIndicator::new(Status::Loading, self.phase_message.clone())
-                    .with_tick(self.tick)
-                    .render(frame, area);
-            }
+            FixStep::Working => self.render_working(frame, area),
             FixStep::Decision => self.render_decision(frame, area),
             FixStep::OtherInput => self.render_other(frame, area),
             FixStep::Applying => self.render_applying(frame, area),
             FixStep::Done => self.render_done(frame, area),
         }
+    }
+
+    /// The comment group being judged, but only while planning — so the
+    /// other Working phases (sync, reply, commit, push) keep the bare spinner.
+    fn analyzing_group(&self) -> Option<&CommentGroup> {
+        self.analyzing
+            .then(|| self.groups.get(self.current))
+            .flatten()
+    }
+
+    /// Working spinner. While analyzing a comment, the reviewer comment being
+    /// judged is shown in a panel below the spinner (same rounded-border,
+    /// bold-title treatment as the Terminal / AI Activity panels).
+    fn render_working(&self, frame: &mut Frame, area: Rect) {
+        let Some(group) = self.analyzing_group().filter(|_| area.height >= 5) else {
+            StatusIndicator::new(Status::Loading, self.phase_message.clone())
+                .with_tick(self.tick)
+                .render(frame, area);
+            return;
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // spinner
+                Constraint::Length(1), // blank
+                Constraint::Min(3),    // reviewer-comment panel
+            ])
+            .split(area);
+        StatusIndicator::new(Status::Loading, self.phase_message.clone())
+            .with_tick(self.tick)
+            .render(frame, chunks[0]);
+        render_comment_panel(group, frame, chunks[2]);
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
@@ -1139,6 +1182,68 @@ fn build_steps_lines() -> Vec<Line<'static>> {
     ]
 }
 
+/// Reviewer-comment panel shown under the spinner while the AI analyzes a
+/// comment. Mirrors the Terminal / AI Activity panels: rounded border, bold
+/// title (`Reviewer comment · path:line`), wrapped body.
+fn render_comment_panel(group: &CommentGroup, frame: &mut Frame, area: Rect) {
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "Reviewer comment",
+            Style::default()
+                .fg(colors::INFO)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ".to_string(), muted_dim()),
+        Span::styled(group.descriptor(), Style::default().fg(colors::EMPHASIS)),
+        Span::raw(" "),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(colors::INFO))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(build_comment_lines(group)).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// One block per reviewer comment: a bold `@author` header followed by the
+/// comment body with its line breaks preserved.
+fn build_comment_lines(group: &CommentGroup) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for comment in &group.comments {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("@{}", comment.author),
+            Style::default()
+                .fg(colors::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for raw in comment.body.trim().lines() {
+            lines.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(colors::WHITE),
+            )));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no comment text)".to_string(),
+            muted_dim(),
+        )));
+    }
+    lines
+}
+
 fn build_proposal_lines(group: &CommentGroup, plan: &FixPlan) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let label = |text: &str| {
@@ -1310,6 +1415,41 @@ mod tests {
         screen.start_planning(1, 1);
         assert_eq!(screen.step(), FixStep::Working);
         assert!(screen.phase_message.contains("comment #1 of 1"));
+    }
+
+    #[test]
+    fn analyzing_shows_reviewer_comment_panel() {
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.start_planning(1, 1);
+        let dump = render_dump(&mut screen, 80, 14);
+        assert!(
+            dump.contains("Analyzing comment #1 of 1"),
+            "missing spinner line:\n{dump}"
+        );
+        assert!(
+            dump.contains("Reviewer comment"),
+            "missing panel title:\n{dump}"
+        );
+        assert!(dump.contains("a.rs:10"), "missing descriptor:\n{dump}");
+        assert!(dump.contains("@alice"), "missing author:\n{dump}");
+        assert!(
+            dump.contains("Magic number 3000"),
+            "missing comment body:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn non_analyzing_working_has_no_comment_panel() {
+        // Committing is also a Working phase but must not show the panel.
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.start_committing();
+        let dump = render_dump(&mut screen, 80, 14);
+        assert!(
+            !dump.contains("Reviewer comment"),
+            "panel should be hidden during commit:\n{dump}"
+        );
     }
 
     #[test]

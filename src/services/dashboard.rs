@@ -1564,17 +1564,31 @@ impl DashboardService {
             return Ok(FixPreparation::SyncFailed(err));
         }
 
-        // owner/repo from origin so replies hit the right repo (forks too).
-        let origin_url = run_command(
-            &self.git_binary,
-            &["remote", "get-url", "origin"],
-            Some(&cwd),
+        // The PR may not live on `origin`: a fork opens PRs against its
+        // upstream, so `origin` (the fork) has no such PR number. Ask `gh`
+        // which repo the PR was actually opened against — `gh pr view`
+        // resolves the base repo from the local remotes, forks included —
+        // and read the slug off the returned URL so the GraphQL fetch and
+        // replies hit the right repo. `headRepository*` fields point at the
+        // (possibly fork) head and would misdirect both.
+        let number_arg = number.to_string();
+        let view = time::timeout(
+            FIX_FETCH_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &["pr", "view", &number_arg, "--json", "url"],
+                Some(&cwd),
+            ),
         )
         .await
-        .ok();
-        let Some((owner, repo)) = origin_url.as_deref().and_then(parse_github_slug) else {
+        .map_err(|_| WisetreeError::other("gh pr view timed out after 15s"))?;
+        let view = match view {
+            Ok(out) => out,
+            Err(err) => return Ok(FixPreparation::SyncFailed(err)),
+        };
+        let Some((owner, repo)) = parse_pr_repo_json(&view) else {
             return Ok(FixPreparation::SyncFailed(
-                "could not parse owner/repo from the origin remote.".to_string(),
+                "could not resolve the PR's repository from gh pr view output.".to_string(),
             ));
         };
 
@@ -2353,6 +2367,23 @@ fn parse_github_slug(remote: &str) -> Option<(String, String)> {
         return None;
     }
     Some((owner.to_string(), repo.to_string()))
+}
+
+/// Resolve the `(owner, repo)` of the repository a PR was opened against from
+/// the JSON `gh pr view <N> --json url` returns. The base repo is read off the
+/// canonical `url` (`https://github.com/<owner>/<repo>/pull/<N>`), which
+/// `parse_github_slug` already handles. `gh` resolves that repo from the local
+/// remotes, so this is correct even when the branch lives on a fork and the PR
+/// targets an upstream repo — unlike the `headRepository*` fields, which point
+/// at the (possibly fork) head.
+fn parse_pr_repo_json(body: &str) -> Option<(String, String)> {
+    #[derive(Deserialize)]
+    struct PrUrlJson {
+        #[serde(default)]
+        url: String,
+    }
+    let parsed: PrUrlJson = serde_json::from_str(body).ok()?;
+    parse_github_slug(&parsed.url)
 }
 
 fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
@@ -4132,6 +4163,28 @@ so the intent reads clearly.
             message.contains("invalid gh pr view output"),
             "unexpected error message: {message}"
         );
+    }
+
+    #[test]
+    fn parses_pr_repo_from_view_url() {
+        // gh resolves the base repo even in a fork-and-PR-to-upstream setup;
+        // the slug must come from the PR url (the repo it was opened against),
+        // not the fork the branch is pushed to.
+        let raw = r#"{"url":"https://github.com/oxeanbits/digitalize-front/pull/4420"}"#;
+        assert_eq!(
+            parse_pr_repo_json(raw),
+            Some(("oxeanbits".into(), "digitalize-front".into()))
+        );
+    }
+
+    #[test]
+    fn parse_pr_repo_json_rejects_invalid_json() {
+        assert_eq!(parse_pr_repo_json("not json at all"), None);
+    }
+
+    #[test]
+    fn parse_pr_repo_json_rejects_missing_url() {
+        assert_eq!(parse_pr_repo_json(r#"{"number":4420}"#), None);
     }
 
     #[test]
