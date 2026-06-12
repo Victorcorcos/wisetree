@@ -116,6 +116,9 @@ pub struct DashboardConfig {
     #[serde(rename = "showPullRequests", default)]
     pub show_pull_requests: bool,
 
+    #[serde(rename = "wiseMerge", default)]
+    pub wise_merge: bool,
+
     #[serde(rename = "columns", default = "default_columns")]
     pub columns: Vec<String>,
 
@@ -135,6 +138,7 @@ impl Default for DashboardConfig {
         Self {
             refresh_interval_ms: default_refresh_ms(),
             show_pull_requests: false,
+            wise_merge: false,
             columns: default_columns(),
             use_ai: String::new(),
             ai_status: AiStatusConfig::default(),

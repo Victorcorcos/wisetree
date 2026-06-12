@@ -223,6 +223,7 @@ fn dashboard_config_round_trips_json() {
         dashboard: wisetree::config::schema::DashboardConfig {
             refresh_interval_ms: 5_000,
             show_pull_requests: true,
+            wise_merge: false,
             columns: vec!["status".into(), "branch".into(), "pull_request".into()],
             use_ai: String::new(),
             ai_status: Default::default(),

@@ -1,7 +1,7 @@
 ---
 source: tests/tui_dashboard.rs
 assertion_line: 1126
-expression: "dump_lines(72, 20, |f| screen.render(f, f.area()))"
+expression: "dump_lines(72, 21, |f| screen.render(f, f.area()))"
 ---
 Refreshed just now - 3 worktrees, 0 dirty, 1 PR open
 
@@ -12,10 +12,11 @@ Worktree        Branch        Status         A/B
  ➤ repo-bug     bug           Opened         +1 -0
    repo-feat    feat          Clean          =0
 Narrow view: 2 hidden  •  PR #42 Open: Improve dashboard...  •  Commit d
+   Wise Merge ☐  auto-merges Opened 🟢 👍 ✅  / 🟢 ✅  PRs every 1s
                               ┌────────┐  ┌────────┐  ┌─────────┐
 Delete worktrees with status: │ Merged │  │ Closed │  │ Drafted │
                               └────────┘  └────────┘  └─────────┘
-↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type t
+↑↓ Navigate  ↵ Actions  Space Wise Merge  ⌫ Delete (empty search)  Tab F
 Status: Mother = main worktree (protected)  Dirty = has uncommitted chan
 PR Checks: ⚪  (Pending)  🟡  (Running)  ⚠️  (Errored)  🔴  (Failed)  🟢  (Pa
 PR Reviews: ✋  (Pending)  👎  (Changes Requested)  👍  (Approved)
