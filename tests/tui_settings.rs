@@ -8,12 +8,53 @@ use ratatui::Terminal;
 
 use wisetree::config::schema::WorktreeConfig;
 use wisetree::messages::colors;
-use wisetree::services::UpdateCheckResult;
+use wisetree::services::{MultiSourceUpdateResult, UpdateCheckResult, UpdateSource};
 use wisetree::tui::screens::settings::{
     CopyDirection, PathTemplateRectStatus, PathTemplateSelection, PostCmdRectStatus,
     PostCmdSelection, SettingsAction, SettingsScreen, SettingsStep, TerminalCmdRectStatus,
-    TerminalCmdSelection,
+    TerminalCmdSelection, UpgradeOutcome,
 };
+
+fn npm_only_result(current: &str, npm_latest: Option<&str>) -> MultiSourceUpdateResult {
+    let npm = UpdateCheckResult {
+        has_update: npm_latest.map(|v| v != current).unwrap_or(false),
+        current_version: current.to_string(),
+        latest_version: npm_latest.map(str::to_string),
+        checked_at: 0,
+        error: None,
+    };
+    let homebrew = UpdateCheckResult {
+        has_update: false,
+        current_version: current.to_string(),
+        latest_version: None,
+        checked_at: 0,
+        error: Some("not checked".to_string()),
+    };
+    MultiSourceUpdateResult {
+        current_version: current.to_string(),
+        npm,
+        homebrew,
+    }
+}
+
+fn dual_result(
+    current: &str,
+    npm_latest: Option<&str>,
+    homebrew_latest: Option<&str>,
+) -> MultiSourceUpdateResult {
+    let mk = |latest: Option<&str>| UpdateCheckResult {
+        has_update: latest.map(|v| v != current).unwrap_or(false),
+        current_version: current.to_string(),
+        latest_version: latest.map(str::to_string),
+        checked_at: 0,
+        error: None,
+    };
+    MultiSourceUpdateResult {
+        current_version: current.to_string(),
+        npm: mk(npm_latest),
+        homebrew: mk(homebrew_latest),
+    }
+}
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -598,43 +639,103 @@ fn check_updates_loading_renders_spinner_message() {
 }
 
 #[test]
-fn check_updates_with_new_version_shows_install_command() {
+fn check_updates_renders_npm_and_homebrew_rectangles() {
     let mut s = ready();
     for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
     s.start_checking_updates();
-    s.set_update_result(UpdateCheckResult {
-        has_update: true,
-        current_version: "1.0.0".into(),
-        latest_version: Some("2.0.0".into()),
-        checked_at: 0,
-        error: None,
-    });
-    let dumped = dump(80, 8, |f| s.render(f, f.area()));
-    assert!(dumped.contains("New version available"));
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+    let dumped = dump(90, 14, |f| s.render(f, f.area()));
+    // Both source labels appear as rectangle titles.
+    assert!(dumped.contains("npm"));
+    assert!(dumped.contains("homebrew"));
+    // Latest version is surfaced inside the rectangles.
     assert!(dumped.contains("v2.0.0"));
+    // Each rectangle hints at the matching upgrade command.
     assert!(dumped.contains("npm install -g wisetree"));
+    assert!(dumped.contains("brew upgrade victorcorcos/tap/wisetree"));
+    assert!(dumped.contains("Current version: v1.0.0"));
 }
 
 #[test]
-fn check_updates_up_to_date_message() {
+fn check_updates_arrow_keys_move_selection() {
     let mut s = ready();
     for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
-    s.set_update_result(UpdateCheckResult {
-        has_update: false,
-        current_version: "1.0.0".into(),
-        latest_version: Some("1.0.0".into()),
-        checked_at: 0,
-        error: None,
-    });
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+    assert_eq!(s.update_selection(), UpdateSource::Npm);
+    s.handle_key(key(KeyCode::Down));
+    assert_eq!(s.update_selection(), UpdateSource::Homebrew);
+    s.handle_key(key(KeyCode::Up));
+    assert_eq!(s.update_selection(), UpdateSource::Npm);
+}
+
+#[test]
+fn check_updates_enter_emits_upgrade_for_selected_source() {
+    let mut s = ready();
+    for _ in 0..CHECK_UPDATES_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::UpgradeSource(UpdateSource::Npm));
+
+    s.handle_key(key(KeyCode::Down));
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::UpgradeSource(UpdateSource::Homebrew)
+    );
+}
+
+#[test]
+fn check_updates_renders_homebrew_error_in_rectangle() {
+    let mut s = ready();
+    for _ in 0..CHECK_UPDATES_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.set_update_result(npm_only_result("1.0.0", Some("2.0.0")));
+    let dumped = dump(90, 14, |f| s.render(f, f.area()));
+    assert!(dumped.contains("homebrew"));
+    assert!(dumped.contains("error"));
+}
+
+#[test]
+fn check_updates_upgrade_spinner_shown_while_upgrading() {
+    let mut s = ready();
+    for _ in 0..CHECK_UPDATES_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+    s.start_upgrade(UpdateSource::Npm);
     let dumped = dump(80, 6, |f| s.render(f, f.area()));
-    assert!(dumped.contains("latest version"));
-    assert!(dumped.contains("v1.0.0"));
+    assert!(dumped.contains("Upgrading via npm"));
+}
+
+#[test]
+fn check_updates_upgrade_outcome_rendered_inline() {
+    let mut s = ready();
+    for _ in 0..CHECK_UPDATES_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+    s.set_upgrade_outcome(UpgradeOutcome {
+        source: UpdateSource::Homebrew,
+        success: true,
+        message: "upgraded successfully".into(),
+    });
+    let dumped = dump(90, 14, |f| s.render(f, f.area()));
+    assert!(dumped.contains("homebrew"));
+    assert!(dumped.contains("upgraded successfully"));
 }
 
 #[test]
@@ -644,13 +745,9 @@ fn check_updates_error_shows_failure_message() {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
-    s.set_update_result(UpdateCheckResult {
-        has_update: false,
-        current_version: "1.0.0".into(),
-        latest_version: None,
-        checked_at: 0,
-        error: Some("network down".into()),
-    });
+    let mut result = npm_only_result("1.0.0", None);
+    result.npm.error = Some("network down".into());
+    s.set_update_result(result);
     let dumped = dump(80, 8, |f| s.render(f, f.area()));
     assert!(!dumped.trim().is_empty());
 }
