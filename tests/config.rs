@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use tempfile::TempDir;
 use wisetree::config::schema::{
     clamp_dashboard_refresh_interval, default_copy_ignores, default_copy_patterns,
-    default_path_template, AiStatusConfig, LinkStrategy,
+    default_path_template, AiStatusConfig, DashboardNotificationsConfig, LinkStrategy,
 };
 use wisetree::config::{ConfigService, WorktreeConfig};
 
@@ -38,6 +38,10 @@ fn defaults_match_upstream() {
     assert_eq!(cfg.worktree_link_cache_dir, None);
     assert_eq!(cfg.terminal_command, "");
     assert!(!cfg.delete_branch_with_worktree);
+    assert_eq!(
+        cfg.dashboard.notifications,
+        DashboardNotificationsConfig::default()
+    );
 }
 
 #[test]
@@ -226,6 +230,10 @@ fn dashboard_config_round_trips_json() {
             columns: vec!["status".into(), "branch".into(), "pull_request".into()],
             use_ai: String::new(),
             ai_status: Default::default(),
+            notifications: DashboardNotificationsConfig {
+                ai_status_ok: true,
+                pr_checks_ok: true,
+            },
         },
         ..WorktreeConfig::default()
     };
@@ -233,6 +241,67 @@ fn dashboard_config_round_trips_json() {
     let raw = serde_json::to_string(&cfg).unwrap();
     let parsed: WorktreeConfig = serde_json::from_str(&raw).unwrap();
     assert_eq!(parsed.dashboard, cfg.dashboard);
+}
+
+#[test]
+fn dashboard_notifications_default_to_disabled_when_omitted() {
+    let raw = r#"{
+  "dashboard": {
+    "refreshIntervalMs": 5000,
+    "showPullRequests": true,
+    "columns": ["branch", "status"],
+    "aiStatus": {
+      "enabledHarnesses": ["claude_code"],
+      "activeWindowMs": 7500
+    }
+  }
+}"#;
+
+    let parsed: WorktreeConfig = serde_json::from_str(raw).unwrap();
+    assert_eq!(parsed.dashboard.refresh_interval_ms, 5_000);
+    assert!(parsed.dashboard.show_pull_requests);
+    assert_eq!(parsed.dashboard.columns, vec!["branch", "status"]);
+    assert_eq!(
+        parsed.dashboard.ai_status.enabled_harnesses,
+        vec!["claude_code"]
+    );
+    assert_eq!(parsed.dashboard.ai_status.active_window_ms, 7_500);
+    assert!(!parsed.dashboard.notifications.ai_status_ok);
+    assert!(!parsed.dashboard.notifications.pr_checks_ok);
+}
+
+#[test]
+fn dashboard_notifications_parse_and_default_partials() {
+    let raw = r#"{
+  "dashboard": {
+    "notifications": {
+      "aiStatusOk": true
+    }
+  }
+}"#;
+
+    let parsed: WorktreeConfig = serde_json::from_str(raw).unwrap();
+    assert!(parsed.dashboard.notifications.ai_status_ok);
+    assert!(!parsed.dashboard.notifications.pr_checks_ok);
+    assert_eq!(parsed.dashboard.ai_status, AiStatusConfig::default());
+}
+
+#[test]
+fn dashboard_notifications_unknown_field_is_rejected() {
+    let raw = r#"{
+  "dashboard": {
+    "notifications": {
+      "aiStatusOk": true,
+      "bogus": true
+    }
+  }
+}"#;
+
+    let parsed: Result<WorktreeConfig, _> = serde_json::from_str(raw);
+    assert!(
+        parsed.is_err(),
+        "unknown notification key should be rejected"
+    );
 }
 
 #[test]

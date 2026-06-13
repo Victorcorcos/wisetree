@@ -128,6 +128,9 @@ pub struct DashboardConfig {
 
     #[serde(rename = "aiStatus", default)]
     pub ai_status: AiStatusConfig,
+
+    #[serde(rename = "notifications", default)]
+    pub notifications: DashboardNotificationsConfig,
 }
 
 impl Default for DashboardConfig {
@@ -138,6 +141,7 @@ impl Default for DashboardConfig {
             columns: default_columns(),
             use_ai: String::new(),
             ai_status: AiStatusConfig::default(),
+            notifications: DashboardNotificationsConfig::default(),
         }
     }
 }
@@ -162,6 +166,17 @@ impl DashboardConfig {
         self.columns = columns;
         warnings
     }
+}
+
+/// Opt-in dashboard terminal-bell notifications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardNotificationsConfig {
+    #[serde(rename = "aiStatusOk", default)]
+    pub ai_status_ok: bool,
+
+    #[serde(rename = "prChecksOk", default)]
+    pub pr_checks_ok: bool,
 }
 
 /// Live `AI Status` column configuration.

@@ -955,14 +955,18 @@ pub enum DashboardField {
     ShowPullRequests,
     Columns,
     UseAi,
+    NotificationsAiStatusOk,
+    NotificationsPrChecksOk,
 }
 
 impl DashboardField {
-    pub const ALL: [DashboardField; 4] = [
+    pub const ALL: [DashboardField; 6] = [
         DashboardField::RefreshIntervalMs,
         DashboardField::ShowPullRequests,
         DashboardField::Columns,
         DashboardField::UseAi,
+        DashboardField::NotificationsAiStatusOk,
+        DashboardField::NotificationsPrChecksOk,
     ];
 
     pub fn label(self) -> &'static str {
@@ -971,6 +975,8 @@ impl DashboardField {
             DashboardField::ShowPullRequests => "showPullRequests",
             DashboardField::Columns => "columns",
             DashboardField::UseAi => "useAi",
+            DashboardField::NotificationsAiStatusOk => "notifications.aiStatusOk",
+            DashboardField::NotificationsPrChecksOk => "notifications.prChecksOk",
         }
     }
 
@@ -984,11 +990,29 @@ impl DashboardField {
             DashboardField::UseAi => {
                 "Provider/model for opencode (e.g. anthropic/claude-sonnet-4-5). Blank disables AI."
             }
+            DashboardField::NotificationsAiStatusOk => {
+                "Press Enter to toggle terminal bell when AI work finishes"
+            }
+            DashboardField::NotificationsPrChecksOk => {
+                "Press Enter to toggle terminal bell when PR checks pass"
+            }
         }
     }
 
     pub fn is_toggle(self) -> bool {
-        matches!(self, DashboardField::ShowPullRequests)
+        matches!(
+            self,
+            DashboardField::ShowPullRequests
+                | DashboardField::NotificationsAiStatusOk
+                | DashboardField::NotificationsPrChecksOk
+        )
+    }
+
+    pub fn section_heading(self) -> Option<&'static str> {
+        match self {
+            DashboardField::NotificationsAiStatusOk => Some("Notifications"),
+            _ => None,
+        }
     }
 }
 
@@ -1021,6 +1045,7 @@ enum SettingsMouseTarget {
 /// but has a fixed list of rectangles (one per dashboard field) and no
 /// Create/Delete affordances — the schema is closed.
 pub struct DashboardEditor {
+    base_config: DashboardConfig,
     pub values: Vec<String>,
     pub statuses: Vec<DashboardRectStatus>,
     pub selection: DashboardSelection,
@@ -1034,9 +1059,12 @@ impl DashboardEditor {
             config.show_pull_requests.to_string(),
             config.columns.join(", "),
             config.use_ai.clone(),
+            config.notifications.ai_status_ok.to_string(),
+            config.notifications.pr_checks_ok.to_string(),
         ];
         let statuses = vec![DashboardRectStatus::Saved; values.len()];
         Self {
+            base_config: config.clone(),
             values,
             statuses,
             selection: DashboardSelection::Rect(0),
@@ -1081,14 +1109,17 @@ impl DashboardEditor {
         let (columns, _warnings) = normalize_dashboard_columns(&raw_columns);
 
         let use_ai = self.values[3].trim().to_string();
+        let ai_status_ok = parse_dashboard_bool(&self.values[4]);
+        let pr_checks_ok = parse_dashboard_bool(&self.values[5]);
 
-        DashboardConfig {
-            refresh_interval_ms,
-            show_pull_requests,
-            columns,
-            use_ai,
-            ai_status: Default::default(),
-        }
+        let mut config = self.base_config.clone();
+        config.refresh_interval_ms = refresh_interval_ms;
+        config.show_pull_requests = show_pull_requests;
+        config.columns = columns;
+        config.use_ai = use_ai;
+        config.notifications.ai_status_ok = ai_status_ok;
+        config.notifications.pr_checks_ok = pr_checks_ok;
+        config
     }
 }
 
@@ -2663,12 +2694,20 @@ impl SettingsScreen {
         let use_ai_idx = use_ai_field_index();
         editor.selection = match editor.selection {
             DashboardSelection::Rect(0) => DashboardSelection::Rect(0),
+            DashboardSelection::Rect(i)
+                if use_ai_idx == Some(i - 1) && chips.as_deref().is_some_and(|c| !c.is_empty()) =>
+            {
+                DashboardSelection::FreeModels(starting_chip_index(
+                    editor,
+                    chips.as_deref().unwrap_or(&[]),
+                ))
+            }
             DashboardSelection::Rect(i) => DashboardSelection::Rect(i - 1),
             DashboardSelection::FreeModels(_) => {
                 DashboardSelection::Rect(use_ai_idx.unwrap_or(editor.values.len() - 1))
             }
             DashboardSelection::Save => match chips.as_deref() {
-                Some(chips) if !chips.is_empty() => {
+                Some(chips) if Some(editor.values.len().saturating_sub(1)) == use_ai_idx => {
                     DashboardSelection::FreeModels(starting_chip_index(editor, chips))
                 }
                 _ => DashboardSelection::Rect(editor.values.len() - 1),
@@ -2687,13 +2726,17 @@ impl SettingsScreen {
                 Some(chips) if !chips.is_empty() => {
                     DashboardSelection::FreeModels(starting_chip_index(editor, chips))
                 }
+                _ if i + 1 < editor.values.len() => DashboardSelection::Rect(i + 1),
                 _ => DashboardSelection::Save,
             },
             DashboardSelection::Rect(i) if i + 1 < editor.values.len() => {
                 DashboardSelection::Rect(i + 1)
             }
             DashboardSelection::Rect(_) => DashboardSelection::Save,
-            DashboardSelection::FreeModels(_) => DashboardSelection::Save,
+            DashboardSelection::FreeModels(_) => match use_ai_idx {
+                Some(i) if i + 1 < editor.values.len() => DashboardSelection::Rect(i + 1),
+                _ => DashboardSelection::Save,
+            },
             DashboardSelection::Save => DashboardSelection::Save,
         };
     }
@@ -2936,10 +2979,14 @@ impl SettingsScreen {
     }
 
     fn dashboard_preferred_height(&self) -> u16 {
-        // Title + description + 3 rectangles (3 rows each) + 3 hint rows
-        // + spacer + Save button (3 rows) + saving-to line + footer hint.
+        // Title + description + rectangles (3 rows each) + hint rows
+        // + section headings + spacer + Save button (3 rows) + saving-to line + footer hint.
         let rects = DashboardField::ALL.len() as u16;
-        2 + rects * 3 + rects + 1 + 3 + 2
+        let headings = DashboardField::ALL
+            .iter()
+            .filter(|field| field.section_heading().is_some())
+            .count() as u16;
+        2 + rects * 3 + rects + headings + 1 + 3 + 2
     }
 
     fn path_template_preferred_height(&self) -> u16 {
@@ -3584,8 +3631,8 @@ impl SettingsScreen {
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+        let info_style = Style::default().fg(colors::INFO);
 
-        let rects = DashboardField::ALL.len();
         // Track where each field's rect chunk ends up so we can splice the
         // free-model chip rows in immediately after the useAi rectangle's
         // ↳ hint. The chips are scoped to useAi, not the whole page, so
@@ -3595,7 +3642,10 @@ impl SettingsScreen {
             .position(|f| matches!(f, DashboardField::UseAi));
         let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
         let mut chip_chunks: Option<(usize, usize)> = None;
-        for (i, _) in DashboardField::ALL.iter().enumerate() {
+        for (i, field) in DashboardField::ALL.iter().enumerate() {
+            if field.section_heading().is_some() {
+                constraints.push(Constraint::Length(1));
+            }
             constraints.push(Constraint::Length(3));
             constraints.push(Constraint::Length(1));
             if Some(i) == use_ai_field_idx {
@@ -3628,7 +3678,14 @@ impl SettingsScreen {
 
         let editing_idx = editor.editing_index();
         let mut cursor = 2usize;
-        for i in 0..rects {
+        for (i, field) in DashboardField::ALL.iter().enumerate() {
+            if let Some(heading) = field.section_heading() {
+                frame.render_widget(
+                    Paragraph::new(Line::from(branded_line(heading, info_style))),
+                    chunks[cursor],
+                );
+                cursor += 1;
+            }
             let rect_chunk = chunks[cursor];
             let hint_chunk = chunks[cursor + 1];
             self.render_dashboard_rectangle(frame, rect_chunk, hint_chunk, editor, i, editing_idx);
@@ -4919,6 +4976,13 @@ fn build_path_template_input(value: &str) -> InputPrompt {
         .with_default(value.to_string())
 }
 
+fn parse_dashboard_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "1" | "on"
+    )
+}
+
 /// Position of the `UseAi` field inside `DashboardField::ALL`. Re-derived
 /// from the static array so reordering the enum doesn't silently break the
 /// chip-row navigation.
@@ -4957,6 +5021,9 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
             "branch, status, ai_status, ahead_behind, diff, last_commit, pull_request"
         }
         DashboardField::UseAi => "provider/model (e.g. anthropic/claude-sonnet-4-5)",
+        DashboardField::NotificationsAiStatusOk | DashboardField::NotificationsPrChecksOk => {
+            "true or false"
+        }
     };
     InputPrompt::new("")
         .with_placeholder(placeholder)
@@ -4966,7 +5033,7 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::WorktreeConfig;
+    use crate::config::schema::{AiStatusConfig, DashboardNotificationsConfig, WorktreeConfig};
 
     fn dashboard_screen_with_free_models(models: Vec<String>) -> SettingsScreen {
         let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
@@ -4984,6 +5051,13 @@ mod tests {
         let idx = use_ai_field_index().unwrap();
         let editor = screen.dashboard_editor.as_mut().unwrap();
         editor.selection = DashboardSelection::Rect(idx);
+    }
+
+    fn dashboard_field_index(field: DashboardField) -> usize {
+        DashboardField::ALL
+            .iter()
+            .position(|candidate| *candidate == field)
+            .expect("dashboard field exists")
     }
 
     #[test]
@@ -5027,7 +5101,12 @@ mod tests {
         focus_use_ai(&mut screen);
         let _ = screen.handle_dashboard(key(KeyCode::Down));
         let editor = screen.dashboard_editor.as_ref().unwrap();
-        assert_eq!(editor.selection, DashboardSelection::Save);
+        assert_eq!(
+            editor.selection,
+            DashboardSelection::Rect(dashboard_field_index(
+                DashboardField::NotificationsAiStatusOk
+            ))
+        );
     }
 
     #[test]
@@ -5089,13 +5168,15 @@ mod tests {
     }
 
     #[test]
-    fn down_from_chips_advances_to_save() {
+    fn down_from_chips_advances_to_notifications() {
         let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
         screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         let _ = screen.handle_dashboard(key(KeyCode::Down));
         assert_eq!(
             screen.dashboard_editor.as_ref().unwrap().selection,
-            DashboardSelection::Save
+            DashboardSelection::Rect(dashboard_field_index(
+                DashboardField::NotificationsAiStatusOk
+            ))
         );
     }
 
@@ -5105,6 +5186,8 @@ mod tests {
             dashboard_screen_with_free_models(vec!["opencode/deepseek-v4-flash-free".to_string()]);
         screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         let _ = screen.handle_dashboard(key(KeyCode::Enter)); // stage
+        let _ = screen.handle_dashboard(key(KeyCode::Down)); // → notifications.aiStatusOk
+        let _ = screen.handle_dashboard(key(KeyCode::Down)); // → notifications.prChecksOk
         let _ = screen.handle_dashboard(key(KeyCode::Down)); // → Save
         let action = screen.handle_dashboard(key(KeyCode::Enter));
         match action {
@@ -5127,6 +5210,102 @@ mod tests {
         // The editor is still on screen — the picker should hand the user
         // back to the Dashboard editor, not bounce them to the menu.
         assert_eq!(screen.step, SettingsStep::Dashboard);
+    }
+
+    #[test]
+    fn dashboard_editor_exposes_notification_toggle_fields() {
+        assert_eq!(
+            DashboardField::NotificationsAiStatusOk.label(),
+            "notifications.aiStatusOk"
+        );
+        assert_eq!(
+            DashboardField::NotificationsPrChecksOk.label(),
+            "notifications.prChecksOk"
+        );
+        assert!(DashboardField::NotificationsAiStatusOk.is_toggle());
+        assert!(DashboardField::NotificationsPrChecksOk.is_toggle());
+        assert_eq!(
+            DashboardField::NotificationsAiStatusOk.section_heading(),
+            Some("Notifications")
+        );
+    }
+
+    #[test]
+    fn enter_toggles_dashboard_notifications_before_save() {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        screen.step = SettingsStep::Dashboard;
+        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+
+        let ai_idx = dashboard_field_index(DashboardField::NotificationsAiStatusOk);
+        let pr_idx = dashboard_field_index(DashboardField::NotificationsPrChecksOk);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(ai_idx);
+        assert_eq!(
+            screen.handle_dashboard(key(KeyCode::Enter)),
+            SettingsAction::Continue
+        );
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(pr_idx);
+        assert_eq!(
+            screen.handle_dashboard(key(KeyCode::Enter)),
+            SettingsAction::Continue
+        );
+
+        let editor = screen.dashboard_editor.as_ref().unwrap();
+        assert_eq!(editor.values[ai_idx], "true");
+        assert_eq!(editor.values[pr_idx], "true");
+        assert_eq!(editor.statuses[ai_idx], DashboardRectStatus::Modified);
+        assert_eq!(editor.statuses[pr_idx], DashboardRectStatus::Modified);
+    }
+
+    #[test]
+    fn save_dashboard_preserves_ai_status_and_persists_notifications() {
+        let config = WorktreeConfig {
+            dashboard: DashboardConfig {
+                ai_status: AiStatusConfig {
+                    enabled_harnesses: vec!["opencode".into()],
+                    active_window_ms: 7_500,
+                },
+                notifications: DashboardNotificationsConfig {
+                    ai_status_ok: false,
+                    pr_checks_ok: true,
+                },
+                ..DashboardConfig::default()
+            },
+            ..WorktreeConfig::default()
+        };
+        let mut screen = SettingsScreen::new(config, "test.json".to_string());
+        screen.step = SettingsStep::Dashboard;
+        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+
+        let ai_idx = dashboard_field_index(DashboardField::NotificationsAiStatusOk);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(ai_idx);
+        let _ = screen.handle_dashboard(key(KeyCode::Enter));
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Save;
+
+        match screen.handle_dashboard(key(KeyCode::Enter)) {
+            SettingsAction::SaveDashboard(cfg) => {
+                assert!(cfg.notifications.ai_status_ok);
+                assert!(cfg.notifications.pr_checks_ok);
+                assert_eq!(cfg.ai_status.enabled_harnesses, vec!["opencode"]);
+                assert_eq!(cfg.ai_status.active_window_ms, 7_500);
+            }
+            other => panic!("expected SaveDashboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_discards_unsaved_dashboard_notifications() {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        screen.step = SettingsStep::Dashboard;
+        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+
+        let ai_idx = dashboard_field_index(DashboardField::NotificationsAiStatusOk);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(ai_idx);
+        let _ = screen.handle_dashboard(key(KeyCode::Enter));
+        let action = screen.handle_dashboard(key(KeyCode::Esc));
+
+        assert_eq!(action, SettingsAction::Continue);
+        assert_eq!(screen.step, SettingsStep::Menu);
+        assert!(!screen.config.dashboard.notifications.ai_status_ok);
     }
 
     #[test]
