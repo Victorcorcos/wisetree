@@ -194,7 +194,6 @@ pub enum DashboardAction {
         branch: String,
     },
     JumpToDelete(String),
-    ToggleWiseMerge(bool),
     BulkDelete(BulkDeleteStatus, Vec<String>),
     CopyPath(String),
     OpenPullRequest(String),
@@ -242,7 +241,6 @@ enum DashboardColumn {
 enum FooterRow {
     Notice,
     Reviewers,
-    WiseMerge,
     BulkDelete,
     Shortcuts,
     StatusLegend,
@@ -328,9 +326,6 @@ pub struct DashboardScreen {
     refreshed_at: Option<Instant>,
     next_pr_fetch_at: Option<Instant>,
     pr_enrichment_enabled: bool,
-    wise_merge_enabled: bool,
-    wise_merge_focus: bool,
-    wise_merge_rect: Option<Rect>,
     /// `Some` while the bulk-delete buttons row owns the keyboard focus,
     /// `None` while the worktree table does. Tab toggles between the two
     /// sections; Left/Right move between buttons; Esc returns focus to the
@@ -385,9 +380,6 @@ impl DashboardScreen {
             refreshed_at: None,
             next_pr_fetch_at: None,
             pr_enrichment_enabled,
-            wise_merge_enabled: false,
-            wise_merge_focus: false,
-            wise_merge_rect: None,
             bulk_focus: None,
             last_bulk_focus: BulkDeleteStatus::ALL[0],
             bulk_button_rects: Vec::new(),
@@ -413,10 +405,6 @@ impl DashboardScreen {
 
     pub fn set_next_pr_fetch_at(&mut self, next_pr_fetch_at: Option<Instant>) {
         self.next_pr_fetch_at = next_pr_fetch_at;
-    }
-
-    pub fn set_wise_merge_enabled(&mut self, enabled: bool) {
-        self.wise_merge_enabled = enabled;
     }
 
     pub fn set_notice(&mut self, notice: DashboardNotice) {
@@ -494,16 +482,12 @@ impl DashboardScreen {
             return DashboardAction::Refresh;
         }
 
-        // Tab cycles focus through table → Wise Merge → bulk-delete → table.
+        // Tab toggles focus between the table and the bulk-delete buttons.
         // Available even while the search query has text — Tab is never
         // typeable into the search.
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.toggle_footer_focus();
+            self.toggle_bulk_focus();
             return DashboardAction::Continue;
-        }
-
-        if self.wise_merge_focus {
-            return self.handle_wise_merge_focus_key(key);
         }
 
         if let Some(focused) = self.bulk_focus {
@@ -521,21 +505,23 @@ impl DashboardScreen {
                 }
             }
             KeyCode::Up => {
-                // Up from the first filtered row jumps focus to the footer.
+                // Up from the first filtered row jumps focus to the bulk
+                // delete buttons.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected == 0 {
-                    self.wise_merge_focus = true;
+                    self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
                     return DashboardAction::Continue;
                 }
                 self.move_selection(-1);
                 DashboardAction::Continue
             }
             KeyCode::Down => {
-                // Down at the last filtered row moves focus onto the footer.
+                // Down at the last filtered row moves focus onto the bulk
+                // delete buttons.
                 // Otherwise advance selection within the table.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected + 1 >= filtered_len {
-                    self.wise_merge_focus = true;
+                    self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
                     return DashboardAction::Continue;
                 }
                 self.move_selection(1);
@@ -572,7 +558,6 @@ impl DashboardScreen {
                 self.selected = 0;
                 DashboardAction::Continue
             }
-            KeyCode::Char(' ') if self.query.is_empty() => self.trigger_wise_merge_toggle(),
             KeyCode::Char(c)
                 if !key
                     .modifiers
@@ -590,7 +575,6 @@ impl DashboardScreen {
         self.bulk_button_rects.clear();
         self.row_rects.clear();
         self.pr_button_rects.clear();
-        self.wise_merge_rect = None;
 
         if self.loading {
             StatusIndicator::new(Status::Loading, "Loading dashboard...")
@@ -639,48 +623,19 @@ impl DashboardScreen {
         }
     }
 
-    /// Tab cycles focus through table → Wise Merge → bulk-delete → table.
-    fn toggle_footer_focus(&mut self) {
-        if self.wise_merge_focus {
-            self.wise_merge_focus = false;
-            self.bulk_focus = Some(self.last_bulk_focus);
-            return;
-        }
-        if let Some(status) = self.bulk_focus {
-            self.last_bulk_focus = status;
-            self.bulk_focus = None;
-            return;
-        }
-        self.wise_merge_focus = true;
-    }
-
-    fn handle_wise_merge_focus_key(&mut self, key: KeyEvent) -> DashboardAction {
-        match key.code {
-            KeyCode::Esc => {
-                self.wise_merge_focus = false;
-                DashboardAction::Continue
+    /// Tab toggles focus between the worktree table (`None`) and the
+    /// bulk-delete buttons. Moving into the buttons resumes on the status
+    /// that was focused last (`last_bulk_focus`); moving back to the table
+    /// remembers the focused status so the round trip preserves the
+    /// selection.
+    fn toggle_bulk_focus(&mut self) {
+        match self.bulk_focus {
+            None => self.bulk_focus = Some(self.last_bulk_focus),
+            Some(status) => {
+                self.last_bulk_focus = status;
+                self.bulk_focus = None;
             }
-            KeyCode::Up => {
-                self.wise_merge_focus = false;
-                let filtered_len = self.filtered_indices().len();
-                if filtered_len > 0 {
-                    self.selected = filtered_len - 1;
-                }
-                DashboardAction::Continue
-            }
-            KeyCode::Down | KeyCode::Right => {
-                self.wise_merge_focus = false;
-                self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
-                DashboardAction::Continue
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => self.trigger_wise_merge_toggle(),
-            _ => DashboardAction::Continue,
         }
-    }
-
-    fn trigger_wise_merge_toggle(&mut self) -> DashboardAction {
-        self.wise_merge_enabled = !self.wise_merge_enabled;
-        DashboardAction::ToggleWiseMerge(self.wise_merge_enabled)
     }
 
     fn handle_bulk_focus_key(
@@ -694,8 +649,14 @@ impl DashboardScreen {
                 DashboardAction::Continue
             }
             KeyCode::Up => {
+                // Mirror the Post-Create Commands page: Up from the
+                // buttons row returns focus to the last item in the
+                // worktree list.
                 self.bulk_focus = None;
-                self.wise_merge_focus = true;
+                let filtered_len = self.filtered_indices().len();
+                if filtered_len > 0 {
+                    self.selected = filtered_len - 1;
+                }
                 DashboardAction::Continue
             }
             KeyCode::Down => {
@@ -820,17 +781,6 @@ impl DashboardScreen {
                 self.action_target = Some(index);
                 self.mode = DashboardMode::ActionMenu;
                 return DashboardAction::Continue;
-            }
-        }
-        if let Some(rect) = self.wise_merge_rect {
-            if position.x >= rect.left()
-                && position.x < rect.right()
-                && position.y >= rect.top()
-                && position.y < rect.bottom()
-            {
-                self.wise_merge_focus = true;
-                self.bulk_focus = None;
-                return self.trigger_wise_merge_toggle();
             }
         }
         for (status, rect) in self.bulk_button_rects.clone() {
@@ -1403,10 +1353,10 @@ impl DashboardScreen {
             data_y += 1;
         }
 
-        // When focus is on the footer, hide the
+        // When focus is on the bulk-delete buttons row, hide the
         // worktree selection (no highlight, no ➤ marker) so the user
         // sees a single active focus indicator at a time.
-        let show_selection = self.bulk_focus.is_none() && !self.wise_merge_focus;
+        let show_selection = self.bulk_focus.is_none();
         for (offset, index) in visible.iter().enumerate() {
             let row = &self.rows[*index];
             let filtered_idx = viewport.start + offset;
@@ -1534,7 +1484,6 @@ impl DashboardScreen {
         if self.reviewers_footer_height() > 0 {
             rows.push(FooterRow::Reviewers);
         }
-        rows.push(FooterRow::WiseMerge);
         rows.push(FooterRow::BulkDelete);
         rows.push(FooterRow::Shortcuts);
         rows.push(FooterRow::StatusLegend);
@@ -1590,7 +1539,6 @@ impl DashboardScreen {
             FooterRow::Reviewers => {
                 frame.render_widget(Paragraph::new(self.reviewers_line()), rect)
             }
-            FooterRow::WiseMerge => self.render_wise_merge_toggle(frame, rect),
             FooterRow::BulkDelete => self.render_bulk_delete_buttons(frame, rect),
             FooterRow::Shortcuts => {
                 frame.render_widget(Paragraph::new(self.shortcuts_line()), rect)
@@ -1750,53 +1698,11 @@ impl DashboardScreen {
 
     fn shortcuts_line(&self) -> Line<'static> {
         Line::from(Span::styled(
-            "↑↓ Navigate  ↵ Actions  Space Wise Merge  ⌫ Delete (empty search)  Tab Footer  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
+            "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
             Style::default()
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM),
         ))
-    }
-
-    fn render_wise_merge_toggle(&mut self, frame: &mut Frame, area: Rect) {
-        self.wise_merge_rect = Some(area);
-        let muted = Style::default().fg(colors::MUTED);
-        let marker = if self.wise_merge_focus {
-            SELECT_MARKER
-        } else {
-            BLANK_SELECT_MARKER
-        };
-        let label_style = if self.wise_merge_focus {
-            Style::default()
-                .fg(colors::WHITE)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(colors::INFO)
-        };
-        let checkbox = if self.wise_merge_enabled {
-            "☒"
-        } else {
-            "☐"
-        };
-        let checkbox_style = if self.wise_merge_enabled {
-            Style::default()
-                .fg(colors::SUCCESS)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(colors::EMPHASIS)
-                .add_modifier(Modifier::BOLD)
-        };
-        let line = Line::from(vec![
-            Span::styled(marker, Style::default().fg(colors::ACCENT)),
-            Span::styled("Wise Merge ", label_style),
-            Span::styled(checkbox, checkbox_style),
-            Span::styled("  ", muted),
-            Span::styled(
-                "auto-merges Opened 🟢👍✅ / 🟢✅ PRs every 1s",
-                muted.add_modifier(Modifier::DIM),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn status_legend_line(&self) -> Line<'static> {

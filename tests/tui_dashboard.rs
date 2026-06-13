@@ -370,38 +370,6 @@ fn ctrl_r_emits_refresh_action() {
 }
 
 #[test]
-fn space_toggles_wise_merge_when_search_is_empty() {
-    let mut screen = ready_screen(true);
-
-    assert_eq!(
-        screen.handle_key(key(KeyCode::Char(' '))),
-        DashboardAction::ToggleWiseMerge(true)
-    );
-    assert_eq!(
-        screen.handle_key(key(KeyCode::Char(' '))),
-        DashboardAction::ToggleWiseMerge(false)
-    );
-}
-
-#[test]
-fn space_stays_search_input_when_search_has_text() {
-    let mut screen = ready_screen(true);
-
-    screen.handle_key(key(KeyCode::Char('b')));
-    assert_eq!(
-        screen.handle_key(key(KeyCode::Char(' '))),
-        DashboardAction::Continue
-    );
-    screen.handle_key(key(KeyCode::Char('u')));
-
-    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
-    assert!(
-        dumped.contains("No worktrees match"),
-        "query should include the space, producing `b u` instead of matching `bug`: {dumped}"
-    );
-}
-
-#[test]
 fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
     let mut wrapper = ready_screen(true);
     wrapper.handle_key(key(KeyCode::Enter));
@@ -964,9 +932,9 @@ fn table_uses_available_height_before_scrolling() {
     screen.set_rows(rows);
 
     // Height must fit exactly: 4 (banner/search) + 13 (header + 12 rows)
-    // + 13 (13-line footer with Wise Merge, bordered bulk-delete buttons row, all legends
+    // + 12 (12-line footer with bordered bulk-delete buttons row, all legends
     // including PR merges, and the two AI Status legend rows).
-    let dumped = dump(120, 30, |f| screen.render(f, f.area()));
+    let dumped = dump(120, 29, |f| screen.render(f, f.area()));
     assert!(dumped.contains("repo-11"));
     assert!(!dumped.contains("more above"));
     assert!(!dumped.contains("more below"));
@@ -1131,7 +1099,7 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
 
     insta::assert_snapshot!(
         "dashboard_wide_pr_footer",
-        dump_lines(110, 21, |f| screen.render(f, f.area()))
+        dump_lines(110, 20, |f| screen.render(f, f.area()))
     );
 }
 
@@ -1160,7 +1128,7 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
 
     insta::assert_snapshot!(
         "dashboard_narrow_collapsed_columns",
-        dump_lines(72, 21, |f| screen.render(f, f.area()))
+        dump_lines(72, 20, |f| screen.render(f, f.area()))
     );
 }
 
@@ -1358,9 +1326,8 @@ fn bulk_delete_drafted_targets_only_draft_pr_rows() {
         row_with_pr_state("/tmp/repo-open", "open", false, PrState::Open),
     ]);
 
-    // Tab moves focus from the table onto Wise Merge, then onto the buttons
-    // (landing on the first, Merged); Right then steps Merged → Closed → Drafted.
-    screen.handle_key(key(KeyCode::Tab));
+    // Tab moves focus from the table onto the buttons (landing on the first,
+    // Merged); Right then steps Merged → Closed → Drafted.
     screen.handle_key(key(KeyCode::Tab));
     screen.handle_key(key(KeyCode::Right));
     screen.handle_key(key(KeyCode::Right));

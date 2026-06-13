@@ -63,7 +63,6 @@ pub const BASE_REF_PRIORITY: [&str; 6] = [
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API. The Status column countdown is driven by the same timer.
 pub const PR_REFRESH_PERIOD_MS: u64 = 30 * 1000;
-const WISE_MERGE_PERIOD: Duration = Duration::from_secs(1);
 const WISE_MERGE_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 /// Per-tick budget for the global AI-status scan. When exceeded, the index
 /// degrades to empty for this tick and every worktree renders `⬜ Pending`
@@ -743,11 +742,7 @@ impl DashboardService {
             let interval_ms = service.config.refresh_interval_ms;
             let mut interval = time::interval(Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let period = if service.config.wise_merge {
-                WISE_MERGE_PERIOD
-            } else {
-                Duration::from_millis(PR_REFRESH_PERIOD_MS)
-            };
+            let period = pr_refresh_period(&service.config);
             // Single source of truth for when the next on-cycle PR fetch
             // is due. The UI countdown reads this verbatim, and the loop
             // wakes precisely at this instant so the fetch fires the moment
@@ -2219,6 +2214,10 @@ fn is_rate_limit_error(err: &str) -> bool {
     lower.contains("rate limit") || lower.contains("rate-limit")
 }
 
+fn pr_refresh_period(_config: &DashboardConfig) -> Duration {
+    Duration::from_millis(PR_REFRESH_PERIOD_MS)
+}
+
 fn wise_merge_candidate(row: &DashboardRow) -> Option<WiseMergeCandidate> {
     if row.worktree.is_main {
         return None;
@@ -3511,6 +3510,18 @@ mod tests {
                 .expect("wise_merge_tasks poisoned")
                 .is_empty(),
             "dropping the watch should drain tracked Wise Merge handles"
+        );
+    }
+
+    #[test]
+    fn wise_merge_does_not_shorten_github_pr_refresh_period() {
+        let config = DashboardConfig {
+            wise_merge: true,
+            ..DashboardConfig::default()
+        };
+        assert_eq!(
+            pr_refresh_period(&config),
+            Duration::from_millis(PR_REFRESH_PERIOD_MS)
         );
     }
 
