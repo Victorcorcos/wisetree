@@ -21,11 +21,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
-use crate::messages::{
-    colors, UPDATE_CHECKING, UPDATE_CHECK_MENU, UPDATE_FAILED, UPDATE_INSTALL_CMD,
-    UPDATE_UP_TO_DATE,
-};
-use crate::services::UpdateCheckResult;
+use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
+use crate::services::{MultiSourceUpdateResult, UpdateSource};
 use crate::tui::widgets::{
     branded_line, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
     InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
@@ -65,6 +62,9 @@ pub enum SettingsAction {
     Back,
     CopySettingsFilePath,
     CheckUpdates,
+    /// User confirmed an upgrade in the "Check for Updates" screen.
+    /// The `App` runs the matching shell command for the source.
+    UpgradeSource(UpdateSource),
     SetDeleteBranchWithWorktree(bool),
     Reset,
     SaveCopyPatterns(Vec<String>),
@@ -1140,10 +1140,26 @@ pub struct SettingsScreen {
     /// focus field.
     free_models: Option<Result<Vec<String>, String>>,
     copy_settings_select: Option<SelectPrompt<CopyDirection>>,
-    update_result: Option<UpdateCheckResult>,
+    update_result: Option<MultiSourceUpdateResult>,
     checking_updates: bool,
+    /// Which source rectangle is currently highlighted in the
+    /// "Check for Updates" screen.
+    update_selection: UpdateSource,
+    /// Source currently being upgraded — `Some` shows a spinner instead of
+    /// the rectangles. Cleared once `set_upgrade_result` is called.
+    upgrading_source: Option<UpdateSource>,
+    /// Result of the last upgrade attempt. Rendered as a success / error
+    /// line above the rectangles when present.
+    upgrade_outcome: Option<UpgradeOutcome>,
     mouse_targets: RefCell<Vec<(SettingsMouseTarget, Rect)>>,
     pub tick: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeOutcome {
+    pub source: UpdateSource,
+    pub success: bool,
+    pub message: String,
 }
 
 impl SettingsScreen {
@@ -1174,6 +1190,9 @@ impl SettingsScreen {
             copy_settings_select: None,
             update_result: None,
             checking_updates: false,
+            update_selection: UpdateSource::Npm,
+            upgrading_source: None,
+            upgrade_outcome: None,
             mouse_targets: RefCell::new(Vec::new()),
             tick: 0,
         };
@@ -1254,8 +1273,20 @@ impl SettingsScreen {
         self.checking_updates
     }
 
-    pub fn update_result(&self) -> Option<&UpdateCheckResult> {
+    pub fn update_result(&self) -> Option<&MultiSourceUpdateResult> {
         self.update_result.as_ref()
+    }
+
+    pub fn update_selection(&self) -> UpdateSource {
+        self.update_selection
+    }
+
+    pub fn upgrading_source(&self) -> Option<UpdateSource> {
+        self.upgrading_source
+    }
+
+    pub fn upgrade_outcome(&self) -> Option<&UpgradeOutcome> {
+        self.upgrade_outcome.as_ref()
     }
 
     pub fn set_error(&mut self, message: String) {
@@ -1408,11 +1439,28 @@ impl SettingsScreen {
     pub fn start_checking_updates(&mut self) {
         self.checking_updates = true;
         self.update_result = None;
+        self.upgrade_outcome = None;
+        self.upgrading_source = None;
+        self.update_selection = UpdateSource::Npm;
     }
 
-    pub fn set_update_result(&mut self, result: UpdateCheckResult) {
+    pub fn set_update_result(&mut self, result: MultiSourceUpdateResult) {
         self.update_result = Some(result);
         self.checking_updates = false;
+    }
+
+    /// Mark the start of an in-flight `<source>` upgrade so the screen can
+    /// swap to a spinner while the subprocess is running.
+    pub fn start_upgrade(&mut self, source: UpdateSource) {
+        self.upgrading_source = Some(source);
+        self.upgrade_outcome = None;
+    }
+
+    /// Surface the result of an upgrade attempt. Caller decides whether to
+    /// also pop the user back to the settings menu.
+    pub fn set_upgrade_outcome(&mut self, outcome: UpgradeOutcome) {
+        self.upgrading_source = None;
+        self.upgrade_outcome = Some(outcome);
     }
 
     fn build_menu(&self) -> SelectPrompt<SettingsStep> {
@@ -2824,21 +2872,38 @@ impl SettingsScreen {
     }
 
     fn handle_check_updates(&mut self, key: KeyEvent) -> SettingsAction {
-        if self.checking_updates {
+        // While the registry check or an upgrade is running, swallow keys
+        // except Esc (which still backs out of the screen).
+        if self.checking_updates || self.upgrading_source.is_some() {
+            if matches!(key.code, KeyCode::Esc) {
+                self.leave_check_updates();
+            }
             return SettingsAction::Continue;
         }
         match key.code {
             KeyCode::Esc => {
-                self.step = SettingsStep::Menu;
-                self.update_result = None;
+                self.leave_check_updates();
                 SettingsAction::Continue
             }
-            _ => {
-                self.step = SettingsStep::Menu;
-                self.update_result = None;
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.update_selection = UpdateSource::Npm;
                 SettingsAction::Continue
             }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.update_selection = UpdateSource::Homebrew;
+                SettingsAction::Continue
+            }
+            KeyCode::Enter => SettingsAction::UpgradeSource(self.update_selection),
+            _ => SettingsAction::Continue,
         }
+    }
+
+    fn leave_check_updates(&mut self) {
+        self.step = SettingsStep::Menu;
+        self.update_result = None;
+        self.upgrading_source = None;
+        self.upgrade_outcome = None;
+        self.update_selection = UpdateSource::Npm;
     }
 
     /// Inner content height for the panel (excludes the rounded border).
@@ -2847,9 +2912,12 @@ impl SettingsScreen {
             return 6;
         }
         match self.step {
+            // Settings menu: config path header + select prompt + hint.
             SettingsStep::Menu => 22,
             SettingsStep::SetupProject => 6,
-            SettingsStep::CheckUpdates => 6,
+            // Title + description + 2 rectangles (3 rows each) + 2 hints
+            // + spacer + result line + footer hint.
+            SettingsStep::CheckUpdates => 14,
             SettingsStep::CopyPatterns => self.pattern_list_preferred_height(),
             SettingsStep::LinkPatterns => self.pattern_list_preferred_height(),
             SettingsStep::LinkStrategy => self.link_strategy_preferred_height(),
@@ -4535,6 +4603,13 @@ Safety features:\n\
                 .render(frame, area);
             return;
         }
+        if let Some(source) = self.upgrading_source {
+            let msg = format!("Upgrading via {}...", source.label());
+            StatusIndicator::new(Status::Loading, &msg)
+                .with_tick(self.tick)
+                .render(frame, area);
+            return;
+        }
         let result = match &self.update_result {
             Some(r) => r,
             None => {
@@ -4545,52 +4620,147 @@ Safety features:\n\
             }
         };
 
-        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            UPDATE_CHECK_MENU.to_string(),
-            Style::default()
-                .fg(colors::INFO)
-                .add_modifier(Modifier::BOLD),
-        ))];
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(colors::MUTED);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
-        if result.has_update {
-            let latest = result.latest_version.as_deref().unwrap_or("");
-            lines.push(Line::from(Span::styled(
-                format!("✓ New version available: v{latest}"),
-                Style::default().fg(colors::SUCCESS),
-            )));
-            lines.push(Line::from(format!(
-                "Current version: v{}",
-                result.current_version
-            )));
-            let install_style = Style::default()
-                .fg(colors::PRIMARY)
-                .add_modifier(Modifier::BOLD);
-            let mut run_spans = vec![Span::styled("Run: ", Style::default().fg(colors::MUTED))];
-            run_spans.extend(branded_line(UPDATE_INSTALL_CMD, install_style));
-            lines.push(Line::from(run_spans));
-        } else if result.error.is_some() {
-            lines.push(Line::from(Span::styled(
-                UPDATE_FAILED.to_string(),
-                Style::default().fg(colors::WARNING),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("Current version: v{}", result.current_version),
-                Style::default().fg(colors::MUTED),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                format!("✓ {UPDATE_UP_TO_DATE} (v{})", result.current_version),
-                Style::default().fg(colors::SUCCESS),
-            )));
+        let sources = [UpdateSource::Npm, UpdateSource::Homebrew];
+        let mut constraints: Vec<Constraint> = vec![
+            Constraint::Length(1), // title
+            Constraint::Length(1), // description
+        ];
+        for _ in 0..sources.len() {
+            constraints.push(Constraint::Length(3)); // rectangle
+            constraints.push(Constraint::Length(1)); // per-source hint
         }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "Press any key to go back.",
+        constraints.push(Constraint::Length(1)); // outcome / blank
+        constraints.push(Constraint::Min(0));
+        constraints.push(Constraint::Length(1)); // footer hint
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(UPDATE_CHECK_MENU, title_style))),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(
+                &format!(
+                    "Current version: v{}. Select a source and press Enter to upgrade:",
+                    result.current_version
+                ),
+                muted_style,
+            ))),
+            chunks[1],
+        );
+
+        for (i, source) in sources.iter().enumerate() {
+            let rect_chunk = chunks[2 + i * 2];
+            let hint_chunk = chunks[2 + i * 2 + 1];
+            self.render_update_rectangle(frame, rect_chunk, hint_chunk, *source, result);
+        }
+
+        let outcome_chunk = chunks[2 + sources.len() * 2];
+        if let Some(outcome) = &self.upgrade_outcome {
+            let style = if outcome.success {
+                Style::default().fg(colors::SUCCESS)
+            } else {
+                Style::default().fg(colors::ERROR)
+            };
+            let prefix = if outcome.success { "✓ " } else { "✗ " };
+            let label = outcome.source.label();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("{prefix}{label}: {}", outcome.message),
+                    style,
+                ))),
+                outcome_chunk,
+            );
+        }
+
+        let footer_chunk = chunks[2 + sources.len() * 2 + 2];
+        frame.render_widget(
+            Paragraph::new("↑↓ to move • Enter to upgrade • Esc to go back").style(dim_muted_style),
+            footer_chunk,
+        );
+    }
+
+    fn render_update_rectangle(
+        &self,
+        frame: &mut Frame,
+        rect_area: Rect,
+        hint_area: Rect,
+        source: UpdateSource,
+        result: &MultiSourceUpdateResult,
+    ) {
+        let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
+
+        let is_selected = self.update_selection == source;
+        let per_source = result.source(source);
+
+        // Body inside the rectangle: latest version, or error string.
+        let body_text = if let Some(err) = &per_source.error {
+            format!("error: {err}")
+        } else if let Some(latest) = &per_source.latest_version {
+            format!("v{latest}")
+        } else {
+            "(unavailable)".to_string()
+        };
+
+        let content_style = if is_selected {
             Style::default()
-                .fg(colors::MUTED)
-                .add_modifier(Modifier::DIM),
-        )));
-        frame.render_widget(Paragraph::new(lines), area);
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        let mut inner_line = Line::from(Span::raw(body_text));
+        if is_selected {
+            inner_line.spans.insert(
+                0,
+                Span::styled(
+                    POST_CMD_SELECTION_MARKER,
+                    Style::default().fg(colors::ACCENT),
+                ),
+            );
+        }
+        inner_line.style = content_style;
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(colors::SUCCESS))
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(format!(" {} ", source.label()), info_style));
+        frame.render_widget(Paragraph::new(inner_line).block(block), rect_area);
+
+        let hint_text = if per_source.error.is_some() {
+            format!(
+                "  ↳ Press Enter to attempt: {}",
+                source.upgrade_command_display()
+            )
+        } else if per_source.has_update {
+            format!(
+                "  ↳ Press Enter to upgrade with: {}",
+                source.upgrade_command_display()
+            )
+        } else {
+            format!(
+                "  ↳ Already up to date. Press Enter to re-run: {}",
+                source.upgrade_command_display()
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint_text, muted_style))),
+            hint_area,
+        );
     }
 }
 
