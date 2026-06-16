@@ -34,10 +34,10 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, DashboardService, DashboardUpdate,
-    DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest, MultiSourceUpdateResult,
-    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
-    UpdateSource,
+    parse_pull_request_md, resolve_dashboard_columns, DashboardNoticeLevel, DashboardService,
+    DashboardUpdate, DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest,
+    MultiSourceUpdateResult, OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -3177,17 +3177,20 @@ impl App {
     }
 
     fn poll_dashboard_updates(&mut self) {
-        let Some(watch) = self.dashboard_watch.as_mut() else {
-            return;
+        let (updates_batch, notices) = {
+            let Some(watch) = self.dashboard_watch.as_mut() else {
+                return;
+            };
+            let mut updates_batch = Vec::new();
+            let mut notices = Vec::new();
+            while let Ok(update) = watch.rx.try_recv() {
+                updates_batch.push(update);
+            }
+            while let Ok(notice) = watch.notice_rx.try_recv() {
+                notices.push(notice);
+            }
+            (updates_batch, notices)
         };
-        let mut updates_batch = Vec::new();
-        let mut notices = Vec::new();
-        while let Ok(update) = watch.rx.try_recv() {
-            updates_batch.push(update);
-        }
-        while let Ok(notice) = watch.notice_rx.try_recv() {
-            notices.push(notice);
-        }
 
         if let Some(screen) = self.dashboard.as_mut() {
             for update in updates_batch {
@@ -3204,13 +3207,24 @@ impl App {
             .dashboard
             .as_ref()
             .is_some_and(DashboardScreen::has_rows);
+        let mut refresh_dashboard = false;
         for notice in notices {
+            if notice.level == DashboardNoticeLevel::Success {
+                refresh_dashboard = true;
+                self.show_toast(ToastVariant::Success, notice.message);
+                continue;
+            }
             if let Some(screen) = self.dashboard.as_mut() {
                 if has_rows {
                     screen.set_notice(notice);
                 } else {
                     screen.set_error(notice.message);
                 }
+            }
+        }
+        if refresh_dashboard {
+            if let Some(watch) = self.dashboard_watch.as_ref() {
+                watch.refresh();
             }
         }
     }

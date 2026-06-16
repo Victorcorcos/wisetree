@@ -1075,6 +1075,7 @@ impl DashboardService {
                     .lock()
                     .expect("wise_merge_merged poisoned")
                     .insert(number);
+                self.mark_cached_pr_merged(number);
                 self.send_dashboard_notice(DashboardNotice::success(format!(
                     "Wise Merge squash-merged PR #{number} after resolving base ref `{base_ref}`."
                 )));
@@ -1088,6 +1089,23 @@ impl DashboardService {
                     "Wise Merge failed for PR #{number}: {err}"
                 )));
             }
+        }
+    }
+
+    fn mark_cached_pr_merged(&self, number: u64) {
+        let mut state = self.pr_state.lock().expect("pr_state poisoned");
+        let mut changed = false;
+        for entry in state.entries.values_mut() {
+            let Some(pr) = entry.pull_request.as_mut() else {
+                continue;
+            };
+            if pr.number == number && pr.state != PrState::Merged {
+                pr.state = PrState::Merged;
+                changed = true;
+            }
+        }
+        if changed {
+            state.dirty = true;
         }
     }
 
@@ -3523,6 +3541,36 @@ mod tests {
             pr_refresh_period(&config),
             Duration::from_millis(PR_REFRESH_PERIOD_MS)
         );
+    }
+
+    #[test]
+    fn finish_wise_merge_marks_cached_pr_as_merged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_cache_path(None);
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let pr = row.pull_request.expect("pull request");
+        {
+            let mut state = service.pr_state.lock().expect("pr_state poisoned");
+            state.entries.insert(
+                "feature".to_string(),
+                PrCacheEntry {
+                    sha: "abc123".to_string(),
+                    pull_request: Some(pr),
+                },
+            );
+        }
+
+        service.finish_wise_merge(42, Ok("upstream/main".to_string()));
+
+        let state = service.pr_state.lock().expect("pr_state poisoned");
+        let pr = state
+            .entries
+            .get("feature")
+            .and_then(|entry| entry.pull_request.as_ref())
+            .expect("cached pull request");
+        assert_eq!(pr.state, PrState::Merged);
+        assert!(state.dirty);
     }
 
     #[test]
