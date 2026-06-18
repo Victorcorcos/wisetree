@@ -482,12 +482,9 @@ impl DashboardScreen {
             return DashboardAction::Refresh;
         }
 
-        // Tab toggles focus between the worktree table and the bulk-delete
-        // buttons; BackTab does the same since there are only two sections.
-        // Each side keeps its selection across the round trip (the table its
-        // highlighted row, the buttons their focused status). Available even
-        // while the search query has text — Tab is never typeable into the
-        // search. Left/Right still move between individual buttons.
+        // Tab toggles focus between the table and the bulk-delete buttons.
+        // Available even while the search query has text — Tab is never
+        // typeable into the search.
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.toggle_bulk_focus();
             return DashboardAction::Continue;
@@ -509,7 +506,7 @@ impl DashboardScreen {
             }
             KeyCode::Up => {
                 // Up from the first filtered row jumps focus to the bulk
-                // delete buttons (mirroring Down at the last row).
+                // delete buttons.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected == 0 {
                     self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
@@ -520,8 +517,8 @@ impl DashboardScreen {
             }
             KeyCode::Down => {
                 // Down at the last filtered row moves focus onto the bulk
-                // delete buttons (matching the Post-Create Commands page
-                // pattern). Otherwise advance selection within the table.
+                // delete buttons.
+                // Otherwise advance selection within the table.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected + 1 >= filtered_len {
                     self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
@@ -869,9 +866,10 @@ impl DashboardScreen {
                 color: colors::BRAND,
             });
         }
-        // Update only when the branch is behind its base (merge_status or
-        // local behind count). Mutually exclusive with Push.
-        if is_active && row_is_behind(row) {
+        // Update when the branch is behind its base (merge_status or local
+        // behind count) or when GitHub reports the PR as conflicting (`Dirty`)
+        // — both need an AI-assisted base merge. Mutually exclusive with Push.
+        if is_active && row_needs_update(row) {
             commands.push(PrCommand {
                 label: "Update",
                 choice: ActionChoice::UpdatePullRequest,
@@ -2617,14 +2615,37 @@ pub(crate) fn row_is_behind(row: &DashboardRow) -> bool {
     merge_says_behind || git_says_behind
 }
 
+/// True when the row's PR has merge conflicts with its base — GitHub reports
+/// `mergeStateStatus = DIRTY` (`MergeStatus::Dirty`) for a branch that has
+/// diverged *and* conflicts. Unlike `Behind`, a conflicting branch is usually
+/// *not* flagged as behind locally (the worktree's default branch is stale),
+/// so this is the only reliable signal that an AI-assisted base merge is
+/// needed. Used together with [`row_is_behind`] to gate the "Update" command.
+pub(crate) fn row_has_conflicts(row: &DashboardRow) -> bool {
+    row.pull_request
+        .as_ref()
+        .and_then(|pr| pr.merge_status)
+        .map(|status| matches!(status, MergeStatus::Dirty))
+        .unwrap_or(false)
+}
+
+/// True when the row's branch needs an AI-assisted base merge — it is either
+/// behind its base ([`row_is_behind`]) or conflicting with it
+/// ([`row_has_conflicts`]). Single source of truth for the "Update Pull
+/// Request" visibility rule; keeps Update and Push mutually exclusive (see
+/// [`row_has_unpushed`]).
+pub(crate) fn row_needs_update(row: &DashboardRow) -> bool {
+    row_is_behind(row) || row_has_conflicts(row)
+}
+
 /// True when the row's branch has local commits that aren't on the remote
-/// yet — ahead of its base but *not* behind. This is the
+/// yet — ahead of its base but with no pending base merge. This is the
 /// "merged-but-not-pushed" signal a failed push leaves behind (the local
 /// merge landed, so `behind` dropped to 0, but `ahead` is still positive).
-/// Mutually exclusive with [`row_is_behind`], so Update and Push never both
+/// Mutually exclusive with [`row_needs_update`], so Update and Push never both
 /// appear. Used to gate the "Push Pull Request" menu entry.
 pub(crate) fn row_has_unpushed(row: &DashboardRow) -> bool {
-    if row_is_behind(row) {
+    if row_needs_update(row) {
         return false;
     }
     row.worktree
@@ -2643,14 +2664,15 @@ fn pr_accepts_lifecycle_commands(state: PrState) -> bool {
 }
 
 /// Assemble the payload the update confirmation screen needs. Returns
-/// `None` when the row's PR is missing/terminal or the branch isn't
-/// behind — mirrors the guard in `build_action_select`.
+/// `None` when the row's PR is missing/terminal or the branch neither is
+/// behind nor conflicts with its base — mirrors the guard in
+/// `build_action_select`.
 fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
     let pr = row.pull_request.as_ref()?;
     if !pr_accepts_lifecycle_commands(pr.state) {
         return None;
     }
-    if !row_is_behind(row) {
+    if !row_needs_update(row) {
         return None;
     }
     let (ahead, behind) = row
@@ -2999,6 +3021,7 @@ fn format_refreshed_label(duration: std::time::Duration) -> String {
 
 fn notice_style(level: DashboardNoticeLevel) -> Style {
     match level {
+        DashboardNoticeLevel::Success => Style::default().fg(colors::SUCCESS),
         DashboardNoticeLevel::Warning => Style::default().fg(colors::WARNING),
         DashboardNoticeLevel::Error => Style::default().fg(colors::ERROR),
     }
@@ -3037,6 +3060,9 @@ mod tests {
             state: PrState::Open,
             url: "https://github.com/example/repo/pull/42".to_string(),
             title: "Add feature".to_string(),
+            base_ref_name: Some("main".to_string()),
+            base_repository: Some("example/repo".to_string()),
+            head_ref_oid: Some("abc123".to_string()),
             labels: vec![],
             checks_status: None,
             review_status: None,
@@ -3132,6 +3158,59 @@ mod tests {
             labels.iter().any(|l| l == "Update"),
             "Update should show when behind: {labels:?}"
         );
+    }
+
+    #[test]
+    fn row_needs_update_true_when_pr_conflicting() {
+        // GitHub reports a conflicting PR as DIRTY, and the worktree's local
+        // default branch is stale so git's behind count reads 0 — only
+        // merge_status flags the conflict.
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Dirty);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        assert!(row_has_conflicts(&r));
+        assert!(!row_is_behind(&r));
+        assert!(row_needs_update(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_when_pr_conflicting() {
+        // A conflicting PR needs Update, not Push, even though it looks
+        // ahead-but-not-behind locally.
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Dirty);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn update_action_appears_for_conflicting_pr() {
+        // Regression: a conflicting (DIRTY) PR whose local branch reads
+        // ahead>0, behind==0 must surface Update — not Push — so the user can
+        // run the AI-assisted base merge that resolves the conflicts.
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Dirty);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        let labels = pr_labels(&r);
+        assert!(
+            labels.iter().any(|l| l == "Update"),
+            "Update should show for a conflicting PR: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "Push"),
+            "Push must not show for a conflicting PR: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn build_update_request_returns_payload_for_conflicting_pr() {
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Dirty);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        let request = build_update_request(&r).expect("update request built for conflicting PR");
+        assert_eq!(request.number, 42);
+        assert_eq!(request.branch, "feature");
+        assert!(request.base_ref.is_none());
     }
 
     #[test]
