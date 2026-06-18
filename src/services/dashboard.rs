@@ -35,6 +35,11 @@ const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_MERGE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on the background single-branch base fetch that keeps the base's
+/// remote-tracking ref fresh for the behind-count. A scoped fetch normally
+/// completes in ~1s; the cap stops a slow network from stalling the on-cycle
+/// tick.
+const BASE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeouts for the "Fill Pull Request" pipeline. Gathering the diff/log is
 /// read-only but can be large on a long branch; push + `gh pr create/edit`
 /// talk to the network.
@@ -750,6 +755,18 @@ impl DashboardService {
             let mut next_pr_fetch_at: Option<Instant> = None;
 
             loop {
+                let enrich = service.pr_enrichment_enabled();
+                let on_cycle = enrich && next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
+                // On the 30s PR beat, refresh the base branch's remote-tracking
+                // ref first so the behind-count below reflects commits another
+                // developer pushed to the base — the signal the "Update"
+                // command is gated on. Awaited *before* collect_git_rows so the
+                // fresh commits land in this same render, and tied to the PR
+                // cadence so the git behind-count and GitHub's merge_status stay
+                // in lockstep. Best-effort: a failed fetch never stalls the tick.
+                if on_cycle {
+                    service.fetch_base_ref().await;
+                }
                 // Emit git-only rows (with cached PRs applied) first so the
                 // UI exits "Loading dashboard..." without waiting on the gh
                 // GraphQL round-trip. Then refresh PRs and emit again.
@@ -762,9 +779,7 @@ impl DashboardService {
                         {
                             break;
                         }
-                        if service.pr_enrichment_enabled() {
-                            let on_cycle =
-                                next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
+                        if enrich {
                             let fresh_prs = service.refresh_pull_requests(&rows, on_cycle).await;
                             if on_cycle {
                                 next_pr_fetch_at = Some(Instant::now() + period);
@@ -1915,6 +1930,38 @@ impl DashboardService {
             insertions,
             deletions,
         })
+    }
+
+    /// Best-effort refresh of the PR base branch's remote-tracking ref so the
+    /// dashboard's behind-count reflects commits another developer pushed to
+    /// the base. Without this the count is measured against a possibly-stale
+    /// `origin/main`, so a behind-but-conflict-free PR never surfaces the
+    /// "Update" command in repos that don't enforce up-to-date branches.
+    ///
+    /// Fetches a single branch with an explicit destination refspec
+    /// (`+<branch>:refs/remotes/<remote>/<branch>`) so only the one
+    /// remote-tracking ref `fetch_upstream_diff` reads is updated — no
+    /// `--all`, no extra branches, minimal transfer. Failures (offline, auth,
+    /// missing ref) are swallowed: a stale tracking ref just means the count
+    /// lags until the next successful fetch, never a stalled tick.
+    async fn fetch_base_ref(&self) {
+        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &self.git_root).await
+        else {
+            return;
+        };
+        let Some((remote, branch)) = base_ref.split_once('/') else {
+            return;
+        };
+        let refspec = format!("+{branch}:refs/remotes/{remote}/{branch}");
+        let _ = time::timeout(
+            BASE_FETCH_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["fetch", remote, &refspec],
+                Some(&self.git_root),
+            ),
+        )
+        .await;
     }
 
     async fn fetch_last_commit(
@@ -3491,6 +3538,79 @@ mod tests {
         assert!(
             log.contains("pr merge 7 --squash --subject Subject (#7) --body Body --repo owner/repo --match-head-commit abc123"),
             "automatic merge must pin --repo and --match-head-commit; log was {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_base_ref_advances_stale_remote_tracking_ref() {
+        use std::process::Command;
+
+        // Hermetic git: never depend on the machine's global identity/config.
+        fn git(cwd: &Path, args: &[&str]) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git invocation");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed in {cwd:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+
+        // Bare remote (the shared base), with `main` as its default branch.
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // A working clone seeds `main` and pushes it to the remote.
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("a.txt"), "1").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // The repo the dashboard polls: a fresh clone, so origin/main matches
+        // the seed commit.
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, local.to_str().unwrap()],
+        );
+        let stale = git(&local, &["rev-parse", "origin/main"]);
+
+        // Another developer pushes a new commit to the base branch.
+        std::fs::write(work.join("b.txt"), "2").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "second"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        let advanced = git(&work, &["rev-parse", "HEAD"]);
+
+        // The dashboard's clone hasn't fetched yet, so its origin/main is stale.
+        assert_ne!(stale, advanced);
+        assert_eq!(git(&local, &["rev-parse", "origin/main"]), stale);
+
+        // fetch_base_ref refreshes only the base's remote-tracking ref.
+        let service = DashboardService::new(local.clone(), DashboardConfig::default());
+        service.fetch_base_ref().await;
+
+        assert_eq!(
+            git(&local, &["rev-parse", "origin/main"]),
+            advanced,
+            "fetch_base_ref should advance origin/main to the newly pushed commit"
         );
     }
 
