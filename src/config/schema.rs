@@ -132,8 +132,17 @@ pub struct DashboardConfig {
     #[serde(rename = "aiStatus", default)]
     pub ai_status: AiStatusConfig,
 
-    #[serde(rename = "notifications", default)]
-    pub notifications: DashboardNotificationsConfig,
+    /// Deprecated location for the notification toggles. Read only for
+    /// backward compatibility with configs written before notifications moved
+    /// to the top-level [`WorktreeConfig::notifications`] field; folded up by
+    /// [`WorktreeConfig::migrate_notifications`] on load and never written back
+    /// (`skip_serializing_if` drops it once `None`).
+    #[serde(
+        rename = "notifications",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_notifications: Option<NotificationsConfig>,
 }
 
 impl Default for DashboardConfig {
@@ -145,7 +154,7 @@ impl Default for DashboardConfig {
             columns: default_columns(),
             use_ai: String::new(),
             ai_status: AiStatusConfig::default(),
-            notifications: DashboardNotificationsConfig::default(),
+            legacy_notifications: None,
         }
     }
 }
@@ -172,10 +181,10 @@ impl DashboardConfig {
     }
 }
 
-/// Opt-in dashboard terminal-bell notifications.
+/// Opt-in terminal-bell notifications for dashboard-observed events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
-pub struct DashboardNotificationsConfig {
+pub struct NotificationsConfig {
     #[serde(rename = "aiStatusOk", default)]
     pub ai_status_ok: bool,
 
@@ -263,6 +272,10 @@ pub struct WorktreeConfig {
     /// Live dashboard preferences.
     #[serde(rename = "dashboard", default)]
     pub dashboard: DashboardConfig,
+
+    /// Opt-in terminal-bell notifications (AI finished, PR checks passed).
+    #[serde(rename = "notifications", default)]
+    pub notifications: NotificationsConfig,
 }
 
 impl Default for WorktreeConfig {
@@ -278,6 +291,22 @@ impl Default for WorktreeConfig {
             terminal_command: String::new(),
             delete_branch_with_worktree: false,
             dashboard: DashboardConfig::default(),
+            notifications: NotificationsConfig::default(),
+        }
+    }
+}
+
+impl WorktreeConfig {
+    /// Fold the pre-split `dashboard.notifications` block into the top-level
+    /// `notifications` field so configs written before notifications became a
+    /// standalone setting keep their bell preferences. The top-level value
+    /// wins when both are present; the legacy block is consumed so it is never
+    /// written back to disk.
+    pub fn migrate_notifications(&mut self) {
+        if let Some(legacy) = self.dashboard.legacy_notifications.take() {
+            if self.notifications == NotificationsConfig::default() {
+                self.notifications = legacy;
+            }
         }
     }
 }

@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use tempfile::TempDir;
 use wisetree::config::schema::{
     clamp_dashboard_refresh_interval, default_copy_ignores, default_copy_patterns,
-    default_path_template, AiStatusConfig, DashboardNotificationsConfig, LinkStrategy,
+    default_path_template, AiStatusConfig, LinkStrategy, NotificationsConfig,
 };
 use wisetree::config::{ConfigService, WorktreeConfig};
 
@@ -38,10 +38,7 @@ fn defaults_match_upstream() {
     assert_eq!(cfg.worktree_link_cache_dir, None);
     assert_eq!(cfg.terminal_command, "");
     assert!(!cfg.delete_branch_with_worktree);
-    assert_eq!(
-        cfg.dashboard.notifications,
-        DashboardNotificationsConfig::default()
-    );
+    assert_eq!(cfg.notifications, NotificationsConfig::default());
 }
 
 #[test]
@@ -231,10 +228,11 @@ fn dashboard_config_round_trips_json() {
             columns: vec!["status".into(), "branch".into(), "pull_request".into()],
             use_ai: String::new(),
             ai_status: Default::default(),
-            notifications: DashboardNotificationsConfig {
-                ai_status_ok: true,
-                pr_checks_ok: true,
-            },
+            legacy_notifications: None,
+        },
+        notifications: NotificationsConfig {
+            ai_status_ok: true,
+            pr_checks_ok: true,
         },
         ..WorktreeConfig::default()
     };
@@ -242,10 +240,11 @@ fn dashboard_config_round_trips_json() {
     let raw = serde_json::to_string(&cfg).unwrap();
     let parsed: WorktreeConfig = serde_json::from_str(&raw).unwrap();
     assert_eq!(parsed.dashboard, cfg.dashboard);
+    assert_eq!(parsed.notifications, cfg.notifications);
 }
 
 #[test]
-fn dashboard_notifications_default_to_disabled_when_omitted() {
+fn notifications_default_to_disabled_when_omitted() {
     let raw = r#"{
   "dashboard": {
     "refreshIntervalMs": 5000,
@@ -267,34 +266,30 @@ fn dashboard_notifications_default_to_disabled_when_omitted() {
         vec!["claude_code"]
     );
     assert_eq!(parsed.dashboard.ai_status.active_window_ms, 7_500);
-    assert!(!parsed.dashboard.notifications.ai_status_ok);
-    assert!(!parsed.dashboard.notifications.pr_checks_ok);
+    assert!(!parsed.notifications.ai_status_ok);
+    assert!(!parsed.notifications.pr_checks_ok);
 }
 
 #[test]
-fn dashboard_notifications_parse_and_default_partials() {
+fn notifications_parse_and_default_partials() {
     let raw = r#"{
-  "dashboard": {
-    "notifications": {
-      "aiStatusOk": true
-    }
+  "notifications": {
+    "aiStatusOk": true
   }
 }"#;
 
     let parsed: WorktreeConfig = serde_json::from_str(raw).unwrap();
-    assert!(parsed.dashboard.notifications.ai_status_ok);
-    assert!(!parsed.dashboard.notifications.pr_checks_ok);
+    assert!(parsed.notifications.ai_status_ok);
+    assert!(!parsed.notifications.pr_checks_ok);
     assert_eq!(parsed.dashboard.ai_status, AiStatusConfig::default());
 }
 
 #[test]
-fn dashboard_notifications_unknown_field_is_rejected() {
+fn notifications_unknown_field_is_rejected() {
     let raw = r#"{
-  "dashboard": {
-    "notifications": {
-      "aiStatusOk": true,
-      "bogus": true
-    }
+  "notifications": {
+    "aiStatusOk": true,
+    "bogus": true
   }
 }"#;
 
@@ -303,6 +298,42 @@ fn dashboard_notifications_unknown_field_is_rejected() {
         parsed.is_err(),
         "unknown notification key should be rejected"
     );
+}
+
+#[test]
+fn legacy_dashboard_notifications_migrate_to_top_level_on_load() {
+    with_home(|tmp| {
+        // A config written before notifications moved out of `dashboard`.
+        let path = tmp.path().join(".wisetree.json");
+        let raw = r#"{
+  "dashboard": {
+    "notifications": {
+      "aiStatusOk": true,
+      "prChecksOk": true
+    }
+  }
+}"#;
+        fs::write(&path, raw).unwrap();
+
+        let mut svc = ConfigService::new();
+        let cfg = svc.load(Some(tmp.path())).unwrap();
+
+        // The legacy block is folded into the top-level field on load.
+        assert!(cfg.notifications.ai_status_ok);
+        assert!(cfg.notifications.pr_checks_ok);
+        assert_eq!(cfg.dashboard.legacy_notifications, None);
+
+        // Re-serializing writes only the new location, never the legacy one.
+        let value: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            value["dashboard"].get("notifications").is_none(),
+            "legacy dashboard.notifications must not be written back"
+        );
+        assert!(value["notifications"]["aiStatusOk"].as_bool().unwrap());
+        let reparsed: WorktreeConfig = serde_json::from_value(value).unwrap();
+        assert!(reparsed.notifications.ai_status_ok);
+        assert!(reparsed.notifications.pr_checks_ok);
+    });
 }
 
 #[test]

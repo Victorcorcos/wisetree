@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
+use crate::config::schema::{DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig};
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
 use crate::tui::widgets::{
@@ -39,6 +39,7 @@ pub enum SettingsStep {
     IgnorePatterns,
     PathTemplate,
     Dashboard,
+    Notifications,
     PostCmd,
     TerminalCmd,
     DeleteBranch,
@@ -90,6 +91,8 @@ pub enum SettingsAction {
     /// columns) to the active config file. Invalid numbers or unknown columns
     /// are normalized by the caller.
     SaveDashboard(DashboardConfig),
+    /// Persist the opt-in notification toggles to the active config file.
+    SaveNotifications(NotificationsConfig),
     /// Open the fullscreen AI provider/model picker prefilled with the current
     /// `useAi` value. The caller owns the picker screen and writes the user's
     /// choice back via `apply_use_ai_selection`.
@@ -956,19 +959,15 @@ pub enum DashboardField {
     WiseMerge,
     Columns,
     UseAi,
-    NotificationsAiStatusOk,
-    NotificationsPrChecksOk,
 }
 
 impl DashboardField {
-    pub const ALL: [DashboardField; 7] = [
+    pub const ALL: [DashboardField; 5] = [
         DashboardField::RefreshIntervalMs,
         DashboardField::ShowPullRequests,
         DashboardField::WiseMerge,
         DashboardField::Columns,
         DashboardField::UseAi,
-        DashboardField::NotificationsAiStatusOk,
-        DashboardField::NotificationsPrChecksOk,
     ];
 
     pub fn label(self) -> &'static str {
@@ -978,8 +977,6 @@ impl DashboardField {
             DashboardField::WiseMerge => "wiseMerge",
             DashboardField::Columns => "columns",
             DashboardField::UseAi => "useAi",
-            DashboardField::NotificationsAiStatusOk => "notifications.aiStatusOk",
-            DashboardField::NotificationsPrChecksOk => "notifications.prChecksOk",
         }
     }
 
@@ -994,30 +991,14 @@ impl DashboardField {
             DashboardField::UseAi => {
                 "Provider/model for opencode (e.g. anthropic/claude-sonnet-4-5). Blank disables AI."
             }
-            DashboardField::NotificationsAiStatusOk => {
-                "Press Enter to toggle terminal bell when AI work finishes"
-            }
-            DashboardField::NotificationsPrChecksOk => {
-                "Press Enter to toggle terminal bell when PR checks pass"
-            }
         }
     }
 
     pub fn is_toggle(self) -> bool {
         matches!(
             self,
-            DashboardField::ShowPullRequests
-                | DashboardField::WiseMerge
-                | DashboardField::NotificationsAiStatusOk
-                | DashboardField::NotificationsPrChecksOk
+            DashboardField::ShowPullRequests | DashboardField::WiseMerge
         )
-    }
-
-    pub fn section_heading(self) -> Option<&'static str> {
-        match self {
-            DashboardField::NotificationsAiStatusOk => Some("Notifications"),
-            _ => None,
-        }
     }
 }
 
@@ -1042,6 +1023,8 @@ enum SettingsMouseTarget {
     LinkStrategySave,
     LinkCacheDirSave,
     DashboardSave,
+    NotificationsSave,
+    NotificationsToggle(usize),
     PathTemplateSave,
 }
 
@@ -1065,8 +1048,6 @@ impl DashboardEditor {
             config.wise_merge.to_string(),
             config.columns.join(", "),
             config.use_ai.clone(),
-            config.notifications.ai_status_ok.to_string(),
-            config.notifications.pr_checks_ok.to_string(),
         ];
         let statuses = vec![DashboardRectStatus::Saved; values.len()];
         Self {
@@ -1120,8 +1101,6 @@ impl DashboardEditor {
         let (columns, _warnings) = normalize_dashboard_columns(&raw_columns);
 
         let use_ai = self.values[4].trim().to_string();
-        let ai_status_ok = parse_dashboard_bool(&self.values[5]);
-        let pr_checks_ok = parse_dashboard_bool(&self.values[6]);
 
         let mut config = self.base_config.clone();
         config.refresh_interval_ms = refresh_interval_ms;
@@ -1129,9 +1108,100 @@ impl DashboardEditor {
         config.wise_merge = wise_merge;
         config.columns = columns;
         config.use_ai = use_ai;
-        config.notifications.ai_status_ok = ai_status_ok;
-        config.notifications.pr_checks_ok = pr_checks_ok;
         config
+    }
+}
+
+/// Opt-in terminal-bell toggles shown on the standalone Notifications screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationsField {
+    AiStatusOk,
+    PrChecksOk,
+}
+
+impl NotificationsField {
+    pub const ALL: [NotificationsField; 2] = [
+        NotificationsField::AiStatusOk,
+        NotificationsField::PrChecksOk,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NotificationsField::AiStatusOk => "aiStatusOk",
+            NotificationsField::PrChecksOk => "prChecksOk",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            NotificationsField::AiStatusOk => {
+                "Press Enter to toggle terminal bell when AI work finishes"
+            }
+            NotificationsField::PrChecksOk => {
+                "Press Enter to toggle terminal bell when PR checks pass"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationsSelection {
+    Rect(usize),
+    Save,
+}
+
+/// Editor backing the Notifications settings screen. Each field is a plain
+/// boolean toggle plus a Save button — no free-text editing, so the state is
+/// just the current values and their per-rectangle save status.
+pub struct NotificationsEditor {
+    pub values: Vec<bool>,
+    pub statuses: Vec<DashboardRectStatus>,
+    pub selection: NotificationsSelection,
+}
+
+impl NotificationsEditor {
+    pub fn new(config: &NotificationsConfig) -> Self {
+        let values = vec![config.ai_status_ok, config.pr_checks_ok];
+        let statuses = vec![DashboardRectStatus::Saved; values.len()];
+        Self {
+            values,
+            statuses,
+            selection: NotificationsSelection::Rect(0),
+        }
+    }
+
+    pub fn field(&self, idx: usize) -> NotificationsField {
+        NotificationsField::ALL[idx]
+    }
+
+    pub fn toggle(&mut self, idx: usize) {
+        self.values[idx] = !self.values[idx];
+        self.statuses[idx] = DashboardRectStatus::Modified;
+    }
+
+    pub fn build_config(&self) -> NotificationsConfig {
+        NotificationsConfig {
+            ai_status_ok: self.values[0],
+            pr_checks_ok: self.values[1],
+        }
+    }
+
+    fn step_up(&mut self) {
+        self.selection = match self.selection {
+            NotificationsSelection::Rect(0) => NotificationsSelection::Rect(0),
+            NotificationsSelection::Rect(i) => NotificationsSelection::Rect(i - 1),
+            NotificationsSelection::Save => NotificationsSelection::Rect(self.values.len() - 1),
+        };
+    }
+
+    fn step_down(&mut self) {
+        self.selection = match self.selection {
+            NotificationsSelection::Rect(i) if i + 1 < self.values.len() => {
+                NotificationsSelection::Rect(i + 1)
+            }
+            NotificationsSelection::Rect(_) => NotificationsSelection::Save,
+            NotificationsSelection::Save => NotificationsSelection::Save,
+        };
     }
 }
 
@@ -1161,6 +1231,7 @@ pub struct SettingsScreen {
     link_cache_dir_input: Option<InputPrompt>,
     dashboard_editor: Option<DashboardEditor>,
     dashboard_input: Option<InputPrompt>,
+    notifications_editor: Option<NotificationsEditor>,
     /// Result of the background `opencode models opencode` fetch surfaced
     /// inline under the `useAi` rectangle. `None` while the request is in
     /// flight; `Some(Ok(_))` after a successful list, `Some(Err(_))` to
@@ -1215,6 +1286,7 @@ impl SettingsScreen {
             link_cache_dir_input: None,
             dashboard_editor: None,
             dashboard_input: None,
+            notifications_editor: None,
             free_models: None,
             copy_settings_select: None,
             update_result: None,
@@ -1340,6 +1412,7 @@ impl SettingsScreen {
         self.link_cache_dir_input = None;
         self.dashboard_editor = None;
         self.dashboard_input = None;
+        self.notifications_editor = None;
         self.free_models = None;
         self.copy_settings_select = None;
         self.error = None;
@@ -1415,6 +1488,14 @@ impl SettingsScreen {
         self.dashboard_editor = None;
         self.dashboard_input = None;
         self.free_models = None;
+        self.step = SettingsStep::Menu;
+    }
+
+    /// Mirror a successful notifications save back into the settings menu.
+    pub fn mark_notifications_saved(&mut self, notifications: NotificationsConfig) {
+        self.config.notifications = notifications;
+        self.select = Some(self.build_menu());
+        self.notifications_editor = None;
         self.step = SettingsStep::Menu;
     }
 
@@ -1506,6 +1587,8 @@ impl SettingsScreen {
                 self.config.dashboard.refresh_interval_ms,
                 self.config.dashboard.columns.len()
             )),
+            SelectOption::new("Notifications", SettingsStep::Notifications)
+                .with_description(notifications_menu_description(&self.config.notifications)),
             SelectOption::new("Copy Patterns", SettingsStep::CopyPatterns).with_description(
                 format!("{} patterns", self.config.worktree_copy_patterns.len()),
             ),
@@ -1589,6 +1672,7 @@ impl SettingsScreen {
             SettingsStep::LinkCacheDir => self.handle_link_cache_dir(key),
             SettingsStep::PathTemplate => self.handle_path_template(key),
             SettingsStep::Dashboard => self.handle_dashboard(key),
+            SettingsStep::Notifications => self.handle_notifications(key),
         }
     }
 
@@ -1657,6 +1741,10 @@ impl SettingsScreen {
                                 Some(DashboardEditor::new(&self.config.dashboard));
                             self.free_models = None;
                             return SettingsAction::FetchFreeModels;
+                        }
+                        if matches!(value, SettingsStep::Notifications) {
+                            self.notifications_editor =
+                                Some(NotificationsEditor::new(&self.config.notifications));
                         }
                         if matches!(value, SettingsStep::CopySettings) {
                             self.copy_settings_select = Some(self.build_copy_settings_select());
@@ -1759,6 +1847,18 @@ impl SettingsScreen {
                 }
                 self.handle_dashboard(enter)
             }
+            SettingsMouseTarget::NotificationsSave => {
+                if let Some(editor) = self.notifications_editor.as_mut() {
+                    editor.selection = NotificationsSelection::Save;
+                }
+                self.handle_notifications(enter)
+            }
+            SettingsMouseTarget::NotificationsToggle(idx) => {
+                if let Some(editor) = self.notifications_editor.as_mut() {
+                    editor.selection = NotificationsSelection::Rect(idx);
+                }
+                self.handle_notifications(enter)
+            }
             SettingsMouseTarget::PathTemplateSave => {
                 if let Some(editor) = self.path_template_editor.as_mut() {
                     editor.selection = PathTemplateSelection::Save;
@@ -1833,6 +1933,10 @@ impl SettingsScreen {
                     // loading state until the fresh `opencode models opencode`
                     // shell-out lands.
                     self.free_models = None;
+                }
+                if matches!(value, SettingsStep::Notifications) {
+                    self.notifications_editor =
+                        Some(NotificationsEditor::new(&self.config.notifications));
                 }
                 if matches!(value, SettingsStep::CopySettings) {
                     self.copy_settings_select = Some(self.build_copy_settings_select());
@@ -2685,6 +2789,67 @@ impl SettingsScreen {
         action
     }
 
+    fn handle_notifications(&mut self, key: KeyEvent) -> SettingsAction {
+        let editor = match self.notifications_editor.as_mut() {
+            Some(e) => e,
+            None => {
+                self.step = SettingsStep::Menu;
+                return SettingsAction::Continue;
+            }
+        };
+
+        let mut toggle_idx = None;
+        let action = match key.code {
+            KeyCode::Esc => {
+                self.notifications_editor = None;
+                self.step = SettingsStep::Menu;
+                SettingsAction::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.notifications_step_up();
+                SettingsAction::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.notifications_step_down();
+                SettingsAction::Continue
+            }
+            KeyCode::Enter => match editor.selection {
+                NotificationsSelection::Rect(i) => {
+                    toggle_idx = Some(i);
+                    SettingsAction::Continue
+                }
+                NotificationsSelection::Save => {
+                    SettingsAction::SaveNotifications(editor.build_config())
+                }
+            },
+            _ => SettingsAction::Continue,
+        };
+
+        if let Some(idx) = toggle_idx {
+            self.toggle_notifications_bool(idx);
+        }
+
+        action
+    }
+
+    fn notifications_step_up(&mut self) {
+        if let Some(editor) = self.notifications_editor.as_mut() {
+            editor.step_up();
+        }
+    }
+
+    fn notifications_step_down(&mut self) {
+        if let Some(editor) = self.notifications_editor.as_mut() {
+            editor.step_down();
+        }
+    }
+
+    fn toggle_notifications_bool(&mut self, idx: usize) {
+        if let Some(editor) = self.notifications_editor.as_mut() {
+            editor.toggle(idx);
+        }
+    }
+
     /// Snapshot of the free-model list if the fetch succeeded and produced
     /// at least one chip. Used both to gate cursor transitions and to
     /// resolve the active pair on Enter.
@@ -2954,7 +3119,7 @@ impl SettingsScreen {
         }
         match self.step {
             // Settings menu: config path header + select prompt + hint.
-            SettingsStep::Menu => 22,
+            SettingsStep::Menu => 23,
             SettingsStep::SetupProject => 6,
             // Title + description + 2 rectangles (3 rows each) + 2 hints
             // + spacer + result line + footer hint.
@@ -2965,6 +3130,7 @@ impl SettingsScreen {
             SettingsStep::LinkCacheDir => self.link_cache_dir_preferred_height(),
             SettingsStep::IgnorePatterns => self.pattern_list_preferred_height(),
             SettingsStep::Dashboard => self.dashboard_preferred_height(),
+            SettingsStep::Notifications => self.notifications_preferred_height(),
             SettingsStep::PathTemplate => self.path_template_preferred_height(),
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
             SettingsStep::PostCmd => self.post_cmd_preferred_height(),
@@ -2992,13 +3158,9 @@ impl SettingsScreen {
 
     fn dashboard_preferred_height(&self) -> u16 {
         // Title + description + rectangles (3 rows each) + hint rows
-        // + section headings + spacer + Save button (3 rows) + saving-to line + footer hint.
+        // + spacer + Save button (3 rows) + saving-to line + footer hint.
         let rects = DashboardField::ALL.len() as u16;
-        let headings = DashboardField::ALL
-            .iter()
-            .filter(|field| field.section_heading().is_some())
-            .count() as u16;
-        2 + rects * 3 + rects + headings + 1 + 3 + 2
+        2 + rects * 3 + rects + 1 + 3 + 2
     }
 
     fn path_template_preferred_height(&self) -> u16 {
@@ -3048,6 +3210,7 @@ impl SettingsScreen {
             SettingsStep::IgnorePatterns => self.render_ignore_patterns(frame, area),
             SettingsStep::PathTemplate => self.render_path_template(frame, area),
             SettingsStep::Dashboard => self.render_dashboard(frame, area),
+            SettingsStep::Notifications => self.render_notifications(frame, area),
             SettingsStep::PostCmd => self.render_post_cmd(frame, area),
             SettingsStep::TerminalCmd => self.render_terminal_cmd(frame, area),
             SettingsStep::DeleteBranch => self.render_delete_branch(frame, area),
@@ -3643,7 +3806,6 @@ impl SettingsScreen {
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
-        let info_style = Style::default().fg(colors::INFO);
 
         // Track where each field's rect chunk ends up so we can splice the
         // free-model chip rows in immediately after the useAi rectangle's
@@ -3654,10 +3816,7 @@ impl SettingsScreen {
             .position(|f| matches!(f, DashboardField::UseAi));
         let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
         let mut chip_chunks: Option<(usize, usize)> = None;
-        for (i, field) in DashboardField::ALL.iter().enumerate() {
-            if field.section_heading().is_some() {
-                constraints.push(Constraint::Length(1));
-            }
+        for (i, _field) in DashboardField::ALL.iter().enumerate() {
             constraints.push(Constraint::Length(3));
             constraints.push(Constraint::Length(1));
             if Some(i) == use_ai_field_idx {
@@ -3690,14 +3849,7 @@ impl SettingsScreen {
 
         let editing_idx = editor.editing_index();
         let mut cursor = 2usize;
-        for (i, field) in DashboardField::ALL.iter().enumerate() {
-            if let Some(heading) = field.section_heading() {
-                frame.render_widget(
-                    Paragraph::new(Line::from(branded_line(heading, info_style))),
-                    chunks[cursor],
-                );
-                cursor += 1;
-            }
+        for (i, _field) in DashboardField::ALL.iter().enumerate() {
             let rect_chunk = chunks[cursor];
             let hint_chunk = chunks[cursor + 1];
             self.render_dashboard_rectangle(frame, rect_chunk, hint_chunk, editor, i, editing_idx);
@@ -3936,6 +4088,177 @@ impl SettingsScreen {
         );
         frame.render_widget(save_box, cols[1]);
         self.push_mouse_target(SettingsMouseTarget::DashboardSave, cols[1]);
+    }
+
+    fn render_notifications(&self, frame: &mut Frame, area: Rect) {
+        let editor = match &self.notifications_editor {
+            Some(e) => e,
+            None => return,
+        };
+
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(colors::MUTED);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+
+        let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
+        for _ in NotificationsField::ALL.iter() {
+            constraints.push(Constraint::Length(3));
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(0));
+        constraints.push(Constraint::Length(3));
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line("Notifications", title_style))),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(
+                "Terminal-bell alerts (Enter toggles each):",
+                muted_style,
+            ))),
+            chunks[1],
+        );
+
+        let mut cursor = 2usize;
+        for idx in 0..NotificationsField::ALL.len() {
+            self.render_notifications_rectangle(
+                frame,
+                chunks[cursor],
+                chunks[cursor + 1],
+                editor,
+                idx,
+            );
+            cursor += 2;
+        }
+
+        // `cursor` now points at the `Min(0)` spacer; Save is one past it.
+        self.render_notifications_save_button(frame, chunks[cursor + 1], editor);
+
+        let saving_line = Line::from(vec![
+            Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
+            Span::styled(
+                self.config_path.clone(),
+                Style::default().fg(colors::EMPHASIS),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(saving_line), chunks[cursor + 2]);
+
+        frame.render_widget(
+            Paragraph::new("↑↓ to move • Enter to toggle/Save • Esc to go back")
+                .style(dim_muted_style),
+            chunks[cursor + 3],
+        );
+    }
+
+    fn render_notifications_rectangle(
+        &self,
+        frame: &mut Frame,
+        rect_area: Rect,
+        hint_area: Rect,
+        editor: &NotificationsEditor,
+        idx: usize,
+    ) {
+        let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
+
+        let enabled = editor.values[idx];
+        let status = editor.statuses[idx];
+        let field = editor.field(idx);
+        let is_selected = matches!(editor.selection, NotificationsSelection::Rect(j) if j == idx);
+        let border_color = match status {
+            DashboardRectStatus::Unchanged => colors::WHITE,
+            DashboardRectStatus::Editing => colors::WARNING,
+            DashboardRectStatus::Modified => colors::ACCENT,
+            DashboardRectStatus::Saved => colors::SUCCESS,
+        };
+        let content_style = if is_selected {
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let value_text = if enabled { "true" } else { "false" };
+        let inner_line = Line::from(Span::styled(value_text, content_style));
+        let title_line = if is_selected {
+            Line::from(vec![
+                Span::styled(
+                    POST_CMD_SELECTION_MARKER,
+                    Style::default().fg(colors::ACCENT),
+                ),
+                Span::styled(format!("{} ", field.label()), info_style),
+            ])
+        } else {
+            Line::from(Span::styled(format!(" {} ", field.label()), info_style))
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(border_color))
+            .padding(Padding::horizontal(1))
+            .title(title_line);
+        frame.render_widget(Paragraph::new(inner_line).block(block), rect_area);
+        self.push_mouse_target(SettingsMouseTarget::NotificationsToggle(idx), rect_area);
+
+        let hint_line = Line::from(vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled(field.hint(), muted_style),
+        ]);
+        frame.render_widget(Paragraph::new(hint_line), hint_area);
+    }
+
+    fn render_notifications_save_button(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        editor: &NotificationsEditor,
+    ) {
+        let save_label = "Save";
+        let save_width = save_label.chars().count() as u16 + 4;
+        let side = area.width.saturating_sub(save_width) / 2;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(side),
+                Constraint::Length(save_width),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        let save_selected = editor.selection == NotificationsSelection::Save;
+        let save_text_style = if save_selected {
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(colors::MUTED)
+        };
+
+        let save_box = Paragraph::new(Line::from(Span::styled(save_label, save_text_style))).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(colors::SUCCESS))
+                .padding(Padding::horizontal(1)),
+        );
+        frame.render_widget(save_box, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::NotificationsSave, cols[1]);
+    }
+
+    fn notifications_preferred_height(&self) -> u16 {
+        // Title + description + rectangles (3 rows each) + hint rows
+        // + spacer + Save button (3 rows) + saving-to line + footer hint.
+        let rects = NotificationsField::ALL.len() as u16;
+        2 + rects * 3 + rects + 1 + 3 + 2
     }
 
     fn render_path_template(&self, frame: &mut Frame, area: Rect) {
@@ -4988,11 +5311,15 @@ fn build_path_template_input(value: &str) -> InputPrompt {
         .with_default(value.to_string())
 }
 
-fn parse_dashboard_bool(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "true" | "yes" | "1" | "on"
-    )
+/// One-line summary of which notification bells are enabled, shown as the
+/// description under the "Notifications" settings-menu entry.
+fn notifications_menu_description(config: &NotificationsConfig) -> String {
+    match (config.ai_status_ok, config.pr_checks_ok) {
+        (false, false) => "all disabled".to_string(),
+        (true, false) => "AI finished".to_string(),
+        (false, true) => "PR checks".to_string(),
+        (true, true) => "AI finished, PR checks".to_string(),
+    }
 }
 
 /// Position of the `UseAi` field inside `DashboardField::ALL`. Re-derived
@@ -5034,9 +5361,6 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
             "branch, status, ai_status, ahead_behind, diff, last_commit, pull_request"
         }
         DashboardField::UseAi => "provider/model (e.g. anthropic/claude-sonnet-4-5)",
-        DashboardField::NotificationsAiStatusOk | DashboardField::NotificationsPrChecksOk => {
-            "true or false"
-        }
     };
     InputPrompt::new("")
         .with_placeholder(placeholder)
@@ -5046,7 +5370,7 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{AiStatusConfig, DashboardNotificationsConfig, WorktreeConfig};
+    use crate::config::schema::{AiStatusConfig, WorktreeConfig};
 
     fn dashboard_screen_with_free_models(models: Vec<String>) -> SettingsScreen {
         let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
@@ -5114,12 +5438,9 @@ mod tests {
         focus_use_ai(&mut screen);
         let _ = screen.handle_dashboard(key(KeyCode::Down));
         let editor = screen.dashboard_editor.as_ref().unwrap();
-        assert_eq!(
-            editor.selection,
-            DashboardSelection::Rect(dashboard_field_index(
-                DashboardField::NotificationsAiStatusOk
-            ))
-        );
+        // useAi is the last dashboard field, so Down lands on Save when the
+        // chip row is unavailable.
+        assert_eq!(editor.selection, DashboardSelection::Save);
     }
 
     #[test]
@@ -5181,15 +5502,15 @@ mod tests {
     }
 
     #[test]
-    fn down_from_chips_advances_to_notifications() {
+    fn down_from_chips_advances_to_save() {
         let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
         screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         let _ = screen.handle_dashboard(key(KeyCode::Down));
+        // useAi (the rect above the chip row) is the last field, so stepping
+        // down out of the chips lands on Save.
         assert_eq!(
             screen.dashboard_editor.as_ref().unwrap().selection,
-            DashboardSelection::Rect(dashboard_field_index(
-                DashboardField::NotificationsAiStatusOk
-            ))
+            DashboardSelection::Save
         );
     }
 
@@ -5199,9 +5520,7 @@ mod tests {
             dashboard_screen_with_free_models(vec!["opencode/deepseek-v4-flash-free".to_string()]);
         screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
         let _ = screen.handle_dashboard(key(KeyCode::Enter)); // stage
-        let _ = screen.handle_dashboard(key(KeyCode::Down)); // → notifications.aiStatusOk
-        let _ = screen.handle_dashboard(key(KeyCode::Down)); // → notifications.prChecksOk
-        let _ = screen.handle_dashboard(key(KeyCode::Down)); // → Save
+        let _ = screen.handle_dashboard(key(KeyCode::Down)); // chips → Save
         let action = screen.handle_dashboard(key(KeyCode::Enter));
         match action {
             SettingsAction::SaveDashboard(cfg) => {
@@ -5226,60 +5545,12 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_editor_exposes_notification_toggle_fields() {
-        assert_eq!(
-            DashboardField::NotificationsAiStatusOk.label(),
-            "notifications.aiStatusOk"
-        );
-        assert_eq!(
-            DashboardField::NotificationsPrChecksOk.label(),
-            "notifications.prChecksOk"
-        );
-        assert!(DashboardField::NotificationsAiStatusOk.is_toggle());
-        assert!(DashboardField::NotificationsPrChecksOk.is_toggle());
-        assert_eq!(
-            DashboardField::NotificationsAiStatusOk.section_heading(),
-            Some("Notifications")
-        );
-    }
-
-    #[test]
-    fn enter_toggles_dashboard_notifications_before_save() {
-        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
-        screen.step = SettingsStep::Dashboard;
-        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
-
-        let ai_idx = dashboard_field_index(DashboardField::NotificationsAiStatusOk);
-        let pr_idx = dashboard_field_index(DashboardField::NotificationsPrChecksOk);
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(ai_idx);
-        assert_eq!(
-            screen.handle_dashboard(key(KeyCode::Enter)),
-            SettingsAction::Continue
-        );
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(pr_idx);
-        assert_eq!(
-            screen.handle_dashboard(key(KeyCode::Enter)),
-            SettingsAction::Continue
-        );
-
-        let editor = screen.dashboard_editor.as_ref().unwrap();
-        assert_eq!(editor.values[ai_idx], "true");
-        assert_eq!(editor.values[pr_idx], "true");
-        assert_eq!(editor.statuses[ai_idx], DashboardRectStatus::Modified);
-        assert_eq!(editor.statuses[pr_idx], DashboardRectStatus::Modified);
-    }
-
-    #[test]
-    fn save_dashboard_preserves_ai_status_and_persists_notifications() {
+    fn save_dashboard_preserves_ai_status() {
         let config = WorktreeConfig {
             dashboard: DashboardConfig {
                 ai_status: AiStatusConfig {
                     enabled_harnesses: vec!["opencode".into()],
                     active_window_ms: 7_500,
-                },
-                notifications: DashboardNotificationsConfig {
-                    ai_status_ok: false,
-                    pr_checks_ok: true,
                 },
                 ..DashboardConfig::default()
             },
@@ -5289,15 +5560,15 @@ mod tests {
         screen.step = SettingsStep::Dashboard;
         screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
 
-        let ai_idx = dashboard_field_index(DashboardField::NotificationsAiStatusOk);
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(ai_idx);
+        let pr_idx = dashboard_field_index(DashboardField::ShowPullRequests);
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(pr_idx);
         let _ = screen.handle_dashboard(key(KeyCode::Enter));
         screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Save;
 
         match screen.handle_dashboard(key(KeyCode::Enter)) {
             SettingsAction::SaveDashboard(cfg) => {
-                assert!(cfg.notifications.ai_status_ok);
-                assert!(cfg.notifications.pr_checks_ok);
+                // Editing an unrelated dashboard field must not clobber the
+                // nested ai_status block carried over from the base config.
                 assert_eq!(cfg.ai_status.enabled_harnesses, vec!["opencode"]);
                 assert_eq!(cfg.ai_status.active_window_ms, 7_500);
             }
@@ -5306,19 +5577,86 @@ mod tests {
     }
 
     #[test]
-    fn esc_discards_unsaved_dashboard_notifications() {
-        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
-        screen.step = SettingsStep::Dashboard;
-        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+    fn notifications_field_metadata() {
+        assert_eq!(NotificationsField::AiStatusOk.label(), "aiStatusOk");
+        assert_eq!(NotificationsField::PrChecksOk.label(), "prChecksOk");
+        assert_eq!(NotificationsField::ALL.len(), 2);
+    }
 
-        let ai_idx = dashboard_field_index(DashboardField::NotificationsAiStatusOk);
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Rect(ai_idx);
-        let _ = screen.handle_dashboard(key(KeyCode::Enter));
-        let action = screen.handle_dashboard(key(KeyCode::Esc));
+    #[test]
+    fn enter_toggles_notifications_before_save() {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        screen.step = SettingsStep::Notifications;
+        screen.notifications_editor = Some(NotificationsEditor::new(&screen.config.notifications));
+
+        screen.notifications_editor.as_mut().unwrap().selection = NotificationsSelection::Rect(0);
+        assert_eq!(
+            screen.handle_notifications(key(KeyCode::Enter)),
+            SettingsAction::Continue
+        );
+        screen.notifications_editor.as_mut().unwrap().selection = NotificationsSelection::Rect(1);
+        assert_eq!(
+            screen.handle_notifications(key(KeyCode::Enter)),
+            SettingsAction::Continue
+        );
+
+        let editor = screen.notifications_editor.as_ref().unwrap();
+        assert!(editor.values[0]);
+        assert!(editor.values[1]);
+        assert_eq!(editor.statuses[0], DashboardRectStatus::Modified);
+        assert_eq!(editor.statuses[1], DashboardRectStatus::Modified);
+    }
+
+    #[test]
+    fn enter_on_save_emits_save_notifications() {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        screen.step = SettingsStep::Notifications;
+        screen.notifications_editor = Some(NotificationsEditor::new(&screen.config.notifications));
+
+        screen.notifications_editor.as_mut().unwrap().selection = NotificationsSelection::Rect(0);
+        let _ = screen.handle_notifications(key(KeyCode::Enter));
+        screen.notifications_editor.as_mut().unwrap().selection = NotificationsSelection::Save;
+
+        match screen.handle_notifications(key(KeyCode::Enter)) {
+            SettingsAction::SaveNotifications(cfg) => {
+                assert!(cfg.ai_status_ok);
+                assert!(!cfg.pr_checks_ok);
+            }
+            other => panic!("expected SaveNotifications, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_discards_unsaved_notifications() {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        screen.step = SettingsStep::Notifications;
+        screen.notifications_editor = Some(NotificationsEditor::new(&screen.config.notifications));
+
+        screen.notifications_editor.as_mut().unwrap().selection = NotificationsSelection::Rect(0);
+        let _ = screen.handle_notifications(key(KeyCode::Enter));
+        let action = screen.handle_notifications(key(KeyCode::Esc));
 
         assert_eq!(action, SettingsAction::Continue);
         assert_eq!(screen.step, SettingsStep::Menu);
-        assert!(!screen.config.dashboard.notifications.ai_status_ok);
+        // The toggle was never saved, so the backing config is untouched.
+        assert!(!screen.config.notifications.ai_status_ok);
+        assert!(screen.notifications_editor.is_none());
+    }
+
+    #[test]
+    fn notifications_menu_entry_initializes_editor() {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        let select = screen.select.as_mut().expect("menu built in new()");
+        let idx = select
+            .options
+            .iter()
+            .position(|opt| opt.value == SettingsStep::Notifications)
+            .expect("notifications option exists");
+        select.selected = idx;
+        let action = screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(action, SettingsAction::Continue);
+        assert_eq!(screen.step, SettingsStep::Notifications);
+        assert!(screen.notifications_editor.is_some());
     }
 
     #[test]

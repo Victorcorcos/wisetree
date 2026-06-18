@@ -22,7 +22,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::cli::AppMode;
-use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
+use crate::config::schema::{DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig};
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
@@ -198,11 +198,11 @@ impl DashboardNotificationSnapshot {
 fn dashboard_update_requests_bell(
     snapshot: &mut Option<DashboardNotificationSnapshot>,
     update: &DashboardUpdate,
-    config: &DashboardConfig,
+    notifications: &NotificationsConfig,
 ) -> bool {
     let requests_bell = snapshot.as_ref().is_some_and(|previous| {
-        (config.notifications.ai_status_ok && ai_finished_transition(previous, update.rows()))
-            || (config.notifications.pr_checks_ok && pr_checks_passed_transition(previous, update))
+        (notifications.ai_status_ok && ai_finished_transition(previous, update.rows()))
+            || (notifications.pr_checks_ok && pr_checks_passed_transition(previous, update))
     });
 
     snapshot
@@ -1185,6 +1185,15 @@ impl App {
                             }
                         }
                     }
+                    SettingsAction::SaveNotifications(notifications) => {
+                        if let Err(err) = self.save_notifications(notifications) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!(
+                                    "Failed to save notification settings: {err}"
+                                ));
+                            }
+                        }
+                    }
                     SettingsAction::OpenAiModelPicker(current_use_ai) => {
                         self.open_ai_model_picker(current_use_ai, tx);
                     }
@@ -1902,6 +1911,12 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn current_notifications_config(&self) -> NotificationsConfig {
+        self.current_config()
+            .map(|cfg| cfg.notifications.clone())
+            .unwrap_or_default()
+    }
+
     fn start_bulk_delete_flow(
         &mut self,
         status: BulkDeleteStatus,
@@ -2205,6 +2220,13 @@ impl App {
                 if let Err(err) = self.save_dashboard(dashboard) {
                     if let Some(settings) = self.settings.as_mut() {
                         settings.set_error(format!("Failed to save dashboard settings: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveNotifications(notifications) => {
+                if let Err(err) = self.save_notifications(notifications) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save notification settings: {err}"));
                     }
                 }
             }
@@ -3283,13 +3305,13 @@ impl App {
             (updates_batch, notices)
         };
 
-        let config = self.current_dashboard_config();
+        let notifications = self.current_notifications_config();
         let mut should_ring_bell = false;
         for update in updates_batch {
             if dashboard_update_requests_bell(
                 &mut self.dashboard_notification_snapshot,
                 &update,
-                &config,
+                &notifications,
             ) {
                 should_ring_bell = true;
             }
@@ -3757,6 +3779,42 @@ impl App {
 
         if let Some(settings) = self.settings.as_mut() {
             settings.mark_dashboard_saved(dashboard);
+        }
+        Ok(())
+    }
+
+    fn save_notifications(&mut self, notifications: NotificationsConfig) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        config.notifications = notifications.clone();
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_notifications_saved(notifications);
         }
         Ok(())
     }
@@ -4872,11 +4930,11 @@ mod tests {
         tx
     }
 
-    fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> DashboardConfig {
-        let mut config = DashboardConfig::default();
-        config.notifications.ai_status_ok = ai_status_ok;
-        config.notifications.pr_checks_ok = pr_checks_ok;
-        config
+    fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> NotificationsConfig {
+        NotificationsConfig {
+            ai_status_ok,
+            pr_checks_ok,
+        }
     }
 
     fn ai_report(status: AiStatus) -> AiStatusReport {
@@ -5297,7 +5355,7 @@ mod tests {
 
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
-            for _ in 0..11 {
+            for _ in 0..12 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5366,7 +5424,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5447,7 +5505,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5538,7 +5596,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5598,7 +5656,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..9 {
+            for _ in 0..10 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5988,7 +6046,7 @@ mod tests {
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
-                    notifications: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -6000,7 +6058,7 @@ mod tests {
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
-                    notifications: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -6028,7 +6086,7 @@ mod tests {
                 ],
                 use_ai: String::new(),
                 ai_status: Default::default(),
-                notifications: Default::default(),
+                legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -6061,7 +6119,7 @@ mod tests {
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
-                    notifications: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -6083,7 +6141,7 @@ mod tests {
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 use_ai: String::new(),
                 ai_status: Default::default(),
-                notifications: Default::default(),
+                legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -6114,7 +6172,7 @@ mod tests {
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
-                    notifications: Default::default(),
+                    legacy_notifications: None,
                 },
                 terminal_command: "global-terminal".into(),
                 ..WorktreeConfig::default()
