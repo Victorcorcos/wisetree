@@ -34,10 +34,10 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, DashboardService, DashboardUpdate,
-    DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest, MultiSourceUpdateResult,
-    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
-    UpdateSource,
+    parse_pull_request_md, resolve_dashboard_columns, DashboardNoticeLevel, DashboardService,
+    DashboardUpdate, DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest,
+    MultiSourceUpdateResult, OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -3177,17 +3177,20 @@ impl App {
     }
 
     fn poll_dashboard_updates(&mut self) {
-        let Some(watch) = self.dashboard_watch.as_mut() else {
-            return;
+        let (updates_batch, notices) = {
+            let Some(watch) = self.dashboard_watch.as_mut() else {
+                return;
+            };
+            let mut updates_batch = Vec::new();
+            let mut notices = Vec::new();
+            while let Ok(update) = watch.rx.try_recv() {
+                updates_batch.push(update);
+            }
+            while let Ok(notice) = watch.notice_rx.try_recv() {
+                notices.push(notice);
+            }
+            (updates_batch, notices)
         };
-        let mut updates_batch = Vec::new();
-        let mut notices = Vec::new();
-        while let Ok(update) = watch.rx.try_recv() {
-            updates_batch.push(update);
-        }
-        while let Ok(notice) = watch.notice_rx.try_recv() {
-            notices.push(notice);
-        }
 
         if let Some(screen) = self.dashboard.as_mut() {
             for update in updates_batch {
@@ -3204,13 +3207,24 @@ impl App {
             .dashboard
             .as_ref()
             .is_some_and(DashboardScreen::has_rows);
+        let mut refresh_dashboard = false;
         for notice in notices {
+            if notice.level == DashboardNoticeLevel::Success {
+                refresh_dashboard = true;
+                self.show_toast(ToastVariant::Success, notice.message);
+                continue;
+            }
             if let Some(screen) = self.dashboard.as_mut() {
                 if has_rows {
                     screen.set_notice(notice);
                 } else {
                     screen.set_error(notice.message);
                 }
+            }
+        }
+        if refresh_dashboard {
+            if let Some(watch) = self.dashboard_watch.as_ref() {
+                watch.refresh();
             }
         }
     }
@@ -3600,9 +3614,16 @@ impl App {
 
     fn save_dashboard(&mut self, dashboard: DashboardConfig) -> Result<(), String> {
         let local_path = self.local_config_path();
-        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
-            Some(path) => path.clone(),
-            None => global_config_file(),
+        let wise_merge_changed = dashboard.wise_merge != self.current_dashboard_config().wise_merge;
+        let target_path = if wise_merge_changed {
+            local_path
+                .clone()
+                .ok_or_else(|| "No git repository in scope".to_string())?
+        } else {
+            match local_path.as_ref().filter(|p| p.exists()) {
+                Some(path) => path.clone(),
+                None => global_config_file(),
+            }
         };
 
         let mut reader = ConfigService::new();
@@ -3610,6 +3631,8 @@ impl App {
             reader
                 .load(target_path.parent())
                 .map_err(|e| e.to_string())?
+        } else if wise_merge_changed {
+            self.current_config().cloned().unwrap_or_default()
         } else {
             WorktreeConfig::default()
         };
@@ -5614,6 +5637,7 @@ mod tests {
                 dashboard: DashboardConfig {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
+                    wise_merge: false,
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
@@ -5624,6 +5648,7 @@ mod tests {
                 dashboard: DashboardConfig {
                     refresh_interval_ms: 6000,
                     show_pull_requests: false,
+                    wise_merge: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
@@ -5645,6 +5670,7 @@ mod tests {
             let new_dashboard = DashboardConfig {
                 refresh_interval_ms: 7000,
                 show_pull_requests: true,
+                wise_merge: true,
                 columns: vec![
                     "branch".into(),
                     "status".into(),
@@ -5681,6 +5707,7 @@ mod tests {
                 dashboard: DashboardConfig {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
+                    wise_merge: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
@@ -5701,6 +5728,7 @@ mod tests {
             let new_dashboard = DashboardConfig {
                 refresh_interval_ms: 8000,
                 show_pull_requests: true,
+                wise_merge: false,
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 use_ai: String::new(),
                 ai_status: Default::default(),
@@ -5712,6 +5740,55 @@ mod tests {
             let saved_global: WorktreeConfig =
                 serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
             assert_eq!(saved_global.dashboard, new_dashboard);
+
+            assert_eq!(app.current_config().unwrap().dashboard, new_dashboard);
+        });
+    }
+
+    #[test]
+    fn save_dashboard_wise_merge_change_writes_to_local_when_local_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                dashboard: DashboardConfig {
+                    refresh_interval_ms: 5000,
+                    show_pull_requests: true,
+                    wise_merge: false,
+                    columns: vec!["branch".into(), "status".into()],
+                    use_ai: String::new(),
+                    ai_status: Default::default(),
+                },
+                terminal_command: "global-terminal".into(),
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let mut new_dashboard = app.current_config().unwrap().dashboard.clone();
+            new_dashboard.wise_merge = true;
+            app.save_dashboard(new_dashboard.clone()).unwrap();
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert_eq!(saved_local.dashboard, new_dashboard);
+            assert_eq!(saved_local.terminal_command, "global-terminal");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.dashboard, global.dashboard);
 
             assert_eq!(app.current_config().unwrap().dashboard, new_dashboard);
         });

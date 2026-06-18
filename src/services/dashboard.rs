@@ -11,7 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::schema::{normalize_dashboard_columns, DashboardConfig};
@@ -63,6 +63,7 @@ pub const BASE_REF_PRIORITY: [&str; 6] = [
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API. The Status column countdown is driven by the same timer.
 pub const PR_REFRESH_PERIOD_MS: u64 = 30 * 1000;
+const WISE_MERGE_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 /// Per-tick budget for the global AI-status scan. When exceeded, the index
 /// degrades to empty for this tick and every worktree renders `⬜ Pending`
 /// rather than blocking the whole dashboard refresh.
@@ -129,6 +130,24 @@ pub struct PullRequest {
     pub state: PrState,
     pub url: String,
     pub title: String,
+    #[serde(
+        rename = "baseRefName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub base_ref_name: Option<String>,
+    #[serde(
+        rename = "baseRepository",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub base_repository: Option<String>,
+    #[serde(
+        rename = "headRefOid",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub head_ref_oid: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     #[serde(
@@ -490,6 +509,7 @@ pub struct DashboardRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardNoticeLevel {
+    Success,
     Warning,
     Error,
 }
@@ -501,6 +521,13 @@ pub struct DashboardNotice {
 }
 
 impl DashboardNotice {
+    fn success(message: impl Into<String>) -> Self {
+        Self {
+            level: DashboardNoticeLevel::Success,
+            message: message.into(),
+        }
+    }
+
     fn warning(message: impl Into<String>) -> Self {
         Self {
             level: DashboardNoticeLevel::Warning,
@@ -531,6 +558,15 @@ pub enum DashboardUpdate {
     },
 }
 
+#[derive(Debug, Clone)]
+struct WiseMergeCandidate {
+    number: u64,
+    worktree_path: String,
+    base_ref_name: String,
+    base_repository: String,
+    head_ref_oid: String,
+}
+
 impl DashboardUpdate {
     pub fn rows(&self) -> &Vec<DashboardRow> {
         match self {
@@ -553,6 +589,7 @@ pub struct DashboardWatch {
     pub notice_rx: mpsc::Receiver<DashboardNotice>,
     cancel: Option<oneshot::Sender<()>>,
     refresh_tx: mpsc::Sender<()>,
+    wise_merge_tasks: Option<Arc<Mutex<Vec<JoinHandle<()>>>>>,
 }
 
 impl DashboardWatch {
@@ -565,6 +602,12 @@ impl Drop for DashboardWatch {
     fn drop(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
+        }
+        if let Some(tasks) = self.wise_merge_tasks.take() {
+            let mut tasks = tasks.lock().expect("wise_merge_tasks poisoned");
+            for task in tasks.drain(..) {
+                task.abort();
+            }
         }
     }
 }
@@ -612,6 +655,10 @@ pub struct DashboardService {
     /// empty index so rows keep their previous values instead of flickering
     /// to `⬜ Pending` and back on the next successful tick.
     last_ai_index: Arc<Mutex<Option<AiStatusIndex>>>,
+    wise_merge_in_flight: Arc<Mutex<HashSet<u64>>>,
+    wise_merge_merged: Arc<Mutex<HashSet<u64>>>,
+    wise_merge_failed_until: Arc<Mutex<HashMap<u64, Instant>>>,
+    wise_merge_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl DashboardService {
@@ -632,6 +679,10 @@ impl DashboardService {
             pr_state: Arc::new(Mutex::new(PrCacheState::default())),
             ai_status,
             last_ai_index: Arc::new(Mutex::new(None)),
+            wise_merge_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            wise_merge_merged: Arc::new(Mutex::new(HashSet::new())),
+            wise_merge_failed_until: Arc::new(Mutex::new(HashMap::new())),
+            wise_merge_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -682,6 +733,7 @@ impl DashboardService {
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let service = self.clone();
+        let wise_merge_tasks = service.wise_merge_tasks.clone();
         if let Ok(mut state) = service.pr_state.lock() {
             state.notice_tx = Some(notice_tx.clone());
         }
@@ -690,7 +742,7 @@ impl DashboardService {
             let interval_ms = service.config.refresh_interval_ms;
             let mut interval = time::interval(Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let period = Duration::from_millis(PR_REFRESH_PERIOD_MS);
+            let period = pr_refresh_period(&service.config);
             // Single source of truth for when the next on-cycle PR fetch
             // is due. The UI countdown reads this verbatim, and the loop
             // wakes precisely at this instant so the fetch fires the moment
@@ -713,11 +765,14 @@ impl DashboardService {
                         if service.pr_enrichment_enabled() {
                             let on_cycle =
                                 next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
-                            service.refresh_pull_requests(&rows, on_cycle).await;
+                            let fresh_prs = service.refresh_pull_requests(&rows, on_cycle).await;
                             if on_cycle {
                                 next_pr_fetch_at = Some(Instant::now() + period);
                             }
                             service.apply_cached_prs(&mut rows);
+                            if fresh_prs {
+                                service.start_wise_merge_candidates(&rows);
+                            }
                             service.save_cache();
                             if rows_tx
                                 .send(DashboardUpdate::WithPRs {
@@ -765,6 +820,7 @@ impl DashboardService {
             notice_rx,
             cancel: Some(cancel_tx),
             refresh_tx,
+            wise_merge_tasks: Some(wise_merge_tasks),
         }
     }
 
@@ -775,7 +831,7 @@ impl DashboardService {
             // SHA changes still trigger a fetch, but unchanged branches reuse
             // the cache so repeated `wisetree dashboard` calls don't hammer
             // the gh API.
-            self.refresh_pull_requests(&rows, false).await;
+            let _ = self.refresh_pull_requests(&rows, false).await;
             self.apply_cached_prs(&mut rows);
             self.save_cache();
         }
@@ -786,19 +842,44 @@ impl DashboardService {
     /// `gh pr view`. Bypasses the dashboard cache so the merge confirmation
     /// screen always shows the description GitHub currently has.
     pub async fn fetch_pr_details(&self, number: u64) -> Result<PullRequestDetails> {
+        self.fetch_pr_details_with_repo(number, None).await
+    }
+
+    async fn fetch_pr_details_for_repo(
+        &self,
+        number: u64,
+        repo_slug: &str,
+    ) -> Result<PullRequestDetails> {
+        self.fetch_pr_details_with_repo(number, Some(repo_slug))
+            .await
+    }
+
+    async fn fetch_pr_details_with_repo(
+        &self,
+        number: u64,
+        repo_slug: Option<&str>,
+    ) -> Result<PullRequestDetails> {
         if !self.gh_available {
             return Err(WisetreeError::other(
                 "gh CLI not found — install `gh` to fetch pull request details.",
             ));
         }
         let number_arg = number.to_string();
+        let mut args = vec![
+            "pr".to_string(),
+            "view".to_string(),
+            number_arg,
+            "--json".to_string(),
+            "title,body".to_string(),
+        ];
+        if let Some(repo_slug) = repo_slug {
+            args.push("--repo".to_string());
+            args.push(repo_slug.to_string());
+        }
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = time::timeout(
             GH_GRAPHQL_TIMEOUT,
-            run_command(
-                &self.gh_binary,
-                &["pr", "view", &number_arg, "--json", "title,body"],
-                Some(&self.git_root),
-            ),
+            run_command(&self.gh_binary, &args_ref, Some(&self.git_root)),
         )
         .await
         .map_err(|_| WisetreeError::other("gh pr view timed out after 8s"))?
@@ -814,6 +895,36 @@ impl DashboardService {
     /// default squash-merge convention (the `#N` is auto-linked to the
     /// PR by GitHub's web UI).
     pub async fn merge_pull_request(&self, number: u64, subject: &str, body: &str) -> Result<()> {
+        self.merge_pull_request_with_options(number, subject, body, None, None)
+            .await
+    }
+
+    async fn merge_pull_request_in_repo(
+        &self,
+        number: u64,
+        subject: &str,
+        body: &str,
+        repo_slug: &str,
+        match_head_commit: &str,
+    ) -> Result<()> {
+        self.merge_pull_request_with_options(
+            number,
+            subject,
+            body,
+            Some(repo_slug),
+            Some(match_head_commit),
+        )
+        .await
+    }
+
+    async fn merge_pull_request_with_options(
+        &self,
+        number: u64,
+        subject: &str,
+        body: &str,
+        repo_slug: Option<&str>,
+        match_head_commit: Option<&str>,
+    ) -> Result<()> {
         if !self.gh_available {
             return Err(WisetreeError::other(
                 "gh CLI not found — install `gh` to merge pull requests.",
@@ -821,27 +932,193 @@ impl DashboardService {
         }
         let number_arg = number.to_string();
         let subject_with_ref = subject_with_pr_reference(subject, number);
+        let mut args = vec![
+            "pr".to_string(),
+            "merge".to_string(),
+            number_arg,
+            "--squash".to_string(),
+            "--subject".to_string(),
+            subject_with_ref,
+            "--body".to_string(),
+            body.to_string(),
+        ];
+        if let Some(repo_slug) = repo_slug {
+            args.push("--repo".to_string());
+            args.push(repo_slug.to_string());
+        }
+        if let Some(match_head_commit) = match_head_commit {
+            args.push("--match-head-commit".to_string());
+            args.push(match_head_commit.to_string());
+        }
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
         time::timeout(
             PR_MERGE_TIMEOUT,
-            run_command(
-                &self.gh_binary,
-                &[
-                    "pr",
-                    "merge",
-                    &number_arg,
-                    "--squash",
-                    "--subject",
-                    &subject_with_ref,
-                    "--body",
-                    body,
-                ],
-                Some(&self.git_root),
-            ),
+            run_command(&self.gh_binary, &args_ref, Some(&self.git_root)),
         )
         .await
         .map_err(|_| WisetreeError::other("gh pr merge timed out after 60s"))?
         .map_err(WisetreeError::other)?;
         Ok(())
+    }
+
+    fn start_wise_merge_candidates(&self, rows: &[DashboardRow]) {
+        if !self.config.wise_merge || !self.pr_enrichment_enabled() {
+            return;
+        }
+
+        for candidate in rows.iter().filter_map(wise_merge_candidate) {
+            if !self.mark_wise_merge_started(candidate.number) {
+                continue;
+            }
+            let service = self.clone();
+            let task = tokio::spawn(async move {
+                let number = candidate.number;
+                let result = service.wise_merge(candidate).await;
+                service.finish_wise_merge(number, result);
+            });
+            let mut tasks = self
+                .wise_merge_tasks
+                .lock()
+                .expect("wise_merge_tasks poisoned");
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
+        }
+    }
+
+    fn mark_wise_merge_started(&self, number: u64) -> bool {
+        if self
+            .wise_merge_merged
+            .lock()
+            .expect("wise_merge_merged poisoned")
+            .contains(&number)
+        {
+            return false;
+        }
+
+        let now = Instant::now();
+        {
+            let mut failed_until = self
+                .wise_merge_failed_until
+                .lock()
+                .expect("wise_merge_failed_until poisoned");
+            if failed_until
+                .get(&number)
+                .is_some_and(|deadline| *deadline > now)
+            {
+                return false;
+            }
+            failed_until.remove(&number);
+        }
+
+        self.wise_merge_in_flight
+            .lock()
+            .expect("wise_merge_in_flight poisoned")
+            .insert(number)
+    }
+
+    async fn wise_merge(&self, candidate: WiseMergeCandidate) -> Result<String> {
+        let cwd = PathBuf::from(&candidate.worktree_path);
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd)
+            .await
+            .ok_or_else(|| {
+                WisetreeError::other(
+                    "No base ref reachable (looked for upstream/main, upstream/master, upstream/develop, origin/main, origin/master, origin/develop).",
+                )
+            })?;
+        let base_remote = remote_name_from_ref(&base_ref).ok_or_else(|| {
+            WisetreeError::other(format!(
+                "Resolved base ref `{base_ref}` does not name a remote."
+            ))
+        })?;
+        let base_repo = self.resolve_github_slug_for_remote(base_remote).await?;
+        validate_wise_merge_base(&candidate, &base_ref)?;
+        validate_wise_merge_repository(&candidate, &base_repo)?;
+        let details = self
+            .fetch_pr_details_for_repo(candidate.number, &base_repo)
+            .await?;
+        self.merge_pull_request_in_repo(
+            candidate.number,
+            &details.title,
+            &details.body,
+            &base_repo,
+            &candidate.head_ref_oid,
+        )
+        .await?;
+        Ok(base_ref)
+    }
+
+    async fn resolve_github_slug_for_remote(&self, remote: &str) -> Result<String> {
+        let url = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["remote", "get-url", remote],
+                Some(&self.git_root),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other(format!("git remote get-url {remote} timed out")))?
+        .map_err(WisetreeError::other)?;
+        parse_github_slug(&url)
+            .map(|(owner, repo)| format!("{owner}/{repo}"))
+            .ok_or_else(|| WisetreeError::other(format!("Remote `{remote}` is not a GitHub URL.")))
+    }
+
+    fn finish_wise_merge(&self, number: u64, result: Result<String>) {
+        self.wise_merge_in_flight
+            .lock()
+            .expect("wise_merge_in_flight poisoned")
+            .remove(&number);
+        match result {
+            Ok(base_ref) => {
+                self.wise_merge_merged
+                    .lock()
+                    .expect("wise_merge_merged poisoned")
+                    .insert(number);
+                self.mark_cached_pr_merged(number);
+                self.send_dashboard_notice(DashboardNotice::success(format!(
+                    "Wise Merge squash-merged PR #{number} after resolving base ref `{base_ref}`."
+                )));
+            }
+            Err(err) => {
+                self.wise_merge_failed_until
+                    .lock()
+                    .expect("wise_merge_failed_until poisoned")
+                    .insert(number, Instant::now() + WISE_MERGE_FAILURE_BACKOFF);
+                self.send_dashboard_notice(DashboardNotice::error(format!(
+                    "Wise Merge failed for PR #{number}: {err}"
+                )));
+            }
+        }
+    }
+
+    fn mark_cached_pr_merged(&self, number: u64) {
+        let mut state = self.pr_state.lock().expect("pr_state poisoned");
+        let mut changed = false;
+        for entry in state.entries.values_mut() {
+            let Some(pr) = entry.pull_request.as_mut() else {
+                continue;
+            };
+            if pr.number == number && pr.state != PrState::Merged {
+                pr.state = PrState::Merged;
+                changed = true;
+            }
+        }
+        if changed {
+            state.dirty = true;
+        }
+    }
+
+    fn send_dashboard_notice(&self, notice: DashboardNotice) {
+        let tx = self
+            .pr_state
+            .lock()
+            .expect("pr_state poisoned")
+            .notice_tx
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(notice);
+        }
     }
 
     /// Close a pull request via `gh pr close <number>`.
@@ -1679,9 +1956,9 @@ impl DashboardService {
     /// `true` once per refresh period, `false` between periods. Off-cycle
     /// runs still pick up brand-new branches and SHA changes so the UI
     /// keeps up with local commits without disturbing the cycle rhythm.
-    async fn refresh_pull_requests(&self, rows: &[DashboardRow], on_cycle: bool) {
+    async fn refresh_pull_requests(&self, rows: &[DashboardRow], on_cycle: bool) -> bool {
         if !self.pr_enrichment_enabled() || self.is_rate_limited() {
-            return;
+            return false;
         }
 
         let to_fetch: Vec<(String, String)> = {
@@ -1703,11 +1980,11 @@ impl DashboardService {
         };
 
         if to_fetch.is_empty() {
-            return;
+            return false;
         }
 
         let Some((owner, repo)) = self.resolve_repo_slug().await else {
-            return;
+            return false;
         };
 
         let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
@@ -1730,6 +2007,7 @@ impl DashboardService {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
+                true
             }
             Err(err) => {
                 if is_rate_limit_error(&err) {
@@ -1740,6 +2018,7 @@ impl DashboardService {
                 // Failures fall back to cached or empty PR data. Surface a
                 // single dashboard-level notice instead of per-row errors,
                 // because this GraphQL request covers every branch at once.
+                false
             }
         }
     }
@@ -1953,6 +2232,83 @@ fn is_rate_limit_error(err: &str) -> bool {
     lower.contains("rate limit") || lower.contains("rate-limit")
 }
 
+fn pr_refresh_period(_config: &DashboardConfig) -> Duration {
+    Duration::from_millis(PR_REFRESH_PERIOD_MS)
+}
+
+fn wise_merge_candidate(row: &DashboardRow) -> Option<WiseMergeCandidate> {
+    if row.worktree.is_main {
+        return None;
+    }
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    if !matches!(pr.checks_status, Some(CheckStatus::Passed)) {
+        return None;
+    }
+    if !matches!(pr.merge_status, Some(MergeStatus::Clean)) {
+        return None;
+    }
+    if !matches!(pr.review_status, None | Some(ReviewStatus::Approved)) {
+        return None;
+    }
+    let base_ref_name = pr
+        .base_ref_name
+        .as_ref()
+        .filter(|value| !value.is_empty())?;
+    let base_repository = pr
+        .base_repository
+        .as_ref()
+        .filter(|value| !value.is_empty())?;
+    let head_ref_oid = pr.head_ref_oid.as_ref().filter(|value| !value.is_empty())?;
+    if !row.worktree.commit.eq_ignore_ascii_case(head_ref_oid) {
+        return None;
+    }
+
+    Some(WiseMergeCandidate {
+        number: pr.number,
+        worktree_path: row.worktree.path.clone(),
+        base_ref_name: base_ref_name.clone(),
+        base_repository: base_repository.clone(),
+        head_ref_oid: head_ref_oid.clone(),
+    })
+}
+
+fn validate_wise_merge_base(candidate: &WiseMergeCandidate, base_ref: &str) -> Result<()> {
+    let expected_base = branch_name_from_ref(base_ref);
+    if candidate.base_ref_name == expected_base {
+        Ok(())
+    } else {
+        Err(WisetreeError::other(format!(
+            "PR base `{}` does not match resolved base ref `{base_ref}`.",
+            candidate.base_ref_name
+        )))
+    }
+}
+
+fn validate_wise_merge_repository(candidate: &WiseMergeCandidate, base_repo: &str) -> Result<()> {
+    if candidate.base_repository == base_repo {
+        Ok(())
+    } else {
+        Err(WisetreeError::other(format!(
+            "PR base repository `{}` does not match resolved base repository `{base_repo}`.",
+            candidate.base_repository
+        )))
+    }
+}
+
+fn branch_name_from_ref(base_ref: &str) -> &str {
+    base_ref
+        .split_once('/')
+        .map(|(_, branch)| branch)
+        .unwrap_or(base_ref)
+}
+
+fn remote_name_from_ref(base_ref: &str) -> Option<&str> {
+    base_ref.split_once('/').map(|(remote, _)| remote)
+}
+
 fn summarize_notice_text(message: &str) -> String {
     let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
@@ -1988,7 +2344,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft baseRefName baseRepository {{ nameWithOwner }} headRefOid mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -2148,6 +2504,9 @@ fn parse_graphql_response(
                     state,
                     url: node.url,
                     title: node.title,
+                    base_ref_name: node.base_ref_name,
+                    base_repository: node.base_repository.and_then(|repo| repo.name_with_owner),
+                    head_ref_oid: node.head_ref_oid,
                     labels,
                     checks_status,
                     review_status,
@@ -2254,6 +2613,11 @@ struct GhLabels {
     #[serde(default)]
     nodes: Vec<GhLabelNode>,
 }
+#[derive(Deserialize, Default)]
+struct GhBaseRepository {
+    #[serde(rename = "nameWithOwner", default)]
+    name_with_owner: Option<String>,
+}
 #[derive(Deserialize)]
 struct GhNode {
     number: u64,
@@ -2262,6 +2626,12 @@ struct GhNode {
     title: String,
     #[serde(rename = "isDraft")]
     is_draft: bool,
+    #[serde(rename = "baseRefName", default)]
+    base_ref_name: Option<String>,
+    #[serde(rename = "baseRepository", default)]
+    base_repository: Option<GhBaseRepository>,
+    #[serde(rename = "headRefOid", default)]
+    head_ref_oid: Option<String>,
     #[serde(rename = "mergeStateStatus", default)]
     merge_state_status: Option<String>,
     #[serde(rename = "reviewDecision", default)]
@@ -2950,7 +3320,9 @@ fn pr_number_from_url(url: &str) -> Option<u64> {
 }
 
 pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -> Option<String> {
-    if config.show_pull_requests && !gh_available {
+    if config.wise_merge && !config.show_pull_requests {
+        Some("Wise Merge requires showPullRequests=true; automatic merge paused.".to_string())
+    } else if config.show_pull_requests && !gh_available {
         Some("gh CLI not found - PR column hidden.".to_string())
     } else {
         None
@@ -2986,6 +3358,17 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_executable(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
 
     #[test]
     fn classify_merge_output_recognizes_already_up_to_date() {
@@ -3073,6 +3456,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn automatic_repo_pinned_helpers_pass_repo_to_gh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("gh.log");
+        let gh_path = dir.path().join("fake-gh.sh");
+        std::fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n  printf '{{\"title\":\"Subject\",\"body\":\"Body\"}}'\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  exit 0\nfi\nexit 1\n",
+                log = log_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&gh_path);
+
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_gh_binary(gh_path);
+        let details = service
+            .fetch_pr_details_for_repo(7, "owner/repo")
+            .await
+            .expect("details");
+        assert_eq!(details.title, "Subject");
+        service
+            .merge_pull_request_in_repo(7, &details.title, &details.body, "owner/repo", "abc123")
+            .await
+            .expect("merge");
+
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(
+            log.contains("pr view 7 --json title,body --repo owner/repo"),
+            "automatic detail fetch must pin --repo; log was {log:?}"
+        );
+        assert!(
+            log.contains("pr merge 7 --squash --subject Subject (#7) --body Body --repo owner/repo --match-head-commit abc123"),
+            "automatic merge must pin --repo and --match-head-commit; log was {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_watch_aborts_tracked_wise_merge_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_cache_path(None);
+        let watch = service.watch();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_task = completed.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            completed_in_task.store(true, Ordering::SeqCst);
+        });
+        service
+            .wise_merge_tasks
+            .lock()
+            .expect("wise_merge_tasks poisoned")
+            .push(task);
+
+        drop(watch);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "tracked Wise Merge task should be aborted before it completes"
+        );
+        assert!(
+            service
+                .wise_merge_tasks
+                .lock()
+                .expect("wise_merge_tasks poisoned")
+                .is_empty(),
+            "dropping the watch should drain tracked Wise Merge handles"
+        );
+    }
+
+    #[test]
+    fn wise_merge_does_not_shorten_github_pr_refresh_period() {
+        let config = DashboardConfig {
+            wise_merge: true,
+            ..DashboardConfig::default()
+        };
+        assert_eq!(
+            pr_refresh_period(&config),
+            Duration::from_millis(PR_REFRESH_PERIOD_MS)
+        );
+    }
+
+    #[test]
+    fn finish_wise_merge_marks_cached_pr_as_merged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_cache_path(None);
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let pr = row.pull_request.expect("pull request");
+        {
+            let mut state = service.pr_state.lock().expect("pr_state poisoned");
+            state.entries.insert(
+                "feature".to_string(),
+                PrCacheEntry {
+                    sha: "abc123".to_string(),
+                    pull_request: Some(pr),
+                },
+            );
+        }
+
+        service.finish_wise_merge(42, Ok("upstream/main".to_string()));
+
+        let state = service.pr_state.lock().expect("pr_state poisoned");
+        let pr = state
+            .entries
+            .get("feature")
+            .and_then(|entry| entry.pull_request.as_ref())
+            .expect("cached pull request");
+        assert_eq!(pr.state, PrState::Merged);
+        assert!(state.dirty);
+    }
+
     #[test]
     fn parses_github_ssh_scp_form() {
         assert_eq!(
@@ -3134,6 +3634,10 @@ mod tests {
             q.contains("statusCheckRollup"),
             "query must request statusCheckRollup so the dashboard can colour the Opened circle: {q}"
         );
+        assert!(q.contains("baseRefName"));
+        assert!(q.contains("baseRepository"));
+        assert!(q.contains("nameWithOwner"));
+        assert!(q.contains("headRefOid"));
         assert!(q.contains("commits(last: 1)"));
         assert!(q.contains("__typename"));
         assert!(q.contains("CheckRun"));
@@ -3145,13 +3649,17 @@ mod tests {
         let body = r#"{
           "data": {
             "repository": {
-              "b0": {"nodes": [{"number": 7, "state": "OPEN", "url": "u", "title": "t", "isDraft": false}]},
+              "b0": {"nodes": [{"number": 7, "state": "OPEN", "url": "u", "title": "t", "isDraft": false, "baseRefName": "main", "baseRepository": {"nameWithOwner": "owner/repo"}, "headRefOid": "abc123"}]},
               "b1": {"nodes": []}
             }
           }
         }"#;
         let out = parse_graphql_response(body, &["feat", "fix"]).unwrap();
-        assert_eq!(out.get("feat").unwrap().as_ref().unwrap().number, 7);
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.base_ref_name.as_deref(), Some("main"));
+        assert_eq!(pr.base_repository.as_deref(), Some("owner/repo"));
+        assert_eq!(pr.head_ref_oid.as_deref(), Some("abc123"));
         assert!(out.get("fix").unwrap().is_none());
     }
 
@@ -3439,6 +3947,120 @@ mod tests {
 
     fn logins<I: IntoIterator<Item = &'static str>>(values: I) -> HashSet<String> {
         values.into_iter().map(String::from).collect()
+    }
+
+    fn wise_merge_row(review_status: Option<ReviewStatus>) -> DashboardRow {
+        DashboardRow {
+            worktree: GitWorktree {
+                path: "/tmp/repo-feature".to_string(),
+                branch: "feature".to_string(),
+                commit: "abc123".to_string(),
+                is_main: false,
+                is_clean: true,
+                branch_status: None,
+            },
+            last_commit: None,
+            pull_request: Some(PullRequest {
+                number: 42,
+                state: PrState::Open,
+                url: "https://github.com/example/repo/pull/42".to_string(),
+                title: "Ready".to_string(),
+                base_ref_name: Some("main".to_string()),
+                base_repository: Some("example/repo".to_string()),
+                head_ref_oid: Some("abc123".to_string()),
+                labels: vec![],
+                checks_status: Some(CheckStatus::Passed),
+                review_status,
+                merge_status: Some(MergeStatus::Clean),
+                reviewers: ReviewerSummary::default(),
+            }),
+            ai_status: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn wise_merge_candidate_accepts_approved_clean_passed_pr() {
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let candidate = wise_merge_candidate(&row).expect("ready PR should match");
+        assert_eq!(candidate.number, 42);
+        assert_eq!(candidate.worktree_path, "/tmp/repo-feature");
+        assert_eq!(candidate.base_ref_name, "main");
+        assert_eq!(candidate.base_repository, "example/repo");
+        assert_eq!(candidate.head_ref_oid, "abc123");
+    }
+
+    #[test]
+    fn wise_merge_candidate_accepts_clean_passed_pr_without_review_requirement() {
+        let row = wise_merge_row(None);
+        assert!(wise_merge_candidate(&row).is_some());
+    }
+
+    #[test]
+    fn wise_merge_candidate_rejects_pending_reviews_or_unclean_merge_state() {
+        let pending = wise_merge_row(Some(ReviewStatus::Pending));
+        assert!(wise_merge_candidate(&pending).is_none());
+
+        let mut dirty = wise_merge_row(Some(ReviewStatus::Approved));
+        dirty.pull_request.as_mut().unwrap().merge_status = Some(MergeStatus::Dirty);
+        assert!(wise_merge_candidate(&dirty).is_none());
+    }
+
+    #[test]
+    fn wise_merge_candidate_rejects_failed_checks_and_non_open_prs() {
+        let mut failed = wise_merge_row(Some(ReviewStatus::Approved));
+        failed.pull_request.as_mut().unwrap().checks_status = Some(CheckStatus::Failed);
+        assert!(wise_merge_candidate(&failed).is_none());
+
+        let mut merged = wise_merge_row(Some(ReviewStatus::Approved));
+        merged.pull_request.as_mut().unwrap().state = PrState::Merged;
+        assert!(wise_merge_candidate(&merged).is_none());
+    }
+
+    #[test]
+    fn wise_merge_candidate_rejects_missing_safety_fields() {
+        let mut missing_base = wise_merge_row(Some(ReviewStatus::Approved));
+        missing_base.pull_request.as_mut().unwrap().base_ref_name = None;
+        assert!(wise_merge_candidate(&missing_base).is_none());
+
+        let mut missing_head = wise_merge_row(Some(ReviewStatus::Approved));
+        missing_head.pull_request.as_mut().unwrap().head_ref_oid = None;
+        assert!(wise_merge_candidate(&missing_head).is_none());
+
+        let mut missing_repository = wise_merge_row(Some(ReviewStatus::Approved));
+        missing_repository
+            .pull_request
+            .as_mut()
+            .unwrap()
+            .base_repository = None;
+        assert!(wise_merge_candidate(&missing_repository).is_none());
+    }
+
+    #[test]
+    fn wise_merge_candidate_rejects_remote_head_that_differs_from_worktree_head() {
+        let mut row = wise_merge_row(Some(ReviewStatus::Approved));
+        row.pull_request.as_mut().unwrap().head_ref_oid = Some("def456".to_string());
+        assert!(wise_merge_candidate(&row).is_none());
+    }
+
+    #[test]
+    fn wise_merge_base_validation_requires_pr_base_to_match_resolved_base_ref_branch() {
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let candidate = wise_merge_candidate(&row).expect("candidate");
+        assert!(validate_wise_merge_base(&candidate, "upstream/main").is_ok());
+
+        let err = validate_wise_merge_base(&candidate, "upstream/develop").unwrap_err();
+        assert!(format!("{err}").contains("does not match resolved base ref"));
+    }
+
+    #[test]
+    fn wise_merge_repository_validation_requires_pr_base_repo_to_match_base_remote_repo() {
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let candidate = wise_merge_candidate(&row).expect("candidate");
+        assert!(validate_wise_merge_repository(&candidate, "example/repo").is_ok());
+
+        let err = validate_wise_merge_repository(&candidate, "other/repo").unwrap_err();
+        assert!(format!("{err}").contains("does not match resolved base repository"));
     }
 
     #[test]

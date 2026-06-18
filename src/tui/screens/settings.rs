@@ -953,14 +953,16 @@ pub enum DashboardRectStatus {
 pub enum DashboardField {
     RefreshIntervalMs,
     ShowPullRequests,
+    WiseMerge,
     Columns,
     UseAi,
 }
 
 impl DashboardField {
-    pub const ALL: [DashboardField; 4] = [
+    pub const ALL: [DashboardField; 5] = [
         DashboardField::RefreshIntervalMs,
         DashboardField::ShowPullRequests,
+        DashboardField::WiseMerge,
         DashboardField::Columns,
         DashboardField::UseAi,
     ];
@@ -969,6 +971,7 @@ impl DashboardField {
         match self {
             DashboardField::RefreshIntervalMs => "refreshIntervalMs",
             DashboardField::ShowPullRequests => "showPullRequests",
+            DashboardField::WiseMerge => "wiseMerge",
             DashboardField::Columns => "columns",
             DashboardField::UseAi => "useAi",
         }
@@ -978,6 +981,7 @@ impl DashboardField {
         match self {
             DashboardField::RefreshIntervalMs => "5000..60000 (ms)",
             DashboardField::ShowPullRequests => "Press Enter to toggle",
+            DashboardField::WiseMerge => "Press Enter to toggle automatic merge of ready PRs",
             DashboardField::Columns => {
                 "Comma-separated: branch, status, ai_status, ahead_behind, diff, last_commit, pull_request"
             }
@@ -988,7 +992,10 @@ impl DashboardField {
     }
 
     pub fn is_toggle(self) -> bool {
-        matches!(self, DashboardField::ShowPullRequests)
+        matches!(
+            self,
+            DashboardField::ShowPullRequests | DashboardField::WiseMerge
+        )
     }
 }
 
@@ -1032,6 +1039,7 @@ impl DashboardEditor {
         let values = vec![
             config.refresh_interval_ms.to_string(),
             config.show_pull_requests.to_string(),
+            config.wise_merge.to_string(),
             config.columns.join(", "),
             config.use_ai.clone(),
         ];
@@ -1073,18 +1081,24 @@ impl DashboardEditor {
             "true" | "yes" | "1" | "on"
         );
 
-        let raw_columns: Vec<String> = self.values[2]
+        let wise_merge = matches!(
+            self.values[2].trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "on"
+        );
+
+        let raw_columns: Vec<String> = self.values[3]
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         let (columns, _warnings) = normalize_dashboard_columns(&raw_columns);
 
-        let use_ai = self.values[3].trim().to_string();
+        let use_ai = self.values[4].trim().to_string();
 
         DashboardConfig {
             refresh_interval_ms,
             show_pull_requests,
+            wise_merge,
             columns,
             use_ai,
             ai_status: Default::default(),
@@ -2936,7 +2950,7 @@ impl SettingsScreen {
     }
 
     fn dashboard_preferred_height(&self) -> u16 {
-        // Title + description + 3 rectangles (3 rows each) + 3 hint rows
+        // Title + description + dashboard rectangles + hint rows
         // + spacer + Save button (3 rows) + saving-to line + footer hint.
         let rects = DashboardField::ALL.len() as u16;
         2 + rects * 3 + rects + 1 + 3 + 2
@@ -4953,6 +4967,7 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
     let placeholder = match field {
         DashboardField::RefreshIntervalMs => "Refresh interval in ms (5000..60000)",
         DashboardField::ShowPullRequests => "true or false",
+        DashboardField::WiseMerge => "true or false",
         DashboardField::Columns => {
             "branch, status, ai_status, ahead_behind, diff, last_commit, pull_request"
         }

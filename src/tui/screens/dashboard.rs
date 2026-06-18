@@ -482,12 +482,9 @@ impl DashboardScreen {
             return DashboardAction::Refresh;
         }
 
-        // Tab toggles focus between the worktree table and the bulk-delete
-        // buttons; BackTab does the same since there are only two sections.
-        // Each side keeps its selection across the round trip (the table its
-        // highlighted row, the buttons their focused status). Available even
-        // while the search query has text — Tab is never typeable into the
-        // search. Left/Right still move between individual buttons.
+        // Tab toggles focus between the table and the bulk-delete buttons.
+        // Available even while the search query has text — Tab is never
+        // typeable into the search.
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.toggle_bulk_focus();
             return DashboardAction::Continue;
@@ -509,7 +506,7 @@ impl DashboardScreen {
             }
             KeyCode::Up => {
                 // Up from the first filtered row jumps focus to the bulk
-                // delete buttons (mirroring Down at the last row).
+                // delete buttons.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected == 0 {
                     self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
@@ -520,8 +517,8 @@ impl DashboardScreen {
             }
             KeyCode::Down => {
                 // Down at the last filtered row moves focus onto the bulk
-                // delete buttons (matching the Post-Create Commands page
-                // pattern). Otherwise advance selection within the table.
+                // delete buttons.
+                // Otherwise advance selection within the table.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected + 1 >= filtered_len {
                     self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
@@ -2999,6 +2996,7 @@ fn format_refreshed_label(duration: std::time::Duration) -> String {
 
 fn notice_style(level: DashboardNoticeLevel) -> Style {
     match level {
+        DashboardNoticeLevel::Success => Style::default().fg(colors::SUCCESS),
         DashboardNoticeLevel::Warning => Style::default().fg(colors::WARNING),
         DashboardNoticeLevel::Error => Style::default().fg(colors::ERROR),
     }
@@ -3037,6 +3035,9 @@ mod tests {
             state: PrState::Open,
             url: "https://github.com/example/repo/pull/42".to_string(),
             title: "Add feature".to_string(),
+            base_ref_name: Some("main".to_string()),
+            base_repository: Some("example/repo".to_string()),
+            head_ref_oid: Some("abc123".to_string()),
             labels: vec![],
             checks_status: None,
             review_status: None,
