@@ -757,19 +757,10 @@ impl DashboardService {
             loop {
                 let enrich = service.pr_enrichment_enabled();
                 let on_cycle = enrich && next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
-                // On the 30s PR beat, refresh the base branch's remote-tracking
-                // ref first so the behind-count below reflects commits another
-                // developer pushed to the base — the signal the "Update"
-                // command is gated on. Awaited *before* collect_git_rows so the
-                // fresh commits land in this same render, and tied to the PR
-                // cadence so the git behind-count and GitHub's merge_status stay
-                // in lockstep. Best-effort: a failed fetch never stalls the tick.
-                if on_cycle {
-                    service.fetch_base_ref().await;
-                }
                 // Emit git-only rows (with cached PRs applied) first so the
-                // UI exits "Loading dashboard..." without waiting on the gh
-                // GraphQL round-trip. Then refresh PRs and emit again.
+                // UI exits "Loading dashboard..." instantly, without waiting on
+                // any network round-trip. PR enrichment and the base-ref fetch
+                // below are refinements that fill in afterwards.
                 match service.collect_git_rows().await {
                     Ok(mut rows) => {
                         if rows_tx
@@ -808,6 +799,17 @@ impl DashboardService {
                             )))
                             .await;
                     }
+                }
+
+                // On the 30s PR beat, refresh the base branch's remote-tracking
+                // ref so the behind-count reflects commits another developer
+                // pushed to the base — the signal the "Update" command is gated
+                // on. Runs *after* the paint above so it never blocks the first
+                // render; when it actually advances the ref, loop again right
+                // away to re-render the refined behind-count. Best-effort: a
+                // failed or no-op fetch just falls through to the normal wait.
+                if on_cycle && service.fetch_base_ref().await {
+                    continue;
                 }
 
                 // Wake on whichever fires first: the git interval (snappy
@@ -1944,14 +1946,20 @@ impl DashboardService {
     /// `--all`, no extra branches, minimal transfer. Failures (offline, auth,
     /// missing ref) are swallowed: a stale tracking ref just means the count
     /// lags until the next successful fetch, never a stalled tick.
-    async fn fetch_base_ref(&self) {
+    ///
+    /// Returns `true` only when the fetch actually advanced the base's
+    /// remote-tracking ref, so the caller can re-render the refined
+    /// behind-count exactly when there is new data — and skip the churn when
+    /// the ref was already current.
+    async fn fetch_base_ref(&self) -> bool {
         let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &self.git_root).await
         else {
-            return;
+            return false;
         };
         let Some((remote, branch)) = base_ref.split_once('/') else {
-            return;
+            return false;
         };
+        let before = self.rev_parse(&base_ref).await;
         let refspec = format!("+{branch}:refs/remotes/{remote}/{branch}");
         let _ = time::timeout(
             BASE_FETCH_TIMEOUT,
@@ -1962,6 +1970,20 @@ impl DashboardService {
             ),
         )
         .await;
+        let after = self.rev_parse(&base_ref).await;
+        after.is_some() && after != before
+    }
+
+    /// Resolve a ref to its commit OID against `git_root`, or `None` when the
+    /// ref is missing. Used to detect whether `fetch_base_ref` moved the base.
+    async fn rev_parse(&self, reference: &str) -> Option<String> {
+        run_command(
+            &self.git_binary,
+            &["rev-parse", "--verify", "--quiet", reference],
+            Some(&self.git_root),
+        )
+        .await
+        .ok()
     }
 
     async fn fetch_last_commit(
@@ -3605,12 +3627,74 @@ mod tests {
 
         // fetch_base_ref refreshes only the base's remote-tracking ref.
         let service = DashboardService::new(local.clone(), DashboardConfig::default());
-        service.fetch_base_ref().await;
+        let did_advance = service.fetch_base_ref().await;
 
+        assert!(
+            did_advance,
+            "fetch_base_ref should report that the base ref advanced"
+        );
         assert_eq!(
             git(&local, &["rev-parse", "origin/main"]),
             advanced,
             "fetch_base_ref should advance origin/main to the newly pushed commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_base_ref_reports_no_change_when_base_is_current() {
+        use std::process::Command;
+
+        // Hermetic git: never depend on the machine's global identity/config.
+        fn git(cwd: &Path, args: &[&str]) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git invocation");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed in {cwd:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+
+        // Bare remote (the shared base), with `main` as its default branch.
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // A working clone seeds `main` and pushes it to the remote.
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("a.txt"), "1").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // The dashboard's clone is current with the base — nobody pushed since.
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, local.to_str().unwrap()],
+        );
+
+        let service = DashboardService::new(local.clone(), DashboardConfig::default());
+        let did_advance = service.fetch_base_ref().await;
+
+        assert!(
+            !did_advance,
+            "fetch_base_ref should report no change when the base ref is already current"
         );
     }
 
