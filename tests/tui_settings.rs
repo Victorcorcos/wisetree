@@ -201,25 +201,26 @@ fn ready_with_link_settings(
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
-// Menu order: Dashboard(0), Copy Patterns(1), Ignore Patterns(2),
-// Link Patterns(3), Link Strategy(4), Link Cache Dir(5),
-// Post-Create Commands(6), Terminal Command(7), Path Template(8),
-// Copy Settings(9), Delete Branch(10), Check for Updates(11).
-const COPY_PATTERNS_INDEX: usize = 1;
-const IGNORE_PATTERNS_INDEX: usize = 2;
-const LINK_STRATEGY_INDEX: usize = 4;
-const LINK_CACHE_DIR_INDEX: usize = 5;
-const POST_CMD_INDEX: usize = 6;
-const TERMINAL_CMD_INDEX: usize = 7;
-const PATH_TEMPLATE_INDEX: usize = 8;
-const COPY_SETTINGS_INDEX: usize = 9;
-const DELETE_BRANCH_INDEX: usize = 10;
-const CHECK_UPDATES_INDEX: usize = 11;
+// Menu order: Dashboard(0), Notifications(1), Copy Patterns(2),
+// Ignore Patterns(3), Link Patterns(4), Link Strategy(5), Link Cache Dir(6),
+// Post-Create Commands(7), Terminal Command(8), Path Template(9),
+// Copy Settings(10), Delete Branch(11), Check for Updates(12).
+const NOTIFICATIONS_INDEX: usize = 1;
+const COPY_PATTERNS_INDEX: usize = 2;
+const IGNORE_PATTERNS_INDEX: usize = 3;
+const LINK_STRATEGY_INDEX: usize = 5;
+const LINK_CACHE_DIR_INDEX: usize = 6;
+const POST_CMD_INDEX: usize = 7;
+const TERMINAL_CMD_INDEX: usize = 8;
+const PATH_TEMPLATE_INDEX: usize = 9;
+const COPY_SETTINGS_INDEX: usize = 10;
+const DELETE_BRANCH_INDEX: usize = 11;
+const CHECK_UPDATES_INDEX: usize = 12;
 
 #[test]
 fn menu_renders_with_config_path() {
     let s = ready();
-    let dumped = dump(80, 20, |f| s.render(f, f.area()));
+    let dumped = dump(80, s.preferred_content_height(), |f| s.render(f, f.area()));
     assert!(dumped.contains("Configuration file"));
     assert!(dumped.contains("/tmp/.wisetree.json"));
     assert!(dumped.contains("➤"));
@@ -265,10 +266,11 @@ fn setup_project_entry_at_index_zero_when_present() {
     // Enter at position 0 should emit OpenSetupProject, not navigate into another sub-step.
     let action = s.handle_key(key(KeyCode::Enter));
     assert_eq!(action, SettingsAction::OpenSetupProject);
-    // Dashboard is now at position 1; navigating there still works.
+    // With Setup Project at 0, the order is Dashboard(1), Notifications(2),
+    // Copy Patterns(3); three Downs reach Copy Patterns.
     let mut s2 = ready().with_has_setup_project(true);
     s2.handle_key(key(KeyCode::Down));
-    // Down again to reach Copy Patterns (position 2).
+    s2.handle_key(key(KeyCode::Down));
     s2.handle_key(key(KeyCode::Down));
     let action2 = s2.handle_key(key(KeyCode::Enter));
     assert_eq!(action2, SettingsAction::Continue); // enters CopyPatterns sub-step
@@ -301,6 +303,52 @@ fn enter_ignore_patterns(s: &mut SettingsScreen) {
     }
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::IgnorePatterns);
+}
+
+fn enter_notifications(s: &mut SettingsScreen) {
+    for _ in 0..NOTIFICATIONS_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::Notifications);
+}
+
+#[test]
+fn notifications_entry_opens_dedicated_screen() {
+    let mut s = ready();
+    enter_notifications(&mut s);
+    let dumped = dump(90, s.preferred_content_height(), |f| s.render(f, f.area()));
+    assert!(dumped.contains("Notifications"));
+    assert!(dumped.contains("aiStatusOk"));
+    assert!(dumped.contains("prChecksOk"));
+    assert!(dumped.contains("Save"));
+}
+
+#[test]
+fn notifications_save_button_emits_save_action() {
+    let mut s = ready();
+    enter_notifications(&mut s);
+    // Toggle aiStatusOk on, then move to Save and confirm.
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Down));
+    s.handle_key(key(KeyCode::Down));
+    let action = s.handle_key(key(KeyCode::Enter));
+    match action {
+        SettingsAction::SaveNotifications(cfg) => {
+            assert!(cfg.ai_status_ok);
+            assert!(!cfg.pr_checks_ok);
+        }
+        other => panic!("expected SaveNotifications, got {other:?}"),
+    }
+}
+
+#[test]
+fn esc_on_notifications_page_returns_to_menu() {
+    let mut s = ready();
+    enter_notifications(&mut s);
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, SettingsAction::Continue);
+    assert_eq!(s.step(), SettingsStep::Menu);
 }
 
 #[test]

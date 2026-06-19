@@ -3,6 +3,7 @@
 //! Owns screen routing, per-screen async work, and the wrapper-mode selected
 //! path handoff used by shell integration.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::cli::AppMode;
-use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
+use crate::config::schema::{DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig};
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
@@ -34,10 +35,10 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, DashboardNoticeLevel, DashboardService,
-    DashboardUpdate, DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest,
-    MultiSourceUpdateResult, OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdateSource,
+    parse_pull_request_md, resolve_dashboard_columns, AiStatus, CheckStatus, DashboardNoticeLevel,
+    DashboardRow, DashboardService, DashboardUpdate, DashboardWatch, FillPreparation,
+    FillSubmitOutcome, FillSubmitRequest, MultiSourceUpdateResult, OpencodeModel, PrState, Shell,
+    ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -179,6 +180,91 @@ struct UpdatePrFailure {
     message: String,
 }
 
+#[derive(Debug, Default)]
+struct DashboardNotificationSnapshot {
+    ai_statuses: HashMap<String, AiStatus>,
+    pr_check_statuses: HashMap<u64, CheckStatus>,
+}
+
+impl DashboardNotificationSnapshot {
+    fn record_update(&mut self, update: &DashboardUpdate) {
+        self.ai_statuses = ai_statuses_by_worktree(update.rows());
+        if let DashboardUpdate::WithPRs { rows, .. } = update {
+            self.pr_check_statuses = pr_check_statuses_by_pr(rows);
+        }
+    }
+}
+
+fn dashboard_update_requests_bell(
+    snapshot: &mut Option<DashboardNotificationSnapshot>,
+    update: &DashboardUpdate,
+    notifications: &NotificationsConfig,
+) -> bool {
+    let requests_bell = snapshot.as_ref().is_some_and(|previous| {
+        (notifications.ai_status_ok && ai_finished_transition(previous, update.rows()))
+            || (notifications.pr_checks_ok && pr_checks_passed_transition(previous, update))
+    });
+
+    snapshot
+        .get_or_insert_with(Default::default)
+        .record_update(update);
+    requests_bell
+}
+
+fn ai_statuses_by_worktree(rows: &[DashboardRow]) -> HashMap<String, AiStatus> {
+    rows.iter()
+        .filter_map(|row| {
+            row.ai_status
+                .as_ref()
+                .map(|report| (row.worktree.path.clone(), report.aggregated))
+        })
+        .collect()
+}
+
+fn pr_check_statuses_by_pr(rows: &[DashboardRow]) -> HashMap<u64, CheckStatus> {
+    rows.iter()
+        .filter_map(|row| {
+            let pr = row.pull_request.as_ref()?;
+            if pr.state != PrState::Open {
+                return None;
+            }
+            pr.checks_status.map(|status| (pr.number, status))
+        })
+        .collect()
+}
+
+fn ai_finished_transition(previous: &DashboardNotificationSnapshot, rows: &[DashboardRow]) -> bool {
+    rows.iter().any(|row| {
+        let Some(next) = row.ai_status.as_ref().map(|report| report.aggregated) else {
+            return false;
+        };
+        next == AiStatus::Finished
+            && previous.ai_statuses.get(&row.worktree.path) == Some(&AiStatus::InProgress)
+    })
+}
+
+fn pr_checks_passed_transition(
+    previous: &DashboardNotificationSnapshot,
+    update: &DashboardUpdate,
+) -> bool {
+    let DashboardUpdate::WithPRs { rows, .. } = update else {
+        return false;
+    };
+
+    rows.iter().any(|row| {
+        let Some(pr) = row.pull_request.as_ref() else {
+            return false;
+        };
+        if pr.state != PrState::Open || pr.checks_status != Some(CheckStatus::Passed) {
+            return false;
+        }
+        previous
+            .pr_check_statuses
+            .get(&pr.number)
+            .is_some_and(|status| *status != CheckStatus::Passed)
+    })
+}
+
 /// State the TUI carries across frames.
 pub struct App {
     pub screen: Screen,
@@ -194,6 +280,7 @@ pub struct App {
     menu: Option<MenuScreen>,
     dashboard: Option<DashboardScreen>,
     dashboard_watch: Option<DashboardWatch>,
+    dashboard_notification_snapshot: Option<DashboardNotificationSnapshot>,
     cache: Option<CacheScreen>,
     create: Option<CreateScreen>,
     delete: Option<DeleteScreen>,
@@ -240,6 +327,7 @@ impl App {
             menu: None,
             dashboard: None,
             dashboard_watch: None,
+            dashboard_notification_snapshot: None,
             cache: None,
             create: None,
             delete: None,
@@ -1097,6 +1185,15 @@ impl App {
                             }
                         }
                     }
+                    SettingsAction::SaveNotifications(notifications) => {
+                        if let Err(err) = self.save_notifications(notifications) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!(
+                                    "Failed to save notification settings: {err}"
+                                ));
+                            }
+                        }
+                    }
                     SettingsAction::OpenAiModelPicker(current_use_ai) => {
                         self.open_ai_model_picker(current_use_ai, tx);
                     }
@@ -1814,6 +1911,12 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn current_notifications_config(&self) -> NotificationsConfig {
+        self.current_config()
+            .map(|cfg| cfg.notifications.clone())
+            .unwrap_or_default()
+    }
+
     fn start_bulk_delete_flow(
         &mut self,
         status: BulkDeleteStatus,
@@ -1998,6 +2101,7 @@ impl App {
                             .unwrap_or_default();
                         let service = DashboardService::new(git_root, config);
                         self.dashboard_watch = Some(service.watch());
+                        self.dashboard_notification_snapshot = None;
                     }
                 }
             } else {
@@ -2116,6 +2220,13 @@ impl App {
                 if let Err(err) = self.save_dashboard(dashboard) {
                     if let Some(settings) = self.settings.as_mut() {
                         settings.set_error(format!("Failed to save dashboard settings: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveNotifications(notifications) => {
+                if let Err(err) = self.save_notifications(notifications) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save notification settings: {err}"));
                     }
                 }
             }
@@ -3012,6 +3123,7 @@ impl App {
                     service.pr_enrichment_enabled(),
                 ));
                 self.dashboard_watch = Some(service.watch());
+                self.dashboard_notification_snapshot = None;
             }
             Screen::Cache => {
                 self.cache = Some(CacheScreen::new());
@@ -3115,6 +3227,7 @@ impl App {
         self.cache = None;
         self.dashboard = None;
         self.dashboard_watch = None;
+        self.dashboard_notification_snapshot = None;
         self.cache = None;
         self.create = None;
         self.delete = None;
@@ -3192,8 +3305,18 @@ impl App {
             (updates_batch, notices)
         };
 
-        if let Some(screen) = self.dashboard.as_mut() {
-            for update in updates_batch {
+        let notifications = self.current_notifications_config();
+        let mut should_ring_bell = false;
+        for update in updates_batch {
+            if dashboard_update_requests_bell(
+                &mut self.dashboard_notification_snapshot,
+                &update,
+                &notifications,
+            ) {
+                should_ring_bell = true;
+            }
+
+            if let Some(screen) = self.dashboard.as_mut() {
                 if let DashboardUpdate::WithPRs {
                     next_pr_fetch_at, ..
                 } = &update
@@ -3202,6 +3325,9 @@ impl App {
                 }
                 screen.set_rows(update.into_rows());
             }
+        }
+        if should_ring_bell {
+            terminal::ring_bell();
         }
         let has_rows = self
             .dashboard
@@ -3653,6 +3779,42 @@ impl App {
 
         if let Some(settings) = self.settings.as_mut() {
             settings.mark_dashboard_saved(dashboard);
+        }
+        Ok(())
+    }
+
+    fn save_notifications(&mut self, notifications: NotificationsConfig) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        config.notifications = notifications.clone();
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_notifications_saved(notifications);
         }
         Ok(())
     }
@@ -4734,6 +4896,7 @@ mod tests {
     use super::*;
     use crate::config::schema::WorktreeConfig;
     use crate::config::service::ConfigService;
+    use crate::services::{AiStatusReport, PullRequest, ReviewerSummary};
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
     use ratatui::backend::TestBackend;
@@ -4765,6 +4928,248 @@ mod tests {
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
+    }
+
+    fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> NotificationsConfig {
+        NotificationsConfig {
+            ai_status_ok,
+            pr_checks_ok,
+        }
+    }
+
+    fn ai_report(status: AiStatus) -> AiStatusReport {
+        AiStatusReport {
+            aggregated: status,
+            per_harness: Default::default(),
+        }
+    }
+
+    fn pr(number: u64, checks_status: Option<CheckStatus>) -> PullRequest {
+        PullRequest {
+            number,
+            state: PrState::Open,
+            url: format!("https://example.test/pull/{number}"),
+            title: format!("PR {number}"),
+            base_ref_name: None,
+            base_repository: None,
+            head_ref_oid: None,
+            labels: Vec::new(),
+            checks_status,
+            review_status: None,
+            merge_status: None,
+            reviewers: ReviewerSummary::default(),
+        }
+    }
+
+    fn dashboard_row(
+        path: &str,
+        branch: &str,
+        ai_status: Option<AiStatus>,
+        pull_request: Option<PullRequest>,
+    ) -> DashboardRow {
+        DashboardRow {
+            worktree: GitWorktree {
+                path: path.into(),
+                branch: branch.into(),
+                commit: "deadbeef".into(),
+                is_main: false,
+                is_clean: true,
+                branch_status: None,
+            },
+            last_commit: None,
+            pull_request,
+            ai_status: ai_status.map(ai_report),
+            error: None,
+        }
+    }
+
+    fn git_update(rows: Vec<DashboardRow>) -> DashboardUpdate {
+        DashboardUpdate::GitOnly(rows)
+    }
+
+    fn pr_update(rows: Vec<DashboardRow>) -> DashboardUpdate {
+        DashboardUpdate::WithPRs {
+            rows,
+            next_pr_fetch_at: None,
+        }
+    }
+
+    #[test]
+    fn dashboard_notifications_do_not_ring_on_initial_ok_states() {
+        let config = notification_config(true, true);
+        let mut snapshot = None;
+        let update = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::Finished),
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &update,
+            &config
+        ));
+    }
+
+    #[test]
+    fn dashboard_notifications_ai_transition_respects_setting() {
+        let enabled = notification_config(true, false);
+        let disabled = notification_config(false, false);
+        let initial = git_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::InProgress),
+            None,
+        )]);
+        let finished = git_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::Finished),
+            None,
+        )]);
+
+        let mut snapshot = None;
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &initial,
+            &enabled
+        ));
+        assert!(dashboard_update_requests_bell(
+            &mut snapshot,
+            &finished,
+            &enabled
+        ));
+
+        let mut snapshot = None;
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &initial,
+            &disabled
+        ));
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &finished,
+            &disabled
+        ));
+    }
+
+    #[test]
+    fn dashboard_notifications_pr_checks_transition_respects_setting() {
+        let enabled = notification_config(false, true);
+        let disabled = notification_config(false, false);
+        let running = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Running))),
+        )]);
+        let passed = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+
+        let mut snapshot = None;
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &running,
+            &enabled
+        ));
+        assert!(dashboard_update_requests_bell(
+            &mut snapshot,
+            &passed,
+            &enabled
+        ));
+
+        let mut snapshot = None;
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &running,
+            &disabled
+        ));
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &passed,
+            &disabled
+        ));
+    }
+
+    #[test]
+    fn dashboard_notifications_ignore_missing_values() {
+        let config = notification_config(true, true);
+        let mut snapshot = None;
+        let active = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::InProgress),
+            Some(pr(42, Some(CheckStatus::Running))),
+        )]);
+        let missing = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, None)),
+        )]);
+        let ok = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::Finished),
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &active,
+            &config
+        ));
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &missing,
+            &config
+        ));
+        assert!(!dashboard_update_requests_bell(&mut snapshot, &ok, &config));
+    }
+
+    #[test]
+    fn dashboard_notifications_ignore_pr_checks_on_git_only_updates() {
+        let config = notification_config(false, true);
+        let mut snapshot = None;
+        let running = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Running))),
+        )]);
+        let git_only_passed = git_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+        let pr_passed = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &running,
+            &config
+        ));
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &git_only_passed,
+            &config
+        ));
+        assert!(dashboard_update_requests_bell(
+            &mut snapshot,
+            &pr_passed,
+            &config
+        ));
     }
 
     #[test]
@@ -4950,7 +5355,7 @@ mod tests {
 
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
-            for _ in 0..11 {
+            for _ in 0..12 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5019,7 +5424,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5100,7 +5505,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5191,7 +5596,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5251,7 +5656,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..9 {
+            for _ in 0..10 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5641,6 +6046,7 @@ mod tests {
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -5652,6 +6058,7 @@ mod tests {
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -5679,6 +6086,7 @@ mod tests {
                 ],
                 use_ai: String::new(),
                 ai_status: Default::default(),
+                legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -5711,6 +6119,7 @@ mod tests {
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -5732,6 +6141,7 @@ mod tests {
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 use_ai: String::new(),
                 ai_status: Default::default(),
+                legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -5762,6 +6172,7 @@ mod tests {
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
                     ai_status: Default::default(),
+                    legacy_notifications: None,
                 },
                 terminal_command: "global-terminal".into(),
                 ..WorktreeConfig::default()
