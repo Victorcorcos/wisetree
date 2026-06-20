@@ -89,6 +89,10 @@ pub struct CreateScreen {
     pub directory_name: String,
     pub source_branch: String,
     pub new_branch: String,
+    /// Whether `source_branch` was entered via the "custom ref" input rather
+    /// than picked from the branch list. Drives which step Esc returns to from
+    /// the new-branch page (CustomRef vs SourceBranch).
+    source_is_custom: bool,
     branches: Arc<Vec<GitBranch>>,
     error: Option<String>,
     loading: bool,
@@ -140,6 +144,7 @@ impl CreateScreen {
             directory_name: String::new(),
             source_branch: String::new(),
             new_branch: String::new(),
+            source_is_custom: false,
             branches: Arc::new(Vec::new()),
             error: None,
             loading: true,
@@ -393,6 +398,7 @@ impl CreateScreen {
                             self.step = CreateStep::CustomRef;
                         } else {
                             self.source_branch = value;
+                            self.source_is_custom = false;
                             self.new_branch.clear();
                             self.source_select = None;
                             self.new_branch_input = Some(self.build_new_branch_input());
@@ -478,6 +484,17 @@ impl CreateScreen {
             .with_footer_spacer()
     }
 
+    /// Build the source-branch picker with its cursor parked on the row whose
+    /// value matches `value` (falls back to the first row). Used when Esc
+    /// returns the user to this step so their prior pick is highlighted.
+    fn source_select_focused_on(&self, value: &str) -> SelectPrompt<String> {
+        let mut select = self.build_source_select();
+        if let Some(idx) = select.options.iter().position(|o| o.value == value) {
+            select.selected = idx;
+        }
+        select
+    }
+
     fn handle_source_branch(&mut self, key: KeyEvent) -> CreateAction {
         if self.source_select.is_none() {
             self.source_select = Some(self.build_source_select());
@@ -491,6 +508,7 @@ impl CreateScreen {
                     self.step = CreateStep::CustomRef;
                 } else {
                     self.source_branch = value;
+                    self.source_is_custom = false;
                     self.new_branch.clear();
                     self.source_select = None;
                     self.new_branch_input = Some(self.build_new_branch_input());
@@ -498,7 +516,13 @@ impl CreateScreen {
                 }
                 CreateAction::Continue
             }
-            SelectOutcome::Cancelled => CreateAction::Cancelled,
+            // Esc → back to the directory step with the typed name restored.
+            SelectOutcome::Cancelled => {
+                self.source_select = None;
+                self.directory_input = Some(directory_input_with_value(&self.directory_name));
+                self.step = CreateStep::Directory;
+                CreateAction::Continue
+            }
             SelectOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -508,13 +532,21 @@ impl CreateScreen {
         match prompt.handle_key(key) {
             InputOutcome::Submitted(value) => {
                 self.source_branch = value.trim().to_string();
+                self.source_is_custom = true;
                 self.new_branch.clear();
                 self.custom_ref_input = None;
                 self.new_branch_input = Some(self.build_new_branch_input());
                 self.step = CreateStep::NewBranch;
                 CreateAction::Continue
             }
-            InputOutcome::Cancelled => CreateAction::Cancelled,
+            // Esc → back to the source-branch picker, re-focused on the
+            // custom-ref row the user came from.
+            InputOutcome::Cancelled => {
+                self.custom_ref_input = None;
+                self.source_select = Some(self.source_select_focused_on(CUSTOM_REF_VALUE));
+                self.step = CreateStep::SourceBranch;
+                CreateAction::Continue
+            }
             InputOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -559,7 +591,18 @@ impl CreateScreen {
                 self.step = CreateStep::Confirm;
                 CreateAction::Continue
             }
-            InputOutcome::Cancelled => CreateAction::Cancelled,
+            // Esc → back to whichever source step we came from, restoring it.
+            InputOutcome::Cancelled => {
+                self.new_branch_input = None;
+                if self.source_is_custom {
+                    self.custom_ref_input = Some(custom_ref_input_with_value(&self.source_branch));
+                    self.step = CreateStep::CustomRef;
+                } else {
+                    self.source_select = Some(self.source_select_focused_on(&self.source_branch));
+                    self.step = CreateStep::SourceBranch;
+                }
+                CreateAction::Continue
+            }
             InputOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -597,9 +640,14 @@ impl CreateScreen {
                 self.step = CreateStep::NavigateConfirm;
                 CreateAction::Continue
             }
-            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
-                CreateAction::Cancelled
+            // Esc → back to the new-branch step (its input is still populated).
+            ConfirmationOutcome::Cancelled => {
+                self.confirm_dialog = None;
+                self.step = CreateStep::NewBranch;
+                CreateAction::Continue
             }
+            // Explicit "Cancel" button → leave the whole create flow.
+            ConfirmationOutcome::Declined => CreateAction::Cancelled,
             ConfirmationOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -629,7 +677,13 @@ impl CreateScreen {
                     new_branch: self.new_branch.clone(),
                 }
             }
-            ConfirmationOutcome::Cancelled => CreateAction::Cancelled,
+            // Esc → back to the create-confirmation modal.
+            ConfirmationOutcome::Cancelled => {
+                self.navigate_dialog = None;
+                self.confirm_dialog = Some(self.build_confirm());
+                self.step = CreateStep::Confirm;
+                CreateAction::Continue
+            }
             ConfirmationOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -860,6 +914,12 @@ fn directory_input() -> InputPrompt {
         .with_validator(|v| validate_directory_name(v).map(|e| e.to_string()))
 }
 
+/// Directory input pre-filled with `value`, for restoring the typed name when
+/// Esc returns the user to the directory step.
+fn directory_input_with_value(value: &str) -> InputPrompt {
+    directory_input().with_default(value.to_string())
+}
+
 fn custom_ref_input() -> InputPrompt {
     InputPrompt::new("Enter a branch name, tag, or commit SHA:")
         .with_placeholder("origin/feature/foo, v1.0.0, abc123f")
@@ -869,6 +929,12 @@ fn custom_ref_input() -> InputPrompt {
             }
             validate_source_ref(v).map(|e| e.to_string())
         })
+}
+
+/// Custom-ref input pre-filled with `value`, for restoring the typed ref when
+/// Esc returns the user to the custom-ref step.
+fn custom_ref_input_with_value(value: &str) -> InputPrompt {
+    custom_ref_input().with_default(value.to_string())
 }
 
 fn build_navigate_confirm() -> ConfirmationModal {
