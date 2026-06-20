@@ -9,15 +9,6 @@ Terminal-first Git worktree manager built in Rust + Ratatui. Lets developers cre
 3. **Surgical changes.** Touch only what the task requires. Do not improve neighboring code. Do not refactor what is not broken. Every changed line should trace back to the request.
 4. **Goal-driven execution.** Turn vague instructions into verifiable targets before writing a line. "Add validation" becomes "write tests for invalid inputs, then make them pass."
 
-## Build & Test
-
-```bash
-cargo build --release          # binary → target/release/wisetree
-cargo test --all               # full suite (uses real git repos via tempdir, no mocks)
-cargo fmt --all                # formatter
-cargo clippy --all-targets -- -D warnings  # linter (CI enforces -D warnings)
-```
-
 Development: symlink the binary and rebuild to test changes without reinstalling.
 
 ```bash
