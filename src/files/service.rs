@@ -332,10 +332,16 @@ pub async fn execute_post_create_commands(
 /// always uses `cmd /C`.
 fn shell_command(resolved: &str, login_shell: bool) -> (String, Vec<String>) {
     if cfg!(target_os = "windows") {
-        return ("cmd".to_string(), vec!["/C".to_string(), resolved.to_string()]);
+        return (
+            "cmd".to_string(),
+            vec!["/C".to_string(), resolved.to_string()],
+        );
     }
     if !login_shell {
-        return ("/bin/sh".to_string(), vec!["-c".to_string(), resolved.to_string()]);
+        return (
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), resolved.to_string()],
+        );
     }
     // Use the user's login shell so their profile is sourced on startup
     // (making shell functions, aliases, and PATH additions available,

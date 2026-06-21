@@ -305,4 +305,3 @@ fn apply_lock_corroboration(
         }
     }
 }
-

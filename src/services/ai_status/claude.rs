@@ -272,4 +272,3 @@ fn classify_turn_state(
         ClaudeTurnState::Unknown => None,
     }
 }
-
