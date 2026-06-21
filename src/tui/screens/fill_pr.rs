@@ -190,6 +190,15 @@ impl FillPullRequestScreen {
         self.pty_focused
     }
 
+    /// Whether the embedded opencode subprocess/PTY is currently alive. The
+    /// App watches this so it can force a full terminal repaint once the PTY
+    /// tears down (the inline `Viewport::Fixed` diff can otherwise leave
+    /// stale scrollback in static regions after the child scrolls the
+    /// primary screen).
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
+    }
+
     /// The drafted title/body/labels parsed from `pull_request.md` (available
     /// once the screen has entered Review).
     pub fn draft_title(&self) -> Option<&str> {
@@ -1474,6 +1483,41 @@ mod tests {
         screen.set_base_ref("upstream/main".to_string());
         screen.start_filling();
         assert!(!screen.tick_pty(None));
+    }
+
+    fn resolve_on_path(binary: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join(binary);
+            candidate.is_file().then_some(candidate)
+        })
+    }
+
+    #[test]
+    fn has_pty_tracks_spawn_and_teardown_edge() {
+        // The App keys its "force a full terminal repaint" guard off this
+        // edge: a torn-down PTY desyncs the inline `Viewport::Fixed` diff and
+        // bleeds scrollback into the Fill "Done" header. Lock the signal in.
+        let mut screen = FillPullRequestScreen::new(create_request());
+        screen.set_base_ref("upstream/main".to_string());
+        screen.start_filling();
+        assert!(!screen.has_pty(), "no PTY before spawn");
+
+        let Some(sleep) = resolve_on_path("sleep") else {
+            return; // No `sleep` binary (unusual); skip the live-PTY half.
+        };
+        screen.spawn_opencode_pty(
+            sleep,
+            vec!["5".to_string()],
+            std::env::temp_dir(),
+            Vec::new(),
+        );
+        assert!(screen.has_pty(), "PTY is live while opencode runs");
+
+        // Entering Review (opencode finished) tears the PTY down — the edge
+        // the App watches to repaint the whole terminal.
+        screen.enter_review("Title".to_string(), "Body".to_string(), vec![]);
+        assert!(!screen.has_pty(), "PTY gone after entering Review");
     }
 
     #[test]

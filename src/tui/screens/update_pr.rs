@@ -405,6 +405,14 @@ impl UpdatePullRequestScreen {
         self.pty_focused
     }
 
+    /// Whether the embedded opencode subprocess/PTY is currently alive. The
+    /// App watches this to force a full terminal repaint once the PTY tears
+    /// down, preventing stale scrollback from bleeding into static regions
+    /// under the inline `Viewport::Fixed` renderer.
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn ai_done(&self) -> bool {
         self.ai_done
