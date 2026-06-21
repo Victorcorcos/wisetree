@@ -3442,6 +3442,27 @@ mod tests {
         }
     }
 
+    // Hermetic git helper: never depend on the machine's global identity/config.
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        use std::process::Command;
+
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {cwd:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     #[test]
     fn classify_merge_output_recognizes_already_up_to_date() {
         let outcome = classify_merge_output("upstream/main".into(), "Already up to date.\n");
@@ -3568,27 +3589,6 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_base_ref_advances_stale_remote_tracking_ref() {
-        use std::process::Command;
-
-        // Hermetic git: never depend on the machine's global identity/config.
-        fn git(cwd: &Path, args: &[&str]) -> String {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(cwd)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.com")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.com")
-                .output()
-                .expect("git invocation");
-            assert!(
-                out.status.success(),
-                "git {args:?} failed in {cwd:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
-
         let tmp = tempfile::tempdir().expect("tempdir");
         let remote = tmp.path().join("remote.git");
         let work = tmp.path().join("work");
@@ -3645,27 +3645,6 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_base_ref_reports_no_change_when_base_is_current() {
-        use std::process::Command;
-
-        // Hermetic git: never depend on the machine's global identity/config.
-        fn git(cwd: &Path, args: &[&str]) -> String {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(cwd)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.com")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.com")
-                .output()
-                .expect("git invocation");
-            assert!(
-                out.status.success(),
-                "git {args:?} failed in {cwd:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
-
         let tmp = tempfile::tempdir().expect("tempdir");
         let remote = tmp.path().join("remote.git");
         let work = tmp.path().join("work");

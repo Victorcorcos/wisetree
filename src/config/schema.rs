@@ -66,12 +66,16 @@ pub fn default_active_window_ms() -> u64 {
     10_000
 }
 
+pub fn clamp_interval_ms(value: u64, min_ms: u64, max_ms: u64) -> u64 {
+    value.clamp(min_ms, max_ms)
+}
+
 pub fn clamp_active_window_ms(value: u64) -> u64 {
-    value.clamp(2_000, 60_000)
+    clamp_interval_ms(value, 2_000, 60_000)
 }
 
 pub fn clamp_dashboard_refresh_interval(value: u64) -> u64 {
-    value.clamp(5_000, 60_000)
+    clamp_interval_ms(value, 5_000, 60_000)
 }
 
 pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<String>) {
