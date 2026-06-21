@@ -10,9 +10,8 @@ fn main() {
     println!("cargo:rerun-if-changed=githooks/pre-push");
     println!("cargo:rerun-if-changed=githooks/post-commit");
 
-    let manifest_dir = match std::env::var_os("CARGO_MANIFEST_DIR") {
-        Some(dir) => dir,
-        None => return,
+    let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") else {
+        return;
     };
 
     if !Path::new(&manifest_dir).join(".git").exists() {
@@ -31,8 +30,7 @@ fn main() {
         .args(["config", "--local", "--get", "core.hooksPath"])
         .current_dir(&manifest_dir)
         .output()
-        .map(|out| out.status.success() && !out.stdout.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|out| out.status.success() && !out.stdout.is_empty());
 
     if already_set {
         return;

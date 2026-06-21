@@ -326,43 +326,65 @@ pub async fn execute_post_create_commands(
     results
 }
 
+/// Return the shell program and arguments for `resolved`. When `login_shell`
+/// is true the user's `$SHELL` is used (with `-l` for shells that support
+/// login profiles); otherwise the plain `/bin/sh -c` path is used. Windows
+/// always uses `cmd /C`.
+fn shell_command(resolved: &str, login_shell: bool) -> (String, Vec<String>) {
+    if cfg!(target_os = "windows") {
+        return (
+            "cmd".to_string(),
+            vec!["/C".to_string(), resolved.to_string()],
+        );
+    }
+    if !login_shell {
+        return (
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), resolved.to_string()],
+        );
+    }
+    // Use the user's login shell so their profile is sourced on startup
+    // (making shell functions, aliases, and PATH additions available,
+    // just like a freshly opened terminal). `-l` (login) is what pulls
+    // in the profile; we omit `-i` (interactive) because stdin is null
+    // and there is no PTY. Keys off the shell name, not the OS, so this
+    // works on macOS, Linux, and any Unix where $SHELL is set. POSIX
+    // sh/dash reject `-l`, so they fall back to plain `-c` only.
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    let shell_name = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sh")
+        .trim_start_matches('-');
+    let mut args = Vec::new();
+    if matches!(
+        shell_name,
+        "bash" | "zsh" | "fish" | "ksh" | "ksh93" | "mksh" | "tcsh" | "csh"
+    ) {
+        args.push("-l".to_string());
+    }
+    args.push("-c".to_string());
+    args.push(resolved.to_string());
+    (shell, args)
+}
+
+fn build_command(program: &str, args: &[String]) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    cmd
+}
+
 async fn execute_shell_command(
     resolved: &str,
     cwd: &Path,
     original: &str,
     on_activity: &mut Option<ActivityCallback<'_>>,
 ) -> CommandRun {
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(resolved);
-        c
-    } else {
-        // Use the user's login shell so their profile is sourced on startup
-        // (making shell functions, aliases, and PATH additions available,
-        // just like a freshly opened terminal). `-l` (login) is what pulls
-        // in the profile; we omit `-i` (interactive) because stdin is null
-        // and there is no PTY. Keys off the shell name, not the OS, so this
-        // works on macOS, Linux, and any Unix where $SHELL is set. POSIX
-        // sh/dash reject `-l`, so they fall back to plain `-c` only.
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".to_string());
-        let shell_name = std::path::Path::new(&shell)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("sh")
-            .trim_start_matches('-');
-        let mut c = Command::new(&shell);
-        if matches!(
-            shell_name,
-            "bash" | "zsh" | "fish" | "ksh" | "ksh93" | "mksh" | "tcsh" | "csh"
-        ) {
-            c.arg("-l");
-        }
-        c.arg("-c").arg(resolved);
-        c
-    };
+    let (program, args) = shell_command(resolved, true);
+    let mut cmd = build_command(&program, &args);
     cmd.current_dir(cwd);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -602,15 +624,9 @@ pub fn open_terminal(terminal_command: &str, variables: &TemplateVariables) -> T
 
     let resolved = resolve_template_shell(terminal_command, variables);
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = std::process::Command::new("cmd");
-        c.arg("/C").arg(&resolved);
-        c
-    } else {
-        let mut c = std::process::Command::new("/bin/sh");
-        c.arg("-c").arg(&resolved);
-        c
-    };
+    let (program, args) = shell_command(&resolved, false);
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
     cmd.current_dir(&variables.worktree_path);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());

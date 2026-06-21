@@ -294,8 +294,8 @@ fn write_bell<W: Write>(writer: &mut W) -> io::Result<()> {
 pub fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore();
-        let _ = restore_wrapper_tty();
+        restore();
+        restore_wrapper_tty();
         prev(info);
     }));
 }
@@ -346,7 +346,7 @@ pub fn clear_wrapper_for_shell(terminal: &mut WrapperTerminal) -> io::Result<()>
 }
 
 /// Best-effort cleanup. Safe to call even if `enter` was never invoked.
-pub fn restore() -> io::Result<()> {
+pub fn restore() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
     let _ = crossterm::execute!(&mut stdout, DisableMouseCapture);
@@ -354,16 +354,14 @@ pub fn restore() -> io::Result<()> {
     let _ = backend.clear_region(ClearType::All);
     let _ = backend.set_cursor_position(Position::ORIGIN);
     let _ = RatatuiBackend::flush(&mut backend);
-    Ok(())
 }
 
 /// Best-effort cleanup for wrapper mode.
-pub fn restore_wrapper_tty() -> io::Result<()> {
+pub fn restore_wrapper_tty() {
     let _ = disable_raw_mode();
     if let Ok(mut tty) = OpenOptions::new().write(true).open(TTY_PATH) {
         let _ = crossterm::execute!(&mut tty, DisableMouseCapture);
     }
-    Ok(())
 }
 
 #[cfg(test)]
