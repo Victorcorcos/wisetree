@@ -691,6 +691,15 @@ impl DashboardService {
         }
     }
 
+    fn require_gh(&self) -> Result<()> {
+        if !self.gh_available {
+            return Err(WisetreeError::other(
+                "gh CLI not found — install `gh` to use pull request features.",
+            ));
+        }
+        Ok(())
+    }
+
     /// Override the `AiStatusService` for hermetic tests so we can point
     /// detection at a `TempDir` instead of the developer's real `$HOME`.
     pub fn with_ai_status(mut self, ai_status: AiStatusService) -> Self {
@@ -876,11 +885,7 @@ impl DashboardService {
         number: u64,
         repo_slug: Option<&str>,
     ) -> Result<PullRequestDetails> {
-        if !self.gh_available {
-            return Err(WisetreeError::other(
-                "gh CLI not found — install `gh` to fetch pull request details.",
-            ));
-        }
+        self.require_gh()?;
         let number_arg = number.to_string();
         let mut args = vec![
             "pr".to_string(),
@@ -894,12 +899,12 @@ impl DashboardService {
             args.push(repo_slug.to_string());
         }
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = time::timeout(
+        let output = with_timeout(
+            "gh pr view",
             GH_GRAPHQL_TIMEOUT,
             run_command(&self.gh_binary, &args_ref, Some(&self.git_root)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("gh pr view timed out after 8s"))?
+        .await?
         .map_err(WisetreeError::other)?;
 
         parse_pr_view_json(&output)
@@ -942,11 +947,7 @@ impl DashboardService {
         repo_slug: Option<&str>,
         match_head_commit: Option<&str>,
     ) -> Result<()> {
-        if !self.gh_available {
-            return Err(WisetreeError::other(
-                "gh CLI not found — install `gh` to merge pull requests.",
-            ));
-        }
+        self.require_gh()?;
         let number_arg = number.to_string();
         let subject_with_ref = subject_with_pr_reference(subject, number);
         let mut args = vec![
@@ -968,12 +969,12 @@ impl DashboardService {
             args.push(match_head_commit.to_string());
         }
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-        time::timeout(
+        with_timeout(
+            "gh pr merge",
             PR_MERGE_TIMEOUT,
             run_command(&self.gh_binary, &args_ref, Some(&self.git_root)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("gh pr merge timed out after 60s"))?
+        .await?
         .map_err(WisetreeError::other)?;
         Ok(())
     }
@@ -1140,13 +1141,10 @@ impl DashboardService {
 
     /// Close a pull request via `gh pr close <number>`.
     pub async fn close_pull_request(&self, number: u64) -> Result<()> {
-        if !self.gh_available {
-            return Err(WisetreeError::other(
-                "gh CLI not found — install `gh` to close pull requests.",
-            ));
-        }
+        self.require_gh()?;
         let number_arg = number.to_string();
-        time::timeout(
+        with_timeout(
+            "gh pr close",
             PR_MERGE_TIMEOUT,
             run_command(
                 &self.gh_binary,
@@ -1154,8 +1152,7 @@ impl DashboardService {
                 Some(&self.git_root),
             ),
         )
-        .await
-        .map_err(|_| WisetreeError::other("gh pr close timed out after 60s"))?
+        .await?
         .map_err(WisetreeError::other)?;
         Ok(())
     }
@@ -1205,12 +1202,12 @@ impl DashboardService {
 
         // 1. fetch
         send_phase(UpdatePhase::Fetching);
-        let fetch = time::timeout(
+        let fetch = with_timeout(
+            "git fetch",
             UPDATE_FETCH_TIMEOUT,
             run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git fetch timed out after 60s"))?;
+        .await?;
         if let Err(err) = fetch {
             return Ok(UpdatePullRequestOutcome::FetchFailed(err));
         }
@@ -1227,12 +1224,12 @@ impl DashboardService {
             if ahead_of_origin > 0 {
                 send_phase(UpdatePhase::NoConflicts);
                 send_phase(UpdatePhase::Pushing);
-                let push = time::timeout(
+                let push = with_timeout(
+                    "git push",
                     UPDATE_PUSH_TIMEOUT,
                     run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
                 )
-                .await
-                .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+                .await?;
                 if let Err(err) = push {
                     return Ok(UpdatePullRequestOutcome::PushFailed(err));
                 }
@@ -1244,12 +1241,12 @@ impl DashboardService {
 
         // 3. merge
         send_phase(UpdatePhase::Merging);
-        let merge = time::timeout(
+        let merge = with_timeout(
+            "git merge",
             UPDATE_MERGE_TIMEOUT,
             run_command(&self.git_binary, &["merge", base_ref], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git merge timed out after 120s"))?;
+        .await?;
 
         let ai_conflicts: Option<Vec<String>> = match merge {
             Ok(_) => None,
@@ -1334,12 +1331,12 @@ impl DashboardService {
         // 4. push (clean merge path only — AI merges return above for review)
         send_phase(UpdatePhase::NoConflicts);
         send_phase(UpdatePhase::Pushing);
-        let push = time::timeout(
+        let push = with_timeout(
+            "git push",
             UPDATE_PUSH_TIMEOUT,
             run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+        .await?;
         if let Err(err) = push {
             return Ok(UpdatePullRequestOutcome::PushFailed(err));
         }
@@ -1363,12 +1360,12 @@ impl DashboardService {
         if let Some(tx) = progress.as_ref() {
             let _ = tx.send(UpdateProgress::Phase(UpdatePhase::Pushing));
         }
-        let push = time::timeout(
+        let push = with_timeout(
+            "git push",
             UPDATE_PUSH_TIMEOUT,
             run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+        .await?;
         match push {
             Ok(_) => Ok(UpdatePullRequestOutcome::Pushed),
             Err(err) => Ok(UpdatePullRequestOutcome::PushFailed(err)),
@@ -1382,12 +1379,12 @@ impl DashboardService {
     pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
         let cwd = PathBuf::from(worktree_path);
 
-        let fetch = time::timeout(
+        let fetch = with_timeout(
+            "git fetch",
             UPDATE_FETCH_TIMEOUT,
             run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git fetch timed out after 60s"))?;
+        .await?;
         if let Err(err) = fetch {
             return Ok(UpdateBranchOutcome::FetchFailed(err));
         }
@@ -1396,12 +1393,12 @@ impl DashboardService {
             return Ok(UpdateBranchOutcome::NoBaseRef);
         };
 
-        let merge = time::timeout(
+        let merge = with_timeout(
+            "git merge",
             UPDATE_MERGE_TIMEOUT,
             run_command(&self.git_binary, &["merge", &base_ref], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git merge timed out after 120s"))?;
+        .await?;
 
         match merge {
             Ok(stdout) => Ok(classify_merge_output(base_ref, &stdout)),
@@ -1443,12 +1440,12 @@ impl DashboardService {
         // Push fallback: upstream HEAD → origin HEAD.
         let mut errors: Vec<String> = Vec::new();
         for remote in ["upstream", "origin"] {
-            let push = time::timeout(
+            let push = with_timeout(
+                "git push",
                 UPDATE_PUSH_TIMEOUT,
                 run_command(&self.git_binary, &["push", remote, "HEAD"], Some(&cwd)),
             )
-            .await
-            .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+            .await?;
             match push {
                 Ok(_) => return Ok(UpdatePullRequestOutcome::MergedWithAiResolution),
                 Err(err) => errors.push(format!("{remote}: {err}")),
@@ -1486,7 +1483,8 @@ impl DashboardService {
         // Commit log (oldest first) and full diff against the base ref.
         let log_range = format!("{base_ref}..HEAD");
         let diff_range = format!("{base_ref}...HEAD");
-        let git_log = time::timeout(
+        let git_log = with_timeout(
+            "git log",
             FILL_CONTEXT_TIMEOUT,
             run_command(
                 &self.git_binary,
@@ -1494,15 +1492,14 @@ impl DashboardService {
                 Some(&cwd),
             ),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git log timed out after 30s"))?
+        .await?
         .unwrap_or_default();
-        let git_diff = time::timeout(
+        let git_diff = with_timeout(
+            "git diff",
             FILL_CONTEXT_TIMEOUT,
             run_command(&self.git_binary, &["diff", &diff_range], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git diff timed out after 30s"))?
+        .await?
         .unwrap_or_default();
 
         if git_diff.trim().is_empty() && git_log.trim().is_empty() {
@@ -1562,11 +1559,7 @@ impl DashboardService {
             existing_title,
             existing_labels,
         } = params;
-        if !self.gh_available {
-            return Err(WisetreeError::other(
-                "gh CLI not found — install `gh` to open pull requests.",
-            ));
-        }
+        self.require_gh()?;
         let cwd = PathBuf::from(worktree_path);
 
         let emit = |text: &str| {
@@ -1612,13 +1605,13 @@ impl DashboardService {
                     }
                 }
                 let edit_args_ref: Vec<&str> = edit_args.iter().map(String::as_str).collect();
-                let edit = time::timeout(
+                let edit_result = with_timeout(
+                    "gh pr edit",
                     FILL_SUBMIT_TIMEOUT,
                     run_command_streamed(&self.gh_binary, &edit_args_ref, Some(&cwd), activity),
                 )
-                .await
-                .map_err(|_| WisetreeError::other("gh pr edit timed out after 60s"))?;
-                match edit {
+                .await?;
+                match edit_result {
                     Ok(_) => Ok(FillSubmitOutcome::Updated { number: *number }),
                     Err(err) => Ok(FillSubmitOutcome::SubmitFailed(err)),
                 }
@@ -1626,7 +1619,8 @@ impl DashboardService {
             // Create a brand-new PR: push the branch, then `gh pr create`.
             None => {
                 emit(&format!("$ git push -u origin {branch}"));
-                let push = time::timeout(
+                let push = with_timeout(
+                    "git push",
                     FILL_PUSH_TIMEOUT,
                     run_command_streamed(
                         &self.git_binary,
@@ -1635,8 +1629,7 @@ impl DashboardService {
                         activity,
                     ),
                 )
-                .await
-                .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+                .await?;
                 if let Err(err) = push {
                     return Ok(FillSubmitOutcome::PushFailed(err));
                 }
@@ -1681,12 +1674,12 @@ impl DashboardService {
                     create_args.push(label.clone());
                 }
                 let create_args_ref: Vec<&str> = create_args.iter().map(String::as_str).collect();
-                let create = time::timeout(
+                let create = with_timeout(
+                    "gh pr create",
                     FILL_SUBMIT_TIMEOUT,
                     run_command_streamed(&self.gh_binary, &create_args_ref, Some(&cwd), activity),
                 )
-                .await
-                .map_err(|_| WisetreeError::other("gh pr create timed out after 60s"))?;
+                .await?;
                 match create {
                     Ok(out) => {
                         let url = pr_url_from_output(&out);
@@ -2937,6 +2930,16 @@ fn parse_shortstat(output: &str) -> (u64, u64) {
         }
     }
     (insertions, deletions)
+}
+
+async fn with_timeout<T>(
+    name: &str,
+    timeout: Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    time::timeout(timeout, fut)
+        .await
+        .map_err(|_| WisetreeError::other(format!("{name} timed out after {}s", timeout.as_secs())))
 }
 
 async fn run_command(

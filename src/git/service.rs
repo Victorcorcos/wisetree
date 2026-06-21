@@ -265,8 +265,7 @@ impl GitService {
     }
 
     pub async fn is_worktree_clean(&self, worktree_path: &Path) -> bool {
-        let result = execute_git_command(&["status", "--porcelain"], Some(worktree_path)).await;
-        result.success && result.stdout.trim().is_empty()
+        is_worktree_clean_at(worktree_path).await
     }
 
     pub async fn branch_exists(&self, branch_name: &str) -> bool {

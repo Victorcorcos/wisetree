@@ -2116,18 +2116,22 @@ fn looks_like_url(token: &str) -> bool {
 fn looks_like_path(token: &str) -> bool {
     let trimmed = token
         .trim_matches(|ch: char| matches!(ch, ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'));
-    trimmed.starts_with("~/")
+    if trimmed.starts_with("~/")
         || trimmed.starts_with("./")
         || trimmed.starts_with("../")
         || trimmed.starts_with('/')
         || trimmed.contains('/')
-        || trimmed.ends_with(".rs")
-        || trimmed.ends_with(".rb")
-        || trimmed.ends_with(".ts")
-        || trimmed.ends_with(".tsx")
-        || trimmed.ends_with(".js")
-        || trimmed.ends_with(".json")
-        || trimmed.ends_with(".md")
+    {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    lower.ends_with(".rs")
+        || lower.ends_with(".rb")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".js")
+        || lower.ends_with(".json")
+        || lower.ends_with(".md")
 }
 
 fn looks_like_number(token: &str) -> bool {

@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use super::paths::{canonical_key, AiStatusPaths};
 use super::state::AiHarnessState;
-use super::util::classify_mtime;
+use super::util::{classify_mtime, merge};
 use super::DetectorOutput;
 
 const MAX_DB_SESSIONS_PER_TICK: i64 = 1000;
@@ -306,7 +306,3 @@ fn apply_lock_corroboration(
     }
 }
 
-fn merge(out: &mut BTreeMap<PathBuf, AiHarnessState>, key: PathBuf, state: AiHarnessState) {
-    let entry = out.entry(key).or_insert(AiHarnessState::Absent);
-    *entry = AiHarnessState::merge(*entry, state);
-}

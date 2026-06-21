@@ -1460,7 +1460,7 @@ mod tests {
     #[test]
     fn editor_to_values_filters_empty_lines() {
         let mut editor = editor_from(0, 0, 0, 0);
-        editor.blocks[0] = vec!["a".into(), "".into(), "  ".into(), "b".into()];
+        editor.blocks[0] = vec!["a".into(), String::new(), "  ".into(), "b".into()];
         let values = editor.to_values();
         assert_eq!(values.copy_patterns, vec!["a", "b"]);
     }

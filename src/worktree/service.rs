@@ -203,14 +203,14 @@ impl WorktreeService {
             outcome.link_report = Some(report);
         }
 
-        if !config.post_create_cmd.is_empty() {
-            let variables = TemplateVariables {
-                base_path: repository_base_name(&git_root),
-                worktree_path: worktree_path_str.clone(),
-                branch_name: options.new_branch.clone(),
-                source_branch: options.source_branch.clone(),
-            };
+        let variables = TemplateVariables {
+            base_path: repository_base_name(&git_root),
+            worktree_path: worktree_path_str.clone(),
+            branch_name: options.new_branch.clone(),
+            source_branch: options.source_branch.clone(),
+        };
 
+        if !config.post_create_cmd.is_empty() {
             let runs = execute_post_create_commands(
                 &config.post_create_cmd,
                 &variables,
@@ -222,12 +222,6 @@ impl WorktreeService {
         }
 
         if !config.terminal_command.trim().is_empty() {
-            let variables = TemplateVariables {
-                base_path: repository_base_name(&git_root),
-                worktree_path: worktree_path_str.clone(),
-                branch_name: options.new_branch.clone(),
-                source_branch: options.source_branch.clone(),
-            };
             let launch = open_terminal(&config.terminal_command, &variables);
             outcome.terminal_launch = Some(launch);
         }

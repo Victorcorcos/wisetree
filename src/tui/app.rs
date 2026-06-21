@@ -86,6 +86,12 @@ const SETTINGS_PATH_COPIED_MESSAGE: &str =
 const WHEEL_LINES_PER_TICK: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitPhase {
     Loading,
     Ready,
@@ -376,14 +382,14 @@ impl App {
             // Clear the screen and reset the cursor so the shell prompt
             // returns at the top instead of below a block of empty rows.
             let _ = terminal::clear_wrapper_for_shell(&mut terminal);
-            let _ = terminal::restore_wrapper_tty();
+            terminal::restore_wrapper_tty();
             let _ = terminal.show_cursor();
             result?;
         } else {
             let mut terminal = terminal::enter()?;
             let result = self.event_loop(&mut terminal).await;
             let _ = terminal.clear();
-            let _ = terminal::restore();
+            terminal::restore();
             let _ = terminal.show_cursor();
             result?;
         }
@@ -801,6 +807,36 @@ impl App {
         }
     }
 
+    fn scroll_screen(&mut self, direction: ScrollDirection, lines: u16) {
+        match self.screen {
+            Screen::UpdatePullRequest => {
+                if let Some(screen) = self.update_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
+            Screen::Create => {
+                if let Some(screen) = self.create.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.scroll_terminal_up(lines),
+                        ScrollDirection::Down => screen.scroll_terminal_down(lines),
+                    };
+                }
+            }
+            Screen::FillPullRequest => {
+                if let Some(screen) = self.fill_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(snapshot) = self.last_rendered_buffer.as_ref() else {
             return;
@@ -859,36 +895,10 @@ impl App {
                 // the live AI Activity panel (during conflict resolution) or
                 // the review diff panel (after the AI creates a merge commit);
                 // on Create it's the "Creating" Terminal Activity log.
-                if matches!(self.screen, Screen::UpdatePullRequest) {
-                    if let Some(screen) = self.update_pr.as_mut() {
-                        screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
-                    }
-                } else if matches!(self.screen, Screen::Create) {
-                    if let Some(screen) = self.create.as_mut() {
-                        screen.scroll_terminal_up(WHEEL_LINES_PER_TICK);
-                    }
-                }
-                if matches!(self.screen, Screen::FillPullRequest) {
-                    if let Some(screen) = self.fill_pr.as_mut() {
-                        screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
-                    }
-                }
+                self.scroll_screen(ScrollDirection::Up, WHEEL_LINES_PER_TICK);
             }
             MouseEventKind::ScrollDown => {
-                if matches!(self.screen, Screen::UpdatePullRequest) {
-                    if let Some(screen) = self.update_pr.as_mut() {
-                        screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
-                    }
-                } else if matches!(self.screen, Screen::Create) {
-                    if let Some(screen) = self.create.as_mut() {
-                        screen.scroll_terminal_down(WHEEL_LINES_PER_TICK);
-                    }
-                }
-                if matches!(self.screen, Screen::FillPullRequest) {
-                    if let Some(screen) = self.fill_pr.as_mut() {
-                        screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
-                    }
-                }
+                self.scroll_screen(ScrollDirection::Down, WHEEL_LINES_PER_TICK);
             }
             _ => {}
         }
