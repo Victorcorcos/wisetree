@@ -309,6 +309,11 @@ pub struct App {
     /// Remaining `(path, force)` items still to delete in the current
     /// bulk run, processed one at a time via `kick_off_delete_worktree`.
     bulk_delete_queue: Vec<(String, bool)>,
+    /// Whether an embedded opencode PTY was alive on the previous frame.
+    /// A torn-down PTY can leave the primary-screen terminal scrolled out
+    /// of sync with Ratatui's diff model, so we force one full repaint on
+    /// the frame after the PTY disappears. See `event_loop_inner`.
+    pty_was_active: bool,
 }
 
 impl App {
@@ -347,6 +352,7 @@ impl App {
             pending_delete_path: None,
             pending_bulk_delete_paths: Vec::new(),
             bulk_delete_queue: Vec::new(),
+            pty_was_active: false,
         }
     }
 
@@ -414,6 +420,19 @@ impl App {
             }
             self.poll_dashboard_updates();
 
+            // An embedded opencode PTY (Fill / Update PR flows) drives the
+            // child through a real terminal whose escape sequences can scroll
+            // the primary screen out of sync with Ratatui's `Viewport::Fixed`
+            // diff model. Once the PTY tears down, static regions Ratatui
+            // thinks are unchanged (e.g. the header above the Fill "Done"
+            // panel) never get repainted, so old scrollback bleeds through.
+            // Force one full repaint on the frame after the PTY disappears.
+            let pty_active = self.pty_active();
+            if self.pty_was_active && !pty_active {
+                terminal.clear()?;
+            }
+            self.pty_was_active = pty_active;
+
             let completed = terminal.draw(|frame| self.draw(frame))?;
             self.last_rendered_buffer = Some(completed.buffer.clone());
 
@@ -460,6 +479,13 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Whether any screen currently embeds a live opencode PTY. Used to
+    /// detect the teardown edge that requires a full terminal repaint.
+    fn pty_active(&self) -> bool {
+        self.fill_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.update_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
