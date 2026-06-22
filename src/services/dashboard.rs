@@ -440,6 +440,12 @@ pub enum UpdateBranchOutcome {
     /// tree, refusal, ...). stderr included. Genuine merge conflicts are
     /// reported via the `Conflicts*` variants below instead.
     MergeFailed { base_ref: String, message: String },
+    /// The worktree has uncommitted tracked changes, so `git merge` would
+    /// refuse to start ("Your local changes ... would be overwritten by
+    /// merge"). Caught as a pre-flight guard *before* fetch/merge. This is
+    /// not a merge conflict — there are no markers and nothing for opencode
+    /// to resolve — so the UI just tells the user to commit or stash first.
+    WorkingTreeDirty { files: Vec<String> },
     /// Merge conflicts were detected, `useAi` is set, and `opencode` is on
     /// PATH. The merge is left mid-flight (conflict markers in the index)
     /// and the UI takes over: it spawns opencode inside an embedded PTY to
@@ -1401,6 +1407,17 @@ impl DashboardService {
     /// mother or derived — pulling its base branch in without pushing.
     pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
         let cwd = PathBuf::from(worktree_path);
+
+        // Pre-flight: a dirty working tree makes `git merge` refuse before it
+        // even starts ("Your local changes ... would be overwritten by
+        // merge"). That's not a merge conflict — no markers land, so there is
+        // nothing for opencode to resolve — so we catch it here and tell the
+        // user to commit or stash first instead of surfacing a raw git
+        // refusal that looks like (but isn't) a conflict.
+        let dirty = dirty_tracked_files(&self.git_binary, &cwd).await;
+        if !dirty.is_empty() {
+            return Ok(UpdateBranchOutcome::WorkingTreeDirty { files: dirty });
+        }
 
         let fetch = with_timeout(
             "git fetch",
@@ -3198,6 +3215,26 @@ async fn behind_against_base(git_binary: &Path, cwd: &Path, base_ref: &str) -> O
 
 /// Return the list of files currently in conflict (`UU`, `AA`, etc.).
 /// Empty when there are no conflicts.
+/// List the worktree's tracked, uncommitted changes — every path that
+/// differs from `HEAD` in the index or the working tree (modifications,
+/// staged additions, deletions, renames). `git diff --name-only HEAD`
+/// emits clean paths with no status prefix and, by design, omits untracked
+/// files: those rarely block a merge, and on the rare collision git's own
+/// "untracked working tree files would be overwritten" message still
+/// surfaces through the normal `MergeFailed` path. Used by `update_branch`
+/// as a pre-flight guard so a dirty tree fails fast with an actionable
+/// message rather than a raw `git merge` refusal.
+async fn dirty_tracked_files(git_binary: &Path, cwd: &Path) -> Vec<String> {
+    match run_command(git_binary, &["diff", "--name-only", "HEAD"], Some(cwd)).await {
+        Ok(out) => out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn conflicted_files(git_binary: &Path, cwd: &Path) -> Vec<String> {
     match run_command(
         git_binary,

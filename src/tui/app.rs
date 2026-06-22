@@ -2718,6 +2718,14 @@ impl App {
                 ToastVariant::Error,
                 format!("git merge {base_ref} failed: {message}"),
             ),
+            Ok(UpdateBranchOutcome::WorkingTreeDirty { files }) => self.show_toast(
+                ToastVariant::Warning,
+                format!(
+                    "{} uncommitted change(s) in the worktree — commit or stash them \
+                     before updating.",
+                    files.len()
+                ),
+            ),
             Ok(UpdateBranchOutcome::ConflictsRequireAi { .. }) => self.show_toast(
                 ToastVariant::Warning,
                 "Conflicts found, please resolve them locally or setup `useAi` \

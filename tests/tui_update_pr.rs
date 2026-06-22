@@ -680,3 +680,64 @@ async fn update_branch_merges_cleanly_without_pushing() {
     let remote_after = git_output(&fx.src, &["rev-parse", "origin/feat"]);
     assert_eq!(remote_before, remote_after, "update_branch must not push");
 }
+
+#[tokio::test]
+async fn update_branch_reports_working_tree_dirty_before_merging() {
+    let fx = Fixture::new();
+    // Advance main on an unrelated file so a real merge *would* happen, then
+    // leave an uncommitted edit to a tracked file. The pre-flight guard must
+    // short-circuit before fetch/merge: git would otherwise refuse with
+    // "Your local changes ... would be overwritten", which is not a conflict.
+    fx.advance_main("MAIN.md", "main doc\n");
+    fs::write(fx.src.join("README.md"), "uncommitted local edit\n").unwrap();
+
+    let service = fx.service();
+    let outcome = service
+        .update_branch(fx.src.to_str().unwrap())
+        .await
+        .expect("update_branch should succeed");
+
+    match outcome {
+        UpdateBranchOutcome::WorkingTreeDirty { files } => {
+            assert!(
+                files.iter().any(|f| f == "README.md"),
+                "expected README.md among {files:?}"
+            );
+        }
+        other => panic!("expected WorkingTreeDirty, got {other:?}"),
+    }
+
+    // The guard must not touch the tree: the dirty edit is untouched and no
+    // merge ran (no merge commit, no MAIN.md pulled in).
+    assert_eq!(
+        fs::read_to_string(fx.src.join("README.md")).unwrap(),
+        "uncommitted local edit\n",
+    );
+    assert!(!fx.src.join("MAIN.md").exists(), "no merge should have run");
+}
+
+/// Untracked files alone must not trip the dirty guard — wisetree itself
+/// drops untracked files (e.g. `pull_request.md`) into worktrees, and git
+/// would still merge cleanly around them.
+#[tokio::test]
+async fn update_branch_ignores_untracked_files() {
+    let fx = Fixture::new();
+    fx.advance_main("MAIN.md", "main doc\n");
+    fs::write(fx.src.join("scratch.txt"), "untracked\n").unwrap();
+
+    let service = fx.service();
+    let outcome = service
+        .update_branch(fx.src.to_str().unwrap())
+        .await
+        .expect("update_branch should succeed");
+
+    assert!(
+        matches!(
+            outcome,
+            UpdateBranchOutcome::Merged { .. }
+                | UpdateBranchOutcome::FastForwarded { .. }
+                | UpdateBranchOutcome::AlreadyUpToDate { .. }
+        ),
+        "untracked files must not block the update, got {outcome:?}"
+    );
+}
