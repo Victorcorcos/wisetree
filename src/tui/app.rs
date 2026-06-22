@@ -3625,9 +3625,10 @@ fn kick_off_update_branch(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        // The mother worktree IS the git root, so reuse the path as the
-        // service root — there is no separate "git_root" to resolve from
-        // app state for this action.
+        // `update_branch` runs every git command with the worktree path as
+        // its cwd, so the service root is only a placeholder here — reuse
+        // the worktree path rather than resolving a separate "git_root".
+        // Works for any worktree, mother or derived.
         let service = DashboardService::new(PathBuf::from(&worktree_path), config);
         let event = match service.update_branch(&worktree_path).await {
             Ok(outcome) => Ok(outcome),

@@ -960,7 +960,8 @@ impl DashboardService {
     /// Fetch the remote and merge the worktree at `worktree_path` with
     /// the first reachable ref in `BASE_REF_PRIORITY` (upstream/main →
     /// upstream/master → origin/main → origin/master). Powers the
-    /// dashboard's "Update Branch" action on the mother worktree.
+    /// dashboard's "Update branch (locally)" action on any worktree —
+    /// mother or derived — pulling its base branch in without pushing.
     pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
         let cwd = PathBuf::from(worktree_path);
 

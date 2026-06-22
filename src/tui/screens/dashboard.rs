@@ -162,10 +162,10 @@ pub enum DashboardAction {
     MergePullRequest(Box<MergePullRequestRequest>),
     UpdatePullRequest(Box<UpdatePullRequestRequest>),
     ClosePullRequest(Box<ClosePullRequestRequest>),
-    /// Fetch the remote and merge the mother branch with the first
+    /// Fetch the remote and merge the worktree's branch with the first
     /// reachable ref in `BASE_REF_PRIORITY` (upstream/main →
-    /// upstream/master → origin/main → origin/master). Only offered on
-    /// the main worktree row.
+    /// upstream/master → origin/main → origin/master). Offered on every
+    /// worktree row; carries the worktree path.
     UpdateBranch(String),
     /// The user tried to delete the mother (main) worktree. The app
     /// layer should surface a toast explaining that this worktree is
@@ -752,6 +752,16 @@ impl DashboardScreen {
                 ActionChoice::CopyPath,
             ));
         }
+        // Pull the worktree's base branch into it locally: fetch the remote
+        // and merge the first reachable ref from `BASE_REF_PRIORITY`
+        // (upstream/main → … → origin/master). Offered on every worktree —
+        // the mother pulls the upstream tip, derived worktrees catch up with
+        // the branch they were created from. Unlike "Update Pull Request"
+        // this never pushes, hence the "(locally)" suffix.
+        options.push(SelectOption::new(
+            "Update branch (locally)",
+            ActionChoice::UpdateBranch,
+        ));
         if row
             .pull_request
             .as_ref()
@@ -797,16 +807,6 @@ impl DashboardScreen {
             options.push(SelectOption::new(
                 "Close Pull Request",
                 ActionChoice::ClosePullRequest,
-            ));
-        }
-        // The mother (main) worktree has no PR of its own, but we still
-        // want a one-click way to pull the upstream tip into it. Fetches
-        // the remote and merges the first reachable ref from
-        // `BASE_REF_PRIORITY`.
-        if row.worktree.is_main {
-            options.push(SelectOption::new(
-                "Update Branch",
-                ActionChoice::UpdateBranch,
             ));
         }
         SelectPrompt::new("Choose action:", options)

@@ -1380,11 +1380,10 @@ fn action_menu_hides_update_option_when_no_pr_present() {
     assert!(!dumped.contains("Update Pull Request"));
 }
 
-// ---- "Update Branch" visibility -----------------------------------------
-// The mother (main) worktree is the only row that exposes "Update Branch".
-// It's the dashboard's one-click way to pull the upstream tip into the
-// mother — irrelevant on derived worktrees that already track their own
-// PR base via "Update Pull Request".
+// ---- "Update branch (locally)" visibility -------------------------------
+// Every worktree exposes "Update branch (locally)" — the mother pulls the
+// upstream tip into itself, derived worktrees catch up with the base branch
+// they were created from. Unlike "Update Pull Request" it never pushes.
 
 fn open_action_menu_for_first_row(screen: &mut DashboardScreen) -> String {
     screen.handle_key(key(KeyCode::Enter));
@@ -1408,13 +1407,13 @@ fn action_menu_shows_update_branch_on_mother_row() {
 
     let dumped = open_action_menu_for_first_row(&mut screen);
     assert!(
-        dumped.contains("Update Branch"),
-        "expected `Update Branch` on mother row: {dumped}"
+        dumped.contains("Update branch (locally)"),
+        "expected `Update branch (locally)` on mother row: {dumped}"
     );
 }
 
 #[test]
-fn action_menu_hides_update_branch_on_non_main_row() {
+fn action_menu_shows_update_branch_on_non_main_row() {
     let mut screen = DashboardScreen::new(
         true,
         true,
@@ -1430,7 +1429,7 @@ fn action_menu_hides_update_branch_on_non_main_row() {
 
     let dumped = open_action_menu_for_second_row(&mut screen);
     assert!(
-        !dumped.contains("Update Branch"),
-        "Update Branch must not appear on non-main rows: {dumped}"
+        dumped.contains("Update branch (locally)"),
+        "expected `Update branch (locally)` on non-main row: {dumped}"
     );
 }

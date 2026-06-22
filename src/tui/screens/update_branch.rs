@@ -15,7 +15,7 @@ use ratatui::Frame;
 
 use crate::tui::widgets::{Status, StatusIndicator};
 
-const UPDATE_BRANCH_LOADING_MESSAGE: &str = "Updating mother branch...";
+const UPDATE_BRANCH_LOADING_MESSAGE: &str = "Updating branch...";
 
 pub struct UpdateBranchScreen {
     worktree_path: String,
