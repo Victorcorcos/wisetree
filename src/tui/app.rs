@@ -36,9 +36,9 @@ use crate::services::{
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
     parse_pull_request_md, resolve_dashboard_columns, AppStateService, CommentGroup,
     DashboardService, DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome,
-    EnrichSubmitRequest, FixApplyHandoff, FixPlan, FixPreparation, FixVerdict, OpencodeModel,
-    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult, UpdatePhase,
-    UpdateProgress,
+    EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
+    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdateCheckResult,
+    UpdatePhase, UpdateProgress,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -164,10 +164,11 @@ enum AppEvent {
         index: usize,
         result: Result<Box<FixApplyHandoff>, String>,
     },
-    /// An applied fix was committed + the reviewer replied to.
+    /// A fix apply finished: either committed + replied, or no change was
+    /// needed and the reviewer was told it's already addressed.
     FixPrCommitted {
         index: usize,
-        result: Result<(), String>,
+        result: Result<FixCommitOutcome, String>,
     },
     /// The final `git push` finished; show the results page.
     FixPrPushed(Result<(), String>),
@@ -2021,7 +2022,7 @@ impl App {
     fn apply_fix_pr_committed(
         &mut self,
         index: usize,
-        result: Result<(), String>,
+        result: Result<FixCommitOutcome, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         if !self.fix_at_index(index) {
@@ -2029,7 +2030,10 @@ impl App {
         }
         if let Some(s) = self.fix_pr.as_mut() {
             match result {
-                Ok(()) => s.record_outcome(FixRowOutcome::Applied),
+                Ok(FixCommitOutcome::Committed) => s.record_outcome(FixRowOutcome::Applied),
+                Ok(FixCommitOutcome::AlreadyResolved) => {
+                    s.record_outcome(FixRowOutcome::AlreadyResolved)
+                }
                 Err(msg) => s.record_outcome(FixRowOutcome::Failed(truncate_error(&msg))),
             }
         }

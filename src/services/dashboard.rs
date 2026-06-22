@@ -493,29 +493,31 @@ pub struct ReviewComment {
     pub body: String,
 }
 
-/// A group of review comments that target the same file + line — or a single
-/// PR-level review summary, when `file` is `None`. The whole group is judged
-/// by one planning call and resolved as a single unit (Apply / Other / Skip).
+/// A group of inline review comments that target the same file + line. The
+/// whole group is judged by one planning call and resolved as a single unit
+/// (Apply / Other / Skip). `file` / `line` may still be `None` for a comment
+/// GitHub no longer maps to a current line; the reply then anchors via
+/// `reply_comment_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentGroup {
-    /// File the comments target; `None` for a PR-level review summary body.
+    /// File the comments target; `None` when GitHub returns no path.
     pub file: Option<String>,
     /// Line the comments target; `None` when not line-anchored.
     pub line: Option<u64>,
-    /// `databaseId` of the inline comment to reply to. `None` for a PR-level
-    /// summary (answered with a general PR comment instead).
+    /// `databaseId` of the inline comment to reply to. `None` only when the
+    /// comment lacks an id, in which case the reply falls back to a PR comment.
     pub reply_comment_id: Option<u64>,
     pub comments: Vec<ReviewComment>,
 }
 
 impl CommentGroup {
     /// Short human label for toasts and the summary table: `path:line`, or a
-    /// fallback for un-anchored review summaries.
+    /// fallback when GitHub returns no path for the comment.
     pub fn descriptor(&self) -> String {
         match (&self.file, self.line) {
             (Some(file), Some(line)) => format!("{file}:{line}"),
             (Some(file), None) => file.clone(),
-            _ => "PR review summary".to_string(),
+            _ => "PR review comment".to_string(),
         }
     }
 
@@ -590,6 +592,18 @@ pub struct FixApplyHandoff {
     pub opencode_binary: PathBuf,
     pub opencode_args: Vec<String>,
     pub cwd: PathBuf,
+}
+
+/// Result of the post-apply [`DashboardService::commit_and_reply`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixCommitOutcome {
+    /// opencode edited the file(s): the change was committed and the reviewer
+    /// was replied to with the commit link.
+    Committed,
+    /// opencode made no change — on closer inspection the code already
+    /// satisfied the comment. No commit was created; the reviewer was told it
+    /// is already addressed. Not a failure.
+    AlreadyResolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1592,8 +1606,9 @@ impl DashboardService {
             ));
         };
 
-        // One GraphQL call returns every review thread + review summary along
-        // with the resolved/outdated/minimized flags we filter on.
+        // One GraphQL call returns every inline review thread (and the
+        // resolved/minimized flags we filter on). PR-level review summaries
+        // are deliberately not fetched — the loop walks inline replies only.
         let query = build_fix_threads_query(&owner, &repo, number);
         let arg = format!("query={query}");
         let output = time::timeout(
@@ -1694,6 +1709,11 @@ impl DashboardService {
     /// commit-message format, and reply to the reviewer with the commit link.
     /// All deterministic — no AI. `comment_index` is the 1-based position in
     /// processing order, used in the commit body.
+    ///
+    /// opencode sometimes concludes the code already satisfies the comment and
+    /// edits nothing. That is not a failure: when the stage is empty we skip
+    /// the commit and instead reply that the comment is already addressed,
+    /// returning [`FixCommitOutcome::AlreadyResolved`].
     #[allow(clippy::too_many_arguments)]
     pub async fn commit_and_reply(
         &self,
@@ -1705,7 +1725,7 @@ impl DashboardService {
         comment_index: usize,
         group: &CommentGroup,
         plan: &FixPlan,
-    ) -> Result<()> {
+    ) -> Result<FixCommitOutcome> {
         let cwd = PathBuf::from(worktree_path);
 
         // Stage only what this fix touched: the targeted file when known. A
@@ -1725,6 +1745,41 @@ impl DashboardService {
         .map_err(|_| WisetreeError::other("git add timed out"))?
         .map_err(WisetreeError::other)?;
 
+        // If nothing got staged, the apply produced no change — opencode judged
+        // the code already handles the comment. Tell the reviewer so, and stop
+        // here: there is nothing to commit, and that's a valid resolution, not
+        // an error that should abort the loop.
+        let staged = time::timeout(
+            FIX_COMMIT_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["diff", "--cached", "--name-only"],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git diff --cached timed out"))?
+        .map_err(WisetreeError::other)?;
+        if staged.trim().is_empty() {
+            post_reply_internal(
+                &self.gh_binary,
+                &cwd,
+                owner,
+                repo,
+                number,
+                group,
+                ALREADY_RESOLVED_REPLY,
+            )
+            .await
+            .map_err(|err| {
+                WisetreeError::other(format!(
+                    "the apply step produced no change (the code already addresses the \
+                     comment), but posting the reply failed: {err}"
+                ))
+            })?;
+            return Ok(FixCommitOutcome::AlreadyResolved);
+        }
+
         let (subject, body) = format_commit_message(number, comment_index, &group.brief(), plan);
         let commit = time::timeout(
             FIX_COMMIT_TIMEOUT,
@@ -1737,9 +1792,8 @@ impl DashboardService {
         .await
         .map_err(|_| WisetreeError::other("git commit timed out"))?;
         if let Err(err) = commit {
-            // Most common cause: opencode made no change, so nothing staged.
             return Err(WisetreeError::other(if err.trim().is_empty() {
-                "nothing to commit — the apply step produced no file changes.".to_string()
+                "git commit failed after staging the change.".to_string()
             } else {
                 err
             }));
@@ -1756,7 +1810,7 @@ impl DashboardService {
         let reply = format_reply(&commit_url, plan);
 
         match post_reply_internal(&self.gh_binary, &cwd, owner, repo, number, group, &reply).await {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(FixCommitOutcome::Committed),
             Err(err) => Err(WisetreeError::other(format!(
                 "committed {} but failed to post the reply: {err}",
                 short_hash(&full_hash)
@@ -3220,15 +3274,16 @@ fn build_enrich_prompt(
 // ── "Fix Pull Request" helpers (deterministic, unit-tested) ────────────
 
 /// Build the GraphQL query that returns every review thread (with the
-/// `isResolved` / `isOutdated` / `isMinimized` flags we filter on) plus the
-/// PR-level review summary bodies, in one call.
+/// `isResolved` flag we filter on and the per-comment `isMinimized` flag).
+/// Only inline review-thread comments are fetched — PR-level review summary
+/// bodies (e.g. a "💡 Codex Review" header) are intentionally excluded so the
+/// Fix loop walks the actionable inline replies, not the umbrella comment.
 fn build_fix_threads_query(owner: &str, repo: &str, number: u64) -> String {
     format!(
         "query {{ repository(owner: \"{}\", name: \"{}\") {{ pullRequest(number: {}) {{ \
-         reviewThreads(first: 100) {{ nodes {{ isResolved isOutdated \
+         reviewThreads(first: 100) {{ nodes {{ isResolved \
          comments(first: 50) {{ nodes {{ databaseId path line originalLine isMinimized body \
-         author {{ login }} }} }} }} }} \
-         reviews(first: 100) {{ nodes {{ state body author {{ login }} }} }} }} }} }}",
+         author {{ login }} }} }} }} }} }} }} }}",
         escape_graphql_string(owner),
         escape_graphql_string(repo),
         number
@@ -3236,9 +3291,11 @@ fn build_fix_threads_query(owner: &str, repo: &str, number: u64) -> String {
 }
 
 /// Parse the review-threads GraphQL response and group the survivors. Drops
-/// resolved + outdated threads and minimized comments, groups the rest by
-/// (file, line) preserving first-seen order, and appends each non-empty
-/// PR-level review summary body as its own un-anchored group.
+/// resolved threads and minimized comments, then groups the rest by
+/// (file, line) preserving first-seen order. Outdated threads are kept (an AI
+/// reviewer often marks its inline comments outdated once the branch advances,
+/// yet the feedback is still actionable). PR-level review summaries are *not*
+/// fetched, so every group anchors to an inline reply we can reply to in-thread.
 fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<CommentGroup>, String> {
     #[derive(Deserialize)]
     struct Resp {
@@ -3258,7 +3315,6 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
     struct Pr {
         #[serde(rename = "reviewThreads")]
         review_threads: Conn<Thread>,
-        reviews: Conn<Review>,
     }
     #[derive(Deserialize)]
     struct Conn<T> {
@@ -3269,8 +3325,6 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
     struct Thread {
         #[serde(rename = "isResolved", default)]
         is_resolved: bool,
-        #[serde(rename = "isOutdated", default)]
-        is_outdated: bool,
         comments: Conn<RawComment>,
     }
     #[derive(Deserialize)]
@@ -3283,14 +3337,6 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
         original_line: Option<u64>,
         #[serde(rename = "isMinimized", default)]
         is_minimized: bool,
-        #[serde(default)]
-        body: String,
-        author: Option<Author>,
-    }
-    #[derive(Deserialize)]
-    struct Review {
-        #[serde(default)]
-        state: String,
         #[serde(default)]
         body: String,
         author: Option<Author>,
@@ -3335,7 +3381,7 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
     let mut index: HashMap<(String, u64), usize> = HashMap::new();
 
     for thread in pr.review_threads.nodes {
-        if thread.is_resolved || thread.is_outdated {
+        if thread.is_resolved {
             continue;
         }
         let surviving: Vec<RawComment> = thread
@@ -3374,26 +3420,6 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
             line,
             reply_comment_id: reply_id,
             comments: mapped,
-        });
-    }
-
-    // PR-level review summary bodies become their own un-anchored groups.
-    for review in pr.reviews.nodes {
-        if review.state.eq_ignore_ascii_case("pending") {
-            continue;
-        }
-        let trimmed = review.body.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        groups.push(CommentGroup {
-            file: None,
-            line: None,
-            reply_comment_id: None,
-            comments: vec![ReviewComment {
-                author: login(&review.author),
-                body: trimmed.to_string(),
-            }],
         });
     }
 
@@ -3573,6 +3599,11 @@ fn format_commit_message(
     let body = format!("PR #{number}, comment #{comment_index} — \"{brief}\"\n{explanation}");
     (subject, body)
 }
+
+/// The reply posted when the apply step produced no change because the code
+/// already satisfies the comment (the planner over-judged it as actionable).
+const ALREADY_RESOLVED_REPLY: &str = "The current code already addresses this — \
+    on a closer look against the comment, no change was needed here. Thanks for the feedback!";
 
 /// Build the reply posted to the reviewer after a fix is committed.
 fn format_reply(commit_url: &str, plan: &FixPlan) -> String {
@@ -3879,36 +3910,41 @@ so the intent reads clearly.
     // ── Fix pipeline: comment grouping ─────────────────────────────────
 
     #[test]
-    fn group_review_threads_filters_and_groups() {
+    fn group_review_threads_keeps_unresolved_inline_and_ignores_reviews() {
         let json = r#"{
           "data": { "repository": { "pullRequest": {
             "reviewThreads": { "nodes": [
-              { "isResolved": true, "isOutdated": false, "comments": { "nodes": [
+              { "isResolved": true, "comments": { "nodes": [
                 { "databaseId": 1, "path": "a.rs", "line": 5, "isMinimized": false, "body": "resolved", "author": { "login": "rev" } }
               ] } },
-              { "isResolved": false, "isOutdated": true, "comments": { "nodes": [
-                { "databaseId": 2, "path": "a.rs", "line": 6, "isMinimized": false, "body": "outdated", "author": { "login": "rev" } }
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 2, "path": "a.rs", "line": null, "originalLine": 6, "isMinimized": false, "body": "outdated but actionable", "author": { "login": "codex" } }
               ] } },
-              { "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
                 { "databaseId": 3, "path": "a.rs", "line": 10, "isMinimized": false, "body": "rename foo", "author": { "login": "alice" } },
                 { "databaseId": 4, "path": "a.rs", "line": 10, "isMinimized": true, "body": "hidden", "author": { "login": "spam" } }
               ] } },
-              { "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
                 { "databaseId": 5, "path": "a.rs", "line": 10, "isMinimized": false, "body": "second thread, same line", "author": { "login": "bob" } }
               ] } }
             ] },
             "reviews": { "nodes": [
-              { "state": "COMMENTED", "body": "Overall looks good but check error handling.", "author": { "login": "carol" } },
-              { "state": "APPROVED", "body": "", "author": { "login": "dave" } },
-              { "state": "PENDING", "body": "draft note", "author": { "login": "eve" } }
+              { "state": "COMMENTED", "body": "💡 Codex Review — overall looks good.", "author": { "login": "codex" } }
             ] }
           } } }
         }"#;
         let groups = parse_and_group_review_threads(json).expect("parse ok");
-        // Resolved + outdated threads dropped → one inline group + one review.
+        // Resolved thread dropped; outdated thread kept; PR-level review ignored.
         assert_eq!(groups.len(), 2);
 
-        let inline = &groups[0];
+        // Outdated-but-unresolved inline thread is now retained, anchored to
+        // the inline comment (line falls back to originalLine).
+        let outdated = &groups[0];
+        assert_eq!(outdated.reply_comment_id, Some(2));
+        assert_eq!(outdated.line, Some(6));
+        assert_eq!(outdated.comments[0].author, "codex");
+
+        let inline = &groups[1];
         assert_eq!(inline.file.as_deref(), Some("a.rs"));
         assert_eq!(inline.line, Some(10));
         assert_eq!(inline.reply_comment_id, Some(3));
@@ -3917,12 +3953,8 @@ so the intent reads clearly.
         assert_eq!(inline.comments[0].author, "alice");
         assert_eq!(inline.comments[1].author, "bob");
 
-        // Non-empty, non-pending review summary becomes an un-anchored group.
-        let review = &groups[1];
-        assert_eq!(review.file, None);
-        assert_eq!(review.reply_comment_id, None);
-        assert_eq!(review.comments[0].author, "carol");
-        assert_eq!(review.descriptor(), "PR review summary");
+        // Every group anchors to an inline reply — no PR-level summary group.
+        assert!(groups.iter().all(|g| g.reply_comment_id.is_some()));
     }
 
     #[test]

@@ -23,6 +23,10 @@ APPROVED_PLAN
 4. Preserve language invariants — imports resolve, signatures stay consistent across call sites, the file remains syntactically valid.
 5. Prefer structured file-editing tools for the edit when available; you may use shell only for read-only inspection (reading files, searching) and a fast targeted check if one is obviously available.
 
+## If the change is already present
+
+If, after reading the targeted file(s), you find the code already satisfies the reviewer's comment — the plan would be a no-op, duplicate existing behavior, or re-implement something already handled — then make **no edit**. Do not invent a change just to produce a diff, and do not rewrite working code to look different. Stop and state in one short line that the code already addresses the comment. The harness detects the empty change and replies to the reviewer that it is already resolved, so an empty change here is a valid, expected outcome — not a failure.
+
 ## Forbidden
 
 - Do NOT stage, commit, push, or reply to anyone (`git add`, `git commit`, `git push`, `gh ...`) — the harness does all of that after you stop.

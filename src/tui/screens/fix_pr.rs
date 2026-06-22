@@ -76,6 +76,9 @@ pub enum FixRowOutcome {
     Applied,
     /// Non-actionable question answered with a reply.
     Replied,
+    /// Apply produced no change — the code already satisfied the comment, and
+    /// the reviewer was replied to saying it's already addressed.
+    AlreadyResolved,
     /// Praise, or the user chose Skip. The reason is shown in parentheses.
     Skipped(&'static str),
     /// Something broke (plan / apply / commit / reply). Message is included.
@@ -348,6 +351,9 @@ impl FixPullRequestScreen {
             }
             FixRowOutcome::Replied => {
                 SummaryRow::with_status(command, "Replied", colors::SUCCESS, None)
+            }
+            FixRowOutcome::AlreadyResolved => {
+                SummaryRow::with_status(command, "No change", colors::INFO, None)
             }
             FixRowOutcome::Skipped(_) => {
                 SummaryRow::with_status(command, "Skipped", colors::WARNING, None)
@@ -1547,6 +1553,21 @@ mod tests {
         assert_eq!(failed.status.as_ref().unwrap().label, "Failed");
         assert_eq!(failed.status.as_ref().unwrap().color, colors::ERROR);
         assert_eq!(failed.failure.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn already_resolved_outcome_is_a_non_failure_no_change_row() {
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.record_outcome(FixRowOutcome::AlreadyResolved);
+        let row = &screen.summary_rows[0];
+        let status = row.status.as_ref().unwrap();
+        assert_eq!(status.label, "No change");
+        assert_eq!(status.color, colors::INFO);
+        // Counts as a success so it never trips the "finished with failures"
+        // headline on the Done page.
+        assert!(row.success);
+        assert!(row.failure.is_none());
     }
 
     #[test]
