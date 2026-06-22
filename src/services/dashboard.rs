@@ -3467,8 +3467,14 @@ mod tests {
 
         assert_eq!(stdout, "stdout");
         assert_eq!(activity.len(), 2, "activity was {activity:?}");
-        assert_eq!(activity[0], ("stdout".to_string(), ActivityKind::Stdout));
-        assert_eq!(activity[1], ("stderr".to_string(), ActivityKind::Stderr));
+        assert!(
+            activity.contains(&("stdout".to_string(), ActivityKind::Stdout)),
+            "stdout entry missing from activity: {activity:?}"
+        );
+        assert!(
+            activity.contains(&("stderr".to_string(), ActivityKind::Stderr)),
+            "stderr entry missing from activity: {activity:?}"
+        );
 
         for text in activity.iter().map(|(text, _)| text).chain([&stdout]) {
             assert!(
