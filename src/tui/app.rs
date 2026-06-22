@@ -729,13 +729,12 @@ impl App {
                 }
             }
             Screen::FillPullRequest => {
-                // The Filling step (live opencode PTY) and the Confirm
-                // explanation both want the full bottom region; the compact
-                // Loading / Review / Opening steps stay in a sized panel.
-                let expand = self
-                    .fill_pr
-                    .as_ref()
-                    .is_some_and(|s| s.is_filling() || matches!(s.step(), FillStep::Confirm));
+                // The Filling step (live opencode PTY), the Confirm
+                // explanation, and Opening's live Terminal Activity all want
+                // the full bottom region. Loading / Review stay compact.
+                let expand = self.fill_pr.as_ref().is_some_and(|s| {
+                    s.is_filling() || matches!(s.step(), FillStep::Confirm | FillStep::Opening)
+                });
                 let panel = if expand {
                     self.render_framed_panel_fill(frame, area)
                 } else {
@@ -4415,7 +4414,7 @@ fn kick_off_submit_pull_request(
 
         // Forward terminal-activity lines into the main event loop.
         let forward_tx = tx.clone();
-        tokio::spawn(async move {
+        let forwarder = tokio::spawn(async move {
             while let Some((text, kind)) = activity_rx.recv().await {
                 let _ = forward_tx.send(AppEvent::FillPrActivity { text, kind });
             }
@@ -4429,6 +4428,8 @@ fn kick_off_submit_pull_request(
             Ok(outcome) => Ok(outcome),
             Err(err) => Err(user_friendly_message(&err)),
         };
+        drop(activity_tx);
+        let _ = forwarder.await;
         let _ = tx.send(AppEvent::FillPrSubmitted(event));
     });
 }
@@ -6328,6 +6329,44 @@ mod tests {
 
         assert!(app.quit_requested);
         assert_eq!(app.selected_path(), Some("/tmp/repo/feat-x"));
+    }
+
+    #[test]
+    fn fill_opening_terminal_activity_uses_full_height_panel() {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::FillPullRequest;
+        app.fill_pr = Some(FillPullRequestScreen::new(FillPullRequestRequest {
+            branch: "feature/fill".into(),
+            worktree_path: "/tmp/repo/feature/fill".into(),
+            base_ref: Some("upstream/main".into()),
+            number: None,
+            title: None,
+            url: None,
+            existing_labels: Vec::new(),
+        }));
+        let screen = app.fill_pr.as_mut().unwrap();
+        screen.start_opening();
+        screen.append_terminal_line("running tests".into(), crate::files::ActivityKind::Stdout);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let dump = rows.join("\n");
+
+        assert!(dump.contains("Opening pull request"), "{dump}");
+        assert!(dump.contains("Terminal Activity"), "{dump}");
+        assert!(
+            !rows.last().unwrap().trim().is_empty(),
+            "Fill Opening must occupy the full bottom panel so streaming output stays framed:\n{dump}"
+        );
     }
 
     #[test]
