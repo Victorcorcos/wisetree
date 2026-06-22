@@ -17,7 +17,7 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::config::schema::{normalize_dashboard_columns, DashboardConfig};
 use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
-use crate::files::ActivityKind;
+use crate::files::{strip_ansi, ActivityKind};
 use crate::git::exec::execute_git_command;
 use crate::git::types::{BranchStatus, GitWorktree};
 use crate::services::ai_status::{AiStatusIndex, AiStatusPaths, AiStatusReport, AiStatusService};
@@ -3072,12 +3072,12 @@ async fn run_command_streamed(
             line = out_lines.next_line(), if !out_done => {
                 match line {
                     Ok(Some(l)) => {
-                        let clean = l.trim_end_matches('\r').to_string();
+                        let clean = strip_ansi(&l);
+                        stdout_buf.push_str(&clean);
+                        stdout_buf.push('\n');
                         if !clean.is_empty() {
                             let _ = tx.send((clean, ActivityKind::Stdout));
                         }
-                        stdout_buf.push_str(&l);
-                        stdout_buf.push('\n');
                     }
                     _ => out_done = true,
                 }
@@ -3085,12 +3085,12 @@ async fn run_command_streamed(
             line = err_lines.next_line(), if !err_done => {
                 match line {
                     Ok(Some(l)) => {
-                        let clean = l.trim_end_matches('\r').to_string();
+                        let clean = strip_ansi(&l);
+                        stderr_buf.push_str(&clean);
+                        stderr_buf.push('\n');
                         if !clean.is_empty() {
                             let _ = tx.send((clean, ActivityKind::Stderr));
                         }
-                        stderr_buf.push_str(&l);
-                        stderr_buf.push('\n');
                     }
                     _ => err_done = true,
                 }
@@ -3507,6 +3507,52 @@ mod tests {
             let mut permissions = std::fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamed_command_sanitizes_terminal_activity_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("ansi-output.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '\\033[31mred\\033[0m\\rstdout\\n'\nprintf '\\033[2K\\033[35mstderr\\033[0m\\n' >&2\n",
+        )
+        .unwrap();
+        make_executable(&script);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let stdout = run_command_streamed(&script, &[], Some(dir.path()), Some(&tx))
+            .await
+            .expect("command should succeed");
+        drop(tx);
+
+        let mut activity = Vec::new();
+        while let Ok((text, kind)) = rx.try_recv() {
+            activity.push((text, kind));
+        }
+
+        assert_eq!(stdout, "stdout");
+        assert_eq!(activity.len(), 2, "activity was {activity:?}");
+        assert!(
+            activity.contains(&("stdout".to_string(), ActivityKind::Stdout)),
+            "stdout entry missing from activity: {activity:?}"
+        );
+        assert!(
+            activity.contains(&("stderr".to_string(), ActivityKind::Stderr)),
+            "stderr entry missing from activity: {activity:?}"
+        );
+
+        for text in activity.iter().map(|(text, _)| text).chain([&stdout]) {
+            assert!(
+                !text.contains('\x1b'),
+                "ANSI escaped into activity: {text:?}"
+            );
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\t'),
+                "control byte escaped into activity: {text:?}"
+            );
         }
     }
 
