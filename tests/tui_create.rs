@@ -241,7 +241,7 @@ fn navigate_confirm_no_choice_still_proceeds_with_create() {
 }
 
 #[test]
-fn navigate_confirm_esc_cancels_entire_flow() {
+fn navigate_confirm_esc_goes_back_to_confirm() {
     let mut s = ready_screen();
     type_str(&mut s, "feat-x");
     s.handle_key(key(KeyCode::Enter));
@@ -249,7 +249,109 @@ fn navigate_confirm_esc_cancels_entire_flow() {
     s.handle_key(key(KeyCode::Enter));
     s.handle_key(key(KeyCode::Char('y')));
     s.handle_key(key(KeyCode::Enter)); // → NavigateConfirm
+    assert_eq!(s.step(), CreateStep::NavigateConfirm);
     let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, CreateAction::Continue);
+    assert_eq!(s.step(), CreateStep::Confirm);
+}
+
+#[test]
+fn esc_steps_back_through_the_whole_flow_preserving_input() {
+    let mut s = ready_screen();
+    type_str(&mut s, "feat-login");
+    s.handle_key(key(KeyCode::Enter)); // Directory → SourceBranch
+    s.handle_key(key(KeyCode::Down)); // move off "develop" onto "main"
+    s.handle_key(key(KeyCode::Enter)); // SourceBranch → NewBranch ("main")
+    assert_eq!(s.step(), CreateStep::NewBranch);
+    assert_eq!(s.source_branch, "main");
+    s.handle_key(key(KeyCode::Enter)); // NewBranch → Confirm
+    assert_eq!(s.step(), CreateStep::Confirm);
+    s.handle_key(key(KeyCode::Char('y')));
+    s.handle_key(key(KeyCode::Enter)); // Confirm → NavigateConfirm
+    assert_eq!(s.step(), CreateStep::NavigateConfirm);
+
+    // Now walk back with Esc, page by page.
+    assert_eq!(s.handle_key(key(KeyCode::Esc)), CreateAction::Continue);
+    assert_eq!(s.step(), CreateStep::Confirm);
+    assert_eq!(s.handle_key(key(KeyCode::Esc)), CreateAction::Continue);
+    assert_eq!(s.step(), CreateStep::NewBranch);
+    assert_eq!(s.handle_key(key(KeyCode::Esc)), CreateAction::Continue);
+    assert_eq!(s.step(), CreateStep::SourceBranch);
+    assert_eq!(s.handle_key(key(KeyCode::Esc)), CreateAction::Continue);
+    assert_eq!(s.step(), CreateStep::Directory);
+
+    // The directory name typed at the very start survives the round trip.
+    assert_eq!(s.directory_name, "feat-login");
+    let dumped = dump(60, 12, |f| s.render(f, f.area()));
+    assert!(dumped.contains("feat-login"));
+
+    // And Esc on the directory step still cancels the whole flow.
+    assert_eq!(s.handle_key(key(KeyCode::Esc)), CreateAction::Cancelled);
+}
+
+#[test]
+fn esc_from_new_branch_returns_to_source_with_prior_pick_focused() {
+    let mut s = ready_screen();
+    type_str(&mut s, "feat-x");
+    s.handle_key(key(KeyCode::Enter)); // → SourceBranch
+    s.handle_key(key(KeyCode::Down)); // develop → main
+    s.handle_key(key(KeyCode::Enter)); // → NewBranch with source "main"
+    assert_eq!(s.source_branch, "main");
+    s.handle_key(key(KeyCode::Esc)); // back to SourceBranch
+    assert_eq!(s.step(), CreateStep::SourceBranch);
+    // Enter again must re-select "main" (the row stayed focused), not "develop".
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), CreateStep::NewBranch);
+    assert_eq!(s.source_branch, "main");
+}
+
+#[test]
+fn esc_from_new_branch_returns_to_custom_ref_with_value_preserved() {
+    let mut s = ready_screen();
+    type_str(&mut s, "feat-x");
+    s.handle_key(key(KeyCode::Enter)); // → SourceBranch
+    for _ in 0..3 {
+        s.handle_key(key(KeyCode::Down)); // reach the custom-ref row
+    }
+    s.handle_key(key(KeyCode::Enter)); // → CustomRef
+    type_str(&mut s, "v1.2.3");
+    s.handle_key(key(KeyCode::Enter)); // → NewBranch with source "v1.2.3"
+    assert_eq!(s.source_branch, "v1.2.3");
+    s.handle_key(key(KeyCode::Esc)); // back to CustomRef
+    assert_eq!(s.step(), CreateStep::CustomRef);
+    // The typed ref is restored — re-submitting keeps it.
+    let dumped = dump(60, 8, |f| s.render(f, f.area()));
+    assert!(dumped.contains("v1.2.3"));
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), CreateStep::NewBranch);
+    assert_eq!(s.source_branch, "v1.2.3");
+}
+
+#[test]
+fn esc_from_custom_ref_returns_to_source_branch() {
+    let mut s = ready_screen();
+    type_str(&mut s, "feat-x");
+    s.handle_key(key(KeyCode::Enter)); // → SourceBranch
+    for _ in 0..3 {
+        s.handle_key(key(KeyCode::Down)); // reach the custom-ref row
+    }
+    s.handle_key(key(KeyCode::Enter)); // → CustomRef
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, CreateAction::Continue);
+    assert_eq!(s.step(), CreateStep::SourceBranch);
+}
+
+#[test]
+fn confirm_cancel_button_still_aborts_the_flow() {
+    let mut s = ready_screen();
+    type_str(&mut s, "feat-x");
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Enter)); // → NewBranch
+    s.handle_key(key(KeyCode::Enter)); // → Confirm
+    assert_eq!(s.step(), CreateStep::Confirm);
+    // Selecting the "Cancel" button and pressing Enter aborts to the menu.
+    s.handle_key(key(KeyCode::Char('n')));
+    let action = s.handle_key(key(KeyCode::Enter));
     assert_eq!(action, CreateAction::Cancelled);
 }
 

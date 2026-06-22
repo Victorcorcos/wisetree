@@ -8,12 +8,53 @@ use ratatui::Terminal;
 
 use wisetree::config::schema::WorktreeConfig;
 use wisetree::messages::colors;
-use wisetree::services::UpdateCheckResult;
+use wisetree::services::{MultiSourceUpdateResult, UpdateCheckResult, UpdateSource};
 use wisetree::tui::screens::settings::{
     CopyDirection, PathTemplateRectStatus, PathTemplateSelection, PostCmdRectStatus,
     PostCmdSelection, SettingsAction, SettingsScreen, SettingsStep, TerminalCmdRectStatus,
-    TerminalCmdSelection,
+    TerminalCmdSelection, UpgradeOutcome,
 };
+
+fn npm_only_result(current: &str, npm_latest: Option<&str>) -> MultiSourceUpdateResult {
+    let npm = UpdateCheckResult {
+        has_update: npm_latest.map(|v| v != current).unwrap_or(false),
+        current_version: current.to_string(),
+        latest_version: npm_latest.map(str::to_string),
+        checked_at: 0,
+        error: None,
+    };
+    let homebrew = UpdateCheckResult {
+        has_update: false,
+        current_version: current.to_string(),
+        latest_version: None,
+        checked_at: 0,
+        error: Some("not checked".to_string()),
+    };
+    MultiSourceUpdateResult {
+        current_version: current.to_string(),
+        npm,
+        homebrew,
+    }
+}
+
+fn dual_result(
+    current: &str,
+    npm_latest: Option<&str>,
+    homebrew_latest: Option<&str>,
+) -> MultiSourceUpdateResult {
+    let mk = |latest: Option<&str>| UpdateCheckResult {
+        has_update: latest.map(|v| v != current).unwrap_or(false),
+        current_version: current.to_string(),
+        latest_version: latest.map(str::to_string),
+        checked_at: 0,
+        error: None,
+    };
+    MultiSourceUpdateResult {
+        current_version: current.to_string(),
+        npm: mk(npm_latest),
+        homebrew: mk(homebrew_latest),
+    }
+}
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -160,25 +201,26 @@ fn ready_with_link_settings(
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
-// Menu order: Dashboard(0), Copy Patterns(1), Ignore Patterns(2),
-// Link Patterns(3), Link Strategy(4), Link Cache Dir(5),
-// Post-Create Commands(6), Terminal Command(7), Path Template(8),
-// Copy Settings(9), Delete Branch(10), Check for Updates(11).
-const COPY_PATTERNS_INDEX: usize = 1;
-const IGNORE_PATTERNS_INDEX: usize = 2;
-const LINK_STRATEGY_INDEX: usize = 4;
-const LINK_CACHE_DIR_INDEX: usize = 5;
-const POST_CMD_INDEX: usize = 6;
-const TERMINAL_CMD_INDEX: usize = 7;
-const PATH_TEMPLATE_INDEX: usize = 8;
-const COPY_SETTINGS_INDEX: usize = 9;
-const DELETE_BRANCH_INDEX: usize = 10;
-const CHECK_UPDATES_INDEX: usize = 11;
+// Menu order: Dashboard(0), Notifications(1), Copy Patterns(2),
+// Ignore Patterns(3), Link Patterns(4), Link Strategy(5), Link Cache Dir(6),
+// Post-Create Commands(7), Terminal Command(8), Path Template(9),
+// Copy Settings(10), Delete Branch(11), Check for Updates(12).
+const NOTIFICATIONS_INDEX: usize = 1;
+const COPY_PATTERNS_INDEX: usize = 2;
+const IGNORE_PATTERNS_INDEX: usize = 3;
+const LINK_STRATEGY_INDEX: usize = 5;
+const LINK_CACHE_DIR_INDEX: usize = 6;
+const POST_CMD_INDEX: usize = 7;
+const TERMINAL_CMD_INDEX: usize = 8;
+const PATH_TEMPLATE_INDEX: usize = 9;
+const COPY_SETTINGS_INDEX: usize = 10;
+const DELETE_BRANCH_INDEX: usize = 11;
+const CHECK_UPDATES_INDEX: usize = 12;
 
 #[test]
 fn menu_renders_with_config_path() {
     let s = ready();
-    let dumped = dump(80, 20, |f| s.render(f, f.area()));
+    let dumped = dump(80, s.preferred_content_height(), |f| s.render(f, f.area()));
     assert!(dumped.contains("Configuration file"));
     assert!(dumped.contains("/tmp/.wisetree.json"));
     assert!(dumped.contains("➤"));
@@ -224,10 +266,11 @@ fn setup_project_entry_at_index_zero_when_present() {
     // Enter at position 0 should emit OpenSetupProject, not navigate into another sub-step.
     let action = s.handle_key(key(KeyCode::Enter));
     assert_eq!(action, SettingsAction::OpenSetupProject);
-    // Dashboard is now at position 1; navigating there still works.
+    // With Setup Project at 0, the order is Dashboard(1), Notifications(2),
+    // Copy Patterns(3); three Downs reach Copy Patterns.
     let mut s2 = ready().with_has_setup_project(true);
     s2.handle_key(key(KeyCode::Down));
-    // Down again to reach Copy Patterns (position 2).
+    s2.handle_key(key(KeyCode::Down));
     s2.handle_key(key(KeyCode::Down));
     let action2 = s2.handle_key(key(KeyCode::Enter));
     assert_eq!(action2, SettingsAction::Continue); // enters CopyPatterns sub-step
@@ -260,6 +303,52 @@ fn enter_ignore_patterns(s: &mut SettingsScreen) {
     }
     s.handle_key(key(KeyCode::Enter));
     assert_eq!(s.step(), SettingsStep::IgnorePatterns);
+}
+
+fn enter_notifications(s: &mut SettingsScreen) {
+    for _ in 0..NOTIFICATIONS_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::Notifications);
+}
+
+#[test]
+fn notifications_entry_opens_dedicated_screen() {
+    let mut s = ready();
+    enter_notifications(&mut s);
+    let dumped = dump(90, s.preferred_content_height(), |f| s.render(f, f.area()));
+    assert!(dumped.contains("Notifications"));
+    assert!(dumped.contains("aiStatusOk"));
+    assert!(dumped.contains("prChecksOk"));
+    assert!(dumped.contains("Save"));
+}
+
+#[test]
+fn notifications_save_button_emits_save_action() {
+    let mut s = ready();
+    enter_notifications(&mut s);
+    // Toggle aiStatusOk on, then move to Save and confirm.
+    s.handle_key(key(KeyCode::Enter));
+    s.handle_key(key(KeyCode::Down));
+    s.handle_key(key(KeyCode::Down));
+    let action = s.handle_key(key(KeyCode::Enter));
+    match action {
+        SettingsAction::SaveNotifications(cfg) => {
+            assert!(cfg.ai_status_ok);
+            assert!(!cfg.pr_checks_ok);
+        }
+        other => panic!("expected SaveNotifications, got {other:?}"),
+    }
+}
+
+#[test]
+fn esc_on_notifications_page_returns_to_menu() {
+    let mut s = ready();
+    enter_notifications(&mut s);
+    let action = s.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, SettingsAction::Continue);
+    assert_eq!(s.step(), SettingsStep::Menu);
 }
 
 #[test]
@@ -598,43 +687,103 @@ fn check_updates_loading_renders_spinner_message() {
 }
 
 #[test]
-fn check_updates_with_new_version_shows_install_command() {
+fn check_updates_renders_npm_and_homebrew_rectangles() {
     let mut s = ready();
     for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
     s.start_checking_updates();
-    s.set_update_result(UpdateCheckResult {
-        has_update: true,
-        current_version: "1.0.0".into(),
-        latest_version: Some("2.0.0".into()),
-        checked_at: 0,
-        error: None,
-    });
-    let dumped = dump(80, 8, |f| s.render(f, f.area()));
-    assert!(dumped.contains("New version available"));
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+    let dumped = dump(90, 14, |f| s.render(f, f.area()));
+    // Both source labels appear as rectangle titles.
+    assert!(dumped.contains("npm"));
+    assert!(dumped.contains("homebrew"));
+    // Latest version is surfaced inside the rectangles.
     assert!(dumped.contains("v2.0.0"));
+    // Each rectangle hints at the matching upgrade command.
     assert!(dumped.contains("npm install -g wisetree"));
+    assert!(dumped.contains("brew upgrade victorcorcos/tap/wisetree"));
+    assert!(dumped.contains("Current version: v1.0.0"));
 }
 
 #[test]
-fn check_updates_up_to_date_message() {
+fn check_updates_arrow_keys_move_selection() {
     let mut s = ready();
     for _ in 0..CHECK_UPDATES_INDEX {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
-    s.set_update_result(UpdateCheckResult {
-        has_update: false,
-        current_version: "1.0.0".into(),
-        latest_version: Some("1.0.0".into()),
-        checked_at: 0,
-        error: None,
-    });
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+    assert_eq!(s.update_selection(), UpdateSource::Npm);
+    s.handle_key(key(KeyCode::Down));
+    assert_eq!(s.update_selection(), UpdateSource::Homebrew);
+    s.handle_key(key(KeyCode::Up));
+    assert_eq!(s.update_selection(), UpdateSource::Npm);
+}
+
+#[test]
+fn check_updates_enter_emits_upgrade_for_selected_source() {
+    let mut s = ready();
+    for _ in 0..CHECK_UPDATES_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(action, SettingsAction::UpgradeSource(UpdateSource::Npm));
+
+    s.handle_key(key(KeyCode::Down));
+    let action = s.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        SettingsAction::UpgradeSource(UpdateSource::Homebrew)
+    );
+}
+
+#[test]
+fn check_updates_renders_homebrew_error_in_rectangle() {
+    let mut s = ready();
+    for _ in 0..CHECK_UPDATES_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.set_update_result(npm_only_result("1.0.0", Some("2.0.0")));
+    let dumped = dump(90, 14, |f| s.render(f, f.area()));
+    assert!(dumped.contains("homebrew"));
+    assert!(dumped.contains("error"));
+}
+
+#[test]
+fn check_updates_upgrade_spinner_shown_while_upgrading() {
+    let mut s = ready();
+    for _ in 0..CHECK_UPDATES_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+    s.start_upgrade(UpdateSource::Npm);
     let dumped = dump(80, 6, |f| s.render(f, f.area()));
-    assert!(dumped.contains("latest version"));
-    assert!(dumped.contains("v1.0.0"));
+    assert!(dumped.contains("Upgrading via npm"));
+}
+
+#[test]
+fn check_updates_upgrade_outcome_rendered_inline() {
+    let mut s = ready();
+    for _ in 0..CHECK_UPDATES_INDEX {
+        s.handle_key(key(KeyCode::Down));
+    }
+    s.handle_key(key(KeyCode::Enter));
+    s.set_update_result(dual_result("1.0.0", Some("2.0.0"), Some("2.0.0")));
+    s.set_upgrade_outcome(UpgradeOutcome {
+        source: UpdateSource::Homebrew,
+        success: true,
+        message: "upgraded successfully".into(),
+    });
+    let dumped = dump(90, 14, |f| s.render(f, f.area()));
+    assert!(dumped.contains("homebrew"));
+    assert!(dumped.contains("upgraded successfully"));
 }
 
 #[test]
@@ -644,13 +793,9 @@ fn check_updates_error_shows_failure_message() {
         s.handle_key(key(KeyCode::Down));
     }
     s.handle_key(key(KeyCode::Enter));
-    s.set_update_result(UpdateCheckResult {
-        has_update: false,
-        current_version: "1.0.0".into(),
-        latest_version: None,
-        checked_at: 0,
-        error: Some("network down".into()),
-    });
+    let mut result = npm_only_result("1.0.0", None);
+    result.npm.error = Some("network down".into());
+    s.set_update_result(result);
     let dumped = dump(80, 8, |f| s.render(f, f.area()));
     assert!(!dumped.trim().is_empty());
 }

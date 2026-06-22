@@ -21,7 +21,7 @@
 //! left every finished turn stuck in `Pending` and forced the live-PID
 //! fallback to keep idle sessions falsely Running.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ use serde::Deserialize;
 
 use super::paths::{canonical_key, AiStatusPaths};
 use super::state::AiHarnessState;
-use super::util::classify_mtime;
+use super::util::{classify_mtime, merge};
 use super::DetectorOutput;
 
 /// Cap to keep a developer with hundreds of long-lived project conversations
@@ -271,9 +271,4 @@ fn classify_turn_state(
         ClaudeTurnState::Completed => Some(AiHarnessState::Idle),
         ClaudeTurnState::Unknown => None,
     }
-}
-
-fn merge(out: &mut BTreeMap<PathBuf, AiHarnessState>, key: PathBuf, state: AiHarnessState) {
-    let entry = out.entry(key).or_insert(AiHarnessState::Absent);
-    *entry = AiHarnessState::merge(*entry, state);
 }

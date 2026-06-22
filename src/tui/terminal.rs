@@ -271,6 +271,21 @@ fn color_distance((r1, g1, b1): (u8, u8, u8), (r2, g2, b2): (u8, u8, u8)) -> u32
 const TTY_PATH: &str = "/dev/tty";
 #[cfg(windows)]
 const TTY_PATH: &str = "CONOUT$";
+const BEL: &[u8] = b"\x07";
+
+/// Best-effort terminal bell notification. Writes to the controlling TTY so
+/// stdout remains clean in wrapper mode and command substitutions are not
+/// corrupted if the app is launched from shell integration.
+pub(crate) fn ring_bell() {
+    if let Ok(mut tty) = OpenOptions::new().write(true).open(TTY_PATH) {
+        let _ = write_bell(&mut tty);
+    }
+}
+
+fn write_bell<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.write_all(BEL)?;
+    writer.flush()
+}
 
 /// Install a panic hook that restores the terminal before delegating to the
 /// previous hook. Idempotent — calling twice replaces the hook with an
@@ -279,8 +294,8 @@ const TTY_PATH: &str = "CONOUT$";
 pub fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore();
-        let _ = restore_wrapper_tty();
+        restore();
+        restore_wrapper_tty();
         prev(info);
     }));
 }
@@ -331,7 +346,7 @@ pub fn clear_wrapper_for_shell(terminal: &mut WrapperTerminal) -> io::Result<()>
 }
 
 /// Best-effort cleanup. Safe to call even if `enter` was never invoked.
-pub fn restore() -> io::Result<()> {
+pub fn restore() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
     let _ = crossterm::execute!(&mut stdout, DisableMouseCapture);
@@ -339,16 +354,14 @@ pub fn restore() -> io::Result<()> {
     let _ = backend.clear_region(ClearType::All);
     let _ = backend.set_cursor_position(Position::ORIGIN);
     let _ = RatatuiBackend::flush(&mut backend);
-    Ok(())
 }
 
 /// Best-effort cleanup for wrapper mode.
-pub fn restore_wrapper_tty() -> io::Result<()> {
+pub fn restore_wrapper_tty() {
     let _ = disable_raw_mode();
     if let Ok(mut tty) = OpenOptions::new().write(true).open(TTY_PATH) {
         let _ = crossterm::execute!(&mut tty, DisableMouseCapture);
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -395,5 +408,12 @@ mod tests {
             app_viewport(Size::new(80, 20)),
             Viewport::Fixed(Rect::new(0, 0, 80, 20))
         );
+    }
+
+    #[test]
+    fn write_bell_emits_single_bel_byte() {
+        let mut out = Vec::new();
+        write_bell(&mut out).unwrap();
+        assert_eq!(out, b"\x07");
     }
 }
