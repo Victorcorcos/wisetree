@@ -436,9 +436,37 @@ pub enum UpdateBranchOutcome {
     NoBaseRef,
     /// `git fetch --all --prune` failed (network, auth, ...). stderr included.
     FetchFailed(String),
-    /// `git merge {base_ref}` failed for any reason (conflicts, dirty
-    /// tree, refusal). stderr included.
+    /// `git merge {base_ref}` failed for a *non-conflict* reason (dirty
+    /// tree, refusal, ...). stderr included. Genuine merge conflicts are
+    /// reported via the `Conflicts*` variants below instead.
     MergeFailed { base_ref: String, message: String },
+    /// The worktree has uncommitted tracked changes, so `git merge` would
+    /// refuse to start ("Your local changes ... would be overwritten by
+    /// merge"). Caught as a pre-flight guard *before* fetch/merge. This is
+    /// not a merge conflict — there are no markers and nothing for opencode
+    /// to resolve — so the UI just tells the user to commit or stash first.
+    WorkingTreeDirty { files: Vec<String> },
+    /// Merge conflicts were detected, `useAi` is set, and `opencode` is on
+    /// PATH. The merge is left mid-flight (conflict markers in the index)
+    /// and the UI takes over: it spawns opencode inside an embedded PTY to
+    /// resolve the conflicts, then commits the result locally (no push).
+    /// Mirrors `UpdatePullRequestOutcome::ConflictsHandedOffToUi`.
+    ConflictsHandedOffToUi {
+        opencode_binary: PathBuf,
+        opencode_args: Vec<String>,
+        cwd: PathBuf,
+        model: String,
+        base_ref: String,
+        conflicts: Vec<String>,
+    },
+    /// Merge conflicts were detected but `useAi` is blank — the merge is
+    /// aborted and the UI prompts the user to configure `useAi` or resolve
+    /// the conflicts manually.
+    ConflictsRequireAi { conflicts: Vec<String> },
+    /// Merge conflicts were detected and `useAi` is set, but the `opencode`
+    /// binary is not on PATH — the merge is aborted and the UI prompts the
+    /// user to install opencode.
+    AiUnavailable { conflicts: Vec<String> },
 }
 
 /// Result of the read-only preparation phase of the "Fill Pull Request"
@@ -1375,9 +1403,21 @@ impl DashboardService {
     /// Fetch the remote and merge the worktree at `worktree_path` with
     /// the first reachable ref in `BASE_REF_PRIORITY` (upstream/main →
     /// upstream/master → origin/main → origin/master). Powers the
-    /// dashboard's "Update Branch" action on the mother worktree.
+    /// dashboard's "Update branch (locally)" action on any worktree —
+    /// mother or derived — pulling its base branch in without pushing.
     pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
         let cwd = PathBuf::from(worktree_path);
+
+        // Pre-flight: a dirty working tree makes `git merge` refuse before it
+        // even starts ("Your local changes ... would be overwritten by
+        // merge"). That's not a merge conflict — no markers land, so there is
+        // nothing for opencode to resolve — so we catch it here and tell the
+        // user to commit or stash first instead of surfacing a raw git
+        // refusal that looks like (but isn't) a conflict.
+        let dirty = dirty_tracked_files(&self.git_binary, &cwd).await;
+        if !dirty.is_empty() {
+            return Ok(UpdateBranchOutcome::WorkingTreeDirty { files: dirty });
+        }
 
         let fetch = with_timeout(
             "git fetch",
@@ -1400,13 +1440,58 @@ impl DashboardService {
         )
         .await?;
 
-        match merge {
-            Ok(stdout) => Ok(classify_merge_output(base_ref, &stdout)),
-            Err(stderr) => Ok(UpdateBranchOutcome::MergeFailed {
+        let stderr = match merge {
+            Ok(stdout) => return Ok(classify_merge_output(base_ref, &stdout)),
+            Err(stderr) => stderr,
+        };
+
+        // The merge failed. Distinguish genuine conflicts (which we can
+        // hand to opencode) from other failures (dirty tree, refusal),
+        // mirroring the conflict handling in
+        // `update_pull_request_with_progress`.
+        let conflicts = conflicted_files(&self.git_binary, &cwd).await;
+        if conflicts.is_empty() {
+            return Ok(UpdateBranchOutcome::MergeFailed {
                 base_ref,
                 message: stderr,
-            }),
+            });
         }
+
+        // useAi blank → no AI available: abort the merge and let the UI
+        // prompt the user to configure useAi or resolve manually.
+        let use_ai = self.config.use_ai.trim().to_string();
+        if use_ai.is_empty() {
+            let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+            return Ok(UpdateBranchOutcome::ConflictsRequireAi { conflicts });
+        }
+
+        // Bail early if opencode isn't on PATH so the user sees the
+        // dedicated "install opencode" toast instead of a spawn error.
+        if !binary_available(&self.opencode_binary) {
+            let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+            return Ok(UpdateBranchOutcome::AiUnavailable { conflicts });
+        }
+
+        // Hand control to the UI. The merge is still mid-flight on disk
+        // (conflict markers in the index); the screen owns the opencode
+        // PTY lifecycle from here and commits the result locally (no push)
+        // via the same machinery as the Update Pull Request flow.
+        let prompt = build_merge_prompt(&base_ref, &conflicts);
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            use_ai.clone(),
+            cwd.to_string_lossy().to_string(),
+        ];
+        Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd: cwd.clone(),
+            model: use_ai,
+            base_ref,
+            conflicts,
+        })
     }
 
     /// Commit the AI-resolved files (`git add -A` + `git commit`) and push
@@ -3130,6 +3215,26 @@ async fn behind_against_base(git_binary: &Path, cwd: &Path, base_ref: &str) -> O
 
 /// Return the list of files currently in conflict (`UU`, `AA`, etc.).
 /// Empty when there are no conflicts.
+/// List the worktree's tracked, uncommitted changes — every path that
+/// differs from `HEAD` in the index or the working tree (modifications,
+/// staged additions, deletions, renames). `git diff --name-only HEAD`
+/// emits clean paths with no status prefix and, by design, omits untracked
+/// files: those rarely block a merge, and on the rare collision git's own
+/// "untracked working tree files would be overwritten" message still
+/// surfaces through the normal `MergeFailed` path. Used by `update_branch`
+/// as a pre-flight guard so a dirty tree fails fast with an actionable
+/// message rather than a raw `git merge` refusal.
+async fn dirty_tracked_files(git_binary: &Path, cwd: &Path) -> Vec<String> {
+    match run_command(git_binary, &["diff", "--name-only", "HEAD"], Some(cwd)).await {
+        Ok(out) => out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn conflicted_files(git_binary: &Path, cwd: &Path) -> Vec<String> {
     match run_command(
         git_binary,

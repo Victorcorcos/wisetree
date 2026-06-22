@@ -518,7 +518,9 @@ impl App {
                         .constraints([Constraint::Length(4), Constraint::Min(0)])
                         .split(area);
                     let cwd = self.git_root.as_deref().unwrap_or("");
-                    WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+                    WelcomeHeader::new(self.screen, cwd)
+                        .with_label(self.header_label_override())
+                        .render(frame, chunks[0]);
                     screens::loading::draw(frame, chunks[1], self.tick, self.screen.as_str());
                 }
             }
@@ -770,6 +772,20 @@ impl App {
         }
     }
 
+    /// Header label override for screens reused across flows. The
+    /// `UpdatePullRequest` screen also hosts the "Update branch (locally)"
+    /// conflict resolution (`local_only`), which should read "Update Branch"
+    /// rather than "Update Pull Request".
+    fn header_label_override(&self) -> Option<&'static str> {
+        if matches!(self.screen, Screen::UpdatePullRequest)
+            && self.update_pr.as_ref().is_some_and(|s| s.local_only())
+        {
+            Some("Update Branch")
+        } else {
+            None
+        }
+    }
+
     fn render_framed_panel(&self, frame: &mut Frame, area: Rect, content_height: u16) -> Rect {
         let panel_height = content_height.saturating_add(2);
         let chunks = Layout::default()
@@ -782,7 +798,9 @@ impl App {
             .split(area);
 
         let cwd = self.git_root.as_deref().unwrap_or("");
-        WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+        WelcomeHeader::new(self.screen, cwd)
+            .with_label(self.header_label_override())
+            .render(frame, chunks[0]);
 
         self.render_panel_block(frame, chunks[1])
     }
@@ -794,7 +812,9 @@ impl App {
             .split(area);
 
         let cwd = self.git_root.as_deref().unwrap_or("");
-        WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+        WelcomeHeader::new(self.screen, cwd)
+            .with_label(self.header_label_override())
+            .render(frame, chunks[0]);
 
         self.render_panel_block(frame, chunks[1])
     }
@@ -1334,35 +1354,7 @@ impl App {
                         self.enter_screen(Screen::Dashboard, tx);
                     }
                     UpdateAction::Confirmed => self.confirm_update_pr(tx),
-                    UpdateAction::AiComplete => {
-                        let dashboard_config = self.current_dashboard_config();
-                        let Some(screen) = self.update_pr.as_mut() else {
-                            return;
-                        };
-                        let request = screen.request().clone();
-                        let use_ai = dashboard_config.use_ai.clone();
-                        let base_ref = request
-                            .base_ref
-                            .clone()
-                            .unwrap_or_else(|| "upstream/main".to_string());
-                        let cwd = PathBuf::from(&request.worktree_path);
-                        let message = format!(
-                            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
-                            crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
-                        );
-                        let script =
-                            "git add -A && git commit -m \"$COMMIT_MSG\" && git push origin HEAD"
-                                .to_string();
-                        let sh = PathBuf::from("/bin/sh");
-                        let (shell, shell_args) =
-                            login_shell_command(&sh, &["-c".to_string(), script]);
-                        screen.start_commit_push_pty(
-                            shell,
-                            shell_args,
-                            cwd,
-                            vec![("COMMIT_MSG".to_string(), message)],
-                        );
-                    }
+                    UpdateAction::AiComplete => self.start_commit_after_ai(),
                     UpdateAction::AiCancel => {
                         let dashboard_config = self.current_dashboard_config();
                         let git_root = self.git_root.clone();
@@ -1515,33 +1507,7 @@ impl App {
                 self.enter_screen(Screen::Dashboard, tx);
             }
             UpdateAction::Confirmed => self.confirm_update_pr(tx),
-            UpdateAction::AiComplete => {
-                let dashboard_config = self.current_dashboard_config();
-                let Some(screen) = self.update_pr.as_mut() else {
-                    return;
-                };
-                let request = screen.request().clone();
-                let use_ai = dashboard_config.use_ai.clone();
-                let base_ref = request
-                    .base_ref
-                    .clone()
-                    .unwrap_or_else(|| "upstream/main".to_string());
-                let cwd = PathBuf::from(&request.worktree_path);
-                let message = format!(
-                    "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
-                    crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
-                );
-                let script = "git add -A && git commit -m \"$COMMIT_MSG\" && git push origin HEAD"
-                    .to_string();
-                let sh = PathBuf::from("/bin/sh");
-                let (shell, shell_args) = login_shell_command(&sh, &["-c".to_string(), script]);
-                screen.start_commit_push_pty(
-                    shell,
-                    shell_args,
-                    cwd,
-                    vec![("COMMIT_MSG".to_string(), message)],
-                );
-            }
+            UpdateAction::AiComplete => self.start_commit_after_ai(),
             UpdateAction::AiCancel => {
                 let dashboard_config = self.current_dashboard_config();
                 let git_root = self.git_root.clone();
@@ -1555,6 +1521,42 @@ impl App {
             UpdateAction::TerminalAccept => self.terminal_accept_push(tx),
             UpdateAction::TerminalDiscard => self.terminal_discard(tx),
         }
+    }
+
+    /// Spawn the finalize PTY that commits the opencode-resolved merge once
+    /// the user presses **Complete**. The Update Pull Request flow commits
+    /// and pushes; the "Update branch (locally)" flow (`local_only`) commits
+    /// without pushing. Either way the PTY exit flips the screen onto the
+    /// ✅ done page.
+    fn start_commit_after_ai(&mut self) {
+        let dashboard_config = self.current_dashboard_config();
+        let Some(screen) = self.update_pr.as_mut() else {
+            return;
+        };
+        let request = screen.request().clone();
+        let use_ai = dashboard_config.use_ai.clone();
+        let base_ref = request
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| "upstream/main".to_string());
+        let cwd = PathBuf::from(&request.worktree_path);
+        let message = format!(
+            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
+            crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
+        );
+        let script = if screen.local_only() {
+            "git add -A && git commit -m \"$COMMIT_MSG\"".to_string()
+        } else {
+            "git add -A && git commit -m \"$COMMIT_MSG\" && git push origin HEAD".to_string()
+        };
+        let sh = PathBuf::from("/bin/sh");
+        let (shell, shell_args) = login_shell_command(&sh, &["-c".to_string(), script]);
+        screen.start_commit_push_pty(
+            shell,
+            shell_args,
+            cwd,
+            vec![("COMMIT_MSG".to_string(), message)],
+        );
     }
 
     /// Shared dispatch for confirming the update/push confirmation dialog.
@@ -1820,8 +1822,8 @@ impl App {
             DashboardAction::PushPullRequest(request) => {
                 self.start_push_pr_flow(*request, tx);
             }
-            DashboardAction::UpdateBranch(path) => {
-                self.start_update_branch_flow(path, tx);
+            DashboardAction::UpdateBranch { path, branch } => {
+                self.start_update_branch_flow(path, branch, tx);
             }
             DashboardAction::ClosePullRequest(request) => {
                 self.start_close_pr_flow(*request, tx);
@@ -1855,14 +1857,16 @@ impl App {
 
     /// Mount the loading splash synchronously so the user gets an
     /// instant visual response, then kick off the background fetch +
-    /// merge. The flow ends in `apply_update_branch_finished`, which
-    /// returns to the dashboard and toasts the outcome.
+    /// merge. On a clean merge the flow ends in
+    /// `apply_update_branch_finished` with a toast; on conflicts it hands
+    /// off to the opencode resolution screen (see that method).
     fn start_update_branch_flow(
         &mut self,
         worktree_path: String,
+        branch: String,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        self.update_branch = Some(UpdateBranchScreen::new(worktree_path.clone()));
+        self.update_branch = Some(UpdateBranchScreen::new(worktree_path.clone(), branch));
         self.screen = Screen::UpdateBranch;
         kick_off_update_branch(self.current_dashboard_config(), worktree_path, tx.clone());
     }
@@ -2609,15 +2613,82 @@ impl App {
         result: Result<UpdateBranchOutcome, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // Drop the loading splash and route back to the dashboard before
-        // toasting — the user must land on the screen where the toast
-        // appears, otherwise the result would flash on the splash for
-        // one frame and vanish.
-        self.update_branch = None;
-        if matches!(self.screen, Screen::UpdateBranch) {
-            self.enter_screen(Screen::Dashboard, tx);
+        // Capture the branch off the splash before we replace it — the
+        // conflict-resolution screen uses it for its synthetic request.
+        let branch = self
+            .update_branch
+            .as_ref()
+            .map(|s| s.branch().to_string())
+            .unwrap_or_default();
+        match result {
+            // Conflicts with AI available: don't toast — hand off to the
+            // opencode resolution screen. The merge is left mid-flight on
+            // disk (conflict markers in the index); the screen owns the
+            // PTY from here and commits the result locally (no push).
+            Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
+                opencode_binary,
+                opencode_args,
+                cwd,
+                model,
+                base_ref,
+                ..
+            }) => {
+                self.start_local_conflict_resolution(
+                    branch,
+                    opencode_binary,
+                    opencode_args,
+                    cwd,
+                    model,
+                    base_ref,
+                );
+            }
+            // Every other outcome drops the loading splash and routes back
+            // to the dashboard before toasting — the user must land on the
+            // screen where the toast appears, otherwise the result would
+            // flash on the splash for one frame and vanish.
+            other => {
+                self.update_branch = None;
+                if matches!(self.screen, Screen::UpdateBranch) {
+                    self.enter_screen(Screen::Dashboard, tx);
+                }
+                self.show_update_branch_toast(other);
+            }
         }
-        self.show_update_branch_toast(result);
+    }
+
+    /// Mount the opencode conflict-resolution screen for the "Update branch
+    /// (locally)" flow. Reuses `UpdatePullRequestScreen` in `local_only`
+    /// mode: it streams opencode in the embedded PTY, then commits the
+    /// merge locally on **Complete** (no push) and shows the ✅ done page.
+    fn start_local_conflict_resolution(
+        &mut self,
+        branch: String,
+        opencode_binary: PathBuf,
+        opencode_args: Vec<String>,
+        cwd: PathBuf,
+        model: String,
+        base_ref: String,
+    ) {
+        let request = UpdatePullRequestRequest {
+            number: 0,
+            title: String::new(),
+            url: String::new(),
+            branch,
+            worktree_path: cwd.to_string_lossy().to_string(),
+            ahead: 0,
+            behind: 0,
+            base_ref: Some(base_ref),
+        };
+        let mut screen = UpdatePullRequestScreen::new_local_conflict(request);
+        screen.set_phase_message(format!("{model} is resolving conflicts..."));
+        // Launch opencode through the user's login shell so it runs with the
+        // same profile-sourced environment as a freshly opened terminal
+        // (matching the Update Pull Request flow).
+        let (shell, wrapped_args) = login_shell_command(&opencode_binary, &opencode_args);
+        screen.spawn_opencode_pty(shell, wrapped_args, cwd, Vec::new());
+        self.update_branch = None;
+        self.update_pr = Some(screen);
+        self.screen = Screen::UpdatePullRequest;
     }
 
     fn show_update_branch_toast(&mut self, result: Result<UpdateBranchOutcome, String>) {
@@ -2647,6 +2718,31 @@ impl App {
                 ToastVariant::Error,
                 format!("git merge {base_ref} failed: {message}"),
             ),
+            Ok(UpdateBranchOutcome::WorkingTreeDirty { files }) => self.show_toast(
+                ToastVariant::Warning,
+                format!(
+                    "{} uncommitted change(s) in the worktree — commit or stash them \
+                     before updating.",
+                    files.len()
+                ),
+            ),
+            Ok(UpdateBranchOutcome::ConflictsRequireAi { .. }) => self.show_toast(
+                ToastVariant::Warning,
+                "Conflicts found, please resolve them locally or setup `useAi` \
+                 setting so we can solve conflicts + merge via AI."
+                    .to_string(),
+            ),
+            Ok(UpdateBranchOutcome::AiUnavailable { conflicts }) => self.show_toast(
+                ToastVariant::Error,
+                format!(
+                    "Merge has {} conflicted file(s). `opencode` CLI is not on PATH — \
+                     install it from https://opencode.ai then retry.",
+                    conflicts.len()
+                ),
+            ),
+            // Handled by `apply_update_branch_finished` before reaching the
+            // toast path (it mounts the resolution screen instead).
+            Ok(UpdateBranchOutcome::ConflictsHandedOffToUi { .. }) => {}
             Err(message) => self.show_toast(
                 ToastVariant::Error,
                 format!("Update branch failed: {message}"),
@@ -2777,6 +2873,13 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         use crate::services::UpdatePullRequestOutcome;
+        // The "Update branch (locally)" flow reuses this screen in
+        // `local_only` mode (no PR); its toasts must not mention a PR.
+        let local_only = self
+            .update_pr
+            .as_ref()
+            .map(|s| s.local_only())
+            .unwrap_or(false);
         // `ConflictsHandedOffToUi` does NOT close the screen — the
         // service paused mid-flight (conflicts in the index, opencode
         // not yet invoked). We spawn opencode inside the screen's
@@ -2856,13 +2959,17 @@ impl App {
                     // only fires if `update_pr` was already torn down.
                 }
                 UpdatePullRequestOutcome::DiscardedAiMerge => {
-                    self.show_toast(
-                        ToastVariant::Warning,
+                    let message = if local_only {
+                        "Discarded the update — branch is back where it was \
+                         before the merge."
+                            .to_string()
+                    } else {
                         format!(
                             "Discarded AI merge for PR #{number}. \
                              Branch is back where it was before the update."
-                        ),
-                    );
+                        )
+                    };
+                    self.show_toast(ToastVariant::Warning, message);
                 }
                 UpdatePullRequestOutcome::ConflictsRequireAi { .. } => {
                     self.show_toast(
@@ -2913,13 +3020,15 @@ impl App {
                     );
                 }
                 UpdatePullRequestOutcome::AbortFailed(detail) => {
-                    self.show_toast(
-                        ToastVariant::Error,
+                    let message = if local_only {
+                        format!("Failed to abort the merge: {}", truncate_error(&detail))
+                    } else {
                         format!(
                             "Failed to abort AI merge for PR #{number}: {}",
                             truncate_error(&detail)
-                        ),
-                    );
+                        )
+                    };
+                    self.show_toast(ToastVariant::Error, message);
                 }
             },
             Err(failure) => {
@@ -4440,9 +4549,10 @@ fn kick_off_update_branch(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        // The mother worktree IS the git root, so reuse the path as the
-        // service root — there is no separate "git_root" to resolve from
-        // app state for this action.
+        // `update_branch` runs every git command with the worktree path as
+        // its cwd, so the service root is only a placeholder here — reuse
+        // the worktree path rather than resolving a separate "git_root".
+        // Works for any worktree, mother or derived.
         let service = DashboardService::new(PathBuf::from(&worktree_path), config);
         let event = match service.update_branch(&worktree_path).await {
             Ok(outcome) => Ok(outcome),

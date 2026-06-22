@@ -209,11 +209,16 @@ pub enum DashboardAction {
     /// Reuses the `UpdatePullRequestRequest` payload.
     PushPullRequest(Box<UpdatePullRequestRequest>),
     ClosePullRequest(Box<ClosePullRequestRequest>),
-    /// Fetch the remote and merge the mother branch with the first
+    /// Fetch the remote and merge the worktree's branch with the first
     /// reachable ref in `BASE_REF_PRIORITY` (upstream/main →
-    /// upstream/master → origin/main → origin/master). Only offered on
-    /// the main worktree row.
-    UpdateBranch(String),
+    /// upstream/master → origin/main → origin/master). Offered on every
+    /// worktree row; carries the worktree path and branch name (the branch
+    /// is used to label the conflict-resolution screen when the merge needs
+    /// opencode).
+    UpdateBranch {
+        path: String,
+        branch: String,
+    },
     /// The user tried to delete the mother (main) worktree. The app
     /// layer should surface a toast explaining that this worktree is
     /// protected, instead of routing to the delete screen.
@@ -532,7 +537,7 @@ impl DashboardScreen {
                     return DashboardAction::Continue;
                 };
                 let row = self.rows[index].clone();
-                self.action_select = Some(self.build_action_select(&row));
+                self.action_select = Some(self.build_action_select());
                 self.pr_commands = self.build_pr_commands(&row);
                 self.action_pr_focus = None;
                 self.last_pr_focus = 0;
@@ -774,7 +779,7 @@ impl DashboardScreen {
                     return DashboardAction::Continue;
                 };
                 let row = self.rows[index].clone();
-                self.action_select = Some(self.build_action_select(&row));
+                self.action_select = Some(self.build_action_select());
                 self.pr_commands = self.build_pr_commands(&row);
                 self.action_pr_focus = None;
                 self.last_pr_focus = 0;
@@ -798,7 +803,7 @@ impl DashboardScreen {
     /// Build the searchable "General Commands" list — every action that
     /// isn't a pull-request operation. PR actions live in their own
     /// button row built by [`Self::build_pr_commands`].
-    fn build_action_select(&self, row: &DashboardRow) -> SelectPrompt<ActionChoice> {
+    fn build_action_select(&self) -> SelectPrompt<ActionChoice> {
         let mut options = Vec::new();
         if self.is_from_wrapper {
             options.push(SelectOption::new(
@@ -818,16 +823,16 @@ impl DashboardScreen {
                 ActionChoice::CopyPath,
             ));
         }
-        // The mother (main) worktree has no PR of its own, but we still
-        // want a one-click way to pull the upstream tip into it. Fetches
-        // the remote and merges the first reachable ref from
-        // `BASE_REF_PRIORITY`.
-        if row.worktree.is_main {
-            options.push(SelectOption::new(
-                "Update Branch",
-                ActionChoice::UpdateBranch,
-            ));
-        }
+        // Pull the worktree's base branch into it locally: fetch the remote
+        // and merge the first reachable ref from `BASE_REF_PRIORITY`
+        // (upstream/main → … → origin/master). Offered on every worktree —
+        // the mother pulls the upstream tip, derived worktrees catch up with
+        // the branch they were created from. Unlike "Update Pull Request"
+        // this never pushes, hence the "(locally)" suffix.
+        options.push(SelectOption::new(
+            "Update branch (locally)",
+            ActionChoice::UpdateBranch,
+        ));
         SelectPrompt::new("General Commands", options)
             .searchable()
             .without_hint()
@@ -911,6 +916,17 @@ impl DashboardScreen {
             .iter()
             .map(|command| command.label.to_string())
             .collect()
+    }
+
+    /// Labels of the "General Commands" list currently shown in the action
+    /// menu. Empty unless the menu is open. Reads straight off the built
+    /// `SelectPrompt` so tests don't have to scrape the rendered viewport
+    /// (which scrolls when the PR command section is also present).
+    pub fn general_command_labels(&self) -> Vec<String> {
+        self.action_select
+            .as_ref()
+            .map(|select| select.options.iter().map(|opt| opt.label.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Clear all transient action-menu state. Called whenever the menu is
@@ -1145,7 +1161,7 @@ impl DashboardScreen {
             },
             ActionChoice::UpdateBranch => {
                 self.mode = DashboardMode::Table;
-                DashboardAction::UpdateBranch(path)
+                DashboardAction::UpdateBranch { path, branch }
             }
         }
     }
@@ -3252,15 +3268,15 @@ mod tests {
     #[test]
     fn general_commands_exclude_pull_request_actions() {
         let screen = DashboardScreen::new(true, true, true, Vec::new(), Vec::new(), true);
-        let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         let labels: Vec<String> = screen
-            .build_action_select(&r)
+            .build_action_select()
             .options
             .iter()
             .map(|opt| opt.label.clone())
             .collect();
         assert!(labels.contains(&"Navigate to Directory".to_string()));
         assert!(labels.contains(&"Copy path to clipboard".to_string()));
+        assert!(labels.contains(&"Update branch (locally)".to_string()));
         assert!(
             labels.iter().all(|label| !label.contains("Pull Request")),
             "General Commands must not contain PR actions: {labels:?}"

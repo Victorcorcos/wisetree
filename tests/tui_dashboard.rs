@@ -1547,59 +1547,48 @@ fn action_menu_hides_update_option_when_no_pr_present() {
     assert!(!labels.iter().any(|l| l == "Update"));
 }
 
-// ---- "Update Branch" visibility -----------------------------------------
-// The mother (main) worktree is the only row that exposes "Update Branch".
-// It's the dashboard's one-click way to pull the upstream tip into the
-// mother — irrelevant on derived worktrees that already track their own
-// PR base via "Update Pull Request".
+// ---- "Update branch (locally)" visibility -------------------------------
+// Every worktree exposes "Update branch (locally)" in its General Commands
+// list — the mother pulls the upstream tip into itself, derived worktrees
+// catch up with the base branch they were created from. Unlike "Update Pull
+// Request" it never pushes. The labels are read straight off the screen
+// (not the rendered viewport, which scrolls when PR commands are present).
 
-fn open_action_menu_for_first_row(screen: &mut DashboardScreen) -> String {
-    screen.handle_key(key(KeyCode::Enter));
-    dump(120, 14, |f| screen.render(f, f.area()))
+fn update_branch_screen() -> DashboardScreen {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row("/tmp/repo-bug", "bug", true),
+    ]);
+    screen
 }
 
 #[test]
 fn action_menu_shows_update_branch_on_mother_row() {
-    let mut screen = DashboardScreen::new(
-        true,
-        true,
-        true,
-        vec!["branch".into(), "status".into()],
-        Vec::new(),
-        false,
-    );
-    screen.set_rows(vec![
-        row("/tmp/repo", "main", true),
-        row("/tmp/repo-bug", "bug", true),
-    ]);
-
-    let dumped = open_action_menu_for_first_row(&mut screen);
+    let mut screen = update_branch_screen();
+    screen.handle_key(key(KeyCode::Enter));
+    let labels = screen.general_command_labels();
     assert!(
-        dumped.contains("Update Branch"),
-        "expected `Update Branch` on mother row: {dumped}"
+        labels.contains(&"Update branch (locally)".to_string()),
+        "expected `Update branch (locally)` on mother row: {labels:?}"
     );
 }
 
 #[test]
-fn action_menu_hides_update_branch_on_non_main_row() {
-    let mut screen = DashboardScreen::new(
-        true,
-        true,
-        true,
-        vec!["branch".into(), "status".into()],
-        Vec::new(),
-        false,
-    );
-    screen.set_rows(vec![
-        row("/tmp/repo", "main", true),
-        row("/tmp/repo-bug", "bug", true),
-    ]);
-
+fn action_menu_shows_update_branch_on_non_main_row() {
+    let mut screen = update_branch_screen();
     screen.handle_key(key(KeyCode::Down));
     screen.handle_key(key(KeyCode::Enter));
-    let dumped = dump(120, 14, |f| screen.render(f, f.area()));
+    let labels = screen.general_command_labels();
     assert!(
-        !dumped.contains("Update Branch"),
-        "Update Branch must not appear on non-main rows: {dumped}"
+        labels.contains(&"Update branch (locally)".to_string()),
+        "expected `Update branch (locally)` on non-main row: {labels:?}"
     );
 }

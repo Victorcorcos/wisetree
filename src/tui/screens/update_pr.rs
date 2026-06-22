@@ -142,6 +142,12 @@ pub struct UpdatePullRequestScreen {
     /// update. Changes the confirm prompt + steps preview and routes the
     /// App to `kick_off_push_pull_request` on confirmation.
     push_only: bool,
+    /// `true` when this screen drives the dashboard's "Update branch
+    /// (locally)" conflict tail rather than a pull-request update. The
+    /// fetch/merge already happened behind the dashboard splash; this
+    /// screen only hosts the opencode resolution + a local `git commit`
+    /// (no push). Drives "push"-free wording on the commit + done pages.
+    local_only: bool,
     /// `true` once a `git push` failed and the screen handed off to the
     /// interactive recovery shell. Drives the "Terminal Activity" panel:
     /// the embedded `pty` hosts the user's shell, and the Accept/Discard
@@ -191,6 +197,7 @@ impl UpdatePullRequestScreen {
             pty_focused: false,
             finalize_confirm: None,
             push_only: false,
+            local_only: false,
             terminal_active: false,
             terminal_button: TermButton::Accept,
             terminal_error: String::new(),
@@ -218,12 +225,33 @@ impl UpdatePullRequestScreen {
         }
     }
 
+    /// Construct the screen for the "Update branch (locally)" conflict
+    /// tail. The dashboard already ran fetch + merge and hit conflicts, so
+    /// we skip Loading/Confirm and land directly on the `Updating` step
+    /// with the AI panel active. The caller spawns the opencode PTY via
+    /// `spawn_opencode_pty` right after constructing. Finishing commits the
+    /// merge locally (no push).
+    pub fn new_local_conflict(request: UpdatePullRequestRequest) -> Self {
+        Self {
+            local_only: true,
+            step: UpdateStep::Updating,
+            ai_active: true,
+            ..Self::new(request)
+        }
+    }
+
     pub fn request(&self) -> &UpdatePullRequestRequest {
         &self.request
     }
 
     pub fn is_push_only(&self) -> bool {
         self.push_only
+    }
+
+    /// `true` when this screen is resolving conflicts for a local branch
+    /// update (commit, no push) rather than a pull-request update.
+    pub fn local_only(&self) -> bool {
+        self.local_only
     }
 
     pub fn terminal_active(&self) -> bool {
@@ -480,7 +508,7 @@ impl UpdatePullRequestScreen {
             Err(err) => {
                 self.pty = None;
                 self.commit_push_summary = vec![SummaryRow::failure(
-                    "Commit & Push AI resolution",
+                    self.commit_action_label(),
                     format!("Could not spawn shell: {err}"),
                 )];
                 self.commit_push_done = true;
@@ -488,16 +516,26 @@ impl UpdatePullRequestScreen {
         }
     }
 
-    /// Called by `tick_pty` once the commit+push child exits. Builds the
+    /// Summary-row label for the finalize step. Drops "Push" for local
+    /// branch updates, which commit but never push.
+    fn commit_action_label(&self) -> &'static str {
+        if self.local_only {
+            "Commit AI resolution"
+        } else {
+            "Commit & Push AI resolution"
+        }
+    }
+
+    /// Called by `tick_pty` once the commit (+ push) child exits. Builds the
     /// one-row summary table and flips into the done view.
     fn mark_commit_push_done(&mut self, exit_code: Option<i32>) {
         let succeeded = exit_code == Some(0);
         self.commit_push_succeeded = succeeded;
         self.commit_push_summary = if succeeded {
-            vec![SummaryRow::success("Commit & Push AI resolution")]
+            vec![SummaryRow::success(self.commit_action_label())]
         } else {
             vec![SummaryRow::failure(
-                "Commit & Push AI resolution",
+                self.commit_action_label(),
                 "See terminal output above",
             )]
         };
@@ -1100,10 +1138,15 @@ impl UpdatePullRequestScreen {
     }
 
     fn render_commit_push_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let panel_label = if self.local_only {
+            "Commit Activity"
+        } else {
+            "Commit & Push Activity"
+        };
         let title = Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                "Commit & Push Activity",
+                panel_label,
                 Style::default()
                     .fg(colors::ACCENT)
                     .add_modifier(Modifier::BOLD),
@@ -1171,12 +1214,20 @@ impl UpdatePullRequestScreen {
         let (status, headline) = if self.commit_push_succeeded {
             (
                 Status::Success,
-                "AI resolution committed and pushed successfully!",
+                if self.local_only {
+                    "AI resolution committed successfully!"
+                } else {
+                    "AI resolution committed and pushed successfully!"
+                },
             )
         } else {
             (
                 Status::Error,
-                "Commit or push failed — check the terminal output for details.",
+                if self.local_only {
+                    "Commit failed — check the terminal output for details."
+                } else {
+                    "Commit or push failed — check the terminal output for details."
+                },
             )
         };
 
@@ -2472,6 +2523,50 @@ mod tests {
         assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(enter), UpdateAction::Confirmed);
+    }
+
+    #[test]
+    fn new_local_conflict_starts_in_updating_with_ai_active() {
+        let screen = UpdatePullRequestScreen::new_local_conflict(sample_request());
+        assert!(screen.local_only());
+        assert_eq!(screen.step(), UpdateStep::Updating);
+        assert!(screen.ai_active());
+    }
+
+    #[test]
+    fn local_only_done_page_drops_push_wording() {
+        let mut screen = UpdatePullRequestScreen::new_local_conflict(sample_request());
+        // Jump to the finished commit page as if the local `git commit`
+        // succeeded.
+        screen.step = UpdateStep::CommitPush;
+        screen.commit_push_succeeded = true;
+        screen.commit_push_summary = vec![SummaryRow::success(screen.commit_action_label())];
+        screen.commit_push_done = true;
+
+        let dump = render_dump(&mut screen, 80, 12);
+        assert!(
+            dump.contains("committed successfully"),
+            "local done page should confirm the commit: {dump}"
+        );
+        assert!(
+            !dump.to_lowercase().contains("push"),
+            "local done page must not mention push: {dump}"
+        );
+    }
+
+    #[test]
+    fn pr_flow_done_page_keeps_push_wording() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.step = UpdateStep::CommitPush;
+        screen.commit_push_succeeded = true;
+        screen.commit_push_summary = vec![SummaryRow::success(screen.commit_action_label())];
+        screen.commit_push_done = true;
+
+        let dump = render_dump(&mut screen, 80, 12);
+        assert!(
+            dump.to_lowercase().contains("pushed"),
+            "PR done page should mention the push: {dump}"
+        );
     }
 
     #[test]
