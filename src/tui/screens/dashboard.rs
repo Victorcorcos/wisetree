@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table};
 use ratatui::Frame;
@@ -45,10 +45,22 @@ enum ActionChoice {
     OpenWithCommand,
     CopyPath,
     OpenPullRequest,
+    FillPullRequest,
     MergePullRequest,
     UpdatePullRequest,
+    PushPullRequest,
     ClosePullRequest,
     UpdateBranch,
+}
+
+/// A single button in the action menu's "Pull Request Commands" section.
+/// The list is rebuilt from the selected row every time the menu opens, so
+/// only the buttons valid for the row's current PR state are present.
+#[derive(Debug, Clone)]
+struct PrCommand {
+    label: &'static str,
+    choice: ActionChoice,
+    color: Color,
 }
 
 /// Payload the dashboard hands to the merge confirmation screen.
@@ -92,22 +104,46 @@ pub struct ClosePullRequestRequest {
     pub worktree_path: String,
 }
 
+/// Payload the dashboard hands to the "Fill Pull Request" screen. The AI
+/// drafts a title + description into `pull_request.md`; the harness then
+/// either creates a new PR (`number == None`) or updates the existing one
+/// (`number == Some`). `base_ref` is resolved by the app layer before the
+/// pipeline runs, exactly like `UpdatePullRequestRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillPullRequestRequest {
+    pub branch: String,
+    pub worktree_path: String,
+    pub base_ref: Option<String>,
+    /// `Some(n)` when an open PR already exists for the branch → the draft
+    /// updates PR #n. `None` when no PR exists yet → the draft opens one.
+    pub number: Option<u64>,
+    /// Existing PR title/url, shown on the confirm + review panels when
+    /// updating. Both `None` when creating a brand-new PR.
+    pub title: Option<String>,
+    pub url: Option<String>,
+    /// Labels the PR already has on GitHub. Non-empty only for open PRs.
+    /// Used to skip `--add-label` in `gh pr edit` when labels are already set.
+    pub existing_labels: Vec<String>,
+}
+
 /// Status filter for the bulk-delete buttons row rendered above the
-/// footer. `button_label` can differ from the row label when a shorter
-/// footer caption keeps narrow layouts readable.
+/// footer. The button caption matches the status-column label exactly so
+/// the two surfaces stay in lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkDeleteStatus {
     Merged,
     Opened,
+    Drafted,
     Closed,
     Clean,
     Dirty,
 }
 
 impl BulkDeleteStatus {
-    pub const ALL: [BulkDeleteStatus; 5] = [
+    pub const ALL: [BulkDeleteStatus; 6] = [
         BulkDeleteStatus::Merged,
         BulkDeleteStatus::Closed,
+        BulkDeleteStatus::Drafted,
         BulkDeleteStatus::Opened,
         BulkDeleteStatus::Clean,
         BulkDeleteStatus::Dirty,
@@ -120,24 +156,26 @@ impl BulkDeleteStatus {
     pub fn button_label(self) -> &'static str {
         match self {
             BulkDeleteStatus::Merged => "Merged",
-            BulkDeleteStatus::Opened => "Open",
+            BulkDeleteStatus::Opened => "Opened",
+            BulkDeleteStatus::Drafted => "Drafted",
             BulkDeleteStatus::Closed => "Closed",
             BulkDeleteStatus::Clean => "Clean",
             BulkDeleteStatus::Dirty => "Dirty",
         }
     }
 
+    /// Status-column label this button filters on. Identical to
+    /// [`Self::button_label`] — the two are kept as separate methods so the
+    /// matching site reads as intent ("rows whose label equals this").
     fn row_label(self) -> &'static str {
-        match self {
-            BulkDeleteStatus::Opened => "Opened",
-            _ => self.button_label(),
-        }
+        self.button_label()
     }
 
     fn color(self) -> ratatui::style::Color {
         match self {
             BulkDeleteStatus::Merged => colors::SUCCESS,
             BulkDeleteStatus::Opened => colors::INFO,
+            BulkDeleteStatus::Drafted => colors::GRAY_MEDIUM,
             BulkDeleteStatus::Closed => colors::GRAY_LIGHT,
             BulkDeleteStatus::Clean => colors::ACCENT,
             BulkDeleteStatus::Dirty => colors::ERROR,
@@ -161,12 +199,26 @@ pub enum DashboardAction {
     OpenPullRequest(String),
     MergePullRequest(Box<MergePullRequestRequest>),
     UpdatePullRequest(Box<UpdatePullRequestRequest>),
+    /// Draft a PR title + description with the AI and open (or update) the
+    /// pull request. Offered on any non-mother worktree that either has an
+    /// open PR or has commits ahead of its base ref.
+    FillPullRequest(Box<FillPullRequestRequest>),
+    /// Push the branch's local commits to origin (`git push origin HEAD`).
+    /// Offered when the PR is Open and the branch is ahead-but-not-behind —
+    /// the "merged-but-not-pushed" state a failed push can leave behind.
+    /// Reuses the `UpdatePullRequestRequest` payload.
+    PushPullRequest(Box<UpdatePullRequestRequest>),
     ClosePullRequest(Box<ClosePullRequestRequest>),
     /// Fetch the remote and merge the worktree's branch with the first
     /// reachable ref in `BASE_REF_PRIORITY` (upstream/main →
     /// upstream/master → origin/main → origin/master). Offered on every
-    /// worktree row; carries the worktree path.
-    UpdateBranch(String),
+    /// worktree row; carries the worktree path and branch name (the branch
+    /// is used to label the conflict-resolution screen when the merge needs
+    /// opencode).
+    UpdateBranch {
+        path: String,
+        branch: String,
+    },
     /// The user tried to delete the mother (main) worktree. The app
     /// layer should surface a toast explaining that this worktree is
     /// protected, instead of routing to the delete screen.
@@ -253,6 +305,23 @@ pub struct DashboardScreen {
     query: String,
     action_select: Option<SelectPrompt<ActionChoice>>,
     action_target: Option<usize>,
+    /// PR command buttons shown in the action menu's "Pull Request
+    /// Commands" section. Rebuilt from the selected row each time the menu
+    /// opens; empty when the row exposes no PR actions.
+    pr_commands: Vec<PrCommand>,
+    /// `Some(i)` while PR command button `i` owns the action-menu keyboard
+    /// focus; `None` keeps focus on the searchable General Commands list.
+    /// Tab toggles between the two sections.
+    action_pr_focus: Option<usize>,
+    /// Remembers the PR button that was focused when Tab moved back to the
+    /// General Commands list, so the next Tab into the PR section resumes
+    /// from there instead of jumping to the first button. Mirrors how the
+    /// General Commands `SelectPrompt` retains its selection across toggles.
+    /// Reset to 0 each time the action menu opens.
+    last_pr_focus: usize,
+    /// Captured during render so mouse clicks on PR command buttons can be
+    /// hit-tested by the app.
+    pr_button_rects: Vec<(usize, Rect)>,
     is_from_wrapper: bool,
     has_terminal_command: bool,
     has_clipboard: bool,
@@ -262,10 +331,16 @@ pub struct DashboardScreen {
     refreshed_at: Option<Instant>,
     next_pr_fetch_at: Option<Instant>,
     pr_enrichment_enabled: bool,
-    /// `Some` while the bulk-delete buttons row owns the keyboard focus.
-    /// Tab moves through buttons in `BulkDeleteStatus::ALL` order; Esc
-    /// returns focus to the table.
+    /// `Some` while the bulk-delete buttons row owns the keyboard focus,
+    /// `None` while the worktree table does. Tab toggles between the two
+    /// sections; Left/Right move between buttons; Esc returns focus to the
+    /// table.
     bulk_focus: Option<BulkDeleteStatus>,
+    /// Remembers the bulk-delete button that was focused when Tab moved back
+    /// to the worktree table, so the next Tab into the buttons resumes from
+    /// there instead of jumping to the first button. Mirrors how the table
+    /// keeps its selected row across the same toggle.
+    last_bulk_focus: BulkDeleteStatus,
     /// Captured during render so mouse clicks on the footer buttons can
     /// be hit-tested by the app.
     bulk_button_rects: Vec<(BulkDeleteStatus, Rect)>,
@@ -294,6 +369,10 @@ impl DashboardScreen {
             query: String::new(),
             action_select: None,
             action_target: None,
+            pr_commands: Vec::new(),
+            action_pr_focus: None,
+            last_pr_focus: 0,
+            pr_button_rects: Vec::new(),
             is_from_wrapper,
             has_terminal_command,
             has_clipboard,
@@ -307,6 +386,7 @@ impl DashboardScreen {
             next_pr_fetch_at: None,
             pr_enrichment_enabled,
             bulk_focus: None,
+            last_bulk_focus: BulkDeleteStatus::ALL[0],
             bulk_button_rects: Vec::new(),
             row_rects: Vec::new(),
             close_pr_modal: None,
@@ -345,6 +425,15 @@ impl DashboardScreen {
         !self.rows.is_empty()
     }
 
+    /// Returns the path of the main (mother) worktree from the loaded rows,
+    /// or `None` if the rows haven't been populated yet.
+    pub fn main_worktree_path(&self) -> Option<String> {
+        self.rows
+            .iter()
+            .find(|row| row.worktree.is_main)
+            .map(|row| row.worktree.path.clone())
+    }
+
     pub fn preferred_content_height(&self) -> u16 {
         if self.loading {
             return 4;
@@ -353,7 +442,10 @@ impl DashboardScreen {
             return 5;
         }
         if matches!(self.mode, DashboardMode::ActionMenu) {
-            return 11;
+            // Header + General Commands list, plus the PR command section
+            // (heading + spacer + bordered button row) when it's shown.
+            let pr_section = if self.pr_commands.is_empty() { 0 } else { 5 };
+            return 11 + pr_section;
         }
         let table_rows = self.filtered_indices().len().max(1) as u16;
         // 1 status banner + 2 search spacers + 1 search line + N rows + footer
@@ -395,15 +487,11 @@ impl DashboardScreen {
             return DashboardAction::Refresh;
         }
 
-        // Tab cycles through the bulk-delete buttons (and back to the
-        // table). BackTab cycles in reverse. Available even while the
-        // search query has text — Tab is never typeable into the search.
-        if matches!(key.code, KeyCode::Tab) {
-            self.bulk_focus = next_bulk_focus(self.bulk_focus, true);
-            return DashboardAction::Continue;
-        }
-        if matches!(key.code, KeyCode::BackTab) {
-            self.bulk_focus = next_bulk_focus(self.bulk_focus, false);
+        // Tab toggles focus between the table and the bulk-delete buttons.
+        // Available even while the search query has text — Tab is never
+        // typeable into the search.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.toggle_bulk_focus();
             return DashboardAction::Continue;
         }
 
@@ -423,7 +511,7 @@ impl DashboardScreen {
             }
             KeyCode::Up => {
                 // Up from the first filtered row jumps focus to the bulk
-                // delete buttons (mirroring Down at the last row).
+                // delete buttons.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected == 0 {
                     self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
@@ -434,8 +522,8 @@ impl DashboardScreen {
             }
             KeyCode::Down => {
                 // Down at the last filtered row moves focus onto the bulk
-                // delete buttons (matching the Post-Create Commands page
-                // pattern). Otherwise advance selection within the table.
+                // delete buttons.
+                // Otherwise advance selection within the table.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected + 1 >= filtered_len {
                     self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
@@ -449,7 +537,10 @@ impl DashboardScreen {
                     return DashboardAction::Continue;
                 };
                 let row = self.rows[index].clone();
-                self.action_select = Some(self.build_action_select(&row));
+                self.action_select = Some(self.build_action_select());
+                self.pr_commands = self.build_pr_commands(&row);
+                self.action_pr_focus = None;
+                self.last_pr_focus = 0;
                 self.action_target = Some(index);
                 self.mode = DashboardMode::ActionMenu;
                 DashboardAction::Continue
@@ -488,6 +579,7 @@ impl DashboardScreen {
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.bulk_button_rects.clear();
         self.row_rects.clear();
+        self.pr_button_rects.clear();
 
         if self.loading {
             StatusIndicator::new(Status::Loading, "Loading dashboard...")
@@ -532,6 +624,21 @@ impl DashboardScreen {
         if matches!(self.mode, DashboardMode::ConfirmClosePr) {
             if let Some((modal, _)) = self.close_pr_modal.as_mut() {
                 modal.render(frame, area);
+            }
+        }
+    }
+
+    /// Tab toggles focus between the worktree table (`None`) and the
+    /// bulk-delete buttons. Moving into the buttons resumes on the status
+    /// that was focused last (`last_bulk_focus`); moving back to the table
+    /// remembers the focused status so the round trip preserves the
+    /// selection.
+    fn toggle_bulk_focus(&mut self) {
+        match self.bulk_focus {
+            None => self.bulk_focus = Some(self.last_bulk_focus),
+            Some(status) => {
+                self.last_bulk_focus = status;
+                self.bulk_focus = None;
             }
         }
     }
@@ -628,6 +735,23 @@ impl DashboardScreen {
             };
         }
         if matches!(self.mode, DashboardMode::ActionMenu) {
+            // PR command buttons are hit-tested first so a click on a button
+            // dispatches its action instead of falling through to the list.
+            for (command_idx, rect) in self.pr_button_rects.clone() {
+                if position.x >= rect.left()
+                    && position.x < rect.right()
+                    && position.y >= rect.top()
+                    && position.y < rect.bottom()
+                {
+                    let choice = self.pr_commands[command_idx].choice;
+                    let Some(index) = self.action_target else {
+                        self.reset_action_menu();
+                        self.mode = DashboardMode::Table;
+                        return DashboardAction::Continue;
+                    };
+                    return self.dispatch_action_choice(choice, index);
+                }
+            }
             let outcome = match self.action_select.as_mut() {
                 Some(select) => select.handle_mouse_click(position),
                 None => return DashboardAction::Continue,
@@ -635,70 +759,11 @@ impl DashboardScreen {
             return match outcome {
                 SelectOutcome::Selected(_, choice) => {
                     let Some(index) = self.action_target else {
+                        self.reset_action_menu();
                         self.mode = DashboardMode::Table;
-                        self.action_select = None;
                         return DashboardAction::Continue;
                     };
-                    let row = &self.rows[index];
-                    let path = row.worktree.path.clone();
-                    let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
-                    let merge_request = build_merge_request(row);
-                    let update_request = build_update_request(row);
-                    let close_request = build_close_request(row);
-                    self.action_select = None;
-                    self.action_target = None;
-                    match choice {
-                        ActionChoice::Navigate => {
-                            self.mode = DashboardMode::Table;
-                            DashboardAction::NavigateTo(path)
-                        }
-                        ActionChoice::OpenWithCommand => {
-                            self.mode = DashboardMode::Table;
-                            DashboardAction::OpenTerminal {
-                                path,
-                                branch: row.worktree.branch.clone(),
-                            }
-                        }
-                        ActionChoice::CopyPath => {
-                            self.mode = DashboardMode::Table;
-                            DashboardAction::CopyPath(path)
-                        }
-                        ActionChoice::OpenPullRequest => {
-                            self.mode = DashboardMode::Table;
-                            pr_url
-                                .map(DashboardAction::OpenPullRequest)
-                                .unwrap_or(DashboardAction::Continue)
-                        }
-                        ActionChoice::MergePullRequest => {
-                            self.mode = DashboardMode::Table;
-                            merge_request
-                                .map(|request| DashboardAction::MergePullRequest(Box::new(request)))
-                                .unwrap_or(DashboardAction::Continue)
-                        }
-                        ActionChoice::UpdatePullRequest => {
-                            self.mode = DashboardMode::Table;
-                            update_request
-                                .map(|request| {
-                                    DashboardAction::UpdatePullRequest(Box::new(request))
-                                })
-                                .unwrap_or(DashboardAction::Continue)
-                        }
-                        ActionChoice::ClosePullRequest => match close_request {
-                            Some(request) => {
-                                self.close_pr_modal = Some((build_close_pr_modal(), request));
-                                self.mode = DashboardMode::ConfirmClosePr;
-                                DashboardAction::Continue
-                            }
-                            None => {
-                                self.mode = DashboardMode::Table;
-                                DashboardAction::Continue
-                            }
-                        },
-                        ActionChoice::UpdateBranch => {
-                            self.mode = DashboardMode::Table;
-                            DashboardAction::UpdateBranch(path)
-                        }
-                    }
+                    self.dispatch_action_choice(choice, index)
                 }
                 SelectOutcome::Cancelled | SelectOutcome::Pending => DashboardAction::Continue,
             };
@@ -714,7 +779,10 @@ impl DashboardScreen {
                     return DashboardAction::Continue;
                 };
                 let row = self.rows[index].clone();
-                self.action_select = Some(self.build_action_select(&row));
+                self.action_select = Some(self.build_action_select());
+                self.pr_commands = self.build_pr_commands(&row);
+                self.action_pr_focus = None;
+                self.last_pr_focus = 0;
                 self.action_target = Some(index);
                 self.mode = DashboardMode::ActionMenu;
                 return DashboardAction::Continue;
@@ -732,7 +800,10 @@ impl DashboardScreen {
         DashboardAction::Continue
     }
 
-    fn build_action_select(&self, row: &DashboardRow) -> SelectPrompt<ActionChoice> {
+    /// Build the searchable "General Commands" list — every action that
+    /// isn't a pull-request operation. PR actions live in their own
+    /// button row built by [`Self::build_pr_commands`].
+    fn build_action_select(&self) -> SelectPrompt<ActionChoice> {
         let mut options = Vec::new();
         if self.is_from_wrapper {
             options.push(SelectOption::new(
@@ -762,139 +833,336 @@ impl DashboardScreen {
             "Update branch (locally)",
             ActionChoice::UpdateBranch,
         ));
-        if row
-            .pull_request
-            .as_ref()
-            .is_some_and(|pr| matches!(pr.state, PrState::Open | PrState::Merged))
-        {
-            options.push(SelectOption::new(
-                "Open Pull Request",
-                ActionChoice::OpenPullRequest,
-            ));
-        }
-        // Merge is only meaningful for PRs still in the Open state — a
-        // Merged / Closed / Draft PR can't be squash-merged again.
-        if row
-            .pull_request
-            .as_ref()
-            .is_some_and(|pr| matches!(pr.state, PrState::Open))
-        {
-            options.push(SelectOption::new(
-                "Merge Pull Request",
-                ActionChoice::MergePullRequest,
-            ));
-        }
-        // Update Pull Request appears only when the branch is *behind*
-        // its base — either the PR's merge_status says so, or git's
-        // local ahead/behind count says so. Showing it on already
-        // up-to-date rows would just be a no-op trip.
-        if row
-            .pull_request
-            .as_ref()
-            .is_some_and(|pr| matches!(pr.state, PrState::Open))
-            && row_is_behind(row)
-        {
-            options.push(SelectOption::new(
-                "Update Pull Request",
-                ActionChoice::UpdatePullRequest,
-            ));
-        }
-        if row
-            .pull_request
-            .as_ref()
-            .is_some_and(|pr| matches!(pr.state, PrState::Open))
-        {
-            options.push(SelectOption::new(
-                "Close Pull Request",
-                ActionChoice::ClosePullRequest,
-            ));
-        }
-        SelectPrompt::new("Choose action:", options)
+        SelectPrompt::new("General Commands", options)
             .searchable()
             .without_hint()
     }
 
+    /// Build the "Pull Request Commands" buttons for `row`. Each button is
+    /// gated by the same condition that previously guarded its menu entry,
+    /// so the buttons and the dispatch stay in lockstep. The order matches
+    /// the lifecycle a PR moves through: Open, Fill, Update, Push, Merge,
+    /// Close. Unavailable actions are simply omitted (no greyed-out
+    /// buttons), so arrow navigation only ever lands on a valid action.
+    fn build_pr_commands(&self, row: &DashboardRow) -> Vec<PrCommand> {
+        let mut commands = Vec::new();
+        let state = row.pull_request.as_ref().map(|pr| pr.state);
+        let is_open = matches!(state, Some(PrState::Open));
+        // Draft PRs are live PRs, so they share every lifecycle command an
+        // open PR exposes *except* Merge — GitHub refuses to merge a PR
+        // while it's still in draft.
+        let is_active = matches!(state, Some(PrState::Open | PrState::Draft));
+        if matches!(
+            state,
+            Some(PrState::Open | PrState::Draft | PrState::Merged)
+        ) {
+            commands.push(PrCommand {
+                label: "Open",
+                choice: ActionChoice::OpenPullRequest,
+                color: colors::PRIMARY,
+            });
+        }
+        // Fill drafts a title + description with the AI, then opens a new PR
+        // (branch ahead, none yet) or refreshes an open/draft PR's description.
+        if build_fill_request(row).is_some() {
+            commands.push(PrCommand {
+                label: "Fill",
+                choice: ActionChoice::FillPullRequest,
+                color: colors::BRAND,
+            });
+        }
+        // Update when the branch is behind its base (merge_status or local
+        // behind count) or when GitHub reports the PR as conflicting (`Dirty`)
+        // — both need an AI-assisted base merge. Mutually exclusive with Push.
+        if is_active && row_needs_update(row) {
+            commands.push(PrCommand {
+                label: "Update",
+                choice: ActionChoice::UpdatePullRequest,
+                color: colors::WARNING,
+            });
+        }
+        // Push when the branch is ahead but not behind — local commits not
+        // yet on the remote (the "merged-but-not-pushed" state).
+        if is_active && row_has_unpushed(row) {
+            commands.push(PrCommand {
+                label: "Push",
+                choice: ActionChoice::PushPullRequest,
+                color: colors::ACCENT,
+            });
+        }
+        // Merge is only meaningful while the PR is Open — a draft must be
+        // marked ready for review before GitHub will accept the merge.
+        if is_open {
+            commands.push(PrCommand {
+                label: "Merge",
+                choice: ActionChoice::MergePullRequest,
+                color: colors::SUCCESS,
+            });
+        }
+        if is_active {
+            commands.push(PrCommand {
+                label: "Close",
+                choice: ActionChoice::ClosePullRequest,
+                color: colors::ERROR,
+            });
+        }
+        commands
+    }
+
+    /// Labels of the PR command buttons currently shown in the action
+    /// menu. Empty unless the menu is open on a row with PR actions.
+    pub fn pr_command_labels(&self) -> Vec<String> {
+        self.pr_commands
+            .iter()
+            .map(|command| command.label.to_string())
+            .collect()
+    }
+
+    /// Labels of the "General Commands" list currently shown in the action
+    /// menu. Empty unless the menu is open. Reads straight off the built
+    /// `SelectPrompt` so tests don't have to scrape the rendered viewport
+    /// (which scrolls when the PR command section is also present).
+    pub fn general_command_labels(&self) -> Vec<String> {
+        self.action_select
+            .as_ref()
+            .map(|select| select.options.iter().map(|opt| opt.label.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Clear all transient action-menu state. Called whenever the menu is
+    /// dismissed so a stale row, focus, or button set can't leak into the
+    /// next open.
+    fn reset_action_menu(&mut self) {
+        self.action_select = None;
+        self.action_target = None;
+        self.pr_commands.clear();
+        self.action_pr_focus = None;
+    }
+
+    /// Move the action-menu's PR button focus one step in `delta` direction,
+    /// wrapping at both ends (matching the bulk-delete buttons row).
+    fn move_pr_focus(&mut self, forward: bool) {
+        let count = self.pr_commands.len();
+        if count == 0 {
+            self.action_pr_focus = None;
+            return;
+        }
+        let current = self.action_pr_focus.unwrap_or(0).min(count - 1);
+        let next = if forward {
+            if current + 1 >= count {
+                0
+            } else {
+                current + 1
+            }
+        } else if current == 0 {
+            count - 1
+        } else {
+            current - 1
+        };
+        self.action_pr_focus = Some(next);
+    }
+
+    /// Tab toggles focus between the General Commands list (`None`) and the
+    /// PR command buttons. Moving into the PR section resumes on the button
+    /// that was focused last (`last_pr_focus`, clamped to the current button
+    /// count); moving back to General remembers the focused button so the
+    /// round trip preserves the selection. A no-op when there are no PR
+    /// buttons.
+    fn toggle_action_focus(&mut self) {
+        if self.pr_commands.is_empty() {
+            self.action_pr_focus = None;
+            return;
+        }
+        self.action_pr_focus = match self.action_pr_focus {
+            None => Some(self.last_pr_focus.min(self.pr_commands.len() - 1)),
+            Some(idx) => {
+                self.last_pr_focus = idx;
+                None
+            }
+        };
+    }
+
     fn handle_action_menu(&mut self, key: KeyEvent) -> DashboardAction {
-        let Some(select) = self.action_select.as_mut() else {
+        if self.action_select.is_none() {
             self.mode = DashboardMode::Table;
             return DashboardAction::Continue;
-        };
+        }
+
+        // Tab toggles focus between the General Commands list and the PR
+        // command buttons; BackTab does the same since there are only two
+        // sections.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.toggle_action_focus();
+            return DashboardAction::Continue;
+        }
+
+        if self.action_pr_focus.is_some() {
+            return self.handle_pr_command_key(key);
+        }
+
+        let select = self.action_select.as_mut().unwrap();
         match select.handle_key(key) {
             SelectOutcome::Selected(_, choice) => {
                 let Some(index) = self.action_target else {
+                    self.reset_action_menu();
                     self.mode = DashboardMode::Table;
-                    self.action_select = None;
                     return DashboardAction::Continue;
                 };
-                let row = &self.rows[index];
-                let path = row.worktree.path.clone();
-                let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
-                let merge_request = build_merge_request(row);
-                let update_request = build_update_request(row);
-                let close_request = build_close_request(row);
-                self.action_select = None;
-                self.action_target = None;
-                match choice {
-                    ActionChoice::Navigate => {
-                        self.mode = DashboardMode::Table;
-                        DashboardAction::NavigateTo(path)
-                    }
-                    ActionChoice::OpenWithCommand => {
-                        self.mode = DashboardMode::Table;
-                        DashboardAction::OpenTerminal {
-                            path,
-                            branch: row.worktree.branch.clone(),
-                        }
-                    }
-                    ActionChoice::CopyPath => {
-                        self.mode = DashboardMode::Table;
-                        DashboardAction::CopyPath(path)
-                    }
-                    ActionChoice::OpenPullRequest => {
-                        self.mode = DashboardMode::Table;
-                        match pr_url {
-                            Some(url) => DashboardAction::OpenPullRequest(url),
-                            None => DashboardAction::Continue,
-                        }
-                    }
-                    ActionChoice::MergePullRequest => {
-                        self.mode = DashboardMode::Table;
-                        match merge_request {
-                            Some(request) => DashboardAction::MergePullRequest(Box::new(request)),
-                            None => DashboardAction::Continue,
-                        }
-                    }
-                    ActionChoice::UpdatePullRequest => {
-                        self.mode = DashboardMode::Table;
-                        match update_request {
-                            Some(request) => DashboardAction::UpdatePullRequest(Box::new(request)),
-                            None => DashboardAction::Continue,
-                        }
-                    }
-                    ActionChoice::ClosePullRequest => match close_request {
-                        Some(request) => {
-                            self.close_pr_modal = Some((build_close_pr_modal(), request));
-                            self.mode = DashboardMode::ConfirmClosePr;
-                            DashboardAction::Continue
-                        }
-                        None => {
-                            self.mode = DashboardMode::Table;
-                            DashboardAction::Continue
-                        }
-                    },
-                    ActionChoice::UpdateBranch => {
-                        self.mode = DashboardMode::Table;
-                        DashboardAction::UpdateBranch(path)
-                    }
-                }
+                self.dispatch_action_choice(choice, index)
             }
             SelectOutcome::Cancelled => {
+                self.reset_action_menu();
                 self.mode = DashboardMode::Table;
-                self.action_select = None;
-                self.action_target = None;
                 DashboardAction::Continue
             }
             SelectOutcome::Pending => DashboardAction::Continue,
+        }
+    }
+
+    /// Keyboard handling while a PR command button owns the focus: Left /
+    /// Right move between buttons, Enter runs the focused action, Esc
+    /// dismisses the whole menu. Letter shortcuts (O/F/U/P/M/C) trigger the
+    /// matching PR command directly without needing to navigate to it first.
+    fn handle_pr_command_key(&mut self, key: KeyEvent) -> DashboardAction {
+        if self.pr_commands.is_empty() {
+            self.action_pr_focus = None;
+            return DashboardAction::Continue;
+        }
+        // Letter shortcuts: map each key to its ActionChoice, then fire the
+        // first matching command that is actually present in the button row.
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            let shortcut_choice = match key.code {
+                KeyCode::Char('o') | KeyCode::Char('O') => Some(ActionChoice::OpenPullRequest),
+                KeyCode::Char('f') | KeyCode::Char('F') => Some(ActionChoice::FillPullRequest),
+                KeyCode::Char('u') | KeyCode::Char('U') => Some(ActionChoice::UpdatePullRequest),
+                KeyCode::Char('p') | KeyCode::Char('P') => Some(ActionChoice::PushPullRequest),
+                KeyCode::Char('m') | KeyCode::Char('M') => Some(ActionChoice::MergePullRequest),
+                KeyCode::Char('c') | KeyCode::Char('C') => Some(ActionChoice::ClosePullRequest),
+                _ => None,
+            };
+            if let Some(target_choice) = shortcut_choice {
+                if let Some(cmd) = self
+                    .pr_commands
+                    .iter()
+                    .find(|cmd| cmd.choice == target_choice)
+                {
+                    let choice = cmd.choice;
+                    let Some(index) = self.action_target else {
+                        self.reset_action_menu();
+                        self.mode = DashboardMode::Table;
+                        return DashboardAction::Continue;
+                    };
+                    return self.dispatch_action_choice(choice, index);
+                }
+                return DashboardAction::Continue;
+            }
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.reset_action_menu();
+                self.mode = DashboardMode::Table;
+                DashboardAction::Continue
+            }
+            KeyCode::Left => {
+                self.move_pr_focus(false);
+                DashboardAction::Continue
+            }
+            KeyCode::Right => {
+                self.move_pr_focus(true);
+                DashboardAction::Continue
+            }
+            KeyCode::Enter => {
+                let focus = self
+                    .action_pr_focus
+                    .unwrap_or(0)
+                    .min(self.pr_commands.len() - 1);
+                let choice = self.pr_commands[focus].choice;
+                let Some(index) = self.action_target else {
+                    self.reset_action_menu();
+                    self.mode = DashboardMode::Table;
+                    return DashboardAction::Continue;
+                };
+                self.dispatch_action_choice(choice, index)
+            }
+            _ => DashboardAction::Continue,
+        }
+    }
+
+    /// Run a chosen action against `self.rows[index]`, clearing the menu
+    /// state first. Shared by the General Commands list, the PR command
+    /// buttons, and mouse clicks so every path dispatches identically.
+    fn dispatch_action_choice(&mut self, choice: ActionChoice, index: usize) -> DashboardAction {
+        let row = &self.rows[index];
+        let path = row.worktree.path.clone();
+        let branch = row.worktree.branch.clone();
+        let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
+        let merge_request = build_merge_request(row);
+        let update_request = build_update_request(row);
+        let fill_request = build_fill_request(row);
+        let push_request = build_push_request(row);
+        let close_request = build_close_request(row);
+        self.reset_action_menu();
+        match choice {
+            ActionChoice::Navigate => {
+                self.mode = DashboardMode::Table;
+                DashboardAction::NavigateTo(path)
+            }
+            ActionChoice::OpenWithCommand => {
+                self.mode = DashboardMode::Table;
+                DashboardAction::OpenTerminal { path, branch }
+            }
+            ActionChoice::CopyPath => {
+                self.mode = DashboardMode::Table;
+                DashboardAction::CopyPath(path)
+            }
+            ActionChoice::OpenPullRequest => {
+                self.mode = DashboardMode::Table;
+                pr_url
+                    .map(DashboardAction::OpenPullRequest)
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::MergePullRequest => {
+                self.mode = DashboardMode::Table;
+                merge_request
+                    .map(|request| DashboardAction::MergePullRequest(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::UpdatePullRequest => {
+                self.mode = DashboardMode::Table;
+                update_request
+                    .map(|request| DashboardAction::UpdatePullRequest(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::FillPullRequest => {
+                self.mode = DashboardMode::Table;
+                fill_request
+                    .map(|request| DashboardAction::FillPullRequest(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::PushPullRequest => {
+                self.mode = DashboardMode::Table;
+                push_request
+                    .map(|request| DashboardAction::PushPullRequest(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::ClosePullRequest => match close_request {
+                Some(request) => {
+                    self.close_pr_modal = Some((build_close_pr_modal(), request));
+                    self.mode = DashboardMode::ConfirmClosePr;
+                    DashboardAction::Continue
+                }
+                None => {
+                    self.mode = DashboardMode::Table;
+                    DashboardAction::Continue
+                }
+            },
+            ActionChoice::UpdateBranch => {
+                self.mode = DashboardMode::Table;
+                DashboardAction::UpdateBranch { path, branch }
+            }
         }
     }
 
@@ -1468,10 +1736,12 @@ impl DashboardScreen {
             Span::styled(" = no uncommitted changes  ", muted_dim),
             Span::styled("Opened", Style::default().fg(colors::INFO)),
             Span::styled(" = PR open  ", muted_dim),
-            Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
-            Span::styled(" = PR merged  ", muted_dim),
+            Span::styled("Drafted", Style::default().fg(colors::GRAY_MEDIUM)),
+            Span::styled(" = PR draft  ", muted_dim),
             Span::styled("Closed", Style::default().fg(colors::GRAY_LIGHT)),
-            Span::styled(" = PR closed", muted_dim),
+            Span::styled(" = PR closed  ", muted_dim),
+            Span::styled("Merged", Style::default().fg(colors::SUCCESS)),
+            Span::styled(" = PR merged", muted_dim),
         ])
     }
 
@@ -1688,10 +1958,19 @@ impl DashboardScreen {
         }
     }
 
-    fn render_action_menu(&self, frame: &mut Frame, area: Rect) {
+    fn render_action_menu(&mut self, frame: &mut Frame, area: Rect) {
+        // Header row (Selected: …), the General Commands list, then the PR
+        // command buttons. The PR section is sized at heading + spacer +
+        // bordered button row, and collapses to nothing when the row
+        // exposes no PR actions.
+        let pr_section_height = if self.pr_commands.is_empty() { 0 } else { 5 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(pr_section_height),
+            ])
             .split(area);
 
         if let Some(index) = self.action_target.or_else(|| self.selected_row_index()) {
@@ -1713,6 +1992,89 @@ impl DashboardScreen {
 
         if let Some(select) = &self.action_select {
             select.render(frame, chunks[1]);
+        }
+
+        if pr_section_height > 0 {
+            self.render_pr_commands(frame, chunks[2]);
+        }
+    }
+
+    /// Render the "Pull Request Commands" section: a heading followed by a
+    /// row of colored, bordered buttons. The focused button (when the PR
+    /// section owns the keyboard) reads in white; the rest wear their
+    /// action color. Mirrors the bulk-delete buttons row.
+    fn render_pr_commands(&mut self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(3),
+            ])
+            .split(area);
+
+        let heading_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Pull Request Commands",
+                heading_style,
+            ))),
+            rows[0],
+        );
+
+        let gap: u16 = 2;
+        let commands = self.pr_commands.clone();
+        let focus = self.action_pr_focus;
+
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(commands.len() * 2 + 1);
+        for (index, command) in commands.iter().enumerate() {
+            if index > 0 {
+                constraints.push(Constraint::Length(gap));
+            }
+            constraints.push(Constraint::Length(command.label.chars().count() as u16 + 4));
+        }
+        constraints.push(Constraint::Min(0));
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .split(rows[2]);
+
+        for (index, command) in commands.iter().enumerate() {
+            let col_index = index * 2;
+            if col_index >= cols.len() {
+                break;
+            }
+            let rect = cols[col_index];
+            if rect.width == 0 {
+                continue;
+            }
+
+            let focused = focus == Some(index);
+            let text_style = if focused {
+                Style::default()
+                    .fg(colors::WHITE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(command.color)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let border_style = Style::default().fg(command.color);
+
+            let button = Paragraph::new(Line::from(Span::styled(command.label, text_style)))
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(border_style)
+                        .padding(Padding::horizontal(1)),
+                );
+            frame.render_widget(button, rect);
+            self.pr_button_rects.push((index, rect));
         }
     }
 
@@ -2269,15 +2631,64 @@ pub(crate) fn row_is_behind(row: &DashboardRow) -> bool {
     merge_says_behind || git_says_behind
 }
 
+/// True when the row's PR has merge conflicts with its base — GitHub reports
+/// `mergeStateStatus = DIRTY` (`MergeStatus::Dirty`) for a branch that has
+/// diverged *and* conflicts. Unlike `Behind`, a conflicting branch is usually
+/// *not* flagged as behind locally (the worktree's default branch is stale),
+/// so this is the only reliable signal that an AI-assisted base merge is
+/// needed. Used together with [`row_is_behind`] to gate the "Update" command.
+pub(crate) fn row_has_conflicts(row: &DashboardRow) -> bool {
+    row.pull_request
+        .as_ref()
+        .and_then(|pr| pr.merge_status)
+        .map(|status| matches!(status, MergeStatus::Dirty))
+        .unwrap_or(false)
+}
+
+/// True when the row's branch needs an AI-assisted base merge — it is either
+/// behind its base ([`row_is_behind`]) or conflicting with it
+/// ([`row_has_conflicts`]). Single source of truth for the "Update Pull
+/// Request" visibility rule; keeps Update and Push mutually exclusive (see
+/// [`row_has_unpushed`]).
+pub(crate) fn row_needs_update(row: &DashboardRow) -> bool {
+    row_is_behind(row) || row_has_conflicts(row)
+}
+
+/// True when the row's branch has local commits that aren't on the remote
+/// yet — ahead of its base but with no pending base merge. This is the
+/// "merged-but-not-pushed" signal a failed push leaves behind (the local
+/// merge landed, so `behind` dropped to 0, but `ahead` is still positive).
+/// Mutually exclusive with [`row_needs_update`], so Update and Push never both
+/// appear. Used to gate the "Push Pull Request" menu entry.
+pub(crate) fn row_has_unpushed(row: &DashboardRow) -> bool {
+    if row_needs_update(row) {
+        return false;
+    }
+    row.worktree
+        .branch_status
+        .as_ref()
+        .map(|s| s.ahead > 0 && s.behind == 0)
+        .unwrap_or(false)
+}
+
+/// True for PR states that still accept the non-merge lifecycle commands
+/// (Fill / Update / Push / Close). Open and Draft both qualify; Merged and
+/// Closed are terminal. Merge stays Open-only (see [`build_merge_request`])
+/// because GitHub refuses to merge a draft until it's marked ready.
+fn pr_accepts_lifecycle_commands(state: PrState) -> bool {
+    matches!(state, PrState::Open | PrState::Draft)
+}
+
 /// Assemble the payload the update confirmation screen needs. Returns
-/// `None` when the row's PR is missing/not Open or the branch isn't
-/// behind — mirrors the guard in `build_action_select`.
+/// `None` when the row's PR is missing/terminal or the branch neither is
+/// behind nor conflicts with its base — mirrors the guard in
+/// `build_action_select`.
 fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
     let pr = row.pull_request.as_ref()?;
-    if !matches!(pr.state, PrState::Open) {
+    if !pr_accepts_lifecycle_commands(pr.state) {
         return None;
     }
-    if !row_is_behind(row) {
+    if !row_needs_update(row) {
         return None;
     }
     let (ahead, behind) = row
@@ -2296,6 +2707,86 @@ fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> 
         behind,
         // App resolves the actual reachable base ref before mounting the
         // screen; the dashboard never runs git itself.
+        base_ref: None,
+    })
+}
+
+/// Assemble the payload the "Fill Pull Request" screen needs. Returns
+/// `None` (so the menu entry is hidden) on the mother worktree, or on a
+/// worktree that has neither an open PR to refresh nor any commits ahead
+/// of its base to describe. When an open PR exists the draft updates it
+/// (`number = Some`); otherwise a branch that is ahead opens a new one
+/// (`number = None`).
+fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
+    // The mother worktree never owns a PR of its own.
+    if row.worktree.is_main {
+        return None;
+    }
+    let branch = row.worktree.branch.clone();
+    let worktree_path = row.worktree.path.clone();
+    match row.pull_request.as_ref() {
+        // Open or draft PR → refresh its description.
+        Some(pr) if pr_accepts_lifecycle_commands(pr.state) => Some(FillPullRequestRequest {
+            branch,
+            worktree_path,
+            base_ref: None,
+            number: Some(pr.number),
+            title: Some(pr.title.clone()),
+            url: Some(pr.url.clone()),
+            existing_labels: pr.labels.clone(),
+        }),
+        // Closed / merged PR → don't resurrect it from this action.
+        Some(_) => None,
+        // No PR yet → only offer when there are commits to describe.
+        None => {
+            let ahead = row
+                .worktree
+                .branch_status
+                .as_ref()
+                .map(|s| s.ahead)
+                .unwrap_or(0);
+            if ahead == 0 {
+                return None;
+            }
+            Some(FillPullRequestRequest {
+                branch,
+                worktree_path,
+                base_ref: None,
+                number: None,
+                title: None,
+                url: None,
+                existing_labels: vec![],
+            })
+        }
+    }
+}
+/// Assemble the payload for the push-only flow. Returns `None` unless the
+/// row's PR is Open and the branch is ahead-but-not-behind — mirrors the
+/// `row_has_unpushed` guard in `build_action_select`. Reuses the
+/// `UpdatePullRequestRequest` struct; `base_ref` stays `None` because a push
+/// needs no base ref.
+fn build_push_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
+    let pr = row.pull_request.as_ref()?;
+    if !pr_accepts_lifecycle_commands(pr.state) {
+        return None;
+    }
+    if !row_has_unpushed(row) {
+        return None;
+    }
+    let (ahead, behind) = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .map(|s| (s.ahead, s.behind))
+        .unwrap_or((0, 0));
+    Some(UpdatePullRequestRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+        ahead,
+        behind,
         base_ref: None,
     })
 }
@@ -2328,7 +2819,7 @@ fn build_merge_request(row: &DashboardRow) -> Option<MergePullRequestRequest> {
 
 fn build_close_request(row: &DashboardRow) -> Option<ClosePullRequestRequest> {
     let pr = row.pull_request.as_ref()?;
-    if !matches!(pr.state, PrState::Open) {
+    if !pr_accepts_lifecycle_commands(pr.state) {
         return None;
     }
     Some(ClosePullRequestRequest {
@@ -2361,6 +2852,11 @@ fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
     match row.pull_request.as_ref().map(|pr| pr.state) {
         Some(PrState::Merged) => ("Merged", Style::default().fg(colors::SUCCESS)),
         Some(PrState::Open) => ("Opened", Style::default().fg(colors::INFO)),
+        // A draft PR is a real, active PR — it gets its own label so the
+        // worktree no longer masquerades as "Clean". `GRAY_MEDIUM` sits
+        // between the footer's `MUTED` gray and the `GRAY_LIGHT` used by
+        // "Closed", so "Drafted" reads as distinct from both.
+        Some(PrState::Draft) => ("Drafted", Style::default().fg(colors::GRAY_MEDIUM)),
         Some(PrState::Closed) => ("Closed", Style::default().fg(colors::GRAY_LIGHT)),
         _ if row.worktree.is_clean => ("Clean", Style::default().fg(colors::ACCENT)),
         _ => ("Dirty", Style::default().fg(colors::ERROR)),
@@ -2541,6 +3037,7 @@ fn format_refreshed_label(duration: std::time::Duration) -> String {
 
 fn notice_style(level: DashboardNoticeLevel) -> Style {
     match level {
+        DashboardNoticeLevel::Success => Style::default().fg(colors::SUCCESS),
         DashboardNoticeLevel::Warning => Style::default().fg(colors::WARNING),
         DashboardNoticeLevel::Error => Style::default().fg(colors::ERROR),
     }
@@ -2555,4 +3052,292 @@ fn truncate(value: &str, max_chars: usize) -> String {
         .iter()
         .collect::<String>()
         + "..."
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::types::{BranchStatus, GitWorktree};
+    use crate::services::{PullRequest, ReviewerSummary};
+
+    fn branch_status(ahead: u64, behind: u64) -> BranchStatus {
+        BranchStatus {
+            ahead,
+            behind,
+            upstream_branch: Some("origin/main".to_string()),
+            insertions: None,
+            deletions: None,
+        }
+    }
+
+    fn open_pr() -> PullRequest {
+        PullRequest {
+            number: 42,
+            state: PrState::Open,
+            url: "https://github.com/example/repo/pull/42".to_string(),
+            title: "Add feature".to_string(),
+            base_ref_name: Some("main".to_string()),
+            base_repository: Some("example/repo".to_string()),
+            head_ref_oid: Some("abc123".to_string()),
+            labels: vec![],
+            checks_status: None,
+            review_status: None,
+            merge_status: None,
+            reviewers: ReviewerSummary::default(),
+        }
+    }
+
+    fn row(pr: Option<PullRequest>, status: Option<BranchStatus>) -> DashboardRow {
+        DashboardRow {
+            worktree: GitWorktree {
+                path: "/tmp/repo-feature".to_string(),
+                branch: "feature".to_string(),
+                commit: "abc123".to_string(),
+                is_main: false,
+                is_clean: true,
+                branch_status: status,
+            },
+            last_commit: None,
+            pull_request: pr,
+            ai_status: None,
+            error: None,
+        }
+    }
+
+    fn pr_labels(row: &DashboardRow) -> Vec<String> {
+        let screen = DashboardScreen::new(false, false, false, Vec::new(), Vec::new(), true);
+        screen
+            .build_pr_commands(row)
+            .iter()
+            .map(|command| command.label.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn row_has_unpushed_true_when_ahead_and_not_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 0)));
+        assert!(row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_when_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 2)));
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_without_branch_status() {
+        let r = row(Some(open_pr()), None);
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_when_not_ahead() {
+        let r = row(Some(open_pr()), Some(branch_status(0, 0)));
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_when_merge_status_says_behind() {
+        // GitHub's merge_status reports Behind even though git's local count
+        // is 0 — `row_is_behind` wins, so Push must not appear (Update does).
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Behind);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn push_action_appears_for_ahead_not_behind_open_pr() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 0)));
+        let labels = pr_labels(&r);
+        assert!(
+            labels.iter().any(|l| l == "Push"),
+            "expected Push command in {labels:?}"
+        );
+        // The merged-but-not-pushed state is not behind, so Update is absent.
+        assert!(
+            !labels.iter().any(|l| l == "Update"),
+            "Update should not show alongside Push: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn push_action_absent_when_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 2)));
+        let labels = pr_labels(&r);
+        assert!(
+            !labels.iter().any(|l| l == "Push"),
+            "Push must not show when behind: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "Update"),
+            "Update should show when behind: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn row_needs_update_true_when_pr_conflicting() {
+        // GitHub reports a conflicting PR as DIRTY, and the worktree's local
+        // default branch is stale so git's behind count reads 0 — only
+        // merge_status flags the conflict.
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Dirty);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        assert!(row_has_conflicts(&r));
+        assert!(!row_is_behind(&r));
+        assert!(row_needs_update(&r));
+    }
+
+    #[test]
+    fn row_has_unpushed_false_when_pr_conflicting() {
+        // A conflicting PR needs Update, not Push, even though it looks
+        // ahead-but-not-behind locally.
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Dirty);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        assert!(!row_has_unpushed(&r));
+    }
+
+    #[test]
+    fn update_action_appears_for_conflicting_pr() {
+        // Regression: a conflicting (DIRTY) PR whose local branch reads
+        // ahead>0, behind==0 must surface Update — not Push — so the user can
+        // run the AI-assisted base merge that resolves the conflicts.
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Dirty);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        let labels = pr_labels(&r);
+        assert!(
+            labels.iter().any(|l| l == "Update"),
+            "Update should show for a conflicting PR: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "Push"),
+            "Push must not show for a conflicting PR: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn build_update_request_returns_payload_for_conflicting_pr() {
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Dirty);
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        let request = build_update_request(&r).expect("update request built for conflicting PR");
+        assert_eq!(request.number, 42);
+        assert_eq!(request.branch, "feature");
+        assert!(request.base_ref.is_none());
+    }
+
+    #[test]
+    fn build_push_request_returns_payload_for_ahead_not_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 0)));
+        let request = build_push_request(&r).expect("push request built");
+        assert_eq!(request.number, 42);
+        assert_eq!(request.branch, "feature");
+        assert_eq!(request.ahead, 3);
+        assert_eq!(request.behind, 0);
+        assert!(request.base_ref.is_none());
+    }
+
+    #[test]
+    fn build_push_request_none_when_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 2)));
+        assert!(build_push_request(&r).is_none());
+    }
+
+    #[test]
+    fn build_push_request_none_when_pr_not_open() {
+        let mut pr = open_pr();
+        pr.state = PrState::Merged;
+        let r = row(Some(pr), Some(branch_status(3, 0)));
+        assert!(build_push_request(&r).is_none());
+    }
+
+    fn key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn screen_with_row(r: DashboardRow) -> DashboardScreen {
+        let mut screen =
+            DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false);
+        screen.set_rows(vec![r]);
+        screen
+    }
+
+    #[test]
+    fn general_commands_exclude_pull_request_actions() {
+        let screen = DashboardScreen::new(true, true, true, Vec::new(), Vec::new(), true);
+        let labels: Vec<String> = screen
+            .build_action_select()
+            .options
+            .iter()
+            .map(|opt| opt.label.clone())
+            .collect();
+        assert!(labels.contains(&"Navigate to Directory".to_string()));
+        assert!(labels.contains(&"Copy path to clipboard".to_string()));
+        assert!(labels.contains(&"Update branch (locally)".to_string()));
+        assert!(
+            labels.iter().all(|label| !label.contains("Pull Request")),
+            "General Commands must not contain PR actions: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn pr_commands_order_for_open_pr_ahead_not_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(3, 0)));
+        assert_eq!(
+            pr_labels(&r),
+            vec!["Open", "Fill", "Push", "Merge", "Close"]
+        );
+    }
+
+    #[test]
+    fn pr_commands_order_for_open_pr_behind() {
+        let r = row(Some(open_pr()), Some(branch_status(1, 3)));
+        assert_eq!(
+            pr_labels(&r),
+            vec!["Open", "Fill", "Update", "Merge", "Close"]
+        );
+    }
+
+    #[test]
+    fn pr_commands_empty_without_pull_request() {
+        let r = row(None, Some(branch_status(0, 0)));
+        assert!(pr_labels(&r).is_empty());
+    }
+
+    #[test]
+    fn tab_toggles_focus_between_general_and_pr_commands() {
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.handle_key(key_event(KeyCode::Enter));
+        assert_eq!(screen.action_pr_focus, None);
+        screen.handle_key(key_event(KeyCode::Tab));
+        assert_eq!(screen.action_pr_focus, Some(0));
+        screen.handle_key(key_event(KeyCode::Tab));
+        assert_eq!(screen.action_pr_focus, None);
+    }
+
+    #[test]
+    fn arrow_keys_move_pr_command_focus_with_wraparound() {
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.handle_key(key_event(KeyCode::Enter));
+        screen.handle_key(key_event(KeyCode::Tab));
+        let count = screen.pr_commands.len();
+        screen.handle_key(key_event(KeyCode::Left));
+        assert_eq!(screen.action_pr_focus, Some(count - 1));
+        screen.handle_key(key_event(KeyCode::Right));
+        assert_eq!(screen.action_pr_focus, Some(0));
+    }
+
+    #[test]
+    fn enter_on_focused_pr_button_dispatches_its_action() {
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.handle_key(key_event(KeyCode::Enter));
+        screen.handle_key(key_event(KeyCode::Tab));
+        let action = screen.handle_key(key_event(KeyCode::Enter));
+        assert!(matches!(action, DashboardAction::OpenPullRequest(_)));
+        assert!(screen.pr_commands.is_empty());
+        assert_eq!(screen.action_pr_focus, None);
+    }
 }

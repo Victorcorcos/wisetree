@@ -22,18 +22,19 @@
 //! at the prompt (`Unknown`/`Completed` → `Idle`) or mid-turn (`Pending` →
 //! `Running`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::paths::{canonical_key, AiStatusPaths};
+use super::probe::{process_basename, scan_live_cwds};
 use super::state::AiHarnessState;
+use super::util::merge;
 use super::DetectorOutput;
 
 const MAX_DIRS_PER_TICK: usize = 200;
@@ -186,11 +187,6 @@ fn classify_turn_state(turn_state: GeminiTurnState, has_live_process: bool) -> A
     }
 }
 
-fn merge(out: &mut BTreeMap<PathBuf, AiHarnessState>, key: PathBuf, state: AiHarnessState) {
-    let entry = out.entry(key).or_insert(AiHarnessState::Absent);
-    *entry = AiHarnessState::merge(*entry, state);
-}
-
 /// Find the canonical-keyed cwds of every live `gemini`/`gemini-cli` process.
 ///
 /// gemini-cli is shipped as a node script, so the OS process name is `node`.
@@ -200,44 +196,7 @@ fn merge(out: &mut BTreeMap<PathBuf, AiHarnessState>, key: PathBuf, state: AiHar
 /// worktree to `Running` even when the session JSONL has been frozen for
 /// minutes during a long "Thinking…" step.
 fn scan_live_gemini_cwds() -> BTreeSet<PathBuf> {
-    let pids = list_gemini_pids();
-    if pids.is_empty() {
-        return BTreeSet::new();
-    }
-    fetch_cwds(&pids)
-        .into_values()
-        .map(|cwd| canonical_key(&cwd))
-        .collect()
-}
-
-fn list_gemini_pids() -> Vec<u32> {
-    let output = Command::new("ps")
-        .args(["-A", "-o", "pid=,command="])
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    parse_gemini_pids(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_gemini_pids(ps_output: &str) -> Vec<u32> {
-    let mut pids = Vec::new();
-    for line in ps_output.lines() {
-        let trimmed = line.trim_start();
-        let Some((pid_str, command)) = trimmed.split_once(char::is_whitespace) else {
-            continue;
-        };
-        if !is_gemini_command(command) {
-            continue;
-        }
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            pids.push(pid);
-        }
-    }
-    pids
+    scan_live_cwds(is_gemini_command)
 }
 
 /// Match `gemini` / `gemini-cli` invocations specifically. Two shapes:
@@ -254,14 +213,7 @@ fn is_gemini_command(command: &str) -> bool {
     let Some(&first) = tokens.first() else {
         return false;
     };
-    let basename = |t: &str| {
-        Path::new(t)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    let first_name = basename(first);
+    let first_name = process_basename(first);
     if matches!(first_name.as_str(), "gemini" | "gemini-cli") {
         return true;
     }
@@ -270,57 +222,7 @@ fn is_gemini_command(command: &str) -> bool {
     }
     tokens[1..]
         .iter()
-        .any(|t| matches!(basename(t).as_str(), "gemini" | "gemini-cli"))
-}
-
-#[cfg(target_os = "linux")]
-fn fetch_cwds(pids: &[u32]) -> BTreeMap<u32, PathBuf> {
-    let mut map = BTreeMap::new();
-    for &pid in pids {
-        if let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) {
-            map.insert(pid, cwd);
-        }
-    }
-    map
-}
-
-#[cfg(target_os = "macos")]
-fn fetch_cwds(pids: &[u32]) -> BTreeMap<u32, PathBuf> {
-    let joined = pids
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let Ok(output) = Command::new("lsof")
-        .args(["-a", "-p", &joined, "-d", "cwd", "-F", "pn"])
-        .output()
-    else {
-        return BTreeMap::new();
-    };
-    // lsof exits non-zero when any single PID lacks accessible info, even if
-    // others produced output — so we always parse stdout regardless of status.
-    parse_lsof_cwd_output(&String::from_utf8_lossy(&output.stdout))
-}
-
-#[cfg(target_os = "macos")]
-fn parse_lsof_cwd_output(output: &str) -> BTreeMap<u32, PathBuf> {
-    let mut map = BTreeMap::new();
-    let mut current_pid: Option<u32> = None;
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix('p') {
-            current_pid = rest.trim().parse::<u32>().ok();
-        } else if let Some(rest) = line.strip_prefix('n') {
-            if let Some(pid) = current_pid {
-                map.insert(pid, PathBuf::from(rest));
-            }
-        }
-    }
-    map
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn fetch_cwds(_pids: &[u32]) -> BTreeMap<u32, PathBuf> {
-    BTreeMap::new()
+        .any(|t| matches!(process_basename(t).as_str(), "gemini" | "gemini-cli"))
 }
 
 #[cfg(test)]
@@ -330,6 +232,11 @@ pub(super) fn scan_with_live_cwds_for_test(
     live_cwds: &BTreeSet<PathBuf>,
 ) -> DetectorOutput {
     scan_with_live_cwds(paths, live_cwds)
+}
+
+#[cfg(test)]
+fn parse_gemini_pids(ps_output: &str) -> Vec<u32> {
+    super::probe::parse_pids(ps_output, is_gemini_command)
 }
 
 #[cfg(test)]
@@ -382,7 +289,7 @@ mod tests {
             "p74935\n",
             "n/Users/foo/other\n",
         );
-        let map = parse_lsof_cwd_output(output);
+        let map = crate::services::ai_status::probe::parse_lsof_cwd_output(output);
         assert_eq!(
             map.get(&85230).map(PathBuf::as_path),
             Some(Path::new("/Users/foo/project"))

@@ -11,7 +11,7 @@ use wisetree::services::{
     DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus, PrState, PullRequest,
     ReviewStatus, ReviewerSummary,
 };
-use wisetree::tui::screens::dashboard::{DashboardAction, DashboardScreen};
+use wisetree::tui::screens::dashboard::{BulkDeleteStatus, DashboardAction, DashboardScreen};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -93,6 +93,10 @@ fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
         state: PrState::Open,
         url: "https://github.com/example/repo/pull/42".into(),
         title: "Improve dashboard footer details for live workflows".into(),
+        base_ref_name: Some("main".into()),
+        base_repository: Some("example/repo".into()),
+        head_ref_oid: Some("abc123".into()),
+        labels: vec![],
         checks_status: None,
         review_status: None,
         merge_status: None,
@@ -536,6 +540,45 @@ fn merged_pr_row_renders_merged_status_in_success_palette() {
 
     let dumped = dump(120, 12, |f| screen.render(f, f.area()));
     assert!(dumped.contains("Merged"));
+}
+
+#[test]
+fn draft_pr_row_renders_drafted_status_in_gray_medium_palette() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    // A draft PR must no longer masquerade as "Clean": even on a clean
+    // worktree it renders its own "Drafted" label in the medium gray —
+    // distinct from the lighter gray "Closed" uses.
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Draft),
+    ]);
+
+    let backend = TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let drafted_cell = buffer
+        .content
+        .iter()
+        .find(|cell| cell.symbol() == "D" && cell.fg == colors::GRAY_MEDIUM)
+        .expect("drafted cell with gray-medium color");
+    assert_eq!(drafted_cell.fg, colors::GRAY_MEDIUM);
+    assert_ne!(
+        drafted_cell.fg,
+        colors::GRAY_LIGHT,
+        "Drafted must not reuse the Closed gray"
+    );
+
+    let dumped = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(dumped.contains("Drafted"));
 }
 
 #[test]
@@ -1089,10 +1132,53 @@ fn narrow_render_snapshot_collapses_trailing_columns() {
     );
 }
 
-fn open_action_menu_for_second_row(screen: &mut DashboardScreen) -> String {
+fn open_action_menu_for_second_row(screen: &mut DashboardScreen) -> Vec<String> {
     screen.handle_key(key(KeyCode::Down));
     screen.handle_key(key(KeyCode::Enter));
-    dump(120, 14, |f| screen.render(f, f.area()))
+    // Render once so the action menu (and its PR command buttons) is laid
+    // out, then read the button labels straight from the screen rather than
+    // scraping the rendered text — the short labels (Open/Merge/…) would
+    // otherwise collide with general entries like "Open with Command".
+    let _ = dump(120, 14, |f| screen.render(f, f.area()));
+    screen.pr_command_labels()
+}
+
+#[test]
+fn action_menu_renders_general_and_pull_request_sections() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open),
+    ]);
+
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Enter));
+    let dumped = dump(120, 16, |f| screen.render(f, f.area()));
+
+    assert!(
+        dumped.contains("General Commands"),
+        "expected the General Commands heading: {dumped}"
+    );
+    assert!(
+        dumped.contains("Pull Request Commands"),
+        "expected the Pull Request Commands heading: {dumped}"
+    );
+    // The PR command buttons render their short labels.
+    assert!(
+        dumped.contains("Merge"),
+        "expected a Merge button: {dumped}"
+    );
+    assert!(
+        dumped.contains("Close"),
+        "expected a Close button: {dumped}"
+    );
 }
 
 #[test]
@@ -1110,12 +1196,12 @@ fn action_menu_shows_merge_option_for_open_pr_row() {
         row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Open),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        dumped.contains("Merge Pull Request"),
-        "expected `Merge Pull Request` for an Open PR row: {dumped}"
+        labels.iter().any(|l| l == "Merge"),
+        "expected `Merge` button for an Open PR row: {labels:?}"
     );
-    assert!(dumped.contains("Open Pull Request"));
+    assert!(labels.iter().any(|l| l == "Open"));
 }
 
 #[test]
@@ -1133,13 +1219,13 @@ fn action_menu_hides_merge_option_for_merged_pr_row() {
         row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Merged),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        !dumped.contains("Merge Pull Request"),
-        "Merge Pull Request must not appear for a Merged PR row: {dumped}"
+        !labels.iter().any(|l| l == "Merge"),
+        "Merge must not appear for a Merged PR row: {labels:?}"
     );
-    // Already-merged PRs should still expose the `Open Pull Request` link.
-    assert!(dumped.contains("Open Pull Request"));
+    // Already-merged PRs should still expose the `Open` button.
+    assert!(labels.iter().any(|l| l == "Open"));
 }
 
 #[test]
@@ -1157,8 +1243,8 @@ fn action_menu_hides_merge_option_for_closed_pr_row() {
         row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Closed),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Merge Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Merge"));
 }
 
 #[test]
@@ -1176,8 +1262,84 @@ fn action_menu_hides_merge_option_for_draft_pr_row() {
         row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Draft),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Merge Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Merge"));
+}
+
+#[test]
+fn action_menu_shows_pr_commands_for_draft_pr_row() {
+    // A draft-PR worktree must expose the same Pull Request Commands as an
+    // open one — Open, Fill, Push (ahead-not-behind), Close — with Merge
+    // the only omission (GitHub won't merge a draft).
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        // The "bug" row helper is ahead 1 / behind 0, so Push is offered.
+        row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Draft),
+    ]);
+
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        labels.iter().any(|l| l == "Open"),
+        "draft PR should expose Open: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "Fill"),
+        "draft PR should expose Fill: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "Push"),
+        "draft PR ahead of its base should expose Push: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "Close"),
+        "draft PR should expose Close: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l == "Merge"),
+        "draft PR must not expose Merge: {labels:?}"
+    );
+}
+
+#[test]
+fn bulk_delete_drafted_targets_only_draft_pr_rows() {
+    // The "Drafted" bulk-delete button must collect exactly the draft-PR
+    // worktrees (never the mother, an open PR, or anything else).
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        row_with_pr_state("/tmp/repo-draft", "draft", true, PrState::Draft),
+        row_with_pr_state("/tmp/repo-open", "open", false, PrState::Open),
+    ]);
+
+    // Tab moves focus from the table onto the buttons (landing on the first,
+    // Merged); Right then steps Merged → Closed → Drafted.
+    screen.handle_key(key(KeyCode::Tab));
+    screen.handle_key(key(KeyCode::Right));
+    screen.handle_key(key(KeyCode::Right));
+    let action = screen.handle_key(key(KeyCode::Enter));
+
+    match action {
+        DashboardAction::BulkDelete(status, paths) => {
+            assert_eq!(status, BulkDeleteStatus::Drafted);
+            assert_eq!(paths, vec!["/tmp/repo-draft".to_string()]);
+        }
+        other => panic!("expected BulkDelete(Drafted, …), got {other:?}"),
+    }
 }
 
 #[test]
@@ -1195,9 +1357,9 @@ fn action_menu_hides_merge_option_when_no_pr_present() {
         row("/tmp/repo-bug", "bug", false),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Merge Pull Request"));
-    assert!(!dumped.contains("Open Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Merge"));
+    assert!(!labels.iter().any(|l| l == "Open"));
 }
 
 // ---- "Update Pull Request" visibility ----------------------------------
@@ -1241,10 +1403,10 @@ fn action_menu_shows_update_option_for_open_pr_behind_via_branch_status() {
         behind_row_via_branch_status("/tmp/repo-bug", "bug"),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        dumped.contains("Update Pull Request"),
-        "expected `Update Pull Request` for Open+behind row: {dumped}"
+        labels.iter().any(|l| l == "Update"),
+        "expected `Update` button for Open+behind row: {labels:?}"
     );
 }
 
@@ -1263,10 +1425,10 @@ fn action_menu_shows_update_option_for_open_pr_behind_via_merge_status() {
         behind_row_via_merge_status("/tmp/repo-bug", "bug"),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        dumped.contains("Update Pull Request"),
-        "expected `Update Pull Request` when merge_status==Behind: {dumped}"
+        labels.iter().any(|l| l == "Update"),
+        "expected `Update` button when merge_status==Behind: {labels:?}"
     );
 }
 
@@ -1287,13 +1449,13 @@ fn action_menu_hides_update_option_for_open_pr_when_up_to_date() {
         row_with_pr_state("/tmp/repo-bug", "bug", true, PrState::Open),
     ]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let labels = open_action_menu_for_second_row(&mut screen);
     assert!(
-        !dumped.contains("Update Pull Request"),
-        "Update Pull Request must hide when branch is up to date: {dumped}"
+        !labels.iter().any(|l| l == "Update"),
+        "Update must hide when branch is up to date: {labels:?}"
     );
-    // Merge Pull Request must still appear (Open and up to date is fine to merge).
-    assert!(dumped.contains("Merge Pull Request"));
+    // Merge must still appear (Open and up to date is fine to merge).
+    assert!(labels.iter().any(|l| l == "Merge"));
 }
 
 #[test]
@@ -1312,8 +1474,8 @@ fn action_menu_hides_update_option_for_merged_pr_even_if_behind() {
     }
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_merged]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Update Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Update"));
 }
 
 #[test]
@@ -1332,12 +1494,14 @@ fn action_menu_hides_update_option_for_closed_pr() {
     }
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_closed]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Update Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Update"));
 }
 
 #[test]
-fn action_menu_hides_update_option_for_draft_pr() {
+fn action_menu_shows_update_option_for_draft_pr_behind() {
+    // A draft PR is a live PR, so it shares the Open PR's lifecycle
+    // commands — including Update when the branch is behind its base.
     let mut screen = DashboardScreen::new(
         true,
         true,
@@ -1352,8 +1516,11 @@ fn action_menu_hides_update_option_for_draft_pr() {
     }
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_draft]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Update Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(
+        labels.iter().any(|l| l == "Update"),
+        "expected `Update` button for a behind draft PR row: {labels:?}"
+    );
 }
 
 #[test]
@@ -1376,22 +1543,18 @@ fn action_menu_hides_update_option_when_no_pr_present() {
     });
     screen.set_rows(vec![row("/tmp/repo", "main", true), behind_no_pr]);
 
-    let dumped = open_action_menu_for_second_row(&mut screen);
-    assert!(!dumped.contains("Update Pull Request"));
+    let labels = open_action_menu_for_second_row(&mut screen);
+    assert!(!labels.iter().any(|l| l == "Update"));
 }
 
 // ---- "Update branch (locally)" visibility -------------------------------
-// Every worktree exposes "Update branch (locally)" — the mother pulls the
-// upstream tip into itself, derived worktrees catch up with the base branch
-// they were created from. Unlike "Update Pull Request" it never pushes.
+// Every worktree exposes "Update branch (locally)" in its General Commands
+// list — the mother pulls the upstream tip into itself, derived worktrees
+// catch up with the base branch they were created from. Unlike "Update Pull
+// Request" it never pushes. The labels are read straight off the screen
+// (not the rendered viewport, which scrolls when PR commands are present).
 
-fn open_action_menu_for_first_row(screen: &mut DashboardScreen) -> String {
-    screen.handle_key(key(KeyCode::Enter));
-    dump(120, 14, |f| screen.render(f, f.area()))
-}
-
-#[test]
-fn action_menu_shows_update_branch_on_mother_row() {
+fn update_branch_screen() -> DashboardScreen {
     let mut screen = DashboardScreen::new(
         true,
         true,
@@ -1404,32 +1567,28 @@ fn action_menu_shows_update_branch_on_mother_row() {
         row("/tmp/repo", "main", true),
         row("/tmp/repo-bug", "bug", true),
     ]);
+    screen
+}
 
-    let dumped = open_action_menu_for_first_row(&mut screen);
+#[test]
+fn action_menu_shows_update_branch_on_mother_row() {
+    let mut screen = update_branch_screen();
+    screen.handle_key(key(KeyCode::Enter));
+    let labels = screen.general_command_labels();
     assert!(
-        dumped.contains("Update branch (locally)"),
-        "expected `Update branch (locally)` on mother row: {dumped}"
+        labels.contains(&"Update branch (locally)".to_string()),
+        "expected `Update branch (locally)` on mother row: {labels:?}"
     );
 }
 
 #[test]
 fn action_menu_shows_update_branch_on_non_main_row() {
-    let mut screen = DashboardScreen::new(
-        true,
-        true,
-        true,
-        vec!["branch".into(), "status".into()],
-        Vec::new(),
-        false,
-    );
-    screen.set_rows(vec![
-        row("/tmp/repo", "main", true),
-        row("/tmp/repo-bug", "bug", true),
-    ]);
-
-    let dumped = open_action_menu_for_second_row(&mut screen);
+    let mut screen = update_branch_screen();
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Enter));
+    let labels = screen.general_command_labels();
     assert!(
-        dumped.contains("Update branch (locally)"),
-        "expected `Update branch (locally)` on non-main row: {dumped}"
+        labels.contains(&"Update branch (locally)".to_string()),
+        "expected `Update branch (locally)` on non-main row: {labels:?}"
     );
 }

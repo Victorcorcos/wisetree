@@ -13,7 +13,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use wisetree::config::schema::DashboardConfig;
-use wisetree::services::{DashboardService, UpdatePullRequestOutcome};
+use wisetree::services::{DashboardService, UpdateBranchOutcome, UpdatePullRequestOutcome};
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -513,4 +513,170 @@ async fn pipeline_returns_push_failed_when_remote_is_unwritable() {
         UpdatePullRequestOutcome::FetchFailed(_) | UpdatePullRequestOutcome::PushFailed(_) => {}
         other => panic!("expected Fetch/Push failure, got {other:?}"),
     }
+}
+
+// -------------------------------------------------------------------------
+// "Update branch (locally)" pipeline (`update_branch`). Same fetch + merge +
+// conflict hand-off as the PR pipeline, but it resolves the base ref itself
+// and never pushes. On conflicts it hands off to opencode exactly like the
+// PR flow; the screen then commits the result locally.
+// -------------------------------------------------------------------------
+
+/// Make `feat` and `origin/main` edit the same line so the local merge of
+/// the resolved base ref conflicts.
+fn seed_local_conflict(fx: &Fixture) {
+    fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
+    git(&fx.src, &["add", "README.md"]);
+    git(&fx.src, &["commit", "-q", "-m", "feat edit"]);
+    fx.advance_main("README.md", "main side\n");
+}
+
+#[tokio::test]
+async fn update_branch_hands_off_to_ui_when_conflicts_detected_and_opencode_available() {
+    let fx = Fixture::new();
+    seed_local_conflict(&fx);
+
+    // Stub opencode exists on disk so the availability check passes; the
+    // service never invokes it (the screen owns the embedded PTY).
+    let stub = fx.write_resolved_readme_stub();
+    let service = fx.ai_service().with_opencode_binary(stub.clone());
+
+    let outcome = service
+        .update_branch(fx.src.to_str().unwrap())
+        .await
+        .expect("update_branch should succeed");
+
+    match outcome {
+        UpdateBranchOutcome::ConflictsHandedOffToUi {
+            opencode_binary,
+            opencode_args,
+            cwd,
+            model,
+            base_ref,
+            conflicts,
+        } => {
+            assert_eq!(opencode_binary, stub);
+            assert_eq!(base_ref, "origin/main");
+            assert_eq!(model, "anthropic/claude-sonnet-4-5");
+            assert_eq!(cwd, fx.src);
+            assert!(
+                conflicts.iter().any(|f| f == "README.md"),
+                "expected README.md among {conflicts:?}"
+            );
+            // Same default-TUI invocation as the PR flow: `--prompt
+            // <prompt> -m <model> <cwd>`.
+            assert_eq!(opencode_args[0], "--prompt");
+            assert!(
+                !opencode_args[1].is_empty(),
+                "merger prompt should follow --prompt"
+            );
+            assert_eq!(opencode_args[2], "-m");
+            assert_eq!(opencode_args[3], "anthropic/claude-sonnet-4-5");
+            assert!(opencode_args[4].contains(fx.src.to_str().unwrap()));
+        }
+        other => panic!("expected ConflictsHandedOffToUi, got {other:?}"),
+    }
+
+    // The merge is intentionally left mid-flight (markers in the index) so
+    // the screen can drive opencode against it.
+    let status = git_output(&fx.src, &["status", "--porcelain"]);
+    assert!(
+        status.contains("UU README.md") || status.contains("AA README.md"),
+        "expected an unmerged README.md, got: {status}"
+    );
+}
+
+#[tokio::test]
+async fn update_branch_returns_conflicts_require_ai_when_use_ai_is_blank() {
+    let fx = Fixture::new();
+    seed_local_conflict(&fx);
+
+    // use_ai blank (default config) → opencode is never consulted.
+    let service = fx.service();
+
+    let outcome = service
+        .update_branch(fx.src.to_str().unwrap())
+        .await
+        .expect("update_branch should succeed");
+
+    match outcome {
+        UpdateBranchOutcome::ConflictsRequireAi { conflicts } => {
+            assert!(
+                conflicts.iter().any(|f| f == "README.md"),
+                "expected README.md among {conflicts:?}"
+            );
+        }
+        other => panic!("expected ConflictsRequireAi, got {other:?}"),
+    }
+
+    // The merge must be aborted so the worktree is left clean.
+    let status = git_output(&fx.src, &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "expected clean tree after abort, got: {status}"
+    );
+}
+
+#[tokio::test]
+async fn update_branch_returns_ai_unavailable_when_opencode_binary_is_missing() {
+    let fx = Fixture::new();
+    seed_local_conflict(&fx);
+
+    let nope = fx.bin.join("opencode-not-here");
+    let service = fx.ai_service().with_opencode_binary(nope);
+
+    let outcome = service
+        .update_branch(fx.src.to_str().unwrap())
+        .await
+        .expect("update_branch should succeed");
+
+    match outcome {
+        UpdateBranchOutcome::AiUnavailable { conflicts } => {
+            assert!(
+                conflicts.iter().any(|f| f == "README.md"),
+                "expected README.md among {conflicts:?}"
+            );
+        }
+        other => panic!("expected AiUnavailable, got {other:?}"),
+    }
+
+    let status = git_output(&fx.src, &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "expected clean tree after abort, got: {status}"
+    );
+}
+
+#[tokio::test]
+async fn update_branch_merges_cleanly_without_pushing() {
+    let fx = Fixture::new();
+    // Advance main on a different file so the merge is conflict-free, and
+    // give feat its own commit so the merge is a real (non-fast-forward)
+    // merge commit rather than a no-op.
+    fs::write(fx.src.join("FEAT.md"), "feature\n").unwrap();
+    git(&fx.src, &["add", "FEAT.md"]);
+    git(&fx.src, &["commit", "-q", "-m", "feat work"]);
+    fx.advance_main("MAIN.md", "main doc\n");
+
+    let remote_before = git_output(&fx.src, &["rev-parse", "origin/feat"]);
+
+    let service = fx.service();
+    let outcome = service
+        .update_branch(fx.src.to_str().unwrap())
+        .await
+        .expect("update_branch should succeed");
+
+    // A clean local merge (fast-forward or merge commit) — never a push.
+    assert!(
+        matches!(
+            outcome,
+            UpdateBranchOutcome::Merged { .. } | UpdateBranchOutcome::FastForwarded { .. }
+        ),
+        "expected a clean merge outcome, got {outcome:?}"
+    );
+    // The base ref's file landed locally...
+    assert!(fx.src.join("MAIN.md").exists());
+    // ...but nothing was pushed: the remote feat tip is unchanged.
+    let remote_after = git_output(&fx.src, &["rev-parse", "origin/feat"]);
+    assert_eq!(remote_before, remote_after, "update_branch must not push");
 }

@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::files::ActivityKind;
@@ -21,8 +21,9 @@ use crate::messages::{
     CREATE_NEW_BRANCH_PLACEHOLDER, CREATE_SOURCE_BRANCH_PROMPT, CREATE_SUCCESS, LOADING_BRANCHES,
 };
 use crate::tui::widgets::{
-    branded_line, CommandListProgress, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
-    InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+    branded_line, render_summary_table, CommandListProgress, ConfirmationChoice, ConfirmationModal,
+    ConfirmationOutcome, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt,
+    Status, StatusIndicator, SummaryRow,
 };
 use crate::utils::validation::{
     normalize_branch_name, validate_branch_name, validate_directory_name, validate_source_ref,
@@ -69,35 +70,6 @@ pub enum CreateAction {
     Done,
 }
 
-/// One row in the post-create summary table. Each row represents a single
-/// action that ran as part of `git worktree add` (Copy patterns, Link
-/// patterns, or one of the user's post-create commands) along with whether
-/// it succeeded and — if it failed — what went wrong.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SummaryRow {
-    pub command: String,
-    pub success: bool,
-    pub failure: Option<String>,
-}
-
-impl SummaryRow {
-    pub fn success(command: impl Into<String>) -> Self {
-        Self {
-            command: command.into(),
-            success: true,
-            failure: None,
-        }
-    }
-
-    pub fn failure(command: impl Into<String>, failure: impl Into<String>) -> Self {
-        Self {
-            command: command.into(),
-            success: false,
-            failure: Some(failure.into()),
-        }
-    }
-}
-
 /// One line in the Terminal Activity panel: a stage banner emitted by the
 /// orchestrator ("$ Copy patterns"), or a line of stdout / stderr streamed
 /// from a post-create command. The `kind` drives the color.
@@ -117,6 +89,10 @@ pub struct CreateScreen {
     pub directory_name: String,
     pub source_branch: String,
     pub new_branch: String,
+    /// Whether `source_branch` was entered via the "custom ref" input rather
+    /// than picked from the branch list. Drives which step Esc returns to from
+    /// the new-branch page (CustomRef vs SourceBranch).
+    source_is_custom: bool,
     branches: Arc<Vec<GitBranch>>,
     error: Option<String>,
     loading: bool,
@@ -153,6 +129,11 @@ pub struct CreateScreen {
     /// at an opaque spinner.
     terminal_log: Vec<TerminalLine>,
 
+    /// Scroll offset from the bottom of `terminal_log`, in lines. `0` follows
+    /// the live tail (default); a positive value holds the view in place as
+    /// new output streams in so the user can read earlier command output.
+    terminal_scroll: u16,
+
     pub tick: usize,
 }
 
@@ -163,6 +144,7 @@ impl CreateScreen {
             directory_name: String::new(),
             source_branch: String::new(),
             new_branch: String::new(),
+            source_is_custom: false,
             branches: Arc::new(Vec::new()),
             error: None,
             loading: true,
@@ -180,6 +162,7 @@ impl CreateScreen {
             current_command_index: 0,
             summary_rows: Vec::new(),
             terminal_log: Vec::new(),
+            terminal_scroll: 0,
             tick: 0,
         }
     }
@@ -188,11 +171,35 @@ impl CreateScreen {
     /// `TERMINAL_LOG_MAX_LINES` are dropped from the front so memory and
     /// render cost stay bounded on noisy commands.
     pub fn append_terminal_line(&mut self, text: String, kind: ActivityKind) {
+        // When the user has scrolled up, keep the same lines on screen as new
+        // output arrives by tracking the growing distance from the tail.
+        if self.terminal_scroll > 0 {
+            self.terminal_scroll = self.terminal_scroll.saturating_add(1);
+        }
         self.terminal_log.push(TerminalLine { text, kind });
         if self.terminal_log.len() > TERMINAL_LOG_MAX_LINES {
             let drop = self.terminal_log.len() - TERMINAL_LOG_MAX_LINES;
             self.terminal_log.drain(0..drop);
+            // Dropping from the front shrinks how far we can scroll up.
+            self.terminal_scroll = self.terminal_scroll.saturating_sub(drop as u16);
         }
+    }
+
+    /// Scroll the Terminal Activity panel up (toward older output) by `lines`.
+    /// Over-scrolling is clamped at render time. Only meaningful while the
+    /// "Creating" panel is on screen.
+    pub fn scroll_terminal_up(&mut self, lines: u16) {
+        self.terminal_scroll = self.terminal_scroll.saturating_add(lines);
+    }
+
+    /// Scroll the Terminal Activity panel down (toward the live tail).
+    pub fn scroll_terminal_down(&mut self, lines: u16) {
+        self.terminal_scroll = self.terminal_scroll.saturating_sub(lines);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_scroll(&self) -> u16 {
+        self.terminal_scroll
     }
 
     pub fn terminal_log_len(&self) -> usize {
@@ -350,9 +357,27 @@ impl CreateScreen {
             CreateStep::NewBranch => self.handle_new_branch(key),
             CreateStep::Confirm => self.handle_confirm(key),
             CreateStep::NavigateConfirm => self.handle_navigate_confirm(key),
-            CreateStep::Creating | CreateStep::RunningCommands => CreateAction::Continue,
+            CreateStep::Creating => self.handle_creating_scroll(key),
+            CreateStep::RunningCommands => CreateAction::Continue,
             CreateStep::Success => CreateAction::Done,
         }
+    }
+
+    /// Keyboard scrolling for the "Creating" step's Terminal Activity panel.
+    /// Everything is swallowed as `Continue` — the create pipeline drives the
+    /// step transitions, so keys never advance the flow here.
+    fn handle_creating_scroll(&mut self, key: KeyEvent) -> CreateAction {
+        const PAGE: u16 = 10;
+        match key.code {
+            KeyCode::Up => self.scroll_terminal_up(1),
+            KeyCode::Down => self.scroll_terminal_down(1),
+            KeyCode::PageUp => self.scroll_terminal_up(PAGE),
+            KeyCode::PageDown => self.scroll_terminal_down(PAGE),
+            KeyCode::Home => self.scroll_terminal_up(u16::MAX),
+            KeyCode::End => self.scroll_terminal_down(u16::MAX),
+            _ => {}
+        }
+        CreateAction::Continue
     }
 
     pub fn handle_mouse_click(&mut self, position: Position) -> CreateAction {
@@ -373,6 +398,7 @@ impl CreateScreen {
                             self.step = CreateStep::CustomRef;
                         } else {
                             self.source_branch = value;
+                            self.source_is_custom = false;
                             self.new_branch.clear();
                             self.source_select = None;
                             self.new_branch_input = Some(self.build_new_branch_input());
@@ -458,6 +484,17 @@ impl CreateScreen {
             .with_footer_spacer()
     }
 
+    /// Build the source-branch picker with its cursor parked on the row whose
+    /// value matches `value` (falls back to the first row). Used when Esc
+    /// returns the user to this step so their prior pick is highlighted.
+    fn source_select_focused_on(&self, value: &str) -> SelectPrompt<String> {
+        let mut select = self.build_source_select();
+        if let Some(idx) = select.options.iter().position(|o| o.value == value) {
+            select.selected = idx;
+        }
+        select
+    }
+
     fn handle_source_branch(&mut self, key: KeyEvent) -> CreateAction {
         if self.source_select.is_none() {
             self.source_select = Some(self.build_source_select());
@@ -471,6 +508,7 @@ impl CreateScreen {
                     self.step = CreateStep::CustomRef;
                 } else {
                     self.source_branch = value;
+                    self.source_is_custom = false;
                     self.new_branch.clear();
                     self.source_select = None;
                     self.new_branch_input = Some(self.build_new_branch_input());
@@ -478,7 +516,13 @@ impl CreateScreen {
                 }
                 CreateAction::Continue
             }
-            SelectOutcome::Cancelled => CreateAction::Cancelled,
+            // Esc → back to the directory step with the typed name restored.
+            SelectOutcome::Cancelled => {
+                self.source_select = None;
+                self.directory_input = Some(directory_input_with_value(&self.directory_name));
+                self.step = CreateStep::Directory;
+                CreateAction::Continue
+            }
             SelectOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -488,13 +532,21 @@ impl CreateScreen {
         match prompt.handle_key(key) {
             InputOutcome::Submitted(value) => {
                 self.source_branch = value.trim().to_string();
+                self.source_is_custom = true;
                 self.new_branch.clear();
                 self.custom_ref_input = None;
                 self.new_branch_input = Some(self.build_new_branch_input());
                 self.step = CreateStep::NewBranch;
                 CreateAction::Continue
             }
-            InputOutcome::Cancelled => CreateAction::Cancelled,
+            // Esc → back to the source-branch picker, re-focused on the
+            // custom-ref row the user came from.
+            InputOutcome::Cancelled => {
+                self.custom_ref_input = None;
+                self.source_select = Some(self.source_select_focused_on(CUSTOM_REF_VALUE));
+                self.step = CreateStep::SourceBranch;
+                CreateAction::Continue
+            }
             InputOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -539,7 +591,18 @@ impl CreateScreen {
                 self.step = CreateStep::Confirm;
                 CreateAction::Continue
             }
-            InputOutcome::Cancelled => CreateAction::Cancelled,
+            // Esc → back to whichever source step we came from, restoring it.
+            InputOutcome::Cancelled => {
+                self.new_branch_input = None;
+                if self.source_is_custom {
+                    self.custom_ref_input = Some(custom_ref_input_with_value(&self.source_branch));
+                    self.step = CreateStep::CustomRef;
+                } else {
+                    self.source_select = Some(self.source_select_focused_on(&self.source_branch));
+                    self.step = CreateStep::SourceBranch;
+                }
+                CreateAction::Continue
+            }
             InputOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -577,9 +640,14 @@ impl CreateScreen {
                 self.step = CreateStep::NavigateConfirm;
                 CreateAction::Continue
             }
-            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
-                CreateAction::Cancelled
+            // Esc → back to the new-branch step (its input is still populated).
+            ConfirmationOutcome::Cancelled => {
+                self.confirm_dialog = None;
+                self.step = CreateStep::NewBranch;
+                CreateAction::Continue
             }
+            // Explicit "Cancel" button → leave the whole create flow.
+            ConfirmationOutcome::Declined => CreateAction::Cancelled,
             ConfirmationOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -609,7 +677,13 @@ impl CreateScreen {
                     new_branch: self.new_branch.clone(),
                 }
             }
-            ConfirmationOutcome::Cancelled => CreateAction::Cancelled,
+            // Esc → back to the create-confirmation modal.
+            ConfirmationOutcome::Cancelled => {
+                self.navigate_dialog = None;
+                self.confirm_dialog = Some(self.build_confirm());
+                self.step = CreateStep::Confirm;
+                CreateAction::Continue
+            }
             ConfirmationOutcome::Pending => CreateAction::Continue,
         }
     }
@@ -743,7 +817,12 @@ impl CreateScreen {
                 StatusIndicator::new(Status::Loading, CREATE_CREATING)
                     .with_tick(self.tick)
                     .render(frame, chunks[0]);
-                render_terminal_activity(&self.terminal_log, frame, chunks[1]);
+                render_terminal_activity(
+                    &self.terminal_log,
+                    self.terminal_scroll,
+                    frame,
+                    chunks[1],
+                );
             }
             CreateStep::RunningCommands => {
                 CommandListProgress::new(&self.post_create_commands, self.current_command_index)
@@ -835,6 +914,12 @@ fn directory_input() -> InputPrompt {
         .with_validator(|v| validate_directory_name(v).map(|e| e.to_string()))
 }
 
+/// Directory input pre-filled with `value`, for restoring the typed name when
+/// Esc returns the user to the directory step.
+fn directory_input_with_value(value: &str) -> InputPrompt {
+    directory_input().with_default(value.to_string())
+}
+
 fn custom_ref_input() -> InputPrompt {
     InputPrompt::new("Enter a branch name, tag, or commit SHA:")
         .with_placeholder("origin/feature/foo, v1.0.0, abc123f")
@@ -846,6 +931,12 @@ fn custom_ref_input() -> InputPrompt {
         })
 }
 
+/// Custom-ref input pre-filled with `value`, for restoring the typed ref when
+/// Esc returns the user to the custom-ref step.
+fn custom_ref_input_with_value(value: &str) -> InputPrompt {
+    custom_ref_input().with_default(value.to_string())
+}
+
 fn build_navigate_confirm() -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title(CREATE_NAVIGATE_TITLE)
@@ -855,87 +946,17 @@ fn build_navigate_confirm() -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Confirm)
 }
 
-fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) {
-    let header = Row::new(vec![
-        Cell::from("Command"),
-        Cell::from("Status"),
-        Cell::from("Failure"),
-    ])
-    .style(
-        Style::default()
-            .fg(colors::INFO)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    let table_rows: Vec<Row> = rows
-        .iter()
-        .map(|r| {
-            let (status_symbol, status_color) = if r.success {
-                ("✅", colors::SUCCESS)
-            } else {
-                ("❌", colors::ERROR)
-            };
-            let status_cell = Cell::from(Line::from(Span::styled(
-                status_symbol,
-                Style::default().fg(status_color),
-            )));
-            let (failure_text, failure_style) = match &r.failure {
-                Some(reason) => (truncate_failure(reason), Style::default().fg(colors::ERROR)),
-                None => ("None".to_string(), Style::default().fg(colors::MUTED)),
-            };
-            Row::new(vec![
-                Cell::from(r.command.clone()).style(Style::default().fg(colors::EMPHASIS)),
-                status_cell,
-                Cell::from(failure_text).style(failure_style),
-            ])
-        })
-        .collect();
-
-    let widths = [
-        Constraint::Percentage(40),
-        Constraint::Length(8),
-        Constraint::Min(10),
-    ];
-
-    let table = Table::new(table_rows, widths)
-        .header(header)
-        .column_spacing(2)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(colors::MUTED)),
-        );
-
-    frame.render_widget(table, area);
-}
-
-/// Keep failure cells to a single line of readable text. Joins multi-line
-/// stderr on spaces and adds an ellipsis when truncated so the table never
-/// expands vertically beyond one row per action.
-fn truncate_failure(text: &str) -> String {
-    let compact = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let trimmed = compact.trim();
-    let limit = 120;
-    if trimmed.chars().count() > limit {
-        let head: String = trimmed.chars().take(limit).collect();
-        format!("{head}…")
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// Render the live "Terminal Activity" panel under the Creating spinner.
 /// Mirrors the AI Activity panel's visual treatment (rounded border, bold
 /// title) but uses TEAL instead of orange to distinguish "background
 /// commands running" from "AI working on conflicts". Auto-tails the log so
 /// the most recent line is always visible.
-fn render_terminal_activity(log: &[TerminalLine], frame: &mut Frame, area: Rect) {
+pub(crate) fn render_terminal_activity(
+    log: &[TerminalLine],
+    scroll: u16,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let border_style = Style::default().fg(colors::TEAL);
     let title = Line::from(vec![
         Span::raw(" "),
@@ -970,8 +991,13 @@ fn render_terminal_activity(log: &[TerminalLine], frame: &mut Frame, area: Rect)
     }
 
     let visible_rows = inner.height as usize;
-    let start = log.len().saturating_sub(visible_rows);
-    let lines: Vec<Line<'static>> = log[start..]
+    // `scroll` is lines-from-the-tail; clamp it to the available history so
+    // over-scrolling (Home / wheel spam) parks cleanly at the oldest line.
+    let max_scroll = log.len().saturating_sub(visible_rows);
+    let scroll = (scroll as usize).min(max_scroll);
+    let end = log.len() - scroll;
+    let start = end.saturating_sub(visible_rows);
+    let lines: Vec<Line<'static>> = log[start..end]
         .iter()
         .map(|line| {
             let style = match line.kind {
@@ -984,5 +1010,75 @@ fn render_terminal_activity(log: &[TerminalLine], frame: &mut Frame, area: Rect)
             Line::from(Span::styled(line.text.clone(), style))
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+
+    // Reserve the rightmost column for the scrollbar when there's overflow so
+    // the thumb never paints over the last character of a line.
+    let has_overflow = max_scroll > 0;
+    let text_area = if has_overflow {
+        Rect {
+            width: inner.width.saturating_sub(1),
+            ..inner
+        }
+    } else {
+        inner
+    };
+    frame.render_widget(Paragraph::new(lines), text_area);
+    if has_overflow {
+        crate::tui::widgets::render_vertical_scrollbar(frame, inner, max_scroll, scroll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen_with_log(lines: usize) -> CreateScreen {
+        let mut screen = CreateScreen::new();
+        for i in 0..lines {
+            screen.append_terminal_line(format!("line {i}"), ActivityKind::Stdout);
+        }
+        screen
+    }
+
+    #[test]
+    fn terminal_starts_pinned_to_the_tail() {
+        let screen = screen_with_log(100);
+        assert_eq!(screen.terminal_scroll(), 0);
+    }
+
+    #[test]
+    fn scrolling_up_then_down_moves_the_offset() {
+        let mut screen = screen_with_log(100);
+        screen.scroll_terminal_up(5);
+        assert_eq!(screen.terminal_scroll(), 5);
+        screen.scroll_terminal_down(2);
+        assert_eq!(screen.terminal_scroll(), 3);
+        // Over-scrolling down clamps back to the live tail.
+        screen.scroll_terminal_down(99);
+        assert_eq!(screen.terminal_scroll(), 0);
+    }
+
+    #[test]
+    fn appending_while_scrolled_up_keeps_the_view_in_place() {
+        let mut screen = screen_with_log(50);
+        screen.scroll_terminal_up(10);
+        assert_eq!(screen.terminal_scroll(), 10);
+        // Each new streamed line grows the distance from the tail by one so the
+        // same content stays on screen instead of scrolling away.
+        screen.append_terminal_line("new".to_string(), ActivityKind::Stdout);
+        screen.append_terminal_line("new".to_string(), ActivityKind::Stdout);
+        assert_eq!(screen.terminal_scroll(), 12);
+    }
+
+    #[test]
+    fn appending_at_the_tail_keeps_following_the_tail() {
+        let mut screen = screen_with_log(50);
+        assert_eq!(screen.terminal_scroll(), 0);
+        screen.append_terminal_line("new".to_string(), ActivityKind::Stdout);
+        assert_eq!(
+            screen.terminal_scroll(),
+            0,
+            "tail-following must not start scrolling"
+        );
+    }
 }

@@ -23,20 +23,21 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
-    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, PtyView, Status, StatusIndicator,
+    render_summary_table, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, PtyView,
+    Status, StatusIndicator, SummaryRow,
 };
 
 const UPDATE_LOADING_MESSAGE: &str = "Resolving base ref...";
 const UPDATE_RUNNING_MESSAGE: &str = "Updating pull request...";
+const UPDATE_PUSH_FAILED_MESSAGE: &str =
+    "Push failed — fix it in the terminal, then Accept to retry";
 
 /// Hard cap on the number of AI activity lines retained in memory. A
 /// long opencode run can emit thousands of rows (tool calls, file edits,
@@ -56,12 +57,25 @@ pub enum UpdateStep {
     Loading,
     Confirm,
     Updating,
+    /// Commit + push of the AI-resolved merge runs in a live PTY so the user
+    /// sees git hooks, push progress, and any errors in real time. Transitions
+    /// to a done summary once the child exits.
+    CommitPush,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiButton {
     Complete,
     Cancel,
+}
+
+/// Focused button in the Terminal Activity recovery panel's decision row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermButton {
+    /// Re-attempt `git push origin HEAD` and report the real outcome.
+    Accept,
+    /// Leave the terminal without re-pushing; back to the dashboard.
+    Discard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +87,11 @@ pub enum UpdateAction {
     AiComplete,
     /// User pressed `Cancel` after the AI finished — abort merge.
     AiCancel,
+    /// User accepted in the Terminal Activity recovery panel — re-run
+    /// `git push origin HEAD` and report success/failure.
+    TerminalAccept,
+    /// User left the Terminal Activity recovery panel without re-pushing.
+    TerminalDiscard,
 }
 
 pub struct UpdatePullRequestScreen {
@@ -118,10 +137,40 @@ pub struct UpdatePullRequestScreen {
     /// Activity panel). The embedded opencode PTY keeps running
     /// underneath either way because `App::tick_pty` ticks every frame.
     finalize_confirm: Option<ConfirmationModal>,
+    /// `true` when this screen drives a *push-only* flow (the dashboard's
+    /// "Push Pull Request" action) instead of the full fetch/merge/push
+    /// update. Changes the confirm prompt + steps preview and routes the
+    /// App to `kick_off_push_pull_request` on confirmation.
+    push_only: bool,
+    /// `true` when this screen drives the dashboard's "Update branch
+    /// (locally)" conflict tail rather than a pull-request update. The
+    /// fetch/merge already happened behind the dashboard splash; this
+    /// screen only hosts the opencode resolution + a local `git commit`
+    /// (no push). Drives "push"-free wording on the commit + done pages.
+    local_only: bool,
+    /// `true` once a `git push` failed and the screen handed off to the
+    /// interactive recovery shell. Drives the "Terminal Activity" panel:
+    /// the embedded `pty` hosts the user's shell, and the Accept/Discard
+    /// button row is always available (no child-exit gating, unlike AI).
+    terminal_active: bool,
+    /// Currently focused button in the Accept/Discard pair while the
+    /// Terminal Activity panel is open.
+    terminal_button: TermButton,
+    /// The `git push` failure that opened the Terminal Activity panel,
+    /// shown as a one-line header above the shell so the user sees why
+    /// they were dropped into the terminal.
+    terminal_error: String,
     error: Option<String>,
     step: UpdateStep,
     ai_button_rects: Cell<[Rect; 2]>,
+    terminal_button_rects: Cell<[Rect; 2]>,
     pub tick: usize,
+    /// `true` once the commit+push PTY child has exited.
+    commit_push_done: bool,
+    /// `true` when the commit+push shell exited with code 0.
+    commit_push_succeeded: bool,
+    /// Summary rows shown on the done page (one row: overall commit+push result).
+    commit_push_summary: Vec<SummaryRow>,
 }
 
 impl UpdatePullRequestScreen {
@@ -131,7 +180,7 @@ impl UpdatePullRequestScreen {
         // Confirm. Otherwise show a loading spinner until `set_base_ref`
         // fires.
         let (confirm, step) = if request.base_ref.is_some() {
-            (Some(build_confirm(&request)), UpdateStep::Confirm)
+            (Some(build_confirm(&request, false)), UpdateStep::Confirm)
         } else {
             (None, UpdateStep::Loading)
         };
@@ -147,15 +196,66 @@ impl UpdatePullRequestScreen {
             pty: None,
             pty_focused: false,
             finalize_confirm: None,
+            push_only: false,
+            local_only: false,
+            terminal_active: false,
+            terminal_button: TermButton::Accept,
+            terminal_error: String::new(),
             error: None,
             step,
             ai_button_rects: Cell::new([Rect::default(); 2]),
+            terminal_button_rects: Cell::new([Rect::default(); 2]),
             tick: 0,
+            commit_push_done: false,
+            commit_push_succeeded: false,
+            commit_push_summary: Vec::new(),
+        }
+    }
+
+    /// Construct the screen for the push-only flow (dashboard "Push Pull
+    /// Request" action). A push needs no base ref, so we land straight on
+    /// the Confirm step regardless of whether `base_ref` was populated.
+    pub fn new_push(request: UpdatePullRequestRequest) -> Self {
+        let confirm = build_confirm(&request, true);
+        Self {
+            push_only: true,
+            confirm: Some(confirm),
+            step: UpdateStep::Confirm,
+            ..Self::new(request)
+        }
+    }
+
+    /// Construct the screen for the "Update branch (locally)" conflict
+    /// tail. The dashboard already ran fetch + merge and hit conflicts, so
+    /// we skip Loading/Confirm and land directly on the `Updating` step
+    /// with the AI panel active. The caller spawns the opencode PTY via
+    /// `spawn_opencode_pty` right after constructing. Finishing commits the
+    /// merge locally (no push).
+    pub fn new_local_conflict(request: UpdatePullRequestRequest) -> Self {
+        Self {
+            local_only: true,
+            step: UpdateStep::Updating,
+            ai_active: true,
+            ..Self::new(request)
         }
     }
 
     pub fn request(&self) -> &UpdatePullRequestRequest {
         &self.request
+    }
+
+    pub fn is_push_only(&self) -> bool {
+        self.push_only
+    }
+
+    /// `true` when this screen is resolving conflicts for a local branch
+    /// update (commit, no push) rather than a pull-request update.
+    pub fn local_only(&self) -> bool {
+        self.local_only
+    }
+
+    pub fn terminal_active(&self) -> bool {
+        self.terminal_active
     }
 
     pub fn step(&self) -> UpdateStep {
@@ -171,7 +271,7 @@ impl UpdatePullRequestScreen {
     /// the `Confirm` step.
     pub fn set_base_ref(&mut self, base_ref: String) {
         self.request.base_ref = Some(base_ref);
-        self.confirm = Some(build_confirm(&self.request));
+        self.confirm = Some(build_confirm(&self.request, self.push_only));
         self.error = None;
         self.step = UpdateStep::Confirm;
     }
@@ -193,6 +293,48 @@ impl UpdatePullRequestScreen {
         self.pty = None;
         self.pty_focused = false;
         self.finalize_confirm = None;
+        self.terminal_active = false;
+        self.terminal_button = TermButton::Accept;
+        self.terminal_error.clear();
+    }
+
+    /// Hand off to the interactive recovery shell after a `git push`
+    /// failure. Spawns the user's shell inside the embedded PTY (rooted at
+    /// the worktree), seeds it with the failing `git push origin HEAD` so
+    /// the panel reproduces the error live, and flips into the Terminal
+    /// Activity layout. From here the user can run any command, then
+    /// Accept (re-push) or Discard (leave). A spawn failure leaves the
+    /// panel up with the error header so the user still sees what went
+    /// wrong (and can Discard back to the dashboard).
+    pub fn start_terminal_recovery(
+        &mut self,
+        shell: PathBuf,
+        args: Vec<String>,
+        cwd: PathBuf,
+        error: String,
+    ) {
+        self.step = UpdateStep::Updating;
+        self.ai_active = false;
+        self.ai_done = false;
+        self.terminal_active = true;
+        self.terminal_button = TermButton::Accept;
+        self.terminal_error = error;
+        self.pty_focused = false;
+        self.phase_message = UPDATE_PUSH_FAILED_MESSAGE.to_string();
+        match PtyView::spawn(&shell, &args, Some(&cwd), &[]) {
+            Ok(mut pty) => {
+                // Reproduce the failing push in the panel so the user lands
+                // on the real error, then leaves them at a live prompt.
+                pty.send_input(b"git push origin HEAD\r");
+                self.pty = Some(pty);
+            }
+            Err(err) => {
+                self.pty = None;
+                if self.terminal_error.is_empty() {
+                    self.terminal_error = format!("Could not spawn shell: {err}");
+                }
+            }
+        }
     }
 
     /// Spawn the opencode subprocess inside an embedded PTY and route
@@ -238,6 +380,21 @@ impl UpdatePullRequestScreen {
             pty.resize(rows, cols);
         }
         if pty.poll_exited() {
+            // Commit+push shell finished — record the exit code and flip
+            // into the done summary view.
+            if matches!(self.step, UpdateStep::CommitPush) {
+                let code = pty.exit_code();
+                self.mark_commit_push_done(code);
+                return true;
+            }
+            // In the Terminal Activity recovery flow the user may type
+            // `exit`, killing the shell. That is *not* the AI-done signal —
+            // the Accept/Discard buttons are already on screen, so we just
+            // release inner focus and leave the rest of the panel intact.
+            if self.terminal_active {
+                self.pty_focused = false;
+                return true;
+            }
             self.mark_ai_done();
             return true;
         }
@@ -276,6 +433,14 @@ impl UpdatePullRequestScreen {
         self.pty_focused
     }
 
+    /// Whether the embedded opencode subprocess/PTY is currently alive. The
+    /// App watches this to force a full terminal repaint once the PTY tears
+    /// down, preventing stale scrollback from bleeding into static regions
+    /// under the inline `Viewport::Fixed` renderer.
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn ai_done(&self) -> bool {
         self.ai_done
@@ -286,8 +451,96 @@ impl UpdatePullRequestScreen {
         self.ai_button
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminal_button(&self) -> TermButton {
+        self.terminal_button
+    }
+
+    /// Flip the screen into Terminal Activity mode without spawning a real
+    /// shell, so the outer-focus key/button logic can be exercised
+    /// deterministically in tests.
+    #[cfg(test)]
+    pub(crate) fn enter_terminal_mode_for_test(&mut self) {
+        self.step = UpdateStep::Updating;
+        self.ai_active = false;
+        self.ai_done = false;
+        self.terminal_active = true;
+        self.terminal_button = TermButton::Accept;
+        self.terminal_error = "remote rejected the push".to_string();
+        self.pty = None;
+        self.pty_focused = false;
+    }
+
     pub fn is_updating(&self) -> bool {
         matches!(self.step, UpdateStep::Updating)
+    }
+
+    /// `true` while the commit+push PTY is running (before the child exits).
+    /// Used by `App` to decide whether to give the panel full-screen height.
+    pub fn commit_push_running(&self) -> bool {
+        matches!(self.step, UpdateStep::CommitPush) && !self.commit_push_done
+    }
+
+    /// Spawn a shell that runs `git add -A && git commit && git push` inside a
+    /// live PTY so the user sees all output (hooks, progress, errors) in real
+    /// time. `shell` + `shell_args` are the login-shell wrapper produced by
+    /// `login_shell_command`; `cwd` is the worktree; `env` carries at minimum
+    /// `COMMIT_MSG` so the script never needs to escape the message.
+    pub fn start_commit_push_pty(
+        &mut self,
+        shell: PathBuf,
+        shell_args: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<(String, String)>,
+    ) {
+        self.step = UpdateStep::CommitPush;
+        self.commit_push_done = false;
+        self.commit_push_succeeded = false;
+        self.commit_push_summary = Vec::new();
+        // The AI phase is over; clear the flag so the Cancelled handler in
+        // `App` does not try to abort a merge that is already committed.
+        self.ai_active = false;
+        self.pty_focused = false;
+        match PtyView::spawn(&shell, &shell_args, Some(&cwd), &env) {
+            Ok(pty) => {
+                self.pty = Some(pty);
+            }
+            Err(err) => {
+                self.pty = None;
+                self.commit_push_summary = vec![SummaryRow::failure(
+                    self.commit_action_label(),
+                    format!("Could not spawn shell: {err}"),
+                )];
+                self.commit_push_done = true;
+            }
+        }
+    }
+
+    /// Summary-row label for the finalize step. Drops "Push" for local
+    /// branch updates, which commit but never push.
+    fn commit_action_label(&self) -> &'static str {
+        if self.local_only {
+            "Commit AI resolution"
+        } else {
+            "Commit & Push AI resolution"
+        }
+    }
+
+    /// Called by `tick_pty` once the commit (+ push) child exits. Builds the
+    /// one-row summary table and flips into the done view.
+    fn mark_commit_push_done(&mut self, exit_code: Option<i32>) {
+        let succeeded = exit_code == Some(0);
+        self.commit_push_succeeded = succeeded;
+        self.commit_push_summary = if succeeded {
+            vec![SummaryRow::success(self.commit_action_label())]
+        } else {
+            vec![SummaryRow::failure(
+                self.commit_action_label(),
+                "See terminal output above",
+            )]
+        };
+        self.commit_push_done = true;
+        self.pty_focused = false;
     }
 
     /// Update the spinner label during `Updating` so the user knows what
@@ -359,27 +612,46 @@ impl UpdatePullRequestScreen {
     /// scroll binding. Without a PTY we fall back to the structured-event
     /// log offset.
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
-        if !matches!(self.step, UpdateStep::Updating) || !self.ai_active {
+        let scrollable = (matches!(self.step, UpdateStep::Updating)
+            && (self.ai_active || self.terminal_active))
+            || (matches!(self.step, UpdateStep::CommitPush) && !self.commit_push_done);
+        if !scrollable {
             return false;
         }
+        // The commit+push shell and the terminal-recovery shell both run on
+        // the main vt100 screen (not alt-screen), so scroll the vt100 buffer
+        // directly. The opencode PTY uses alt-screen, so we forward PageUp as
+        // a keystroke and opencode handles its own scroll.
+        let use_direct_scroll = self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
         if let Some(pty) = self.pty.as_mut() {
-            pty.send_input(PTY_PAGE_UP);
-        } else {
+            if use_direct_scroll {
+                pty.scroll_up(lines);
+            } else {
+                pty.send_input(PTY_PAGE_UP);
+            }
+        } else if matches!(self.step, UpdateStep::Updating) {
             self.ai_scroll = self.ai_scroll.saturating_add(lines);
         }
         true
     }
 
-    /// Scroll the AI Activity panel down by `lines`. The render path
-    /// clamps against the content height every frame, so over-scrolling is
-    /// safe here.
+    /// Scroll the panel down by `lines`. The render path clamps against the
+    /// content height every frame, so over-scrolling is safe here.
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
-        if !matches!(self.step, UpdateStep::Updating) || !self.ai_active {
+        let scrollable = (matches!(self.step, UpdateStep::Updating)
+            && (self.ai_active || self.terminal_active))
+            || (matches!(self.step, UpdateStep::CommitPush) && !self.commit_push_done);
+        if !scrollable {
             return false;
         }
+        let use_direct_scroll = self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
         if let Some(pty) = self.pty.as_mut() {
-            pty.send_input(PTY_PAGE_DOWN);
-        } else {
+            if use_direct_scroll {
+                pty.scroll_down(lines);
+            } else {
+                pty.send_input(PTY_PAGE_DOWN);
+            }
+        } else if matches!(self.step, UpdateStep::Updating) {
             self.ai_scroll = self.ai_scroll.saturating_sub(lines);
         }
         true
@@ -401,7 +673,10 @@ impl UpdatePullRequestScreen {
     /// Handle scroll-only keys when the outer (Wisetree) terminal owns
     /// focus. Returns true when the key was consumed as a scroll action.
     fn handle_outer_scroll_key(&mut self, key: &KeyEvent) -> bool {
-        if !self.ai_active {
+        let scrollable = self.ai_active
+            || self.terminal_active
+            || (matches!(self.step, UpdateStep::CommitPush) && !self.commit_push_done);
+        if !scrollable {
             return false;
         }
         match key.code {
@@ -465,6 +740,45 @@ impl UpdatePullRequestScreen {
         self.finalize_confirm.as_ref().map(|m| m.selected())
     }
 
+    /// Keyboard handling while the Terminal Activity recovery panel owns the
+    /// screen. Mirrors the AI panel's split-focus model: Tab toggles between
+    /// the outer Wisetree TUI and the inner shell; inner focus forwards every
+    /// keystroke to the shell. With outer focus, ←/→ switch Accept/Discard,
+    /// the scroll keys page the shell's scrollback, Enter acts on the focused
+    /// button, and Esc discards.
+    fn handle_terminal_key(&mut self, key: KeyEvent) -> UpdateAction {
+        if self.pty.is_some() && matches!(key.code, KeyCode::Tab) {
+            self.pty_focused = !self.pty_focused;
+            return UpdateAction::Continue;
+        }
+        if self.pty_focused {
+            if let Some(pty) = self.pty.as_mut() {
+                if let Some(bytes) = key_event_to_pty_bytes(&key) {
+                    pty.send_input(&bytes);
+                }
+            }
+            return UpdateAction::Continue;
+        }
+        if self.handle_outer_scroll_key(&key) {
+            return UpdateAction::Continue;
+        }
+        match key.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::BackTab => {
+                self.terminal_button = match self.terminal_button {
+                    TermButton::Accept => TermButton::Discard,
+                    TermButton::Discard => TermButton::Accept,
+                };
+                UpdateAction::Continue
+            }
+            KeyCode::Enter => match self.terminal_button {
+                TermButton::Accept => UpdateAction::TerminalAccept,
+                TermButton::Discard => UpdateAction::TerminalDiscard,
+            },
+            KeyCode::Esc => UpdateAction::TerminalDiscard,
+            _ => UpdateAction::Continue,
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
         if self.error.is_some() {
             return UpdateAction::Cancelled;
@@ -475,7 +789,25 @@ impl UpdatePullRequestScreen {
                 _ => UpdateAction::Continue,
             };
         }
+        if matches!(self.step, UpdateStep::CommitPush) {
+            // Done: any key goes back to the dashboard.
+            if self.commit_push_done {
+                return UpdateAction::Cancelled;
+            }
+            // Running: allow scrolling the PTY, swallow everything else so
+            // the user can't accidentally navigate away mid-commit.
+            if self.handle_outer_scroll_key(&key) {
+                return UpdateAction::Continue;
+            }
+            return UpdateAction::Continue;
+        }
         if matches!(self.step, UpdateStep::Updating) {
+            // The Terminal Activity recovery panel has its own focus + button
+            // model (Accept/Discard always available, no child-exit gating),
+            // so it short-circuits the AI handling below.
+            if self.terminal_active {
+                return self.handle_terminal_key(key);
+            }
             if !self.ai_done {
                 // The finalize-confirmation modal — when open — owns all
                 // input. Tab/←/→ toggle Yes↔No, Enter commits the choice,
@@ -562,7 +894,25 @@ impl UpdatePullRequestScreen {
         if self.error.is_some() || matches!(self.step, UpdateStep::Loading) {
             return UpdateAction::Continue;
         }
+        if matches!(self.step, UpdateStep::CommitPush) {
+            if self.commit_push_done {
+                return UpdateAction::Cancelled;
+            }
+            return UpdateAction::Continue;
+        }
         if matches!(self.step, UpdateStep::Updating) {
+            if self.terminal_active {
+                let [accept_rect, discard_rect] = self.terminal_button_rects.get();
+                if contains_position(accept_rect, position) {
+                    self.terminal_button = TermButton::Accept;
+                    return UpdateAction::TerminalAccept;
+                }
+                if contains_position(discard_rect, position) {
+                    self.terminal_button = TermButton::Discard;
+                    return UpdateAction::TerminalDiscard;
+                }
+                return UpdateAction::Continue;
+            }
             if let Some(modal) = self.finalize_confirm.as_mut() {
                 return match modal.handle_mouse_click(position) {
                     ConfirmationOutcome::Pending => UpdateAction::Continue,
@@ -606,12 +956,23 @@ impl UpdatePullRequestScreen {
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
             UpdateStep::Loading => 3,
+            UpdateStep::CommitPush => {
+                if self.commit_push_done {
+                    // StatusIndicator (3) + summary table (4) + hint (1)
+                    8
+                } else {
+                    28 // full PTY panel (same as terminal_active)
+                }
+            }
             UpdateStep::Updating => {
                 // Pre-conflict phases (fetching, merging, pushing-clean)
                 // don't need the AI Activity panel — keep the panel tall
                 // only once we've flipped into AI mode so the streaming
-                // output has room to breathe.
-                if self.ai_active {
+                // output has room to breathe. The Terminal Activity recovery
+                // panel needs the same generous height (shell + buttons).
+                if self.terminal_active {
+                    28
+                } else if self.ai_active {
                     if self.ai_done {
                         29
                     } else {
@@ -633,9 +994,14 @@ impl UpdatePullRequestScreen {
     }
 
     fn detail_line_count(&self) -> usize {
-        let mut rows = 0;
-        // PR / Title / URL / Branch / Worktree / Base ref / Behind
-        rows += 7;
+        // PR / Title / URL / Branch / Worktree are always shown.
+        let mut rows = 5;
+        if self.request.base_ref.is_some() {
+            rows += 1;
+        }
+        if self.request.behind > 0 {
+            rows += 1;
+        }
         if self.request.ahead > 0 {
             rows += 1;
         }
@@ -643,8 +1009,13 @@ impl UpdatePullRequestScreen {
     }
 
     fn steps_line_count(&self) -> usize {
-        // header + 4 bullets
-        5
+        if self.push_only {
+            // header + 1 bullet
+            2
+        } else {
+            // header + 4 bullets
+            5
+        }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -678,18 +1049,23 @@ impl UpdatePullRequestScreen {
             }
             UpdateStep::Updating => self.render_updating(frame, area),
             UpdateStep::Confirm => self.render_confirm(frame, area),
+            UpdateStep::CommitPush => self.render_commit_push(frame, area),
         }
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
+        let title_verb = if self.push_only { "Push" } else { "Update" };
         let title_line = Line::from(Span::styled(
-            format!("Update Pull Request #{}?", self.request.number),
+            format!("{title_verb} Pull Request #{}?", self.request.number),
             Style::default()
                 .fg(colors::BRAND)
                 .add_modifier(Modifier::BOLD),
         ));
         let detail_lines = build_detail_lines(&self.request);
-        let steps_lines = build_steps_lines(self.request.base_ref.as_deref().unwrap_or("?"));
+        let steps_lines = build_steps_lines(
+            self.request.base_ref.as_deref().unwrap_or("?"),
+            self.push_only,
+        );
 
         let confirm_height: u16 = 12;
         let detail_height = detail_lines.len() as u16;
@@ -718,14 +1094,24 @@ impl UpdatePullRequestScreen {
     }
 }
 
-fn build_confirm(request: &UpdatePullRequestRequest) -> ConfirmationModal {
-    let base = request.base_ref.as_deref().unwrap_or("base");
-    let prompt = format!(
-        "Merge `{base}` into branch `{}` and push the update?",
-        request.branch
-    );
+fn build_confirm(request: &UpdatePullRequestRequest, push_only: bool) -> ConfirmationModal {
+    let (title, prompt) = if push_only {
+        (
+            format!("Push Pull Request #{}", request.number),
+            format!("Push branch `{}` to origin?", request.branch),
+        )
+    } else {
+        let base = request.base_ref.as_deref().unwrap_or("base");
+        (
+            format!("Update Pull Request #{}", request.number),
+            format!(
+                "Merge `{base}` into branch `{}` and push the update?",
+                request.branch
+            ),
+        )
+    };
     ConfirmationModal::new()
-        .with_title(format!("Update Pull Request #{}", request.number))
+        .with_title(title)
         .with_subtitle(prompt)
         .with_confirm_text("Yes")
         .with_cancel_text("No")
@@ -734,8 +1120,153 @@ fn build_confirm(request: &UpdatePullRequestRequest) -> ConfirmationModal {
 }
 
 impl UpdatePullRequestScreen {
+    fn render_commit_push(&mut self, frame: &mut Frame, area: Rect) {
+        if self.commit_push_done {
+            self.render_commit_push_done(frame, area);
+            return;
+        }
+        // Running: PTY panel fills the area; scroll hint sits at the bottom.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),    // Commit & Push Activity panel
+                Constraint::Length(1), // shortcuts hint
+            ])
+            .split(area);
+        self.render_commit_push_panel(frame, chunks[0]);
+        self.render_commit_push_shortcuts(frame, chunks[1]);
+    }
+
+    fn render_commit_push_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let panel_label = if self.local_only {
+            "Commit Activity"
+        } else {
+            "Commit & Push Activity"
+        };
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                panel_label,
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(colors::INFO))
+            .title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        if let Some(pty) = self.pty.as_mut() {
+            pty.resize(inner.height, inner.width);
+            pty.render(frame, inner);
+            render_pty_scrollbar(frame, inner, pty);
+            return;
+        }
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Waiting for shell...",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ))),
+            inner,
+        );
+    }
+
+    fn render_commit_push_shortcuts(&self, frame: &mut Frame, area: Rect) {
+        let muted = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        let separator = Span::styled("  ·  ", muted);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if self.pty.is_some() {
+            spans.push(Span::styled(
+                "Scroll: ",
+                Style::default()
+                    .fg(colors::INFO)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled("↑/↓", Style::default().fg(colors::BRAND)));
+            spans.push(Span::styled(" line", muted));
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "PgUp/PgDn",
+                Style::default().fg(colors::BRAND),
+            ));
+            spans.push(Span::styled(" page", muted));
+            spans.push(separator.clone());
+            spans.push(Span::styled("wheel", Style::default().fg(colors::BRAND)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn render_commit_push_done(&self, frame: &mut Frame, area: Rect) {
+        let (status, headline) = if self.commit_push_succeeded {
+            (
+                Status::Success,
+                if self.local_only {
+                    "AI resolution committed successfully!"
+                } else {
+                    "AI resolution committed and pushed successfully!"
+                },
+            )
+        } else {
+            (
+                Status::Error,
+                if self.local_only {
+                    "Commit failed — check the terminal output for details."
+                } else {
+                    "Commit or push failed — check the terminal output for details."
+                },
+            )
+        };
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // StatusIndicator banner
+                Constraint::Min(3),    // summary table
+                Constraint::Length(1), // press-any-key hint
+            ])
+            .split(area);
+
+        StatusIndicator::new(status, headline)
+            .without_spinner()
+            .render(frame, chunks[0]);
+
+        render_summary_table(&self.commit_push_summary, frame, chunks[1]);
+
+        frame.render_widget(
+            Paragraph::new("Press any key to return to dashboard").style(
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+            chunks[2],
+        );
+    }
+}
+
+impl UpdatePullRequestScreen {
     fn render_updating(&mut self, frame: &mut Frame, area: Rect) {
         self.ai_button_rects.set([Rect::default(); 2]);
+        self.terminal_button_rects.set([Rect::default(); 2]);
+        // The Terminal Activity recovery panel takes over the whole step
+        // once a push has failed.
+        if self.terminal_active {
+            self.render_terminal(frame, area);
+            return;
+        }
         // Pre-conflict (or "no conflict at all") runs render as just a
         // spinner — the AI Activity panel is reserved for the post-
         // `ConflictsDetected` portion of the pipeline. We also fall back
@@ -845,22 +1376,7 @@ impl UpdatePullRequestScreen {
         if let Some(pty) = self.pty.as_mut() {
             pty.resize(inner.height, inner.width);
             pty.render(frame, inner);
-            let scrollback_len = pty.scrollback_len();
-            if scrollback_len > 0 {
-                // Position: 0 = top of scrollback (oldest), len = bottom
-                // (live tail). vt100's offset is "rows back from tail",
-                // so invert to keep the thumb intuitive.
-                let offset = pty.scrollback_offset();
-                let position = scrollback_len.saturating_sub(offset);
-                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .style(Style::default().fg(colors::MUTED))
-                    .thumb_style(Style::default().fg(colors::INFO));
-                let mut state =
-                    ScrollbarState::new(scrollback_len.saturating_add(inner.height as usize))
-                        .viewport_content_length(inner.height as usize)
-                        .position(position);
-                frame.render_stateful_widget(scrollbar, inner, &mut state);
-            }
+            render_pty_scrollbar(frame, inner, pty);
             return;
         }
 
@@ -1048,16 +1564,312 @@ impl UpdatePullRequestScreen {
         );
         self.ai_button_rects.set([chunks[1], chunks[3]]);
     }
+
+    /// Render the Terminal Activity recovery layout: a bordered "Push error"
+    /// box (sized to the wrapped error so nothing is truncated), the embedded
+    /// shell panel, a shortcuts row, and the Accept/Discard decision buttons.
+    fn render_terminal(&mut self, frame: &mut Frame, area: Rect) {
+        if area.height < 7 {
+            StatusIndicator::new(Status::Loading, UPDATE_PUSH_FAILED_MESSAGE)
+                .with_tick(self.tick)
+                .render(frame, area);
+            return;
+        }
+        let header_h = self.terminal_header_height(area.width);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_h), // Push error box
+                Constraint::Length(1),        // blank
+                Constraint::Min(3),           // Terminal Activity panel
+                Constraint::Length(1),        // shortcuts hint
+                Constraint::Length(1),        // blank
+                Constraint::Length(3),        // Accept / Discard buttons
+            ])
+            .split(area);
+
+        self.render_terminal_header(frame, chunks[0]);
+        self.render_terminal_panel(frame, chunks[2]);
+        self.render_terminal_shortcuts(frame, chunks[3]);
+        self.render_terminal_buttons(frame, chunks[5]);
+    }
+
+    /// Height (borders included) for the "Push error" box: sized to the
+    /// wrapped error text and capped so a long git error never crowds out the
+    /// shell below it.
+    fn terminal_header_height(&self, width: u16) -> u16 {
+        const MAX_CONTENT_LINES: usize = 6;
+        let inner = width.saturating_sub(2).max(1) as usize;
+        let content = terminal_error_lines(self.terminal_header_text())
+            .iter()
+            .map(|line| line.chars().count().max(1).div_ceil(inner))
+            .sum::<usize>()
+            .clamp(1, MAX_CONTENT_LINES);
+        content as u16 + 2
+    }
+
+    fn terminal_header_text(&self) -> &str {
+        if self.terminal_error.is_empty() {
+            UPDATE_PUSH_FAILED_MESSAGE
+        } else {
+            self.terminal_error.as_str()
+        }
+    }
+
+    fn render_terminal_header(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line<'static>> = terminal_error_lines(self.terminal_header_text())
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(colors::ERROR))))
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(colors::ERROR))
+            .title(Line::from(Span::styled(
+                " Push error ".to_string(),
+                Style::default()
+                    .fg(colors::ERROR)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_terminal_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let pty_alive = self.pty.is_some();
+        let focused_inner = pty_alive && self.pty_focused;
+        let mut title_spans = vec![
+            Span::raw(" "),
+            Span::styled(
+                "Terminal Activity",
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if pty_alive {
+            title_spans.push(Span::styled(
+                " · ".to_string(),
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ));
+            title_spans.push(Span::styled(
+                if focused_inner {
+                    "inner focused"
+                } else {
+                    "outer focused"
+                }
+                .to_string(),
+                Style::default()
+                    .fg(if focused_inner {
+                        colors::ACCENT
+                    } else {
+                        colors::INFO
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        title_spans.push(Span::raw(" "));
+        let border_color = if focused_inner {
+            colors::ACCENT
+        } else {
+            colors::INFO
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .title(Line::from(title_spans));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        if let Some(pty) = self.pty.as_mut() {
+            pty.resize(inner.height, inner.width);
+            pty.render(frame, inner);
+            render_pty_scrollbar(frame, inner, pty);
+            return;
+        }
+
+        // No shell (spawn failed) — explain and let the user Discard out.
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Could not open a shell here. Press Discard to return to the dashboard.",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ))),
+            inner,
+        );
+    }
+
+    fn render_terminal_shortcuts(&self, frame: &mut Frame, area: Rect) {
+        let muted = Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM);
+        let separator = Span::styled("  ·  ".to_string(), muted);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+
+        let focused_inner = self.pty.is_some() && self.pty_focused;
+        let focus_label = if focused_inner {
+            "Inner (shell)"
+        } else {
+            "Outer (wisetree)"
+        };
+        spans.push(Span::styled("Focus: ".to_string(), muted));
+        spans.push(Span::styled(
+            focus_label.to_string(),
+            Style::default()
+                .fg(if focused_inner {
+                    colors::ACCENT
+                } else {
+                    colors::INFO
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(separator.clone());
+        spans.push(Span::styled(
+            "Tab ".to_string(),
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(
+            if focused_inner {
+                "Switch to Wisetree"
+            } else {
+                "Switch to shell"
+            }
+            .to_string(),
+            muted,
+        ));
+        if focused_inner {
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "keys flow into the shell".to_string(),
+                Style::default()
+                    .fg(colors::GRAY_LIGHT)
+                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+            ));
+        } else {
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "← → ".to_string(),
+                Style::default().fg(colors::INFO),
+            ));
+            spans.push(Span::styled("Switch button".to_string(), muted));
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "↵ ".to_string(),
+                Style::default().fg(colors::SUCCESS),
+            ));
+            spans.push(Span::styled("Confirm".to_string(), muted));
+            spans.push(separator.clone());
+            spans.push(Span::styled(
+                "Esc ".to_string(),
+                Style::default().fg(colors::ERROR),
+            ));
+            spans.push(Span::styled("Discard".to_string(), muted));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn render_terminal_buttons(&self, frame: &mut Frame, area: Rect) {
+        // Each button hugs its own label instead of sharing a fixed width, so
+        // the short "Discard" doesn't render as a wide, mostly-empty box. Width
+        // = label + 2 borders + 2 padding cells each side; both labels are
+        // odd-length, so the even padding keeps the text centered with equal
+        // space on both sides (bare labels — `button_paragraph` centers, so
+        // any manual padding would just push the text off-center).
+        let accept = "Accept & Push";
+        let discard = "Discard";
+        let button_width = |label: &str| label.len() as u16 + 6;
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(button_width(accept)),
+                Constraint::Length(2),
+                Constraint::Length(button_width(discard)),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        frame.render_widget(
+            button_paragraph(
+                accept,
+                colors::SUCCESS,
+                matches!(self.terminal_button, TermButton::Accept),
+            ),
+            chunks[1],
+        );
+        frame.render_widget(
+            button_paragraph(
+                discard,
+                colors::ERROR,
+                matches!(self.terminal_button, TermButton::Discard),
+            ),
+            chunks[3],
+        );
+        self.terminal_button_rects.set([chunks[1], chunks[3]]);
+    }
 }
 
-fn contains_position(area: Rect, position: Position) -> bool {
+/// Split a (possibly multi-line) push error into trimmed, non-empty display
+/// lines for the "Push error" box. git writes its push rejection across
+/// several lines (`To <remote>` / `! [rejected] ...` / `error: ...` /
+/// `hint: ...`), and `run_command` keeps those newlines, so this preserves
+/// the structure instead of mashing it onto one truncated row.
+fn terminal_error_lines(text: &str) -> Vec<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        vec![text.trim().to_string()]
+    } else {
+        lines
+    }
+}
+
+/// Render the vertical scrollbar for an embedded PTY that keeps a real vt100
+/// scrollback buffer. No-op when there's no scrollback yet.
+///
+/// vt100's offset is "rows back from the live tail" (0 = bottom). ratatui's
+/// scrollbar, however, lands the thumb flush at the bottom of the track only
+/// when `position == content_length - 1`. The intuitive mapping is therefore
+/// `content_length = scrollback_len + 1` with `position = scrollback_len -
+/// offset`: at the live tail (offset 0) `position` hits that maximum so the
+/// thumb sits exactly at the bottom. (The earlier `scrollback_len + height`
+/// content length left the thumb floating `height - 1` rows short of the
+/// bottom even when fully scrolled down.) `viewport_content_length = height`
+/// keeps the thumb sized to the visible fraction of the content.
+fn render_pty_scrollbar(frame: &mut Frame, inner: Rect, pty: &PtyView) {
+    // vt100's offset is "rows back from the live tail" (0 = bottom), which is
+    // exactly the tail-anchored model the shared scrollbar expects.
+    crate::tui::widgets::render_vertical_scrollbar(
+        frame,
+        inner,
+        pty.scrollback_len(),
+        pty.scrollback_offset(),
+    );
+}
+
+pub(crate) fn contains_position(area: Rect, position: Position) -> bool {
     position.x >= area.left()
         && position.x < area.right()
         && position.y >= area.top()
         && position.y < area.bottom()
 }
 
-fn button_paragraph(
+pub(crate) fn button_paragraph(
     label: &str,
     color: ratatui::style::Color,
     focused: bool,
@@ -1083,7 +1895,7 @@ fn button_paragraph(
         .alignment(ratatui::layout::Alignment::Center)
 }
 
-fn ai_activity_event_to_line(event: &AiActivityEvent) -> Line<'static> {
+pub(crate) fn ai_activity_event_to_line(event: &AiActivityEvent) -> Line<'static> {
     match event {
         AiActivityEvent::SessionStart { model } => Line::from(vec![
             Span::styled("[session started] ".to_string(), muted_bold()),
@@ -1363,18 +2175,22 @@ fn looks_like_url(token: &str) -> bool {
 fn looks_like_path(token: &str) -> bool {
     let trimmed = token
         .trim_matches(|ch: char| matches!(ch, ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'));
-    trimmed.starts_with("~/")
+    if trimmed.starts_with("~/")
         || trimmed.starts_with("./")
         || trimmed.starts_with("../")
         || trimmed.starts_with('/')
         || trimmed.contains('/')
-        || trimmed.ends_with(".rs")
-        || trimmed.ends_with(".rb")
-        || trimmed.ends_with(".ts")
-        || trimmed.ends_with(".tsx")
-        || trimmed.ends_with(".js")
-        || trimmed.ends_with(".json")
-        || trimmed.ends_with(".md")
+    {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    lower.ends_with(".rs")
+        || lower.ends_with(".rb")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".js")
+        || lower.ends_with(".json")
+        || lower.ends_with(".md")
 }
 
 fn looks_like_number(token: &str) -> bool {
@@ -1452,30 +2268,35 @@ fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> 
         None,
     ));
 
-    rows.push(labeled_line(
-        "Base ref",
-        Span::styled(
-            request
-                .base_ref
-                .clone()
-                .unwrap_or_else(|| "(resolving...)".to_string()),
-            Style::default()
-                .fg(colors::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        None,
-    ));
+    // Base ref only resolves for the update flow; the push-only flow leaves
+    // it `None`, so we omit the row rather than show "(resolving...)".
+    if let Some(base_ref) = request.base_ref.clone() {
+        rows.push(labeled_line(
+            "Base ref",
+            Span::styled(
+                base_ref,
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None,
+        ));
+    }
 
-    rows.push(labeled_line(
-        "Behind",
-        Span::styled(
-            format!("-{}", request.behind),
-            Style::default()
-                .fg(colors::ERROR)
-                .add_modifier(Modifier::BOLD),
-        ),
-        None,
-    ));
+    // A push-only row is, by definition, not behind — skip the alarming
+    // "Behind -0" line in that case.
+    if request.behind > 0 {
+        rows.push(labeled_line(
+            "Behind",
+            Span::styled(
+                format!("-{}", request.behind),
+                Style::default()
+                    .fg(colors::ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None,
+        ));
+    }
 
     if request.ahead > 0 {
         rows.push(labeled_line(
@@ -1491,7 +2312,7 @@ fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> 
     rows
 }
 
-fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
+fn build_steps_lines(base_ref: &str, push_only: bool) -> Vec<Line<'static>> {
     let header_style = Style::default()
         .fg(colors::INFO)
         .add_modifier(Modifier::BOLD);
@@ -1499,27 +2320,24 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
     let muted = Style::default()
         .fg(colors::MUTED)
         .add_modifier(Modifier::DIM);
+    let bullet = |cmd: String| {
+        Line::from(vec![
+            Span::styled("  • ".to_string(), muted),
+            Span::styled(cmd, bullet_style),
+        ])
+    };
+    if push_only {
+        return vec![
+            Line::from(Span::styled("Will run:".to_string(), header_style)),
+            bullet("git push origin HEAD".to_string()),
+        ];
+    }
     vec![
         Line::from(Span::styled("Will run:".to_string(), header_style)),
-        Line::from(vec![
-            Span::styled("  • ".to_string(), muted),
-            Span::styled("git fetch --all --prune".to_string(), bullet_style),
-        ]),
-        Line::from(vec![
-            Span::styled("  • ".to_string(), muted),
-            Span::styled(format!("git merge {base_ref}"), bullet_style),
-        ]),
-        Line::from(vec![
-            Span::styled("  • ".to_string(), muted),
-            Span::styled(
-                "on conflict: opencode streams resolution, then Complete/Cancel".to_string(),
-                bullet_style,
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  • ".to_string(), muted),
-            Span::styled("git push origin HEAD".to_string(), bullet_style),
-        ]),
+        bullet("git fetch --all --prune".to_string()),
+        bullet(format!("git merge {base_ref}")),
+        bullet("on conflict: opencode streams resolution, then Complete/Cancel".to_string()),
+        bullet("git push origin HEAD".to_string()),
     ]
 }
 
@@ -1528,7 +2346,7 @@ fn build_steps_lines(base_ref: &str) -> Vec<Line<'static>> {
 /// opencode actually cares about (printable chars, control combos, arrow
 /// keys, function keys, navigation). Tab is intentionally not mapped —
 /// callers reserve it as the focus-toggle shortcut.
-fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+pub(crate) fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -1705,6 +2523,50 @@ mod tests {
         assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(enter), UpdateAction::Confirmed);
+    }
+
+    #[test]
+    fn new_local_conflict_starts_in_updating_with_ai_active() {
+        let screen = UpdatePullRequestScreen::new_local_conflict(sample_request());
+        assert!(screen.local_only());
+        assert_eq!(screen.step(), UpdateStep::Updating);
+        assert!(screen.ai_active());
+    }
+
+    #[test]
+    fn local_only_done_page_drops_push_wording() {
+        let mut screen = UpdatePullRequestScreen::new_local_conflict(sample_request());
+        // Jump to the finished commit page as if the local `git commit`
+        // succeeded.
+        screen.step = UpdateStep::CommitPush;
+        screen.commit_push_succeeded = true;
+        screen.commit_push_summary = vec![SummaryRow::success(screen.commit_action_label())];
+        screen.commit_push_done = true;
+
+        let dump = render_dump(&mut screen, 80, 12);
+        assert!(
+            dump.contains("committed successfully"),
+            "local done page should confirm the commit: {dump}"
+        );
+        assert!(
+            !dump.to_lowercase().contains("push"),
+            "local done page must not mention push: {dump}"
+        );
+    }
+
+    #[test]
+    fn pr_flow_done_page_keeps_push_wording() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        screen.step = UpdateStep::CommitPush;
+        screen.commit_push_succeeded = true;
+        screen.commit_push_summary = vec![SummaryRow::success(screen.commit_action_label())];
+        screen.commit_push_done = true;
+
+        let dump = render_dump(&mut screen, 80, 12);
+        assert!(
+            dump.to_lowercase().contains("pushed"),
+            "PR done page should mention the push: {dump}"
+        );
     }
 
     #[test]
@@ -2174,5 +3036,197 @@ mod tests {
         assert!(dumped.contains("-7"));
         assert!(dumped.contains("Yes"));
         assert!(dumped.contains("No"));
+    }
+
+    #[test]
+    fn new_push_lands_on_confirm_in_push_only_mode() {
+        let screen = UpdatePullRequestScreen::new_push(sample_request());
+        assert_eq!(screen.step(), UpdateStep::Confirm);
+        assert!(screen.is_push_only());
+        assert!(screen.error().is_none());
+    }
+
+    #[test]
+    fn render_push_confirm_shows_push_wording_only() {
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        let dumped = render_dump(&mut screen, 100, 24);
+        assert!(
+            dumped.contains("Push Pull Request #21?"),
+            "expected push title in:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("git push origin HEAD"),
+            "expected push step in:\n{dumped}"
+        );
+        // The push-only flow never fetches or merges.
+        assert!(
+            !dumped.contains("git fetch"),
+            "push confirm must not mention fetch:\n{dumped}"
+        );
+        assert!(
+            !dumped.contains("git merge"),
+            "push confirm must not mention merge:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn terminal_mode_grows_preferred_height() {
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        screen.enter_terminal_mode_for_test();
+        assert!(screen.terminal_active());
+        assert!(
+            screen.preferred_content_height() >= 25,
+            "terminal panel needs room: {}",
+            screen.preferred_content_height()
+        );
+    }
+
+    #[test]
+    fn terminal_outer_enter_accepts_and_esc_discards() {
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        screen.enter_terminal_mode_for_test();
+
+        // Default focus is Accept → Enter re-pushes.
+        assert_eq!(screen.terminal_button(), TermButton::Accept);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(enter), UpdateAction::TerminalAccept);
+
+        // Esc always discards regardless of focused button.
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(esc), UpdateAction::TerminalDiscard);
+    }
+
+    #[test]
+    fn terminal_arrows_switch_button_then_enter_discards() {
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        screen.enter_terminal_mode_for_test();
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(right), UpdateAction::Continue);
+        assert_eq!(screen.terminal_button(), TermButton::Discard);
+
+        // With Discard focused, Enter discards.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(enter), UpdateAction::TerminalDiscard);
+    }
+
+    #[test]
+    fn render_terminal_panel_shows_terminal_activity_title() {
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        screen.enter_terminal_mode_for_test();
+        let dumped = render_dump(&mut screen, 100, 28);
+        assert!(
+            dumped.contains("Terminal Activity"),
+            "expected Terminal Activity panel title in:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("Accept") && dumped.contains("Discard"),
+            "expected Accept/Discard buttons in:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn terminal_error_lines_splits_multiline_git_error() {
+        let err = "To github.com:me/repo.git\n ! [rejected]   HEAD -> main (fetch first)\nerror: failed to push some refs to 'github.com:me/repo.git'";
+        let lines = terminal_error_lines(err);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "To github.com:me/repo.git");
+        assert!(lines[2].starts_with("error: failed to push"));
+    }
+
+    #[test]
+    fn terminal_error_box_shows_full_error_wrapped_not_truncated() {
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        // A realistic multi-line git push rejection. A nonexistent shell makes
+        // the spawn fail (pty = None) without affecting the error-box render.
+        screen.start_terminal_recovery(
+            std::path::PathBuf::from("/nonexistent-shell-xyz"),
+            Vec::new(),
+            std::env::temp_dir(),
+            "To github.com:me/repo.git\n ! [rejected] HEAD -> main (fetch first)\n\
+             error: failed to push some refs to 'github.com:me/repo.git'"
+                .to_string(),
+        );
+        let dumped = render_dump(&mut screen, 100, 30);
+        assert!(
+            dumped.contains("Push error"),
+            "expected dedicated error box title:\n{dumped}"
+        );
+        // The tail of the error (previously cut off at "...some re") must now
+        // be fully visible.
+        assert!(
+            dumped.contains("failed to push some refs"),
+            "full error must not be truncated:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn terminal_button_label_is_horizontally_centered() {
+        // Render a focused button into a 19-wide cell (matches
+        // `render_terminal_buttons`) and assert the label sits with equal
+        // padding on both sides — i.e. no asymmetric manual padding sneaks
+        // back into the label.
+        let backend = TestBackend::new(19, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    button_paragraph("Accept & Push", colors::SUCCESS, true),
+                    f.area(),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // Row 1 sits between the top/bottom borders; cols 0 and 18 are the
+        // side borders, so the usable inner span is cols 1..=17.
+        let symbols: Vec<String> = (0..19)
+            .map(|x| buffer[(x, 1)].symbol().to_string())
+            .collect();
+        let first_text = (1..18)
+            .find(|&x| symbols[x] != " ")
+            .expect("label rendered");
+        let last_text = (1..18)
+            .rev()
+            .find(|&x| symbols[x] != " ")
+            .expect("label rendered");
+        let left_pad = first_text - 1;
+        let right_pad = 17 - last_text;
+        assert_eq!(
+            left_pad, right_pad,
+            "button label not centered (left {left_pad} vs right {right_pad}): {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_tab_toggles_focus_when_shell_alive() {
+        // Spawns a real shell so `pty.is_some()` and Tab can toggle focus.
+        // Skips cleanly if no shell binary is present in the test env.
+        let shell = ["/bin/sh", "/bin/bash"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists());
+        let Some(shell) = shell else {
+            return;
+        };
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        screen.start_updating();
+        screen.start_terminal_recovery(
+            shell,
+            Vec::new(),
+            std::env::temp_dir(),
+            "remote rejected".to_string(),
+        );
+        assert!(screen.terminal_active());
+        assert!(!screen.is_pty_focused());
+
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
+        assert!(screen.is_pty_focused(), "Tab should focus the inner shell");
+
+        assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
+        assert!(
+            !screen.is_pty_focused(),
+            "Tab again should return focus to Wisetree"
+        );
     }
 }

@@ -259,6 +259,13 @@ impl PtyView {
         }
     }
 
+    /// Returns the exit code recorded when the child exited. `None` when the
+    /// child is still running or the kill/wait path was taken (status
+    /// unavailable). Only meaningful after `poll_exited` has returned `true`.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_status.lock().ok().and_then(|slot| *slot)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -364,15 +371,28 @@ fn convert_color(c: VtColor, _is_fg: bool) -> RatColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
+    fn resolve_on_path(binary: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join(binary);
+            candidate.is_file().then_some(candidate)
+        })
+    }
+
     fn spawn_echo() -> PtyView {
-        let echo = if Path::new("/bin/echo").exists() {
-            Path::new("/bin/echo")
-        } else {
-            Path::new("/usr/bin/echo")
-        };
-        PtyView::spawn(echo, &["hello".to_string()], None, &[]).expect("spawn echo")
+        let echo = resolve_on_path("echo")
+            .or_else(|| {
+                ["/bin/echo", "/usr/bin/echo"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .map(std::path::PathBuf::from)
+                    .find(|path| path.is_file())
+            })
+            .expect("echo available on PATH");
+        PtyView::spawn(&echo, &["hello".to_string()], None, &[]).expect("spawn echo")
     }
 
     fn wait_for_exit(pty: &mut PtyView) {

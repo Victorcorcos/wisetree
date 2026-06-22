@@ -19,19 +19,25 @@ const UPDATE_BRANCH_LOADING_MESSAGE: &str = "Updating branch...";
 
 pub struct UpdateBranchScreen {
     worktree_path: String,
+    branch: String,
     pub tick: usize,
 }
 
 impl UpdateBranchScreen {
-    pub fn new(worktree_path: String) -> Self {
+    pub fn new(worktree_path: String, branch: String) -> Self {
         Self {
             worktree_path,
+            branch,
             tick: 0,
         }
     }
 
     pub fn worktree_path(&self) -> &str {
         &self.worktree_path
+    }
+
+    pub fn branch(&self) -> &str {
+        &self.branch
     }
 
     /// Inner content height for the framed panel (excludes the rounded

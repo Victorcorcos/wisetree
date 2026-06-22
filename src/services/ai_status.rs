@@ -11,6 +11,7 @@ mod codex;
 mod gemini;
 mod opencode;
 mod paths;
+mod probe;
 mod state;
 mod util;
 
@@ -121,19 +122,13 @@ impl AiStatusService {
     /// failures fold into [`AiHarnessState::Failed`].
     pub fn build_index(&self) -> AiStatusIndex {
         let mut index = AiStatusIndex::default();
-        let window = self.active_window;
 
-        if self.enabled.contains(&AiHarness::ClaudeCode) {
-            let result = claude::scan(&self.paths, window);
-            for (cwd, state) in result.per_cwd {
-                index.insert(AiHarness::ClaudeCode, cwd, state);
-            }
-            if result.global_failure {
-                index.record_global_failure(AiHarness::ClaudeCode);
-            }
-        }
+        self.run_detector(&mut index, AiHarness::ClaudeCode, claude::scan);
+        self.run_detector(&mut index, AiHarness::Opencode, opencode::scan);
+        self.run_detector(&mut index, AiHarness::GeminiCli, gemini::scan);
+
         if self.enabled.contains(&AiHarness::CodexCli) {
-            let result = codex::scan(&self.paths, window);
+            let result = codex::scan(&self.paths, self.active_window);
             for (cwd, state) in result.per_cwd {
                 index.insert(AiHarness::CodexCli, cwd, state);
             }
@@ -151,26 +146,26 @@ impl AiStatusService {
                 }
             }
         }
-        if self.enabled.contains(&AiHarness::Opencode) {
-            let result = opencode::scan(&self.paths, window);
-            for (cwd, state) in result.per_cwd {
-                index.insert(AiHarness::Opencode, cwd, state);
-            }
-            if result.global_failure {
-                index.record_global_failure(AiHarness::Opencode);
-            }
-        }
-        if self.enabled.contains(&AiHarness::GeminiCli) {
-            let result = gemini::scan(&self.paths, window);
-            for (cwd, state) in result.per_cwd {
-                index.insert(AiHarness::GeminiCli, cwd, state);
-            }
-            if result.global_failure {
-                index.record_global_failure(AiHarness::GeminiCli);
-            }
-        }
 
         index
+    }
+
+    fn run_detector(
+        &self,
+        index: &mut AiStatusIndex,
+        harness: AiHarness,
+        scan: impl FnOnce(&AiStatusPaths, Duration) -> DetectorOutput,
+    ) {
+        if !self.enabled.contains(&harness) {
+            return;
+        }
+        let result = scan(&self.paths, self.active_window);
+        for (cwd, state) in result.per_cwd {
+            index.insert(harness, cwd, state);
+        }
+        if result.global_failure {
+            index.record_global_failure(harness);
+        }
     }
 
     /// Look up the per-worktree report. `worktree` must be the path returned

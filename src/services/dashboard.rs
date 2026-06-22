@@ -6,15 +6,18 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::schema::{normalize_dashboard_columns, DashboardConfig};
 use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
+use crate::files::ActivityKind;
 use crate::git::exec::execute_git_command;
 use crate::git::types::{BranchStatus, GitWorktree};
 use crate::services::ai_status::{AiStatusIndex, AiStatusPaths, AiStatusReport, AiStatusService};
@@ -32,6 +35,24 @@ const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const UPDATE_MERGE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on the background single-branch base fetch that keeps the base's
+/// remote-tracking ref fresh for the behind-count. A scoped fetch normally
+/// completes in ~1s; the cap stops a slow network from stalling the on-cycle
+/// tick.
+const BASE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeouts for the "Fill Pull Request" pipeline. Gathering the diff/log is
+/// read-only but can be large on a long branch; push + `gh pr create/edit`
+/// talk to the network.
+const FILL_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
+const FILL_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+const FILL_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Soft cap on the embedded diff size inside the AI prompt. opencode
+/// receives the whole prompt as a single argv entry, so an unbounded diff
+/// risks exceeding the OS argument-length limit and failing to spawn.
+/// Diffs above this are truncated with a marker so the launch always
+/// succeeds; the AI still has the commit log + the bulk of the diff to work
+/// from.
+const FILL_DIFF_MAX_BYTES: usize = 120_000;
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -47,6 +68,7 @@ pub const BASE_REF_PRIORITY: [&str; 6] = [
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API. The Status column countdown is driven by the same timer.
 pub const PR_REFRESH_PERIOD_MS: u64 = 30 * 1000;
+const WISE_MERGE_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 /// Per-tick budget for the global AI-status scan. When exceeded, the index
 /// degrades to empty for this tick and every worktree renders `⬜ Pending`
 /// rather than blocking the whole dashboard refresh.
@@ -113,6 +135,26 @@ pub struct PullRequest {
     pub state: PrState,
     pub url: String,
     pub title: String,
+    #[serde(
+        rename = "baseRefName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub base_ref_name: Option<String>,
+    #[serde(
+        rename = "baseRepository",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub base_repository: Option<String>,
+    #[serde(
+        rename = "headRefOid",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub head_ref_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     #[serde(
         rename = "checksStatus",
         default,
@@ -326,6 +368,10 @@ pub enum UpdatePullRequestOutcome {
     AlreadyUpToDate,
     /// `git merge` succeeded with no conflicts; the result has been pushed.
     MergedCleanly,
+    /// A push-only run (`Push Pull Request` action, or the Terminal recovery
+    /// re-push) sent `git push origin HEAD` and it succeeded. No merge was
+    /// attempted — the branch was already ahead-but-not-behind.
+    Pushed,
     /// Conflicts were detected, `useAi` is set, opencode is on PATH, and
     /// the merge is paused mid-flight (index has conflict markers). The
     /// UI takes over from here: it spawns opencode inside an embedded
@@ -390,9 +436,85 @@ pub enum UpdateBranchOutcome {
     NoBaseRef,
     /// `git fetch --all --prune` failed (network, auth, ...). stderr included.
     FetchFailed(String),
-    /// `git merge {base_ref}` failed for any reason (conflicts, dirty
-    /// tree, refusal). stderr included.
+    /// `git merge {base_ref}` failed for a *non-conflict* reason (dirty
+    /// tree, refusal, ...). stderr included. Genuine merge conflicts are
+    /// reported via the `Conflicts*` variants below instead.
     MergeFailed { base_ref: String, message: String },
+    /// Merge conflicts were detected, `useAi` is set, and `opencode` is on
+    /// PATH. The merge is left mid-flight (conflict markers in the index)
+    /// and the UI takes over: it spawns opencode inside an embedded PTY to
+    /// resolve the conflicts, then commits the result locally (no push).
+    /// Mirrors `UpdatePullRequestOutcome::ConflictsHandedOffToUi`.
+    ConflictsHandedOffToUi {
+        opencode_binary: PathBuf,
+        opencode_args: Vec<String>,
+        cwd: PathBuf,
+        model: String,
+        base_ref: String,
+        conflicts: Vec<String>,
+    },
+    /// Merge conflicts were detected but `useAi` is blank — the merge is
+    /// aborted and the UI prompts the user to configure `useAi` or resolve
+    /// the conflicts manually.
+    ConflictsRequireAi { conflicts: Vec<String> },
+    /// Merge conflicts were detected and `useAi` is set, but the `opencode`
+    /// binary is not on PATH — the merge is aborted and the UI prompts the
+    /// user to install opencode.
+    AiUnavailable { conflicts: Vec<String> },
+}
+
+/// Result of the read-only preparation phase of the "Fill Pull Request"
+/// pipeline (`prepare_fill`). On `HandedOffToUi` the UI spawns opencode in
+/// its embedded PTY to draft `pull_request.md`; the other variants are
+/// terminal and map straight to a toast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillPreparation {
+    /// Diff/log gathered, prompt built, `useAi` set and `opencode` on PATH.
+    /// The UI owns the PTY lifecycle from here; once opencode finishes the
+    /// screen reads `pull_request.md` and offers to open/update the PR.
+    HandedOffToUi {
+        opencode_binary: PathBuf,
+        opencode_args: Vec<String>,
+        cwd: PathBuf,
+        model: String,
+    },
+    /// No commits ahead of the base ref → there is nothing to describe.
+    NothingToDescribe,
+    /// `useAi` is blank in `DashboardConfig` — no model configured to draft.
+    AiNotConfigured,
+    /// `useAi` is set but the `opencode` binary is not on PATH.
+    AiUnavailable,
+}
+
+/// Parameters for opening or updating a pull request via `submit_pull_request`.
+pub struct FillSubmitRequest {
+    pub worktree_path: String,
+    pub branch: String,
+    /// `Some` → update an existing PR; `None` → push + create a new one.
+    pub number: Option<u64>,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+    /// Title the PR already has on GitHub (update path only). When non-empty,
+    /// `--title` is omitted from `gh pr edit` so the existing title is preserved.
+    pub existing_title: Option<String>,
+    /// Labels the PR already has on GitHub (update path only). When non-empty,
+    /// `--add-label` is omitted from `gh pr edit` so existing labels are preserved.
+    pub existing_labels: Vec<String>,
+}
+
+/// Outcome of submitting the drafted PR (`submit_pull_request`): either a
+/// brand-new PR was created or the existing one's title/body were updated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillSubmitOutcome {
+    /// `gh pr create` succeeded. `url` is parsed from gh's stdout.
+    Created { number: u64, url: String },
+    /// `gh pr edit` succeeded for the existing PR.
+    Updated { number: u64 },
+    /// `git push` failed before the PR could be created. stderr included.
+    PushFailed(String),
+    /// `gh pr create` / `gh pr edit` failed. stderr included.
+    SubmitFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +536,7 @@ pub struct DashboardRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardNoticeLevel {
+    Success,
     Warning,
     Error,
 }
@@ -425,6 +548,13 @@ pub struct DashboardNotice {
 }
 
 impl DashboardNotice {
+    fn success(message: impl Into<String>) -> Self {
+        Self {
+            level: DashboardNoticeLevel::Success,
+            message: message.into(),
+        }
+    }
+
     fn warning(message: impl Into<String>) -> Self {
         Self {
             level: DashboardNoticeLevel::Warning,
@@ -455,6 +585,15 @@ pub enum DashboardUpdate {
     },
 }
 
+#[derive(Debug, Clone)]
+struct WiseMergeCandidate {
+    number: u64,
+    worktree_path: String,
+    base_ref_name: String,
+    base_repository: String,
+    head_ref_oid: String,
+}
+
 impl DashboardUpdate {
     pub fn rows(&self) -> &Vec<DashboardRow> {
         match self {
@@ -477,6 +616,7 @@ pub struct DashboardWatch {
     pub notice_rx: mpsc::Receiver<DashboardNotice>,
     cancel: Option<oneshot::Sender<()>>,
     refresh_tx: mpsc::Sender<()>,
+    wise_merge_tasks: Option<Arc<Mutex<Vec<JoinHandle<()>>>>>,
 }
 
 impl DashboardWatch {
@@ -489,6 +629,12 @@ impl Drop for DashboardWatch {
     fn drop(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
+        }
+        if let Some(tasks) = self.wise_merge_tasks.take() {
+            let mut tasks = tasks.lock().expect("wise_merge_tasks poisoned");
+            for task in tasks.drain(..) {
+                task.abort();
+            }
         }
     }
 }
@@ -536,6 +682,10 @@ pub struct DashboardService {
     /// empty index so rows keep their previous values instead of flickering
     /// to `⬜ Pending` and back on the next successful tick.
     last_ai_index: Arc<Mutex<Option<AiStatusIndex>>>,
+    wise_merge_in_flight: Arc<Mutex<HashSet<u64>>>,
+    wise_merge_merged: Arc<Mutex<HashSet<u64>>>,
+    wise_merge_failed_until: Arc<Mutex<HashMap<u64, Instant>>>,
+    wise_merge_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl DashboardService {
@@ -556,7 +706,20 @@ impl DashboardService {
             pr_state: Arc::new(Mutex::new(PrCacheState::default())),
             ai_status,
             last_ai_index: Arc::new(Mutex::new(None)),
+            wise_merge_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            wise_merge_merged: Arc::new(Mutex::new(HashSet::new())),
+            wise_merge_failed_until: Arc::new(Mutex::new(HashMap::new())),
+            wise_merge_tasks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn require_gh(&self) -> Result<()> {
+        if !self.gh_available {
+            return Err(WisetreeError::other(
+                "gh CLI not found — install `gh` to use pull request features.",
+            ));
+        }
+        Ok(())
     }
 
     /// Override the `AiStatusService` for hermetic tests so we can point
@@ -606,6 +769,7 @@ impl DashboardService {
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let service = self.clone();
+        let wise_merge_tasks = service.wise_merge_tasks.clone();
         if let Ok(mut state) = service.pr_state.lock() {
             state.notice_tx = Some(notice_tx.clone());
         }
@@ -614,7 +778,7 @@ impl DashboardService {
             let interval_ms = service.config.refresh_interval_ms;
             let mut interval = time::interval(Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let period = Duration::from_millis(PR_REFRESH_PERIOD_MS);
+            let period = pr_refresh_period(&service.config);
             // Single source of truth for when the next on-cycle PR fetch
             // is due. The UI countdown reads this verbatim, and the loop
             // wakes precisely at this instant so the fetch fires the moment
@@ -622,9 +786,12 @@ impl DashboardService {
             let mut next_pr_fetch_at: Option<Instant> = None;
 
             loop {
+                let enrich = service.pr_enrichment_enabled();
+                let on_cycle = enrich && next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
                 // Emit git-only rows (with cached PRs applied) first so the
-                // UI exits "Loading dashboard..." without waiting on the gh
-                // GraphQL round-trip. Then refresh PRs and emit again.
+                // UI exits "Loading dashboard..." instantly, without waiting on
+                // any network round-trip. PR enrichment and the base-ref fetch
+                // below are refinements that fill in afterwards.
                 match service.collect_git_rows().await {
                     Ok(mut rows) => {
                         if rows_tx
@@ -634,14 +801,15 @@ impl DashboardService {
                         {
                             break;
                         }
-                        if service.pr_enrichment_enabled() {
-                            let on_cycle =
-                                next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
-                            service.refresh_pull_requests(&rows, on_cycle).await;
+                        if enrich {
+                            let fresh_prs = service.refresh_pull_requests(&rows, on_cycle).await;
                             if on_cycle {
                                 next_pr_fetch_at = Some(Instant::now() + period);
                             }
                             service.apply_cached_prs(&mut rows);
+                            if fresh_prs {
+                                service.start_wise_merge_candidates(&rows);
+                            }
                             service.save_cache();
                             if rows_tx
                                 .send(DashboardUpdate::WithPRs {
@@ -662,6 +830,17 @@ impl DashboardService {
                             )))
                             .await;
                     }
+                }
+
+                // On the 30s PR beat, refresh the base branch's remote-tracking
+                // ref so the behind-count reflects commits another developer
+                // pushed to the base — the signal the "Update" command is gated
+                // on. Runs *after* the paint above so it never blocks the first
+                // render; when it actually advances the ref, loop again right
+                // away to re-render the refined behind-count. Best-effort: a
+                // failed or no-op fetch just falls through to the normal wait.
+                if on_cycle && service.fetch_base_ref().await {
+                    continue;
                 }
 
                 // Wake on whichever fires first: the git interval (snappy
@@ -689,6 +868,7 @@ impl DashboardService {
             notice_rx,
             cancel: Some(cancel_tx),
             refresh_tx,
+            wise_merge_tasks: Some(wise_merge_tasks),
         }
     }
 
@@ -699,7 +879,7 @@ impl DashboardService {
             // SHA changes still trigger a fetch, but unchanged branches reuse
             // the cache so repeated `wisetree dashboard` calls don't hammer
             // the gh API.
-            self.refresh_pull_requests(&rows, false).await;
+            let _ = self.refresh_pull_requests(&rows, false).await;
             self.apply_cached_prs(&mut rows);
             self.save_cache();
         }
@@ -710,22 +890,43 @@ impl DashboardService {
     /// `gh pr view`. Bypasses the dashboard cache so the merge confirmation
     /// screen always shows the description GitHub currently has.
     pub async fn fetch_pr_details(&self, number: u64) -> Result<PullRequestDetails> {
-        if !self.gh_available {
-            return Err(WisetreeError::other(
-                "gh CLI not found — install `gh` to fetch pull request details.",
-            ));
-        }
+        self.fetch_pr_details_with_repo(number, None).await
+    }
+
+    async fn fetch_pr_details_for_repo(
+        &self,
+        number: u64,
+        repo_slug: &str,
+    ) -> Result<PullRequestDetails> {
+        self.fetch_pr_details_with_repo(number, Some(repo_slug))
+            .await
+    }
+
+    async fn fetch_pr_details_with_repo(
+        &self,
+        number: u64,
+        repo_slug: Option<&str>,
+    ) -> Result<PullRequestDetails> {
+        self.require_gh()?;
         let number_arg = number.to_string();
-        let output = time::timeout(
+        let mut args = vec![
+            "pr".to_string(),
+            "view".to_string(),
+            number_arg,
+            "--json".to_string(),
+            "title,body".to_string(),
+        ];
+        if let Some(repo_slug) = repo_slug {
+            args.push("--repo".to_string());
+            args.push(repo_slug.to_string());
+        }
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = with_timeout(
+            "gh pr view",
             GH_GRAPHQL_TIMEOUT,
-            run_command(
-                &self.gh_binary,
-                &["pr", "view", &number_arg, "--json", "title,body"],
-                Some(&self.git_root),
-            ),
+            run_command(&self.gh_binary, &args_ref, Some(&self.git_root)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("gh pr view timed out after 8s"))?
+        .await?
         .map_err(WisetreeError::other)?;
 
         parse_pr_view_json(&output)
@@ -738,45 +939,234 @@ impl DashboardService {
     /// default squash-merge convention (the `#N` is auto-linked to the
     /// PR by GitHub's web UI).
     pub async fn merge_pull_request(&self, number: u64, subject: &str, body: &str) -> Result<()> {
-        if !self.gh_available {
-            return Err(WisetreeError::other(
-                "gh CLI not found — install `gh` to merge pull requests.",
-            ));
-        }
-        let number_arg = number.to_string();
-        let subject_with_ref = subject_with_pr_reference(subject, number);
-        time::timeout(
-            PR_MERGE_TIMEOUT,
-            run_command(
-                &self.gh_binary,
-                &[
-                    "pr",
-                    "merge",
-                    &number_arg,
-                    "--squash",
-                    "--subject",
-                    &subject_with_ref,
-                    "--body",
-                    body,
-                ],
-                Some(&self.git_root),
-            ),
+        self.merge_pull_request_with_options(number, subject, body, None, None)
+            .await
+    }
+
+    async fn merge_pull_request_in_repo(
+        &self,
+        number: u64,
+        subject: &str,
+        body: &str,
+        repo_slug: &str,
+        match_head_commit: &str,
+    ) -> Result<()> {
+        self.merge_pull_request_with_options(
+            number,
+            subject,
+            body,
+            Some(repo_slug),
+            Some(match_head_commit),
         )
         .await
-        .map_err(|_| WisetreeError::other("gh pr merge timed out after 60s"))?
+    }
+
+    async fn merge_pull_request_with_options(
+        &self,
+        number: u64,
+        subject: &str,
+        body: &str,
+        repo_slug: Option<&str>,
+        match_head_commit: Option<&str>,
+    ) -> Result<()> {
+        self.require_gh()?;
+        let number_arg = number.to_string();
+        let subject_with_ref = subject_with_pr_reference(subject, number);
+        let mut args = vec![
+            "pr".to_string(),
+            "merge".to_string(),
+            number_arg,
+            "--squash".to_string(),
+            "--subject".to_string(),
+            subject_with_ref,
+            "--body".to_string(),
+            body.to_string(),
+        ];
+        if let Some(repo_slug) = repo_slug {
+            args.push("--repo".to_string());
+            args.push(repo_slug.to_string());
+        }
+        if let Some(match_head_commit) = match_head_commit {
+            args.push("--match-head-commit".to_string());
+            args.push(match_head_commit.to_string());
+        }
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        with_timeout(
+            "gh pr merge",
+            PR_MERGE_TIMEOUT,
+            run_command(&self.gh_binary, &args_ref, Some(&self.git_root)),
+        )
+        .await?
         .map_err(WisetreeError::other)?;
         Ok(())
     }
 
+    fn start_wise_merge_candidates(&self, rows: &[DashboardRow]) {
+        if !self.config.wise_merge || !self.pr_enrichment_enabled() {
+            return;
+        }
+
+        for candidate in rows.iter().filter_map(wise_merge_candidate) {
+            if !self.mark_wise_merge_started(candidate.number) {
+                continue;
+            }
+            let service = self.clone();
+            let task = tokio::spawn(async move {
+                let number = candidate.number;
+                let result = service.wise_merge(candidate).await;
+                service.finish_wise_merge(number, result);
+            });
+            let mut tasks = self
+                .wise_merge_tasks
+                .lock()
+                .expect("wise_merge_tasks poisoned");
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
+        }
+    }
+
+    fn mark_wise_merge_started(&self, number: u64) -> bool {
+        if self
+            .wise_merge_merged
+            .lock()
+            .expect("wise_merge_merged poisoned")
+            .contains(&number)
+        {
+            return false;
+        }
+
+        let now = Instant::now();
+        {
+            let mut failed_until = self
+                .wise_merge_failed_until
+                .lock()
+                .expect("wise_merge_failed_until poisoned");
+            if failed_until
+                .get(&number)
+                .is_some_and(|deadline| *deadline > now)
+            {
+                return false;
+            }
+            failed_until.remove(&number);
+        }
+
+        self.wise_merge_in_flight
+            .lock()
+            .expect("wise_merge_in_flight poisoned")
+            .insert(number)
+    }
+
+    async fn wise_merge(&self, candidate: WiseMergeCandidate) -> Result<String> {
+        let cwd = PathBuf::from(&candidate.worktree_path);
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd)
+            .await
+            .ok_or_else(|| {
+                WisetreeError::other(
+                    "No base ref reachable (looked for upstream/main, upstream/master, upstream/develop, origin/main, origin/master, origin/develop).",
+                )
+            })?;
+        let base_remote = remote_name_from_ref(&base_ref).ok_or_else(|| {
+            WisetreeError::other(format!(
+                "Resolved base ref `{base_ref}` does not name a remote."
+            ))
+        })?;
+        let base_repo = self.resolve_github_slug_for_remote(base_remote).await?;
+        validate_wise_merge_base(&candidate, &base_ref)?;
+        validate_wise_merge_repository(&candidate, &base_repo)?;
+        let details = self
+            .fetch_pr_details_for_repo(candidate.number, &base_repo)
+            .await?;
+        self.merge_pull_request_in_repo(
+            candidate.number,
+            &details.title,
+            &details.body,
+            &base_repo,
+            &candidate.head_ref_oid,
+        )
+        .await?;
+        Ok(base_ref)
+    }
+
+    async fn resolve_github_slug_for_remote(&self, remote: &str) -> Result<String> {
+        let url = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["remote", "get-url", remote],
+                Some(&self.git_root),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other(format!("git remote get-url {remote} timed out")))?
+        .map_err(WisetreeError::other)?;
+        parse_github_slug(&url)
+            .map(|(owner, repo)| format!("{owner}/{repo}"))
+            .ok_or_else(|| WisetreeError::other(format!("Remote `{remote}` is not a GitHub URL.")))
+    }
+
+    fn finish_wise_merge(&self, number: u64, result: Result<String>) {
+        self.wise_merge_in_flight
+            .lock()
+            .expect("wise_merge_in_flight poisoned")
+            .remove(&number);
+        match result {
+            Ok(base_ref) => {
+                self.wise_merge_merged
+                    .lock()
+                    .expect("wise_merge_merged poisoned")
+                    .insert(number);
+                self.mark_cached_pr_merged(number);
+                self.send_dashboard_notice(DashboardNotice::success(format!(
+                    "Wise Merge squash-merged PR #{number} after resolving base ref `{base_ref}`."
+                )));
+            }
+            Err(err) => {
+                self.wise_merge_failed_until
+                    .lock()
+                    .expect("wise_merge_failed_until poisoned")
+                    .insert(number, Instant::now() + WISE_MERGE_FAILURE_BACKOFF);
+                self.send_dashboard_notice(DashboardNotice::error(format!(
+                    "Wise Merge failed for PR #{number}: {err}"
+                )));
+            }
+        }
+    }
+
+    fn mark_cached_pr_merged(&self, number: u64) {
+        let mut state = self.pr_state.lock().expect("pr_state poisoned");
+        let mut changed = false;
+        for entry in state.entries.values_mut() {
+            let Some(pr) = entry.pull_request.as_mut() else {
+                continue;
+            };
+            if pr.number == number && pr.state != PrState::Merged {
+                pr.state = PrState::Merged;
+                changed = true;
+            }
+        }
+        if changed {
+            state.dirty = true;
+        }
+    }
+
+    fn send_dashboard_notice(&self, notice: DashboardNotice) {
+        let tx = self
+            .pr_state
+            .lock()
+            .expect("pr_state poisoned")
+            .notice_tx
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(notice);
+        }
+    }
+
     /// Close a pull request via `gh pr close <number>`.
     pub async fn close_pull_request(&self, number: u64) -> Result<()> {
-        if !self.gh_available {
-            return Err(WisetreeError::other(
-                "gh CLI not found — install `gh` to close pull requests.",
-            ));
-        }
+        self.require_gh()?;
         let number_arg = number.to_string();
-        time::timeout(
+        with_timeout(
+            "gh pr close",
             PR_MERGE_TIMEOUT,
             run_command(
                 &self.gh_binary,
@@ -784,8 +1174,7 @@ impl DashboardService {
                 Some(&self.git_root),
             ),
         )
-        .await
-        .map_err(|_| WisetreeError::other("gh pr close timed out after 60s"))?
+        .await?
         .map_err(WisetreeError::other)?;
         Ok(())
     }
@@ -835,12 +1224,12 @@ impl DashboardService {
 
         // 1. fetch
         send_phase(UpdatePhase::Fetching);
-        let fetch = time::timeout(
+        let fetch = with_timeout(
+            "git fetch",
             UPDATE_FETCH_TIMEOUT,
             run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git fetch timed out after 60s"))?;
+        .await?;
         if let Err(err) = fetch {
             return Ok(UpdatePullRequestOutcome::FetchFailed(err));
         }
@@ -848,18 +1237,38 @@ impl DashboardService {
         // 2. recheck behind
         let behind = behind_against_base(&self.git_binary, &cwd, base_ref).await;
         if matches!(behind, Some(0)) {
+            // Local branch already contains all upstream changes. However
+            // the user may have already merged upstream locally but never
+            // pushed — in that case the PR on GitHub still shows "behind"
+            // even though local HEAD is up to date. Check for unpushed
+            // commits and push them before declaring AlreadyUpToDate.
+            let ahead_of_origin = local_ahead_of_tracking(&self.git_binary, &cwd).await;
+            if ahead_of_origin > 0 {
+                send_phase(UpdatePhase::NoConflicts);
+                send_phase(UpdatePhase::Pushing);
+                let push = with_timeout(
+                    "git push",
+                    UPDATE_PUSH_TIMEOUT,
+                    run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+                )
+                .await?;
+                if let Err(err) = push {
+                    return Ok(UpdatePullRequestOutcome::PushFailed(err));
+                }
+                return Ok(UpdatePullRequestOutcome::Pushed);
+            }
             send_phase(UpdatePhase::AlreadyUpToDate);
             return Ok(UpdatePullRequestOutcome::AlreadyUpToDate);
         }
 
         // 3. merge
         send_phase(UpdatePhase::Merging);
-        let merge = time::timeout(
+        let merge = with_timeout(
+            "git merge",
             UPDATE_MERGE_TIMEOUT,
             run_command(&self.git_binary, &["merge", base_ref], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git merge timed out after 120s"))?;
+        .await?;
 
         let ai_conflicts: Option<Vec<String>> = match merge {
             Ok(_) => None,
@@ -944,17 +1353,45 @@ impl DashboardService {
         // 4. push (clean merge path only — AI merges return above for review)
         send_phase(UpdatePhase::NoConflicts);
         send_phase(UpdatePhase::Pushing);
-        let push = time::timeout(
+        let push = with_timeout(
+            "git push",
             UPDATE_PUSH_TIMEOUT,
             run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+        .await?;
         if let Err(err) = push {
             return Ok(UpdatePullRequestOutcome::PushFailed(err));
         }
 
         Ok(UpdatePullRequestOutcome::MergedCleanly)
+    }
+
+    /// Push-only counterpart to the update pipeline: just runs
+    /// `git push origin HEAD` against `worktree_path`. Powers the dashboard's
+    /// "Push Pull Request" action (for branches that are ahead-but-not-behind,
+    /// e.g. a local merge that never got pushed) and the Terminal recovery
+    /// panel's "Accept" re-push. Returns `Pushed` on success or `PushFailed`
+    /// on failure — the exact same failure variant the merge pipeline emits,
+    /// so both paths hand off to the same recovery UI.
+    pub async fn push_pull_request_with_progress(
+        &self,
+        worktree_path: &str,
+        progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
+    ) -> Result<UpdatePullRequestOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+        if let Some(tx) = progress.as_ref() {
+            let _ = tx.send(UpdateProgress::Phase(UpdatePhase::Pushing));
+        }
+        let push = with_timeout(
+            "git push",
+            UPDATE_PUSH_TIMEOUT,
+            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+        )
+        .await?;
+        match push {
+            Ok(_) => Ok(UpdatePullRequestOutcome::Pushed),
+            Err(err) => Ok(UpdatePullRequestOutcome::PushFailed(err)),
+        }
     }
 
     /// Fetch the remote and merge the worktree at `worktree_path` with
@@ -965,12 +1402,12 @@ impl DashboardService {
     pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
         let cwd = PathBuf::from(worktree_path);
 
-        let fetch = time::timeout(
+        let fetch = with_timeout(
+            "git fetch",
             UPDATE_FETCH_TIMEOUT,
             run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git fetch timed out after 60s"))?;
+        .await?;
         if let Err(err) = fetch {
             return Ok(UpdateBranchOutcome::FetchFailed(err));
         }
@@ -979,20 +1416,65 @@ impl DashboardService {
             return Ok(UpdateBranchOutcome::NoBaseRef);
         };
 
-        let merge = time::timeout(
+        let merge = with_timeout(
+            "git merge",
             UPDATE_MERGE_TIMEOUT,
             run_command(&self.git_binary, &["merge", &base_ref], Some(&cwd)),
         )
-        .await
-        .map_err(|_| WisetreeError::other("git merge timed out after 120s"))?;
+        .await?;
 
-        match merge {
-            Ok(stdout) => Ok(classify_merge_output(base_ref, &stdout)),
-            Err(stderr) => Ok(UpdateBranchOutcome::MergeFailed {
+        let stderr = match merge {
+            Ok(stdout) => return Ok(classify_merge_output(base_ref, &stdout)),
+            Err(stderr) => stderr,
+        };
+
+        // The merge failed. Distinguish genuine conflicts (which we can
+        // hand to opencode) from other failures (dirty tree, refusal),
+        // mirroring the conflict handling in
+        // `update_pull_request_with_progress`.
+        let conflicts = conflicted_files(&self.git_binary, &cwd).await;
+        if conflicts.is_empty() {
+            return Ok(UpdateBranchOutcome::MergeFailed {
                 base_ref,
                 message: stderr,
-            }),
+            });
         }
+
+        // useAi blank → no AI available: abort the merge and let the UI
+        // prompt the user to configure useAi or resolve manually.
+        let use_ai = self.config.use_ai.trim().to_string();
+        if use_ai.is_empty() {
+            let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+            return Ok(UpdateBranchOutcome::ConflictsRequireAi { conflicts });
+        }
+
+        // Bail early if opencode isn't on PATH so the user sees the
+        // dedicated "install opencode" toast instead of a spawn error.
+        if !binary_available(&self.opencode_binary) {
+            let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+            return Ok(UpdateBranchOutcome::AiUnavailable { conflicts });
+        }
+
+        // Hand control to the UI. The merge is still mid-flight on disk
+        // (conflict markers in the index); the screen owns the opencode
+        // PTY lifecycle from here and commits the result locally (no push)
+        // via the same machinery as the Update Pull Request flow.
+        let prompt = build_merge_prompt(&base_ref, &conflicts);
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            use_ai.clone(),
+            cwd.to_string_lossy().to_string(),
+        ];
+        Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd: cwd.clone(),
+            model: use_ai,
+            base_ref,
+            conflicts,
+        })
     }
 
     /// Commit the AI-resolved files (`git add -A` + `git commit`) and push
@@ -1026,12 +1508,12 @@ impl DashboardService {
         // Push fallback: upstream HEAD → origin HEAD.
         let mut errors: Vec<String> = Vec::new();
         for remote in ["upstream", "origin"] {
-            let push = time::timeout(
+            let push = with_timeout(
+                "git push",
                 UPDATE_PUSH_TIMEOUT,
                 run_command(&self.git_binary, &["push", remote, "HEAD"], Some(&cwd)),
             )
-            .await
-            .map_err(|_| WisetreeError::other("git push timed out after 60s"))?;
+            .await?;
             match push {
                 Ok(_) => return Ok(UpdatePullRequestOutcome::MergedWithAiResolution),
                 Err(err) => errors.push(format!("{remote}: {err}")),
@@ -1049,6 +1531,232 @@ impl DashboardService {
         match abort {
             Ok(_) => Ok(UpdatePullRequestOutcome::DiscardedAiMerge),
             Err(err) => Ok(UpdatePullRequestOutcome::AbortFailed(err)),
+        }
+    }
+
+    /// Read-only preparation for the "Fill Pull Request" flow. Gathers the
+    /// commit log + diff against `base_ref`, extracts the ticket from the
+    /// branch name, reads the repo's PR template (falling back to the
+    /// embedded one), and renders `prompts/filler.md` into the opencode
+    /// command the UI will spawn. No git mutation happens here — the AI's
+    /// only job is to write `pull_request.md`.
+    pub async fn prepare_fill(
+        &self,
+        worktree_path: &str,
+        branch: &str,
+        base_ref: &str,
+    ) -> Result<FillPreparation> {
+        let cwd = PathBuf::from(worktree_path);
+
+        // Commit log (oldest first) and full diff against the base ref.
+        let log_range = format!("{base_ref}..HEAD");
+        let diff_range = format!("{base_ref}...HEAD");
+        let git_log = with_timeout(
+            "git log",
+            FILL_CONTEXT_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["log", &log_range, "--reverse", "--format=### %s%n%n%b"],
+                Some(&cwd),
+            ),
+        )
+        .await?
+        .unwrap_or_default();
+        let git_diff = with_timeout(
+            "git diff",
+            FILL_CONTEXT_TIMEOUT,
+            run_command(&self.git_binary, &["diff", &diff_range], Some(&cwd)),
+        )
+        .await?
+        .unwrap_or_default();
+
+        if git_diff.trim().is_empty() && git_log.trim().is_empty() {
+            return Ok(FillPreparation::NothingToDescribe);
+        }
+
+        let use_ai = self.config.use_ai.trim().to_string();
+        if use_ai.is_empty() {
+            return Ok(FillPreparation::AiNotConfigured);
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Ok(FillPreparation::AiUnavailable);
+        }
+
+        let ticket = extract_ticket(branch).unwrap_or_default();
+        let template = read_pr_template(&cwd).await;
+        let prompt = build_fill_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
+
+        // Invoke opencode's default TUI (no subcommand) with `--prompt` so
+        // the filler instructions auto-send on launch and `-m <model>` so
+        // the user's configured model is honored — mirrors the merge flow.
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            use_ai.clone(),
+            cwd.to_string_lossy().to_string(),
+        ];
+
+        Ok(FillPreparation::HandedOffToUi {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+            model: use_ai,
+        })
+    }
+
+    /// Open or update the pull request from the drafted title + body. When
+    /// `number` is `Some`, the existing PR's title/body are edited (with any
+    /// media from the old body re-inserted under `# Overview`). When `None`,
+    /// the branch is pushed and a new PR is created.
+    /// Open or update the pull request described by `params`. Labels are
+    /// applied via `--label`/`--add-label`; the PR is always self-assigned
+    /// via `--assignee "@me"` / `--add-assignee "@me"`.
+    pub async fn submit_pull_request(
+        &self,
+        params: &FillSubmitRequest,
+        activity: Option<&mpsc::UnboundedSender<(String, ActivityKind)>>,
+    ) -> Result<FillSubmitOutcome> {
+        let FillSubmitRequest {
+            worktree_path,
+            branch,
+            number,
+            title,
+            body,
+            labels,
+            existing_title,
+            existing_labels,
+        } = params;
+        self.require_gh()?;
+        let cwd = PathBuf::from(worktree_path);
+
+        let emit = |text: &str| {
+            if let Some(tx) = activity {
+                let _ = tx.send((text.to_string(), ActivityKind::Status));
+            }
+        };
+
+        match number {
+            // Update the existing PR's description, preserving any media
+            // (screenshots / videos) GitHub already had in the old body.
+            Some(number) => {
+                let body = match self.fetch_pr_details(*number).await {
+                    Ok(details) => preserve_media(&details.body, body),
+                    // If we can't read the old body, push the new body as-is
+                    // rather than blocking the update entirely.
+                    Err(_) => body.to_string(),
+                };
+                let number_arg = number.to_string();
+                let skip_title = existing_title.as_ref().is_some_and(|t| !t.is_empty());
+                let skip_labels = !existing_labels.is_empty();
+                let emit_title = if skip_title { "(skipped)" } else { "<title>" };
+                let emit_labels = if skip_labels { " (labels skipped)" } else { "" };
+                emit(&format!(
+                    "$ gh pr edit #{number} --title {emit_title} --body <body> --add-assignee @me{emit_labels}"
+                ));
+                let mut edit_args: Vec<String> =
+                    vec!["pr".into(), "edit".into(), number_arg.clone()];
+                if !skip_title {
+                    edit_args.push("--title".into());
+                    edit_args.push(title.into());
+                }
+                edit_args.extend([
+                    "--body".into(),
+                    body.clone(),
+                    "--add-assignee".into(),
+                    "@me".into(),
+                ]);
+                if !skip_labels {
+                    for label in labels {
+                        edit_args.push("--add-label".into());
+                        edit_args.push(label.clone());
+                    }
+                }
+                let edit_args_ref: Vec<&str> = edit_args.iter().map(String::as_str).collect();
+                let edit_result = with_timeout(
+                    "gh pr edit",
+                    FILL_SUBMIT_TIMEOUT,
+                    run_command_streamed(&self.gh_binary, &edit_args_ref, Some(&cwd), activity),
+                )
+                .await?;
+                match edit_result {
+                    Ok(_) => Ok(FillSubmitOutcome::Updated { number: *number }),
+                    Err(err) => Ok(FillSubmitOutcome::SubmitFailed(err)),
+                }
+            }
+            // Create a brand-new PR: push the branch, then `gh pr create`.
+            None => {
+                emit(&format!("$ git push -u origin {branch}"));
+                let push = with_timeout(
+                    "git push",
+                    FILL_PUSH_TIMEOUT,
+                    run_command_streamed(
+                        &self.git_binary,
+                        &["push", "-u", "origin", branch],
+                        Some(&cwd),
+                        activity,
+                    ),
+                )
+                .await?;
+                if let Err(err) = push {
+                    return Ok(FillSubmitOutcome::PushFailed(err));
+                }
+
+                // `--head owner:branch` keeps `gh` from aborting when the
+                // worktree has uncommitted files; fall back to the bare
+                // branch if the owner lookup fails.
+                // Parse owner from `origin` URL so that forks point to the
+                // correct user (not the upstream org that `gh repo view` returns).
+                let origin_url = run_command(
+                    &self.git_binary,
+                    &["remote", "get-url", "origin"],
+                    Some(&cwd),
+                )
+                .await
+                .ok();
+                let owner = origin_url
+                    .as_deref()
+                    .and_then(parse_github_slug)
+                    .map(|(o, _)| o);
+                let head = match owner {
+                    Some(owner) => format!("{owner}:{branch}"),
+                    None => branch.to_string(),
+                };
+                emit(&format!(
+                    "$ gh pr create --title <title> --body <body> --head {head} --assignee @me"
+                ));
+                let mut create_args: Vec<String> = vec![
+                    "pr".into(),
+                    "create".into(),
+                    "--title".into(),
+                    title.into(),
+                    "--body".into(),
+                    body.to_string(),
+                    "--head".into(),
+                    head.clone(),
+                    "--assignee".into(),
+                    "@me".into(),
+                ];
+                for label in labels {
+                    create_args.push("--label".into());
+                    create_args.push(label.clone());
+                }
+                let create_args_ref: Vec<&str> = create_args.iter().map(String::as_str).collect();
+                let create = with_timeout(
+                    "gh pr create",
+                    FILL_SUBMIT_TIMEOUT,
+                    run_command_streamed(&self.gh_binary, &create_args_ref, Some(&cwd), activity),
+                )
+                .await?;
+                match create {
+                    Ok(out) => {
+                        let url = pr_url_from_output(&out);
+                        let number = pr_number_from_url(&url).unwrap_or(0);
+                        Ok(FillSubmitOutcome::Created { number, url })
+                    }
+                    Err(err) => Ok(FillSubmitOutcome::SubmitFailed(err)),
+                }
+            }
         }
     }
 
@@ -1287,6 +1995,58 @@ impl DashboardService {
         })
     }
 
+    /// Best-effort refresh of the PR base branch's remote-tracking ref so the
+    /// dashboard's behind-count reflects commits another developer pushed to
+    /// the base. Without this the count is measured against a possibly-stale
+    /// `origin/main`, so a behind-but-conflict-free PR never surfaces the
+    /// "Update" command in repos that don't enforce up-to-date branches.
+    ///
+    /// Fetches a single branch with an explicit destination refspec
+    /// (`+<branch>:refs/remotes/<remote>/<branch>`) so only the one
+    /// remote-tracking ref `fetch_upstream_diff` reads is updated — no
+    /// `--all`, no extra branches, minimal transfer. Failures (offline, auth,
+    /// missing ref) are swallowed: a stale tracking ref just means the count
+    /// lags until the next successful fetch, never a stalled tick.
+    ///
+    /// Returns `true` only when the fetch actually advanced the base's
+    /// remote-tracking ref, so the caller can re-render the refined
+    /// behind-count exactly when there is new data — and skip the churn when
+    /// the ref was already current.
+    async fn fetch_base_ref(&self) -> bool {
+        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &self.git_root).await
+        else {
+            return false;
+        };
+        let Some((remote, branch)) = base_ref.split_once('/') else {
+            return false;
+        };
+        let before = self.rev_parse(&base_ref).await;
+        let refspec = format!("+{branch}:refs/remotes/{remote}/{branch}");
+        let _ = time::timeout(
+            BASE_FETCH_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["fetch", remote, &refspec],
+                Some(&self.git_root),
+            ),
+        )
+        .await;
+        let after = self.rev_parse(&base_ref).await;
+        after.is_some() && after != before
+    }
+
+    /// Resolve a ref to its commit OID against `git_root`, or `None` when the
+    /// ref is missing. Used to detect whether `fetch_base_ref` moved the base.
+    async fn rev_parse(&self, reference: &str) -> Option<String> {
+        run_command(
+            &self.git_binary,
+            &["rev-parse", "--verify", "--quiet", reference],
+            Some(&self.git_root),
+        )
+        .await
+        .ok()
+    }
+
     async fn fetch_last_commit(
         &self,
         cwd: &Path,
@@ -1326,9 +2086,9 @@ impl DashboardService {
     /// `true` once per refresh period, `false` between periods. Off-cycle
     /// runs still pick up brand-new branches and SHA changes so the UI
     /// keeps up with local commits without disturbing the cycle rhythm.
-    async fn refresh_pull_requests(&self, rows: &[DashboardRow], on_cycle: bool) {
+    async fn refresh_pull_requests(&self, rows: &[DashboardRow], on_cycle: bool) -> bool {
         if !self.pr_enrichment_enabled() || self.is_rate_limited() {
-            return;
+            return false;
         }
 
         let to_fetch: Vec<(String, String)> = {
@@ -1350,11 +2110,11 @@ impl DashboardService {
         };
 
         if to_fetch.is_empty() {
-            return;
+            return false;
         }
 
         let Some((owner, repo)) = self.resolve_repo_slug().await else {
-            return;
+            return false;
         };
 
         let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
@@ -1377,6 +2137,7 @@ impl DashboardService {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
+                true
             }
             Err(err) => {
                 if is_rate_limit_error(&err) {
@@ -1387,6 +2148,7 @@ impl DashboardService {
                 // Failures fall back to cached or empty PR data. Surface a
                 // single dashboard-level notice instead of per-row errors,
                 // because this GraphQL request covers every branch at once.
+                false
             }
         }
     }
@@ -1600,6 +2362,83 @@ fn is_rate_limit_error(err: &str) -> bool {
     lower.contains("rate limit") || lower.contains("rate-limit")
 }
 
+fn pr_refresh_period(_config: &DashboardConfig) -> Duration {
+    Duration::from_millis(PR_REFRESH_PERIOD_MS)
+}
+
+fn wise_merge_candidate(row: &DashboardRow) -> Option<WiseMergeCandidate> {
+    if row.worktree.is_main {
+        return None;
+    }
+    let pr = row.pull_request.as_ref()?;
+    if !matches!(pr.state, PrState::Open) {
+        return None;
+    }
+    if !matches!(pr.checks_status, Some(CheckStatus::Passed)) {
+        return None;
+    }
+    if !matches!(pr.merge_status, Some(MergeStatus::Clean)) {
+        return None;
+    }
+    if !matches!(pr.review_status, None | Some(ReviewStatus::Approved)) {
+        return None;
+    }
+    let base_ref_name = pr
+        .base_ref_name
+        .as_ref()
+        .filter(|value| !value.is_empty())?;
+    let base_repository = pr
+        .base_repository
+        .as_ref()
+        .filter(|value| !value.is_empty())?;
+    let head_ref_oid = pr.head_ref_oid.as_ref().filter(|value| !value.is_empty())?;
+    if !row.worktree.commit.eq_ignore_ascii_case(head_ref_oid) {
+        return None;
+    }
+
+    Some(WiseMergeCandidate {
+        number: pr.number,
+        worktree_path: row.worktree.path.clone(),
+        base_ref_name: base_ref_name.clone(),
+        base_repository: base_repository.clone(),
+        head_ref_oid: head_ref_oid.clone(),
+    })
+}
+
+fn validate_wise_merge_base(candidate: &WiseMergeCandidate, base_ref: &str) -> Result<()> {
+    let expected_base = branch_name_from_ref(base_ref);
+    if candidate.base_ref_name == expected_base {
+        Ok(())
+    } else {
+        Err(WisetreeError::other(format!(
+            "PR base `{}` does not match resolved base ref `{base_ref}`.",
+            candidate.base_ref_name
+        )))
+    }
+}
+
+fn validate_wise_merge_repository(candidate: &WiseMergeCandidate, base_repo: &str) -> Result<()> {
+    if candidate.base_repository == base_repo {
+        Ok(())
+    } else {
+        Err(WisetreeError::other(format!(
+            "PR base repository `{}` does not match resolved base repository `{base_repo}`.",
+            candidate.base_repository
+        )))
+    }
+}
+
+fn branch_name_from_ref(base_ref: &str) -> &str {
+    base_ref
+        .split_once('/')
+        .map(|(_, branch)| branch)
+        .unwrap_or(base_ref)
+}
+
+fn remote_name_from_ref(base_ref: &str) -> Option<&str> {
+    base_ref.split_once('/').map(|(remote, _)| remote)
+}
+
 fn summarize_notice_text(message: &str) -> String {
     let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
@@ -1635,7 +2474,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft mergeStateStatus reviewDecision reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft baseRefName baseRepository {{ nameWithOwner }} headRefOid mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -1783,11 +2622,22 @@ fn parse_graphql_response(
                     Some("CLEAN") => Some(MergeStatus::Clean),
                     _ => None,
                 };
+                let labels = node
+                    .labels
+                    .nodes
+                    .into_iter()
+                    .filter(|l| !l.name.is_empty())
+                    .map(|l| l.name)
+                    .collect();
                 PullRequest {
                     number: node.number,
                     state,
                     url: node.url,
                     title: node.title,
+                    base_ref_name: node.base_ref_name,
+                    base_repository: node.base_repository.and_then(|repo| repo.name_with_owner),
+                    head_ref_oid: node.head_ref_oid,
+                    labels,
                     checks_status,
                     review_status,
                     merge_status,
@@ -1883,6 +2733,21 @@ struct GhReviewAuthor {
     #[serde(default)]
     login: Option<String>,
 }
+#[derive(Deserialize, Default)]
+struct GhLabelNode {
+    #[serde(default)]
+    name: String,
+}
+#[derive(Deserialize, Default)]
+struct GhLabels {
+    #[serde(default)]
+    nodes: Vec<GhLabelNode>,
+}
+#[derive(Deserialize, Default)]
+struct GhBaseRepository {
+    #[serde(rename = "nameWithOwner", default)]
+    name_with_owner: Option<String>,
+}
 #[derive(Deserialize)]
 struct GhNode {
     number: u64,
@@ -1891,10 +2756,18 @@ struct GhNode {
     title: String,
     #[serde(rename = "isDraft")]
     is_draft: bool,
+    #[serde(rename = "baseRefName", default)]
+    base_ref_name: Option<String>,
+    #[serde(rename = "baseRepository", default)]
+    base_repository: Option<GhBaseRepository>,
+    #[serde(rename = "headRefOid", default)]
+    head_ref_oid: Option<String>,
     #[serde(rename = "mergeStateStatus", default)]
     merge_state_status: Option<String>,
     #[serde(rename = "reviewDecision", default)]
     review_decision: Option<String>,
+    #[serde(default)]
+    labels: GhLabels,
     #[serde(rename = "reviewRequests", default)]
     review_requests: GhReviewRequests,
     #[serde(rename = "latestOpinionatedReviews", default)]
@@ -2127,6 +3000,16 @@ fn parse_shortstat(output: &str) -> (u64, u64) {
     (insertions, deletions)
 }
 
+async fn with_timeout<T>(
+    name: &str,
+    timeout: Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    time::timeout(timeout, fut)
+        .await
+        .map_err(|_| WisetreeError::other(format!("{name} timed out after {}s", timeout.as_secs())))
+}
+
 async fn run_command(
     binary: &Path,
     args: &[&str],
@@ -2147,6 +3030,79 @@ async fn run_command(
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Run a command and stream each line of stdout/stderr through `activity` as
+/// it arrives. Returns stdout on success or stderr on failure, same as
+/// `run_command`. When `activity` is `None` the function falls back to the
+/// non-streaming `run_command` path.
+async fn run_command_streamed(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    activity: Option<&mpsc::UnboundedSender<(String, ActivityKind)>>,
+) -> std::result::Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let Some(tx) = activity else {
+        return run_command(binary, args, cwd).await;
+    };
+
+    let mut cmd = Command::new(binary);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let mut out_lines = BufReader::new(stdout).lines();
+    let mut err_lines = BufReader::new(stderr).lines();
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+    let mut out_done = false;
+    let mut err_done = false;
+
+    while !out_done || !err_done {
+        tokio::select! {
+            line = out_lines.next_line(), if !out_done => {
+                match line {
+                    Ok(Some(l)) => {
+                        let clean = l.trim_end_matches('\r').to_string();
+                        if !clean.is_empty() {
+                            let _ = tx.send((clean, ActivityKind::Stdout));
+                        }
+                        stdout_buf.push_str(&l);
+                        stdout_buf.push('\n');
+                    }
+                    _ => out_done = true,
+                }
+            }
+            line = err_lines.next_line(), if !err_done => {
+                match line {
+                    Ok(Some(l)) => {
+                        let clean = l.trim_end_matches('\r').to_string();
+                        if !clean.is_empty() {
+                            let _ = tx.send((clean, ActivityKind::Stderr));
+                        }
+                        stderr_buf.push_str(&l);
+                        stderr_buf.push('\n');
+                    }
+                    _ => err_done = true,
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(stdout_buf.trim().to_string())
+    } else {
+        Err(stderr_buf.trim().to_string())
     }
 }
 
@@ -2204,6 +3160,22 @@ pub fn is_behind(row: &DashboardRow) -> bool {
         .map(|status| status.behind > 0)
         .unwrap_or(false);
     merge_says_behind || git_says_behind
+}
+
+/// Number of commits that local HEAD has that the tracking remote
+/// (`@{upstream}`) does not. Returns 0 when the tracking ref is not
+/// configured or the count cannot be parsed — a safe fallback that
+/// avoids a spurious push when the tracking state is unknown.
+async fn local_ahead_of_tracking(git_binary: &Path, cwd: &Path) -> u64 {
+    run_command(
+        git_binary,
+        &["rev-list", "--count", "@{upstream}..HEAD"],
+        Some(cwd),
+    )
+    .await
+    .ok()
+    .and_then(|out| out.trim().parse::<u64>().ok())
+    .unwrap_or(0)
 }
 
 /// Count of commits HEAD is behind `base_ref`. `None` when the count
@@ -2268,8 +3240,229 @@ fn build_merge_prompt(base_ref: &str, conflicts: &[String]) -> String {
         .replace("CONFLICTED_FILES", &bulleted)
 }
 
+/// Fallback PR template used when the repo ships none of the well-known
+/// template files. Mirrors the `filler` skill's reference template so the
+/// native flow produces the same section layout the team is used to.
+const FILL_TEMPLATE_FALLBACK: &str = "# Description ✍️
+
+Brief explanation of the PR purpose
+
+
+# Overview 🔍
+
+Overview of the feature if possible (screenshot, gif, etc)
+
+
+# Test Guidance 🦮
+
+Step-by-step process to test the changes related to this Pull Request
+
+
+# Ticket 🎫
+
+[{{ACRONYM}}-{{NUMBER}}](link/to/{{ACRONYM}}-{{NUMBER}})
+";
+
+/// Extract a ticket id from a branch name. Matches the `filler`/`creator`
+/// skills: acronym `DIGIT` or `DPMS` (case-insensitive), an optional
+/// hyphen, then digits — normalized to uppercase `ACRONYM-NUM`.
+fn extract_ticket(branch: &str) -> Option<String> {
+    static TICKET: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(DIGIT|DPMS)-?(\d+)").unwrap());
+    let caps = TICKET.captures(branch)?;
+    let acronym = caps.get(1)?.as_str().to_uppercase();
+    let number = caps.get(2)?.as_str();
+    Some(format!("{acronym}-{number}"))
+}
+
+/// Read the repository's PR template, trying the well-known locations in
+/// order and falling back to the embedded default. Searched relative to the
+/// worktree so each checkout's `.github/` is honored.
+async fn read_pr_template(cwd: &Path) -> String {
+    const CANDIDATES: [&str; 7] = [
+        ".github/pull_request_template.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        ".github/PULL_REQUEST_TEMPLATE/pull_request_template.md",
+        "docs/pull_request_template.md",
+        "docs/PULL_REQUEST_TEMPLATE.md",
+        "pull_request_template.md",
+        "PULL_REQUEST_TEMPLATE.md",
+    ];
+    for rel in CANDIDATES {
+        if let Ok(content) = tokio::fs::read_to_string(cwd.join(rel)).await {
+            if !content.trim().is_empty() {
+                return content;
+            }
+        }
+    }
+    FILL_TEMPLATE_FALLBACK.to_string()
+}
+
+/// Render `prompts/filler.md` into a concrete prompt by substituting the
+/// harness-gathered inputs. The diff is embedded last (and truncated if
+/// huge) so the earlier placeholder substitutions never scan the diff body.
+fn build_fill_prompt(
+    base_ref: &str,
+    branch: &str,
+    ticket: &str,
+    git_log: &str,
+    git_diff: &str,
+    template: &str,
+) -> String {
+    const FILLER_PROMPT: &str = include_str!("../../prompts/filler.md");
+    let diff = truncate_for_prompt(git_diff, FILL_DIFF_MAX_BYTES);
+    FILLER_PROMPT
+        .replace("BASE_REF", base_ref)
+        .replace("CURRENT_BRANCH", branch)
+        .replace("TICKET", ticket)
+        .replace("PR_TEMPLATE", template)
+        .replace("GIT_LOG", git_log)
+        .replace("GIT_DIFF", &diff)
+}
+
+/// Truncate `text` to at most `max_bytes` on a UTF-8 char boundary,
+/// appending a marker so the reader knows the content was clipped.
+fn truncate_for_prompt(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[... diff truncated at ~{} KB — describe the overall change; \
+         the full diff exceeds the prompt budget ...]",
+        &text[..end],
+        max_bytes / 1000
+    )
+}
+
+/// Parse a drafted `pull_request.md`: the first non-empty line is the PR
+/// title (any leading `# ` is stripped), everything after it (leading blank
+/// lines trimmed) is the body, and any `<!-- wisetree-labels: ... -->` comment
+/// is extracted as the label list (and stripped from the body).
+/// Returns `None` when there is no title.
+pub fn parse_pull_request_md(content: &str) -> Option<(String, String, Vec<String>)> {
+    let mut lines = content.lines();
+    let title_line = lines.by_ref().find(|line| !line.trim().is_empty())?;
+    let title = title_line.trim().trim_start_matches('#').trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let raw_body = lines.collect::<Vec<_>>().join("\n");
+    let raw_body = raw_body.trim_start().to_string();
+    let (body, labels) = extract_wisetree_labels(&raw_body);
+    Some((title, body, labels))
+}
+
+/// Extract `<!-- wisetree-labels: label1, label2 -->` from a PR body,
+/// returning the cleaned body (comment stripped) and the parsed label list.
+fn extract_wisetree_labels(body: &str) -> (String, Vec<String>) {
+    static LABELS_COMMENT: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?m)^[ \t]*<!--\s*wisetree-labels:\s*([^-]*?)-->\s*\n?").unwrap()
+    });
+    match LABELS_COMMENT.captures(body) {
+        Some(cap) => {
+            let labels_str = cap[1].trim();
+            let labels = if labels_str.is_empty() {
+                vec![]
+            } else {
+                labels_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            let clean = LABELS_COMMENT.replace(body, "").trim_start().to_string();
+            (clean, labels)
+        }
+        None => (body.to_string(), vec![]),
+    }
+}
+
+/// Pull every media reference out of a PR body in first-seen order:
+/// markdown images, `<img>`/`<video>` tags, and bare GitHub asset URLs
+/// (`.../assets/...`, `user-images.githubusercontent.com/...`). Used to
+/// carry screenshots/videos across a description rewrite.
+fn extract_media(body: &str) -> Vec<String> {
+    static MEDIA: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?is)!\[[^\]]*\]\([^)]*\)|<img[^>]*>|<video[^>]*>.*?</video>|<video[^>]*/?>|https?://github\.com/[^\s)]+/assets/[^\s)]+|https?://user-images\.githubusercontent\.com/[^\s)]+",
+        )
+        .unwrap()
+    });
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for m in MEDIA.find_iter(body) {
+        let snippet = m.as_str().trim().to_string();
+        if !snippet.is_empty() && seen.insert(snippet.clone()) {
+            out.push(snippet);
+        }
+    }
+    out
+}
+
+/// Re-insert media from `old_body` into `new_body` immediately under the
+/// `# Overview` heading, skipping anything already present. When the new
+/// body has no Overview section the media is appended under a fresh one.
+fn preserve_media(old_body: &str, new_body: &str) -> String {
+    let fresh: Vec<String> = extract_media(old_body)
+        .into_iter()
+        .filter(|m| !new_body.contains(m.as_str()))
+        .collect();
+    if fresh.is_empty() {
+        return new_body.to_string();
+    }
+    let block = fresh.join("\n\n");
+    let lines: Vec<&str> = new_body.lines().collect();
+    let overview = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('#') && trimmed.to_lowercase().contains("overview")
+    });
+    match overview {
+        Some(idx) => {
+            let insert_at = idx + 1;
+            let mut result = lines[..insert_at].join("\n");
+            result.push_str("\n\n");
+            result.push_str(&block);
+            if insert_at < lines.len() {
+                result.push('\n');
+                result.push('\n');
+                result.push_str(&lines[insert_at..].join("\n"));
+            } else {
+                result.push('\n');
+            }
+            result
+        }
+        None => format!("{}\n\n# Overview 🔍\n\n{block}\n", new_body.trim_end()),
+    }
+}
+
+/// First http(s) URL on the last non-empty line of `gh pr create` output —
+/// gh prints the new PR's URL as the final line on success.
+fn pr_url_from_output(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.split_whitespace()
+                .find(|token| token.starts_with("http"))
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the numeric PR id from a `.../pull/<n>` GitHub URL.
+fn pr_number_from_url(url: &str) -> Option<u64> {
+    let tail = url.rsplit("/pull/").next()?;
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().ok()
+}
+
 pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -> Option<String> {
-    if config.show_pull_requests && !gh_available {
+    if config.wise_merge && !config.show_pull_requests {
+        Some("Wise Merge requires showPullRequests=true; automatic merge paused.".to_string())
+    } else if config.show_pull_requests && !gh_available {
         Some("gh CLI not found - PR column hidden.".to_string())
     } else {
         None
@@ -2305,6 +3498,38 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_executable(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    // Hermetic git helper: never depend on the machine's global identity/config.
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        use std::process::Command;
+
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {cwd:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
 
     #[test]
     fn classify_merge_output_recognizes_already_up_to_date() {
@@ -2392,6 +3617,216 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn automatic_repo_pinned_helpers_pass_repo_to_gh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("gh.log");
+        let gh_path = dir.path().join("fake-gh.sh");
+        std::fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n  printf '{{\"title\":\"Subject\",\"body\":\"Body\"}}'\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  exit 0\nfi\nexit 1\n",
+                log = log_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&gh_path);
+
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_gh_binary(gh_path);
+        let details = service
+            .fetch_pr_details_for_repo(7, "owner/repo")
+            .await
+            .expect("details");
+        assert_eq!(details.title, "Subject");
+        service
+            .merge_pull_request_in_repo(7, &details.title, &details.body, "owner/repo", "abc123")
+            .await
+            .expect("merge");
+
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(
+            log.contains("pr view 7 --json title,body --repo owner/repo"),
+            "automatic detail fetch must pin --repo; log was {log:?}"
+        );
+        assert!(
+            log.contains("pr merge 7 --squash --subject Subject (#7) --body Body --repo owner/repo --match-head-commit abc123"),
+            "automatic merge must pin --repo and --match-head-commit; log was {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_base_ref_advances_stale_remote_tracking_ref() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+
+        // Bare remote (the shared base), with `main` as its default branch.
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // A working clone seeds `main` and pushes it to the remote.
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("a.txt"), "1").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // The repo the dashboard polls: a fresh clone, so origin/main matches
+        // the seed commit.
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, local.to_str().unwrap()],
+        );
+        let stale = git(&local, &["rev-parse", "origin/main"]);
+
+        // Another developer pushes a new commit to the base branch.
+        std::fs::write(work.join("b.txt"), "2").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "second"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        let advanced = git(&work, &["rev-parse", "HEAD"]);
+
+        // The dashboard's clone hasn't fetched yet, so its origin/main is stale.
+        assert_ne!(stale, advanced);
+        assert_eq!(git(&local, &["rev-parse", "origin/main"]), stale);
+
+        // fetch_base_ref refreshes only the base's remote-tracking ref.
+        let service = DashboardService::new(local.clone(), DashboardConfig::default());
+        let did_advance = service.fetch_base_ref().await;
+
+        assert!(
+            did_advance,
+            "fetch_base_ref should report that the base ref advanced"
+        );
+        assert_eq!(
+            git(&local, &["rev-parse", "origin/main"]),
+            advanced,
+            "fetch_base_ref should advance origin/main to the newly pushed commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_base_ref_reports_no_change_when_base_is_current() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+
+        // Bare remote (the shared base), with `main` as its default branch.
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // A working clone seeds `main` and pushes it to the remote.
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("a.txt"), "1").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // The dashboard's clone is current with the base — nobody pushed since.
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, local.to_str().unwrap()],
+        );
+
+        let service = DashboardService::new(local.clone(), DashboardConfig::default());
+        let did_advance = service.fetch_base_ref().await;
+
+        assert!(
+            !did_advance,
+            "fetch_base_ref should report no change when the base ref is already current"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_watch_aborts_tracked_wise_merge_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_cache_path(None);
+        let watch = service.watch();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_task = completed.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            completed_in_task.store(true, Ordering::SeqCst);
+        });
+        service
+            .wise_merge_tasks
+            .lock()
+            .expect("wise_merge_tasks poisoned")
+            .push(task);
+
+        drop(watch);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "tracked Wise Merge task should be aborted before it completes"
+        );
+        assert!(
+            service
+                .wise_merge_tasks
+                .lock()
+                .expect("wise_merge_tasks poisoned")
+                .is_empty(),
+            "dropping the watch should drain tracked Wise Merge handles"
+        );
+    }
+
+    #[test]
+    fn wise_merge_does_not_shorten_github_pr_refresh_period() {
+        let config = DashboardConfig {
+            wise_merge: true,
+            ..DashboardConfig::default()
+        };
+        assert_eq!(
+            pr_refresh_period(&config),
+            Duration::from_millis(PR_REFRESH_PERIOD_MS)
+        );
+    }
+
+    #[test]
+    fn finish_wise_merge_marks_cached_pr_as_merged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_cache_path(None);
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let pr = row.pull_request.expect("pull request");
+        {
+            let mut state = service.pr_state.lock().expect("pr_state poisoned");
+            state.entries.insert(
+                "feature".to_string(),
+                PrCacheEntry {
+                    sha: "abc123".to_string(),
+                    pull_request: Some(pr),
+                },
+            );
+        }
+
+        service.finish_wise_merge(42, Ok("upstream/main".to_string()));
+
+        let state = service.pr_state.lock().expect("pr_state poisoned");
+        let pr = state
+            .entries
+            .get("feature")
+            .and_then(|entry| entry.pull_request.as_ref())
+            .expect("cached pull request");
+        assert_eq!(pr.state, PrState::Merged);
+        assert!(state.dirty);
+    }
+
     #[test]
     fn parses_github_ssh_scp_form() {
         assert_eq!(
@@ -2453,6 +3888,10 @@ mod tests {
             q.contains("statusCheckRollup"),
             "query must request statusCheckRollup so the dashboard can colour the Opened circle: {q}"
         );
+        assert!(q.contains("baseRefName"));
+        assert!(q.contains("baseRepository"));
+        assert!(q.contains("nameWithOwner"));
+        assert!(q.contains("headRefOid"));
         assert!(q.contains("commits(last: 1)"));
         assert!(q.contains("__typename"));
         assert!(q.contains("CheckRun"));
@@ -2464,13 +3903,17 @@ mod tests {
         let body = r#"{
           "data": {
             "repository": {
-              "b0": {"nodes": [{"number": 7, "state": "OPEN", "url": "u", "title": "t", "isDraft": false}]},
+              "b0": {"nodes": [{"number": 7, "state": "OPEN", "url": "u", "title": "t", "isDraft": false, "baseRefName": "main", "baseRepository": {"nameWithOwner": "owner/repo"}, "headRefOid": "abc123"}]},
               "b1": {"nodes": []}
             }
           }
         }"#;
         let out = parse_graphql_response(body, &["feat", "fix"]).unwrap();
-        assert_eq!(out.get("feat").unwrap().as_ref().unwrap().number, 7);
+        let pr = out.get("feat").unwrap().as_ref().unwrap();
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.base_ref_name.as_deref(), Some("main"));
+        assert_eq!(pr.base_repository.as_deref(), Some("owner/repo"));
+        assert_eq!(pr.head_ref_oid.as_deref(), Some("abc123"));
         assert!(out.get("fix").unwrap().is_none());
     }
 
@@ -2758,6 +4201,120 @@ mod tests {
 
     fn logins<I: IntoIterator<Item = &'static str>>(values: I) -> HashSet<String> {
         values.into_iter().map(String::from).collect()
+    }
+
+    fn wise_merge_row(review_status: Option<ReviewStatus>) -> DashboardRow {
+        DashboardRow {
+            worktree: GitWorktree {
+                path: "/tmp/repo-feature".to_string(),
+                branch: "feature".to_string(),
+                commit: "abc123".to_string(),
+                is_main: false,
+                is_clean: true,
+                branch_status: None,
+            },
+            last_commit: None,
+            pull_request: Some(PullRequest {
+                number: 42,
+                state: PrState::Open,
+                url: "https://github.com/example/repo/pull/42".to_string(),
+                title: "Ready".to_string(),
+                base_ref_name: Some("main".to_string()),
+                base_repository: Some("example/repo".to_string()),
+                head_ref_oid: Some("abc123".to_string()),
+                labels: vec![],
+                checks_status: Some(CheckStatus::Passed),
+                review_status,
+                merge_status: Some(MergeStatus::Clean),
+                reviewers: ReviewerSummary::default(),
+            }),
+            ai_status: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn wise_merge_candidate_accepts_approved_clean_passed_pr() {
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let candidate = wise_merge_candidate(&row).expect("ready PR should match");
+        assert_eq!(candidate.number, 42);
+        assert_eq!(candidate.worktree_path, "/tmp/repo-feature");
+        assert_eq!(candidate.base_ref_name, "main");
+        assert_eq!(candidate.base_repository, "example/repo");
+        assert_eq!(candidate.head_ref_oid, "abc123");
+    }
+
+    #[test]
+    fn wise_merge_candidate_accepts_clean_passed_pr_without_review_requirement() {
+        let row = wise_merge_row(None);
+        assert!(wise_merge_candidate(&row).is_some());
+    }
+
+    #[test]
+    fn wise_merge_candidate_rejects_pending_reviews_or_unclean_merge_state() {
+        let pending = wise_merge_row(Some(ReviewStatus::Pending));
+        assert!(wise_merge_candidate(&pending).is_none());
+
+        let mut dirty = wise_merge_row(Some(ReviewStatus::Approved));
+        dirty.pull_request.as_mut().unwrap().merge_status = Some(MergeStatus::Dirty);
+        assert!(wise_merge_candidate(&dirty).is_none());
+    }
+
+    #[test]
+    fn wise_merge_candidate_rejects_failed_checks_and_non_open_prs() {
+        let mut failed = wise_merge_row(Some(ReviewStatus::Approved));
+        failed.pull_request.as_mut().unwrap().checks_status = Some(CheckStatus::Failed);
+        assert!(wise_merge_candidate(&failed).is_none());
+
+        let mut merged = wise_merge_row(Some(ReviewStatus::Approved));
+        merged.pull_request.as_mut().unwrap().state = PrState::Merged;
+        assert!(wise_merge_candidate(&merged).is_none());
+    }
+
+    #[test]
+    fn wise_merge_candidate_rejects_missing_safety_fields() {
+        let mut missing_base = wise_merge_row(Some(ReviewStatus::Approved));
+        missing_base.pull_request.as_mut().unwrap().base_ref_name = None;
+        assert!(wise_merge_candidate(&missing_base).is_none());
+
+        let mut missing_head = wise_merge_row(Some(ReviewStatus::Approved));
+        missing_head.pull_request.as_mut().unwrap().head_ref_oid = None;
+        assert!(wise_merge_candidate(&missing_head).is_none());
+
+        let mut missing_repository = wise_merge_row(Some(ReviewStatus::Approved));
+        missing_repository
+            .pull_request
+            .as_mut()
+            .unwrap()
+            .base_repository = None;
+        assert!(wise_merge_candidate(&missing_repository).is_none());
+    }
+
+    #[test]
+    fn wise_merge_candidate_rejects_remote_head_that_differs_from_worktree_head() {
+        let mut row = wise_merge_row(Some(ReviewStatus::Approved));
+        row.pull_request.as_mut().unwrap().head_ref_oid = Some("def456".to_string());
+        assert!(wise_merge_candidate(&row).is_none());
+    }
+
+    #[test]
+    fn wise_merge_base_validation_requires_pr_base_to_match_resolved_base_ref_branch() {
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let candidate = wise_merge_candidate(&row).expect("candidate");
+        assert!(validate_wise_merge_base(&candidate, "upstream/main").is_ok());
+
+        let err = validate_wise_merge_base(&candidate, "upstream/develop").unwrap_err();
+        assert!(format!("{err}").contains("does not match resolved base ref"));
+    }
+
+    #[test]
+    fn wise_merge_repository_validation_requires_pr_base_repo_to_match_base_remote_repo() {
+        let row = wise_merge_row(Some(ReviewStatus::Approved));
+        let candidate = wise_merge_candidate(&row).expect("candidate");
+        assert!(validate_wise_merge_repository(&candidate, "example/repo").is_ok());
+
+        let err = validate_wise_merge_repository(&candidate, "other/repo").unwrap_err();
+        assert!(format!("{err}").contains("does not match resolved base repository"));
     }
 
     #[test]
@@ -3059,5 +4616,135 @@ mod tests {
             subject_with_pr_reference("Add merge action (#99)", 7),
             "Add merge action (#99) (#7)"
         );
+    }
+
+    #[test]
+    fn extract_ticket_normalizes_acronym_and_hyphen() {
+        assert_eq!(
+            extract_ticket("digit3131-add-retry"),
+            Some("DIGIT-3131".into())
+        );
+        assert_eq!(extract_ticket("DIGIT-42-fix"), Some("DIGIT-42".into()));
+        assert_eq!(
+            extract_ticket("feature/dpms-9-thing"),
+            Some("DPMS-9".into())
+        );
+        assert_eq!(extract_ticket("just-a-branch"), None);
+    }
+
+    #[test]
+    fn parse_pull_request_md_splits_title_and_body() {
+        let md = "DIGIT-3131 Add payment retry logic\n\n# Description ✍️\n\nDetails here.";
+        let (title, body, labels) = parse_pull_request_md(md).expect("parsed");
+        assert_eq!(title, "DIGIT-3131 Add payment retry logic");
+        assert!(body.starts_with("# Description ✍️"));
+        assert!(body.contains("Details here."));
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn parse_pull_request_md_strips_heading_marker_from_title() {
+        let md = "# My title line\n\nbody";
+        let (title, body, labels) = parse_pull_request_md(md).expect("parsed");
+        assert_eq!(title, "My title line");
+        assert_eq!(body, "body");
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn parse_pull_request_md_returns_none_when_empty() {
+        assert!(parse_pull_request_md("\n\n   \n").is_none());
+    }
+
+    #[test]
+    fn parse_pull_request_md_extracts_wisetree_labels() {
+        let md = "Fix login crash\n<!-- wisetree-labels: bug 🐛, security 🛡️ -->\n\n# Description\n\nDetails.";
+        let (title, body, labels) = parse_pull_request_md(md).expect("parsed");
+        assert_eq!(title, "Fix login crash");
+        assert!(
+            !body.contains("wisetree-labels"),
+            "comment should be stripped from body"
+        );
+        assert_eq!(labels, vec!["bug 🐛", "security 🛡️"]);
+    }
+
+    #[test]
+    fn parse_pull_request_md_handles_single_label() {
+        let md = "Add docs\n<!-- wisetree-labels: documentation 📖 -->\n\n# Description\n\nBody.";
+        let (_, _, labels) = parse_pull_request_md(md).expect("parsed");
+        assert_eq!(labels, vec!["documentation 📖"]);
+    }
+
+    #[test]
+    fn build_fill_prompt_substitutes_all_inputs() {
+        let prompt = build_fill_prompt(
+            "upstream/main",
+            "digit-3131-retry",
+            "DIGIT-3131",
+            "### Add retry\n\nbody",
+            "diff --git a/x b/x",
+            "# Description ✍️",
+        );
+        assert!(!prompt.contains("BASE_REF"));
+        assert!(!prompt.contains("GIT_DIFF"));
+        assert!(!prompt.contains("GIT_LOG"));
+        assert!(!prompt.contains("PR_TEMPLATE"));
+        assert!(prompt.contains("upstream/main"));
+        assert!(prompt.contains("DIGIT-3131"));
+        assert!(prompt.contains("diff --git a/x b/x"));
+    }
+
+    #[test]
+    fn truncate_for_prompt_caps_oversized_diff() {
+        let big = "x".repeat(10);
+        let out = truncate_for_prompt(&big, 4);
+        assert!(out.starts_with("xxxx"));
+        assert!(out.contains("truncated"));
+        let small = "tiny";
+        assert_eq!(truncate_for_prompt(small, 100), "tiny");
+    }
+
+    #[test]
+    fn preserve_media_reinserts_under_overview() {
+        let old = "# Description\n\nstuff\n\n# Overview\n\n![shot](https://user-images.githubusercontent.com/1/a.png)\n";
+        let new = "# Description ✍️\n\nNew description\n\n# Overview 🔍\n\nplaceholder\n\n# Test Guidance\n\nsteps";
+        let merged = preserve_media(old, new);
+        assert!(merged.contains("![shot](https://user-images.githubusercontent.com/1/a.png)"));
+        let overview_idx = merged.find("# Overview").unwrap();
+        let media_idx = merged.find("![shot]").unwrap();
+        let guidance_idx = merged.find("# Test Guidance").unwrap();
+        // Media lands after the Overview heading but before Test Guidance.
+        assert!(overview_idx < media_idx && media_idx < guidance_idx);
+    }
+
+    #[test]
+    fn preserve_media_no_media_returns_body_unchanged() {
+        let old = "# Overview\n\njust text, no media";
+        let new = "# Overview 🔍\n\nfresh";
+        assert_eq!(preserve_media(old, new), new);
+    }
+
+    #[test]
+    fn preserve_media_skips_media_already_present() {
+        let token = "![s](https://github.com/o/r/assets/1/2)";
+        let old = format!("# Overview\n\n{token}");
+        let new = format!("# Overview 🔍\n\n{token}");
+        // Already present in the new body → not duplicated.
+        assert_eq!(preserve_media(&old, &new), new);
+    }
+
+    #[test]
+    fn pr_number_from_url_parses_pull_path() {
+        assert_eq!(
+            pr_number_from_url("https://github.com/o/r/pull/321"),
+            Some(321)
+        );
+        assert_eq!(pr_number_from_url("https://github.com/o/r"), None);
+    }
+
+    #[test]
+    fn pr_url_from_output_finds_last_url_line() {
+        let out = "Warning: 3 uncommitted changes\nhttps://github.com/o/r/pull/9";
+        assert_eq!(pr_url_from_output(out), "https://github.com/o/r/pull/9");
     }
 }

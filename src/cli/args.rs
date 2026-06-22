@@ -92,6 +92,18 @@ pub struct ParsedArgs {
     pub cli_args: Option<CliArgs>,
 }
 
+impl ParsedArgs {
+    fn special(help: bool, version: bool) -> Self {
+        Self {
+            mode: AppMode::Menu,
+            help,
+            version,
+            is_from_wrapper: false,
+            cli_args: None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ArgError {
     #[error("Unknown option: {0}")]
@@ -136,28 +148,28 @@ where
             "-w" | "--watch" => watch = true,
             "-f" | "--force" => force = true,
             "-m" | "--mode" => {
-                mode_arg = Some(take_value(&raw, &mut i, token)?);
+                mode_arg = Some(parse_value_arg(&raw, &mut i, token, "--mode")?);
             }
             "-n" | "--name" => {
-                name = Some(take_value(&raw, &mut i, token)?);
+                name = Some(parse_value_arg(&raw, &mut i, token, "--name")?);
             }
             "-s" | "--source" => {
-                source = Some(take_value(&raw, &mut i, token)?);
+                source = Some(parse_value_arg(&raw, &mut i, token, "--source")?);
             }
             "-b" | "--branch" => {
-                branch = Some(take_value(&raw, &mut i, token)?);
+                branch = Some(parse_value_arg(&raw, &mut i, token, "--branch")?);
             }
             t if t.starts_with("--mode=") => {
-                mode_arg = Some(t["--mode=".len()..].to_string());
+                mode_arg = Some(parse_value_arg(&raw, &mut i, t, "--mode")?);
             }
             t if t.starts_with("--name=") => {
-                name = Some(t["--name=".len()..].to_string());
+                name = Some(parse_value_arg(&raw, &mut i, t, "--name")?);
             }
             t if t.starts_with("--source=") => {
-                source = Some(t["--source=".len()..].to_string());
+                source = Some(parse_value_arg(&raw, &mut i, t, "--source")?);
             }
             t if t.starts_with("--branch=") => {
-                branch = Some(t["--branch=".len()..].to_string());
+                branch = Some(parse_value_arg(&raw, &mut i, t, "--branch")?);
             }
             t if t.starts_with("--") || (t.starts_with('-') && t.len() > 1) => {
                 return Err(ArgError::Unknown(t.to_string()));
@@ -168,22 +180,10 @@ where
     }
 
     if help {
-        return Ok(ParsedArgs {
-            mode: AppMode::Menu,
-            help: true,
-            version: false,
-            is_from_wrapper: false,
-            cli_args: None,
-        });
+        return Ok(ParsedArgs::special(true, false));
     }
     if version {
-        return Ok(ParsedArgs {
-            mode: AppMode::Menu,
-            help: false,
-            version: true,
-            is_from_wrapper: false,
-            cli_args: None,
-        });
+        return Ok(ParsedArgs::special(false, true));
     }
 
     // Mode resolution: explicit `--mode <x>` first, then a positional command,
@@ -258,6 +258,21 @@ fn take_value(raw: &[String], i: &mut usize, flag: &str) -> Result<String, ArgEr
         .ok_or_else(|| ArgError::MissingValue(flag.to_string()))?;
     *i += 1;
     Ok(next.clone())
+}
+
+/// Read a value supplied either as a separate token (`--name foo`) or inline
+/// (`--name=foo`). The inline form does not consume the next token.
+fn parse_value_arg(
+    raw: &[String],
+    i: &mut usize,
+    token: &str,
+    long: &str,
+) -> Result<String, ArgError> {
+    if let Some(rest) = token.strip_prefix(&format!("{long}=")) {
+        Ok(rest.to_string())
+    } else {
+        take_value(raw, i, token)
+    }
 }
 
 /// Hand-written help text that mirrors `showHelp()` from upstream verbatim,

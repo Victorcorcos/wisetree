@@ -203,14 +203,14 @@ impl WorktreeService {
             outcome.link_report = Some(report);
         }
 
-        if !config.post_create_cmd.is_empty() {
-            let variables = TemplateVariables {
-                base_path: repository_base_name(&git_root),
-                worktree_path: worktree_path_str.clone(),
-                branch_name: options.new_branch.clone(),
-                source_branch: options.source_branch.clone(),
-            };
+        let variables = TemplateVariables {
+            base_path: repository_base_name(&git_root),
+            worktree_path: worktree_path_str.clone(),
+            branch_name: options.new_branch.clone(),
+            source_branch: options.source_branch.clone(),
+        };
 
+        if !config.post_create_cmd.is_empty() {
             let runs = execute_post_create_commands(
                 &config.post_create_cmd,
                 &variables,
@@ -222,12 +222,6 @@ impl WorktreeService {
         }
 
         if !config.terminal_command.trim().is_empty() {
-            let variables = TemplateVariables {
-                base_path: repository_base_name(&git_root),
-                worktree_path: worktree_path_str.clone(),
-                branch_name: options.new_branch.clone(),
-                source_branch: options.source_branch.clone(),
-            };
             let launch = open_terminal(&config.terminal_command, &variables);
             outcome.terminal_launch = Some(launch);
         }
@@ -240,9 +234,18 @@ impl WorktreeService {
     pub async fn delete_worktree(&self, worktree_path: &str, force: bool) -> Result<DeleteOutcome> {
         let config = self.config_service.config().clone();
         let mut branch_name: Option<String> = None;
+        // Path of the main worktree, captured before deletion. Used as the git
+        // working directory for branch deletion — if git_root was the worktree
+        // we're about to delete, running git commands in it afterward fails with
+        // "No such file or directory".
+        let mut main_worktree_path: Option<PathBuf> = None;
 
         if config.delete_branch_with_worktree {
             let worktrees = self.git_service.list_worktrees().await?;
+            main_worktree_path = worktrees
+                .iter()
+                .find(|w| w.is_main)
+                .map(|w| PathBuf::from(&w.path));
             if let Some(wt) = worktrees.iter().find(|w| w.path == worktree_path) {
                 if !wt.branch.is_empty() && wt.branch != "detached" {
                     branch_name = Some(wt.branch.clone());
@@ -305,7 +308,8 @@ impl WorktreeService {
         let mut branch_deleted = false;
         let mut branch_delete_error = None;
         if let Some(name) = &branch_name {
-            match self.git_service.delete_branch(name, true).await {
+            let branch_git = GitService::new(main_worktree_path.or_else(|| self.git_root.clone()));
+            match branch_git.delete_branch(name, true).await {
                 Ok(()) => branch_deleted = true,
                 Err(e) => {
                     branch_delete_error = Some(format!("Branch '{name}' was kept.\n{e}"));
