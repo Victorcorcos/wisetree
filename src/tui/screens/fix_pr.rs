@@ -350,7 +350,7 @@ impl FixPullRequestScreen {
                 SummaryRow::with_status(command, "Applied", colors::SUCCESS, None)
             }
             FixRowOutcome::Replied => {
-                SummaryRow::with_status(command, "Replied", colors::SUCCESS, None)
+                SummaryRow::with_status(command, "Replied", colors::INFO, None)
             }
             FixRowOutcome::AlreadyResolved => {
                 SummaryRow::with_status(command, "No change", colors::INFO, None)
@@ -1527,29 +1527,40 @@ mod tests {
     fn record_outcome_builds_colored_rows_and_advances() {
         let mut screen = FixPullRequestScreen::new(request());
         screen.set_groups(
-            vec![group("a.rs", 10), group("b.rs", 20), group("c.rs", 30)],
+            vec![
+                group("a.rs", 10),
+                group("b.rs", 20),
+                group("c.rs", 30),
+                group("d.rs", 40),
+            ],
             "o".into(),
             "r".into(),
         );
         screen.record_outcome(FixRowOutcome::Applied);
+        assert!(screen.advance());
+        screen.record_outcome(FixRowOutcome::Replied);
         assert!(screen.advance());
         screen.record_outcome(FixRowOutcome::Skipped("praise"));
         assert!(screen.advance());
         screen.record_outcome(FixRowOutcome::Failed("boom".to_string()));
         assert!(!screen.advance()); // no more groups
 
-        assert_eq!(screen.summary_rows.len(), 3);
+        assert_eq!(screen.summary_rows.len(), 4);
         let applied = &screen.summary_rows[0];
         assert_eq!(applied.status.as_ref().unwrap().label, "Applied");
         assert_eq!(applied.status.as_ref().unwrap().color, colors::SUCCESS);
         assert!(applied.command.starts_with("#1 a.rs:10"));
 
-        let skipped = &screen.summary_rows[1];
+        let replied = &screen.summary_rows[1];
+        assert_eq!(replied.status.as_ref().unwrap().label, "Replied");
+        assert_eq!(replied.status.as_ref().unwrap().color, colors::INFO);
+
+        let skipped = &screen.summary_rows[2];
         assert_eq!(skipped.status.as_ref().unwrap().label, "Skipped");
         assert_eq!(skipped.status.as_ref().unwrap().color, colors::WARNING);
         assert!(skipped.command.contains("(praise)"));
 
-        let failed = &screen.summary_rows[2];
+        let failed = &screen.summary_rows[3];
         assert_eq!(failed.status.as_ref().unwrap().label, "Failed");
         assert_eq!(failed.status.as_ref().unwrap().color, colors::ERROR);
         assert_eq!(failed.failure.as_deref(), Some("boom"));
