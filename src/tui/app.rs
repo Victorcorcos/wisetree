@@ -3,6 +3,7 @@
 //! Owns screen routing, per-screen async work, and the wrapper-mode selected
 //! path handoff used by shell integration.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::cli::AppMode;
-use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
+use crate::config::schema::{DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig};
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
@@ -34,10 +35,10 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
     fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, DashboardService, DashboardUpdate,
-    DashboardWatch, FillPreparation, FillSubmitOutcome, FillSubmitRequest, MultiSourceUpdateResult,
-    OpencodeModel, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
-    UpdateSource,
+    parse_pull_request_md, resolve_dashboard_columns, AiStatus, CheckStatus, DashboardNoticeLevel,
+    DashboardRow, DashboardService, DashboardUpdate, DashboardWatch, FillPreparation,
+    FillSubmitOutcome, FillSubmitRequest, MultiSourceUpdateResult, OpencodeModel, PrState, Shell,
+    ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -83,6 +84,12 @@ const SETTINGS_PATH_COPIED_MESSAGE: &str =
 /// Lines a single mouse-wheel tick advances a scrollable panel by.
 /// Matches the common browser default (3) so the diff feels familiar.
 const WHEEL_LINES_PER_TICK: u16 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitPhase {
@@ -179,6 +186,91 @@ struct UpdatePrFailure {
     message: String,
 }
 
+#[derive(Debug, Default)]
+struct DashboardNotificationSnapshot {
+    ai_statuses: HashMap<String, AiStatus>,
+    pr_check_statuses: HashMap<u64, CheckStatus>,
+}
+
+impl DashboardNotificationSnapshot {
+    fn record_update(&mut self, update: &DashboardUpdate) {
+        self.ai_statuses = ai_statuses_by_worktree(update.rows());
+        if let DashboardUpdate::WithPRs { rows, .. } = update {
+            self.pr_check_statuses = pr_check_statuses_by_pr(rows);
+        }
+    }
+}
+
+fn dashboard_update_requests_bell(
+    snapshot: &mut Option<DashboardNotificationSnapshot>,
+    update: &DashboardUpdate,
+    notifications: &NotificationsConfig,
+) -> bool {
+    let requests_bell = snapshot.as_ref().is_some_and(|previous| {
+        (notifications.ai_status_ok && ai_finished_transition(previous, update.rows()))
+            || (notifications.pr_checks_ok && pr_checks_passed_transition(previous, update))
+    });
+
+    snapshot
+        .get_or_insert_with(Default::default)
+        .record_update(update);
+    requests_bell
+}
+
+fn ai_statuses_by_worktree(rows: &[DashboardRow]) -> HashMap<String, AiStatus> {
+    rows.iter()
+        .filter_map(|row| {
+            row.ai_status
+                .as_ref()
+                .map(|report| (row.worktree.path.clone(), report.aggregated))
+        })
+        .collect()
+}
+
+fn pr_check_statuses_by_pr(rows: &[DashboardRow]) -> HashMap<u64, CheckStatus> {
+    rows.iter()
+        .filter_map(|row| {
+            let pr = row.pull_request.as_ref()?;
+            if pr.state != PrState::Open {
+                return None;
+            }
+            pr.checks_status.map(|status| (pr.number, status))
+        })
+        .collect()
+}
+
+fn ai_finished_transition(previous: &DashboardNotificationSnapshot, rows: &[DashboardRow]) -> bool {
+    rows.iter().any(|row| {
+        let Some(next) = row.ai_status.as_ref().map(|report| report.aggregated) else {
+            return false;
+        };
+        next == AiStatus::Finished
+            && previous.ai_statuses.get(&row.worktree.path) == Some(&AiStatus::InProgress)
+    })
+}
+
+fn pr_checks_passed_transition(
+    previous: &DashboardNotificationSnapshot,
+    update: &DashboardUpdate,
+) -> bool {
+    let DashboardUpdate::WithPRs { rows, .. } = update else {
+        return false;
+    };
+
+    rows.iter().any(|row| {
+        let Some(pr) = row.pull_request.as_ref() else {
+            return false;
+        };
+        if pr.state != PrState::Open || pr.checks_status != Some(CheckStatus::Passed) {
+            return false;
+        }
+        previous
+            .pr_check_statuses
+            .get(&pr.number)
+            .is_some_and(|status| *status != CheckStatus::Passed)
+    })
+}
+
 /// State the TUI carries across frames.
 pub struct App {
     pub screen: Screen,
@@ -194,6 +286,7 @@ pub struct App {
     menu: Option<MenuScreen>,
     dashboard: Option<DashboardScreen>,
     dashboard_watch: Option<DashboardWatch>,
+    dashboard_notification_snapshot: Option<DashboardNotificationSnapshot>,
     cache: Option<CacheScreen>,
     create: Option<CreateScreen>,
     delete: Option<DeleteScreen>,
@@ -222,6 +315,11 @@ pub struct App {
     /// Remaining `(path, force)` items still to delete in the current
     /// bulk run, processed one at a time via `kick_off_delete_worktree`.
     bulk_delete_queue: Vec<(String, bool)>,
+    /// Whether an embedded opencode PTY was alive on the previous frame.
+    /// A torn-down PTY can leave the primary-screen terminal scrolled out
+    /// of sync with Ratatui's diff model, so we force one full repaint on
+    /// the frame after the PTY disappears. See `event_loop_inner`.
+    pty_was_active: bool,
 }
 
 impl App {
@@ -240,6 +338,7 @@ impl App {
             menu: None,
             dashboard: None,
             dashboard_watch: None,
+            dashboard_notification_snapshot: None,
             cache: None,
             create: None,
             delete: None,
@@ -259,6 +358,7 @@ impl App {
             pending_delete_path: None,
             pending_bulk_delete_paths: Vec::new(),
             bulk_delete_queue: Vec::new(),
+            pty_was_active: false,
         }
     }
 
@@ -288,14 +388,14 @@ impl App {
             // Clear the screen and reset the cursor so the shell prompt
             // returns at the top instead of below a block of empty rows.
             let _ = terminal::clear_wrapper_for_shell(&mut terminal);
-            let _ = terminal::restore_wrapper_tty();
+            terminal::restore_wrapper_tty();
             let _ = terminal.show_cursor();
             result?;
         } else {
             let mut terminal = terminal::enter()?;
             let result = self.event_loop(&mut terminal).await;
             let _ = terminal.clear();
-            let _ = terminal::restore();
+            terminal::restore();
             let _ = terminal.show_cursor();
             result?;
         }
@@ -325,6 +425,19 @@ impl App {
                 self.handle_app_event(event, &tx);
             }
             self.poll_dashboard_updates();
+
+            // An embedded opencode PTY (Fill / Update PR flows) drives the
+            // child through a real terminal whose escape sequences can scroll
+            // the primary screen out of sync with Ratatui's `Viewport::Fixed`
+            // diff model. Once the PTY tears down, static regions Ratatui
+            // thinks are unchanged (e.g. the header above the Fill "Done"
+            // panel) never get repainted, so old scrollback bleeds through.
+            // Force one full repaint on the frame after the PTY disappears.
+            let pty_active = self.pty_active();
+            if self.pty_was_active && !pty_active {
+                terminal.clear()?;
+            }
+            self.pty_was_active = pty_active;
 
             let completed = terminal.draw(|frame| self.draw(frame))?;
             self.last_rendered_buffer = Some(completed.buffer.clone());
@@ -374,6 +487,13 @@ impl App {
         Ok(())
     }
 
+    /// Whether any screen currently embeds a live opencode PTY. Used to
+    /// detect the teardown edge that requires a full terminal repaint.
+    fn pty_active(&self) -> bool {
+        self.fill_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.update_pr.as_ref().is_some_and(|s| s.has_pty())
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         self.toast.dismiss_expired();
         let area = frame.area();
@@ -398,7 +518,9 @@ impl App {
                         .constraints([Constraint::Length(4), Constraint::Min(0)])
                         .split(area);
                     let cwd = self.git_root.as_deref().unwrap_or("");
-                    WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+                    WelcomeHeader::new(self.screen, cwd)
+                        .with_label(self.header_label_override())
+                        .render(frame, chunks[0]);
                     screens::loading::draw(frame, chunks[1], self.tick, self.screen.as_str());
                 }
             }
@@ -609,13 +731,12 @@ impl App {
                 }
             }
             Screen::FillPullRequest => {
-                // The Filling step (live opencode PTY) and the Confirm
-                // explanation both want the full bottom region; the compact
-                // Loading / Review / Opening steps stay in a sized panel.
-                let expand = self
-                    .fill_pr
-                    .as_ref()
-                    .is_some_and(|s| s.is_filling() || matches!(s.step(), FillStep::Confirm));
+                // The Filling step (live opencode PTY), the Confirm
+                // explanation, and Opening's live Terminal Activity all want
+                // the full bottom region. Loading / Review stay compact.
+                let expand = self.fill_pr.as_ref().is_some_and(|s| {
+                    s.is_filling() || matches!(s.step(), FillStep::Confirm | FillStep::Opening)
+                });
                 let panel = if expand {
                     self.render_framed_panel_fill(frame, area)
                 } else {
@@ -651,6 +772,20 @@ impl App {
         }
     }
 
+    /// Header label override for screens reused across flows. The
+    /// `UpdatePullRequest` screen also hosts the "Update branch (locally)"
+    /// conflict resolution (`local_only`), which should read "Update Branch"
+    /// rather than "Update Pull Request".
+    fn header_label_override(&self) -> Option<&'static str> {
+        if matches!(self.screen, Screen::UpdatePullRequest)
+            && self.update_pr.as_ref().is_some_and(|s| s.local_only())
+        {
+            Some("Update Branch")
+        } else {
+            None
+        }
+    }
+
     fn render_framed_panel(&self, frame: &mut Frame, area: Rect, content_height: u16) -> Rect {
         let panel_height = content_height.saturating_add(2);
         let chunks = Layout::default()
@@ -663,7 +798,9 @@ impl App {
             .split(area);
 
         let cwd = self.git_root.as_deref().unwrap_or("");
-        WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+        WelcomeHeader::new(self.screen, cwd)
+            .with_label(self.header_label_override())
+            .render(frame, chunks[0]);
 
         self.render_panel_block(frame, chunks[1])
     }
@@ -675,7 +812,9 @@ impl App {
             .split(area);
 
         let cwd = self.git_root.as_deref().unwrap_or("");
-        WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+        WelcomeHeader::new(self.screen, cwd)
+            .with_label(self.header_label_override())
+            .render(frame, chunks[0]);
 
         self.render_panel_block(frame, chunks[1])
     }
@@ -710,6 +849,36 @@ impl App {
             InitPhase::Errored => self.handle_error_key(key, tx),
             InitPhase::Ready => self.handle_screen_key(key, tx),
             InitPhase::Loading => {}
+        }
+    }
+
+    fn scroll_screen(&mut self, direction: ScrollDirection, lines: u16) {
+        match self.screen {
+            Screen::UpdatePullRequest => {
+                if let Some(screen) = self.update_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
+            Screen::Create => {
+                if let Some(screen) = self.create.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.scroll_terminal_up(lines),
+                        ScrollDirection::Down => screen.scroll_terminal_down(lines),
+                    };
+                }
+            }
+            Screen::FillPullRequest => {
+                if let Some(screen) = self.fill_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
+            _ => {}
         }
     }
 
@@ -771,36 +940,10 @@ impl App {
                 // the live AI Activity panel (during conflict resolution) or
                 // the review diff panel (after the AI creates a merge commit);
                 // on Create it's the "Creating" Terminal Activity log.
-                if matches!(self.screen, Screen::UpdatePullRequest) {
-                    if let Some(screen) = self.update_pr.as_mut() {
-                        screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
-                    }
-                } else if matches!(self.screen, Screen::Create) {
-                    if let Some(screen) = self.create.as_mut() {
-                        screen.scroll_terminal_up(WHEEL_LINES_PER_TICK);
-                    }
-                }
-                if matches!(self.screen, Screen::FillPullRequest) {
-                    if let Some(screen) = self.fill_pr.as_mut() {
-                        screen.handle_mouse_scroll_up(WHEEL_LINES_PER_TICK);
-                    }
-                }
+                self.scroll_screen(ScrollDirection::Up, WHEEL_LINES_PER_TICK);
             }
             MouseEventKind::ScrollDown => {
-                if matches!(self.screen, Screen::UpdatePullRequest) {
-                    if let Some(screen) = self.update_pr.as_mut() {
-                        screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
-                    }
-                } else if matches!(self.screen, Screen::Create) {
-                    if let Some(screen) = self.create.as_mut() {
-                        screen.scroll_terminal_down(WHEEL_LINES_PER_TICK);
-                    }
-                }
-                if matches!(self.screen, Screen::FillPullRequest) {
-                    if let Some(screen) = self.fill_pr.as_mut() {
-                        screen.handle_mouse_scroll_down(WHEEL_LINES_PER_TICK);
-                    }
-                }
+                self.scroll_screen(ScrollDirection::Down, WHEEL_LINES_PER_TICK);
             }
             _ => {}
         }
@@ -1097,6 +1240,15 @@ impl App {
                             }
                         }
                     }
+                    SettingsAction::SaveNotifications(notifications) => {
+                        if let Err(err) = self.save_notifications(notifications) {
+                            if let Some(settings) = self.settings.as_mut() {
+                                settings.set_error(format!(
+                                    "Failed to save notification settings: {err}"
+                                ));
+                            }
+                        }
+                    }
                     SettingsAction::OpenAiModelPicker { model, variant } => {
                         self.open_ai_model_picker(model, variant, tx);
                     }
@@ -1202,35 +1354,7 @@ impl App {
                         self.enter_screen(Screen::Dashboard, tx);
                     }
                     UpdateAction::Confirmed => self.confirm_update_pr(tx),
-                    UpdateAction::AiComplete => {
-                        let dashboard_config = self.current_dashboard_config();
-                        let Some(screen) = self.update_pr.as_mut() else {
-                            return;
-                        };
-                        let request = screen.request().clone();
-                        let use_ai = dashboard_config.use_ai.clone();
-                        let base_ref = request
-                            .base_ref
-                            .clone()
-                            .unwrap_or_else(|| "upstream/main".to_string());
-                        let cwd = PathBuf::from(&request.worktree_path);
-                        let message = format!(
-                            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
-                            crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
-                        );
-                        let script =
-                            "git add -A && git commit -m \"$COMMIT_MSG\" && git push origin HEAD"
-                                .to_string();
-                        let sh = PathBuf::from("/bin/sh");
-                        let (shell, shell_args) =
-                            login_shell_command(&sh, &["-c".to_string(), script]);
-                        screen.start_commit_push_pty(
-                            shell,
-                            shell_args,
-                            cwd,
-                            vec![("COMMIT_MSG".to_string(), message)],
-                        );
-                    }
+                    UpdateAction::AiComplete => self.start_commit_after_ai(),
                     UpdateAction::AiCancel => {
                         let dashboard_config = self.current_dashboard_config();
                         let git_root = self.git_root.clone();
@@ -1384,33 +1508,7 @@ impl App {
                 self.enter_screen(Screen::Dashboard, tx);
             }
             UpdateAction::Confirmed => self.confirm_update_pr(tx),
-            UpdateAction::AiComplete => {
-                let dashboard_config = self.current_dashboard_config();
-                let Some(screen) = self.update_pr.as_mut() else {
-                    return;
-                };
-                let request = screen.request().clone();
-                let use_ai = dashboard_config.use_ai.clone();
-                let base_ref = request
-                    .base_ref
-                    .clone()
-                    .unwrap_or_else(|| "upstream/main".to_string());
-                let cwd = PathBuf::from(&request.worktree_path);
-                let message = format!(
-                    "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
-                    crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
-                );
-                let script = "git add -A && git commit -m \"$COMMIT_MSG\" && git push origin HEAD"
-                    .to_string();
-                let sh = PathBuf::from("/bin/sh");
-                let (shell, shell_args) = login_shell_command(&sh, &["-c".to_string(), script]);
-                screen.start_commit_push_pty(
-                    shell,
-                    shell_args,
-                    cwd,
-                    vec![("COMMIT_MSG".to_string(), message)],
-                );
-            }
+            UpdateAction::AiComplete => self.start_commit_after_ai(),
             UpdateAction::AiCancel => {
                 let dashboard_config = self.current_dashboard_config();
                 let git_root = self.git_root.clone();
@@ -1424,6 +1522,42 @@ impl App {
             UpdateAction::TerminalAccept => self.terminal_accept_push(tx),
             UpdateAction::TerminalDiscard => self.terminal_discard(tx),
         }
+    }
+
+    /// Spawn the finalize PTY that commits the opencode-resolved merge once
+    /// the user presses **Complete**. The Update Pull Request flow commits
+    /// and pushes; the "Update branch (locally)" flow (`local_only`) commits
+    /// without pushing. Either way the PTY exit flips the screen onto the
+    /// ✅ done page.
+    fn start_commit_after_ai(&mut self) {
+        let dashboard_config = self.current_dashboard_config();
+        let Some(screen) = self.update_pr.as_mut() else {
+            return;
+        };
+        let request = screen.request().clone();
+        let use_ai = dashboard_config.use_ai.clone();
+        let base_ref = request
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| "upstream/main".to_string());
+        let cwd = PathBuf::from(&request.worktree_path);
+        let message = format!(
+            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
+            crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
+        );
+        let script = if screen.local_only() {
+            "git add -A && git commit -m \"$COMMIT_MSG\"".to_string()
+        } else {
+            "git add -A && git commit -m \"$COMMIT_MSG\" && git push origin HEAD".to_string()
+        };
+        let sh = PathBuf::from("/bin/sh");
+        let (shell, shell_args) = login_shell_command(&sh, &["-c".to_string(), script]);
+        screen.start_commit_push_pty(
+            shell,
+            shell_args,
+            cwd,
+            vec![("COMMIT_MSG".to_string(), message)],
+        );
     }
 
     /// Shared dispatch for confirming the update/push confirmation dialog.
@@ -1689,8 +1823,8 @@ impl App {
             DashboardAction::PushPullRequest(request) => {
                 self.start_push_pr_flow(*request, tx);
             }
-            DashboardAction::UpdateBranch(path) => {
-                self.start_update_branch_flow(path, tx);
+            DashboardAction::UpdateBranch { path, branch } => {
+                self.start_update_branch_flow(path, branch, tx);
             }
             DashboardAction::ClosePullRequest(request) => {
                 self.start_close_pr_flow(*request, tx);
@@ -1724,14 +1858,16 @@ impl App {
 
     /// Mount the loading splash synchronously so the user gets an
     /// instant visual response, then kick off the background fetch +
-    /// merge. The flow ends in `apply_update_branch_finished`, which
-    /// returns to the dashboard and toasts the outcome.
+    /// merge. On a clean merge the flow ends in
+    /// `apply_update_branch_finished` with a toast; on conflicts it hands
+    /// off to the opencode resolution screen (see that method).
     fn start_update_branch_flow(
         &mut self,
         worktree_path: String,
+        branch: String,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        self.update_branch = Some(UpdateBranchScreen::new(worktree_path.clone()));
+        self.update_branch = Some(UpdateBranchScreen::new(worktree_path.clone(), branch));
         self.screen = Screen::UpdateBranch;
         kick_off_update_branch(self.current_dashboard_config(), worktree_path, tx.clone());
     }
@@ -1812,6 +1948,12 @@ impl App {
     fn current_dashboard_config(&self) -> DashboardConfig {
         self.current_config()
             .map(|cfg| cfg.dashboard.clone())
+            .unwrap_or_default()
+    }
+
+    fn current_notifications_config(&self) -> NotificationsConfig {
+        self.current_config()
+            .map(|cfg| cfg.notifications.clone())
             .unwrap_or_default()
     }
 
@@ -1999,6 +2141,7 @@ impl App {
                             .unwrap_or_default();
                         let service = DashboardService::new(git_root, config);
                         self.dashboard_watch = Some(service.watch());
+                        self.dashboard_notification_snapshot = None;
                     }
                 }
             } else {
@@ -2117,6 +2260,13 @@ impl App {
                 if let Err(err) = self.save_dashboard(dashboard) {
                     if let Some(settings) = self.settings.as_mut() {
                         settings.set_error(format!("Failed to save dashboard settings: {err}"));
+                    }
+                }
+            }
+            SettingsAction::SaveNotifications(notifications) => {
+                if let Err(err) = self.save_notifications(notifications) {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.set_error(format!("Failed to save notification settings: {err}"));
                     }
                 }
             }
@@ -2464,15 +2614,82 @@ impl App {
         result: Result<UpdateBranchOutcome, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // Drop the loading splash and route back to the dashboard before
-        // toasting — the user must land on the screen where the toast
-        // appears, otherwise the result would flash on the splash for
-        // one frame and vanish.
-        self.update_branch = None;
-        if matches!(self.screen, Screen::UpdateBranch) {
-            self.enter_screen(Screen::Dashboard, tx);
+        // Capture the branch off the splash before we replace it — the
+        // conflict-resolution screen uses it for its synthetic request.
+        let branch = self
+            .update_branch
+            .as_ref()
+            .map(|s| s.branch().to_string())
+            .unwrap_or_default();
+        match result {
+            // Conflicts with AI available: don't toast — hand off to the
+            // opencode resolution screen. The merge is left mid-flight on
+            // disk (conflict markers in the index); the screen owns the
+            // PTY from here and commits the result locally (no push).
+            Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
+                opencode_binary,
+                opencode_args,
+                cwd,
+                model,
+                base_ref,
+                ..
+            }) => {
+                self.start_local_conflict_resolution(
+                    branch,
+                    opencode_binary,
+                    opencode_args,
+                    cwd,
+                    model,
+                    base_ref,
+                );
+            }
+            // Every other outcome drops the loading splash and routes back
+            // to the dashboard before toasting — the user must land on the
+            // screen where the toast appears, otherwise the result would
+            // flash on the splash for one frame and vanish.
+            other => {
+                self.update_branch = None;
+                if matches!(self.screen, Screen::UpdateBranch) {
+                    self.enter_screen(Screen::Dashboard, tx);
+                }
+                self.show_update_branch_toast(other);
+            }
         }
-        self.show_update_branch_toast(result);
+    }
+
+    /// Mount the opencode conflict-resolution screen for the "Update branch
+    /// (locally)" flow. Reuses `UpdatePullRequestScreen` in `local_only`
+    /// mode: it streams opencode in the embedded PTY, then commits the
+    /// merge locally on **Complete** (no push) and shows the ✅ done page.
+    fn start_local_conflict_resolution(
+        &mut self,
+        branch: String,
+        opencode_binary: PathBuf,
+        opencode_args: Vec<String>,
+        cwd: PathBuf,
+        model: String,
+        base_ref: String,
+    ) {
+        let request = UpdatePullRequestRequest {
+            number: 0,
+            title: String::new(),
+            url: String::new(),
+            branch,
+            worktree_path: cwd.to_string_lossy().to_string(),
+            ahead: 0,
+            behind: 0,
+            base_ref: Some(base_ref),
+        };
+        let mut screen = UpdatePullRequestScreen::new_local_conflict(request);
+        screen.set_phase_message(format!("{model} is resolving conflicts..."));
+        // Launch opencode through the user's login shell so it runs with the
+        // same profile-sourced environment as a freshly opened terminal
+        // (matching the Update Pull Request flow).
+        let (shell, wrapped_args) = login_shell_command(&opencode_binary, &opencode_args);
+        screen.spawn_opencode_pty(shell, wrapped_args, cwd, Vec::new());
+        self.update_branch = None;
+        self.update_pr = Some(screen);
+        self.screen = Screen::UpdatePullRequest;
     }
 
     fn show_update_branch_toast(&mut self, result: Result<UpdateBranchOutcome, String>) {
@@ -2502,6 +2719,31 @@ impl App {
                 ToastVariant::Error,
                 format!("git merge {base_ref} failed: {message}"),
             ),
+            Ok(UpdateBranchOutcome::WorkingTreeDirty { files }) => self.show_toast(
+                ToastVariant::Warning,
+                format!(
+                    "{} uncommitted change(s) in the worktree — commit or stash them \
+                     before updating.",
+                    files.len()
+                ),
+            ),
+            Ok(UpdateBranchOutcome::ConflictsRequireAi { .. }) => self.show_toast(
+                ToastVariant::Warning,
+                "Conflicts found, please resolve them locally or setup `useAi` \
+                 setting so we can solve conflicts + merge via AI."
+                    .to_string(),
+            ),
+            Ok(UpdateBranchOutcome::AiUnavailable { conflicts }) => self.show_toast(
+                ToastVariant::Error,
+                format!(
+                    "Merge has {} conflicted file(s). `opencode` CLI is not on PATH — \
+                     install it from https://opencode.ai then retry.",
+                    conflicts.len()
+                ),
+            ),
+            // Handled by `apply_update_branch_finished` before reaching the
+            // toast path (it mounts the resolution screen instead).
+            Ok(UpdateBranchOutcome::ConflictsHandedOffToUi { .. }) => {}
             Err(message) => self.show_toast(
                 ToastVariant::Error,
                 format!("Update branch failed: {message}"),
@@ -2632,6 +2874,13 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         use crate::services::UpdatePullRequestOutcome;
+        // The "Update branch (locally)" flow reuses this screen in
+        // `local_only` mode (no PR); its toasts must not mention a PR.
+        let local_only = self
+            .update_pr
+            .as_ref()
+            .map(|s| s.local_only())
+            .unwrap_or(false);
         // `ConflictsHandedOffToUi` does NOT close the screen — the
         // service paused mid-flight (conflicts in the index, opencode
         // not yet invoked). We spawn opencode inside the screen's
@@ -2711,13 +2960,17 @@ impl App {
                     // only fires if `update_pr` was already torn down.
                 }
                 UpdatePullRequestOutcome::DiscardedAiMerge => {
-                    self.show_toast(
-                        ToastVariant::Warning,
+                    let message = if local_only {
+                        "Discarded the update — branch is back where it was \
+                         before the merge."
+                            .to_string()
+                    } else {
                         format!(
                             "Discarded AI merge for PR #{number}. \
                              Branch is back where it was before the update."
-                        ),
-                    );
+                        )
+                    };
+                    self.show_toast(ToastVariant::Warning, message);
                 }
                 UpdatePullRequestOutcome::ConflictsRequireAi { .. } => {
                     self.show_toast(
@@ -2768,13 +3021,15 @@ impl App {
                     );
                 }
                 UpdatePullRequestOutcome::AbortFailed(detail) => {
-                    self.show_toast(
-                        ToastVariant::Error,
+                    let message = if local_only {
+                        format!("Failed to abort the merge: {}", truncate_error(&detail))
+                    } else {
                         format!(
                             "Failed to abort AI merge for PR #{number}: {}",
                             truncate_error(&detail)
-                        ),
-                    );
+                        )
+                    };
+                    self.show_toast(ToastVariant::Error, message);
                 }
             },
             Err(failure) => {
@@ -3013,6 +3268,7 @@ impl App {
                     service.pr_enrichment_enabled(),
                 ));
                 self.dashboard_watch = Some(service.watch());
+                self.dashboard_notification_snapshot = None;
             }
             Screen::Cache => {
                 self.cache = Some(CacheScreen::new());
@@ -3116,6 +3372,7 @@ impl App {
         self.cache = None;
         self.dashboard = None;
         self.dashboard_watch = None;
+        self.dashboard_notification_snapshot = None;
         self.cache = None;
         self.create = None;
         self.delete = None;
@@ -3178,20 +3435,33 @@ impl App {
     }
 
     fn poll_dashboard_updates(&mut self) {
-        let Some(watch) = self.dashboard_watch.as_mut() else {
-            return;
+        let (updates_batch, notices) = {
+            let Some(watch) = self.dashboard_watch.as_mut() else {
+                return;
+            };
+            let mut updates_batch = Vec::new();
+            let mut notices = Vec::new();
+            while let Ok(update) = watch.rx.try_recv() {
+                updates_batch.push(update);
+            }
+            while let Ok(notice) = watch.notice_rx.try_recv() {
+                notices.push(notice);
+            }
+            (updates_batch, notices)
         };
-        let mut updates_batch = Vec::new();
-        let mut notices = Vec::new();
-        while let Ok(update) = watch.rx.try_recv() {
-            updates_batch.push(update);
-        }
-        while let Ok(notice) = watch.notice_rx.try_recv() {
-            notices.push(notice);
-        }
 
-        if let Some(screen) = self.dashboard.as_mut() {
-            for update in updates_batch {
+        let notifications = self.current_notifications_config();
+        let mut should_ring_bell = false;
+        for update in updates_batch {
+            if dashboard_update_requests_bell(
+                &mut self.dashboard_notification_snapshot,
+                &update,
+                &notifications,
+            ) {
+                should_ring_bell = true;
+            }
+
+            if let Some(screen) = self.dashboard.as_mut() {
                 if let DashboardUpdate::WithPRs {
                     next_pr_fetch_at, ..
                 } = &update
@@ -3201,17 +3471,31 @@ impl App {
                 screen.set_rows(update.into_rows());
             }
         }
+        if should_ring_bell {
+            terminal::ring_bell();
+        }
         let has_rows = self
             .dashboard
             .as_ref()
             .is_some_and(DashboardScreen::has_rows);
+        let mut refresh_dashboard = false;
         for notice in notices {
+            if notice.level == DashboardNoticeLevel::Success {
+                refresh_dashboard = true;
+                self.show_toast(ToastVariant::Success, notice.message);
+                continue;
+            }
             if let Some(screen) = self.dashboard.as_mut() {
                 if has_rows {
                     screen.set_notice(notice);
                 } else {
                     screen.set_error(notice.message);
                 }
+            }
+        }
+        if refresh_dashboard {
+            if let Some(watch) = self.dashboard_watch.as_ref() {
+                watch.refresh();
             }
         }
     }
@@ -3601,9 +3885,16 @@ impl App {
 
     fn save_dashboard(&mut self, dashboard: DashboardConfig) -> Result<(), String> {
         let local_path = self.local_config_path();
-        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
-            Some(path) => path.clone(),
-            None => global_config_file(),
+        let wise_merge_changed = dashboard.wise_merge != self.current_dashboard_config().wise_merge;
+        let target_path = if wise_merge_changed {
+            local_path
+                .clone()
+                .ok_or_else(|| "No git repository in scope".to_string())?
+        } else {
+            match local_path.as_ref().filter(|p| p.exists()) {
+                Some(path) => path.clone(),
+                None => global_config_file(),
+            }
         };
 
         let mut reader = ConfigService::new();
@@ -3611,6 +3902,8 @@ impl App {
             reader
                 .load(target_path.parent())
                 .map_err(|e| e.to_string())?
+        } else if wise_merge_changed {
+            self.current_config().cloned().unwrap_or_default()
         } else {
             WorktreeConfig::default()
         };
@@ -3631,6 +3924,42 @@ impl App {
 
         if let Some(settings) = self.settings.as_mut() {
             settings.mark_dashboard_saved(dashboard);
+        }
+        Ok(())
+    }
+
+    fn save_notifications(&mut self, notifications: NotificationsConfig) -> Result<(), String> {
+        let local_path = self.local_config_path();
+        let target_path = match local_path.as_ref().filter(|p| p.exists()) {
+            Some(path) => path.clone(),
+            None => global_config_file(),
+        };
+
+        let mut reader = ConfigService::new();
+        let mut config = if target_path.exists() {
+            reader
+                .load(target_path.parent())
+                .map_err(|e| e.to_string())?
+        } else {
+            WorktreeConfig::default()
+        };
+        config.notifications = notifications.clone();
+
+        let mut writer = ConfigService::new();
+        writer
+            .save(&config, Some(&target_path))
+            .map_err(|e| e.to_string())?;
+
+        if let Some(service) = self.worktree_service.as_mut() {
+            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            service
+                .config_service_mut()
+                .load(project_path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(settings) = self.settings.as_mut() {
+            settings.mark_notifications_saved(notifications);
         }
         Ok(())
     }
@@ -4195,7 +4524,7 @@ fn kick_off_submit_pull_request(
 
         // Forward terminal-activity lines into the main event loop.
         let forward_tx = tx.clone();
-        tokio::spawn(async move {
+        let forwarder = tokio::spawn(async move {
             while let Some((text, kind)) = activity_rx.recv().await {
                 let _ = forward_tx.send(AppEvent::FillPrActivity { text, kind });
             }
@@ -4209,6 +4538,8 @@ fn kick_off_submit_pull_request(
             Ok(outcome) => Ok(outcome),
             Err(err) => Err(user_friendly_message(&err)),
         };
+        drop(activity_tx);
+        let _ = forwarder.await;
         let _ = tx.send(AppEvent::FillPrSubmitted(event));
     });
 }
@@ -4219,9 +4550,10 @@ fn kick_off_update_branch(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        // The mother worktree IS the git root, so reuse the path as the
-        // service root — there is no separate "git_root" to resolve from
-        // app state for this action.
+        // `update_branch` runs every git command with the worktree path as
+        // its cwd, so the service root is only a placeholder here — reuse
+        // the worktree path rather than resolving a separate "git_root".
+        // Works for any worktree, mother or derived.
         let service = DashboardService::new(PathBuf::from(&worktree_path), config);
         let event = match service.update_branch(&worktree_path).await {
             Ok(outcome) => Ok(outcome),
@@ -4712,6 +5044,7 @@ mod tests {
     use super::*;
     use crate::config::schema::WorktreeConfig;
     use crate::config::service::ConfigService;
+    use crate::services::{AiStatusReport, PullRequest, ReviewerSummary};
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
     use ratatui::backend::TestBackend;
@@ -4743,6 +5076,248 @@ mod tests {
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
+    }
+
+    fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> NotificationsConfig {
+        NotificationsConfig {
+            ai_status_ok,
+            pr_checks_ok,
+        }
+    }
+
+    fn ai_report(status: AiStatus) -> AiStatusReport {
+        AiStatusReport {
+            aggregated: status,
+            per_harness: Default::default(),
+        }
+    }
+
+    fn pr(number: u64, checks_status: Option<CheckStatus>) -> PullRequest {
+        PullRequest {
+            number,
+            state: PrState::Open,
+            url: format!("https://example.test/pull/{number}"),
+            title: format!("PR {number}"),
+            base_ref_name: None,
+            base_repository: None,
+            head_ref_oid: None,
+            labels: Vec::new(),
+            checks_status,
+            review_status: None,
+            merge_status: None,
+            reviewers: ReviewerSummary::default(),
+        }
+    }
+
+    fn dashboard_row(
+        path: &str,
+        branch: &str,
+        ai_status: Option<AiStatus>,
+        pull_request: Option<PullRequest>,
+    ) -> DashboardRow {
+        DashboardRow {
+            worktree: GitWorktree {
+                path: path.into(),
+                branch: branch.into(),
+                commit: "deadbeef".into(),
+                is_main: false,
+                is_clean: true,
+                branch_status: None,
+            },
+            last_commit: None,
+            pull_request,
+            ai_status: ai_status.map(ai_report),
+            error: None,
+        }
+    }
+
+    fn git_update(rows: Vec<DashboardRow>) -> DashboardUpdate {
+        DashboardUpdate::GitOnly(rows)
+    }
+
+    fn pr_update(rows: Vec<DashboardRow>) -> DashboardUpdate {
+        DashboardUpdate::WithPRs {
+            rows,
+            next_pr_fetch_at: None,
+        }
+    }
+
+    #[test]
+    fn dashboard_notifications_do_not_ring_on_initial_ok_states() {
+        let config = notification_config(true, true);
+        let mut snapshot = None;
+        let update = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::Finished),
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &update,
+            &config
+        ));
+    }
+
+    #[test]
+    fn dashboard_notifications_ai_transition_respects_setting() {
+        let enabled = notification_config(true, false);
+        let disabled = notification_config(false, false);
+        let initial = git_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::InProgress),
+            None,
+        )]);
+        let finished = git_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::Finished),
+            None,
+        )]);
+
+        let mut snapshot = None;
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &initial,
+            &enabled
+        ));
+        assert!(dashboard_update_requests_bell(
+            &mut snapshot,
+            &finished,
+            &enabled
+        ));
+
+        let mut snapshot = None;
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &initial,
+            &disabled
+        ));
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &finished,
+            &disabled
+        ));
+    }
+
+    #[test]
+    fn dashboard_notifications_pr_checks_transition_respects_setting() {
+        let enabled = notification_config(false, true);
+        let disabled = notification_config(false, false);
+        let running = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Running))),
+        )]);
+        let passed = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+
+        let mut snapshot = None;
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &running,
+            &enabled
+        ));
+        assert!(dashboard_update_requests_bell(
+            &mut snapshot,
+            &passed,
+            &enabled
+        ));
+
+        let mut snapshot = None;
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &running,
+            &disabled
+        ));
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &passed,
+            &disabled
+        ));
+    }
+
+    #[test]
+    fn dashboard_notifications_ignore_missing_values() {
+        let config = notification_config(true, true);
+        let mut snapshot = None;
+        let active = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::InProgress),
+            Some(pr(42, Some(CheckStatus::Running))),
+        )]);
+        let missing = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, None)),
+        )]);
+        let ok = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            Some(AiStatus::Finished),
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &active,
+            &config
+        ));
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &missing,
+            &config
+        ));
+        assert!(!dashboard_update_requests_bell(&mut snapshot, &ok, &config));
+    }
+
+    #[test]
+    fn dashboard_notifications_ignore_pr_checks_on_git_only_updates() {
+        let config = notification_config(false, true);
+        let mut snapshot = None;
+        let running = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Running))),
+        )]);
+        let git_only_passed = git_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+        let pr_passed = pr_update(vec![dashboard_row(
+            "/repo/feature",
+            "feature",
+            None,
+            Some(pr(42, Some(CheckStatus::Passed))),
+        )]);
+
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &running,
+            &config
+        ));
+        assert!(!dashboard_update_requests_bell(
+            &mut snapshot,
+            &git_only_passed,
+            &config
+        ));
+        assert!(dashboard_update_requests_bell(
+            &mut snapshot,
+            &pr_passed,
+            &config
+        ));
     }
 
     #[test]
@@ -4928,7 +5503,7 @@ mod tests {
 
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
-            for _ in 0..11 {
+            for _ in 0..12 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -4997,7 +5572,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5078,7 +5653,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5169,7 +5744,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..10 {
+            for _ in 0..11 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5229,7 +5804,7 @@ mod tests {
             let tx = app_event_tx();
             app.enter_screen(Screen::Settings, &tx);
 
-            for _ in 0..9 {
+            for _ in 0..10 {
                 app.handle_key(key(KeyCode::Down), &tx);
             }
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -5615,10 +6190,12 @@ mod tests {
                 dashboard: DashboardConfig {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
+                    wise_merge: false,
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
                     use_ai_variant: String::new(),
                     ai_status: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -5626,10 +6203,12 @@ mod tests {
                 dashboard: DashboardConfig {
                     refresh_interval_ms: 6000,
                     show_pull_requests: false,
+                    wise_merge: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
                     use_ai_variant: String::new(),
                     ai_status: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -5648,6 +6227,7 @@ mod tests {
             let new_dashboard = DashboardConfig {
                 refresh_interval_ms: 7000,
                 show_pull_requests: true,
+                wise_merge: true,
                 columns: vec![
                     "branch".into(),
                     "status".into(),
@@ -5657,6 +6237,7 @@ mod tests {
                 use_ai: String::new(),
                 use_ai_variant: String::new(),
                 ai_status: Default::default(),
+                legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -5685,10 +6266,12 @@ mod tests {
                 dashboard: DashboardConfig {
                     refresh_interval_ms: 5000,
                     show_pull_requests: false,
+                    wise_merge: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
                     use_ai_variant: String::new(),
                     ai_status: Default::default(),
+                    legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
             };
@@ -5706,10 +6289,12 @@ mod tests {
             let new_dashboard = DashboardConfig {
                 refresh_interval_ms: 8000,
                 show_pull_requests: true,
+                wise_merge: false,
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 use_ai: String::new(),
                 use_ai_variant: String::new(),
                 ai_status: Default::default(),
+                legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
 
@@ -5718,6 +6303,57 @@ mod tests {
             let saved_global: WorktreeConfig =
                 serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
             assert_eq!(saved_global.dashboard, new_dashboard);
+
+            assert_eq!(app.current_config().unwrap().dashboard, new_dashboard);
+        });
+    }
+
+    #[test]
+    fn save_dashboard_wise_merge_change_writes_to_local_when_local_missing() {
+        with_home(|home| {
+            let repo_root = home.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            let global_path = home.path().join(".wisetree").join("settings.json");
+            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+
+            let global = WorktreeConfig {
+                dashboard: DashboardConfig {
+                    refresh_interval_ms: 5000,
+                    show_pull_requests: true,
+                    wise_merge: false,
+                    columns: vec!["branch".into(), "status".into()],
+                    use_ai: String::new(),
+                    use_ai_variant: String::new(),
+                    ai_status: Default::default(),
+                    legacy_notifications: None,
+                },
+                terminal_command: "global-terminal".into(),
+                ..WorktreeConfig::default()
+            };
+            let mut writer = ConfigService::new();
+            writer.save(&global, Some(&global_path)).unwrap();
+
+            let mut service = WorktreeService::new(Some(repo_root.clone()));
+            service.config_service_mut().load(Some(&repo_root)).unwrap();
+
+            let mut app = App::new(AppMode::Settings, false);
+            app.phase = InitPhase::Ready;
+            app.worktree_service = Some(service);
+            app.git_root = Some(repo_root.display().to_string());
+
+            let mut new_dashboard = app.current_config().unwrap().dashboard.clone();
+            new_dashboard.wise_merge = true;
+            app.save_dashboard(new_dashboard.clone()).unwrap();
+
+            let saved_local: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+            assert_eq!(saved_local.dashboard, new_dashboard);
+            assert_eq!(saved_local.terminal_command, "global-terminal");
+
+            let saved_global: WorktreeConfig =
+                serde_json::from_str(&fs::read_to_string(&global_path).unwrap()).unwrap();
+            assert_eq!(saved_global.dashboard, global.dashboard);
 
             assert_eq!(app.current_config().unwrap().dashboard, new_dashboard);
         });
@@ -5810,6 +6446,44 @@ mod tests {
 
         assert!(app.quit_requested);
         assert_eq!(app.selected_path(), Some("/tmp/repo/feat-x"));
+    }
+
+    #[test]
+    fn fill_opening_terminal_activity_uses_full_height_panel() {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::FillPullRequest;
+        app.fill_pr = Some(FillPullRequestScreen::new(FillPullRequestRequest {
+            branch: "feature/fill".into(),
+            worktree_path: "/tmp/repo/feature/fill".into(),
+            base_ref: Some("upstream/main".into()),
+            number: None,
+            title: None,
+            url: None,
+            existing_labels: Vec::new(),
+        }));
+        let screen = app.fill_pr.as_mut().unwrap();
+        screen.start_opening();
+        screen.append_terminal_line("running tests".into(), crate::files::ActivityKind::Stdout);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let dump = rows.join("\n");
+
+        assert!(dump.contains("Opening pull request"), "{dump}");
+        assert!(dump.contains("Terminal Activity"), "{dump}");
+        assert!(
+            !rows.last().unwrap().trim().is_empty(),
+            "Fill Opening must occupy the full bottom panel so streaming output stays framed:\n{dump}"
+        );
     }
 
     #[test]

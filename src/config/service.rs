@@ -172,6 +172,7 @@ impl ConfigService {
             )
         })?;
 
+        parsed.migrate_notifications();
         parsed.dashboard.clamp();
         self.warnings = parsed.dashboard.normalize_columns();
 

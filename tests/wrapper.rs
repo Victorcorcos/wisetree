@@ -44,6 +44,7 @@ mod unix_shutdown {
     use std::time::{Duration, Instant};
 
     use assert_cmd::cargo::cargo_bin;
+    use tempfile::TempDir;
 
     /// Every test in this module spawns `wisetree --from-wrapper` children
     /// and detects orphans via `pgrep -f wisetree.*--from-wrapper`. Cargo
@@ -65,6 +66,11 @@ mod unix_shutdown {
     struct WrapperProcess {
         child: Child,
         master: File,
+        _home: TempDir,
+    }
+
+    fn isolated_home() -> io::Result<TempDir> {
+        tempfile::tempdir()
     }
 
     fn duplicate_stdio(file: &File) -> io::Result<Stdio> {
@@ -116,10 +122,12 @@ mod unix_shutdown {
 
     fn spawn_wrapper_process() -> io::Result<WrapperProcess> {
         let binary = cargo_bin("wisetree");
+        let home = isolated_home()?;
         let (master, slave) = open_pty()?;
         let slave_fd = slave.as_raw_fd();
         let mut cmd = Command::new(binary);
         cmd.arg("--from-wrapper")
+            .env("HOME", home.path())
             .stdin(duplicate_stdio(&slave)?)
             .stdout(Stdio::piped())
             .stderr(duplicate_stdio(&slave)?);
@@ -136,7 +144,11 @@ mod unix_shutdown {
         }
         let child = cmd.spawn()?;
         drop(slave);
-        Ok(WrapperProcess { child, master })
+        Ok(WrapperProcess {
+            child,
+            master,
+            _home: home,
+        })
     }
 
     fn read_available(master: &File, buffer: &mut Vec<u8>) -> io::Result<usize> {
@@ -321,6 +333,7 @@ mod unix_shutdown {
 
     fn spawn_wrapper_via_bash() -> io::Result<WrapperProcess> {
         let binary = cargo_bin("wisetree");
+        let home = isolated_home()?;
         let script = format!(
             "dir=$(FORCE_COLOR=3 {} --from-wrapper); echo CAPTURED=$dir",
             binary.display()
@@ -331,6 +344,7 @@ mod unix_shutdown {
         let mut cmd = Command::new("/bin/bash");
         cmd.arg("-c")
             .arg(script)
+            .env("HOME", home.path())
             .stdin(duplicate_stdio(&slave)?)
             .stdout(duplicate_stdio(&slave)?)
             .stderr(duplicate_stdio(&slave)?);
@@ -347,7 +361,11 @@ mod unix_shutdown {
         }
         let child = cmd.spawn()?;
         drop(slave);
-        Ok(WrapperProcess { child, master })
+        Ok(WrapperProcess {
+            child,
+            master,
+            _home: home,
+        })
     }
 
     #[test]

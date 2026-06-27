@@ -14,11 +14,26 @@ use crate::tui::router::Screen;
 pub struct WelcomeHeader<'a> {
     pub screen: Screen,
     pub cwd: &'a str,
+    /// Overrides the screen-derived label when set. Used so a screen that is
+    /// reused across flows (e.g. `UpdatePullRequest` hosting the local
+    /// "Update branch (locally)" conflict resolution) can show the correct
+    /// title instead of the default one keyed on `Screen`.
+    label_override: Option<&'static str>,
 }
 
 impl<'a> WelcomeHeader<'a> {
     pub fn new(screen: Screen, cwd: &'a str) -> Self {
-        Self { screen, cwd }
+        Self {
+            screen,
+            cwd,
+            label_override: None,
+        }
+    }
+
+    /// Replace the screen-derived header label. `None` keeps the default.
+    pub fn with_label(mut self, label: Option<&'static str>) -> Self {
+        self.label_override = label;
+        self
     }
 
     fn mode_label(&self) -> Option<&'static str> {
@@ -71,7 +86,7 @@ impl<'a> WelcomeHeader<'a> {
             Span::styled("  ", panel_style),
             Span::styled("🧙 ", panel_style),
         ];
-        match self.mode_label() {
+        match self.label_override.or_else(|| self.mode_label()) {
             None => {
                 header_spans.push(Span::styled("Welcome to ", title_style));
                 header_spans.push(Span::styled("Wisetree", brand_style));

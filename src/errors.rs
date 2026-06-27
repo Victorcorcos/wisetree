@@ -32,6 +32,26 @@ impl GitErrorCode {
             Self::GitOperationFailed => "GIT_OPERATION_FAILED",
         }
     }
+
+    /// User-facing sentence for this git error code.
+    pub fn user_message(self, detail: &str) -> String {
+        match self {
+            Self::AlreadyExists => "A worktree or branch with this name already exists.".to_string(),
+            Self::InvalidRef => "Invalid branch name or commit reference.".to_string(),
+            Self::BranchCheckedOut => {
+                "This branch is already checked out in another worktree.".to_string()
+            }
+            Self::PathNotFound => "The specified path does not exist.".to_string(),
+            Self::NotGitRepo => "Current directory is not a git repository.".to_string(),
+            Self::UncommittedChanges => {
+                "Worktree has uncommitted changes. Use force to delete anyway.".to_string()
+            }
+            Self::CorruptedWorktree => {
+                "Worktree is corrupted. This can be fixed by manually deleting the worktree directory and running 'git worktree prune'.".to_string()
+            }
+            Self::GitOperationFailed => format!("Git operation failed: {detail}"),
+        }
+    }
 }
 
 /// Top-level error type. `WisetreeError` is the only `Display`/`Error`-
@@ -120,93 +140,66 @@ pub type Result<T> = std::result::Result<T, WisetreeError>;
 /// `handle_git_error` substring matcher. **Order matters** — the first
 /// matching pattern wins.
 pub fn handle_git_error(stderr: &str, operation: &str) -> WisetreeError {
+    let git_err = |message: &str, code: GitErrorCode| -> WisetreeError {
+        WisetreeError::git(message, code, Some(stderr.to_string()))
+    };
+
     if stderr.contains("already exists") {
-        return WisetreeError::git(
+        return git_err(
             "Worktree or branch already exists",
             GitErrorCode::AlreadyExists,
-            Some(stderr.to_string()),
         );
     }
 
     if stderr.contains("not a valid object name") {
-        return WisetreeError::git(
+        return git_err(
             "Invalid branch or commit reference",
             GitErrorCode::InvalidRef,
-            Some(stderr.to_string()),
         );
     }
 
     if stderr.contains("is already checked out") {
-        return WisetreeError::git(
+        return git_err(
             "Branch is already checked out in another worktree",
             GitErrorCode::BranchCheckedOut,
-            Some(stderr.to_string()),
         );
     }
 
     if stderr.contains("No such file or directory") {
-        return WisetreeError::git(
-            "Path does not exist",
-            GitErrorCode::PathNotFound,
-            Some(stderr.to_string()),
-        );
+        return git_err("Path does not exist", GitErrorCode::PathNotFound);
     }
 
     if stderr.contains("not a git repository") {
-        return WisetreeError::git(
-            "Not a git repository",
-            GitErrorCode::NotGitRepo,
-            Some(stderr.to_string()),
-        );
+        return git_err("Not a git repository", GitErrorCode::NotGitRepo);
     }
 
     if stderr.contains("contains modified or untracked files")
         || stderr.contains("worktree is dirty")
         || (stderr.contains("cannot be removed") && stderr.contains("is dirty"))
     {
-        return WisetreeError::git(
+        return git_err(
             "Worktree has uncommitted changes. Use force to delete anyway.",
             GitErrorCode::UncommittedChanges,
-            Some(stderr.to_string()),
         );
     }
 
     if stderr.contains("is not a .git file") && stderr.contains("validation failed") {
-        return WisetreeError::git(
+        return git_err(
             "Worktree is corrupted. Try manual cleanup or use force delete.",
             GitErrorCode::CorruptedWorktree,
-            Some(stderr.to_string()),
         );
     }
 
-    WisetreeError::git(
-        format!("Git {operation} operation failed: {stderr}"),
+    git_err(
+        &format!("Git {operation} operation failed: {stderr}"),
         GitErrorCode::GitOperationFailed,
-        Some(stderr.to_string()),
     )
 }
 
 /// Translate an internal error into the friendlier wording the UI shows.
 pub fn user_friendly_message(error: &WisetreeError) -> String {
     match error {
-        WisetreeError::Git { code, message, .. } => match code {
-            GitErrorCode::AlreadyExists => {
-                "A worktree or branch with this name already exists.".to_string()
-            }
-            GitErrorCode::InvalidRef => "Invalid branch name or commit reference.".to_string(),
-            GitErrorCode::BranchCheckedOut => {
-                "This branch is already checked out in another worktree.".to_string()
-            }
-            GitErrorCode::PathNotFound => "The specified path does not exist.".to_string(),
-            GitErrorCode::NotGitRepo => "Current directory is not a git repository.".to_string(),
-            GitErrorCode::UncommittedChanges => {
-                "Worktree has uncommitted changes. Use force to delete anyway.".to_string()
-            }
-            GitErrorCode::CorruptedWorktree => {
-                "Worktree is corrupted. This can be fixed by manually deleting the worktree directory and running 'git worktree prune'.".to_string()
-            }
-            GitErrorCode::GitOperationFailed => format!("Git operation failed: {message}"),
-        },
+        WisetreeError::Git { code, message, .. } => code.user_message(message),
         WisetreeError::Validation { message, .. } => format!("Validation error: {message}"),
         WisetreeError::Config { message, .. } => format!("Configuration error: {message}"),
         WisetreeError::Io(err) => format!("Unexpected error: {err}"),
