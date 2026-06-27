@@ -1838,8 +1838,9 @@ impl DashboardService {
     /// No AI here. The branch is already checked out in this worktree (that's
     /// why "Fix" is offered), so we sync it with a fast-forward-only pull
     /// rather than `gh pr checkout`, which could switch branches inside the
-    /// worktree. Resolved, outdated, and minimized threads are dropped via
-    /// GraphQL flags; survivors are grouped by file + line.
+    /// worktree. Resolved and minimized threads are dropped, as are outdated
+    /// threads we already replied to; surviving inline comments are grouped by
+    /// file + line, and PR-level review summaries are folded into one group.
     pub async fn prepare_fix(&self, worktree_path: &str, number: u64) -> Result<FixPreparation> {
         if !self.gh_available {
             return Ok(FixPreparation::GhUnavailable);
@@ -1893,10 +1894,10 @@ impl DashboardService {
             ));
         };
 
-        // One GraphQL call returns every inline review thread (and the
-        // resolved/minimized flags we filter on). PR-level review summaries
-        // are deliberately not fetched — the loop walks inline replies only.
-        let query = build_fix_threads_query(&owner, &repo, number);
+        // One GraphQL call returns every inline review thread (with the
+        // resolved/outdated/minimized flags we filter on) plus every PR-level
+        // review summary body, which is folded into its own group.
+        let query = build_fix_feedback_query(&owner, &repo, number);
         let arg = format!("query={query}");
         let output = time::timeout(
             FIX_FETCH_TIMEOUT,
@@ -1906,7 +1907,7 @@ impl DashboardService {
         .map_err(|_| WisetreeError::other("gh api graphql timed out after 15s"))?
         .map_err(WisetreeError::other)?;
 
-        let groups = parse_and_group_review_threads(&output).map_err(WisetreeError::other)?;
+        let groups = parse_and_group_review_feedback(&output).map_err(WisetreeError::other)?;
         if groups.is_empty() {
             return Ok(FixPreparation::NoComments);
         }
@@ -3715,30 +3716,38 @@ fn build_enrich_prompt(
 
 // ── "Fix Pull Request" helpers (deterministic, unit-tested) ────────────
 
-/// Build the GraphQL query that returns every review thread (with the
-/// `isResolved` flag we filter on and the per-comment `isMinimized` flag).
-/// Only inline review-thread comments are fetched — PR-level review summary
-/// bodies (e.g. a "💡 Codex Review" header) are intentionally excluded so the
-/// Fix loop walks the actionable inline replies, not the umbrella comment.
-fn build_fix_threads_query(owner: &str, repo: &str, number: u64) -> String {
+/// Build the GraphQL query for the Fix loop. It returns, in one round-trip:
+/// every inline review thread (with the `isResolved` / `isOutdated` flags we
+/// filter on, plus each comment's `isMinimized` and `viewerDidAuthor` flags),
+/// and every PR-level review summary body (the text left when submitting a
+/// review, not anchored to a line). Both feed `parse_and_group_review_feedback`.
+fn build_fix_feedback_query(owner: &str, repo: &str, number: u64) -> String {
     format!(
         "query {{ repository(owner: \"{}\", name: \"{}\") {{ pullRequest(number: {}) {{ \
-         reviewThreads(first: 100) {{ nodes {{ isResolved \
-         comments(first: 50) {{ nodes {{ databaseId path line originalLine isMinimized body \
-         author {{ login }} }} }} }} }} }} }} }}",
+         reviewThreads(first: 100) {{ nodes {{ isResolved isOutdated \
+         comments(first: 50) {{ nodes {{ databaseId path line originalLine isMinimized \
+         viewerDidAuthor body author {{ login }} }} }} }} }} \
+         reviews(first: 100) {{ nodes {{ state body author {{ login }} }} }} }} }} }}",
         escape_graphql_string(owner),
         escape_graphql_string(repo),
         number
     )
 }
 
-/// Parse the review-threads GraphQL response and group the survivors. Drops
-/// resolved threads and minimized comments, then groups the rest by
-/// (file, line) preserving first-seen order. Outdated threads are kept (an AI
-/// reviewer often marks its inline comments outdated once the branch advances,
-/// yet the feedback is still actionable). PR-level review summaries are *not*
-/// fetched, so every group anchors to an inline reply we can reply to in-thread.
-fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<CommentGroup>, String> {
+/// Parse the review-feedback GraphQL response and group the survivors.
+///
+/// Inline threads: resolved threads and minimized comments are dropped. An
+/// *outdated* thread is dropped only when we (the viewer) already replied to it
+/// — that reply means a previous run analysed and addressed it, which is what
+/// moved the line and marked the thread outdated. An outdated thread with no
+/// reply from us is still pending, so it is kept (anchored via `originalLine`).
+/// Surviving inline comments are grouped by (file, line) in first-seen order.
+///
+/// PR-level review summaries (review bodies not anchored to a line) cannot be
+/// replied to in-thread, so every submitted, non-empty one is folded into a
+/// single group (file / line / reply id all `None`) appended last. The planning
+/// AI judges them together and any reply goes back as one general PR comment.
+fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<CommentGroup>, String> {
     #[derive(Deserialize)]
     struct Resp {
         data: Option<RespData>,
@@ -3757,6 +3766,7 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
     struct Pr {
         #[serde(rename = "reviewThreads")]
         review_threads: Conn<Thread>,
+        reviews: Option<Conn<Review>>,
     }
     #[derive(Deserialize)]
     struct Conn<T> {
@@ -3767,6 +3777,8 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
     struct Thread {
         #[serde(rename = "isResolved", default)]
         is_resolved: bool,
+        #[serde(rename = "isOutdated", default)]
+        is_outdated: bool,
         comments: Conn<RawComment>,
     }
     #[derive(Deserialize)]
@@ -3779,6 +3791,18 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
         original_line: Option<u64>,
         #[serde(rename = "isMinimized", default)]
         is_minimized: bool,
+        #[serde(rename = "viewerDidAuthor", default)]
+        viewer_did_author: bool,
+        #[serde(default)]
+        body: String,
+        author: Option<Author>,
+    }
+    /// A submitted PR-level review. `body` is the summary text; `state` is one
+    /// of APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING.
+    #[derive(Deserialize)]
+    struct Review {
+        #[serde(default)]
+        state: String,
         #[serde(default)]
         body: String,
         author: Option<Author>,
@@ -3826,6 +3850,13 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
         if thread.is_resolved {
             continue;
         }
+        // An outdated thread we (the viewer) already replied to was handled in
+        // a previous run — our fix moved the line, which is what marked it
+        // outdated — so skip re-analysing it. Outdated threads with no reply
+        // from us are still pending and fall through to be kept below.
+        if thread.is_outdated && thread.comments.nodes.iter().any(|c| c.viewer_did_author) {
+            continue;
+        }
         let surviving: Vec<RawComment> = thread
             .comments
             .nodes
@@ -3862,6 +3893,32 @@ fn parse_and_group_review_threads(body: &str) -> std::result::Result<Vec<Comment
             line,
             reply_comment_id: reply_id,
             comments: mapped,
+        });
+    }
+
+    // Fold every PR-level review summary body into one trailing group. These
+    // are not line-anchored and cannot be replied to in-thread, so the whole
+    // set shares a single group (file / line / reply id `None`, so the reply
+    // falls back to a general PR comment) and is judged together by one
+    // planning call. PENDING reviews aren't submitted yet and DISMISSED ones
+    // were explicitly retracted, so both are excluded along with empty bodies.
+    let mut summaries: Vec<ReviewComment> = Vec::new();
+    for review in pr.reviews.map(|c| c.nodes).unwrap_or_default() {
+        let state = review.state.to_ascii_uppercase();
+        if state == "PENDING" || state == "DISMISSED" || review.body.trim().is_empty() {
+            continue;
+        }
+        summaries.push(ReviewComment {
+            author: login(&review.author),
+            body: review.body,
+        });
+    }
+    if !summaries.is_empty() {
+        groups.push(CommentGroup {
+            file: None,
+            line: None,
+            reply_comment_id: None,
+            comments: summaries,
         });
     }
 
@@ -4354,35 +4411,38 @@ so the intent reads clearly.
     // ── Fix pipeline: comment grouping ─────────────────────────────────
 
     #[test]
-    fn group_review_threads_keeps_unresolved_inline_and_ignores_reviews() {
+    fn group_review_feedback_keeps_inline_and_folds_pr_level() {
         let json = r#"{
           "data": { "repository": { "pullRequest": {
             "reviewThreads": { "nodes": [
-              { "isResolved": true, "comments": { "nodes": [
-                { "databaseId": 1, "path": "a.rs", "line": 5, "isMinimized": false, "body": "resolved", "author": { "login": "rev" } }
+              { "isResolved": true, "isOutdated": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 5, "isMinimized": false, "viewerDidAuthor": false, "body": "resolved", "author": { "login": "rev" } }
               ] } },
-              { "isResolved": false, "comments": { "nodes": [
-                { "databaseId": 2, "path": "a.rs", "line": null, "originalLine": 6, "isMinimized": false, "body": "outdated but actionable", "author": { "login": "codex" } }
+              { "isResolved": false, "isOutdated": true, "comments": { "nodes": [
+                { "databaseId": 2, "path": "a.rs", "line": null, "originalLine": 6, "isMinimized": false, "viewerDidAuthor": false, "body": "outdated but actionable", "author": { "login": "codex" } }
               ] } },
-              { "isResolved": false, "comments": { "nodes": [
-                { "databaseId": 3, "path": "a.rs", "line": 10, "isMinimized": false, "body": "rename foo", "author": { "login": "alice" } },
-                { "databaseId": 4, "path": "a.rs", "line": 10, "isMinimized": true, "body": "hidden", "author": { "login": "spam" } }
+              { "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+                { "databaseId": 3, "path": "a.rs", "line": 10, "isMinimized": false, "viewerDidAuthor": false, "body": "rename foo", "author": { "login": "alice" } },
+                { "databaseId": 4, "path": "a.rs", "line": 10, "isMinimized": true, "viewerDidAuthor": false, "body": "hidden", "author": { "login": "spam" } }
               ] } },
-              { "isResolved": false, "comments": { "nodes": [
-                { "databaseId": 5, "path": "a.rs", "line": 10, "isMinimized": false, "body": "second thread, same line", "author": { "login": "bob" } }
+              { "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+                { "databaseId": 5, "path": "a.rs", "line": 10, "isMinimized": false, "viewerDidAuthor": false, "body": "second thread, same line", "author": { "login": "bob" } }
               ] } }
             ] },
             "reviews": { "nodes": [
-              { "state": "COMMENTED", "body": "💡 Codex Review — overall looks good.", "author": { "login": "codex" } }
+              { "state": "COMMENTED", "body": "Overall looks solid, one concern below.", "author": { "login": "codex" } },
+              { "state": "APPROVED", "body": "", "author": { "login": "ci" } }
             ] }
           } } }
         }"#;
-        let groups = parse_and_group_review_threads(json).expect("parse ok");
-        // Resolved thread dropped; outdated thread kept; PR-level review ignored.
-        assert_eq!(groups.len(), 2);
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        // Resolved dropped; outdated-without-our-reply kept; same-line threads
+        // merged; PR-level summary folded into one trailing group (empty review
+        // body excluded).
+        assert_eq!(groups.len(), 3);
 
-        // Outdated-but-unresolved inline thread is now retained, anchored to
-        // the inline comment (line falls back to originalLine).
+        // Outdated-but-unreplied inline thread is retained, anchored to the
+        // inline comment (line falls back to originalLine).
         let outdated = &groups[0];
         assert_eq!(outdated.reply_comment_id, Some(2));
         assert_eq!(outdated.line, Some(6));
@@ -4397,27 +4457,84 @@ so the intent reads clearly.
         assert_eq!(inline.comments[0].author, "alice");
         assert_eq!(inline.comments[1].author, "bob");
 
-        // Every group anchors to an inline reply — no PR-level summary group.
-        assert!(groups.iter().all(|g| g.reply_comment_id.is_some()));
+        // The PR-level review summary is its own trailing group: not line-
+        // anchored and with no inline reply target (reply falls back to a
+        // general PR comment).
+        let summary = &groups[2];
+        assert!(summary.file.is_none());
+        assert!(summary.line.is_none());
+        assert!(summary.reply_comment_id.is_none());
+        assert_eq!(summary.comments.len(), 1);
+        assert!(summary.comments[0].body.contains("Overall looks solid"));
     }
 
     #[test]
-    fn group_review_threads_empty_when_all_resolved() {
+    fn group_review_feedback_drops_outdated_thread_we_already_replied_to() {
+        // An outdated thread where the viewer (us) already posted a reply was
+        // handled in a prior run, so it must not be re-analysed. A second
+        // outdated thread with no reply from us is still pending and kept.
         let json = r#"{ "data": { "repository": { "pullRequest": {
             "reviewThreads": { "nodes": [
-              { "isResolved": true, "isOutdated": false, "comments": { "nodes": [
-                { "databaseId": 1, "path": "a.rs", "line": 5, "isMinimized": false, "body": "x", "author": { "login": "rev" } }
+              { "isResolved": false, "isOutdated": true, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": null, "originalLine": 8, "isMinimized": false, "viewerDidAuthor": false, "body": "extract this", "author": { "login": "alice" } },
+                { "databaseId": 2, "path": "a.rs", "line": null, "originalLine": 8, "isMinimized": false, "viewerDidAuthor": true, "body": "Addressed in abc123. Thanks!", "author": { "login": "me" } }
+              ] } },
+              { "isResolved": false, "isOutdated": true, "comments": { "nodes": [
+                { "databaseId": 3, "path": "b.rs", "line": null, "originalLine": 3, "isMinimized": false, "viewerDidAuthor": false, "body": "still needs work", "author": { "login": "alice" } }
               ] } }
             ] },
             "reviews": { "nodes": [] }
         } } } }"#;
-        assert!(parse_and_group_review_threads(json).unwrap().is_empty());
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].reply_comment_id, Some(3));
+        assert_eq!(groups[0].comments[0].body, "still needs work");
     }
 
     #[test]
-    fn group_review_threads_surfaces_graphql_errors() {
+    fn group_review_feedback_folds_only_submitted_nonempty_summaries() {
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [] },
+            "reviews": { "nodes": [
+              { "state": "CHANGES_REQUESTED", "body": "Please add tests.", "author": { "login": "alice" } },
+              { "state": "PENDING", "body": "draft note, not submitted", "author": { "login": "me" } },
+              { "state": "DISMISSED", "body": "old retracted review", "author": { "login": "bob" } },
+              { "state": "APPROVED", "body": "", "author": { "login": "ci" } },
+              { "state": "COMMENTED", "body": "Also rename the module.", "author": { "login": "carol" } }
+            ] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        // One folded group from the two submitted, non-empty summaries; PENDING,
+        // DISMISSED, and empty-body reviews are excluded.
+        assert_eq!(groups.len(), 1);
+        let summary = &groups[0];
+        assert!(summary.reply_comment_id.is_none());
+        assert_eq!(summary.comments.len(), 2);
+        assert_eq!(summary.comments[0].author, "alice");
+        assert_eq!(summary.comments[1].author, "carol");
+        // The combined text carries both summaries into the single planning call.
+        let combined = summary.combined_text();
+        assert!(combined.contains("Please add tests."));
+        assert!(combined.contains("Also rename the module."));
+    }
+
+    #[test]
+    fn group_review_feedback_empty_when_all_resolved() {
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": true, "isOutdated": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 5, "isMinimized": false, "viewerDidAuthor": false, "body": "x", "author": { "login": "rev" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        assert!(parse_and_group_review_feedback(json).unwrap().is_empty());
+    }
+
+    #[test]
+    fn group_review_feedback_surfaces_graphql_errors() {
         let json = r#"{ "errors": [ { "message": "Could not resolve to a Repository." } ] }"#;
-        assert!(parse_and_group_review_threads(json).is_err());
+        assert!(parse_and_group_review_feedback(json).is_err());
     }
 
     // ── Fix pipeline: commit + reply formatting ────────────────────────
