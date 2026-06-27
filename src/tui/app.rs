@@ -1097,8 +1097,8 @@ impl App {
                             }
                         }
                     }
-                    SettingsAction::OpenAiModelPicker(current_use_ai) => {
-                        self.open_ai_model_picker(current_use_ai, tx);
+                    SettingsAction::OpenAiModelPicker { model, variant } => {
+                        self.open_ai_model_picker(model, variant, tx);
                     }
                     SettingsAction::FetchFreeModels => {
                         kick_off_fetch_free_opencode_models(tx.clone());
@@ -1266,9 +1266,9 @@ impl App {
                 match action {
                     AiModelPickerAction::Continue => {}
                     AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
-                    AiModelPickerAction::Selected(model) => {
+                    AiModelPickerAction::Selected { model, variant } => {
                         if let Some(settings) = self.settings.as_mut() {
-                            settings.apply_use_ai_selection(model);
+                            settings.apply_use_ai_selection(model, variant);
                         }
                         self.close_ai_model_picker();
                     }
@@ -1289,15 +1289,15 @@ impl App {
         match action {
             AiModelPickerAction::Continue => {}
             AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
-            AiModelPickerAction::Selected(model) => {
-                // Stamp the chosen pair into the still-live Dashboard editor
-                // and drop back onto it — the user persists the change by
-                // pressing the editor's Save button (same pattern as every
-                // other dashboard field). Auto-saving here would route the
+            AiModelPickerAction::Selected { model, variant } => {
+                // Stamp the chosen model + thinking strength into the still-live
+                // Dashboard editor and drop back onto it — the user persists the
+                // change by pressing the editor's Save button (same pattern as
+                // every other dashboard field). Auto-saving here would route the
                 // user past the editor to the Settings menu, which they
                 // don't expect.
                 if let Some(settings) = self.settings.as_mut() {
-                    settings.apply_use_ai_selection(model);
+                    settings.apply_use_ai_selection(model, variant);
                 }
                 self.close_ai_model_picker();
                 let _ = tx;
@@ -1306,15 +1306,16 @@ impl App {
     }
 
     /// Push the picker on top of the still-alive Settings screen, kick off the
-    /// background catalogue fetch, and flip the route. The picker reads
-    /// `current_use_ai` so reopening the picker lands on the user's prior
-    /// choice.
+    /// background catalogue fetch, and flip the route. The picker reads the
+    /// current `model` / `variant` so reopening it lands on the user's prior
+    /// choice (and pre-selects their thinking strength).
     fn open_ai_model_picker(
         &mut self,
-        current_use_ai: String,
+        model: String,
+        variant: String,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        self.ai_model_picker = Some(AiModelPickerScreen::new(current_use_ai));
+        self.ai_model_picker = Some(AiModelPickerScreen::new(model, variant));
         self.screen = Screen::AiModelPicker;
         kick_off_fetch_opencode_models(tx.clone());
     }
@@ -2119,8 +2120,8 @@ impl App {
                     }
                 }
             }
-            SettingsAction::OpenAiModelPicker(current_use_ai) => {
-                self.open_ai_model_picker(current_use_ai, tx);
+            SettingsAction::OpenAiModelPicker { model, variant } => {
+                self.open_ai_model_picker(model, variant, tx);
             }
             SettingsAction::FetchFreeModels => {
                 kick_off_fetch_free_opencode_models(tx.clone());
@@ -5616,6 +5617,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into(), "status".into()],
                     use_ai: String::new(),
+                    use_ai_variant: String::new(),
                     ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
@@ -5626,6 +5628,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
+                    use_ai_variant: String::new(),
                     ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
@@ -5652,6 +5655,7 @@ mod tests {
                     "pull_request".into(),
                 ],
                 use_ai: String::new(),
+                use_ai_variant: String::new(),
                 ai_status: Default::default(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
@@ -5683,6 +5687,7 @@ mod tests {
                     show_pull_requests: false,
                     columns: vec!["branch".into()],
                     use_ai: String::new(),
+                    use_ai_variant: String::new(),
                     ai_status: Default::default(),
                 },
                 ..WorktreeConfig::default()
@@ -5703,6 +5708,7 @@ mod tests {
                 show_pull_requests: true,
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 use_ai: String::new(),
+                use_ai_variant: String::new(),
                 ai_status: Default::default(),
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();

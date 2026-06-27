@@ -126,6 +126,13 @@ pub struct DashboardConfig {
     #[serde(rename = "useAi", default)]
     pub use_ai: String,
 
+    /// Thinking strength (reasoning effort) paired with `useAi`, chosen in the
+    /// AI model picker — e.g. `low`, `medium`, `high`. Empty means "default"
+    /// (no reasoning override). Stored alongside `useAi` rather than encoded
+    /// into it so `useAi` stays a clean `provider/model` value for `-m`.
+    #[serde(rename = "useAiVariant", default)]
+    pub use_ai_variant: String,
+
     #[serde(rename = "aiStatus", default)]
     pub ai_status: AiStatusConfig,
 }
@@ -137,6 +144,7 @@ impl Default for DashboardConfig {
             show_pull_requests: false,
             columns: default_columns(),
             use_ai: String::new(),
+            use_ai_variant: String::new(),
             ai_status: AiStatusConfig::default(),
         }
     }

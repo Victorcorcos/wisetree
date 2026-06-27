@@ -90,10 +90,13 @@ pub enum SettingsAction {
     /// columns) to the active config file. Invalid numbers or unknown columns
     /// are normalized by the caller.
     SaveDashboard(DashboardConfig),
-    /// Open the fullscreen AI provider/model picker prefilled with the current
-    /// `useAi` value. The caller owns the picker screen and writes the user's
-    /// choice back via `apply_use_ai_selection`.
-    OpenAiModelPicker(String),
+    /// Open the fullscreen AI model picker prefilled with the current `useAi`
+    /// model and its thinking strength. The caller owns the picker screen and
+    /// writes the user's choice back via `apply_use_ai_selection`.
+    OpenAiModelPicker {
+        model: String,
+        variant: String,
+    },
     /// Kick off the background `opencode models opencode` shell-out that
     /// populates the Dashboard editor's inline free-model quick-pick row.
     /// Emitted once when the user enters the Dashboard editor.
@@ -982,7 +985,7 @@ impl DashboardField {
                 "Comma-separated: branch, status, ai_status, ahead_behind, diff, last_commit, pull_request"
             }
             DashboardField::UseAi => {
-                "Provider/model for opencode (e.g. anthropic/claude-sonnet-4-5). Blank disables AI."
+                "Press Enter to pick an opencode model + thinking strength. Blank disables AI."
             }
         }
     }
@@ -1023,6 +1026,10 @@ enum SettingsMouseTarget {
 pub struct DashboardEditor {
     pub values: Vec<String>,
     pub statuses: Vec<DashboardRectStatus>,
+    /// Thinking strength chosen for `useAi`. Not a tab-able rectangle — it is
+    /// staged by the AI model picker alongside the `useAi` value and persisted
+    /// on Save. Empty means "default" (no reasoning override).
+    pub use_ai_variant: String,
     pub selection: DashboardSelection,
     edit_backup: Option<(String, DashboardRectStatus)>,
 }
@@ -1039,6 +1046,7 @@ impl DashboardEditor {
         Self {
             values,
             statuses,
+            use_ai_variant: config.use_ai_variant.clone(),
             selection: DashboardSelection::Rect(0),
             edit_backup: None,
         }
@@ -1081,12 +1089,20 @@ impl DashboardEditor {
         let (columns, _warnings) = normalize_dashboard_columns(&raw_columns);
 
         let use_ai = self.values[3].trim().to_string();
+        // A variant only means something when a model is set; clear it if the
+        // user blanked out `useAi` so we never persist an orphaned strength.
+        let use_ai_variant = if use_ai.is_empty() {
+            String::new()
+        } else {
+            self.use_ai_variant.clone()
+        };
 
         DashboardConfig {
             refresh_interval_ms,
             show_pull_requests,
             columns,
             use_ai,
+            use_ai_variant,
             ai_status: Default::default(),
         }
     }
@@ -1410,14 +1426,15 @@ impl SettingsScreen {
     /// button as every other dashboard field, matching the rest of the
     /// page's edit-then-Save model. Leaves the editor on screen so the
     /// user lands back where they were instead of bouncing to the menu.
-    pub fn apply_use_ai_selection(&mut self, value: String) {
+    pub fn apply_use_ai_selection(&mut self, model: String, variant: String) {
         let Some(editor) = self.dashboard_editor.as_mut() else {
             return;
         };
         let Some(idx) = use_ai_field_index() else {
             return;
         };
-        editor.values[idx] = value;
+        editor.values[idx] = model;
+        editor.use_ai_variant = variant;
         editor.statuses[idx] = DashboardRectStatus::Modified;
         editor.selection = DashboardSelection::Rect(idx);
     }
@@ -2614,10 +2631,13 @@ impl SettingsScreen {
                         SettingsAction::Continue
                     } else if matches!(field, DashboardField::UseAi) {
                         // The useAi field is selected from a fetched list of
-                        // opencode-known provider/model pairs, not free-typed.
-                        // Surface the current value so the picker pre-selects
-                        // it when the catalogue arrives.
-                        SettingsAction::OpenAiModelPicker(editor.values[i].clone())
+                        // opencode-known models, not free-typed. Surface the
+                        // current model + thinking strength so the picker
+                        // pre-selects them when the catalogue arrives.
+                        SettingsAction::OpenAiModelPicker {
+                            model: editor.values[i].clone(),
+                            variant: editor.use_ai_variant.clone(),
+                        }
                     } else {
                         start_editing = Some(i);
                         SettingsAction::Continue
@@ -3800,6 +3820,19 @@ impl SettingsScreen {
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM);
             Line::from(Span::styled("(empty — press Enter to edit)", placeholder))
+        } else if matches!(field, DashboardField::UseAi) && !editor.use_ai_variant.is_empty() {
+            // Show the chosen thinking strength next to the model, e.g.
+            // "anthropic/claude-opus-4-7  ·  high". The variant is stored
+            // separately, so it never bleeds into the saved `useAi` value.
+            Line::from(vec![
+                Span::raw(value.clone()),
+                Span::styled(
+                    format!("  ·  {}", editor.use_ai_variant),
+                    Style::default()
+                        .fg(colors::MUTED)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ])
         } else {
             Line::from(Span::raw(value.clone()))
         };
@@ -5118,10 +5151,17 @@ mod tests {
     #[test]
     fn apply_use_ai_selection_marks_modified_and_stays_on_dashboard_step() {
         let mut screen = dashboard_screen_with_free_models(vec![]);
-        screen.apply_use_ai_selection("anthropic/claude-sonnet-4-5".to_string());
+        screen.apply_use_ai_selection(
+            "anthropic/claude-sonnet-4-5".to_string(),
+            "high".to_string(),
+        );
         let editor = screen.dashboard_editor.as_ref().unwrap();
         let idx = use_ai_field_index().unwrap();
         assert_eq!(editor.values[idx], "anthropic/claude-sonnet-4-5");
+        assert_eq!(editor.use_ai_variant, "high");
+        // The chosen strength rides along into the persisted config, but only
+        // while a model is set.
+        assert_eq!(editor.build_config().use_ai_variant, "high");
         assert_eq!(editor.statuses[idx], DashboardRectStatus::Modified);
         assert_eq!(editor.selection, DashboardSelection::Rect(idx));
         // The editor is still on screen — the picker should hand the user

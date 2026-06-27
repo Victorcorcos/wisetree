@@ -28,6 +28,11 @@ pub struct OpencodeModel {
     pub provider_name: String,
     pub model_id: String,
     pub model_name: String,
+    /// `true` when models.dev marks the model as reasoning-capable. Drives
+    /// whether the picker offers a "Select variant" (thinking strength) step
+    /// after the model is chosen.
+    #[serde(default)]
+    pub reasoning: bool,
 }
 
 impl OpencodeModel {
@@ -49,6 +54,8 @@ struct ProviderEntry {
 struct ModelEntry {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    reasoning: bool,
 }
 
 /// Hit `models.dev/api.json` and return the catalogue as a flat, sorted list.
@@ -86,6 +93,7 @@ fn flatten_providers(
                 provider_name: provider_name.clone(),
                 model_id,
                 model_name,
+                reasoning: model.reasoning,
             });
         }
     }
@@ -161,7 +169,7 @@ mod tests {
             "anthropic": {
                 "name": "Anthropic",
                 "models": {
-                    "claude-sonnet-4-5": {"name": "Claude Sonnet 4.5"}
+                    "claude-sonnet-4-5": {"name": "Claude Sonnet 4.5", "reasoning": true}
                 }
             }
         }"#;
@@ -177,6 +185,24 @@ mod tests {
         );
         assert_eq!(parsed[0].provider_name, "Anthropic");
         assert_eq!(parsed[0].model_name, "Claude Sonnet 4.5");
+    }
+
+    #[test]
+    fn reasoning_flag_is_parsed_and_defaults_to_false() {
+        let raw = r#"{
+            "openai": {
+                "name": "OpenAI",
+                "models": {
+                    "gpt-5.4": {"name": "GPT-5.4", "reasoning": true},
+                    "gpt-image-1-mini": {"name": "GPT Image 1 mini"}
+                }
+            }
+        }"#;
+        let parsed = parse_models_json(raw).expect("fixture parses");
+        let reasoning: std::collections::BTreeMap<String, bool> =
+            parsed.iter().map(|m| (m.pair(), m.reasoning)).collect();
+        assert!(reasoning["openai/gpt-5.4"]);
+        assert!(!reasoning["openai/gpt-image-1-mini"]);
     }
 
     #[test]

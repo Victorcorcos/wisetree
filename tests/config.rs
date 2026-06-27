@@ -225,6 +225,7 @@ fn dashboard_config_round_trips_json() {
             show_pull_requests: true,
             columns: vec!["status".into(), "branch".into(), "pull_request".into()],
             use_ai: String::new(),
+            use_ai_variant: String::new(),
             ai_status: Default::default(),
         },
         ..WorktreeConfig::default()
