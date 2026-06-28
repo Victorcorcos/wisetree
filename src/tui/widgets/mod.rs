@@ -35,7 +35,7 @@ pub use select_prompt::{
 };
 pub use spinner::{spinner_frame, Spinner, SPINNER_FRAMES};
 pub use status_indicator::{Status, StatusIndicator};
-pub use summary_table::{render_summary_table, SummaryRow};
+pub use summary_table::{render_summary_table, RowStatus, SummaryRow};
 pub use toast::{render_toast, ToastSnapshot, ToastState, ToastVariant};
 pub use update_banner::UpdateBanner;
 pub use welcome_header::WelcomeHeader;
