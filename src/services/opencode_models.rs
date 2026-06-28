@@ -19,6 +19,10 @@ use tokio::process::Command;
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const OPENCODE_MODELS_TIMEOUT: Duration = Duration::from_secs(5);
+/// `opencode models --verbose` dumps the full JSON for every configured
+/// provider's models, so it can run longer than the bare-list call (it may
+/// refresh the models.dev cache first). Give it a roomier ceiling.
+const OPENCODE_VARIANTS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One row in the picker: a single `provider/model` pair plus the human
 /// names the picker uses for the description column.
@@ -28,6 +32,20 @@ pub struct OpencodeModel {
     pub provider_name: String,
     pub model_id: String,
     pub model_name: String,
+    /// `true` when models.dev marks the model as reasoning-capable. Drives
+    /// whether the picker offers a "Select variant" (thinking strength) step
+    /// after the model is chosen.
+    #[serde(default)]
+    pub reasoning: bool,
+    /// The exact thinking-strength variants this model accepts, as computed by
+    /// the local `opencode` CLI (`opencode models --verbose`). `None` means the
+    /// local CLI doesn't know this model (an unconfigured provider), so callers
+    /// fall back to a generic ladder. `Some(vec![])` is authoritative: the
+    /// model takes no reasoning override even though models.dev flags it
+    /// reasoning-capable (e.g. Kimi, Qwen). Weakest→strongest order is
+    /// preserved from opencode's own output.
+    #[serde(default)]
+    pub variants: Option<Vec<String>>,
 }
 
 impl OpencodeModel {
@@ -49,6 +67,8 @@ struct ProviderEntry {
 struct ModelEntry {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    reasoning: bool,
 }
 
 /// Hit `models.dev/api.json` and return the catalogue as a flat, sorted list.
@@ -86,6 +106,11 @@ fn flatten_providers(
                 provider_name: provider_name.clone(),
                 model_id,
                 model_name,
+                reasoning: model.reasoning,
+                // models.dev only advertises the reasoning flag, never the
+                // per-model variant set. `fetch_opencode_model_variants` fills
+                // this in afterwards from the local CLI.
+                variants: None,
             });
         }
     }
@@ -135,6 +160,127 @@ pub fn parse_opencode_models_output(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Ask the locally installed `opencode` to dump every configured model's full
+/// metadata (`opencode models --verbose`) and harvest the `variants` object
+/// each model carries. opencode computes these per model with provider-specific
+/// heuristics (Anthropic thinking budgets, OpenAI efforts, GLM `high`/`max`, …)
+/// and deliberately returns an empty set for models that take no reasoning
+/// override (Kimi, Qwen, MiniMax, …). Reusing opencode's own output keeps us
+/// correct without re-porting that logic — and in lock-step as opencode evolves.
+///
+/// Returns a `provider/model` → ordered-variant-names map. Only providers the
+/// local CLI is configured/authenticated for appear; callers fall back to a
+/// generic ladder for anything absent.
+pub async fn fetch_opencode_model_variants(
+    binary: &Path,
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    let mut cmd = Command::new(binary);
+    cmd.arg("models")
+        .arg("--verbose")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = tokio::time::timeout(OPENCODE_VARIANTS_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| "opencode models --verbose timed out".to_string())?
+        .map_err(|e| format!("spawn opencode: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "opencode models --verbose exited non-zero".to_string()
+        } else {
+            stderr
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_verbose_models_output(&stdout))
+}
+
+/// Shape of one model block in `opencode models --verbose`. We only care about
+/// the identity and the variant names; everything else is ignored.
+#[derive(Debug, Deserialize)]
+struct VerboseModel {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(default)]
+    variants: OrderedKeys,
+}
+
+/// The keys of a JSON object, captured in their original insertion order.
+/// opencode emits variants weakest→strongest, and the picker / cycle rely on
+/// that ordering, so we can't route through a `HashMap`/`BTreeMap` (which would
+/// drop or reorder the keys).
+#[derive(Debug, Default)]
+struct OrderedKeys(Vec<String>);
+
+impl<'de> Deserialize<'de> for OrderedKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct KeysVisitor;
+        impl<'de> serde::de::Visitor<'de> for KeysVisitor {
+            type Value = Vec<String>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map of variant name to settings")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut keys = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let _: serde::de::IgnoredAny = map.next_value()?;
+                    keys.push(key);
+                }
+                Ok(keys)
+            }
+        }
+        deserializer.deserialize_map(KeysVisitor).map(OrderedKeys)
+    }
+}
+
+/// Split `opencode models --verbose` stdout into its per-model JSON blocks and
+/// collect each model's variant names. The output interleaves a bare
+/// `provider/model` line before every pretty-printed JSON object, so we skip
+/// non-JSON lines and accumulate brace-balanced blocks. Each block is parsed
+/// with serde, so a mis-split or schema drift degrades gracefully (that model
+/// is simply dropped from the map → caller falls back to the generic ladder)
+/// instead of failing the whole fetch. Pulled out for unit testing without a
+/// subprocess.
+pub fn parse_verbose_models_output(raw: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    let mut block = String::new();
+    let mut depth: usize = 0;
+    let mut in_block = false;
+    for line in raw.lines() {
+        if !in_block {
+            // The bare `provider/model` lines carry no braces — skip until the
+            // opening `{` of the next JSON object.
+            if !line.contains('{') {
+                continue;
+            }
+            in_block = true;
+        }
+        block.push_str(line);
+        block.push('\n');
+        depth += line.matches('{').count();
+        depth = depth.saturating_sub(line.matches('}').count());
+        if depth == 0 {
+            if let Ok(model) = serde_json::from_str::<VerboseModel>(&block) {
+                out.insert(
+                    format!("{}/{}", model.provider_id, model.id),
+                    model.variants.0,
+                );
+            }
+            block.clear();
+            in_block = false;
+        }
+    }
+    out
+}
+
 /// Test-only helper: run the same flattening logic against a raw JSON string.
 /// Kept `pub` so the integration test crate can reuse it without re-deriving
 /// the schema.
@@ -161,7 +307,7 @@ mod tests {
             "anthropic": {
                 "name": "Anthropic",
                 "models": {
-                    "claude-sonnet-4-5": {"name": "Claude Sonnet 4.5"}
+                    "claude-sonnet-4-5": {"name": "Claude Sonnet 4.5", "reasoning": true}
                 }
             }
         }"#;
@@ -177,6 +323,24 @@ mod tests {
         );
         assert_eq!(parsed[0].provider_name, "Anthropic");
         assert_eq!(parsed[0].model_name, "Claude Sonnet 4.5");
+    }
+
+    #[test]
+    fn reasoning_flag_is_parsed_and_defaults_to_false() {
+        let raw = r#"{
+            "openai": {
+                "name": "OpenAI",
+                "models": {
+                    "gpt-5.4": {"name": "GPT-5.4", "reasoning": true},
+                    "gpt-image-1-mini": {"name": "GPT Image 1 mini"}
+                }
+            }
+        }"#;
+        let parsed = parse_models_json(raw).expect("fixture parses");
+        let reasoning: std::collections::BTreeMap<String, bool> =
+            parsed.iter().map(|m| (m.pair(), m.reasoning)).collect();
+        assert!(reasoning["openai/gpt-5.4"]);
+        assert!(!reasoning["openai/gpt-image-1-mini"]);
     }
 
     #[test]
@@ -225,6 +389,67 @@ mod tests {
                 "opencode/deepseek-v4-flash-free".to_string(),
                 "opencode/nemotron-3-super-free".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn parse_verbose_models_output_extracts_ordered_variants_per_model() {
+        // Mirrors `opencode models --verbose`: a bare `provider/model` line
+        // before each pretty-printed JSON object. Covers the three cases the
+        // picker cares about — no `variants` key, an empty object (Kimi-style),
+        // and a populated set whose weakest→strongest order must survive.
+        let raw = r#"opencode-go/kimi-k2.7-code
+{
+  "id": "kimi-k2.7-code",
+  "providerID": "opencode-go",
+  "capabilities": { "reasoning": true },
+  "variants": {}
+}
+opencode-go/glm-5.2
+{
+  "id": "glm-5.2",
+  "providerID": "opencode-go",
+  "variants": {
+    "high": { "reasoningEffort": "high" },
+    "max": { "reasoningEffort": "max" }
+  }
+}
+opencode/big-pickle
+{
+  "id": "big-pickle",
+  "providerID": "opencode"
+}
+"#;
+        let map = parse_verbose_models_output(raw);
+        assert_eq!(map.get("opencode-go/kimi-k2.7-code"), Some(&Vec::new()));
+        assert_eq!(
+            map.get("opencode-go/glm-5.2"),
+            Some(&vec!["high".to_string(), "max".to_string()])
+        );
+        // A model without a `variants` key yields an empty list, not a miss.
+        assert_eq!(map.get("opencode/big-pickle"), Some(&Vec::new()));
+    }
+
+    #[test]
+    fn parse_verbose_models_output_skips_unparseable_blocks() {
+        // A malformed block must be dropped without poisoning the rest.
+        let raw = r#"prov/bad
+{
+  "id": "bad",
+  not valid json
+}
+prov/good
+{
+  "id": "good",
+  "providerID": "prov",
+  "variants": { "low": {}, "high": {} }
+}
+"#;
+        let map = parse_verbose_models_output(raw);
+        assert!(!map.contains_key("prov/bad"));
+        assert_eq!(
+            map.get("prov/good"),
+            Some(&vec!["low".to_string(), "high".to_string()])
         );
     }
 

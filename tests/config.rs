@@ -226,7 +226,7 @@ fn dashboard_config_round_trips_json() {
             show_pull_requests: true,
             wise_merge: false,
             columns: vec!["status".into(), "branch".into(), "pull_request".into()],
-            use_ai: String::new(),
+            ai: Default::default(),
             ai_status: Default::default(),
             legacy_notifications: None,
         },

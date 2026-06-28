@@ -98,6 +98,10 @@ pub struct SelectPrompt<T: Clone> {
     pub selected: usize,
     pub query: String,
     pub searchable: bool,
+    /// When `true`, the search filter also matches an option's `description`
+    /// (not just its `label`). Lets the AI model picker filter by provider
+    /// name — typing "Copilot" surfaces every GitHub Copilot model.
+    pub search_description: bool,
     pub style: SelectStyle,
     pub show_hint: bool,
     pub footer_spacer: bool,
@@ -112,6 +116,7 @@ impl<T: Clone> SelectPrompt<T> {
             selected: 0,
             query: String::new(),
             searchable: false,
+            search_description: false,
             style: SelectStyle::Plain,
             show_hint: true,
             footer_spacer: false,
@@ -121,6 +126,14 @@ impl<T: Clone> SelectPrompt<T> {
 
     pub fn searchable(mut self) -> Self {
         self.searchable = true;
+        self
+    }
+
+    /// Extend the search filter to also match each option's description.
+    /// Implies `searchable`.
+    pub fn search_description(mut self) -> Self {
+        self.searchable = true;
+        self.search_description = true;
         self
     }
 
@@ -163,8 +176,12 @@ impl<T: Clone> SelectPrompt<T> {
             .enumerate()
             .filter_map(|(i, o)| {
                 let label_match = o.label.to_lowercase().contains(&q);
+                let desc_match = self.search_description
+                    && o.description
+                        .as_ref()
+                        .is_some_and(|d| d.to_lowercase().contains(&q));
                 let number_match = number_idx == Some(i);
-                (label_match || number_match).then_some(i)
+                (label_match || desc_match || number_match).then_some(i)
             })
             .collect()
     }

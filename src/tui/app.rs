@@ -34,12 +34,13 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
-    fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, AiStatus, CheckStatus, CommentGroup,
-    DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
-    EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
-    FixPlan, FixPreparation, FixVerdict, MultiSourceUpdateResult, OpencodeModel, PrState, Shell,
-    ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
+    install_shell_integration, parse_pull_request_md, resolve_dashboard_columns, AiStatus,
+    CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService,
+    DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest,
+    FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
+    MultiSourceUpdateResult, OpencodeModel, PrState, Shell, ShellIntegrationStatus,
+    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -191,6 +192,10 @@ enum AppEvent {
     /// Result of the background `opencode models opencode` shell-out that
     /// powers the Dashboard footer's free-model quick-pick.
     FreeOpencodeModelsFetched(Result<Vec<String>, String>),
+    /// Result of the background `opencode models --verbose` shell-out that maps
+    /// each `provider/model` to its authoritative reasoning variants, powering
+    /// the Dashboard `ai.model` field's per-model ←/→ reasoning cycle.
+    AiModelVariantsFetched(Result<std::collections::HashMap<String, Vec<String>>, String>),
     ShellIntegrationDetected(ShellIntegrationStatus),
 }
 
@@ -1319,11 +1324,12 @@ impl App {
                             }
                         }
                     }
-                    SettingsAction::OpenAiModelPicker(current_use_ai) => {
-                        self.open_ai_model_picker(current_use_ai, tx);
+                    SettingsAction::OpenAiModelPicker { model, variant } => {
+                        self.open_ai_model_picker(model, variant, tx);
                     }
                     SettingsAction::FetchFreeModels => {
                         kick_off_fetch_free_opencode_models(tx.clone());
+                        kick_off_fetch_ai_model_variants(tx.clone());
                     }
                     SettingsAction::UpgradeSource(source) => {
                         if let Some(settings) = self.settings.as_mut() {
@@ -1468,9 +1474,9 @@ impl App {
                 match action {
                     AiModelPickerAction::Continue => {}
                     AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
-                    AiModelPickerAction::Selected(model) => {
+                    AiModelPickerAction::Selected { model, variant } => {
                         if let Some(settings) = self.settings.as_mut() {
-                            settings.apply_use_ai_selection(model);
+                            settings.apply_ai_selection(model, variant);
                         }
                         self.close_ai_model_picker();
                     }
@@ -1491,15 +1497,15 @@ impl App {
         match action {
             AiModelPickerAction::Continue => {}
             AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
-            AiModelPickerAction::Selected(model) => {
-                // Stamp the chosen pair into the still-live Dashboard editor
-                // and drop back onto it — the user persists the change by
-                // pressing the editor's Save button (same pattern as every
-                // other dashboard field). Auto-saving here would route the
+            AiModelPickerAction::Selected { model, variant } => {
+                // Stamp the chosen model + thinking strength into the still-live
+                // Dashboard editor and drop back onto it — the user persists the
+                // change by pressing the editor's Save button (same pattern as
+                // every other dashboard field). Auto-saving here would route the
                 // user past the editor to the Settings menu, which they
                 // don't expect.
                 if let Some(settings) = self.settings.as_mut() {
-                    settings.apply_use_ai_selection(model);
+                    settings.apply_ai_selection(model, variant);
                 }
                 self.close_ai_model_picker();
                 let _ = tx;
@@ -1508,15 +1514,16 @@ impl App {
     }
 
     /// Push the picker on top of the still-alive Settings screen, kick off the
-    /// background catalogue fetch, and flip the route. The picker reads
-    /// `current_use_ai` so reopening the picker lands on the user's prior
-    /// choice.
+    /// background catalogue fetch, and flip the route. The picker reads the
+    /// current `model` / `variant` so reopening it lands on the user's prior
+    /// choice (and pre-selects their thinking strength).
     fn open_ai_model_picker(
         &mut self,
-        current_use_ai: String,
+        model: String,
+        variant: String,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        self.ai_model_picker = Some(AiModelPickerScreen::new(current_use_ai));
+        self.ai_model_picker = Some(AiModelPickerScreen::new(model, variant));
         self.screen = Screen::AiModelPicker;
         kick_off_fetch_opencode_models(tx.clone());
     }
@@ -1612,14 +1619,14 @@ impl App {
             return;
         };
         let request = screen.request().clone();
-        let use_ai = dashboard_config.use_ai.clone();
+        let model = dashboard_config.ai.model.clone();
         let base_ref = request
             .base_ref
             .clone()
             .unwrap_or_else(|| "upstream/main".to_string());
         let cwd = PathBuf::from(&request.worktree_path);
         let message = format!(
-            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
+            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({model}).",
             crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
         );
         let script = if screen.local_only() {
@@ -2025,7 +2032,7 @@ impl App {
                 ),
                 FixPreparation::AiNotConfigured => self.fail_fix(
                     ToastVariant::Warning,
-                    "Set the `useAi` setting so the AI can plan review fixes.".to_string(),
+                    "Set the `ai.model` setting so the AI can plan review fixes.".to_string(),
                     tx,
                 ),
                 FixPreparation::AiUnavailable => self.fail_fix(
@@ -2765,11 +2772,12 @@ impl App {
                     }
                 }
             }
-            SettingsAction::OpenAiModelPicker(current_use_ai) => {
-                self.open_ai_model_picker(current_use_ai, tx);
+            SettingsAction::OpenAiModelPicker { model, variant } => {
+                self.open_ai_model_picker(model, variant, tx);
             }
             SettingsAction::FetchFreeModels => {
                 kick_off_fetch_free_opencode_models(tx.clone());
+                kick_off_fetch_ai_model_variants(tx.clone());
             }
             SettingsAction::OpenSetupProject => {
                 self.enter_screen(Screen::SetupProject, tx);
@@ -3116,6 +3124,14 @@ impl App {
                     }
                 }
             }
+            AppEvent::AiModelVariantsFetched(result) => {
+                // Best-effort, like the free-model fetch: drop the result if
+                // the user has already left the Settings screen, and ignore
+                // errors (the cycle falls back to the generic ladder).
+                if let (Some(settings), Ok(variants)) = (self.settings.as_mut(), result) {
+                    settings.set_ai_model_variants(variants);
+                }
+            }
             AppEvent::ShellIntegrationDetected(status) => {
                 self.shell_integration_status = Some(status);
             }
@@ -3242,7 +3258,7 @@ impl App {
             ),
             Ok(UpdateBranchOutcome::ConflictsRequireAi { .. }) => self.show_toast(
                 ToastVariant::Warning,
-                "Conflicts found, please resolve them locally or setup `useAi` \
+                "Conflicts found, please resolve them locally or setup `ai.model` \
                  setting so we can solve conflicts + merge via AI."
                     .to_string(),
             ),
@@ -3488,7 +3504,7 @@ impl App {
                 UpdatePullRequestOutcome::ConflictsRequireAi { .. } => {
                     self.show_toast(
                         ToastVariant::Warning,
-                        "Conflicts found, please resolve them locally or setup `useAi` \
+                        "Conflicts found, please resolve them locally or setup `ai.model` \
                          setting so we can solve conflicts + merge via AI."
                             .to_string(),
                     );
@@ -3608,7 +3624,7 @@ impl App {
                 EnrichPreparation::AiNotConfigured => {
                     self.show_toast(
                         ToastVariant::Warning,
-                        "Set the `useAi` setting so we can draft the PR description with AI."
+                        "Set the `ai.model` setting so we can draft the PR description with AI."
                             .to_string(),
                     );
                     self.enrich_pr = None;
@@ -4862,7 +4878,24 @@ fn run_upgrade(source: UpdateSource) -> Result<String, String> {
 
 fn kick_off_fetch_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
-        let result = fetch_opencode_models().await;
+        let result = match fetch_opencode_models().await {
+            Ok(mut models) => {
+                // Enrich the models.dev catalogue with the authoritative
+                // per-model variant sets from the local CLI. Best-effort: if
+                // the CLI is missing or errors, every model keeps `variants:
+                // None` and the picker falls back to the generic ladder.
+                let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
+                if let Ok(variants) = fetch_opencode_model_variants(&binary).await {
+                    for model in &mut models {
+                        if let Some(v) = variants.get(&model.pair()) {
+                            model.variants = Some(v.clone());
+                        }
+                    }
+                }
+                Ok(models)
+            }
+            Err(message) => Err(message),
+        };
         let _ = tx.send(AppEvent::AiModelsFetched(result));
     });
 }
@@ -4878,6 +4911,19 @@ fn kick_off_fetch_free_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
         let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
         let result = fetch_free_opencode_models(&binary).await;
         let _ = tx.send(AppEvent::FreeOpencodeModelsFetched(result));
+    });
+}
+
+/// Shell out to `opencode models --verbose` to learn each model's authoritative
+/// reasoning variants, so the Dashboard `ai.model` field's ←/→ cycle offers only
+/// the levels the chosen model actually accepts. Same best-effort posture as
+/// the free-model fetch — failures leave the Settings screen on the generic
+/// fallback ladder.
+fn kick_off_fetch_ai_model_variants(tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
+        let result = fetch_opencode_model_variants(&binary).await;
+        let _ = tx.send(AppEvent::AiModelVariantsFetched(result));
     });
 }
 
@@ -6945,7 +6991,7 @@ mod tests {
                     show_pull_requests: false,
                     wise_merge: false,
                     columns: vec!["branch".into(), "status".into()],
-                    use_ai: String::new(),
+                    ai: Default::default(),
                     ai_status: Default::default(),
                     legacy_notifications: None,
                 },
@@ -6957,7 +7003,7 @@ mod tests {
                     show_pull_requests: false,
                     wise_merge: false,
                     columns: vec!["branch".into()],
-                    use_ai: String::new(),
+                    ai: Default::default(),
                     ai_status: Default::default(),
                     legacy_notifications: None,
                 },
@@ -6985,7 +7031,7 @@ mod tests {
                     "ai_status".into(),
                     "pull_request".into(),
                 ],
-                use_ai: String::new(),
+                ai: Default::default(),
                 ai_status: Default::default(),
                 legacy_notifications: None,
             };
@@ -7018,7 +7064,7 @@ mod tests {
                     show_pull_requests: false,
                     wise_merge: false,
                     columns: vec!["branch".into()],
-                    use_ai: String::new(),
+                    ai: Default::default(),
                     ai_status: Default::default(),
                     legacy_notifications: None,
                 },
@@ -7040,7 +7086,7 @@ mod tests {
                 show_pull_requests: true,
                 wise_merge: false,
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
-                use_ai: String::new(),
+                ai: Default::default(),
                 ai_status: Default::default(),
                 legacy_notifications: None,
             };
@@ -7071,7 +7117,7 @@ mod tests {
                     show_pull_requests: true,
                     wise_merge: false,
                     columns: vec!["branch".into(), "status".into()],
-                    use_ai: String::new(),
+                    ai: Default::default(),
                     ai_status: Default::default(),
                     legacy_notifications: None,
                 },
