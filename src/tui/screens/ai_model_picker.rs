@@ -40,7 +40,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 /// provider-specific heuristics; we offer the full union and let the user pick
 /// — opencode silently drops a level a given model doesn't accept. The
 /// "Default" option (no override) is rendered separately and stored as "".
-const REASONING_VARIANTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+pub const REASONING_VARIANTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// One row in the model phase. Carries the `provider/model` pair that gets
 /// stored in `useAi` plus whether the model supports thinking strengths.

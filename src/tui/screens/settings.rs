@@ -23,6 +23,7 @@ use ratatui::Frame;
 use crate::config::schema::{DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig};
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
+use crate::tui::screens::ai_model_picker::REASONING_VARIANTS;
 use crate::tui::widgets::{
     branded_line, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
     InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
@@ -992,7 +993,7 @@ impl DashboardField {
                 "Comma-separated: branch, status, ai_status, ahead_behind, diff, last_commit, pull_request"
             }
             DashboardField::UseAi => {
-                "Press Enter to pick an opencode model + thinking strength. Blank disables AI."
+                "Enter picks a model. ←/→ adjust thinking strength. Blank disables AI."
             }
         }
     }
@@ -2763,11 +2764,15 @@ impl SettingsScreen {
                 SettingsAction::Continue
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.dashboard_cycle_chip(false);
+                if !self.dashboard_adjust_use_ai_reasoning(false) {
+                    self.dashboard_cycle_chip(false);
+                }
                 SettingsAction::Continue
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.dashboard_cycle_chip(true);
+                if !self.dashboard_adjust_use_ai_reasoning(true) {
+                    self.dashboard_cycle_chip(true);
+                }
                 SettingsAction::Continue
             }
             KeyCode::Enter => match editor.selection {
@@ -2960,6 +2965,38 @@ impl SettingsScreen {
         }
     }
 
+    /// Left/Right on the `useAi` rectangle adjusts the staged thinking
+    /// strength. The empty string is the persisted "Default" value; concrete
+    /// variants follow opencode's weakest-to-strongest ladder.
+    fn dashboard_adjust_use_ai_reasoning(&mut self, increase: bool) -> bool {
+        let Some(editor) = self.dashboard_editor.as_mut() else {
+            return false;
+        };
+        let Some(idx) = use_ai_field_index() else {
+            return false;
+        };
+        if !matches!(editor.selection, DashboardSelection::Rect(i) if i == idx) {
+            return false;
+        }
+        if editor.values[idx].trim().is_empty() {
+            return true;
+        }
+
+        let current = editor.use_ai_variant.as_str();
+        let current_idx = reasoning_level_index(current);
+        let next_idx = if increase {
+            (current_idx + 1).min(reasoning_level_count() - 1)
+        } else {
+            current_idx.saturating_sub(1)
+        };
+        let next = reasoning_level_at(next_idx).unwrap_or_default().to_string();
+        if next != editor.use_ai_variant {
+            editor.use_ai_variant = next;
+            editor.statuses[idx] = DashboardRectStatus::Modified;
+        }
+        true
+    }
+
     /// Stamp the chip-row cursor's pair into the `useAi` rectangle without
     /// saving — the user persists the change by pressing the screen's Save
     /// button just like any other dashboard field. Cursor stays on the
@@ -2978,6 +3015,7 @@ impl SettingsScreen {
         let pair = models[i.min(models.len() - 1)].clone();
         if let Some(idx) = use_ai_field_index() {
             editor.values[idx] = pair;
+            editor.use_ai_variant.clear();
             editor.statuses[idx] = DashboardRectStatus::Modified;
         }
     }
@@ -4041,14 +4079,14 @@ impl SettingsScreen {
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM);
             Line::from(Span::styled("(empty — press Enter to edit)", placeholder))
-        } else if matches!(field, DashboardField::UseAi) && !editor.use_ai_variant.is_empty() {
-            // Show the chosen thinking strength next to the model, e.g.
+        } else if matches!(field, DashboardField::UseAi) {
+            // Show the staged thinking strength next to the model, e.g.
             // "anthropic/claude-opus-4-7  ·  high". The variant is stored
             // separately, so it never bleeds into the saved `useAi` value.
             Line::from(vec![
                 Span::raw(value.clone()),
                 Span::styled(
-                    format!("  ·  {}", editor.use_ai_variant),
+                    format!("  ·  {}", reasoning_level_label(&editor.use_ai_variant)),
                     Style::default()
                         .fg(colors::MUTED)
                         .add_modifier(Modifier::DIM),
@@ -5364,6 +5402,38 @@ fn use_ai_field_index() -> Option<usize> {
         .position(|f| matches!(f, DashboardField::UseAi))
 }
 
+fn reasoning_level_count() -> usize {
+    1 + REASONING_VARIANTS.len()
+}
+
+fn reasoning_level_at(index: usize) -> Option<&'static str> {
+    if index == 0 {
+        Some("")
+    } else {
+        REASONING_VARIANTS.get(index - 1).copied()
+    }
+}
+
+fn reasoning_level_index(variant: &str) -> usize {
+    if variant.is_empty() {
+        0
+    } else {
+        REASONING_VARIANTS
+            .iter()
+            .position(|v| *v == variant)
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+}
+
+fn reasoning_level_label(variant: &str) -> &str {
+    if variant.is_empty() {
+        "default"
+    } else {
+        variant
+    }
+}
+
 /// When the cursor enters the chip row, prefer the chip whose value matches
 /// the `useAi` rectangle's current contents. Falls back to chip 0 when no
 /// chip matches so the cursor always has somewhere visible to land.
@@ -5510,6 +5580,7 @@ mod tests {
             "opencode/big-pickle".to_string(),
             "opencode/deepseek-v4-flash-free".to_string(),
         ]);
+        screen.dashboard_editor.as_mut().unwrap().use_ai_variant = "high".to_string();
         screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(1);
         let action = screen.handle_dashboard(key(KeyCode::Enter));
         // Stays on the page — no SaveDashboard, no ApplyFreeModel side-effect.
@@ -5517,9 +5588,70 @@ mod tests {
         let editor = screen.dashboard_editor.as_ref().unwrap();
         let idx = use_ai_field_index().unwrap();
         assert_eq!(editor.values[idx], "opencode/deepseek-v4-flash-free");
+        assert_eq!(editor.use_ai_variant, "");
         assert_eq!(editor.statuses[idx], DashboardRectStatus::Modified);
         // Cursor stays on the chip so the user can keep cycling.
         assert_eq!(editor.selection, DashboardSelection::FreeModels(1));
+    }
+
+    #[test]
+    fn arrows_on_use_ai_adjust_reasoning_strength() {
+        let mut screen = dashboard_screen_with_free_models(vec![]);
+        focus_use_ai(&mut screen);
+        let idx = use_ai_field_index().unwrap();
+        screen.dashboard_editor.as_mut().unwrap().values[idx] = "opencode/big-pickle".to_string();
+
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        let editor = screen.dashboard_editor.as_ref().unwrap();
+        assert_eq!(editor.use_ai_variant, "minimal");
+        assert_eq!(editor.statuses[idx], DashboardRectStatus::Modified);
+
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().use_ai_variant,
+            "low"
+        );
+
+        let _ = screen.handle_dashboard(key(KeyCode::Left));
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().use_ai_variant,
+            "minimal"
+        );
+
+        let _ = screen.handle_dashboard(key(KeyCode::Left));
+        assert_eq!(screen.dashboard_editor.as_ref().unwrap().use_ai_variant, "");
+    }
+
+    #[test]
+    fn arrows_on_empty_use_ai_do_not_stage_orphaned_strength() {
+        let mut screen = dashboard_screen_with_free_models(vec![]);
+        focus_use_ai(&mut screen);
+
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+
+        let editor = screen.dashboard_editor.as_ref().unwrap();
+        let idx = use_ai_field_index().unwrap();
+        assert_eq!(editor.use_ai_variant, "");
+        assert_eq!(editor.statuses[idx], DashboardRectStatus::Saved);
+    }
+
+    #[test]
+    fn save_dashboard_after_reasoning_arrow_persists_variant() {
+        let mut screen = dashboard_screen_with_free_models(vec![]);
+        focus_use_ai(&mut screen);
+        let idx = use_ai_field_index().unwrap();
+        screen.dashboard_editor.as_mut().unwrap().values[idx] = "opencode/big-pickle".to_string();
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Save;
+
+        match screen.handle_dashboard(key(KeyCode::Enter)) {
+            SettingsAction::SaveDashboard(cfg) => {
+                assert_eq!(cfg.use_ai, "opencode/big-pickle");
+                assert_eq!(cfg.use_ai_variant, "low");
+            }
+            other => panic!("expected SaveDashboard, got {other:?}"),
+        }
     }
 
     #[test]
