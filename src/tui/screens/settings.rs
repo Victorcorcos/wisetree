@@ -1256,6 +1256,12 @@ pub struct SettingsScreen {
     /// `DashboardEditor::selection::FreeModels(i)` — there is no separate
     /// focus field.
     free_models: Option<Result<Vec<String>, String>>,
+    /// `provider/model` → authoritative reasoning variants (weakest→strongest),
+    /// harvested from `opencode models --verbose`. Drives the `useAi` field's
+    /// ←/→ reasoning cycle so it only steps through the levels the chosen model
+    /// actually accepts. `None` until the background fetch lands; a model
+    /// missing from the map falls back to the generic ladder.
+    ai_model_variants: Option<std::collections::HashMap<String, Vec<String>>>,
     copy_settings_select: Option<SelectPrompt<CopyDirection>>,
     update_result: Option<MultiSourceUpdateResult>,
     checking_updates: bool,
@@ -1305,6 +1311,7 @@ impl SettingsScreen {
             dashboard_input: None,
             notifications_editor: None,
             free_models: None,
+            ai_model_variants: None,
             copy_settings_select: None,
             update_result: None,
             checking_updates: false,
@@ -1543,6 +1550,29 @@ impl SettingsScreen {
     #[cfg(test)]
     pub fn free_models(&self) -> Option<&Result<Vec<String>, String>> {
         self.free_models.as_ref()
+    }
+
+    /// Cache the `provider/model` → reasoning-variant map fetched in the
+    /// background, so the `useAi` ←/→ cycle becomes model-aware.
+    pub fn set_ai_model_variants(
+        &mut self,
+        variants: std::collections::HashMap<String, Vec<String>>,
+    ) {
+        self.ai_model_variants = Some(variants);
+    }
+
+    /// The reasoning ladder (weakest→strongest, excluding "Default") to cycle
+    /// for `pair`. Prefers the authoritative set from the local CLI — which may
+    /// legitimately be empty, meaning the model accepts no reasoning override —
+    /// and falls back to the generic ladder for models the CLI doesn't know (or
+    /// before the fetch lands).
+    fn use_ai_variant_ladder(&self, pair: &str) -> Vec<String> {
+        if let Some(map) = &self.ai_model_variants {
+            if let Some(variants) = map.get(pair) {
+                return variants.clone();
+            }
+        }
+        REASONING_VARIANTS.iter().map(|s| s.to_string()).collect()
     }
 
     /// Stamp the picked `useAi` value into the still-active dashboard editor
@@ -2969,27 +2999,38 @@ impl SettingsScreen {
     /// strength. The empty string is the persisted "Default" value; concrete
     /// variants follow opencode's weakest-to-strongest ladder.
     fn dashboard_adjust_use_ai_reasoning(&mut self, increase: bool) -> bool {
-        let Some(editor) = self.dashboard_editor.as_mut() else {
-            return false;
-        };
         let Some(idx) = use_ai_field_index() else {
             return false;
         };
-        if !matches!(editor.selection, DashboardSelection::Rect(i) if i == idx) {
-            return false;
-        }
-        if editor.values[idx].trim().is_empty() {
-            return true;
-        }
+        // Read the editor state up front so the immutable borrow is released
+        // before `use_ai_variant_ladder` (which also borrows `self`).
+        let (pair, current) = {
+            let Some(editor) = self.dashboard_editor.as_ref() else {
+                return false;
+            };
+            if !matches!(editor.selection, DashboardSelection::Rect(i) if i == idx) {
+                return false;
+            }
+            let pair = editor.values[idx].trim().to_string();
+            if pair.is_empty() {
+                return true;
+            }
+            (pair, editor.use_ai_variant.clone())
+        };
 
-        let current = editor.use_ai_variant.as_str();
-        let current_idx = reasoning_level_index(current);
+        // Step through the chosen model's own reasoning ladder, not a fixed
+        // one — e.g. Kimi accepts none (cycle is a no-op), GLM only high/max.
+        let ladder = self.use_ai_variant_ladder(&pair);
+        let current_idx = reasoning_level_index(&ladder, &current);
         let next_idx = if increase {
-            (current_idx + 1).min(reasoning_level_count() - 1)
+            (current_idx + 1).min(reasoning_level_count(&ladder) - 1)
         } else {
             current_idx.saturating_sub(1)
         };
-        let next = reasoning_level_at(next_idx).unwrap_or_default().to_string();
+        let next = reasoning_level_at(&ladder, next_idx).unwrap_or_default();
+        let Some(editor) = self.dashboard_editor.as_mut() else {
+            return false;
+        };
         if next != editor.use_ai_variant {
             editor.use_ai_variant = next;
             editor.statuses[idx] = DashboardRectStatus::Modified;
@@ -4086,7 +4127,13 @@ impl SettingsScreen {
             Line::from(vec![
                 Span::raw(value.clone()),
                 Span::styled(
-                    format!("  ·  {}", reasoning_level_label(&editor.use_ai_variant)),
+                    format!(
+                        "  ·  {}",
+                        reasoning_level_label(
+                            &self.use_ai_variant_ladder(value.trim()),
+                            &editor.use_ai_variant,
+                        )
+                    ),
                     Style::default()
                         .fg(colors::MUTED)
                         .add_modifier(Modifier::DIM),
@@ -5402,32 +5449,38 @@ fn use_ai_field_index() -> Option<usize> {
         .position(|f| matches!(f, DashboardField::UseAi))
 }
 
-fn reasoning_level_count() -> usize {
-    1 + REASONING_VARIANTS.len()
+/// Number of cycle stops for `ladder`: the levels plus the leading "Default".
+fn reasoning_level_count(ladder: &[String]) -> usize {
+    1 + ladder.len()
 }
 
-fn reasoning_level_at(index: usize) -> Option<&'static str> {
+/// The variant stored at cycle position `index` (0 = "Default" / empty string).
+fn reasoning_level_at(ladder: &[String], index: usize) -> Option<String> {
     if index == 0 {
-        Some("")
+        Some(String::new())
     } else {
-        REASONING_VARIANTS.get(index - 1).copied()
+        ladder.get(index - 1).cloned()
     }
 }
 
-fn reasoning_level_index(variant: &str) -> usize {
+/// The cycle position of `variant` within `ladder`. An empty string (or a
+/// stale variant no longer in this model's ladder) maps to 0 ("Default").
+fn reasoning_level_index(ladder: &[String], variant: &str) -> usize {
     if variant.is_empty() {
         0
     } else {
-        REASONING_VARIANTS
+        ladder
             .iter()
-            .position(|v| *v == variant)
+            .position(|v| v == variant)
             .map(|i| i + 1)
             .unwrap_or(0)
     }
 }
 
-fn reasoning_level_label(variant: &str) -> &str {
-    if variant.is_empty() {
+/// Human label for the staged variant. Shows "default" for the empty value or
+/// any variant that isn't valid for the current model's `ladder`.
+fn reasoning_level_label<'a>(ladder: &[String], variant: &'a str) -> &'a str {
+    if variant.is_empty() || !ladder.iter().any(|v| v == variant) {
         "default"
     } else {
         variant
@@ -5619,6 +5672,58 @@ mod tests {
         );
 
         let _ = screen.handle_dashboard(key(KeyCode::Left));
+        assert_eq!(screen.dashboard_editor.as_ref().unwrap().use_ai_variant, "");
+    }
+
+    #[test]
+    fn arrows_use_authoritative_per_model_variants() {
+        // GLM-5.2 only accepts high/max. The first Right must jump straight to
+        // "high" (not the generic ladder's "minimal"), and stepping past "max"
+        // must clamp there.
+        let mut screen = dashboard_screen_with_free_models(vec![]);
+        focus_use_ai(&mut screen);
+        let idx = use_ai_field_index().unwrap();
+        screen.dashboard_editor.as_mut().unwrap().values[idx] = "opencode-go/glm-5.2".to_string();
+        screen.set_ai_model_variants(std::collections::HashMap::from([(
+            "opencode-go/glm-5.2".to_string(),
+            vec!["high".to_string(), "max".to_string()],
+        )]));
+
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().use_ai_variant,
+            "high"
+        );
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().use_ai_variant,
+            "max"
+        );
+        // Clamped at the strongest level.
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        assert_eq!(
+            screen.dashboard_editor.as_ref().unwrap().use_ai_variant,
+            "max"
+        );
+    }
+
+    #[test]
+    fn arrows_are_inert_for_models_with_no_reasoning_variants() {
+        // Kimi is reasoning-capable on models.dev but opencode exposes no
+        // variants for it, so the cycle must stay on "default".
+        let mut screen = dashboard_screen_with_free_models(vec![]);
+        focus_use_ai(&mut screen);
+        let idx = use_ai_field_index().unwrap();
+        screen.dashboard_editor.as_mut().unwrap().values[idx] =
+            "opencode-go/kimi-k2.7-code".to_string();
+        screen.set_ai_model_variants(std::collections::HashMap::from([(
+            "opencode-go/kimi-k2.7-code".to_string(),
+            Vec::new(),
+        )]));
+
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        assert_eq!(screen.dashboard_editor.as_ref().unwrap().use_ai_variant, "");
+        let _ = screen.handle_dashboard(key(KeyCode::Right));
         assert_eq!(screen.dashboard_editor.as_ref().unwrap().use_ai_variant, "");
     }
 

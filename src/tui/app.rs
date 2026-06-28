@@ -34,12 +34,13 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
-    fetch_free_opencode_models, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, AiStatus, CheckStatus, CommentGroup,
-    DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
-    EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
-    FixPlan, FixPreparation, FixVerdict, MultiSourceUpdateResult, OpencodeModel, PrState, Shell,
-    ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
+    install_shell_integration, parse_pull_request_md, resolve_dashboard_columns, AiStatus,
+    CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService,
+    DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest,
+    FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
+    MultiSourceUpdateResult, OpencodeModel, PrState, Shell, ShellIntegrationStatus,
+    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -191,6 +192,10 @@ enum AppEvent {
     /// Result of the background `opencode models opencode` shell-out that
     /// powers the Dashboard footer's free-model quick-pick.
     FreeOpencodeModelsFetched(Result<Vec<String>, String>),
+    /// Result of the background `opencode models --verbose` shell-out that maps
+    /// each `provider/model` to its authoritative reasoning variants, powering
+    /// the Dashboard `useAi` field's per-model ←/→ reasoning cycle.
+    AiModelVariantsFetched(Result<std::collections::HashMap<String, Vec<String>>, String>),
     ShellIntegrationDetected(ShellIntegrationStatus),
 }
 
@@ -1324,6 +1329,7 @@ impl App {
                     }
                     SettingsAction::FetchFreeModels => {
                         kick_off_fetch_free_opencode_models(tx.clone());
+                        kick_off_fetch_ai_model_variants(tx.clone());
                     }
                     SettingsAction::UpgradeSource(source) => {
                         if let Some(settings) = self.settings.as_mut() {
@@ -2771,6 +2777,7 @@ impl App {
             }
             SettingsAction::FetchFreeModels => {
                 kick_off_fetch_free_opencode_models(tx.clone());
+                kick_off_fetch_ai_model_variants(tx.clone());
             }
             SettingsAction::OpenSetupProject => {
                 self.enter_screen(Screen::SetupProject, tx);
@@ -3115,6 +3122,14 @@ impl App {
                         Ok(models) => settings.set_free_models(models),
                         Err(message) => settings.set_free_models_error(message),
                     }
+                }
+            }
+            AppEvent::AiModelVariantsFetched(result) => {
+                // Best-effort, like the free-model fetch: drop the result if
+                // the user has already left the Settings screen, and ignore
+                // errors (the cycle falls back to the generic ladder).
+                if let (Some(settings), Ok(variants)) = (self.settings.as_mut(), result) {
+                    settings.set_ai_model_variants(variants);
                 }
             }
             AppEvent::ShellIntegrationDetected(status) => {
@@ -4863,7 +4878,24 @@ fn run_upgrade(source: UpdateSource) -> Result<String, String> {
 
 fn kick_off_fetch_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
-        let result = fetch_opencode_models().await;
+        let result = match fetch_opencode_models().await {
+            Ok(mut models) => {
+                // Enrich the models.dev catalogue with the authoritative
+                // per-model variant sets from the local CLI. Best-effort: if
+                // the CLI is missing or errors, every model keeps `variants:
+                // None` and the picker falls back to the generic ladder.
+                let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
+                if let Ok(variants) = fetch_opencode_model_variants(&binary).await {
+                    for model in &mut models {
+                        if let Some(v) = variants.get(&model.pair()) {
+                            model.variants = Some(v.clone());
+                        }
+                    }
+                }
+                Ok(models)
+            }
+            Err(message) => Err(message),
+        };
         let _ = tx.send(AppEvent::AiModelsFetched(result));
     });
 }
@@ -4879,6 +4911,19 @@ fn kick_off_fetch_free_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
         let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
         let result = fetch_free_opencode_models(&binary).await;
         let _ = tx.send(AppEvent::FreeOpencodeModelsFetched(result));
+    });
+}
+
+/// Shell out to `opencode models --verbose` to learn each model's authoritative
+/// reasoning variants, so the Dashboard `useAi` field's ←/→ cycle offers only
+/// the levels the chosen model actually accepts. Same best-effort posture as
+/// the free-model fetch — failures leave the Settings screen on the generic
+/// fallback ladder.
+fn kick_off_fetch_ai_model_variants(tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
+        let result = fetch_opencode_model_variants(&binary).await;
+        let _ = tx.send(AppEvent::AiModelVariantsFetched(result));
     });
 }
 

@@ -35,19 +35,35 @@ use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Reasoning-effort ladder offered (weakest→strongest) for models models.dev
-/// flags as reasoning-capable. opencode derives the exact per-model set with
-/// provider-specific heuristics; we offer the full union and let the user pick
-/// — opencode silently drops a level a given model doesn't accept. The
-/// "Default" option (no override) is rendered separately and stored as "".
+/// Generic fallback reasoning ladder (weakest→strongest), used only when the
+/// local `opencode` CLI can't tell us a model's real variants — i.e. for a
+/// models.dev entry whose provider isn't configured locally. For configured
+/// models we use the authoritative per-model set
+/// (`OpencodeModel::variants`), which opencode computes with provider-specific
+/// heuristics and which is often a strict subset (or empty). The "Default"
+/// option (no override) is rendered separately and stored as "".
 pub const REASONING_VARIANTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// Resolve the thinking-strength options to offer for a model. Prefers the
+/// authoritative set from the local `opencode` CLI (`Some`, possibly empty —
+/// an empty list means the model takes no reasoning override, e.g. Kimi), and
+/// falls back to the generic ladder for models the CLI doesn't know but
+/// models.dev flags reasoning-capable. A non-reasoning model gets no options.
+fn resolve_variants(model: &OpencodeModel) -> Vec<String> {
+    match &model.variants {
+        Some(variants) => variants.clone(),
+        None if model.reasoning => REASONING_VARIANTS.iter().map(|s| s.to_string()).collect(),
+        None => Vec::new(),
+    }
+}
+
 /// One row in the model phase. Carries the `provider/model` pair that gets
-/// stored in `useAi` plus whether the model supports thinking strengths.
+/// stored in `useAi` plus the resolved thinking-strength options (empty = no
+/// variant step; the model is selected immediately).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelChoice {
     pair: String,
-    reasoning: bool,
+    variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +128,7 @@ impl AiModelPickerScreen {
                     m.model_name.clone(),
                     ModelChoice {
                         pair: m.pair(),
-                        reasoning: m.reasoning,
+                        variants: resolve_variants(m),
                     },
                 )
                 .with_description(m.provider_name.clone())
@@ -131,16 +147,17 @@ impl AiModelPickerScreen {
         self.state = PickerState::Error(message);
     }
 
-    /// Build the variant (thinking strength) prompt for `model_pair`,
-    /// pre-selecting the user's prior variant when there is one.
-    fn variant_prompt(&self) -> SelectPrompt<String> {
+    /// Build the variant (thinking strength) prompt from `variants` (the
+    /// model's resolved options), pre-selecting the user's prior variant when
+    /// it's still on offer.
+    fn variant_prompt(&self, variants: &[String]) -> SelectPrompt<String> {
         let mut options = vec![SelectOption::new("Default", String::new())
             .with_description("no reasoning override")
             .with_description_color(colors::GRAY_DARK)];
         options.extend(
-            REASONING_VARIANTS
+            variants
                 .iter()
-                .map(|v| SelectOption::new(*v, v.to_string())),
+                .map(|v| SelectOption::new(v.clone(), v.clone())),
         );
         let default_idx = options
             .iter()
@@ -152,16 +169,16 @@ impl AiModelPickerScreen {
             .with_footer_spacer()
     }
 
-    /// Move from the model phase into the variant phase for `model_pair`,
+    /// Move from the model phase into the variant phase for `choice`,
     /// preserving the model prompt so the user can step back.
-    fn enter_variant_phase(&mut self, model_pair: String) {
-        let variant_prompt = self.variant_prompt();
+    fn enter_variant_phase(&mut self, choice: ModelChoice) {
+        let variant_prompt = self.variant_prompt(&choice.variants);
         if let PickerState::ModelSelect(model_prompt) =
             std::mem::replace(&mut self.state, PickerState::Loading)
         {
             self.state = PickerState::VariantSelect {
                 model_prompt,
-                model_pair,
+                model_pair: choice.pair,
                 variant_prompt,
             };
         }
@@ -183,8 +200,8 @@ impl AiModelPickerScreen {
             |prompt| prompt.handle_key(key),
         ) {
             Dispatch::Action(action) => action,
-            Dispatch::ToVariant(pair) => {
-                self.enter_variant_phase(pair);
+            Dispatch::ToVariant(choice) => {
+                self.enter_variant_phase(choice);
                 AiModelPickerAction::Continue
             }
             Dispatch::BackToModel => {
@@ -207,8 +224,8 @@ impl AiModelPickerScreen {
             |prompt| prompt.handle_mouse_click(position),
         ) {
             Dispatch::Action(action) => action,
-            Dispatch::ToVariant(pair) => {
-                self.enter_variant_phase(pair);
+            Dispatch::ToVariant(choice) => {
+                self.enter_variant_phase(choice);
                 AiModelPickerAction::Continue
             }
             // A click outside the variant rows is a no-op rather than a step
@@ -229,13 +246,13 @@ impl AiModelPickerScreen {
         match &mut self.state {
             PickerState::ModelSelect(prompt) => match model_input(prompt) {
                 SelectOutcome::Selected(_, choice) => {
-                    if choice.reasoning {
-                        Dispatch::ToVariant(choice.pair)
-                    } else {
+                    if choice.variants.is_empty() {
                         Dispatch::Action(AiModelPickerAction::Selected {
                             model: choice.pair,
                             variant: String::new(),
                         })
+                    } else {
+                        Dispatch::ToVariant(choice)
                     }
                 }
                 SelectOutcome::Cancelled => Dispatch::Action(AiModelPickerAction::Cancelled),
@@ -368,7 +385,7 @@ impl AiModelPickerScreen {
 /// active `SelectPrompt` has been released.
 enum Dispatch {
     Action(AiModelPickerAction),
-    ToVariant(String),
+    ToVariant(ModelChoice),
     BackToModel,
     /// No active prompt (Loading / Empty / Error).
     Inert,
@@ -400,6 +417,25 @@ mod tests {
             model_id: model_id.into(),
             model_name: model_name.into(),
             reasoning,
+            // No authoritative CLI data → callers fall back to the generic
+            // ladder when `reasoning` is true.
+            variants: None,
+        }
+    }
+
+    /// A model carrying an authoritative variant set from the local CLI.
+    fn model_with_variants(
+        provider_id: &str,
+        model_id: &str,
+        variants: Vec<&str>,
+    ) -> OpencodeModel {
+        OpencodeModel {
+            provider_id: provider_id.into(),
+            provider_name: provider_id.into(),
+            model_id: model_id.into(),
+            model_name: model_id.into(),
+            reasoning: true,
+            variants: Some(variants.into_iter().map(String::from).collect()),
         }
     }
 
@@ -471,6 +507,52 @@ mod tests {
             AiModelPickerAction::Selected {
                 model: "openai/gpt-5.4".to_string(),
                 variant: "minimal".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn authoritative_empty_variants_skip_the_variant_phase() {
+        // Kimi-style: models.dev flags it reasoning-capable, but opencode says
+        // it accepts no thinking strength. Selecting it must finish immediately
+        // with an empty variant rather than opening the (empty) variant phase.
+        let mut screen = new_picker();
+        screen.set_models(vec![model_with_variants(
+            "opencode-go",
+            "kimi-k2.7-code",
+            vec![],
+        )]);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            AiModelPickerAction::Selected {
+                model: "opencode-go/kimi-k2.7-code".to_string(),
+                variant: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn authoritative_variants_offer_only_that_models_levels() {
+        // GLM-5.2 only accepts high/max — not the generic ladder. The variant
+        // phase must offer exactly those (below Default), so the first step
+        // down lands on "high", not "minimal".
+        let mut screen = new_picker();
+        screen.set_models(vec![model_with_variants(
+            "opencode-go",
+            "glm-5.2",
+            vec!["high", "max"],
+        )]);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            AiModelPickerAction::Continue
+        );
+        assert!(matches!(screen.state, PickerState::VariantSelect { .. }));
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            AiModelPickerAction::Selected {
+                model: "opencode-go/glm-5.2".to_string(),
+                variant: "high".to_string(),
             }
         );
     }

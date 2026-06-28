@@ -22,7 +22,9 @@ pub use dashboard::{
     ReviewComment, ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
     UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };
-pub use opencode_models::{fetch_free_opencode_models, fetch_opencode_models, OpencodeModel};
+pub use opencode_models::{
+    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,
+};
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,
