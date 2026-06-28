@@ -3727,7 +3727,7 @@ fn build_enrich_prompt(
 fn build_fix_feedback_query(owner: &str, repo: &str, number: u64) -> String {
     format!(
         "query {{ repository(owner: \"{}\", name: \"{}\") {{ pullRequest(number: {}) {{ \
-         reviewThreads(first: 100) {{ nodes {{ isResolved isOutdated \
+         reviewThreads(first: 100) {{ nodes {{ isResolved \
          comments(first: 50) {{ nodes {{ databaseId path line originalLine isMinimized \
          viewerDidAuthor body author {{ login }} }} }} }} }} \
          reviews(first: 100) {{ nodes {{ state body author {{ login }} }} }} }} }} }}",
@@ -3739,11 +3739,14 @@ fn build_fix_feedback_query(owner: &str, repo: &str, number: u64) -> String {
 
 /// Parse the review-feedback GraphQL response and group the survivors.
 ///
-/// Inline threads: resolved threads and minimized comments are dropped. An
-/// *outdated* thread is dropped only when we (the viewer) already replied to it
-/// — that reply means a previous run analysed and addressed it, which is what
-/// moved the line and marked the thread outdated. An outdated thread with no
-/// reply from us is still pending, so it is kept (anchored via `originalLine`).
+/// Inline threads: resolved threads and minimized comments are dropped. A
+/// thread is also dropped when our own resolution reply ("Addressed in …" or
+/// the no-change reply) is its *most recent* comment — a previous run handled
+/// it and nobody has objected since. If the reviewer replied *after* that
+/// resolution reply (e.g. "you changed the wrong function"), the thread is
+/// pending again and kept, so the planner re-reads the whole discussion —
+/// including our prior reply — and tries again. Outdated threads with no reply
+/// from us are likewise kept (anchored via `originalLine`).
 /// Surviving inline comments are grouped by (file, line) in first-seen order.
 ///
 /// PR-level review summaries (review bodies not anchored to a line) cannot be
@@ -3780,8 +3783,6 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
     struct Thread {
         #[serde(rename = "isResolved", default)]
         is_resolved: bool,
-        #[serde(rename = "isOutdated", default)]
-        is_outdated: bool,
         comments: Conn<RawComment>,
     }
     #[derive(Deserialize)]
@@ -3853,13 +3854,6 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
         if thread.is_resolved {
             continue;
         }
-        // An outdated thread we (the viewer) already replied to was handled in
-        // a previous run — our fix moved the line, which is what marked it
-        // outdated — so skip re-analysing it. Outdated threads with no reply
-        // from us are still pending and fall through to be kept below.
-        if thread.is_outdated && thread.comments.nodes.iter().any(|c| c.viewer_did_author) {
-            continue;
-        }
         let surviving: Vec<RawComment> = thread
             .comments
             .nodes
@@ -3869,6 +3863,18 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
         let Some(first) = surviving.first() else {
             continue;
         };
+        // A thread is handled only when our own resolution reply is its *last*
+        // word — nobody, not even the reviewer, responded after it. If the
+        // reviewer followed up ("you changed the wrong function"), the thread is
+        // pending again and must be re-analysed with the whole discussion. This
+        // replaces the old `isOutdated`-based skip, which dropped any outdated
+        // thread we'd ever replied to and so swallowed reviewer follow-ups.
+        if surviving
+            .last()
+            .is_some_and(|c| c.viewer_did_author && is_resolution_reply(&c.body))
+        {
+            continue;
+        }
         let file = first.path.clone();
         let line = first.line.or(first.original_line);
         let reply_id = first.database_id;
@@ -4117,6 +4123,11 @@ fn format_commit_message(
 const ALREADY_RESOLVED_REPLY: &str = "The current code already addresses this — \
     on a closer look against the comment, no change was needed here. Thanks for the feedback!";
 
+/// Prefix of the reply [`format_reply`] posts after committing a fix. Shared
+/// with [`is_resolution_reply`] so the thread filter recognises our own
+/// resolution reply when deciding whether a thread is still pending.
+const ADDRESSED_REPLY_PREFIX: &str = "Addressed in ";
+
 /// Build the reply posted to the reviewer after a fix is committed.
 fn format_reply(commit_url: &str, plan: &FixPlan) -> String {
     let summary = {
@@ -4127,7 +4138,17 @@ fn format_reply(commit_url: &str, plan: &FixPlan) -> String {
             s.to_string()
         }
     };
-    format!("Addressed in {commit_url} — {summary}. Thanks for the feedback!")
+    format!("{ADDRESSED_REPLY_PREFIX}{commit_url} — {summary}. Thanks for the feedback!")
+}
+
+/// True when `body` is one of the resolution replies the Fix loop posts to mark
+/// a thread handled: the post-commit "Addressed in <url> …" reply or the
+/// "already addresses this — no change needed" reply. The thread filter skips a
+/// thread only when such a reply is its most recent comment; if the reviewer
+/// responded afterwards, the thread is pending again and gets re-analysed.
+fn is_resolution_reply(body: &str) -> bool {
+    let body = body.trim();
+    body.starts_with(ADDRESSED_REPLY_PREFIX) || body == ALREADY_RESOLVED_REPLY
 }
 
 /// Reply to a reviewer: an inline thread reply when the group has an anchor
@@ -4482,17 +4503,17 @@ so the intent reads clearly.
     }
 
     #[test]
-    fn group_review_feedback_drops_outdated_thread_we_already_replied_to() {
-        // An outdated thread where the viewer (us) already posted a reply was
-        // handled in a prior run, so it must not be re-analysed. A second
-        // outdated thread with no reply from us is still pending and kept.
+    fn group_review_feedback_skips_thread_ending_in_our_resolution_reply() {
+        // A thread whose most recent comment is our own resolution reply
+        // ("Addressed in …") was handled and nobody objected since, so it is
+        // dropped. A second thread with no reply from us is still pending.
         let json = r#"{ "data": { "repository": { "pullRequest": {
             "reviewThreads": { "nodes": [
-              { "isResolved": false, "isOutdated": true, "comments": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
                 { "databaseId": 1, "path": "a.rs", "line": null, "originalLine": 8, "isMinimized": false, "viewerDidAuthor": false, "body": "extract this", "author": { "login": "alice" } },
-                { "databaseId": 2, "path": "a.rs", "line": null, "originalLine": 8, "isMinimized": false, "viewerDidAuthor": true, "body": "Addressed in abc123. Thanks!", "author": { "login": "me" } }
+                { "databaseId": 2, "path": "a.rs", "line": null, "originalLine": 8, "isMinimized": false, "viewerDidAuthor": true, "body": "Addressed in abc123 — extracted it. Thanks for the feedback!", "author": { "login": "me" } }
               ] } },
-              { "isResolved": false, "isOutdated": true, "comments": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
                 { "databaseId": 3, "path": "b.rs", "line": null, "originalLine": 3, "isMinimized": false, "viewerDidAuthor": false, "body": "still needs work", "author": { "login": "alice" } }
               ] } }
             ] },
@@ -4502,6 +4523,72 @@ so the intent reads clearly.
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].reply_comment_id, Some(3));
         assert_eq!(groups[0].comments[0].body, "still needs work");
+    }
+
+    #[test]
+    fn group_review_feedback_reanalyses_thread_with_reviewer_followup() {
+        // The reviewer replied *after* our "Addressed in …" resolution reply
+        // ("you got it wrong"). The thread is pending again: it is kept and the
+        // whole discussion — original comment, our reply, the follow-up — is
+        // handed to the planner so it can understand what went wrong.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": false, "body": "This function should take 4 parameters", "author": { "login": "marcos" } },
+                { "databaseId": 2, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": true, "body": "Addressed in abc123 — updated the signature. Thanks for the feedback!", "author": { "login": "me" } },
+                { "databaseId": 3, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": false, "body": "You changed it to 3 parameters, it should be 4!", "author": { "login": "marcos" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        assert_eq!(groups.len(), 1);
+        // The reply still threads onto the original comment.
+        assert_eq!(groups[0].reply_comment_id, Some(1));
+        // All three comments reach the planner, in order and attributed, so it
+        // can see its own prior (wrong) reply and the reviewer's correction.
+        assert_eq!(groups[0].comments.len(), 3);
+        let combined = groups[0].combined_text();
+        assert!(combined.contains("@marcos: This function should take 4 parameters"));
+        assert!(combined.contains("@me: Addressed in abc123"));
+        assert!(combined.contains("@marcos: You changed it to 3 parameters"));
+    }
+
+    #[test]
+    fn group_review_feedback_keeps_thread_ending_in_non_resolution_viewer_comment() {
+        // A viewer comment that is *not* one of our resolution replies (e.g. a
+        // human note typed from the same account) must not be mistaken for a
+        // handled thread — it is kept for analysis.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": false, "body": "rename this", "author": { "login": "marcos" } },
+                { "databaseId": 2, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": true, "body": "good point, let me think about it", "author": { "login": "me" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].comments.len(), 2);
+    }
+
+    #[test]
+    fn group_review_feedback_skips_thread_ending_in_no_change_reply() {
+        // The "already addresses this — no change needed" reply is also a
+        // resolution reply, so a thread ending in it is dropped.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": false, "body": "use a constant", "author": { "login": "marcos" } },
+                { "databaseId": 2, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": true, "body": "NO_CHANGE_REPLY", "author": { "login": "me" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#
+        .replace("NO_CHANGE_REPLY", ALREADY_RESOLVED_REPLY);
+        let groups = parse_and_group_review_feedback(&json).expect("parse ok");
+        assert!(groups.is_empty());
     }
 
     #[test]
@@ -4606,6 +4693,19 @@ so the intent reads clearly.
             "Addressed in https://github.com/o/r/pull/42/changes/abc123 — \
              extract retry delay into a named constant. Thanks for the feedback!"
         );
+    }
+
+    #[test]
+    fn is_resolution_reply_matches_our_replies_only() {
+        // Both replies the Fix loop posts to mark a thread handled.
+        assert!(is_resolution_reply(&format_reply(
+            "https://x/commit/abc",
+            &sample_plan()
+        )));
+        assert!(is_resolution_reply(ALREADY_RESOLVED_REPLY));
+        // A reviewer follow-up or an arbitrary viewer note is not a resolution.
+        assert!(!is_resolution_reply("You changed the wrong function!"));
+        assert!(!is_resolution_reply("good point, let me think about it"));
     }
 
     // ── Fix pipeline: prompt substitution ──────────────────────────────
