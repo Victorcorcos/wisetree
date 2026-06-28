@@ -201,4 +201,22 @@ pub mod colors {
     pub const HARNESS_CODEX: Color = GRAY_DARK;
     /// `G` — Gemini identity color.
     pub const HARNESS_GEMINI: Color = Color::Rgb(0xe8, 0x79, 0xa6);
+
+    // ── Diff bars (Fix → Proposed fix) ──────────────────────────────────
+    //
+    // Used to render a ```diff block the way GitHub does: a full-width
+    // colored bar behind each added / removed line. Backgrounds are dark
+    // tints that sit on the brown app surface; foregrounds stay legible on
+    // top of them.
+
+    /// Added line (`+`) foreground.
+    pub const DIFF_ADD_FG: Color = Color::Rgb(0xc3, 0xe8, 0x8a);
+    /// Added line (`+`) background — dark green tint.
+    pub const DIFF_ADD_BG: Color = Color::Rgb(0x20, 0x33, 0x16);
+    /// Removed line (`-`) foreground.
+    pub const DIFF_REMOVE_FG: Color = Color::Rgb(0xf2, 0xa3, 0xb6);
+    /// Removed line (`-`) background — dark red tint.
+    pub const DIFF_REMOVE_BG: Color = Color::Rgb(0x3a, 0x18, 0x20);
+    /// Hunk header (`@@ … @@`) foreground — no background.
+    pub const DIFF_HUNK_FG: Color = Color::Rgb(0xb4, 0x7e, 0xff);
 }

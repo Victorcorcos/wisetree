@@ -778,13 +778,6 @@ impl FixPullRequestScreen {
             chunks[0],
         );
 
-        let lines = match (group, self.current_plan.as_ref()) {
-            (Some(group), Some(plan)) => build_proposal_lines(group, plan),
-            _ => vec![Line::from(Span::styled(
-                "(no proposal)".to_string(),
-                muted_dim(),
-            ))],
-        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -796,6 +789,13 @@ impl FixPullRequestScreen {
                     .add_modifier(Modifier::BOLD),
             )));
         let inner = block.inner(chunks[1]);
+        let lines = match (group, self.current_plan.as_ref()) {
+            (Some(group), Some(plan)) => build_proposal_lines(group, plan, inner.width as usize),
+            _ => vec![Line::from(Span::styled(
+                "(no proposal)".to_string(),
+                muted_dim(),
+            ))],
+        };
         frame.render_widget(block, chunks[1]);
         let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
         let scroll = self.decision_scroll.min(max_scroll);
@@ -1250,18 +1250,13 @@ fn build_comment_lines(group: &CommentGroup) -> Vec<Line<'static>> {
     lines
 }
 
-fn build_proposal_lines(group: &CommentGroup, plan: &FixPlan) -> Vec<Line<'static>> {
+/// Build the body of the `Proposed fix` panel: the reviewer comment, the AI's
+/// validity / plan reasoning, and the concrete change. `width` is the panel's
+/// inner content width, used to draw full-width diff bars in the change block.
+fn build_proposal_lines(group: &CommentGroup, plan: &FixPlan, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let label = |text: &str| {
-        Line::from(Span::styled(
-            text.to_string(),
-            Style::default()
-                .fg(colors::INFO)
-                .add_modifier(Modifier::BOLD),
-        ))
-    };
 
-    lines.push(label("Reviewer"));
+    lines.push(section_label("Reviewer"));
     for comment in &group.comments {
         lines.push(Line::from(vec![
             Span::styled(
@@ -1279,25 +1274,34 @@ fn build_proposal_lines(group: &CommentGroup, plan: &FixPlan) -> Vec<Line<'stati
     lines.push(Line::from(""));
 
     if !plan.validity.trim().is_empty() {
-        lines.push(label("Validity"));
+        lines.push(section_label("Validity"));
         push_wrapped(&mut lines, &plan.validity, colors::GRAY_LIGHT);
         lines.push(Line::from(""));
     }
     if !plan.explanation.trim().is_empty() {
-        lines.push(label("Plan"));
+        lines.push(section_label("Plan"));
         push_wrapped(&mut lines, &plan.explanation, colors::WHITE);
         lines.push(Line::from(""));
     }
     if !plan.change.trim().is_empty() {
-        lines.push(label("Proposed change"));
-        for raw in plan.change.lines() {
-            lines.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::default().fg(colors::GRAY_LIGHT),
-            )));
-        }
+        lines.push(section_label("Proposed change"));
+        push_change(&mut lines, &plan.change, width);
     }
     lines
+}
+
+/// A bold teal section heading prefixed with a brand accent bar so the
+/// `Reviewer` / `Validity` / `Plan` / `Proposed change` blocks are easy to scan.
+fn section_label(text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("▌ ".to_string(), Style::default().fg(colors::BRAND)),
+        Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(colors::INFO)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 /// Push each source line of `text` as its own ratatui line (the Paragraph's
@@ -1309,6 +1313,80 @@ fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
             Style::default().fg(color),
         )));
     }
+}
+
+/// Render the `Proposed change` body. Lines inside a ```` ``` ```` fenced block
+/// are drawn as a diff — `+` lines get a green bar, `-` lines a red bar, `@@`
+/// hunk headers an accent color, everything else neutral context — mirroring
+/// how GitHub renders a ```` ```diff ```` block. The fence markers themselves
+/// are hidden. Text outside any fence keeps the muted body style.
+fn push_change(lines: &mut Vec<Line<'static>>, change: &str, width: usize) {
+    let mut in_fence = false;
+    for raw in change.lines() {
+        if raw.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            lines.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(colors::GRAY_LIGHT),
+            )));
+            continue;
+        }
+        match raw.chars().next() {
+            Some('+') => push_diff_bar(lines, raw, colors::DIFF_ADD_FG, colors::DIFF_ADD_BG, width),
+            Some('-') => push_diff_bar(
+                lines,
+                raw,
+                colors::DIFF_REMOVE_FG,
+                colors::DIFF_REMOVE_BG,
+                width,
+            ),
+            _ if raw.starts_with("@@") => lines.push(Line::from(Span::styled(
+                expand_tabs(raw),
+                Style::default()
+                    .fg(colors::DIFF_HUNK_FG)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            _ => lines.push(Line::from(Span::styled(
+                expand_tabs(raw),
+                Style::default().fg(colors::GRAY_MEDIUM),
+            ))),
+        }
+    }
+}
+
+/// Push one diff line as a full-width colored bar. The line is hard-wrapped at
+/// `width` columns and each visual row is padded with trailing spaces so the
+/// background fills the panel edge to edge (ratatui only styles cells that hold
+/// a grapheme, so the padding is what extends the bar).
+fn push_diff_bar(lines: &mut Vec<Line<'static>>, raw: &str, fg: Color, bg: Color, width: usize) {
+    let style = Style::default().fg(fg).bg(bg);
+    let text = expand_tabs(raw);
+    if width == 0 {
+        lines.push(Line::from(Span::styled(text, style)));
+        return;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    loop {
+        let end = (start + width).min(chars.len());
+        let mut segment: String = chars[start..end].iter().collect();
+        let pad = width - (end - start);
+        segment.extend(std::iter::repeat(' ').take(pad));
+        lines.push(Line::from(Span::styled(segment, style)));
+        start = end;
+        if start >= chars.len() {
+            break;
+        }
+    }
+}
+
+/// Expand tabs to four spaces so diff alignment and bar widths are predictable
+/// (ratatui renders a raw tab as a single cell, which skews indentation).
+fn expand_tabs(s: &str) -> String {
+    s.replace('\t', "    ")
 }
 
 fn labeled_line(
@@ -1361,7 +1439,8 @@ mod tests {
             summary: "extract retry delay into a named constant".to_string(),
             validity: "Valid: 3000 is a magic number.".to_string(),
             explanation: "Replace the literal with RETRY_DELAY_MS.".to_string(),
-            change: "- sleep(3000)\n+ sleep(RETRY_DELAY_MS)".to_string(),
+            change: "Replace the literal:\n```diff\n- sleep(3000)\n+ sleep(RETRY_DELAY_MS)\n```"
+                .to_string(),
         }
     }
 
@@ -1606,6 +1685,51 @@ mod tests {
         assert!(dump.contains("Apply"), "{dump}");
         assert!(dump.contains("Other"), "{dump}");
         assert!(dump.contains("Skip"), "{dump}");
+        // The ```diff fence markers are hidden; only the diff body shows.
+        assert!(dump.contains("- sleep(3000)"), "{dump}");
+        assert!(dump.contains("+ sleep(RETRY_DELAY_MS)"), "{dump}");
+        assert!(!dump.contains("```"), "fence markers leaked:\n{dump}");
+    }
+
+    #[test]
+    fn diff_lines_render_full_width_colored_bars() {
+        // `+` rows get a green background, `-` rows a red one, and the bar
+        // extends across the full inner width of the panel.
+        let width = 40usize;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_change(
+            &mut lines,
+            "```diff\n- old line\n+ new line\n unchanged\n```",
+            width,
+        );
+
+        let bar_bg = |needle: &str| {
+            lines.iter().find_map(|line| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.trim_end()
+                    .eq(needle)
+                    .then(|| line.spans.last().map(|s| (s.content.len(), s.style.bg)))
+                    .flatten()
+            })
+        };
+
+        let (removed_len, removed_bg) = bar_bg("- old line").expect("removed bar");
+        let (added_len, added_bg) = bar_bg("+ new line").expect("added bar");
+        assert_eq!(removed_bg, Some(colors::DIFF_REMOVE_BG));
+        assert_eq!(added_bg, Some(colors::DIFF_ADD_BG));
+        // Padded out to the full panel width so the bar reaches the edge.
+        assert_eq!(removed_len, width);
+        assert_eq!(added_len, width);
+
+        // Context lines stay neutral (no diff background bar).
+        let context = lines
+            .iter()
+            .find(|line| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.trim() == "unchanged"
+            })
+            .expect("context line");
+        assert!(context.spans.iter().all(|s| s.style.bg.is_none()));
     }
 
     #[test]

@@ -41,7 +41,7 @@ When the user's feedback above is non-empty, treat it as the authority: revise y
 ### Quality rules for a `fix`
 
 - Be **faithful** to what the reviewer actually asked — do not over-extend the change.
-- Be **concrete**: describe the exact edit (a short diff sketch is ideal), grounded in the real code shown above.
+- Be **concrete**: show the exact edit as a unified-diff sketch grounded in the real code shown above. Prefix removed lines with `-` and added lines with `+`.
 - **Respect the surrounding conventions** (naming, style, error handling). Introduce no new issues and no unrelated refactors.
 - Keep it **minimal** — change only what the comment is about.
 
@@ -79,7 +79,7 @@ VERDICT: fix
 ---EXPLANATION---
 <why and how you will fix it — a short paragraph the user reads before approving>
 ---CHANGE---
-<the concrete proposed change: a diff sketch or precise description of the edit. Describe only; do not apply it.>
+<the concrete proposed change. When it is a code edit, present it as a unified-diff sketch inside a ```diff fenced code block (removed lines prefixed with `-`, added lines with `+`, unchanged context lines left as-is); a leading sentence of prose before the block is fine. Describe only; do not apply it.>
 ===WISETREE-FIX-END===
 ```
 
