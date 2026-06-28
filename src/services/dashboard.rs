@@ -1943,13 +1943,20 @@ impl DashboardService {
             None => String::new(),
         };
         let prompt = build_fix_plan_prompt(group, &code, feedback, previous_plan, history);
-        // `opencode run` is the captured/non-interactive transcript mode —
-        // no inner TUI; we parse its stdout. `-m` honors the configured model.
+        // `opencode run` is the captured/non-interactive transcript mode — no
+        // inner TUI; we parse its stdout. `-m` honors the configured model.
+        // `--agent plan` pins it to opencode's read-only Plan agent (write /
+        // edit / patch tools disabled), so this phase can ONLY think and emit a
+        // verdict — it cannot touch files. This matters most on the "Other"
+        // re-plan: the user's feedback reads like a direct instruction, and the
+        // default (build) agent would act on it — editing the file and skipping
+        // the verdict — which made "Other" silently apply a change and advance
+        // instead of showing a revised plan. Read-only forces a clean re-plan.
         let output = time::timeout(
             FIX_PLAN_TIMEOUT,
             run_command(
                 &self.opencode_binary,
-                &["run", &prompt, "-m", &model],
+                &["run", &prompt, "-m", &model, "--agent", "plan"],
                 Some(&cwd),
             ),
         )
