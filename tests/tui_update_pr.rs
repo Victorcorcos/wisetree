@@ -67,10 +67,28 @@ fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
+/// An explicitly-blank per-command AI config (every slot empty), since the
+/// schema default now seeds free opencode models.
+fn blank_ai() -> wisetree::config::schema::AiConfig {
+    use wisetree::config::schema::{AiConfig, AiFixConfig, AiModelConfig};
+    AiConfig {
+        enrich: AiModelConfig::default(),
+        fix: AiFixConfig {
+            plan: AiModelConfig::default(),
+            apply: AiModelConfig::default(),
+        },
+        update: AiModelConfig::default(),
+    }
+}
+
 fn ai_config() -> DashboardConfig {
     DashboardConfig {
         ai: wisetree::config::schema::AiConfig {
-            model: "anthropic/claude-sonnet-4-5".to_string(),
+            // The Update flow resolves merge conflicts with `ai.update`.
+            update: wisetree::config::schema::AiModelConfig {
+                model: "anthropic/claude-sonnet-4-5".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..DashboardConfig::default()
@@ -192,7 +210,14 @@ impl Fixture {
     }
 
     fn service(&self) -> DashboardService {
-        DashboardService::new(self.src.clone(), DashboardConfig::default()).with_cache_path(None)
+        // Per-command AI now defaults to free opencode models, so a plain
+        // default config would resolve conflicts with AI. These no-AI tests
+        // want it genuinely blank — clear every slot explicitly.
+        let config = DashboardConfig {
+            ai: blank_ai(),
+            ..DashboardConfig::default()
+        };
+        DashboardService::new(self.src.clone(), config).with_cache_path(None)
     }
 
     fn ai_service(&self) -> DashboardService {

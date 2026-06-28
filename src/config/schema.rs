@@ -111,27 +111,181 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
     (resolved, warnings)
 }
 
-/// AI model + thinking strength used for opencode-assisted flows. Persisted as
-/// a nested `ai` object inside the dashboard config:
-///
-/// ```json
-/// "ai": { "model": "opencode/deepseek-v4-flash-free", "thinking": "max" }
-/// ```
+/// Model + thinking strength for a single AI-assisted step. The leaf of the
+/// per-command [`AiConfig`], e.g.
+/// `{ "model": "opencode/deepseek-v4-flash-free", "thinking": "max" }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
-pub struct AiConfig {
+pub struct AiModelConfig {
     /// Provider/model selector passed to `opencode run -m <value>` (e.g.
-    /// `anthropic/claude-sonnet-4-5`). When empty, AI-assisted conflict
-    /// resolution is disabled and the user is asked to resolve manually.
+    /// `anthropic/claude-sonnet-4-5`). When empty, the AI-assisted step is
+    /// disabled and the user is asked to act manually.
     #[serde(default)]
     pub model: String,
 
     /// Thinking strength (reasoning effort) paired with `model`, chosen in the
     /// AI model picker — e.g. `low`, `medium`, `high`. Empty means "default"
     /// (no reasoning override). Stored separately from `model` so `model`
-    /// stays a clean `provider/model` value for `-m`.
+    /// stays a clean `provider/model` value for `-m`, and passed to opencode
+    /// as `--variant <thinking>` where supported.
     #[serde(default)]
     pub thinking: String,
+}
+
+// Out-of-the-box defaults per AI command. These point at opencode's free /
+// cheap router models so AI-assisted flows work without the user wiring up
+// their own keys: `enrich` and `fix.plan` get a roomier reasoning budget
+// (`max`), while the heavier-traffic `fix.apply` / `update` run at the model's
+// default effort. Used both for `*Config::default()` and as the per-command
+// fallback when a slot is absent from the persisted config.
+fn default_enrich_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "opencode-go/deepseek-v4-flash".to_string(),
+        thinking: "max".to_string(),
+    }
+}
+fn default_fix_plan_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "opencode-go/glm-5.2".to_string(),
+        thinking: "max".to_string(),
+    }
+}
+fn default_fix_apply_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "opencode-go/kimi-k2.7-code".to_string(),
+        thinking: String::new(),
+    }
+}
+fn default_update_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "opencode-go/kimi-k2.7-code".to_string(),
+        thinking: String::new(),
+    }
+}
+
+/// Per-step models for the two-phase "Fix Pull Request" pipeline. `plan` judges
+/// and plans each review comment with a non-interactive `opencode run` (so it
+/// can afford a stronger reasoning model); `apply` edits files live in the
+/// embedded opencode TUI (and can use a cheaper/faster model).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiFixConfig {
+    #[serde(default = "default_fix_plan_ai")]
+    pub plan: AiModelConfig,
+    #[serde(default = "default_fix_apply_ai")]
+    pub apply: AiModelConfig,
+}
+
+impl Default for AiFixConfig {
+    fn default() -> Self {
+        Self {
+            plan: default_fix_plan_ai(),
+            apply: default_fix_apply_ai(),
+        }
+    }
+}
+
+/// Per-command AI model + thinking strength for the opencode-assisted flows.
+/// Each command (or sub-step) selects its own model so a planning step can use
+/// a stronger model than, say, the PR-drafting step. Persisted as a nested
+/// `ai` object inside the dashboard config:
+///
+/// ```json
+/// "ai": {
+///   "enrich": { "model": "opencode-go/deepseek-v4-flash", "thinking": "max" },
+///   "fix": {
+///     "plan":  { "model": "opencode-go/glm-5.2", "thinking": "max" },
+///     "apply": { "model": "opencode-go/kimi-k2.7-code", "thinking": "default" }
+///   },
+///   "update": { "model": "opencode-go/kimi-k2.7-code", "thinking": "default" }
+/// }
+/// ```
+///
+/// `enrich` drives the "Enrich Pull Request" draft; `fix.plan` / `fix.apply`
+/// drive the two Fix phases; `update` drives the AI merge-conflict resolution
+/// shared by "Update Pull Request" and "Update branch (locally)".
+///
+/// An absent slot falls back to its built-in default (free/cheap opencode
+/// router models — see `default_*_ai`), so AI flows work out of the box and a
+/// fresh AI Settings page is pre-filled. Configs written before per-command
+/// models existed used a single flat `{ "model": ..., "thinking": ... }`; those
+/// are migrated transparently on load by seeding every command with that one
+/// value (which takes precedence over the per-command defaults — see the custom
+/// [`Deserialize`] impl below). Serialization always emits the nested shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct AiConfig {
+    pub enrich: AiModelConfig,
+    pub fix: AiFixConfig,
+    pub update: AiModelConfig,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enrich: default_enrich_ai(),
+            fix: AiFixConfig::default(),
+            update: default_update_ai(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AiConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept both the current per-command shape and the legacy flat
+        // `{ model, thinking }`. `deny_unknown_fields` keeps the strictness of
+        // the prior schema while allowing either set of keys.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            // Legacy flat shape (pre per-command models).
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            thinking: Option<String>,
+            // Current per-command shape.
+            #[serde(default)]
+            enrich: Option<AiModelConfig>,
+            #[serde(default)]
+            fix: Option<AiFixConfig>,
+            #[serde(default)]
+            update: Option<AiModelConfig>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        // A legacy flat value seeds every command and takes precedence over the
+        // per-command defaults. An absent slot with no legacy value falls back
+        // to that command's built-in default.
+        let legacy = if raw.model.is_some() || raw.thinking.is_some() {
+            Some(AiModelConfig {
+                model: raw.model.unwrap_or_default(),
+                thinking: raw.thinking.unwrap_or_default(),
+            })
+        } else {
+            None
+        };
+
+        Ok(AiConfig {
+            enrich: raw
+                .enrich
+                .or_else(|| legacy.clone())
+                .unwrap_or_else(default_enrich_ai),
+            fix: raw.fix.unwrap_or_else(|| match &legacy {
+                Some(l) => AiFixConfig {
+                    plan: l.clone(),
+                    apply: l.clone(),
+                },
+                None => AiFixConfig::default(),
+            }),
+            update: raw
+                .update
+                .or_else(|| legacy.clone())
+                .unwrap_or_else(default_update_ai),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -149,9 +303,9 @@ pub struct DashboardConfig {
     #[serde(rename = "columns", default = "default_columns")]
     pub columns: Vec<String>,
 
-    /// AI model + thinking strength for opencode-assisted flows (merge
-    /// conflict resolution, PR drafting). When `ai.model` is empty, AI
-    /// assistance is disabled and the user resolves conflicts manually.
+    /// Per-command AI model + thinking strength for opencode-assisted flows
+    /// (enrich, fix plan/apply, update conflict resolution). When a command's
+    /// `model` is empty, that AI step is disabled and the user acts manually.
     #[serde(rename = "ai", default)]
     pub ai: AiConfig,
 
@@ -351,4 +505,104 @@ pub struct AppState {
     /// Version that was current when last checked.
     #[serde(rename = "checkedVersion", skip_serializing_if = "Option::is_none")]
     pub checked_version: Option<String>,
+}
+
+#[cfg(test)]
+mod ai_config_tests {
+    use super::{AiConfig, DashboardConfig};
+
+    #[test]
+    fn legacy_flat_ai_seeds_every_command() {
+        // Configs written before per-command models used a single flat
+        // `{ model, thinking }`. It must migrate by seeding every command.
+        let json = r#"{ "model": "opencode/deepseek-v4-flash-free", "thinking": "max" }"#;
+        let ai: AiConfig = serde_json::from_str(json).expect("legacy ai parses");
+        for leaf in [&ai.enrich, &ai.fix.plan, &ai.fix.apply, &ai.update] {
+            assert_eq!(leaf.model, "opencode/deepseek-v4-flash-free");
+            assert_eq!(leaf.thinking, "max");
+        }
+    }
+
+    #[test]
+    fn nested_per_command_ai_parses_each_slot() {
+        let json = r#"{
+            "enrich": { "model": "opencode/deepseek-v4-flash-free", "thinking": "max" },
+            "fix": {
+                "plan":  { "model": "openai/gpt-5.5", "thinking": "high" },
+                "apply": { "model": "opencode-go/kimi-k2.7-code" }
+            },
+            "update": { "model": "opencode-go/kimi-k2.7-code" }
+        }"#;
+        let ai: AiConfig = serde_json::from_str(json).expect("nested ai parses");
+        assert_eq!(ai.enrich.model, "opencode/deepseek-v4-flash-free");
+        assert_eq!(ai.enrich.thinking, "max");
+        assert_eq!(ai.fix.plan.model, "openai/gpt-5.5");
+        assert_eq!(ai.fix.plan.thinking, "high");
+        assert_eq!(ai.fix.apply.model, "opencode-go/kimi-k2.7-code");
+        assert_eq!(ai.fix.apply.thinking, ""); // omitted → Default
+        assert_eq!(ai.update.model, "opencode-go/kimi-k2.7-code");
+    }
+
+    #[test]
+    fn empty_ai_object_uses_per_command_defaults() {
+        let ai: AiConfig = serde_json::from_str("{}").expect("empty ai parses");
+        assert_eq!(ai, AiConfig::default());
+        assert_eq!(ai.enrich.model, "opencode-go/deepseek-v4-flash");
+        assert_eq!(ai.enrich.thinking, "max");
+        assert_eq!(ai.fix.plan.model, "opencode-go/glm-5.2");
+        assert_eq!(ai.fix.plan.thinking, "max");
+        assert_eq!(ai.fix.apply.model, "opencode-go/kimi-k2.7-code");
+        assert_eq!(ai.fix.apply.thinking, "");
+        assert_eq!(ai.update.model, "opencode-go/kimi-k2.7-code");
+        assert_eq!(ai.update.thinking, "");
+    }
+
+    #[test]
+    fn absent_slot_falls_back_to_its_default_other_slots_explicit() {
+        // Only `enrich` configured → fix/update fall back to their defaults.
+        let json = r#"{ "enrich": { "model": "x", "thinking": "low" } }"#;
+        let ai: AiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(ai.enrich.model, "x");
+        assert_eq!(ai.fix.plan.model, "opencode-go/glm-5.2");
+        assert_eq!(ai.update.model, "opencode-go/kimi-k2.7-code");
+    }
+
+    #[test]
+    fn legacy_flat_overrides_per_command_defaults() {
+        // A legacy value must win over the per-command defaults (it was an
+        // explicit choice), seeding all four slots.
+        let json = r#"{ "model": "legacy/model", "thinking": "low" }"#;
+        let ai: AiConfig = serde_json::from_str(json).unwrap();
+        for leaf in [&ai.enrich, &ai.fix.plan, &ai.fix.apply, &ai.update] {
+            assert_eq!(leaf.model, "legacy/model");
+            assert_eq!(leaf.thinking, "low");
+        }
+    }
+
+    #[test]
+    fn unknown_ai_key_is_rejected() {
+        // Strictness is preserved: a typo'd key must error, not silently drop.
+        let json = r#"{ "enrich": { "model": "x" }, "bogus": {} }"#;
+        assert!(serde_json::from_str::<AiConfig>(json).is_err());
+    }
+
+    #[test]
+    fn round_trips_through_nested_shape() {
+        // A legacy config, once loaded, serializes back as the nested shape.
+        let legacy = r#"{ "model": "m", "thinking": "high" }"#;
+        let ai: AiConfig = serde_json::from_str(legacy).unwrap();
+        let serialized = serde_json::to_string(&ai).unwrap();
+        assert!(serialized.contains("\"enrich\""));
+        assert!(serialized.contains("\"fix\""));
+        assert!(serialized.contains("\"update\""));
+        let reparsed: AiConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(ai, reparsed);
+    }
+
+    #[test]
+    fn dashboard_config_default_ai_uses_per_command_defaults() {
+        let dash = DashboardConfig::default();
+        assert_eq!(dash.ai, AiConfig::default());
+        assert_eq!(dash.ai.fix.plan.model, "opencode-go/glm-5.2");
+    }
 }

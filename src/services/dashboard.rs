@@ -1425,9 +1425,9 @@ impl DashboardService {
         };
 
         if let Some(conflicts) = ai_conflicts {
-            // ai.model blank → no AI available, abort and let the UI prompt
-            // the user to configure ai.model or resolve conflicts manually.
-            let model = self.config.ai.model.trim().to_string();
+            // ai.update.model blank → no AI available, abort and let the UI
+            // prompt the user to configure it or resolve conflicts manually.
+            let model = self.config.ai.update.model.trim().to_string();
             if model.is_empty() {
                 send_phase(UpdatePhase::ConflictsDetected {
                     count: conflicts.len(),
@@ -1469,13 +1469,18 @@ impl DashboardService {
             // headers, colored tool calls, syntax-highlighted diffs)
             // the user expects to see inside the AI Activity panel.
             let prompt = build_merge_prompt(base_ref, &conflicts);
-            let opencode_args: Vec<String> = vec![
+            let mut opencode_args: Vec<String> = vec![
                 "--prompt".to_string(),
                 prompt,
                 "-m".to_string(),
                 model.clone(),
-                cwd.to_string_lossy().to_string(),
             ];
+            push_tui_variant_args(
+                &mut opencode_args,
+                &self.opencode_binary,
+                &self.config.ai.update.thinking,
+            );
+            opencode_args.push(cwd.to_string_lossy().to_string());
 
             // Hand control to the UI. The merge is still mid-flight on
             // disk (conflict markers in the index); the screen owns the
@@ -1592,9 +1597,9 @@ impl DashboardService {
             });
         }
 
-        // ai.model blank → no AI available: abort the merge and let the UI
-        // prompt the user to configure ai.model or resolve manually.
-        let model = self.config.ai.model.trim().to_string();
+        // ai.update.model blank → no AI available: abort the merge and let the
+        // UI prompt the user to configure it or resolve manually.
+        let model = self.config.ai.update.model.trim().to_string();
         if model.is_empty() {
             let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
             return Ok(UpdateBranchOutcome::ConflictsRequireAi { conflicts });
@@ -1612,13 +1617,18 @@ impl DashboardService {
         // PTY lifecycle from here and commits the result locally (no push)
         // via the same machinery as the Update Pull Request flow.
         let prompt = build_merge_prompt(&base_ref, &conflicts);
-        let opencode_args: Vec<String> = vec![
+        let mut opencode_args: Vec<String> = vec![
             "--prompt".to_string(),
             prompt,
             "-m".to_string(),
             model.clone(),
-            cwd.to_string_lossy().to_string(),
         ];
+        push_tui_variant_args(
+            &mut opencode_args,
+            &self.opencode_binary,
+            &self.config.ai.update.thinking,
+        );
+        opencode_args.push(cwd.to_string_lossy().to_string());
         Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
             opencode_binary: self.opencode_binary.clone(),
             opencode_args,
@@ -1726,7 +1736,7 @@ impl DashboardService {
             return Ok(EnrichPreparation::NothingToDescribe);
         }
 
-        let model = self.config.ai.model.trim().to_string();
+        let model = self.config.ai.enrich.model.trim().to_string();
         if model.is_empty() {
             return Ok(EnrichPreparation::AiNotConfigured);
         }
@@ -1741,13 +1751,20 @@ impl DashboardService {
         // Invoke opencode's default TUI (no subcommand) with `--prompt` so
         // the enricher instructions auto-send on launch and `-m <model>` so
         // the user's configured model is honored — mirrors the merge flow.
-        let opencode_args: Vec<String> = vec![
+        // `--variant` carries the reasoning effort when this opencode TUI
+        // supports it (see `push_tui_variant_args`).
+        let mut opencode_args: Vec<String> = vec![
             "--prompt".to_string(),
             prompt,
             "-m".to_string(),
             model.clone(),
-            cwd.to_string_lossy().to_string(),
         ];
+        push_tui_variant_args(
+            &mut opencode_args,
+            &self.opencode_binary,
+            &self.config.ai.enrich.thinking,
+        );
+        opencode_args.push(cwd.to_string_lossy().to_string());
 
         Ok(EnrichPreparation::HandedOffToUi {
             opencode_binary: self.opencode_binary.clone(),
@@ -1930,7 +1947,9 @@ impl DashboardService {
         if !self.gh_available {
             return Ok(FixPreparation::GhUnavailable);
         }
-        let model = self.config.ai.model.trim().to_string();
+        // The pipeline's first AI step is planning, so gate on `fix.plan`;
+        // the apply step validates `fix.apply.model` itself when it runs.
+        let model = self.config.ai.fix.plan.model.trim().to_string();
         if model.is_empty() {
             return Ok(FixPreparation::AiNotConfigured);
         }
@@ -2019,9 +2038,9 @@ impl DashboardService {
         history: Option<&str>,
     ) -> Result<FixVerdict> {
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.model.trim().to_string();
+        let model = self.config.ai.fix.plan.model.trim().to_string();
         if model.is_empty() {
-            return Err(WisetreeError::other("ai.model is not configured."));
+            return Err(WisetreeError::other("ai.fix.plan.model is not configured."));
         }
         let code = match &group.file {
             Some(file) => read_code_window(&cwd, file, group.line).await,
@@ -2037,13 +2056,21 @@ impl DashboardService {
         // default (build) agent would act on it — editing the file and skipping
         // the verdict — which made "Other" silently apply a change and advance
         // instead of showing a revised plan. Read-only forces a clean re-plan.
+        // `opencode run` accepts `--variant <effort>`, so the plan phase honors
+        // its configured thinking strength directly (unlike the TUI flows).
+        let mut run_args: Vec<String> = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model.clone(),
+            "--agent".to_string(),
+            "plan".to_string(),
+        ];
+        run_args.extend(run_variant_args(&self.config.ai.fix.plan.thinking));
+        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
         let output = time::timeout(
             FIX_PLAN_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &["run", &prompt, "-m", &model, "--agent", "plan"],
-                Some(&cwd),
-            ),
+            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
         )
         .await
         .map_err(|_| WisetreeError::other("opencode planning timed out after 180s"))?
@@ -2066,21 +2093,24 @@ impl DashboardService {
         plan: &FixPlan,
     ) -> Result<FixApplyHandoff> {
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.model.trim().to_string();
+        let model = self.config.ai.fix.apply.model.trim().to_string();
         if model.is_empty() {
-            return Err(WisetreeError::other("ai.model is not configured."));
+            return Err(WisetreeError::other(
+                "ai.fix.apply.model is not configured.",
+            ));
         }
         if !binary_available(&self.opencode_binary) {
             return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let prompt = build_fix_apply_prompt(group, plan);
-        let opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
-            prompt,
-            "-m".to_string(),
-            model,
-            cwd.to_string_lossy().to_string(),
-        ];
+        let mut opencode_args: Vec<String> =
+            vec!["--prompt".to_string(), prompt, "-m".to_string(), model];
+        push_tui_variant_args(
+            &mut opencode_args,
+            &self.opencode_binary,
+            &self.config.ai.fix.apply.thinking,
+        );
+        opencode_args.push(cwd.to_string_lossy().to_string());
         Ok(FixApplyHandoff {
             opencode_binary: self.opencode_binary.clone(),
             opencode_args,
@@ -2858,6 +2888,60 @@ fn binary_available(binary: &Path) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+/// Whether the installed opencode's *interactive* (root/TUI) command accepts
+/// `--variant`. opencode exposes the reasoning-effort flag on `opencode run`,
+/// but — through at least 1.17.x — NOT on the TUI launch, and it parses flags
+/// strictly, so passing `--variant` to the TUI aborts the launch instead of
+/// honoring it. The interactive flows therefore gate the flag on a one-shot
+/// probe of `opencode --help`, cached per binary path for the process lifetime
+/// (so a future opencode that adds TUI `--variant` support lights up
+/// automatically). `opencode run` always gets the flag — see [`run_variant_args`].
+fn opencode_tui_supports_variant(binary: &Path) -> bool {
+    static CACHE: Lazy<Mutex<HashMap<PathBuf, bool>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = CACHE.lock().expect("variant cache poisoned").get(binary) {
+        return *hit;
+    }
+    let supported = std::process::Command::new(binary)
+        .arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map(|out| {
+            // yargs prints usage to stdout; check stderr too for safety.
+            String::from_utf8_lossy(&out.stdout).contains("--variant")
+                || String::from_utf8_lossy(&out.stderr).contains("--variant")
+        })
+        .unwrap_or(false);
+    CACHE
+        .lock()
+        .expect("variant cache poisoned")
+        .insert(binary.to_path_buf(), supported);
+    supported
+}
+
+/// `--variant <thinking>` for a non-interactive `opencode run` call (always
+/// supported there). Empty thinking (the persisted "Default") yields no args.
+fn run_variant_args(thinking: &str) -> Vec<String> {
+    let thinking = thinking.trim();
+    if thinking.is_empty() {
+        Vec::new()
+    } else {
+        vec!["--variant".to_string(), thinking.to_string()]
+    }
+}
+
+/// Append the TUI reasoning-effort flag to a TUI invocation's args, but only
+/// when a thinking strength is configured AND the installed opencode TUI
+/// accepts `--variant`. Must be called before the trailing `cwd` positional so
+/// argument order stays valid.
+fn push_tui_variant_args(args: &mut Vec<String>, binary: &Path, thinking: &str) {
+    let thinking = thinking.trim();
+    if !thinking.is_empty() && opencode_tui_supports_variant(binary) {
+        args.push("--variant".to_string());
+        args.push(thinking.to_string());
+    }
 }
 
 fn is_rate_limit_error(err: &str) -> bool {
@@ -6107,6 +6191,25 @@ so the intent reads clearly.
             !prompt.trim_start().starts_with("---"),
             "prompt must not start with YAML frontmatter, got:\n{prompt}"
         );
+    }
+
+    #[test]
+    fn run_variant_args_emits_flag_only_for_a_set_thinking() {
+        // `opencode run` always accepts `--variant`, so the plan phase passes
+        // the configured reasoning effort through. Empty (Default) → no flag.
+        assert!(run_variant_args("").is_empty());
+        assert!(run_variant_args("   ").is_empty());
+        assert_eq!(run_variant_args("high"), vec!["--variant", "high"]);
+        assert_eq!(run_variant_args("  max "), vec!["--variant", "max"]);
+    }
+
+    #[test]
+    fn push_tui_variant_args_is_a_noop_for_blank_thinking() {
+        // Blank thinking must never spawn the capability probe nor mutate args,
+        // so a missing opencode binary is irrelevant here.
+        let mut args = vec!["--prompt".to_string(), "x".to_string()];
+        push_tui_variant_args(&mut args, Path::new("/no/such/opencode"), "");
+        assert_eq!(args, vec!["--prompt".to_string(), "x".to_string()]);
     }
 
     #[test]
