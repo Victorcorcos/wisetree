@@ -2142,8 +2142,7 @@ impl DashboardService {
             return Ok(());
         };
         let cwd = PathBuf::from(worktree_path);
-        let endpoint =
-            format!("repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions");
+        let endpoint = format!("repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions");
         time::timeout(
             FIX_REPLY_TIMEOUT,
             run_command(
