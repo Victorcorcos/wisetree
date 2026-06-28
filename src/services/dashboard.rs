@@ -2126,6 +2126,38 @@ impl DashboardService {
             .map_err(WisetreeError::other)
     }
 
+    /// Add a 😄 ("laugh") reaction to the first inline review comment in
+    /// `group`. Skips silently when the group has no `reply_comment_id` (PR-level
+    /// summary comments have no comment anchor). The GitHub reactions API is
+    /// idempotent — re-adding an existing reaction returns 200 without a
+    /// duplicate, so no pre-check is needed.
+    pub async fn react_to_praise_comment(
+        &self,
+        worktree_path: &str,
+        owner: &str,
+        repo: &str,
+        group: &CommentGroup,
+    ) -> Result<()> {
+        let Some(comment_id) = group.reply_comment_id else {
+            return Ok(());
+        };
+        let cwd = PathBuf::from(worktree_path);
+        let endpoint =
+            format!("repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions");
+        time::timeout(
+            FIX_REPLY_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &["api", "--method", "POST", &endpoint, "-f", "content=laugh"],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh react timed out"))?
+        .map_err(WisetreeError::other)?;
+        Ok(())
+    }
+
     /// Final step of the Fix loop: push every review-fix commit to origin so
     /// the commit links in the replies resolve.
     pub async fn push_fix(&self, worktree_path: &str) -> Result<()> {

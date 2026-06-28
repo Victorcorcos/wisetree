@@ -2061,8 +2061,25 @@ impl App {
         }
         match result {
             Ok(FixVerdict::Praise) => {
-                if let Some(s) = self.fix_pr.as_mut() {
+                let reaction_info = self.fix_pr.as_mut().and_then(|s| {
                     s.record_outcome(FixRowOutcome::Skipped("praise"));
+                    let group = s.current_group()?;
+                    Some((
+                        s.owner().to_string(),
+                        s.repo().to_string(),
+                        s.request().worktree_path.clone(),
+                        group,
+                    ))
+                });
+                if let Some((owner, repo, worktree_path, group)) = reaction_info {
+                    kick_off_praise_reaction(
+                        self.git_root.clone(),
+                        self.current_dashboard_config(),
+                        owner,
+                        repo,
+                        worktree_path,
+                        group,
+                    );
                 }
                 self.advance_fix(tx);
             }
@@ -5094,6 +5111,27 @@ fn kick_off_commit_and_reply(
             .await
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::FixPrCommitted { index, result });
+    });
+}
+
+/// Fire-and-forget: react with 😄 to a praise comment. Errors are silently
+/// dropped — the reaction is a best-effort courtesy, not part of the Fix flow.
+fn kick_off_praise_reaction(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    owner: String,
+    repo: String,
+    worktree_path: String,
+    group: CommentGroup,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let _ = service
+            .react_to_praise_comment(&worktree_path, &owner, &repo, &group)
+            .await;
     });
 }
 
