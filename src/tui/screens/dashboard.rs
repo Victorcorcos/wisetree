@@ -45,7 +45,8 @@ enum ActionChoice {
     OpenWithCommand,
     CopyPath,
     OpenPullRequest,
-    FillPullRequest,
+    EnrichPullRequest,
+    FixPullRequest,
     MergePullRequest,
     UpdatePullRequest,
     PushPullRequest,
@@ -104,13 +105,13 @@ pub struct ClosePullRequestRequest {
     pub worktree_path: String,
 }
 
-/// Payload the dashboard hands to the "Fill Pull Request" screen. The AI
+/// Payload the dashboard hands to the "Enrich Pull Request" screen. The AI
 /// drafts a title + description into `pull_request.md`; the harness then
 /// either creates a new PR (`number == None`) or updates the existing one
 /// (`number == Some`). `base_ref` is resolved by the app layer before the
 /// pipeline runs, exactly like `UpdatePullRequestRequest`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FillPullRequestRequest {
+pub struct EnrichPullRequestRequest {
     pub branch: String,
     pub worktree_path: String,
     pub base_ref: Option<String>,
@@ -124,6 +125,19 @@ pub struct FillPullRequestRequest {
     /// Labels the PR already has on GitHub. Non-empty only for open PRs.
     /// Used to skip `--add-label` in `gh pr edit` when labels are already set.
     pub existing_labels: Vec<String>,
+}
+
+/// Payload the dashboard hands to the "Fix Pull Request" screen, which walks
+/// the PR's review comments and resolves each one (plan → apply → commit →
+/// reply). Only built for a non-mother worktree with an active (open/draft)
+/// PR — there is no review feedback to resolve otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixPullRequestRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub branch: String,
+    pub worktree_path: String,
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
@@ -202,7 +216,11 @@ pub enum DashboardAction {
     /// Draft a PR title + description with the AI and open (or update) the
     /// pull request. Offered on any non-mother worktree that either has an
     /// open PR or has commits ahead of its base ref.
-    FillPullRequest(Box<FillPullRequestRequest>),
+    EnrichPullRequest(Box<EnrichPullRequestRequest>),
+    /// Walk the PR's review comments and resolve each one interactively
+    /// (plan → apply → commit → reply). Offered on a non-mother worktree
+    /// whose PR is open or draft.
+    FixPullRequest(Box<FixPullRequestRequest>),
     /// Push the branch's local commits to origin (`git push origin HEAD`).
     /// Offered when the PR is Open and the branch is ahead-but-not-behind —
     /// the "merged-but-not-pushed" state a failed push can leave behind.
@@ -841,7 +859,7 @@ impl DashboardScreen {
     /// Build the "Pull Request Commands" buttons for `row`. Each button is
     /// gated by the same condition that previously guarded its menu entry,
     /// so the buttons and the dispatch stay in lockstep. The order matches
-    /// the lifecycle a PR moves through: Open, Fill, Update, Push, Merge,
+    /// the lifecycle a PR moves through: Open, Enrich, Update, Push, Merge,
     /// Close. Unavailable actions are simply omitted (no greyed-out
     /// buttons), so arrow navigation only ever lands on a valid action.
     fn build_pr_commands(&self, row: &DashboardRow) -> Vec<PrCommand> {
@@ -862,13 +880,22 @@ impl DashboardScreen {
                 color: colors::PRIMARY,
             });
         }
-        // Fill drafts a title + description with the AI, then opens a new PR
+        // Enrich drafts a title + description with the AI, then opens a new PR
         // (branch ahead, none yet) or refreshes an open/draft PR's description.
-        if build_fill_request(row).is_some() {
+        if build_enrich_request(row).is_some() {
             commands.push(PrCommand {
-                label: "Fill",
-                choice: ActionChoice::FillPullRequest,
+                label: "Enrich",
+                choice: ActionChoice::EnrichPullRequest,
                 color: colors::BRAND,
+            });
+        }
+        // Fix resolves the PR's review comments with the AI. Offered while the
+        // PR is active (open/draft), where review feedback can exist.
+        if build_fix_request(row).is_some() {
+            commands.push(PrCommand {
+                label: "Fix",
+                choice: ActionChoice::FixPullRequest,
+                color: colors::CYAN,
             });
         }
         // Update when the branch is behind its base (merge_status or local
@@ -881,13 +908,15 @@ impl DashboardScreen {
                 color: colors::WARNING,
             });
         }
-        // Push when the branch is ahead but not behind — local commits not
-        // yet on the remote (the "merged-but-not-pushed" state).
+        // Upload when the branch is ahead but not behind — local commits not
+        // yet on the remote (the "merged-but-not-pushed" state). Mutually
+        // exclusive with Update, so they share the yellow color and 'u'
+        // shortcut without ever colliding.
         if is_active && row_has_unpushed(row) {
             commands.push(PrCommand {
-                label: "Push",
+                label: "Upload",
                 choice: ActionChoice::PushPullRequest,
-                color: colors::ACCENT,
+                color: colors::WARNING,
             });
         }
         // Merge is only meaningful while the PR is Open — a draft must be
@@ -1021,7 +1050,7 @@ impl DashboardScreen {
 
     /// Keyboard handling while a PR command button owns the focus: Left /
     /// Right move between buttons, Enter runs the focused action, Esc
-    /// dismisses the whole menu. Letter shortcuts (O/F/U/P/M/C) trigger the
+    /// dismisses the whole menu. Letter shortcuts (O/E/F/U/P/M/C) trigger the
     /// matching PR command directly without needing to navigate to it first.
     fn handle_pr_command_key(&mut self, key: KeyEvent) -> DashboardAction {
         if self.pr_commands.is_empty() {
@@ -1034,20 +1063,26 @@ impl DashboardScreen {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            let shortcut_choice = match key.code {
-                KeyCode::Char('o') | KeyCode::Char('O') => Some(ActionChoice::OpenPullRequest),
-                KeyCode::Char('f') | KeyCode::Char('F') => Some(ActionChoice::FillPullRequest),
-                KeyCode::Char('u') | KeyCode::Char('U') => Some(ActionChoice::UpdatePullRequest),
-                KeyCode::Char('p') | KeyCode::Char('P') => Some(ActionChoice::PushPullRequest),
-                KeyCode::Char('m') | KeyCode::Char('M') => Some(ActionChoice::MergePullRequest),
-                KeyCode::Char('c') | KeyCode::Char('C') => Some(ActionChoice::ClosePullRequest),
-                _ => None,
+            // Each key maps to its candidate choice(s); we fire the first one
+            // actually present in the button row. Update and Upload are mutually
+            // exclusive, so 'u' covers whichever the row exposes.
+            let shortcut_choices: &[ActionChoice] = match key.code {
+                KeyCode::Char('o') | KeyCode::Char('O') => &[ActionChoice::OpenPullRequest],
+                KeyCode::Char('e') | KeyCode::Char('E') => &[ActionChoice::EnrichPullRequest],
+                KeyCode::Char('f') | KeyCode::Char('F') => &[ActionChoice::FixPullRequest],
+                KeyCode::Char('u') | KeyCode::Char('U') => &[
+                    ActionChoice::UpdatePullRequest,
+                    ActionChoice::PushPullRequest,
+                ],
+                KeyCode::Char('m') | KeyCode::Char('M') => &[ActionChoice::MergePullRequest],
+                KeyCode::Char('c') | KeyCode::Char('C') => &[ActionChoice::ClosePullRequest],
+                _ => &[],
             };
-            if let Some(target_choice) = shortcut_choice {
+            if !shortcut_choices.is_empty() {
                 if let Some(cmd) = self
                     .pr_commands
                     .iter()
-                    .find(|cmd| cmd.choice == target_choice)
+                    .find(|cmd| shortcut_choices.contains(&cmd.choice))
                 {
                     let choice = cmd.choice;
                     let Some(index) = self.action_target else {
@@ -1101,7 +1136,8 @@ impl DashboardScreen {
         let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
         let merge_request = build_merge_request(row);
         let update_request = build_update_request(row);
-        let fill_request = build_fill_request(row);
+        let enrich_request = build_enrich_request(row);
+        let fix_request = build_fix_request(row);
         let push_request = build_push_request(row);
         let close_request = build_close_request(row);
         self.reset_action_menu();
@@ -1136,10 +1172,16 @@ impl DashboardScreen {
                     .map(|request| DashboardAction::UpdatePullRequest(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
-            ActionChoice::FillPullRequest => {
+            ActionChoice::EnrichPullRequest => {
                 self.mode = DashboardMode::Table;
-                fill_request
-                    .map(|request| DashboardAction::FillPullRequest(Box::new(request)))
+                enrich_request
+                    .map(|request| DashboardAction::EnrichPullRequest(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::FixPullRequest => {
+                self.mode = DashboardMode::Table;
+                fix_request
+                    .map(|request| DashboardAction::FixPullRequest(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
             ActionChoice::PushPullRequest => {
@@ -2672,7 +2714,7 @@ pub(crate) fn row_has_unpushed(row: &DashboardRow) -> bool {
 }
 
 /// True for PR states that still accept the non-merge lifecycle commands
-/// (Fill / Update / Push / Close). Open and Draft both qualify; Merged and
+/// (Enrich / Update / Push / Close). Open and Draft both qualify; Merged and
 /// Closed are terminal. Merge stays Open-only (see [`build_merge_request`])
 /// because GitHub refuses to merge a draft until it's marked ready.
 fn pr_accepts_lifecycle_commands(state: PrState) -> bool {
@@ -2711,13 +2753,13 @@ fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> 
     })
 }
 
-/// Assemble the payload the "Fill Pull Request" screen needs. Returns
+/// Assemble the payload the "Enrich Pull Request" screen needs. Returns
 /// `None` (so the menu entry is hidden) on the mother worktree, or on a
 /// worktree that has neither an open PR to refresh nor any commits ahead
 /// of its base to describe. When an open PR exists the draft updates it
 /// (`number = Some`); otherwise a branch that is ahead opens a new one
 /// (`number = None`).
-fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
+fn build_enrich_request(row: &DashboardRow) -> Option<EnrichPullRequestRequest> {
     // The mother worktree never owns a PR of its own.
     if row.worktree.is_main {
         return None;
@@ -2726,7 +2768,7 @@ fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
     let worktree_path = row.worktree.path.clone();
     match row.pull_request.as_ref() {
         // Open or draft PR → refresh its description.
-        Some(pr) if pr_accepts_lifecycle_commands(pr.state) => Some(FillPullRequestRequest {
+        Some(pr) if pr_accepts_lifecycle_commands(pr.state) => Some(EnrichPullRequestRequest {
             branch,
             worktree_path,
             base_ref: None,
@@ -2748,7 +2790,7 @@ fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
             if ahead == 0 {
                 return None;
             }
-            Some(FillPullRequestRequest {
+            Some(EnrichPullRequestRequest {
                 branch,
                 worktree_path,
                 base_ref: None,
@@ -2760,6 +2802,26 @@ fn build_fill_request(row: &DashboardRow) -> Option<FillPullRequestRequest> {
         }
     }
 }
+/// Assemble the payload the "Fix Pull Request" screen needs. Returns `None`
+/// (so the menu entry is hidden) on the mother worktree, or when the row has
+/// no active PR — review comments only exist on an open or draft PR.
+fn build_fix_request(row: &DashboardRow) -> Option<FixPullRequestRequest> {
+    if row.worktree.is_main {
+        return None;
+    }
+    let pr = row.pull_request.as_ref()?;
+    if !pr_accepts_lifecycle_commands(pr.state) {
+        return None;
+    }
+    Some(FixPullRequestRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+    })
+}
+
 /// Assemble the payload for the push-only flow. Returns `None` unless the
 /// row's PR is Open and the branch is ahead-but-not-behind — mirrors the
 /// `row_has_unpushed` guard in `build_action_select`. Reuses the
@@ -3152,8 +3214,8 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         let labels = pr_labels(&r);
         assert!(
-            labels.iter().any(|l| l == "Push"),
-            "expected Push command in {labels:?}"
+            labels.iter().any(|l| l == "Upload"),
+            "expected Upload command in {labels:?}"
         );
         // The merged-but-not-pushed state is not behind, so Update is absent.
         assert!(
@@ -3167,8 +3229,8 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 2)));
         let labels = pr_labels(&r);
         assert!(
-            !labels.iter().any(|l| l == "Push"),
-            "Push must not show when behind: {labels:?}"
+            !labels.iter().any(|l| l == "Upload"),
+            "Upload must not show when behind: {labels:?}"
         );
         assert!(
             labels.iter().any(|l| l == "Update"),
@@ -3288,7 +3350,7 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Fill", "Push", "Merge", "Close"]
+            vec!["Open", "Enrich", "Fix", "Upload", "Merge", "Close"]
         );
     }
 
@@ -3297,8 +3359,18 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(1, 3)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Fill", "Update", "Merge", "Close"]
+            vec!["Open", "Enrich", "Fix", "Update", "Merge", "Close"]
         );
+    }
+
+    #[test]
+    fn fix_offered_for_active_pr_only() {
+        // Active PR (open) → Fix is present.
+        let active = row(Some(open_pr()), Some(branch_status(0, 0)));
+        assert!(build_fix_request(&active).is_some());
+        // No PR → Fix is hidden.
+        let no_pr = row(None, Some(branch_status(2, 0)));
+        assert!(build_fix_request(&no_pr).is_none());
     }
 
     #[test]
@@ -3339,5 +3411,37 @@ mod tests {
         assert!(matches!(action, DashboardAction::OpenPullRequest(_)));
         assert!(screen.pr_commands.is_empty());
         assert_eq!(screen.action_pr_focus, None);
+    }
+
+    #[test]
+    fn e_shortcut_dispatches_enrich_action() {
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.handle_key(key_event(KeyCode::Enter));
+        screen.handle_key(key_event(KeyCode::Tab));
+        let action = screen.handle_key(key_event(KeyCode::Char('e')));
+        assert!(matches!(action, DashboardAction::EnrichPullRequest(_)));
+        assert!(screen.pr_commands.is_empty());
+    }
+
+    #[test]
+    fn f_shortcut_dispatches_fix_action() {
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.handle_key(key_event(KeyCode::Enter));
+        screen.handle_key(key_event(KeyCode::Tab));
+        let action = screen.handle_key(key_event(KeyCode::Char('f')));
+        assert!(matches!(action, DashboardAction::FixPullRequest(_)));
+        assert!(screen.pr_commands.is_empty());
+    }
+
+    #[test]
+    fn x_is_no_longer_a_pr_command_shortcut() {
+        // Fix moved from `x` to `f`, so `x` must be inert: the menu stays open
+        // and no action is dispatched.
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.handle_key(key_event(KeyCode::Enter));
+        screen.handle_key(key_event(KeyCode::Tab));
+        let action = screen.handle_key(key_event(KeyCode::Char('x')));
+        assert!(matches!(action, DashboardAction::Continue));
+        assert!(!screen.pr_commands.is_empty());
     }
 }

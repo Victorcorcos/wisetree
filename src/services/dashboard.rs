@@ -40,19 +40,33 @@ const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// completes in ~1s; the cap stops a slow network from stalling the on-cycle
 /// tick.
 const BASE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Timeouts for the "Fill Pull Request" pipeline. Gathering the diff/log is
+/// Timeouts for the "Enrich Pull Request" pipeline. Gathering the diff/log is
 /// read-only but can be large on a long branch; push + `gh pr create/edit`
 /// talk to the network.
-const FILL_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
-const FILL_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
-const FILL_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+const ENRICH_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
+const ENRICH_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+const ENRICH_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Soft cap on the embedded diff size inside the AI prompt. opencode
 /// receives the whole prompt as a single argv entry, so an unbounded diff
 /// risks exceeding the OS argument-length limit and failing to spawn.
 /// Diffs above this are truncated with a marker so the launch always
 /// succeeds; the AI still has the commit log + the bulk of the diff to work
 /// from.
-const FILL_DIFF_MAX_BYTES: usize = 120_000;
+const ENRICH_DIFF_MAX_BYTES: usize = 120_000;
+/// Timeouts for the "Fix Pull Request" pipeline (resolve review comments).
+/// Sync + fetch are network paths; the captured planning call drives a full
+/// model turn so it gets the longest leash; commit/reply/push are local-ish.
+const FIX_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+const FIX_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const FIX_PLAN_TIMEOUT: Duration = Duration::from_secs(180);
+const FIX_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
+const FIX_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const FIX_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many lines of context to show the planning AI on each side of a
+/// commented line, and a hard byte cap so the captured prompt never blows
+/// past the OS argv limit.
+const FIX_CODE_WINDOW_RADIUS: usize = 40;
+const FIX_CODE_MAX_BYTES: usize = 24_000;
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -469,12 +483,12 @@ pub enum UpdateBranchOutcome {
     AiUnavailable { conflicts: Vec<String> },
 }
 
-/// Result of the read-only preparation phase of the "Fill Pull Request"
-/// pipeline (`prepare_fill`). On `HandedOffToUi` the UI spawns opencode in
+/// Result of the read-only preparation phase of the "Enrich Pull Request"
+/// pipeline (`prepare_enrich`). On `HandedOffToUi` the UI spawns opencode in
 /// its embedded PTY to draft `pull_request.md`; the other variants are
 /// terminal and map straight to a toast.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FillPreparation {
+pub enum EnrichPreparation {
     /// Diff/log gathered, prompt built, `useAi` set and `opencode` on PATH.
     /// The UI owns the PTY lifecycle from here; once opencode finishes the
     /// screen reads `pull_request.md` and offers to open/update the PR.
@@ -493,7 +507,7 @@ pub enum FillPreparation {
 }
 
 /// Parameters for opening or updating a pull request via `submit_pull_request`.
-pub struct FillSubmitRequest {
+pub struct EnrichSubmitRequest {
     pub worktree_path: String,
     pub branch: String,
     /// `Some` → update an existing PR; `None` → push + create a new one.
@@ -512,7 +526,7 @@ pub struct FillSubmitRequest {
 /// Outcome of submitting the drafted PR (`submit_pull_request`): either a
 /// brand-new PR was created or the existing one's title/body were updated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FillSubmitOutcome {
+pub enum EnrichSubmitOutcome {
     /// `gh pr create` succeeded. `url` is parsed from gh's stdout.
     Created { number: u64, url: String },
     /// `gh pr edit` succeeded for the existing PR.
@@ -521,6 +535,127 @@ pub enum FillSubmitOutcome {
     PushFailed(String),
     /// `gh pr create` / `gh pr edit` failed. stderr included.
     SubmitFailed(String),
+}
+
+/// One reviewer comment retained after filtering. `body` is the raw markdown
+/// the reviewer wrote; `author` is their GitHub login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub author: String,
+    pub body: String,
+}
+
+/// A group of inline review comments that target the same file + line. The
+/// whole group is judged by one planning call and resolved as a single unit
+/// (Apply / Other / Skip). `file` / `line` may still be `None` for a comment
+/// GitHub no longer maps to a current line; the reply then anchors via
+/// `reply_comment_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentGroup {
+    /// File the comments target; `None` when GitHub returns no path.
+    pub file: Option<String>,
+    /// Line the comments target; `None` when not line-anchored.
+    pub line: Option<u64>,
+    /// `databaseId` of the inline comment to reply to. `None` only when the
+    /// comment lacks an id, in which case the reply falls back to a PR comment.
+    pub reply_comment_id: Option<u64>,
+    pub comments: Vec<ReviewComment>,
+}
+
+impl CommentGroup {
+    /// Short human label for toasts and the summary table: `path:line`, or a
+    /// fallback when GitHub returns no path for the comment.
+    pub fn descriptor(&self) -> String {
+        match (&self.file, self.line) {
+            (Some(file), Some(line)) => format!("{file}:{line}"),
+            (Some(file), None) => file.clone(),
+            _ => "PR review comment".to_string(),
+        }
+    }
+
+    /// The comment text fed to the planning prompt: each comment prefixed
+    /// with its author so the AI can weigh who said what.
+    pub fn combined_text(&self) -> String {
+        self.comments
+            .iter()
+            .map(|c| format!("@{}: {}", c.author, c.body.trim()))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// First comment's body, collapsed to a single line and clipped — quoted
+    /// inside the commit body as the reviewer's feedback.
+    fn brief(&self) -> String {
+        let raw = self.comments.first().map(|c| c.body.as_str()).unwrap_or("");
+        let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        clip(&one_line, 80)
+    }
+}
+
+/// Outcome of the read-only Fix preparation (`prepare_fix`): sync the branch,
+/// then fetch + filter + group the PR's review comments. `Ready` hands the
+/// groups to the UI which drives the per-comment plan/apply loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixPreparation {
+    Ready {
+        groups: Vec<CommentGroup>,
+        owner: String,
+        repo: String,
+    },
+    /// No unresolved review comments remain after filtering.
+    NoComments,
+    /// `gh` CLI is missing.
+    GhUnavailable,
+    /// `useAi` is blank — no model configured to plan fixes.
+    AiNotConfigured,
+    /// `useAi` set but `opencode` is not on PATH.
+    AiUnavailable,
+    /// `git pull --ff-only` failed (divergence / network). stderr included.
+    SyncFailed(String),
+}
+
+/// The structured fields the planning AI emits for a `fix` verdict. Rendered
+/// to the user on the Decision step and fed into the apply prompt + commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixPlan {
+    /// One short imperative line for the commit subject.
+    pub summary: String,
+    pub validity: String,
+    pub explanation: String,
+    pub change: String,
+}
+
+/// The verdict the planning AI returns for one comment group. The harness
+/// branches on this deterministically — never asks the AI to route itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixVerdict {
+    /// Pure acknowledgement — skip silently.
+    Praise,
+    /// Non-actionable — post this reply, no code change.
+    Reply(String),
+    /// Actionable — present the plan with Apply / Other / Skip.
+    Fix(FixPlan),
+}
+
+/// Spawn parameters for the live apply phase, mirroring
+/// [`EnrichPreparation::HandedOffToUi`]. The UI owns the PTY from here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixApplyHandoff {
+    pub opencode_binary: PathBuf,
+    pub opencode_args: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+/// Result of the post-apply [`DashboardService::commit_and_reply`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixCommitOutcome {
+    /// opencode edited the file(s): the change was committed and the reviewer
+    /// was replied to with the commit link.
+    Committed,
+    /// opencode made no change — on closer inspection the code already
+    /// satisfied the comment. No commit was created; the reviewer was told it
+    /// is already addressed. Not a failure.
+    AlreadyResolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1551,18 +1686,18 @@ impl DashboardService {
         }
     }
 
-    /// Read-only preparation for the "Fill Pull Request" flow. Gathers the
+    /// Read-only preparation for the "Enrich Pull Request" flow. Gathers the
     /// commit log + diff against `base_ref`, extracts the ticket from the
     /// branch name, reads the repo's PR template (falling back to the
-    /// embedded one), and renders `prompts/filler.md` into the opencode
+    /// embedded one), and renders `prompts/enricher.md` into the opencode
     /// command the UI will spawn. No git mutation happens here — the AI's
     /// only job is to write `pull_request.md`.
-    pub async fn prepare_fill(
+    pub async fn prepare_enrich(
         &self,
         worktree_path: &str,
         branch: &str,
         base_ref: &str,
-    ) -> Result<FillPreparation> {
+    ) -> Result<EnrichPreparation> {
         let cwd = PathBuf::from(worktree_path);
 
         // Commit log (oldest first) and full diff against the base ref.
@@ -1570,7 +1705,7 @@ impl DashboardService {
         let diff_range = format!("{base_ref}...HEAD");
         let git_log = with_timeout(
             "git log",
-            FILL_CONTEXT_TIMEOUT,
+            ENRICH_CONTEXT_TIMEOUT,
             run_command(
                 &self.git_binary,
                 &["log", &log_range, "--reverse", "--format=### %s%n%n%b"],
@@ -1581,30 +1716,30 @@ impl DashboardService {
         .unwrap_or_default();
         let git_diff = with_timeout(
             "git diff",
-            FILL_CONTEXT_TIMEOUT,
+            ENRICH_CONTEXT_TIMEOUT,
             run_command(&self.git_binary, &["diff", &diff_range], Some(&cwd)),
         )
         .await?
         .unwrap_or_default();
 
         if git_diff.trim().is_empty() && git_log.trim().is_empty() {
-            return Ok(FillPreparation::NothingToDescribe);
+            return Ok(EnrichPreparation::NothingToDescribe);
         }
 
         let use_ai = self.config.use_ai.trim().to_string();
         if use_ai.is_empty() {
-            return Ok(FillPreparation::AiNotConfigured);
+            return Ok(EnrichPreparation::AiNotConfigured);
         }
         if !binary_available(&self.opencode_binary) {
-            return Ok(FillPreparation::AiUnavailable);
+            return Ok(EnrichPreparation::AiUnavailable);
         }
 
         let ticket = extract_ticket(branch).unwrap_or_default();
         let template = read_pr_template(&cwd).await;
-        let prompt = build_fill_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
+        let prompt = build_enrich_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
 
         // Invoke opencode's default TUI (no subcommand) with `--prompt` so
-        // the filler instructions auto-send on launch and `-m <model>` so
+        // the enricher instructions auto-send on launch and `-m <model>` so
         // the user's configured model is honored — mirrors the merge flow.
         let opencode_args: Vec<String> = vec![
             "--prompt".to_string(),
@@ -1614,7 +1749,7 @@ impl DashboardService {
             cwd.to_string_lossy().to_string(),
         ];
 
-        Ok(FillPreparation::HandedOffToUi {
+        Ok(EnrichPreparation::HandedOffToUi {
             opencode_binary: self.opencode_binary.clone(),
             opencode_args,
             cwd,
@@ -1631,10 +1766,10 @@ impl DashboardService {
     /// via `--assignee "@me"` / `--add-assignee "@me"`.
     pub async fn submit_pull_request(
         &self,
-        params: &FillSubmitRequest,
+        params: &EnrichSubmitRequest,
         activity: Option<&mpsc::UnboundedSender<(String, ActivityKind)>>,
-    ) -> Result<FillSubmitOutcome> {
-        let FillSubmitRequest {
+    ) -> Result<EnrichSubmitOutcome> {
+        let EnrichSubmitRequest {
             worktree_path,
             branch,
             number,
@@ -1692,13 +1827,13 @@ impl DashboardService {
                 let edit_args_ref: Vec<&str> = edit_args.iter().map(String::as_str).collect();
                 let edit_result = with_timeout(
                     "gh pr edit",
-                    FILL_SUBMIT_TIMEOUT,
+                    ENRICH_SUBMIT_TIMEOUT,
                     run_command_streamed(&self.gh_binary, &edit_args_ref, Some(&cwd), activity),
                 )
                 .await?;
                 match edit_result {
-                    Ok(_) => Ok(FillSubmitOutcome::Updated { number: *number }),
-                    Err(err) => Ok(FillSubmitOutcome::SubmitFailed(err)),
+                    Ok(_) => Ok(EnrichSubmitOutcome::Updated { number: *number }),
+                    Err(err) => Ok(EnrichSubmitOutcome::SubmitFailed(err)),
                 }
             }
             // Create a brand-new PR: push the branch, then `gh pr create`.
@@ -1706,7 +1841,7 @@ impl DashboardService {
                 emit(&format!("$ git push -u origin {branch}"));
                 let push = with_timeout(
                     "git push",
-                    FILL_PUSH_TIMEOUT,
+                    ENRICH_PUSH_TIMEOUT,
                     run_command_streamed(
                         &self.git_binary,
                         &["push", "-u", "origin", branch],
@@ -1716,7 +1851,7 @@ impl DashboardService {
                 )
                 .await?;
                 if let Err(err) = push {
-                    return Ok(FillSubmitOutcome::PushFailed(err));
+                    return Ok(EnrichSubmitOutcome::PushFailed(err));
                 }
 
                 // `--head owner:branch` keeps `gh` from aborting when the
@@ -1761,7 +1896,7 @@ impl DashboardService {
                 let create_args_ref: Vec<&str> = create_args.iter().map(String::as_str).collect();
                 let create = with_timeout(
                     "gh pr create",
-                    FILL_SUBMIT_TIMEOUT,
+                    ENRICH_SUBMIT_TIMEOUT,
                     run_command_streamed(&self.gh_binary, &create_args_ref, Some(&cwd), activity),
                 )
                 .await?;
@@ -1769,12 +1904,363 @@ impl DashboardService {
                     Ok(out) => {
                         let url = pr_url_from_output(&out);
                         let number = pr_number_from_url(&url).unwrap_or(0);
-                        Ok(FillSubmitOutcome::Created { number, url })
+                        Ok(EnrichSubmitOutcome::Created { number, url })
                     }
-                    Err(err) => Ok(FillSubmitOutcome::SubmitFailed(err)),
+                    Err(err) => Ok(EnrichSubmitOutcome::SubmitFailed(err)),
                 }
             }
         }
+    }
+
+    // ── "Fix Pull Request" pipeline ────────────────────────────────────
+    //
+    // Resolve PR review comments. Deterministic work (sync, fetch, filter,
+    // group, commit, reply, push) is Rust; the AI is invoked only to judge +
+    // plan each comment (captured) and to apply an approved fix (live PTY).
+
+    /// Sync the PR branch, then fetch, filter, and group its review comments.
+    ///
+    /// No AI here. The branch is already checked out in this worktree (that's
+    /// why "Fix" is offered), so we sync it with a fast-forward-only pull
+    /// rather than `gh pr checkout`, which could switch branches inside the
+    /// worktree. Resolved and minimized threads are dropped, as are outdated
+    /// threads we already replied to; surviving inline comments are grouped by
+    /// file + line, and PR-level review summaries are folded into one group.
+    pub async fn prepare_fix(&self, worktree_path: &str, number: u64) -> Result<FixPreparation> {
+        if !self.gh_available {
+            return Ok(FixPreparation::GhUnavailable);
+        }
+        let use_ai = self.config.use_ai.trim().to_string();
+        if use_ai.is_empty() {
+            return Ok(FixPreparation::AiNotConfigured);
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Ok(FixPreparation::AiUnavailable);
+        }
+        let cwd = PathBuf::from(worktree_path);
+
+        // Sync the branch with its upstream so fixes land on the latest PR
+        // state and the final push updates the branch reviewers see.
+        let pull = time::timeout(
+            FIX_SYNC_TIMEOUT,
+            run_command(&self.git_binary, &["pull", "--ff-only"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git pull --ff-only timed out after 60s"))?;
+        if let Err(err) = pull {
+            return Ok(FixPreparation::SyncFailed(err));
+        }
+
+        // The PR may not live on `origin`: a fork opens PRs against its
+        // upstream, so `origin` (the fork) has no such PR number. Ask `gh`
+        // which repo the PR was actually opened against — `gh pr view`
+        // resolves the base repo from the local remotes, forks included —
+        // and read the slug off the returned URL so the GraphQL fetch and
+        // replies hit the right repo. `headRepository*` fields point at the
+        // (possibly fork) head and would misdirect both.
+        let number_arg = number.to_string();
+        let view = time::timeout(
+            FIX_FETCH_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &["pr", "view", &number_arg, "--json", "url"],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh pr view timed out after 15s"))?;
+        let view = match view {
+            Ok(out) => out,
+            Err(err) => return Ok(FixPreparation::SyncFailed(err)),
+        };
+        let Some((owner, repo)) = parse_pr_repo_json(&view) else {
+            return Ok(FixPreparation::SyncFailed(
+                "could not resolve the PR's repository from gh pr view output.".to_string(),
+            ));
+        };
+
+        // One GraphQL call returns every inline review thread (with the
+        // resolved/outdated/minimized flags we filter on) plus every PR-level
+        // review summary body, which is folded into its own group.
+        let query = build_fix_feedback_query(&owner, &repo, number);
+        let arg = format!("query={query}");
+        let output = time::timeout(
+            FIX_FETCH_TIMEOUT,
+            run_command(&self.gh_binary, &["api", "graphql", "-f", &arg], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh api graphql timed out after 15s"))?
+        .map_err(WisetreeError::other)?;
+
+        let groups = parse_and_group_review_feedback(&output).map_err(WisetreeError::other)?;
+        if groups.is_empty() {
+            return Ok(FixPreparation::NoComments);
+        }
+        Ok(FixPreparation::Ready {
+            groups,
+            owner,
+            repo,
+        })
+    }
+
+    /// Judge + plan one comment group with a single captured (non-interactive)
+    /// opencode call. The planning output is structured text we parse in Rust;
+    /// the AI must not edit any file in this phase. When `feedback` is set the
+    /// user chose "Other" — the previous plan + their feedback are threaded
+    /// back in so the model revises rather than starts over. `history` carries
+    /// the comments / replies / fixes already resolved earlier in this run so
+    /// the model can interpret a comment that refers back to them.
+    pub async fn plan_comment(
+        &self,
+        worktree_path: &str,
+        group: &CommentGroup,
+        feedback: Option<&str>,
+        previous_plan: Option<&str>,
+        history: Option<&str>,
+    ) -> Result<FixVerdict> {
+        let cwd = PathBuf::from(worktree_path);
+        let model = self.config.use_ai.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other("useAi is not configured."));
+        }
+        let code = match &group.file {
+            Some(file) => read_code_window(&cwd, file, group.line).await,
+            None => String::new(),
+        };
+        let prompt = build_fix_plan_prompt(group, &code, feedback, previous_plan, history);
+        // `opencode run` is the captured/non-interactive transcript mode — no
+        // inner TUI; we parse its stdout. `-m` honors the configured model.
+        // `--agent plan` pins it to opencode's read-only Plan agent (write /
+        // edit / patch tools disabled), so this phase can ONLY think and emit a
+        // verdict — it cannot touch files. This matters most on the "Other"
+        // re-plan: the user's feedback reads like a direct instruction, and the
+        // default (build) agent would act on it — editing the file and skipping
+        // the verdict — which made "Other" silently apply a change and advance
+        // instead of showing a revised plan. Read-only forces a clean re-plan.
+        let output = time::timeout(
+            FIX_PLAN_TIMEOUT,
+            run_command(
+                &self.opencode_binary,
+                &["run", &prompt, "-m", &model, "--agent", "plan"],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("opencode planning timed out after 180s"))?
+        .map_err(WisetreeError::other)?;
+
+        parse_fix_verdict(&output).ok_or_else(|| {
+            WisetreeError::other("could not parse a verdict from the planning AI output.")
+        })
+    }
+
+    /// Build the spawn parameters for the live apply phase. The targeted
+    /// file(s) are edited live inside the opencode PTY (the AI Activity
+    /// panel), exactly like the merge conflict-resolution flow — opencode
+    /// reads the files itself, so nothing is embedded in the prompt but the
+    /// comment + approved plan.
+    pub async fn prepare_apply(
+        &self,
+        worktree_path: &str,
+        group: &CommentGroup,
+        plan: &FixPlan,
+    ) -> Result<FixApplyHandoff> {
+        let cwd = PathBuf::from(worktree_path);
+        let model = self.config.use_ai.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other("useAi is not configured."));
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Err(WisetreeError::other("opencode CLI is not on PATH."));
+        }
+        let prompt = build_fix_apply_prompt(group, plan);
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            cwd.to_string_lossy().to_string(),
+        ];
+        Ok(FixApplyHandoff {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+        })
+    }
+
+    /// After a live apply: stage the change, commit it with the review
+    /// commit-message format, and reply to the reviewer with the commit link.
+    /// All deterministic — no AI. `comment_index` is the 1-based position in
+    /// processing order, used in the commit body.
+    ///
+    /// opencode sometimes concludes the code already satisfies the comment and
+    /// edits nothing. That is not a failure: when the stage is empty we skip
+    /// the commit and instead reply that the comment is already addressed,
+    /// returning [`FixCommitOutcome::AlreadyResolved`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_and_reply(
+        &self,
+        worktree_path: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        pr_url: &str,
+        comment_index: usize,
+        group: &CommentGroup,
+        plan: &FixPlan,
+    ) -> Result<FixCommitOutcome> {
+        let cwd = PathBuf::from(worktree_path);
+
+        // Stage only what this fix touched: the targeted file when known. A
+        // PR-level fix has no single anchor file, so fall back to `add -u`
+        // (tracked modifications only) — never `-A`, which would sweep stray
+        // untracked files (a leftover `pull_request.md`, `.DS_Store`, …) into
+        // the review-fix commit.
+        let stage_args: Vec<&str> = match &group.file {
+            Some(file) => vec!["add", "--", file.as_str()],
+            None => vec!["add", "-u"],
+        };
+        time::timeout(
+            FIX_COMMIT_TIMEOUT,
+            run_command(&self.git_binary, &stage_args, Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git add timed out"))?
+        .map_err(WisetreeError::other)?;
+
+        // If nothing got staged, the apply produced no change — opencode judged
+        // the code already handles the comment. Tell the reviewer so, and stop
+        // here: there is nothing to commit, and that's a valid resolution, not
+        // an error that should abort the loop.
+        let staged = time::timeout(
+            FIX_COMMIT_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["diff", "--cached", "--name-only"],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git diff --cached timed out"))?
+        .map_err(WisetreeError::other)?;
+        if staged.trim().is_empty() {
+            post_reply_internal(
+                &self.gh_binary,
+                &cwd,
+                owner,
+                repo,
+                number,
+                group,
+                ALREADY_RESOLVED_REPLY,
+            )
+            .await
+            .map_err(|err| {
+                WisetreeError::other(format!(
+                    "the apply step produced no change (the code already addresses the \
+                     comment), but posting the reply failed: {err}"
+                ))
+            })?;
+            return Ok(FixCommitOutcome::AlreadyResolved);
+        }
+
+        let (subject, body) = format_commit_message(number, comment_index, &group.brief(), plan);
+        let commit = time::timeout(
+            FIX_COMMIT_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["commit", "-m", &subject, "-m", &body],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git commit timed out"))?;
+        if let Err(err) = commit {
+            return Err(WisetreeError::other(if err.trim().is_empty() {
+                "git commit failed after staging the change.".to_string()
+            } else {
+                err
+            }));
+        }
+
+        let full_hash = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
+            .await
+            .unwrap_or_default();
+        let commit_url = if pr_url.is_empty() {
+            format!("https://github.com/{owner}/{repo}/pull/{number}/changes/{full_hash}")
+        } else {
+            format!("{}/changes/{full_hash}", pr_url.trim_end_matches('/'))
+        };
+        let reply = format_reply(&commit_url, plan);
+
+        match post_reply_internal(&self.gh_binary, &cwd, owner, repo, number, group, &reply).await {
+            Ok(_) => Ok(FixCommitOutcome::Committed),
+            Err(err) => Err(WisetreeError::other(format!(
+                "committed {} but failed to post the reply: {err}",
+                short_hash(&full_hash)
+            ))),
+        }
+    }
+
+    /// Post a non-actionable reply (the `reply` verdict) without any commit.
+    pub async fn post_reply(
+        &self,
+        worktree_path: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        group: &CommentGroup,
+        text: &str,
+    ) -> Result<()> {
+        let cwd = PathBuf::from(worktree_path);
+        post_reply_internal(&self.gh_binary, &cwd, owner, repo, number, group, text)
+            .await
+            .map(|_| ())
+            .map_err(WisetreeError::other)
+    }
+
+    /// Add a 😄 ("laugh") reaction to the first inline review comment in
+    /// `group`. Skips silently when the group has no `reply_comment_id` (PR-level
+    /// summary comments have no comment anchor). The GitHub reactions API is
+    /// idempotent — re-adding an existing reaction returns 200 without a
+    /// duplicate, so no pre-check is needed.
+    pub async fn react_to_praise_comment(
+        &self,
+        worktree_path: &str,
+        owner: &str,
+        repo: &str,
+        group: &CommentGroup,
+    ) -> Result<()> {
+        let Some(comment_id) = group.reply_comment_id else {
+            return Ok(());
+        };
+        let cwd = PathBuf::from(worktree_path);
+        let endpoint = format!("repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions");
+        time::timeout(
+            FIX_REPLY_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &["api", "--method", "POST", &endpoint, "-f", "content=laugh"],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh react timed out"))?
+        .map_err(WisetreeError::other)?;
+        Ok(())
+    }
+
+    /// Final step of the Fix loop: push every review-fix commit to origin so
+    /// the commit links in the replies resolve.
+    pub async fn push_fix(&self, worktree_path: &str) -> Result<()> {
+        let cwd = PathBuf::from(worktree_path);
+        time::timeout(
+            FIX_PUSH_TIMEOUT,
+            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git push timed out after 60s"))?
+        .map_err(WisetreeError::other)?;
+        Ok(())
     }
 
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
@@ -2482,6 +2968,23 @@ fn parse_github_slug(remote: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
+/// Resolve the `(owner, repo)` of the repository a PR was opened against from
+/// the JSON `gh pr view <N> --json url` returns. The base repo is read off the
+/// canonical `url` (`https://github.com/<owner>/<repo>/pull/<N>`), which
+/// `parse_github_slug` already handles. `gh` resolves that repo from the local
+/// remotes, so this is correct even when the branch lives on a fork and the PR
+/// targets an upstream repo — unlike the `headRepository*` fields, which point
+/// at the (possibly fork) head.
+fn parse_pr_repo_json(body: &str) -> Option<(String, String)> {
+    #[derive(Deserialize)]
+    struct PrUrlJson {
+        #[serde(default)]
+        url: String,
+    }
+    let parsed: PrUrlJson = serde_json::from_str(body).ok()?;
+    parse_github_slug(&parsed.url)
+}
+
 fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     let mut q = String::new();
     q.push_str("query { repository(owner: \"");
@@ -2581,15 +3084,16 @@ fn parse_graphql_response(
             .and_then(|v| serde_json::from_value::<GhConnection>(v.clone()).ok())
             .and_then(|conn| conn.nodes.into_iter().next())
             .map(|node| {
-                let state = if node.is_draft {
-                    PrState::Draft
-                } else {
-                    match node.state.as_str() {
-                        "OPEN" => PrState::Open,
-                        "MERGED" => PrState::Merged,
-                        "CLOSED" => PrState::Closed,
-                        _ => PrState::Closed,
-                    }
+                // GitHub keeps `isDraft = true` on a PR that was closed while
+                // still a draft, so the terminal states must win over the draft
+                // flag — otherwise a closed draft keeps reading as "Drafted".
+                // Priority: Merged > Closed > Drafted > Opened.
+                let state = match node.state.as_str() {
+                    "MERGED" => PrState::Merged,
+                    "CLOSED" => PrState::Closed,
+                    "OPEN" if node.is_draft => PrState::Draft,
+                    "OPEN" => PrState::Open,
+                    _ => PrState::Closed,
                 };
                 let checks_status = node
                     .commits
@@ -3280,7 +3784,7 @@ fn build_merge_prompt(base_ref: &str, conflicts: &[String]) -> String {
 /// Fallback PR template used when the repo ships none of the well-known
 /// template files. Mirrors the `filler` skill's reference template so the
 /// native flow produces the same section layout the team is used to.
-const FILL_TEMPLATE_FALLBACK: &str = "# Description ✍️
+const ENRICH_TEMPLATE_FALLBACK: &str = "# Description ✍️
 
 Brief explanation of the PR purpose
 
@@ -3331,13 +3835,13 @@ async fn read_pr_template(cwd: &Path) -> String {
             }
         }
     }
-    FILL_TEMPLATE_FALLBACK.to_string()
+    ENRICH_TEMPLATE_FALLBACK.to_string()
 }
 
-/// Render `prompts/filler.md` into a concrete prompt by substituting the
+/// Render `prompts/enricher.md` into a concrete prompt by substituting the
 /// harness-gathered inputs. The diff is embedded last (and truncated if
 /// huge) so the earlier placeholder substitutions never scan the diff body.
-fn build_fill_prompt(
+fn build_enrich_prompt(
     base_ref: &str,
     branch: &str,
     ticket: &str,
@@ -3345,15 +3849,503 @@ fn build_fill_prompt(
     git_diff: &str,
     template: &str,
 ) -> String {
-    const FILLER_PROMPT: &str = include_str!("../../prompts/filler.md");
-    let diff = truncate_for_prompt(git_diff, FILL_DIFF_MAX_BYTES);
-    FILLER_PROMPT
+    const ENRICHER_PROMPT: &str = include_str!("../../prompts/enricher.md");
+    let diff = truncate_for_prompt(git_diff, ENRICH_DIFF_MAX_BYTES);
+    ENRICHER_PROMPT
         .replace("BASE_REF", base_ref)
         .replace("CURRENT_BRANCH", branch)
         .replace("TICKET", ticket)
         .replace("PR_TEMPLATE", template)
         .replace("GIT_LOG", git_log)
         .replace("GIT_DIFF", &diff)
+}
+
+// ── "Fix Pull Request" helpers (deterministic, unit-tested) ────────────
+
+/// Build the GraphQL query for the Fix loop. It returns, in one round-trip:
+/// every inline review thread (with the `isResolved` / `isOutdated` flags we
+/// filter on, plus each comment's `isMinimized` and `viewerDidAuthor` flags),
+/// and every PR-level review summary body (the text left when submitting a
+/// review, not anchored to a line). Both feed `parse_and_group_review_feedback`.
+fn build_fix_feedback_query(owner: &str, repo: &str, number: u64) -> String {
+    format!(
+        "query {{ repository(owner: \"{}\", name: \"{}\") {{ pullRequest(number: {}) {{ \
+         reviewThreads(first: 100) {{ nodes {{ isResolved \
+         comments(first: 50) {{ nodes {{ databaseId path line originalLine isMinimized \
+         viewerDidAuthor body author {{ login }} }} }} }} }} \
+         reviews(first: 100) {{ nodes {{ state body author {{ login }} }} }} }} }} }}",
+        escape_graphql_string(owner),
+        escape_graphql_string(repo),
+        number
+    )
+}
+
+/// Parse the review-feedback GraphQL response and group the survivors.
+///
+/// Inline threads: resolved threads and minimized comments are dropped. A
+/// thread is also dropped when our own resolution reply ("Addressed in …" or
+/// the no-change reply) is its *most recent* comment — a previous run handled
+/// it and nobody has objected since. If the reviewer replied *after* that
+/// resolution reply (e.g. "you changed the wrong function"), the thread is
+/// pending again and kept, so the planner re-reads the whole discussion —
+/// including our prior reply — and tries again. Outdated threads with no reply
+/// from us are likewise kept (anchored via `originalLine`).
+/// Surviving inline comments are grouped by (file, line) in first-seen order.
+///
+/// PR-level review summaries (review bodies not anchored to a line) cannot be
+/// replied to in-thread, so every submitted, non-empty one is folded into a
+/// single group (file / line / reply id all `None`) appended last. The planning
+/// AI judges them together and any reply goes back as one general PR comment.
+fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<CommentGroup>, String> {
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Option<RespData>,
+        errors: Option<Vec<GhErr>>,
+    }
+    #[derive(Deserialize)]
+    struct RespData {
+        repository: Option<Repo>,
+    }
+    #[derive(Deserialize)]
+    struct Repo {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<Pr>,
+    }
+    #[derive(Deserialize)]
+    struct Pr {
+        #[serde(rename = "reviewThreads")]
+        review_threads: Conn<Thread>,
+        reviews: Option<Conn<Review>>,
+    }
+    #[derive(Deserialize)]
+    struct Conn<T> {
+        #[serde(default = "Vec::new")]
+        nodes: Vec<T>,
+    }
+    #[derive(Deserialize)]
+    struct Thread {
+        #[serde(rename = "isResolved", default)]
+        is_resolved: bool,
+        comments: Conn<RawComment>,
+    }
+    #[derive(Deserialize)]
+    struct RawComment {
+        #[serde(rename = "databaseId")]
+        database_id: Option<u64>,
+        path: Option<String>,
+        line: Option<u64>,
+        #[serde(rename = "originalLine")]
+        original_line: Option<u64>,
+        #[serde(rename = "isMinimized", default)]
+        is_minimized: bool,
+        #[serde(rename = "viewerDidAuthor", default)]
+        viewer_did_author: bool,
+        #[serde(default)]
+        body: String,
+        author: Option<Author>,
+    }
+    /// A submitted PR-level review. `body` is the summary text; `state` is one
+    /// of APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING.
+    #[derive(Deserialize)]
+    struct Review {
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        body: String,
+        author: Option<Author>,
+    }
+    #[derive(Deserialize)]
+    struct Author {
+        #[serde(default)]
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct GhErr {
+        #[serde(default)]
+        message: String,
+    }
+
+    let resp: Resp = serde_json::from_str(body).map_err(|e| format!("invalid gh response: {e}"))?;
+    if let Some(errors) = resp.errors {
+        let joined = errors
+            .into_iter()
+            .map(|e| e.message)
+            .filter(|m| !m.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !joined.is_empty() {
+            return Err(joined);
+        }
+    }
+    let pr = resp
+        .data
+        .and_then(|d| d.repository)
+        .and_then(|r| r.pull_request)
+        .ok_or_else(|| "missing pull request in response".to_string())?;
+
+    let login = |a: &Option<Author>| -> String {
+        a.as_ref()
+            .map(|a| a.login.clone())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| "reviewer".to_string())
+    };
+
+    let mut groups: Vec<CommentGroup> = Vec::new();
+    let mut index: HashMap<(String, u64), usize> = HashMap::new();
+
+    for thread in pr.review_threads.nodes {
+        if thread.is_resolved {
+            continue;
+        }
+        let surviving: Vec<RawComment> = thread
+            .comments
+            .nodes
+            .into_iter()
+            .filter(|c| !c.is_minimized)
+            .collect();
+        let Some(first) = surviving.first() else {
+            continue;
+        };
+        // A thread is handled only when our own resolution reply is its *last*
+        // word — nobody, not even the reviewer, responded after it. If the
+        // reviewer followed up ("you changed the wrong function"), the thread is
+        // pending again and must be re-analysed with the whole discussion. This
+        // replaces the old `isOutdated`-based skip, which dropped any outdated
+        // thread we'd ever replied to and so swallowed reviewer follow-ups.
+        if surviving
+            .last()
+            .is_some_and(|c| c.viewer_did_author && is_resolution_reply(&c.body))
+        {
+            continue;
+        }
+        let file = first.path.clone();
+        let line = first.line.or(first.original_line);
+        let reply_id = first.database_id;
+        let mapped: Vec<ReviewComment> = surviving
+            .iter()
+            .filter(|c| !c.body.trim().is_empty())
+            .map(|c| ReviewComment {
+                author: login(&c.author),
+                body: c.body.clone(),
+            })
+            .collect();
+        if mapped.is_empty() {
+            continue;
+        }
+        // Merge threads sharing the same file + line into one group.
+        if let (Some(f), Some(l)) = (&file, line) {
+            if let Some(&gi) = index.get(&(f.clone(), l)) {
+                groups[gi].comments.extend(mapped);
+                continue;
+            }
+            index.insert((f.clone(), l), groups.len());
+        }
+        groups.push(CommentGroup {
+            file,
+            line,
+            reply_comment_id: reply_id,
+            comments: mapped,
+        });
+    }
+
+    // Fold every PR-level review summary body into one trailing group. These
+    // are not line-anchored and cannot be replied to in-thread, so the whole
+    // set shares a single group (file / line / reply id `None`, so the reply
+    // falls back to a general PR comment) and is judged together by one
+    // planning call. PENDING reviews aren't submitted yet and DISMISSED ones
+    // were explicitly retracted, so both are excluded along with empty bodies.
+    let mut summaries: Vec<ReviewComment> = Vec::new();
+    for review in pr.reviews.map(|c| c.nodes).unwrap_or_default() {
+        let state = review.state.to_ascii_uppercase();
+        if state == "PENDING" || state == "DISMISSED" || review.body.trim().is_empty() {
+            continue;
+        }
+        summaries.push(ReviewComment {
+            author: login(&review.author),
+            body: review.body,
+        });
+    }
+    if !summaries.is_empty() {
+        groups.push(CommentGroup {
+            file: None,
+            line: None,
+            reply_comment_id: None,
+            comments: summaries,
+        });
+    }
+
+    Ok(groups)
+}
+
+/// Read a generous window of the targeted file around `line`, numbered so the
+/// AI can cite exact lines. Whole-file (capped) when not line-anchored.
+async fn read_code_window(cwd: &Path, file: &str, line: Option<u64>) -> String {
+    let Ok(content) = tokio::fs::read_to_string(cwd.join(file)).await else {
+        return String::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let (start, end) = match line {
+        Some(l) if l >= 1 => {
+            let l0 = (l as usize).saturating_sub(1);
+            let start = l0.saturating_sub(FIX_CODE_WINDOW_RADIUS);
+            let end = (l0 + FIX_CODE_WINDOW_RADIUS + 1).min(total);
+            (start, end)
+        }
+        _ => (0, total.min(FIX_CODE_WINDOW_RADIUS * 2 + 1)),
+    };
+    let mut out = String::new();
+    for (offset, text) in lines[start..end].iter().enumerate() {
+        let n = start + offset + 1;
+        out.push_str(&format!("{n:>5} | {text}\n"));
+        if out.len() > FIX_CODE_MAX_BYTES {
+            out.push_str("...(truncated)\n");
+            break;
+        }
+    }
+    out
+}
+
+/// Render `prompts/fixer_plan.md` into a concrete planning prompt. The big
+/// user-controlled blocks (comments, code, processed history) are substituted
+/// last so an earlier placeholder can't be clobbered by a value containing a
+/// later token. `history` carries the comments + replies + fixes already
+/// handled earlier in this same run, so a later comment that refers back to
+/// them ("good job, but we have misalignments") is judged with that context
+/// instead of in isolation.
+fn build_fix_plan_prompt(
+    group: &CommentGroup,
+    code: &str,
+    feedback: Option<&str>,
+    previous_plan: Option<&str>,
+    history: Option<&str>,
+) -> String {
+    const PLAN_PROMPT: &str = include_str!("../../prompts/fixer_plan.md");
+    let file = group.file.clone().unwrap_or_default();
+    let lines = group.line.map(|l| l.to_string()).unwrap_or_default();
+    let code = if code.trim().is_empty() {
+        "(no code context — PR-level comment)".to_string()
+    } else {
+        code.to_string()
+    };
+    let history = match history {
+        Some(h) if !h.trim().is_empty() => h,
+        _ => "(none — this is the first comment of the run)",
+    };
+    PLAN_PROMPT
+        .replace("FILE_PATH", &file)
+        .replace("COMMENT_LINES", &lines)
+        .replace("USER_FEEDBACK", feedback.unwrap_or("(none)"))
+        .replace("PREVIOUS_PLAN", previous_plan.unwrap_or("(none)"))
+        .replace("REVIEW_COMMENTS", &group.combined_text())
+        .replace("CODE_CONTEXT", &code)
+        .replace("PROCESSED_HISTORY", history)
+}
+
+/// Render `prompts/fixer_apply.md` for the live apply phase.
+fn build_fix_apply_prompt(group: &CommentGroup, plan: &FixPlan) -> String {
+    const APPLY_PROMPT: &str = include_str!("../../prompts/fixer_apply.md");
+    let files = group
+        .file
+        .clone()
+        .unwrap_or_else(|| "(see the comment — no single target file)".to_string());
+    let plan_text = format!(
+        "{}\n\nValidity: {}\n\nExplanation: {}\n\nChange:\n{}",
+        plan.summary.trim(),
+        plan.validity.trim(),
+        plan.explanation.trim(),
+        plan.change.trim()
+    );
+    APPLY_PROMPT
+        .replace("TARGET_FILES", &files)
+        .replace("REVIEW_COMMENT", &group.combined_text())
+        .replace("APPROVED_PLAN", &plan_text)
+}
+
+/// Parse the single machine-readable verdict block the planning AI emits.
+/// Tolerant of surrounding transcript noise: locates the BEGIN/END markers
+/// anywhere in `output`. Returns `None` when no valid block is present.
+fn parse_fix_verdict(output: &str) -> Option<FixVerdict> {
+    const BEGIN: &str = "===WISETREE-FIX-BEGIN===";
+    const END: &str = "===WISETREE-FIX-END===";
+    let after_begin = &output[output.find(BEGIN)? + BEGIN.len()..];
+    let block = &after_begin[..after_begin.find(END)?];
+
+    let verdict = block
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("VERDICT:"))?
+        .trim()
+        .to_lowercase();
+
+    match verdict.as_str() {
+        "praise" => Some(FixVerdict::Praise),
+        "reply" => {
+            let reply = extract_fix_section(block, "REPLY")?.trim().to_string();
+            (!reply.is_empty()).then_some(FixVerdict::Reply(reply))
+        }
+        "fix" => {
+            let summary = extract_fix_section(block, "SUMMARY")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let validity = extract_fix_section(block, "VALIDITY")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let explanation = extract_fix_section(block, "EXPLANATION")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let change = extract_fix_section(block, "CHANGE")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if summary.is_empty() && explanation.is_empty() && change.is_empty() {
+                return None;
+            }
+            Some(FixVerdict::Fix(FixPlan {
+                summary,
+                validity,
+                explanation,
+                change,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Extract the body of a `---NAME---` section: every line after the header up
+/// to the next `---SECTION---` header (or the block end). A bare `---` markdown
+/// rule does not terminate a section (the closing `---` must wrap a name).
+fn extract_fix_section(block: &str, name: &str) -> Option<String> {
+    let header = format!("---{name}---");
+    let lines: Vec<&str> = block.lines().collect();
+    let pos = lines.iter().position(|l| l.trim() == header)?;
+    let mut body = Vec::new();
+    for line in &lines[pos + 1..] {
+        let t = line.trim();
+        if t.len() > 6 && t.starts_with("---") && t.ends_with("---") {
+            break;
+        }
+        body.push(*line);
+    }
+    Some(body.join("\n"))
+}
+
+/// Build the commit subject + body for one applied review fix, in the format
+/// the resolution flow uses: a `fix (review):` subject and a body citing the
+/// PR + comment and the reviewer's feedback.
+fn format_commit_message(
+    number: u64,
+    comment_index: usize,
+    brief: &str,
+    plan: &FixPlan,
+) -> (String, String) {
+    let summary = {
+        let s = plan.summary.trim();
+        if s.is_empty() {
+            "address review comment".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let subject = format!("fix (review): {summary}");
+    let explanation = plan
+        .explanation
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| summary.clone());
+    let body = format!("PR #{number}, comment #{comment_index} — \"{brief}\"\n{explanation}");
+    (subject, body)
+}
+
+/// The reply posted when the apply step produced no change because the code
+/// already satisfies the comment (the planner over-judged it as actionable).
+const ALREADY_RESOLVED_REPLY: &str = "The current code already addresses this — \
+    on a closer look against the comment, no change was needed here. Thanks for the feedback!";
+
+/// Prefix of the reply [`format_reply`] posts after committing a fix. Shared
+/// with [`is_resolution_reply`] so the thread filter recognises our own
+/// resolution reply when deciding whether a thread is still pending.
+const ADDRESSED_REPLY_PREFIX: &str = "Addressed in ";
+
+/// Build the reply posted to the reviewer after a fix is committed.
+fn format_reply(commit_url: &str, plan: &FixPlan) -> String {
+    let summary = {
+        let s = plan.summary.trim();
+        if s.is_empty() {
+            "Applied the suggested change".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    format!("{ADDRESSED_REPLY_PREFIX}{commit_url} — {summary}. Thanks for the feedback!")
+}
+
+/// True when `body` is one of the resolution replies the Fix loop posts to mark
+/// a thread handled: the post-commit "Addressed in <url> …" reply or the
+/// "already addresses this — no change needed" reply. The thread filter skips a
+/// thread only when such a reply is its most recent comment; if the reviewer
+/// responded afterwards, the thread is pending again and gets re-analysed.
+fn is_resolution_reply(body: &str) -> bool {
+    let body = body.trim();
+    body.starts_with(ADDRESSED_REPLY_PREFIX) || body == ALREADY_RESOLVED_REPLY
+}
+
+/// Reply to a reviewer: an inline thread reply when the group has an anchor
+/// comment, else a general PR comment. Shared by the actionable (commit) and
+/// non-actionable (reply-only) paths.
+async fn post_reply_internal(
+    gh_binary: &Path,
+    cwd: &Path,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    group: &CommentGroup,
+    text: &str,
+) -> std::result::Result<String, String> {
+    match group.reply_comment_id {
+        Some(id) => {
+            let endpoint = format!("repos/{owner}/{repo}/pulls/{number}/comments/{id}/replies");
+            let body_arg = format!("body={text}");
+            time::timeout(
+                FIX_REPLY_TIMEOUT,
+                run_command(gh_binary, &["api", &endpoint, "-f", &body_arg], Some(cwd)),
+            )
+            .await
+            .map_err(|_| "gh reply timed out".to_string())?
+        }
+        None => {
+            let number_arg = number.to_string();
+            time::timeout(
+                FIX_REPLY_TIMEOUT,
+                run_command(
+                    gh_binary,
+                    &["pr", "comment", &number_arg, "--body", text],
+                    Some(cwd),
+                ),
+            )
+            .await
+            .map_err(|_| "gh pr comment timed out".to_string())?
+        }
+    }
+}
+
+/// First 8 chars of a commit hash, for terse error messages.
+fn short_hash(hash: &str) -> String {
+    hash.trim().chars().take(8).collect()
+}
+
+/// Clip `s` to at most `max` chars, appending an ellipsis when truncated.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
 }
 
 /// Truncate `text` to at most `max_bytes` on a UTF-8 char boundary,
@@ -3535,6 +4527,410 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Fix pipeline: verdict parsing ──────────────────────────────────
+
+    #[test]
+    fn parse_fix_verdict_reads_praise() {
+        let out =
+            "chatter\n===WISETREE-FIX-BEGIN===\nVERDICT: praise\n===WISETREE-FIX-END===\nmore";
+        assert_eq!(parse_fix_verdict(out), Some(FixVerdict::Praise));
+    }
+
+    #[test]
+    fn parse_fix_verdict_reads_reply() {
+        let out = "===WISETREE-FIX-BEGIN===\nVERDICT: reply\n---REPLY---\nThe code already guards this case in `init()`.\n===WISETREE-FIX-END===";
+        assert_eq!(
+            parse_fix_verdict(out),
+            Some(FixVerdict::Reply(
+                "The code already guards this case in `init()`.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_fix_verdict_reads_multiline_fix() {
+        let out = "\
+===WISETREE-FIX-BEGIN===
+VERDICT: fix
+---SUMMARY---
+extract retry delay into a named constant
+---VALIDITY---
+Valid: 3000 is a magic number.
+---EXPLANATION---
+Replace the literal with a documented constant
+so the intent reads clearly.
+---CHANGE---
+- sleep(3000)
++ sleep(RETRY_DELAY_MS)
+===WISETREE-FIX-END===";
+        let verdict = parse_fix_verdict(out).expect("fix verdict");
+        match verdict {
+            FixVerdict::Fix(plan) => {
+                assert_eq!(plan.summary, "extract retry delay into a named constant");
+                assert_eq!(plan.validity, "Valid: 3000 is a magic number.");
+                assert!(plan.explanation.contains("documented constant"));
+                assert!(plan.explanation.contains("reads clearly"));
+                assert!(plan.change.contains("RETRY_DELAY_MS"));
+            }
+            other => panic!("expected Fix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_fix_verdict_rejects_missing_block() {
+        assert_eq!(parse_fix_verdict("no markers here at all"), None);
+        // Unknown verdict word.
+        let out = "===WISETREE-FIX-BEGIN===\nVERDICT: maybe\n===WISETREE-FIX-END===";
+        assert_eq!(parse_fix_verdict(out), None);
+    }
+
+    // ── Fix pipeline: comment grouping ─────────────────────────────────
+
+    #[test]
+    fn group_review_feedback_keeps_inline_and_folds_pr_level() {
+        let json = r#"{
+          "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": true, "isOutdated": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 5, "isMinimized": false, "viewerDidAuthor": false, "body": "resolved", "author": { "login": "rev" } }
+              ] } },
+              { "isResolved": false, "isOutdated": true, "comments": { "nodes": [
+                { "databaseId": 2, "path": "a.rs", "line": null, "originalLine": 6, "isMinimized": false, "viewerDidAuthor": false, "body": "outdated but actionable", "author": { "login": "codex" } }
+              ] } },
+              { "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+                { "databaseId": 3, "path": "a.rs", "line": 10, "isMinimized": false, "viewerDidAuthor": false, "body": "rename foo", "author": { "login": "alice" } },
+                { "databaseId": 4, "path": "a.rs", "line": 10, "isMinimized": true, "viewerDidAuthor": false, "body": "hidden", "author": { "login": "spam" } }
+              ] } },
+              { "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+                { "databaseId": 5, "path": "a.rs", "line": 10, "isMinimized": false, "viewerDidAuthor": false, "body": "second thread, same line", "author": { "login": "bob" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [
+              { "state": "COMMENTED", "body": "Overall looks solid, one concern below.", "author": { "login": "codex" } },
+              { "state": "APPROVED", "body": "", "author": { "login": "ci" } }
+            ] }
+          } } }
+        }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        // Resolved dropped; outdated-without-our-reply kept; same-line threads
+        // merged; PR-level summary folded into one trailing group (empty review
+        // body excluded).
+        assert_eq!(groups.len(), 3);
+
+        // Outdated-but-unreplied inline thread is retained, anchored to the
+        // inline comment (line falls back to originalLine).
+        let outdated = &groups[0];
+        assert_eq!(outdated.reply_comment_id, Some(2));
+        assert_eq!(outdated.line, Some(6));
+        assert_eq!(outdated.comments[0].author, "codex");
+
+        let inline = &groups[1];
+        assert_eq!(inline.file.as_deref(), Some("a.rs"));
+        assert_eq!(inline.line, Some(10));
+        assert_eq!(inline.reply_comment_id, Some(3));
+        // Minimized comment dropped; both same-line threads merged.
+        assert_eq!(inline.comments.len(), 2);
+        assert_eq!(inline.comments[0].author, "alice");
+        assert_eq!(inline.comments[1].author, "bob");
+
+        // The PR-level review summary is its own trailing group: not line-
+        // anchored and with no inline reply target (reply falls back to a
+        // general PR comment).
+        let summary = &groups[2];
+        assert!(summary.file.is_none());
+        assert!(summary.line.is_none());
+        assert!(summary.reply_comment_id.is_none());
+        assert_eq!(summary.comments.len(), 1);
+        assert!(summary.comments[0].body.contains("Overall looks solid"));
+    }
+
+    #[test]
+    fn group_review_feedback_skips_thread_ending_in_our_resolution_reply() {
+        // A thread whose most recent comment is our own resolution reply
+        // ("Addressed in …") was handled and nobody objected since, so it is
+        // dropped. A second thread with no reply from us is still pending.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": null, "originalLine": 8, "isMinimized": false, "viewerDidAuthor": false, "body": "extract this", "author": { "login": "alice" } },
+                { "databaseId": 2, "path": "a.rs", "line": null, "originalLine": 8, "isMinimized": false, "viewerDidAuthor": true, "body": "Addressed in abc123 — extracted it. Thanks for the feedback!", "author": { "login": "me" } }
+              ] } },
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 3, "path": "b.rs", "line": null, "originalLine": 3, "isMinimized": false, "viewerDidAuthor": false, "body": "still needs work", "author": { "login": "alice" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].reply_comment_id, Some(3));
+        assert_eq!(groups[0].comments[0].body, "still needs work");
+    }
+
+    #[test]
+    fn group_review_feedback_reanalyses_thread_with_reviewer_followup() {
+        // The reviewer replied *after* our "Addressed in …" resolution reply
+        // ("you got it wrong"). The thread is pending again: it is kept and the
+        // whole discussion — original comment, our reply, the follow-up — is
+        // handed to the planner so it can understand what went wrong.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": false, "body": "This function should take 4 parameters", "author": { "login": "marcos" } },
+                { "databaseId": 2, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": true, "body": "Addressed in abc123 — updated the signature. Thanks for the feedback!", "author": { "login": "me" } },
+                { "databaseId": 3, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": false, "body": "You changed it to 3 parameters, it should be 4!", "author": { "login": "marcos" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        assert_eq!(groups.len(), 1);
+        // The reply still threads onto the original comment.
+        assert_eq!(groups[0].reply_comment_id, Some(1));
+        // All three comments reach the planner, in order and attributed, so it
+        // can see its own prior (wrong) reply and the reviewer's correction.
+        assert_eq!(groups[0].comments.len(), 3);
+        let combined = groups[0].combined_text();
+        assert!(combined.contains("@marcos: This function should take 4 parameters"));
+        assert!(combined.contains("@me: Addressed in abc123"));
+        assert!(combined.contains("@marcos: You changed it to 3 parameters"));
+    }
+
+    #[test]
+    fn group_review_feedback_keeps_thread_ending_in_non_resolution_viewer_comment() {
+        // A viewer comment that is *not* one of our resolution replies (e.g. a
+        // human note typed from the same account) must not be mistaken for a
+        // handled thread — it is kept for analysis.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": false, "body": "rename this", "author": { "login": "marcos" } },
+                { "databaseId": 2, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": true, "body": "good point, let me think about it", "author": { "login": "me" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].comments.len(), 2);
+    }
+
+    #[test]
+    fn group_review_feedback_skips_thread_ending_in_no_change_reply() {
+        // The "already addresses this — no change needed" reply is also a
+        // resolution reply, so a thread ending in it is dropped.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": false, "body": "use a constant", "author": { "login": "marcos" } },
+                { "databaseId": 2, "path": "a.rs", "line": 4, "isMinimized": false, "viewerDidAuthor": true, "body": "NO_CHANGE_REPLY", "author": { "login": "me" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#
+        .replace("NO_CHANGE_REPLY", ALREADY_RESOLVED_REPLY);
+        let groups = parse_and_group_review_feedback(&json).expect("parse ok");
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn group_review_feedback_folds_only_submitted_nonempty_summaries() {
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [] },
+            "reviews": { "nodes": [
+              { "state": "CHANGES_REQUESTED", "body": "Please add tests.", "author": { "login": "alice" } },
+              { "state": "PENDING", "body": "draft note, not submitted", "author": { "login": "me" } },
+              { "state": "DISMISSED", "body": "old retracted review", "author": { "login": "bob" } },
+              { "state": "APPROVED", "body": "", "author": { "login": "ci" } },
+              { "state": "COMMENTED", "body": "Also rename the module.", "author": { "login": "carol" } }
+            ] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        // One folded group from the two submitted, non-empty summaries; PENDING,
+        // DISMISSED, and empty-body reviews are excluded.
+        assert_eq!(groups.len(), 1);
+        let summary = &groups[0];
+        assert!(summary.reply_comment_id.is_none());
+        assert_eq!(summary.comments.len(), 2);
+        assert_eq!(summary.comments[0].author, "alice");
+        assert_eq!(summary.comments[1].author, "carol");
+        // The combined text carries both summaries into the single planning call.
+        let combined = summary.combined_text();
+        assert!(combined.contains("Please add tests."));
+        assert!(combined.contains("Also rename the module."));
+    }
+
+    #[test]
+    fn group_review_feedback_empty_when_all_resolved() {
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": true, "isOutdated": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rs", "line": 5, "isMinimized": false, "viewerDidAuthor": false, "body": "x", "author": { "login": "rev" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        assert!(parse_and_group_review_feedback(json).unwrap().is_empty());
+    }
+
+    #[test]
+    fn group_review_feedback_surfaces_graphql_errors() {
+        let json = r#"{ "errors": [ { "message": "Could not resolve to a Repository." } ] }"#;
+        assert!(parse_and_group_review_feedback(json).is_err());
+    }
+
+    // ── Fix pipeline: commit + reply formatting ────────────────────────
+
+    fn sample_plan() -> FixPlan {
+        FixPlan {
+            summary: "extract retry delay into a named constant".to_string(),
+            validity: "Valid.".to_string(),
+            explanation: "Replace the literal 3000 with RETRY_DELAY_MS.".to_string(),
+            change: "diff".to_string(),
+        }
+    }
+
+    #[test]
+    fn format_commit_message_follows_review_format() {
+        let group = CommentGroup {
+            file: Some("src/retry.rs".to_string()),
+            line: Some(12),
+            reply_comment_id: Some(7),
+            comments: vec![ReviewComment {
+                author: "alice".to_string(),
+                body: "Magic number 3000 is unclear".to_string(),
+            }],
+        };
+        let (subject, body) = format_commit_message(42, 2, &group.brief(), &sample_plan());
+        assert_eq!(
+            subject,
+            "fix (review): extract retry delay into a named constant"
+        );
+        assert!(body.starts_with("PR #42, comment #2 — \"Magic number 3000 is unclear\""));
+        assert!(body.contains("RETRY_DELAY_MS"));
+    }
+
+    #[test]
+    fn format_commit_message_defaults_blank_summary() {
+        let plan = FixPlan {
+            summary: "   ".to_string(),
+            validity: String::new(),
+            explanation: String::new(),
+            change: String::new(),
+        };
+        let (subject, body) = format_commit_message(1, 1, "feedback", &plan);
+        assert_eq!(subject, "fix (review): address review comment");
+        // Explanation falls back to the (defaulted) summary.
+        assert!(body.ends_with("address review comment"));
+    }
+
+    #[test]
+    fn format_reply_links_the_commit() {
+        let reply = format_reply(
+            "https://github.com/o/r/pull/42/changes/abc123",
+            &sample_plan(),
+        );
+        assert_eq!(
+            reply,
+            "Addressed in https://github.com/o/r/pull/42/changes/abc123 — \
+             extract retry delay into a named constant. Thanks for the feedback!"
+        );
+    }
+
+    #[test]
+    fn is_resolution_reply_matches_our_replies_only() {
+        // Both replies the Fix loop posts to mark a thread handled.
+        assert!(is_resolution_reply(&format_reply(
+            "https://x/commit/abc",
+            &sample_plan()
+        )));
+        assert!(is_resolution_reply(ALREADY_RESOLVED_REPLY));
+        // A reviewer follow-up or an arbitrary viewer note is not a resolution.
+        assert!(!is_resolution_reply("You changed the wrong function!"));
+        assert!(!is_resolution_reply("good point, let me think about it"));
+    }
+
+    // ── Fix pipeline: prompt substitution ──────────────────────────────
+
+    const PLAN_TOKENS: [&str; 7] = [
+        "FILE_PATH",
+        "COMMENT_LINES",
+        "REVIEW_COMMENTS",
+        "CODE_CONTEXT",
+        "USER_FEEDBACK",
+        "PREVIOUS_PLAN",
+        "PROCESSED_HISTORY",
+    ];
+
+    #[test]
+    fn build_fix_plan_prompt_substitutes_inputs_and_leaks_no_tokens() {
+        let group = CommentGroup {
+            file: Some("src/retry.rs".to_string()),
+            line: Some(12),
+            reply_comment_id: Some(7),
+            comments: vec![ReviewComment {
+                author: "alice".to_string(),
+                body: "Magic number 3000 is unclear".to_string(),
+            }],
+        };
+        let prompt = build_fix_plan_prompt(
+            &group,
+            "   12 | sleep(3000)\n",
+            Some("avoid nested ifs"),
+            Some("old plan text"),
+            Some("[#1] src/styles.css:20 — Applied a fix: change the color to purple"),
+        );
+        assert!(prompt.contains("src/retry.rs"));
+        assert!(prompt.contains("Magic number 3000 is unclear"));
+        assert!(prompt.contains("sleep(3000)"));
+        assert!(prompt.contains("avoid nested ifs"));
+        assert!(prompt.contains("old plan text"));
+        assert!(prompt.contains("change the color to purple"));
+        for token in PLAN_TOKENS {
+            assert!(!prompt.contains(token), "leaked placeholder token: {token}");
+        }
+    }
+
+    #[test]
+    fn build_fix_plan_prompt_defaults_optional_inputs_for_pr_level() {
+        let group = CommentGroup {
+            file: None,
+            line: None,
+            reply_comment_id: None,
+            comments: vec![ReviewComment {
+                author: "carol".to_string(),
+                body: "Looks good overall".to_string(),
+            }],
+        };
+        let prompt = build_fix_plan_prompt(&group, "", None, None, None);
+        assert!(prompt.contains("(none)")); // feedback + previous plan defaults
+        assert!(prompt.contains("(no code context"));
+        assert!(prompt.contains("(none — this is the first comment")); // history default
+        for token in PLAN_TOKENS {
+            assert!(!prompt.contains(token), "leaked placeholder token: {token}");
+        }
+    }
+
+    #[test]
+    fn build_fix_apply_prompt_substitutes_inputs_and_leaks_no_tokens() {
+        let group = CommentGroup {
+            file: Some("src/retry.rs".to_string()),
+            line: Some(12),
+            reply_comment_id: Some(7),
+            comments: vec![ReviewComment {
+                author: "alice".to_string(),
+                body: "rename foo to bar".to_string(),
+            }],
+        };
+        let prompt = build_fix_apply_prompt(&group, &sample_plan());
+        assert!(prompt.contains("src/retry.rs"));
+        assert!(prompt.contains("rename foo to bar"));
+        assert!(prompt.contains("extract retry delay into a named constant"));
+        for token in ["TARGET_FILES", "REVIEW_COMMENT", "APPROVED_PLAN"] {
+            assert!(!prompt.contains(token), "leaked placeholder token: {token}");
+        }
+    }
 
     fn make_executable(path: &std::path::Path) {
         #[cfg(unix)]
@@ -3911,6 +5307,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_pr_repo_from_view_url() {
+        // gh resolves the base repo even in a fork-and-PR-to-upstream setup;
+        // the slug must come from the PR url (the repo it was opened against),
+        // not the fork the branch is pushed to.
+        let raw = r#"{"url":"https://github.com/oxeanbits/digitalize-front/pull/4420"}"#;
+        assert_eq!(
+            parse_pr_repo_json(raw),
+            Some(("oxeanbits".into(), "digitalize-front".into()))
+        );
+    }
+
+    #[test]
+    fn parse_pr_repo_json_rejects_invalid_json() {
+        assert_eq!(parse_pr_repo_json("not json at all"), None);
+    }
+
+    #[test]
+    fn parse_pr_repo_json_rejects_missing_url() {
+        assert_eq!(parse_pr_repo_json(r#"{"number":4420}"#), None);
+    }
+
+    #[test]
     fn parses_github_ssh_scp_form() {
         assert_eq!(
             parse_github_slug("git@github.com:victorcorcos/wisetree.git"),
@@ -3998,6 +5416,57 @@ mod tests {
         assert_eq!(pr.base_repository.as_deref(), Some("owner/repo"));
         assert_eq!(pr.head_ref_oid.as_deref(), Some("abc123"));
         assert!(out.get("fix").unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_closed_draft_pr_as_closed_not_drafted() {
+        // GitHub leaves `isDraft = true` on a PR closed while still a draft;
+        // the terminal CLOSED state must win so it doesn't read as "Drafted".
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{"number": 9, "state": "CLOSED", "url": "u", "title": "t", "isDraft": true}]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        assert_eq!(
+            out.get("feat").unwrap().as_ref().unwrap().state,
+            PrState::Closed
+        );
+    }
+
+    #[test]
+    fn parses_merged_draft_pr_as_merged_not_drafted() {
+        // A draft can be merged via admin merge; MERGED still outranks the flag.
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{"number": 9, "state": "MERGED", "url": "u", "title": "t", "isDraft": true}]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        assert_eq!(
+            out.get("feat").unwrap().as_ref().unwrap().state,
+            PrState::Merged
+        );
+    }
+
+    #[test]
+    fn parses_open_draft_pr_as_drafted() {
+        let body = r#"{
+          "data": {
+            "repository": {
+              "b0": {"nodes": [{"number": 9, "state": "OPEN", "url": "u", "title": "t", "isDraft": true}]}
+            }
+          }
+        }"#;
+        let out = parse_graphql_response(body, &["feat"]).unwrap();
+        assert_eq!(
+            out.get("feat").unwrap().as_ref().unwrap().state,
+            PrState::Draft
+        );
     }
 
     #[test]
@@ -4759,8 +6228,8 @@ mod tests {
     }
 
     #[test]
-    fn build_fill_prompt_substitutes_all_inputs() {
-        let prompt = build_fill_prompt(
+    fn build_enrich_prompt_substitutes_all_inputs() {
+        let prompt = build_enrich_prompt(
             "upstream/main",
             "digit-3131-retry",
             "DIGIT-3131",

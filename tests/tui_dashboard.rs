@@ -1269,7 +1269,7 @@ fn action_menu_hides_merge_option_for_draft_pr_row() {
 #[test]
 fn action_menu_shows_pr_commands_for_draft_pr_row() {
     // A draft-PR worktree must expose the same Pull Request Commands as an
-    // open one — Open, Fill, Push (ahead-not-behind), Close — with Merge
+    // open one — Open, Enrich, Upload (ahead-not-behind), Close — with Merge
     // the only omission (GitHub won't merge a draft).
     let mut screen = DashboardScreen::new(
         true,
@@ -1281,7 +1281,7 @@ fn action_menu_shows_pr_commands_for_draft_pr_row() {
     );
     screen.set_rows(vec![
         row("/tmp/repo", "main", true),
-        // The "bug" row helper is ahead 1 / behind 0, so Push is offered.
+        // The "bug" row helper is ahead 1 / behind 0, so Upload is offered.
         row_with_pr_state("/tmp/repo-bug", "bug", false, PrState::Draft),
     ]);
 
@@ -1291,12 +1291,12 @@ fn action_menu_shows_pr_commands_for_draft_pr_row() {
         "draft PR should expose Open: {labels:?}"
     );
     assert!(
-        labels.iter().any(|l| l == "Fill"),
-        "draft PR should expose Fill: {labels:?}"
+        labels.iter().any(|l| l == "Enrich"),
+        "draft PR should expose Enrich: {labels:?}"
     );
     assert!(
-        labels.iter().any(|l| l == "Push"),
-        "draft PR ahead of its base should expose Push: {labels:?}"
+        labels.iter().any(|l| l == "Upload"),
+        "draft PR ahead of its base should expose Upload: {labels:?}"
     );
     assert!(
         labels.iter().any(|l| l == "Close"),
