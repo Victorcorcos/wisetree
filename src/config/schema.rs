@@ -111,6 +111,29 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
     (resolved, warnings)
 }
 
+/// AI model + thinking strength used for opencode-assisted flows. Persisted as
+/// a nested `ai` object inside the dashboard config:
+///
+/// ```json
+/// "ai": { "model": "opencode/deepseek-v4-flash-free", "thinking": "max" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AiConfig {
+    /// Provider/model selector passed to `opencode run -m <value>` (e.g.
+    /// `anthropic/claude-sonnet-4-5`). When empty, AI-assisted conflict
+    /// resolution is disabled and the user is asked to resolve manually.
+    #[serde(default)]
+    pub model: String,
+
+    /// Thinking strength (reasoning effort) paired with `model`, chosen in the
+    /// AI model picker — e.g. `low`, `medium`, `high`. Empty means "default"
+    /// (no reasoning override). Stored separately from `model` so `model`
+    /// stays a clean `provider/model` value for `-m`.
+    #[serde(default)]
+    pub thinking: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DashboardConfig {
@@ -126,19 +149,11 @@ pub struct DashboardConfig {
     #[serde(rename = "columns", default = "default_columns")]
     pub columns: Vec<String>,
 
-    /// Provider/model selector passed to `opencode run -m <value>` when
-    /// resolving merge conflicts (e.g. `anthropic/claude-sonnet-4-5`). When
-    /// empty, AI-assisted conflict resolution is disabled and the user is
-    /// asked to resolve conflicts manually.
-    #[serde(rename = "useAi", default)]
-    pub use_ai: String,
-
-    /// Thinking strength (reasoning effort) paired with `useAi`, chosen in the
-    /// AI model picker — e.g. `low`, `medium`, `high`. Empty means "default"
-    /// (no reasoning override). Stored alongside `useAi` rather than encoded
-    /// into it so `useAi` stays a clean `provider/model` value for `-m`.
-    #[serde(rename = "useAiVariant", default)]
-    pub use_ai_variant: String,
+    /// AI model + thinking strength for opencode-assisted flows (merge
+    /// conflict resolution, PR drafting). When `ai.model` is empty, AI
+    /// assistance is disabled and the user resolves conflicts manually.
+    #[serde(rename = "ai", default)]
+    pub ai: AiConfig,
 
     #[serde(rename = "aiStatus", default)]
     pub ai_status: AiStatusConfig,
@@ -163,8 +178,7 @@ impl Default for DashboardConfig {
             show_pull_requests: false,
             wise_merge: false,
             columns: default_columns(),
-            use_ai: String::new(),
-            use_ai_variant: String::new(),
+            ai: AiConfig::default(),
             ai_status: AiStatusConfig::default(),
             legacy_notifications: None,
         }

@@ -69,7 +69,10 @@ fn sh_quote(path: &Path) -> String {
 
 fn ai_config() -> DashboardConfig {
     DashboardConfig {
-        use_ai: "anthropic/claude-sonnet-4-5".to_string(),
+        ai: wisetree::config::schema::AiConfig {
+            model: "anthropic/claude-sonnet-4-5".to_string(),
+            ..Default::default()
+        },
         ..DashboardConfig::default()
     }
 }
@@ -244,7 +247,7 @@ async fn pipeline_returns_merged_cleanly_when_no_conflicts() {
 }
 
 #[tokio::test]
-async fn pipeline_returns_conflicts_require_ai_when_use_ai_is_blank() {
+async fn pipeline_returns_conflicts_require_ai_when_ai_model_is_blank() {
     let fx = Fixture::new();
     // Conflict: same file edited on both sides.
     fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
@@ -253,7 +256,7 @@ async fn pipeline_returns_conflicts_require_ai_when_use_ai_is_blank() {
     git(&fx.src, &["push", "-q", "origin", "feat"]);
     fx.advance_main("README.md", "main side\n");
 
-    // No opencode override needed: use_ai is blank, so opencode is never
+    // No opencode override needed: ai_model is blank, so opencode is never
     // invoked.
     let service = fx.service();
 
@@ -587,11 +590,11 @@ async fn update_branch_hands_off_to_ui_when_conflicts_detected_and_opencode_avai
 }
 
 #[tokio::test]
-async fn update_branch_returns_conflicts_require_ai_when_use_ai_is_blank() {
+async fn update_branch_returns_conflicts_require_ai_when_ai_model_is_blank() {
     let fx = Fixture::new();
     seed_local_conflict(&fx);
 
-    // use_ai blank (default config) → opencode is never consulted.
+    // ai_model blank (default config) → opencode is never consulted.
     let service = fx.service();
 
     let outcome = service

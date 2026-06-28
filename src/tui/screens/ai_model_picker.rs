@@ -1,5 +1,5 @@
 //! Fullscreen AI model picker. Opens when the user presses Enter on the
-//! `useAi` rectangle in the Dashboard Settings screen. Modelled on opencode's
+//! `ai` rectangle in the Dashboard Settings screen. Modelled on opencode's
 //! own model picker (`dialog-model.tsx` → `dialog-variant.tsx`): pick a model
 //! by its human-readable name, then — for reasoning-capable models — pick a
 //! thinking strength ("variant").
@@ -58,7 +58,7 @@ fn resolve_variants(model: &OpencodeModel) -> Vec<String> {
 }
 
 /// One row in the model phase. Carries the `provider/model` pair that gets
-/// stored in `useAi` plus the resolved thinking-strength options (empty = no
+/// stored in `ai.model` plus the resolved thinking-strength options (empty = no
 /// variant step; the model is selected immediately).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelChoice {

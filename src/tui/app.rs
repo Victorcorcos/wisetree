@@ -194,7 +194,7 @@ enum AppEvent {
     FreeOpencodeModelsFetched(Result<Vec<String>, String>),
     /// Result of the background `opencode models --verbose` shell-out that maps
     /// each `provider/model` to its authoritative reasoning variants, powering
-    /// the Dashboard `useAi` field's per-model ←/→ reasoning cycle.
+    /// the Dashboard `ai.model` field's per-model ←/→ reasoning cycle.
     AiModelVariantsFetched(Result<std::collections::HashMap<String, Vec<String>>, String>),
     ShellIntegrationDetected(ShellIntegrationStatus),
 }
@@ -1476,7 +1476,7 @@ impl App {
                     AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
                     AiModelPickerAction::Selected { model, variant } => {
                         if let Some(settings) = self.settings.as_mut() {
-                            settings.apply_use_ai_selection(model, variant);
+                            settings.apply_ai_selection(model, variant);
                         }
                         self.close_ai_model_picker();
                     }
@@ -1505,7 +1505,7 @@ impl App {
                 // user past the editor to the Settings menu, which they
                 // don't expect.
                 if let Some(settings) = self.settings.as_mut() {
-                    settings.apply_use_ai_selection(model, variant);
+                    settings.apply_ai_selection(model, variant);
                 }
                 self.close_ai_model_picker();
                 let _ = tx;
@@ -1619,14 +1619,14 @@ impl App {
             return;
         };
         let request = screen.request().clone();
-        let use_ai = dashboard_config.use_ai.clone();
+        let model = dashboard_config.ai.model.clone();
         let base_ref = request
             .base_ref
             .clone()
             .unwrap_or_else(|| "upstream/main".to_string());
         let cwd = PathBuf::from(&request.worktree_path);
         let message = format!(
-            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({use_ai}).",
+            "{}\n\nMerged `{base_ref}` and resolved conflicts using opencode ({model}).",
             crate::constants::UPDATE_MERGE_COMMIT_MESSAGE
         );
         let script = if screen.local_only() {
@@ -2032,7 +2032,7 @@ impl App {
                 ),
                 FixPreparation::AiNotConfigured => self.fail_fix(
                     ToastVariant::Warning,
-                    "Set the `useAi` setting so the AI can plan review fixes.".to_string(),
+                    "Set the `ai.model` setting so the AI can plan review fixes.".to_string(),
                     tx,
                 ),
                 FixPreparation::AiUnavailable => self.fail_fix(
@@ -3258,7 +3258,7 @@ impl App {
             ),
             Ok(UpdateBranchOutcome::ConflictsRequireAi { .. }) => self.show_toast(
                 ToastVariant::Warning,
-                "Conflicts found, please resolve them locally or setup `useAi` \
+                "Conflicts found, please resolve them locally or setup `ai.model` \
                  setting so we can solve conflicts + merge via AI."
                     .to_string(),
             ),
@@ -3504,7 +3504,7 @@ impl App {
                 UpdatePullRequestOutcome::ConflictsRequireAi { .. } => {
                     self.show_toast(
                         ToastVariant::Warning,
-                        "Conflicts found, please resolve them locally or setup `useAi` \
+                        "Conflicts found, please resolve them locally or setup `ai.model` \
                          setting so we can solve conflicts + merge via AI."
                             .to_string(),
                     );
@@ -3624,7 +3624,7 @@ impl App {
                 EnrichPreparation::AiNotConfigured => {
                     self.show_toast(
                         ToastVariant::Warning,
-                        "Set the `useAi` setting so we can draft the PR description with AI."
+                        "Set the `ai.model` setting so we can draft the PR description with AI."
                             .to_string(),
                     );
                     self.enrich_pr = None;
@@ -4915,7 +4915,7 @@ fn kick_off_fetch_free_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
 }
 
 /// Shell out to `opencode models --verbose` to learn each model's authoritative
-/// reasoning variants, so the Dashboard `useAi` field's ←/→ cycle offers only
+/// reasoning variants, so the Dashboard `ai.model` field's ←/→ cycle offers only
 /// the levels the chosen model actually accepts. Same best-effort posture as
 /// the free-model fetch — failures leave the Settings screen on the generic
 /// fallback ladder.
@@ -6991,8 +6991,7 @@ mod tests {
                     show_pull_requests: false,
                     wise_merge: false,
                     columns: vec!["branch".into(), "status".into()],
-                    use_ai: String::new(),
-                    use_ai_variant: String::new(),
+                    ai: Default::default(),
                     ai_status: Default::default(),
                     legacy_notifications: None,
                 },
@@ -7004,8 +7003,7 @@ mod tests {
                     show_pull_requests: false,
                     wise_merge: false,
                     columns: vec!["branch".into()],
-                    use_ai: String::new(),
-                    use_ai_variant: String::new(),
+                    ai: Default::default(),
                     ai_status: Default::default(),
                     legacy_notifications: None,
                 },
@@ -7033,8 +7031,7 @@ mod tests {
                     "ai_status".into(),
                     "pull_request".into(),
                 ],
-                use_ai: String::new(),
-                use_ai_variant: String::new(),
+                ai: Default::default(),
                 ai_status: Default::default(),
                 legacy_notifications: None,
             };
@@ -7067,8 +7064,7 @@ mod tests {
                     show_pull_requests: false,
                     wise_merge: false,
                     columns: vec!["branch".into()],
-                    use_ai: String::new(),
-                    use_ai_variant: String::new(),
+                    ai: Default::default(),
                     ai_status: Default::default(),
                     legacy_notifications: None,
                 },
@@ -7090,8 +7086,7 @@ mod tests {
                 show_pull_requests: true,
                 wise_merge: false,
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
-                use_ai: String::new(),
-                use_ai_variant: String::new(),
+                ai: Default::default(),
                 ai_status: Default::default(),
                 legacy_notifications: None,
             };
@@ -7122,8 +7117,7 @@ mod tests {
                     show_pull_requests: true,
                     wise_merge: false,
                     columns: vec!["branch".into(), "status".into()],
-                    use_ai: String::new(),
-                    use_ai_variant: String::new(),
+                    ai: Default::default(),
                     ai_status: Default::default(),
                     legacy_notifications: None,
                 },

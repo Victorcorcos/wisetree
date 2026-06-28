@@ -386,7 +386,7 @@ pub enum UpdatePullRequestOutcome {
     /// re-push) sent `git push origin HEAD` and it succeeded. No merge was
     /// attempted — the branch was already ahead-but-not-behind.
     Pushed,
-    /// Conflicts were detected, `useAi` is set, opencode is on PATH, and
+    /// Conflicts were detected, `ai.model` is set, opencode is on PATH, and
     /// the merge is paused mid-flight (index has conflict markers). The
     /// UI takes over from here: it spawns opencode inside an embedded
     /// PTY so the user sees the real opencode TUI in the AI Activity
@@ -400,12 +400,12 @@ pub enum UpdatePullRequestOutcome {
         base_ref: String,
         conflicts: Vec<String>,
     },
-    /// Conflicts were detected but `useAi` is blank in DashboardConfig, so
+    /// Conflicts were detected but `ai.model` is blank in DashboardConfig, so
     /// no AI is available to resolve them. The merge has been aborted and
     /// the worktree is clean again. The list of conflicted files is
     /// included so the toast can show how many files need attention.
     ConflictsRequireAi { conflicts: Vec<String> },
-    /// Conflicts were detected, `useAi` is set, but the `opencode` binary
+    /// Conflicts were detected, `ai.model` is set, but the `opencode` binary
     /// is not on PATH. The merge has been aborted; the worktree is clean
     /// again.
     AiUnavailable { conflicts: Vec<String> },
@@ -460,7 +460,7 @@ pub enum UpdateBranchOutcome {
     /// not a merge conflict — there are no markers and nothing for opencode
     /// to resolve — so the UI just tells the user to commit or stash first.
     WorkingTreeDirty { files: Vec<String> },
-    /// Merge conflicts were detected, `useAi` is set, and `opencode` is on
+    /// Merge conflicts were detected, `ai.model` is set, and `opencode` is on
     /// PATH. The merge is left mid-flight (conflict markers in the index)
     /// and the UI takes over: it spawns opencode inside an embedded PTY to
     /// resolve the conflicts, then commits the result locally (no push).
@@ -473,11 +473,11 @@ pub enum UpdateBranchOutcome {
         base_ref: String,
         conflicts: Vec<String>,
     },
-    /// Merge conflicts were detected but `useAi` is blank — the merge is
-    /// aborted and the UI prompts the user to configure `useAi` or resolve
+    /// Merge conflicts were detected but `ai.model` is blank — the merge is
+    /// aborted and the UI prompts the user to configure `ai.model` or resolve
     /// the conflicts manually.
     ConflictsRequireAi { conflicts: Vec<String> },
-    /// Merge conflicts were detected and `useAi` is set, but the `opencode`
+    /// Merge conflicts were detected and `ai.model` is set, but the `opencode`
     /// binary is not on PATH — the merge is aborted and the UI prompts the
     /// user to install opencode.
     AiUnavailable { conflicts: Vec<String> },
@@ -489,7 +489,7 @@ pub enum UpdateBranchOutcome {
 /// terminal and map straight to a toast.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnrichPreparation {
-    /// Diff/log gathered, prompt built, `useAi` set and `opencode` on PATH.
+    /// Diff/log gathered, prompt built, `ai.model` set and `opencode` on PATH.
     /// The UI owns the PTY lifecycle from here; once opencode finishes the
     /// screen reads `pull_request.md` and offers to open/update the PR.
     HandedOffToUi {
@@ -500,9 +500,9 @@ pub enum EnrichPreparation {
     },
     /// No commits ahead of the base ref → there is nothing to describe.
     NothingToDescribe,
-    /// `useAi` is blank in `DashboardConfig` — no model configured to draft.
+    /// `ai.model` is blank in `DashboardConfig` — no model configured to draft.
     AiNotConfigured,
-    /// `useAi` is set but the `opencode` binary is not on PATH.
+    /// `ai.model` is set but the `opencode` binary is not on PATH.
     AiUnavailable,
 }
 
@@ -606,9 +606,9 @@ pub enum FixPreparation {
     NoComments,
     /// `gh` CLI is missing.
     GhUnavailable,
-    /// `useAi` is blank — no model configured to plan fixes.
+    /// `ai.model` is blank — no model configured to plan fixes.
     AiNotConfigured,
-    /// `useAi` set but `opencode` is not on PATH.
+    /// `ai.model` set but `opencode` is not on PATH.
     AiUnavailable,
     /// `git pull --ff-only` failed (divergence / network). stderr included.
     SyncFailed(String),
@@ -1327,7 +1327,7 @@ impl DashboardService {
     /// 3. `git merge <base_ref>`.
     ///    - Exit 0 → push and return `MergedCleanly`.
     ///    - Non-zero → look for conflicts:
-    ///       - If `useAi` is blank → abort merge, return
+    ///       - If `ai.model` is blank → abort merge, return
     ///         `ConflictsRequireAi { conflicts }`.
     ///       - If `opencode` is missing → abort merge, return
     ///         `AiUnavailable { conflicts }`.
@@ -1425,10 +1425,10 @@ impl DashboardService {
         };
 
         if let Some(conflicts) = ai_conflicts {
-            // useAi blank → no AI available, abort and let the UI prompt
-            // the user to configure useAi or resolve conflicts manually.
-            let use_ai = self.config.use_ai.trim().to_string();
-            if use_ai.is_empty() {
+            // ai.model blank → no AI available, abort and let the UI prompt
+            // the user to configure ai.model or resolve conflicts manually.
+            let model = self.config.ai.model.trim().to_string();
+            if model.is_empty() {
                 send_phase(UpdatePhase::ConflictsDetected {
                     count: conflicts.len(),
                 });
@@ -1449,12 +1449,12 @@ impl DashboardService {
             }
 
             send_phase(UpdatePhase::AiResolving {
-                model: use_ai.clone(),
+                model: model.clone(),
             });
             send_ai_activity(
                 progress.as_ref(),
                 AiActivityEvent::SessionStart {
-                    model: use_ai.clone(),
+                    model: model.clone(),
                 },
             );
 
@@ -1473,7 +1473,7 @@ impl DashboardService {
                 "--prompt".to_string(),
                 prompt,
                 "-m".to_string(),
-                use_ai.clone(),
+                model.clone(),
                 cwd.to_string_lossy().to_string(),
             ];
 
@@ -1485,7 +1485,7 @@ impl DashboardService {
                 opencode_binary: self.opencode_binary.clone(),
                 opencode_args,
                 cwd: cwd.clone(),
-                model: use_ai,
+                model,
                 base_ref: base_ref.to_string(),
                 conflicts,
             });
@@ -1592,10 +1592,10 @@ impl DashboardService {
             });
         }
 
-        // useAi blank → no AI available: abort the merge and let the UI
-        // prompt the user to configure useAi or resolve manually.
-        let use_ai = self.config.use_ai.trim().to_string();
-        if use_ai.is_empty() {
+        // ai.model blank → no AI available: abort the merge and let the UI
+        // prompt the user to configure ai.model or resolve manually.
+        let model = self.config.ai.model.trim().to_string();
+        if model.is_empty() {
             let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
             return Ok(UpdateBranchOutcome::ConflictsRequireAi { conflicts });
         }
@@ -1616,14 +1616,14 @@ impl DashboardService {
             "--prompt".to_string(),
             prompt,
             "-m".to_string(),
-            use_ai.clone(),
+            model.clone(),
             cwd.to_string_lossy().to_string(),
         ];
         Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
             opencode_binary: self.opencode_binary.clone(),
             opencode_args,
             cwd: cwd.clone(),
-            model: use_ai,
+            model,
             base_ref,
             conflicts,
         })
@@ -1636,7 +1636,7 @@ impl DashboardService {
         &self,
         worktree_path: &str,
         base_ref: &str,
-        use_ai: &str,
+        model: &str,
     ) -> Result<UpdatePullRequestOutcome> {
         let cwd = PathBuf::from(worktree_path);
 
@@ -1647,7 +1647,7 @@ impl DashboardService {
         }
         let title = crate::constants::UPDATE_MERGE_COMMIT_MESSAGE;
         let description =
-            format!("Merged `{base_ref}` and resolved conflicts using opencode ({use_ai}).");
+            format!("Merged `{base_ref}` and resolved conflicts using opencode ({model}).");
         let message = format!("{title}\n\n{description}");
         if let Err(err) =
             run_command(&self.git_binary, &["commit", "-m", &message], Some(&cwd)).await
@@ -1726,8 +1726,8 @@ impl DashboardService {
             return Ok(EnrichPreparation::NothingToDescribe);
         }
 
-        let use_ai = self.config.use_ai.trim().to_string();
-        if use_ai.is_empty() {
+        let model = self.config.ai.model.trim().to_string();
+        if model.is_empty() {
             return Ok(EnrichPreparation::AiNotConfigured);
         }
         if !binary_available(&self.opencode_binary) {
@@ -1745,7 +1745,7 @@ impl DashboardService {
             "--prompt".to_string(),
             prompt,
             "-m".to_string(),
-            use_ai.clone(),
+            model.clone(),
             cwd.to_string_lossy().to_string(),
         ];
 
@@ -1753,7 +1753,7 @@ impl DashboardService {
             opencode_binary: self.opencode_binary.clone(),
             opencode_args,
             cwd,
-            model: use_ai,
+            model,
         })
     }
 
@@ -1930,8 +1930,8 @@ impl DashboardService {
         if !self.gh_available {
             return Ok(FixPreparation::GhUnavailable);
         }
-        let use_ai = self.config.use_ai.trim().to_string();
-        if use_ai.is_empty() {
+        let model = self.config.ai.model.trim().to_string();
+        if model.is_empty() {
             return Ok(FixPreparation::AiNotConfigured);
         }
         if !binary_available(&self.opencode_binary) {
@@ -2019,9 +2019,9 @@ impl DashboardService {
         history: Option<&str>,
     ) -> Result<FixVerdict> {
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.use_ai.trim().to_string();
+        let model = self.config.ai.model.trim().to_string();
         if model.is_empty() {
-            return Err(WisetreeError::other("useAi is not configured."));
+            return Err(WisetreeError::other("ai.model is not configured."));
         }
         let code = match &group.file {
             Some(file) => read_code_window(&cwd, file, group.line).await,
@@ -2066,9 +2066,9 @@ impl DashboardService {
         plan: &FixPlan,
     ) -> Result<FixApplyHandoff> {
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.use_ai.trim().to_string();
+        let model = self.config.ai.model.trim().to_string();
         if model.is_empty() {
-            return Err(WisetreeError::other("useAi is not configured."));
+            return Err(WisetreeError::other("ai.model is not configured."));
         }
         if !binary_available(&self.opencode_binary) {
             return Err(WisetreeError::other("opencode CLI is not on PATH."));
