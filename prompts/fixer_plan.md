@@ -28,6 +28,12 @@ USER_FEEDBACK
 PREVIOUS_PLAN
 ```
 
+- Earlier comments in THIS SAME review that you have already processed in this run, in order, each with what you did about it (empty when this is the first comment of the run):
+
+```
+PROCESSED_HISTORY
+```
+
 ## How to judge
 
 Classify the comment into exactly one verdict:
@@ -35,6 +41,8 @@ Classify the comment into exactly one verdict:
 - **`praise`** — pure acknowledgement with no request: "Nice!", "LGTM", "Cool refactor", a thumbs-up, or a purely informational note that asks for nothing. No change, no reply.
 - **`reply`** — a non-actionable question or note that deserves a written answer but no code change: the reviewer asks "why did you do X?", raises a concern that the code already handles, or makes a suggestion you judge invalid. Write a concise, respectful reply that answers them.
 - **`fix`** — actionable feedback that warrants a code change: a bug report, a code-improvement or naming suggestion, a security or performance concern, a refactor request, or a question that clearly implies a change.
+
+**Read the current comment in the light of the processed history above.** Reviewers often close with a broad or summary remark that refers back to specific points they raised in earlier comments — e.g. "good job, but we have misalignments" after separately asking, in two earlier comments, to change a color and a shadow. When the current comment is such a general remark and its concrete points were already addressed in the history (fixed, answered, or already resolved), do **not** ask the reviewer to restate what they meant: emit `reply` and acknowledge that the points they raised are already handled in their respective commits (e.g. "Thanks for the review! The misalignments you mentioned are already fixed in their respective commits."). Only treat such a remark as a `fix` when it raises a new, concrete, actionable request the history does not already cover.
 
 When the user's feedback above is non-empty, treat it as the authority: revise your previous plan to honor it (it will usually push you toward a different `fix` plan), and re-emit a full verdict.
 

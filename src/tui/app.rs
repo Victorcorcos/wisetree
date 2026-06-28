@@ -1904,6 +1904,7 @@ impl App {
         let index = screen.current_index();
         let total = screen.groups_len();
         let worktree_path = screen.request().worktree_path.clone();
+        let history = screen.history_text();
         screen.start_planning(index + 1, total);
         kick_off_plan_comment(
             self.git_root.clone(),
@@ -1913,6 +1914,7 @@ impl App {
                 group,
                 feedback,
                 previous_plan,
+                history,
                 index,
             },
             tx.clone(),
@@ -2075,6 +2077,7 @@ impl App {
                 let repo = screen.repo().to_string();
                 let number = screen.request().number;
                 let worktree_path = screen.request().worktree_path.clone();
+                screen.set_pending_reply(text.clone());
                 screen.start_posting_reply();
                 kick_off_post_reply(
                     self.git_root.clone(),
@@ -4945,6 +4948,9 @@ struct FixPlanRequest {
     group: CommentGroup,
     feedback: Option<String>,
     previous_plan: Option<String>,
+    /// Comments + replies + fixes already resolved earlier this run, so the
+    /// model can interpret a comment that refers back to them.
+    history: Option<String>,
     index: usize,
 }
 
@@ -5025,6 +5031,7 @@ fn kick_off_plan_comment(
                 &req.group,
                 req.feedback.as_deref(),
                 req.previous_plan.as_deref(),
+                req.history.as_deref(),
             )
             .await
             .map_err(|err| user_friendly_message(&err));

@@ -1922,13 +1922,16 @@ impl DashboardService {
     /// opencode call. The planning output is structured text we parse in Rust;
     /// the AI must not edit any file in this phase. When `feedback` is set the
     /// user chose "Other" — the previous plan + their feedback are threaded
-    /// back in so the model revises rather than starts over.
+    /// back in so the model revises rather than starts over. `history` carries
+    /// the comments / replies / fixes already resolved earlier in this run so
+    /// the model can interpret a comment that refers back to them.
     pub async fn plan_comment(
         &self,
         worktree_path: &str,
         group: &CommentGroup,
         feedback: Option<&str>,
         previous_plan: Option<&str>,
+        history: Option<&str>,
     ) -> Result<FixVerdict> {
         let cwd = PathBuf::from(worktree_path);
         let model = self.config.use_ai.trim().to_string();
@@ -1939,7 +1942,7 @@ impl DashboardService {
             Some(file) => read_code_window(&cwd, file, group.line).await,
             None => String::new(),
         };
-        let prompt = build_fix_plan_prompt(group, &code, feedback, previous_plan);
+        let prompt = build_fix_plan_prompt(group, &code, feedback, previous_plan, history);
         // `opencode run` is the captured/non-interactive transcript mode —
         // no inner TUI; we parse its stdout. `-m` honors the configured model.
         let output = time::timeout(
@@ -3955,13 +3958,18 @@ async fn read_code_window(cwd: &Path, file: &str, line: Option<u64>) -> String {
 }
 
 /// Render `prompts/fixer_plan.md` into a concrete planning prompt. The big
-/// user-controlled blocks (comments, code) are substituted last so an earlier
-/// placeholder can't be clobbered by a value containing a later token.
+/// user-controlled blocks (comments, code, processed history) are substituted
+/// last so an earlier placeholder can't be clobbered by a value containing a
+/// later token. `history` carries the comments + replies + fixes already
+/// handled earlier in this same run, so a later comment that refers back to
+/// them ("good job, but we have misalignments") is judged with that context
+/// instead of in isolation.
 fn build_fix_plan_prompt(
     group: &CommentGroup,
     code: &str,
     feedback: Option<&str>,
     previous_plan: Option<&str>,
+    history: Option<&str>,
 ) -> String {
     const PLAN_PROMPT: &str = include_str!("../../prompts/fixer_plan.md");
     let file = group.file.clone().unwrap_or_default();
@@ -3971,6 +3979,10 @@ fn build_fix_plan_prompt(
     } else {
         code.to_string()
     };
+    let history = match history {
+        Some(h) if !h.trim().is_empty() => h,
+        _ => "(none — this is the first comment of the run)",
+    };
     PLAN_PROMPT
         .replace("FILE_PATH", &file)
         .replace("COMMENT_LINES", &lines)
@@ -3978,6 +3990,7 @@ fn build_fix_plan_prompt(
         .replace("PREVIOUS_PLAN", previous_plan.unwrap_or("(none)"))
         .replace("REVIEW_COMMENTS", &group.combined_text())
         .replace("CODE_CONTEXT", &code)
+        .replace("PROCESSED_HISTORY", history)
 }
 
 /// Render `prompts/fixer_apply.md` for the live apply phase.
@@ -4597,13 +4610,14 @@ so the intent reads clearly.
 
     // ── Fix pipeline: prompt substitution ──────────────────────────────
 
-    const PLAN_TOKENS: [&str; 6] = [
+    const PLAN_TOKENS: [&str; 7] = [
         "FILE_PATH",
         "COMMENT_LINES",
         "REVIEW_COMMENTS",
         "CODE_CONTEXT",
         "USER_FEEDBACK",
         "PREVIOUS_PLAN",
+        "PROCESSED_HISTORY",
     ];
 
     #[test]
@@ -4622,12 +4636,14 @@ so the intent reads clearly.
             "   12 | sleep(3000)\n",
             Some("avoid nested ifs"),
             Some("old plan text"),
+            Some("[#1] src/styles.css:20 — Applied a fix: change the color to purple"),
         );
         assert!(prompt.contains("src/retry.rs"));
         assert!(prompt.contains("Magic number 3000 is unclear"));
         assert!(prompt.contains("sleep(3000)"));
         assert!(prompt.contains("avoid nested ifs"));
         assert!(prompt.contains("old plan text"));
+        assert!(prompt.contains("change the color to purple"));
         for token in PLAN_TOKENS {
             assert!(!prompt.contains(token), "leaked placeholder token: {token}");
         }
@@ -4644,9 +4660,10 @@ so the intent reads clearly.
                 body: "Looks good overall".to_string(),
             }],
         };
-        let prompt = build_fix_plan_prompt(&group, "", None, None);
+        let prompt = build_fix_plan_prompt(&group, "", None, None, None);
         assert!(prompt.contains("(none)")); // feedback + previous plan defaults
         assert!(prompt.contains("(no code context"));
+        assert!(prompt.contains("(none — this is the first comment")); // history default
         for token in PLAN_TOKENS {
             assert!(!prompt.contains(token), "leaked placeholder token: {token}");
         }

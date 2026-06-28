@@ -85,6 +85,23 @@ pub enum FixRowOutcome {
     Failed(String),
 }
 
+/// One resolved comment group, kept so the next comment's planning call can be
+/// fed everything handled before it. Without this the AI judges each comment in
+/// isolation and mishandles a later remark that refers back to earlier ones
+/// (e.g. a PR-level "good job, but we have misalignments" after two earlier
+/// comments already pinned down and fixed those misalignments).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixHistoryEntry {
+    /// 1-based position in processing order.
+    index: usize,
+    /// `path:line` (or fallback) label for the group.
+    descriptor: String,
+    /// The reviewer comment(s), authors included.
+    comments: String,
+    /// What we did about it — reply text, fix summary, praise, skip, or failure.
+    resolution: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixAction {
     Continue,
@@ -127,6 +144,12 @@ pub struct FixPullRequestScreen {
     /// Plan for the current group (a `fix` verdict), shown on the Decision
     /// step and reused for Apply / commit and "Other" re-planning.
     current_plan: Option<FixPlan>,
+    /// Reply text for the in-flight `reply` verdict, stashed so the resolved
+    /// group can fold it into `history` once the post succeeds.
+    pending_reply: Option<String>,
+    /// Comments resolved so far this run, threaded into each later group's
+    /// planning call so the AI keeps context across the whole review.
+    history: Vec<FixHistoryEntry>,
     decision_button: DecisionButton,
     decision_button_rects: Cell<[Rect; 3]>,
     /// Scroll offset for the (potentially long) proposal text on Decision.
@@ -156,6 +179,8 @@ impl FixPullRequestScreen {
             groups: Vec::new(),
             current: 0,
             current_plan: None,
+            pending_reply: None,
+            history: Vec::new(),
             decision_button: DecisionButton::Apply,
             decision_button_rects: Cell::new([Rect::default(); 3]),
             decision_scroll: 0,
@@ -230,6 +255,32 @@ impl FixPullRequestScreen {
         self.owner = owner;
         self.repo = repo;
         self.current = 0;
+        self.history.clear();
+    }
+
+    /// Stash the reply for the in-flight `reply` verdict so `record_outcome`
+    /// can fold it into the processed history once the post succeeds.
+    pub fn set_pending_reply(&mut self, text: String) {
+        self.pending_reply = Some(text);
+    }
+
+    /// The comments resolved so far, rendered as the `PROCESSED_HISTORY` block
+    /// for the next planning call. `None` until at least one group is resolved.
+    pub fn history_text(&self) -> Option<String> {
+        if self.history.is_empty() {
+            return None;
+        }
+        let blocks: Vec<String> = self
+            .history
+            .iter()
+            .map(|e| {
+                format!(
+                    "[#{} {}]\nReviewer said:\n{}\nWhat you did: {}",
+                    e.index, e.descriptor, e.comments, e.resolution
+                )
+            })
+            .collect();
+        Some(blocks.join("\n\n"))
     }
 
     /// Working step with the "Analyzing comment #N of M…" message.
@@ -341,6 +392,7 @@ impl FixPullRequestScreen {
             .get(self.current)
             .map(|g| g.descriptor())
             .unwrap_or_default();
+        self.record_history(n, &descriptor, &outcome);
         let command = match &outcome {
             FixRowOutcome::Skipped(reason) => format!("#{n} {descriptor} ({reason})"),
             _ => format!("#{n} {descriptor}"),
@@ -366,10 +418,56 @@ impl FixPullRequestScreen {
         self.pty = None;
     }
 
+    /// Append how the current group was resolved to `history`, so the next
+    /// comment's planning call sees the reviewer's earlier comments and what we
+    /// did about each. Called from `record_outcome`, before it consumes the
+    /// outcome, and reads `current_plan` / `pending_reply` for the substance.
+    fn record_history(&mut self, n: usize, descriptor: &str, outcome: &FixRowOutcome) {
+        let comments = self
+            .groups
+            .get(self.current)
+            .map(|g| g.combined_text())
+            .unwrap_or_default();
+        let resolution = match outcome {
+            FixRowOutcome::Applied => match &self.current_plan {
+                Some(p) => format!(
+                    "Applied a fix and committed it — {}. {}",
+                    p.summary.trim(),
+                    p.explanation.trim()
+                ),
+                None => "Applied a fix and committed it.".to_string(),
+            },
+            FixRowOutcome::Replied => match &self.pending_reply {
+                Some(reply) => format!("Replied (no code change): \"{}\"", reply.trim()),
+                None => "Replied (no code change).".to_string(),
+            },
+            FixRowOutcome::AlreadyResolved => {
+                "No change needed — the code already addressed it; replied saying so.".to_string()
+            }
+            FixRowOutcome::Skipped("praise") => {
+                "Acknowledged as praise — no reply, no change.".to_string()
+            }
+            FixRowOutcome::Skipped(reason) => match &self.current_plan {
+                Some(p) => format!("Skipped ({reason}) a proposed fix: {}.", p.summary.trim()),
+                None => format!("Skipped ({reason})."),
+            },
+            FixRowOutcome::Failed(msg) => format!(
+                "A fix/reply was attempted but failed ({msg}); treat this comment as NOT yet resolved."
+            ),
+        };
+        self.history.push(FixHistoryEntry {
+            index: n,
+            descriptor: descriptor.to_string(),
+            comments,
+            resolution,
+        });
+    }
+
     /// Advance to the next comment group. Returns `true` when one remains.
     pub fn advance(&mut self) -> bool {
         self.current += 1;
         self.current_plan = None;
+        self.pending_reply = None;
         self.current < self.groups.len()
     }
 
@@ -1444,6 +1542,27 @@ mod tests {
         }
     }
 
+    fn group_with(file: Option<&str>, line: Option<u64>, author: &str, body: &str) -> CommentGroup {
+        CommentGroup {
+            file: file.map(str::to_string),
+            line,
+            reply_comment_id: Some(7),
+            comments: vec![ReviewComment {
+                author: author.to_string(),
+                body: body.to_string(),
+            }],
+        }
+    }
+
+    fn plan_with(summary: &str, explanation: &str) -> FixPlan {
+        FixPlan {
+            summary: summary.to_string(),
+            validity: "Valid.".to_string(),
+            explanation: explanation.to_string(),
+            change: "diff".to_string(),
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1643,6 +1762,113 @@ mod tests {
         assert_eq!(failed.status.as_ref().unwrap().label, "Failed");
         assert_eq!(failed.status.as_ref().unwrap().color, colors::ERROR);
         assert_eq!(failed.failure.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn history_carries_prior_comments_and_resolutions_forward() {
+        // Mirrors the real failure: three line comments (praise + two fixes)
+        // followed by a PR-level "good job, but we have misalignments." remark.
+        // The trailing remark must be planned with the prior context, not alone.
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(
+            vec![
+                group_with(
+                    Some("style.css"),
+                    Some(10),
+                    "marcos",
+                    "Congratulations!!! perfect.",
+                ),
+                group_with(
+                    Some("style.css"),
+                    Some(20),
+                    "marcos",
+                    "change the color to purple",
+                ),
+                group_with(
+                    Some("style.css"),
+                    Some(30),
+                    "marcos",
+                    "change the shadow color to pink",
+                ),
+                group_with(None, None, "marcos", "good job, but we have misalignments."),
+            ],
+            "o".into(),
+            "r".into(),
+        );
+
+        // First comment of the run: nothing came before it.
+        assert!(screen.history_text().is_none());
+
+        // #1 praise → acknowledged, no change.
+        screen.record_outcome(FixRowOutcome::Skipped("praise"));
+        assert!(screen.advance());
+        // #2 applied the color fix.
+        screen.show_decision(plan_with(
+            "change the button color to purple",
+            "Swap blue for purple.",
+        ));
+        screen.record_outcome(FixRowOutcome::Applied);
+        assert!(screen.advance());
+        // #3 applied the shadow fix.
+        screen.show_decision(plan_with(
+            "change the shadow to pink",
+            "Swap the shadow to pink.",
+        ));
+        screen.record_outcome(FixRowOutcome::Applied);
+        assert!(screen.advance());
+
+        // Planning the trailing remark now sees the full prior context.
+        let history = screen.history_text().expect("history after three groups");
+        // The earlier reviewer comments are present verbatim...
+        assert!(history.contains("Congratulations!!! perfect."), "{history}");
+        assert!(history.contains("change the color to purple"), "{history}");
+        assert!(
+            history.contains("change the shadow color to pink"),
+            "{history}"
+        );
+        // ...alongside what we did about each.
+        assert!(history.contains("Acknowledged as praise"), "{history}");
+        assert!(
+            history.contains("change the button color to purple"),
+            "{history}"
+        );
+        assert!(history.contains("change the shadow to pink"), "{history}");
+        // Indexed in processing order.
+        assert!(history.contains("[#1 style.css:10]"), "{history}");
+        assert!(history.contains("[#3 style.css:30]"), "{history}");
+    }
+
+    #[test]
+    fn history_folds_in_the_reply_text_and_clears_on_advance() {
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(
+            vec![group("a.rs", 10), group("b.rs", 20)],
+            "o".into(),
+            "r".into(),
+        );
+        screen.set_pending_reply("Intentional — the retry guards the network call.".to_string());
+        screen.record_outcome(FixRowOutcome::Replied);
+        assert!(screen.advance());
+
+        let history = screen.history_text().expect("history after one reply");
+        assert!(history.contains("Replied (no code change)"), "{history}");
+        assert!(
+            history.contains("the retry guards the network call"),
+            "{history}"
+        );
+        // Advancing drops the stale reply so it can't leak into the next group.
+        assert!(screen.pending_reply.is_none());
+    }
+
+    #[test]
+    fn set_groups_resets_history_from_a_prior_run() {
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.record_outcome(FixRowOutcome::Applied);
+        assert!(screen.history_text().is_some());
+        // A fresh preparation must start the history empty again.
+        screen.set_groups(vec![group("b.rs", 20)], "o".into(), "r".into());
+        assert!(screen.history_text().is_none());
     }
 
     #[test]
