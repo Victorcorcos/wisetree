@@ -29,6 +29,12 @@ pub const UPDATE_MERGE_COMMIT_MESSAGE: &str = "Merging and solving conflicts";
 /// CLI binary name used for AI-assisted merge conflict resolution.
 pub const OPENCODE_CLI_BINARY: &str = "opencode";
 
+/// Subdirectory under the XDG state home where opencode keeps its state.
+pub const OPENCODE_STATE_DIR_NAME: &str = "opencode";
+
+/// Filename of opencode's persisted per-model state (recent/favorite/variant).
+pub const OPENCODE_MODEL_STATE_FILE_NAME: &str = "model.json";
+
 /// Resolve the global config directory (`~/.wisetree/`).
 ///
 /// Mirrors the upstream behaviour of synthesising the path from `$HOME`. We
@@ -63,4 +69,33 @@ pub fn global_cache_dir() -> PathBuf {
 /// Path to the dashboard PR cache (`~/.wisetree/dashboard_pr_cache.json`).
 pub fn dashboard_pr_cache_file() -> PathBuf {
     global_config_dir().join(DASHBOARD_PR_CACHE_FILE_NAME)
+}
+
+/// Resolve opencode's persisted model-state file
+/// (`$XDG_STATE_HOME/opencode/model.json`, defaulting to
+/// `~/.local/state/opencode/model.json`).
+///
+/// opencode derives this path through the `xdg-basedir` package: it honours
+/// `$XDG_STATE_HOME` when set and non-empty, otherwise `$HOME/.local/state`. We
+/// mirror that resolution exactly so the file we seed is the same one the
+/// opencode TUI reads on launch to pick a model's reasoning-effort variant.
+pub fn opencode_model_state_file() -> PathBuf {
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        if !state_home.is_empty() {
+            return PathBuf::from(state_home)
+                .join(OPENCODE_STATE_DIR_NAME)
+                .join(OPENCODE_MODEL_STATE_FILE_NAME);
+        }
+    }
+
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+    home.join(".local")
+        .join("state")
+        .join(OPENCODE_STATE_DIR_NAME)
+        .join(OPENCODE_MODEL_STATE_FILE_NAME)
 }
