@@ -288,7 +288,11 @@ impl FixPullRequestScreen {
         self.step = FixStep::Working;
         self.phase_message = format!("Analyzing comment #{n} of {total}...");
         self.analyzing = true;
-        self.current_plan = None;
+        // Keep any existing plan in place. On a fresh comment it is already
+        // `None` (cleared by `advance` / prep); on an "Other" re-plan we retain
+        // it so a re-plan that fails to produce a revision can fall back to the
+        // previous proposal (see `reshow_decision`) rather than stranding the
+        // user on the spinner.
     }
 
     pub fn start_posting_reply(&mut self) {
@@ -313,6 +317,17 @@ impl FixPullRequestScreen {
     /// Present an actionable plan with the Apply / Other / Skip buttons.
     pub fn show_decision(&mut self, plan: FixPlan) {
         self.current_plan = Some(plan);
+        self.decision_button = DecisionButton::Apply;
+        self.decision_scroll = 0;
+        self.other_input = None;
+        self.step = FixStep::Decision;
+    }
+
+    /// Re-enter the Decision screen with the plan already in hand. Used when an
+    /// "Other" re-plan fails to produce a revised fix (the model disobeyed or
+    /// the call errored): the user keeps their place and the previous proposal
+    /// instead of being dropped out of the loop or stuck on the spinner.
+    pub fn reshow_decision(&mut self) {
         self.decision_button = DecisionButton::Apply;
         self.decision_scroll = 0;
         self.other_input = None;
@@ -1815,6 +1830,39 @@ mod tests {
         screen.show_other_input();
         assert_eq!(screen.handle_key(key(KeyCode::Esc)), FixAction::Continue);
         assert_eq!(screen.step(), FixStep::Decision);
+    }
+
+    #[test]
+    fn replan_retains_previous_plan_through_planning() {
+        // The "Other" path re-plans while the previous proposal must stay in
+        // hand, so a re-plan that yields no revision can fall back to it.
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.show_decision(plan());
+        screen.start_planning(1, 1);
+        assert_eq!(screen.step(), FixStep::Working);
+        assert!(screen
+            .previous_plan_text()
+            .unwrap()
+            .contains("RETRY_DELAY_MS"));
+    }
+
+    #[test]
+    fn reshow_decision_returns_to_decision_with_the_prior_plan() {
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.show_decision(plan());
+        screen.show_other_input();
+        // A re-plan that produced no revision drops the user back on Decision
+        // with the same plan and the Apply button focused — never advances.
+        screen.reshow_decision();
+        assert_eq!(screen.step(), FixStep::Decision);
+        assert!(screen
+            .current_plan()
+            .unwrap()
+            .change
+            .contains("RETRY_DELAY_MS"));
+        assert_eq!(screen.handle_key(key(KeyCode::Enter)), FixAction::Apply);
     }
 
     #[test]
