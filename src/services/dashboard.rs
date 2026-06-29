@@ -543,6 +543,12 @@ pub enum EnrichSubmitOutcome {
 pub struct ReviewComment {
     pub author: String,
     pub body: String,
+    /// `databaseId` of this inline comment, used to anchor a reaction to the
+    /// exact comment. `None` for PR-level review summaries (no comment anchor).
+    pub database_id: Option<u64>,
+    /// True when the viewer (the PR author running Fix) wrote this comment.
+    /// Lets us skip our own replies when locating the reviewer's praise.
+    pub viewer_did_author: bool,
 }
 
 /// A group of inline review comments that target the same file + line. The
@@ -589,6 +595,21 @@ impl CommentGroup {
         let raw = self.comments.first().map(|c| c.body.as_str()).unwrap_or("");
         let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
         clip(&one_line, 80)
+    }
+
+    /// The inline comment to react to when the thread ends in praise: the
+    /// reviewer's *most recent* comment — the one actually praising — not the
+    /// first comment, which is usually the original change request. Threads
+    /// often run "reviewer asks for a change → we justify → reviewer concedes
+    /// and praises"; the 😄 belongs on that closing remark. Returns `None`
+    /// (no reaction) when no reviewer comment carries an id, e.g. PR-level
+    /// summaries, where reacting via the inline-comment endpoint is impossible.
+    pub fn praise_reaction_target_id(&self) -> Option<u64> {
+        self.comments
+            .iter()
+            .rev()
+            .find(|c| !c.viewer_did_author && c.database_id.is_some())
+            .and_then(|c| c.database_id)
     }
 }
 
@@ -2248,11 +2269,13 @@ impl DashboardService {
             .map_err(WisetreeError::other)
     }
 
-    /// Add a 😄 ("laugh") reaction to the first inline review comment in
-    /// `group`. Skips silently when the group has no `reply_comment_id` (PR-level
-    /// summary comments have no comment anchor). The GitHub reactions API is
-    /// idempotent — re-adding an existing reaction returns 200 without a
-    /// duplicate, so no pre-check is needed.
+    /// Add a 😄 ("laugh") reaction to the comment that praised us — the
+    /// reviewer's most recent comment in `group`, located by
+    /// [`CommentGroup::praise_reaction_target_id`], not the first comment (which
+    /// is usually the original change request). Skips silently when no reviewer
+    /// comment carries an id (e.g. PR-level summary comments have no inline
+    /// anchor). The GitHub reactions API is idempotent — re-adding an existing
+    /// reaction returns 200 without a duplicate, so no pre-check is needed.
     pub async fn react_to_praise_comment(
         &self,
         worktree_path: &str,
@@ -2260,7 +2283,7 @@ impl DashboardService {
         repo: &str,
         group: &CommentGroup,
     ) -> Result<()> {
-        let Some(comment_id) = group.reply_comment_id else {
+        let Some(comment_id) = group.praise_reaction_target_id() else {
             return Ok(());
         };
         let cwd = PathBuf::from(worktree_path);
@@ -4111,6 +4134,8 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
             .map(|c| ReviewComment {
                 author: login(&c.author),
                 body: c.body.clone(),
+                database_id: c.database_id,
+                viewer_did_author: c.viewer_did_author,
             })
             .collect();
         if mapped.is_empty() {
@@ -4147,6 +4172,9 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
         summaries.push(ReviewComment {
             author: login(&review.author),
             body: review.body,
+            // PR-level summaries have no inline-comment id to react to.
+            database_id: None,
+            viewer_did_author: false,
         });
     }
     if !summaries.is_empty() {
@@ -4846,6 +4874,107 @@ so the intent reads clearly.
     }
 
     #[test]
+    fn praise_reaction_targets_reviewers_latest_comment_not_the_change_request() {
+        // The thread the user reported: the reviewer first asks for a change,
+        // we justify keeping the code, and the reviewer concedes with praise.
+        // The 😄 must land on that closing praise (id 3), not the opening
+        // change request (id 1, which `reply_comment_id` anchors replies to).
+        let group = CommentGroup {
+            file: Some("app/helpers/ai_assistant_helper.rb".to_string()),
+            line: Some(11),
+            reply_comment_id: Some(1),
+            comments: vec![
+                ReviewComment {
+                    author: "marcos".to_string(),
+                    body: "essa linha está com a gramatica errada, retirar acento.".to_string(),
+                    database_id: Some(1),
+                    viewer_did_author: false,
+                },
+                ReviewComment {
+                    author: "victorcorcos".to_string(),
+                    body: "Obrigado, mas vou manter \"portfólio\" com acento.".to_string(),
+                    database_id: Some(2),
+                    viewer_did_author: true,
+                },
+                ReviewComment {
+                    author: "marcos".to_string(),
+                    body: "é... realmente você tem razão! parabéns.".to_string(),
+                    database_id: Some(3),
+                    viewer_did_author: false,
+                },
+            ],
+        };
+        assert_eq!(group.praise_reaction_target_id(), Some(3));
+    }
+
+    #[test]
+    fn praise_reaction_skips_our_own_trailing_comment() {
+        // If our own comment is the most recent, the reaction still targets the
+        // reviewer's last comment — we never react to ourselves.
+        let group = CommentGroup {
+            file: Some("a.rs".to_string()),
+            line: Some(4),
+            reply_comment_id: Some(1),
+            comments: vec![
+                ReviewComment {
+                    author: "marcos".to_string(),
+                    body: "great job here!".to_string(),
+                    database_id: Some(1),
+                    viewer_did_author: false,
+                },
+                ReviewComment {
+                    author: "victorcorcos".to_string(),
+                    body: "thanks!".to_string(),
+                    database_id: Some(2),
+                    viewer_did_author: true,
+                },
+            ],
+        };
+        assert_eq!(group.praise_reaction_target_id(), Some(1));
+    }
+
+    #[test]
+    fn praise_reaction_none_for_pr_level_summary() {
+        // PR-level summaries have no inline-comment anchor, so there is nothing
+        // to react to and the courtesy is skipped.
+        let group = CommentGroup {
+            file: None,
+            line: None,
+            reply_comment_id: None,
+            comments: vec![ReviewComment {
+                author: "carol".to_string(),
+                body: "Looks good overall".to_string(),
+                database_id: None,
+                viewer_did_author: false,
+            }],
+        };
+        assert_eq!(group.praise_reaction_target_id(), None);
+    }
+
+    #[test]
+    fn group_review_feedback_retains_per_comment_ids_and_authorship() {
+        // End-to-end through the parser: the praise reaction target resolves to
+        // the reviewer's closing comment, not the opening change request.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rb", "line": 11, "isMinimized": false, "viewerDidAuthor": false, "body": "retirar acento", "author": { "login": "marcos" } },
+                { "databaseId": 2, "path": "a.rb", "line": 11, "isMinimized": false, "viewerDidAuthor": true, "body": "vou manter o acento", "author": { "login": "me" } },
+                { "databaseId": 3, "path": "a.rb", "line": 11, "isMinimized": false, "viewerDidAuthor": false, "body": "você tem razão! parabéns", "author": { "login": "marcos" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        assert_eq!(groups.len(), 1);
+        // Replies still thread onto the original comment…
+        assert_eq!(groups[0].reply_comment_id, Some(1));
+        // …but the praise reaction targets the reviewer's latest comment.
+        assert_eq!(groups[0].praise_reaction_target_id(), Some(3));
+        assert!(groups[0].comments[1].viewer_did_author);
+    }
+
+    #[test]
     fn group_review_feedback_empty_when_all_resolved() {
         let json = r#"{ "data": { "repository": { "pullRequest": {
             "reviewThreads": { "nodes": [
@@ -4884,6 +5013,8 @@ so the intent reads clearly.
             comments: vec![ReviewComment {
                 author: "alice".to_string(),
                 body: "Magic number 3000 is unclear".to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         };
         let (subject, body) = format_commit_message(42, 2, &group.brief(), &sample_plan());
@@ -4956,6 +5087,8 @@ so the intent reads clearly.
             comments: vec![ReviewComment {
                 author: "alice".to_string(),
                 body: "Magic number 3000 is unclear".to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         };
         let prompt = build_fix_plan_prompt(
@@ -4985,6 +5118,8 @@ so the intent reads clearly.
             comments: vec![ReviewComment {
                 author: "carol".to_string(),
                 body: "Looks good overall".to_string(),
+                database_id: None,
+                viewer_did_author: false,
             }],
         };
         let prompt = build_fix_plan_prompt(&group, "", None, None, None);
@@ -5005,6 +5140,8 @@ so the intent reads clearly.
             comments: vec![ReviewComment {
                 author: "alice".to_string(),
                 body: "rename foo to bar".to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         };
         let prompt = build_fix_apply_prompt(&group, &sample_plan());

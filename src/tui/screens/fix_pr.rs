@@ -1528,6 +1528,8 @@ mod tests {
             comments: vec![ReviewComment {
                 author: "alice".to_string(),
                 body: "Magic number 3000 is unclear".to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         }
     }
@@ -1550,6 +1552,8 @@ mod tests {
             comments: vec![ReviewComment {
                 author: author.to_string(),
                 body: body.to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         }
     }
