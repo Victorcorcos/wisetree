@@ -806,10 +806,14 @@ impl App {
                 let panel = if expand {
                     self.render_framed_panel_fill(frame, area)
                 } else {
+                    // The framed panel trims rounded borders (2) + horizontal
+                    // padding (4) off the area; pass that inner width so the
+                    // Working step can size its wrapped reviewer-comment panel.
+                    let content_width = area.width.saturating_sub(6);
                     let h = self
                         .fix_pr
                         .as_ref()
-                        .map_or(8, |s| s.preferred_content_height());
+                        .map_or(8, |s| s.preferred_content_height(content_width));
                     self.render_framed_panel(frame, area, h)
                 };
                 if let Some(fix_pr) = self.fix_pr.as_mut() {

@@ -724,12 +724,20 @@ impl FixPullRequestScreen {
         }
     }
 
-    pub fn preferred_content_height(&self) -> u16 {
+    pub fn preferred_content_height(&self, content_width: u16) -> u16 {
         match self.step {
             FixStep::Working => match self.analyzing_group() {
                 // spinner + blank + bordered comment panel (content capped so
-                // a long comment can't swallow the whole screen).
-                Some(group) => (build_comment_lines(group).len() as u16).clamp(1, 14) + 4,
+                // a long comment can't swallow the whole screen). The body is
+                // soft-wrapped, so size by the wrapped row count — not the raw
+                // line count, which clipped the last comment whenever an
+                // earlier one wrapped onto a second row. `content_width` is the
+                // panel's inner width; the comment block's own border trims two
+                // more columns before the text wraps.
+                Some(group) => {
+                    let wrap_width = content_width.saturating_sub(2) as usize;
+                    (comment_panel_rows(group, wrap_width) as u16).clamp(1, 14) + 4
+                }
                 None => 3,
             },
             FixStep::Done => {
@@ -1348,6 +1356,56 @@ fn build_comment_lines(group: &CommentGroup) -> Vec<Line<'static>> {
     lines
 }
 
+/// Rows the reviewer-comment panel needs once its body is soft-wrapped at
+/// `width` columns. Each `build_comment_lines` entry is a single newline-free
+/// line, so its rows are just its own wrapped span count — summed across all
+/// lines this is the true rendered height the panel must reserve.
+fn comment_panel_rows(group: &CommentGroup, width: usize) -> usize {
+    build_comment_lines(group)
+        .iter()
+        .map(|line| {
+            wrapped_rows(
+                &line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                width,
+            )
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Rows a single newline-free `text` occupies when soft-wrapped into `width`
+/// columns, mirroring ratatui's `Wrap { trim: false }`: words stay whole when
+/// they fit, and a word wider than the row spills onto extra rows. A blank line
+/// still takes one row.
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    if width == 0 || text.trim().is_empty() {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if col == 0 {
+            col = wlen;
+        } else if col + 1 + wlen <= width {
+            col += 1 + wlen;
+        } else {
+            rows += 1;
+            col = wlen;
+        }
+        // A single word longer than the row width wraps within itself.
+        if col > width {
+            rows += (col - 1) / width;
+            col = (col - 1) % width + 1;
+        }
+    }
+    rows
+}
+
 /// Build the body of the `Proposed fix` panel: the reviewer comment, the AI's
 /// validity / plan reasoning, and the concrete change. `width` is the panel's
 /// inner content width, used to draw full-width diff bars in the change block.
@@ -1644,6 +1702,57 @@ mod tests {
         assert!(
             dump.contains("Magic number 3000"),
             "missing comment body:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn analyzing_panel_height_fits_wrapped_thread_without_clipping_last_comment() {
+        // A reviewer asks for a change, we justify, and the reviewer concedes.
+        // Our justification is long enough to wrap onto a second row, so sizing
+        // the panel by raw line count clipped the reviewer's trailing concession
+        // (the praise) off the bottom. The panel height must reserve wrapped
+        // rows so the last comment's body still renders.
+        let group = CommentGroup {
+            file: Some("app/helpers/ai_assistant_helper.rb".to_string()),
+            line: Some(11),
+            reply_comment_id: Some(7),
+            comments: vec![
+                ReviewComment {
+                    author: "marcosleu".to_string(),
+                    body: "retirar acento de portfolio".to_string(),
+                    database_id: Some(1),
+                    viewer_did_author: false,
+                },
+                ReviewComment {
+                    author: "victorcorcos".to_string(),
+                    // Long enough to wrap onto a second row at the test width.
+                    body: "Obrigado pelo apontamento, mas vou manter portfolio com \
+                           acento porque essa e a forma registrada no portugues \
+                           segundo o VOLP e o dicionario Priberam."
+                        .to_string(),
+                    database_id: Some(2),
+                    viewer_did_author: true,
+                },
+                ReviewComment {
+                    author: "marcosleu".to_string(),
+                    body: "PRAISE_TAIL realmente voce tem razao".to_string(),
+                    database_id: Some(3),
+                    viewer_did_author: false,
+                },
+            ],
+        };
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group], "o".into(), "r".into());
+        screen.start_planning(1, 1);
+
+        // Render into exactly the height the App reserves for this width, the
+        // way the framed panel sizes the Working step in production.
+        let width = 80u16;
+        let height = screen.preferred_content_height(width);
+        let dump = render_dump(&mut screen, width, height);
+        assert!(
+            dump.contains("PRAISE_TAIL"),
+            "last comment was clipped:\n{dump}"
         );
     }
 
