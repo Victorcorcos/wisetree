@@ -163,9 +163,13 @@ enum AppEvent {
     /// "Fix Pull Request": sync + fetch + group review comments finished.
     FixPrPrepared(Result<Box<FixPreparation>, String>),
     /// One comment group's captured planning call finished. `index` lets the
-    /// handler ignore a result that arrives after the user moved on.
+    /// handler ignore a result that arrives after the user moved on. `is_replan`
+    /// is true for the "Other" path (feedback was supplied), so the handler
+    /// always returns to the Decision screen with a revised plan rather than
+    /// acting on a `reply` / `praise` verdict and skipping the user's approval.
     FixPrPlanned {
         index: usize,
+        is_replan: bool,
         result: Result<FixVerdict, String>,
     },
     /// A non-actionable reply was posted (the `reply` verdict).
@@ -806,10 +810,14 @@ impl App {
                 let panel = if expand {
                     self.render_framed_panel_fill(frame, area)
                 } else {
+                    // The framed panel trims rounded borders (2) + horizontal
+                    // padding (4) off the area; pass that inner width so the
+                    // Working step can size its wrapped reviewer-comment panel.
+                    let content_width = area.width.saturating_sub(6);
                     let h = self
                         .fix_pr
                         .as_ref()
-                        .map_or(8, |s| s.preferred_content_height());
+                        .map_or(8, |s| s.preferred_content_height(content_width));
                     self.render_framed_panel(frame, area, h)
                 };
                 if let Some(fix_pr) = self.fix_pr.as_mut() {
@@ -2063,10 +2071,41 @@ impl App {
     fn apply_fix_pr_planned(
         &mut self,
         index: usize,
+        is_replan: bool,
         result: Result<FixVerdict, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         if !self.fix_at_index(index) {
+            return;
+        }
+        // An "Other" re-plan revises a `fix` plan the user is actively
+        // reviewing, so it must always return to the Decision screen with a
+        // revised plan — never post a reply or skip + advance. The planning
+        // prompt is told to always emit `fix` here; this guard keeps the loop
+        // correct even if the model disobeys or the call fails: we keep the user
+        // on the previous proposal and let them refine their feedback.
+        if is_replan {
+            match result {
+                Ok(FixVerdict::Fix(plan)) => {
+                    if let Some(s) = self.fix_pr.as_mut() {
+                        s.show_decision(plan);
+                    }
+                }
+                other => {
+                    if let Some(s) = self.fix_pr.as_mut() {
+                        s.reshow_decision();
+                    }
+                    let message = match other {
+                        Err(msg) => {
+                            format!("Could not revise the plan: {}", truncate_error(&msg))
+                        }
+                        _ => "The AI didn't return a revised fix — kept the previous plan. \
+                              Adjust your feedback and try Other again."
+                            .to_string(),
+                    };
+                    self.show_toast(ToastVariant::Warning, message);
+                }
+            }
             return;
         }
         match result {
@@ -3085,9 +3124,11 @@ impl App {
                 }
             }
             AppEvent::FixPrPrepared(result) => self.apply_fix_pr_prepared(result, tx),
-            AppEvent::FixPrPlanned { index, result } => {
-                self.apply_fix_pr_planned(index, result, tx)
-            }
+            AppEvent::FixPrPlanned {
+                index,
+                is_replan,
+                result,
+            } => self.apply_fix_pr_planned(index, is_replan, result, tx),
             AppEvent::FixPrReplied { index, result } => {
                 self.apply_fix_pr_replied(index, result, tx)
             }
@@ -5189,9 +5230,13 @@ fn kick_off_plan_comment(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let index = req.index;
+    // The "Other" path supplies feedback; that's what makes this a re-plan that
+    // must round-trip back to the Decision screen rather than auto-resolve.
+    let is_replan = req.feedback.is_some();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::FixPrPlanned {
             index,
+            is_replan,
             result: Err("Could not resolve git root.".to_string()),
         });
         return;
@@ -5208,7 +5253,11 @@ fn kick_off_plan_comment(
             )
             .await
             .map_err(|err| user_friendly_message(&err));
-        let _ = tx.send(AppEvent::FixPrPlanned { index, result });
+        let _ = tx.send(AppEvent::FixPrPlanned {
+            index,
+            is_replan,
+            result,
+        });
     });
 }
 

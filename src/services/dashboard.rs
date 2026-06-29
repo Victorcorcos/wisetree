@@ -543,6 +543,12 @@ pub enum EnrichSubmitOutcome {
 pub struct ReviewComment {
     pub author: String,
     pub body: String,
+    /// `databaseId` of this inline comment, used to anchor a reaction to the
+    /// exact comment. `None` for PR-level review summaries (no comment anchor).
+    pub database_id: Option<u64>,
+    /// True when the viewer (the PR author running Fix) wrote this comment.
+    /// Lets us skip our own replies when locating the reviewer's praise.
+    pub viewer_did_author: bool,
 }
 
 /// A group of inline review comments that target the same file + line. The
@@ -589,6 +595,21 @@ impl CommentGroup {
         let raw = self.comments.first().map(|c| c.body.as_str()).unwrap_or("");
         let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
         clip(&one_line, 80)
+    }
+
+    /// The inline comment to react to when the thread ends in praise: the
+    /// reviewer's *most recent* comment — the one actually praising — not the
+    /// first comment, which is usually the original change request. Threads
+    /// often run "reviewer asks for a change → we justify → reviewer concedes
+    /// and praises"; the 😄 belongs on that closing remark. Returns `None`
+    /// (no reaction) when no reviewer comment carries an id, e.g. PR-level
+    /// summaries, where reacting via the inline-comment endpoint is impossible.
+    pub fn praise_reaction_target_id(&self) -> Option<u64> {
+        self.comments
+            .iter()
+            .rev()
+            .find(|c| !c.viewer_did_author && c.database_id.is_some())
+            .and_then(|c| c.database_id)
     }
 }
 
@@ -1467,7 +1488,11 @@ impl DashboardService {
             // work, but its output is the plain CLI transcript — only
             // the TUI renders the full Monokai theme (orange Thinking
             // headers, colored tool calls, syntax-highlighted diffs)
-            // the user expects to see inside the AI Activity panel.
+            // the user expects to see inside the AI Activity panel. The
+            // TUI has no `--variant` flag, so the configured reasoning
+            // effort is seeded into opencode's `model.json` instead (see
+            // `seed_opencode_tui_variant`).
+            seed_opencode_tui_variant(&model, &self.config.ai.update.thinking);
             let prompt = build_merge_prompt(base_ref, &conflicts);
             let mut opencode_args: Vec<String> = vec![
                 "--prompt".to_string(),
@@ -1475,11 +1500,6 @@ impl DashboardService {
                 "-m".to_string(),
                 model.clone(),
             ];
-            push_tui_variant_args(
-                &mut opencode_args,
-                &self.opencode_binary,
-                &self.config.ai.update.thinking,
-            );
             opencode_args.push(cwd.to_string_lossy().to_string());
 
             // Hand control to the UI. The merge is still mid-flight on
@@ -1616,6 +1636,9 @@ impl DashboardService {
         // (conflict markers in the index); the screen owns the opencode
         // PTY lifecycle from here and commits the result locally (no push)
         // via the same machinery as the Update Pull Request flow.
+        // The TUI takes no `--variant`; seed the reasoning effort into
+        // opencode's `model.json` so it opens at the configured strength.
+        seed_opencode_tui_variant(&model, &self.config.ai.update.thinking);
         let prompt = build_merge_prompt(&base_ref, &conflicts);
         let mut opencode_args: Vec<String> = vec![
             "--prompt".to_string(),
@@ -1623,11 +1646,6 @@ impl DashboardService {
             "-m".to_string(),
             model.clone(),
         ];
-        push_tui_variant_args(
-            &mut opencode_args,
-            &self.opencode_binary,
-            &self.config.ai.update.thinking,
-        );
         opencode_args.push(cwd.to_string_lossy().to_string());
         Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
             opencode_binary: self.opencode_binary.clone(),
@@ -1751,19 +1769,15 @@ impl DashboardService {
         // Invoke opencode's default TUI (no subcommand) with `--prompt` so
         // the enricher instructions auto-send on launch and `-m <model>` so
         // the user's configured model is honored — mirrors the merge flow.
-        // `--variant` carries the reasoning effort when this opencode TUI
-        // supports it (see `push_tui_variant_args`).
+        // The TUI takes no `--variant`, so the reasoning effort is seeded into
+        // opencode's `model.json` first (see `seed_opencode_tui_variant`).
+        seed_opencode_tui_variant(&model, &self.config.ai.enrich.thinking);
         let mut opencode_args: Vec<String> = vec![
             "--prompt".to_string(),
             prompt,
             "-m".to_string(),
             model.clone(),
         ];
-        push_tui_variant_args(
-            &mut opencode_args,
-            &self.opencode_binary,
-            &self.config.ai.enrich.thinking,
-        );
         opencode_args.push(cwd.to_string_lossy().to_string());
 
         Ok(EnrichPreparation::HandedOffToUi {
@@ -2103,13 +2117,12 @@ impl DashboardService {
             return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let prompt = build_fix_apply_prompt(group, plan);
+        // The apply phase runs in the opencode TUI (live edits in the AI
+        // Activity panel), which takes no `--variant`; seed the reasoning
+        // effort into `model.json` before spawning.
+        seed_opencode_tui_variant(&model, &self.config.ai.fix.apply.thinking);
         let mut opencode_args: Vec<String> =
             vec!["--prompt".to_string(), prompt, "-m".to_string(), model];
-        push_tui_variant_args(
-            &mut opencode_args,
-            &self.opencode_binary,
-            &self.config.ai.fix.apply.thinking,
-        );
         opencode_args.push(cwd.to_string_lossy().to_string());
         Ok(FixApplyHandoff {
             opencode_binary: self.opencode_binary.clone(),
@@ -2248,11 +2261,13 @@ impl DashboardService {
             .map_err(WisetreeError::other)
     }
 
-    /// Add a 😄 ("laugh") reaction to the first inline review comment in
-    /// `group`. Skips silently when the group has no `reply_comment_id` (PR-level
-    /// summary comments have no comment anchor). The GitHub reactions API is
-    /// idempotent — re-adding an existing reaction returns 200 without a
-    /// duplicate, so no pre-check is needed.
+    /// Add a 😄 ("laugh") reaction to the comment that praised us — the
+    /// reviewer's most recent comment in `group`, located by
+    /// [`CommentGroup::praise_reaction_target_id`], not the first comment (which
+    /// is usually the original change request). Skips silently when no reviewer
+    /// comment carries an id (e.g. PR-level summary comments have no inline
+    /// anchor). The GitHub reactions API is idempotent — re-adding an existing
+    /// reaction returns 200 without a duplicate, so no pre-check is needed.
     pub async fn react_to_praise_comment(
         &self,
         worktree_path: &str,
@@ -2260,7 +2275,7 @@ impl DashboardService {
         repo: &str,
         group: &CommentGroup,
     ) -> Result<()> {
-        let Some(comment_id) = group.reply_comment_id else {
+        let Some(comment_id) = group.praise_reaction_target_id() else {
             return Ok(());
         };
         let cwd = PathBuf::from(worktree_path);
@@ -2890,37 +2905,6 @@ fn binary_available(binary: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the installed opencode's *interactive* (root/TUI) command accepts
-/// `--variant`. opencode exposes the reasoning-effort flag on `opencode run`,
-/// but — through at least 1.17.x — NOT on the TUI launch, and it parses flags
-/// strictly, so passing `--variant` to the TUI aborts the launch instead of
-/// honoring it. The interactive flows therefore gate the flag on a one-shot
-/// probe of `opencode --help`, cached per binary path for the process lifetime
-/// (so a future opencode that adds TUI `--variant` support lights up
-/// automatically). `opencode run` always gets the flag — see [`run_variant_args`].
-fn opencode_tui_supports_variant(binary: &Path) -> bool {
-    static CACHE: Lazy<Mutex<HashMap<PathBuf, bool>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = CACHE.lock().expect("variant cache poisoned").get(binary) {
-        return *hit;
-    }
-    let supported = std::process::Command::new(binary)
-        .arg("--help")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map(|out| {
-            // yargs prints usage to stdout; check stderr too for safety.
-            String::from_utf8_lossy(&out.stdout).contains("--variant")
-                || String::from_utf8_lossy(&out.stderr).contains("--variant")
-        })
-        .unwrap_or(false);
-    CACHE
-        .lock()
-        .expect("variant cache poisoned")
-        .insert(binary.to_path_buf(), supported);
-    supported
-}
-
 /// `--variant <thinking>` for a non-interactive `opencode run` call (always
 /// supported there). Empty thinking (the persisted "Default") yields no args.
 fn run_variant_args(thinking: &str) -> Vec<String> {
@@ -2932,16 +2916,109 @@ fn run_variant_args(thinking: &str) -> Vec<String> {
     }
 }
 
-/// Append the TUI reasoning-effort flag to a TUI invocation's args, but only
-/// when a thinking strength is configured AND the installed opencode TUI
-/// accepts `--variant`. Must be called before the trailing `cwd` positional so
-/// argument order stays valid.
-fn push_tui_variant_args(args: &mut Vec<String>, binary: &Path, thinking: &str) {
-    let thinking = thinking.trim();
-    if !thinking.is_empty() && opencode_tui_supports_variant(binary) {
-        args.push("--variant".to_string());
-        args.push(thinking.to_string());
+/// opencode's sentinel value for "no reasoning override" in `model.json`. The
+/// TUI persists this (not the empty string) when a model is cycled back to no
+/// variant, and treats it as "no override" because it's never a real variant
+/// name (which are reasoning efforts like `high`/`max`).
+const OPENCODE_NO_VARIANT: &str = "default";
+
+/// Persist the configured reasoning effort for `model` into opencode's
+/// `model.json` so the **TUI** opens at that thinking strength.
+///
+/// opencode's interactive TUI (`opencode [project]`) exposes no `--variant`
+/// flag — through at least 1.17.x it resolves a model's reasoning effort
+/// *solely* from its persisted state file (the "saved preference" the user
+/// otherwise cycles with ctrl+t), keyed by `provider/model`. Only `opencode
+/// run` takes `--variant` (see [`run_variant_args`]). So to launch a TUI flow
+/// at the user's configured strength we seed that exact entry here first.
+///
+/// Best-effort: any IO/JSON error is swallowed so a read-only or absent state
+/// dir never blocks the AI flow — it just launches without the seeded effort,
+/// exactly as before this seeding existed.
+fn seed_opencode_tui_variant(model: &str, thinking: &str) {
+    seed_opencode_tui_variant_at(
+        &crate::constants::opencode_model_state_file(),
+        model,
+        thinking,
+    );
+}
+
+/// [`seed_opencode_tui_variant`] against an explicit state-file path, so tests
+/// can target a tempdir instead of the developer's real `$XDG_STATE_HOME`.
+fn seed_opencode_tui_variant_at(path: &Path, model: &str, thinking: &str) {
+    let model = model.trim();
+    if model.is_empty() {
+        return;
     }
+    let current = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let next = merged_variant_state(current, model, thinking);
+    let _ = write_json_atomic(path, &next);
+}
+
+/// Pure merge: take the current `model.json` value (or `None`) and return it
+/// with `variant[model]` set to the resolved effort, preserving every other
+/// field (`recent`, `favorite`, other models' variants). An empty `thinking`
+/// (the persisted "Default") writes [`OPENCODE_NO_VARIANT`], which clears any
+/// stale effort a prior session left for this model. Factored out so the merge
+/// is unit-testable without touching the filesystem.
+fn merged_variant_state(
+    current: Option<serde_json::Value>,
+    model: &str,
+    thinking: &str,
+) -> serde_json::Value {
+    let effort = {
+        let t = thinking.trim();
+        if t.is_empty() {
+            OPENCODE_NO_VARIANT
+        } else {
+            t
+        }
+    };
+
+    let mut root = current
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    // Safe: `root` is guaranteed to be an object by the filter/fallback above.
+    let obj = root.as_object_mut().expect("root is a json object");
+    let variant = obj
+        .entry("variant")
+        .or_insert_with(|| serde_json::json!({}));
+    if !variant.is_object() {
+        *variant = serde_json::json!({});
+    }
+    variant
+        .as_object_mut()
+        .expect("variant is a json object")
+        .insert(
+            model.to_string(),
+            serde_json::Value::String(effort.to_string()),
+        );
+    root
+}
+
+/// Atomically write `value` as JSON to `path` — write a sibling temp file then
+/// rename over the target — so a concurrent opencode reader never observes a
+/// half-written file (mirrors opencode's own `writeJsonAtomic`). Parent dirs
+/// are created as needed.
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // pid-suffixed sibling so two wisetree processes can't collide on the temp.
+    let tmp = path.with_file_name(format!(
+        ".{}.wisetree.{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "model.json".to_string()),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn is_rate_limit_error(err: &str) -> bool {
@@ -4111,6 +4188,8 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
             .map(|c| ReviewComment {
                 author: login(&c.author),
                 body: c.body.clone(),
+                database_id: c.database_id,
+                viewer_did_author: c.viewer_did_author,
             })
             .collect();
         if mapped.is_empty() {
@@ -4147,6 +4226,9 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
         summaries.push(ReviewComment {
             author: login(&review.author),
             body: review.body,
+            // PR-level summaries have no inline-comment id to react to.
+            database_id: None,
+            viewer_did_author: false,
         });
     }
     if !summaries.is_empty() {
@@ -4846,6 +4928,107 @@ so the intent reads clearly.
     }
 
     #[test]
+    fn praise_reaction_targets_reviewers_latest_comment_not_the_change_request() {
+        // The thread the user reported: the reviewer first asks for a change,
+        // we justify keeping the code, and the reviewer concedes with praise.
+        // The 😄 must land on that closing praise (id 3), not the opening
+        // change request (id 1, which `reply_comment_id` anchors replies to).
+        let group = CommentGroup {
+            file: Some("app/helpers/ai_assistant_helper.rb".to_string()),
+            line: Some(11),
+            reply_comment_id: Some(1),
+            comments: vec![
+                ReviewComment {
+                    author: "marcos".to_string(),
+                    body: "essa linha está com a gramatica errada, retirar acento.".to_string(),
+                    database_id: Some(1),
+                    viewer_did_author: false,
+                },
+                ReviewComment {
+                    author: "victorcorcos".to_string(),
+                    body: "Obrigado, mas vou manter \"portfólio\" com acento.".to_string(),
+                    database_id: Some(2),
+                    viewer_did_author: true,
+                },
+                ReviewComment {
+                    author: "marcos".to_string(),
+                    body: "é... realmente você tem razão! parabéns.".to_string(),
+                    database_id: Some(3),
+                    viewer_did_author: false,
+                },
+            ],
+        };
+        assert_eq!(group.praise_reaction_target_id(), Some(3));
+    }
+
+    #[test]
+    fn praise_reaction_skips_our_own_trailing_comment() {
+        // If our own comment is the most recent, the reaction still targets the
+        // reviewer's last comment — we never react to ourselves.
+        let group = CommentGroup {
+            file: Some("a.rs".to_string()),
+            line: Some(4),
+            reply_comment_id: Some(1),
+            comments: vec![
+                ReviewComment {
+                    author: "marcos".to_string(),
+                    body: "great job here!".to_string(),
+                    database_id: Some(1),
+                    viewer_did_author: false,
+                },
+                ReviewComment {
+                    author: "victorcorcos".to_string(),
+                    body: "thanks!".to_string(),
+                    database_id: Some(2),
+                    viewer_did_author: true,
+                },
+            ],
+        };
+        assert_eq!(group.praise_reaction_target_id(), Some(1));
+    }
+
+    #[test]
+    fn praise_reaction_none_for_pr_level_summary() {
+        // PR-level summaries have no inline-comment anchor, so there is nothing
+        // to react to and the courtesy is skipped.
+        let group = CommentGroup {
+            file: None,
+            line: None,
+            reply_comment_id: None,
+            comments: vec![ReviewComment {
+                author: "carol".to_string(),
+                body: "Looks good overall".to_string(),
+                database_id: None,
+                viewer_did_author: false,
+            }],
+        };
+        assert_eq!(group.praise_reaction_target_id(), None);
+    }
+
+    #[test]
+    fn group_review_feedback_retains_per_comment_ids_and_authorship() {
+        // End-to-end through the parser: the praise reaction target resolves to
+        // the reviewer's closing comment, not the opening change request.
+        let json = r#"{ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+              { "isResolved": false, "comments": { "nodes": [
+                { "databaseId": 1, "path": "a.rb", "line": 11, "isMinimized": false, "viewerDidAuthor": false, "body": "retirar acento", "author": { "login": "marcos" } },
+                { "databaseId": 2, "path": "a.rb", "line": 11, "isMinimized": false, "viewerDidAuthor": true, "body": "vou manter o acento", "author": { "login": "me" } },
+                { "databaseId": 3, "path": "a.rb", "line": 11, "isMinimized": false, "viewerDidAuthor": false, "body": "você tem razão! parabéns", "author": { "login": "marcos" } }
+              ] } }
+            ] },
+            "reviews": { "nodes": [] }
+        } } } }"#;
+        let groups = parse_and_group_review_feedback(json).expect("parse ok");
+        assert_eq!(groups.len(), 1);
+        // Replies still thread onto the original comment…
+        assert_eq!(groups[0].reply_comment_id, Some(1));
+        // …but the praise reaction targets the reviewer's latest comment.
+        assert_eq!(groups[0].praise_reaction_target_id(), Some(3));
+        assert!(groups[0].comments[1].viewer_did_author);
+    }
+
+    #[test]
     fn group_review_feedback_empty_when_all_resolved() {
         let json = r#"{ "data": { "repository": { "pullRequest": {
             "reviewThreads": { "nodes": [
@@ -4884,6 +5067,8 @@ so the intent reads clearly.
             comments: vec![ReviewComment {
                 author: "alice".to_string(),
                 body: "Magic number 3000 is unclear".to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         };
         let (subject, body) = format_commit_message(42, 2, &group.brief(), &sample_plan());
@@ -4956,6 +5141,8 @@ so the intent reads clearly.
             comments: vec![ReviewComment {
                 author: "alice".to_string(),
                 body: "Magic number 3000 is unclear".to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         };
         let prompt = build_fix_plan_prompt(
@@ -4985,6 +5172,8 @@ so the intent reads clearly.
             comments: vec![ReviewComment {
                 author: "carol".to_string(),
                 body: "Looks good overall".to_string(),
+                database_id: None,
+                viewer_did_author: false,
             }],
         };
         let prompt = build_fix_plan_prompt(&group, "", None, None, None);
@@ -5005,6 +5194,8 @@ so the intent reads clearly.
             comments: vec![ReviewComment {
                 author: "alice".to_string(),
                 body: "rename foo to bar".to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         };
         let prompt = build_fix_apply_prompt(&group, &sample_plan());
@@ -6204,12 +6395,97 @@ so the intent reads clearly.
     }
 
     #[test]
-    fn push_tui_variant_args_is_a_noop_for_blank_thinking() {
-        // Blank thinking must never spawn the capability probe nor mutate args,
-        // so a missing opencode binary is irrelevant here.
-        let mut args = vec!["--prompt".to_string(), "x".to_string()];
-        push_tui_variant_args(&mut args, Path::new("/no/such/opencode"), "");
-        assert_eq!(args, vec!["--prompt".to_string(), "x".to_string()]);
+    fn merged_variant_state_seeds_variant_into_empty_state() {
+        // No prior model.json → a fresh object carrying just the seeded effort.
+        let next = merged_variant_state(None, "openai/gpt-5.4", "high");
+        assert_eq!(next["variant"]["openai/gpt-5.4"], serde_json::json!("high"));
+    }
+
+    #[test]
+    fn merged_variant_state_preserves_other_fields_and_overwrites_same_model() {
+        // A realistic model.json: recent/favorite and other models' variants
+        // must survive untouched; only the target model's effort changes.
+        let current = serde_json::json!({
+            "recent": [{ "providerID": "openai", "modelID": "gpt-5.4" }],
+            "favorite": [],
+            "variant": {
+                "openai/gpt-5.5": "low",
+                "openai/gpt-5.4": "medium"
+            }
+        });
+        let next = merged_variant_state(Some(current), "openai/gpt-5.4", "high");
+        assert_eq!(
+            next["recent"],
+            serde_json::json!([{ "providerID": "openai", "modelID": "gpt-5.4" }])
+        );
+        assert_eq!(next["favorite"], serde_json::json!([]));
+        // Untouched sibling variant.
+        assert_eq!(next["variant"]["openai/gpt-5.5"], serde_json::json!("low"));
+        // Target model overwritten medium → high.
+        assert_eq!(next["variant"]["openai/gpt-5.4"], serde_json::json!("high"));
+    }
+
+    #[test]
+    fn merged_variant_state_writes_default_sentinel_for_blank_thinking() {
+        // Empty thinking (the persisted "Default") must clear any stale effort
+        // by writing opencode's "default" sentinel, not the empty string.
+        let current = serde_json::json!({ "variant": { "openai/gpt-5.4": "max" } });
+        for blank in ["", "   "] {
+            let next = merged_variant_state(Some(current.clone()), "openai/gpt-5.4", blank);
+            assert_eq!(
+                next["variant"]["openai/gpt-5.4"],
+                serde_json::json!("default")
+            );
+        }
+    }
+
+    #[test]
+    fn merged_variant_state_recovers_from_a_non_object_variant_field() {
+        // A corrupt/unexpected `variant` (here an array) is replaced with a
+        // fresh object rather than panicking or dropping the seed.
+        let current = serde_json::json!({ "variant": [1, 2, 3] });
+        let next = merged_variant_state(Some(current), "openai/gpt-5.4", "high");
+        assert_eq!(next["variant"]["openai/gpt-5.4"], serde_json::json!("high"));
+    }
+
+    #[test]
+    fn seed_opencode_tui_variant_at_round_trips_through_disk() {
+        // End-to-end against a tempdir: the seeded effort lands in model.json
+        // and a subsequent seed of a different model is merged in, not clobbered.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode").join("model.json");
+
+        seed_opencode_tui_variant_at(&path, "openai/gpt-5.4", "high");
+        let first: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read seeded file"))
+                .expect("valid json");
+        assert_eq!(
+            first["variant"]["openai/gpt-5.4"],
+            serde_json::json!("high")
+        );
+
+        seed_opencode_tui_variant_at(&path, "opencode/glm-5.2", "max");
+        let second: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read seeded file"))
+                .expect("valid json");
+        // Both entries coexist after the second seed.
+        assert_eq!(
+            second["variant"]["openai/gpt-5.4"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            second["variant"]["opencode/glm-5.2"],
+            serde_json::json!("max")
+        );
+    }
+
+    #[test]
+    fn seed_opencode_tui_variant_at_is_a_noop_for_blank_model() {
+        // A blank model id must never create or touch the state file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode").join("model.json");
+        seed_opencode_tui_variant_at(&path, "   ", "high");
+        assert!(!path.exists());
     }
 
     #[test]

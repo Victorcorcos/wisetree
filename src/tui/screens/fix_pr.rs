@@ -288,7 +288,11 @@ impl FixPullRequestScreen {
         self.step = FixStep::Working;
         self.phase_message = format!("Analyzing comment #{n} of {total}...");
         self.analyzing = true;
-        self.current_plan = None;
+        // Keep any existing plan in place. On a fresh comment it is already
+        // `None` (cleared by `advance` / prep); on an "Other" re-plan we retain
+        // it so a re-plan that fails to produce a revision can fall back to the
+        // previous proposal (see `reshow_decision`) rather than stranding the
+        // user on the spinner.
     }
 
     pub fn start_posting_reply(&mut self) {
@@ -313,6 +317,17 @@ impl FixPullRequestScreen {
     /// Present an actionable plan with the Apply / Other / Skip buttons.
     pub fn show_decision(&mut self, plan: FixPlan) {
         self.current_plan = Some(plan);
+        self.decision_button = DecisionButton::Apply;
+        self.decision_scroll = 0;
+        self.other_input = None;
+        self.step = FixStep::Decision;
+    }
+
+    /// Re-enter the Decision screen with the plan already in hand. Used when an
+    /// "Other" re-plan fails to produce a revised fix (the model disobeyed or
+    /// the call errored): the user keeps their place and the previous proposal
+    /// instead of being dropped out of the loop or stuck on the spinner.
+    pub fn reshow_decision(&mut self) {
         self.decision_button = DecisionButton::Apply;
         self.decision_scroll = 0;
         self.other_input = None;
@@ -724,12 +739,20 @@ impl FixPullRequestScreen {
         }
     }
 
-    pub fn preferred_content_height(&self) -> u16 {
+    pub fn preferred_content_height(&self, content_width: u16) -> u16 {
         match self.step {
             FixStep::Working => match self.analyzing_group() {
                 // spinner + blank + bordered comment panel (content capped so
-                // a long comment can't swallow the whole screen).
-                Some(group) => (build_comment_lines(group).len() as u16).clamp(1, 14) + 4,
+                // a long comment can't swallow the whole screen). The body is
+                // soft-wrapped, so size by the wrapped row count — not the raw
+                // line count, which clipped the last comment whenever an
+                // earlier one wrapped onto a second row. `content_width` is the
+                // panel's inner width; the comment block's own border trims two
+                // more columns before the text wraps.
+                Some(group) => {
+                    let wrap_width = content_width.saturating_sub(2) as usize;
+                    (comment_panel_rows(group, wrap_width) as u16).clamp(1, 14) + 4
+                }
                 None => 3,
             },
             FixStep::Done => {
@@ -1348,6 +1371,56 @@ fn build_comment_lines(group: &CommentGroup) -> Vec<Line<'static>> {
     lines
 }
 
+/// Rows the reviewer-comment panel needs once its body is soft-wrapped at
+/// `width` columns. Each `build_comment_lines` entry is a single newline-free
+/// line, so its rows are just its own wrapped span count — summed across all
+/// lines this is the true rendered height the panel must reserve.
+fn comment_panel_rows(group: &CommentGroup, width: usize) -> usize {
+    build_comment_lines(group)
+        .iter()
+        .map(|line| {
+            wrapped_rows(
+                &line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                width,
+            )
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Rows a single newline-free `text` occupies when soft-wrapped into `width`
+/// columns, mirroring ratatui's `Wrap { trim: false }`: words stay whole when
+/// they fit, and a word wider than the row spills onto extra rows. A blank line
+/// still takes one row.
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    if width == 0 || text.trim().is_empty() {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if col == 0 {
+            col = wlen;
+        } else if col + 1 + wlen <= width {
+            col += 1 + wlen;
+        } else {
+            rows += 1;
+            col = wlen;
+        }
+        // A single word longer than the row width wraps within itself.
+        if col > width {
+            rows += (col - 1) / width;
+            col = (col - 1) % width + 1;
+        }
+    }
+    rows
+}
+
 /// Build the body of the `Proposed fix` panel: the reviewer comment, the AI's
 /// validity / plan reasoning, and the concrete change. `width` is the panel's
 /// inner content width, used to draw full-width diff bars in the change block.
@@ -1528,6 +1601,8 @@ mod tests {
             comments: vec![ReviewComment {
                 author: "alice".to_string(),
                 body: "Magic number 3000 is unclear".to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         }
     }
@@ -1550,6 +1625,8 @@ mod tests {
             comments: vec![ReviewComment {
                 author: author.to_string(),
                 body: body.to_string(),
+                database_id: Some(7),
+                viewer_did_author: false,
             }],
         }
     }
@@ -1644,6 +1721,57 @@ mod tests {
     }
 
     #[test]
+    fn analyzing_panel_height_fits_wrapped_thread_without_clipping_last_comment() {
+        // A reviewer asks for a change, we justify, and the reviewer concedes.
+        // Our justification is long enough to wrap onto a second row, so sizing
+        // the panel by raw line count clipped the reviewer's trailing concession
+        // (the praise) off the bottom. The panel height must reserve wrapped
+        // rows so the last comment's body still renders.
+        let group = CommentGroup {
+            file: Some("app/helpers/ai_assistant_helper.rb".to_string()),
+            line: Some(11),
+            reply_comment_id: Some(7),
+            comments: vec![
+                ReviewComment {
+                    author: "marcosleu".to_string(),
+                    body: "retirar acento de portfolio".to_string(),
+                    database_id: Some(1),
+                    viewer_did_author: false,
+                },
+                ReviewComment {
+                    author: "victorcorcos".to_string(),
+                    // Long enough to wrap onto a second row at the test width.
+                    body: "Obrigado pelo apontamento, mas vou manter portfolio com \
+                           acento porque essa e a forma registrada no portugues \
+                           segundo o VOLP e o dicionario Priberam."
+                        .to_string(),
+                    database_id: Some(2),
+                    viewer_did_author: true,
+                },
+                ReviewComment {
+                    author: "marcosleu".to_string(),
+                    body: "PRAISE_TAIL realmente voce tem razao".to_string(),
+                    database_id: Some(3),
+                    viewer_did_author: false,
+                },
+            ],
+        };
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group], "o".into(), "r".into());
+        screen.start_planning(1, 1);
+
+        // Render into exactly the height the App reserves for this width, the
+        // way the framed panel sizes the Working step in production.
+        let width = 80u16;
+        let height = screen.preferred_content_height(width);
+        let dump = render_dump(&mut screen, width, height);
+        assert!(
+            dump.contains("PRAISE_TAIL"),
+            "last comment was clipped:\n{dump}"
+        );
+    }
+
+    #[test]
     fn non_analyzing_working_has_no_comment_panel() {
         // Committing is also a Working phase but must not show the panel.
         let mut screen = FixPullRequestScreen::new(request());
@@ -1702,6 +1830,39 @@ mod tests {
         screen.show_other_input();
         assert_eq!(screen.handle_key(key(KeyCode::Esc)), FixAction::Continue);
         assert_eq!(screen.step(), FixStep::Decision);
+    }
+
+    #[test]
+    fn replan_retains_previous_plan_through_planning() {
+        // The "Other" path re-plans while the previous proposal must stay in
+        // hand, so a re-plan that yields no revision can fall back to it.
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.show_decision(plan());
+        screen.start_planning(1, 1);
+        assert_eq!(screen.step(), FixStep::Working);
+        assert!(screen
+            .previous_plan_text()
+            .unwrap()
+            .contains("RETRY_DELAY_MS"));
+    }
+
+    #[test]
+    fn reshow_decision_returns_to_decision_with_the_prior_plan() {
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.show_decision(plan());
+        screen.show_other_input();
+        // A re-plan that produced no revision drops the user back on Decision
+        // with the same plan and the Apply button focused — never advances.
+        screen.reshow_decision();
+        assert_eq!(screen.step(), FixStep::Decision);
+        assert!(screen
+            .current_plan()
+            .unwrap()
+            .change
+            .contains("RETRY_DELAY_MS"));
+        assert_eq!(screen.handle_key(key(KeyCode::Enter)), FixAction::Apply);
     }
 
     #[test]

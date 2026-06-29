@@ -44,7 +44,7 @@ Classify the comment into exactly one verdict:
 
 **Read the current comment in the light of the processed history above.** Reviewers often close with a broad or summary remark that refers back to specific points they raised in earlier comments — e.g. "good job, but we have misalignments" after separately asking, in two earlier comments, to change a color and a shadow. When the current comment is such a general remark and its concrete points were already addressed in the history (fixed, answered, or already resolved), do **not** ask the reviewer to restate what they meant: emit `reply` and acknowledge that the points they raised are already handled in their respective commits (e.g. "Thanks for the review! The misalignments you mentioned are already fixed in their respective commits."). Only treat such a remark as a `fix` when it raises a new, concrete, actionable request the history does not already cover.
 
-When the user's feedback above is non-empty, treat it as the authority: revise your previous plan to honor it (it will usually push you toward a different `fix` plan), and re-emit a full verdict.
+When the user's feedback above is non-empty, you are **revising a `fix` plan the user is actively reviewing** — they pressed "Other" on your previous proposal to steer it in a new direction. Treat their feedback as the authority and **always emit a `fix` verdict here — never downgrade to `praise` or `reply`**. Revise your previous plan to honor their feedback and re-emit a full `fix` verdict with all of its sections (`SUMMARY`/`VALIDITY`/`EXPLANATION`/`CHANGE`).
 
 ### Quality rules for a `fix`
 
