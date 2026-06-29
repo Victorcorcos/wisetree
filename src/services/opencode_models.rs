@@ -16,6 +16,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::files::strip_ansi;
+
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const OPENCODE_MODELS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -137,15 +139,38 @@ pub async fn fetch_free_opencode_models(binary: &Path) -> Result<Vec<String>, St
         .map_err(|_| "opencode models timed out".to_string())?
         .map_err(|e| format!("spawn opencode: {e}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            "opencode models exited non-zero".to_string()
-        } else {
-            stderr
-        });
+        return Err(sanitize_cli_error(&String::from_utf8_lossy(&output.stderr)));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(parse_opencode_models_output(&stdout))
+}
+
+/// Flatten a CLI's stderr into a single clean line for the one-line chip-row
+/// error slot. opencode's transient failures (e.g. an "Unexpected error\n…
+/// database …" stack) arrive multi-line and ANSI-colored; rendered raw into a
+/// single ratatui `Line` the words mash together ("errordatabase"). We fold
+/// every whitespace char (newlines/tabs included) into a space *first* —
+/// [`strip_ansi`] drops bare `\n` control bytes, which is what mashes adjacent
+/// words — then strip ANSI, collapse runs of spaces, and cap the length. Empty
+/// input → a generic note.
+fn sanitize_cli_error(raw: &str) -> String {
+    let spaced: String = raw
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let cleaned = strip_ansi(&spaced);
+    let one_line = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return "opencode models exited non-zero".to_string();
+    }
+    // Cap so a long stack trace can't blow out the row.
+    const MAX_CHARS: usize = 160;
+    if one_line.chars().count() > MAX_CHARS {
+        let truncated: String = one_line.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        one_line
+    }
 }
 
 /// Pulled out so unit tests can exercise the parser without spawning a
@@ -463,5 +488,43 @@ prov/good
             parse_opencode_models_output(raw),
             vec!["opencode/big-pickle".to_string()]
         );
+    }
+
+    #[test]
+    fn sanitize_cli_error_folds_multiline_stderr_into_one_line() {
+        // Regression: opencode's transient failure arrived as
+        // "Unexpected error\ndatabase ..." and rendered as
+        // "Unexpected errordatabase..." in the single-line chip slot.
+        let raw = "Unexpected error\ndatabase is locked";
+        assert_eq!(
+            sanitize_cli_error(raw),
+            "Unexpected error database is locked"
+        );
+    }
+
+    #[test]
+    fn sanitize_cli_error_strips_ansi_and_collapses_whitespace() {
+        let raw = "\u{1b}[31mError:\u{1b}[0m  failed\t to   load\n\n  models";
+        assert_eq!(sanitize_cli_error(raw), "Error: failed to load models");
+    }
+
+    #[test]
+    fn sanitize_cli_error_falls_back_when_empty() {
+        assert_eq!(
+            sanitize_cli_error("   \n\t "),
+            "opencode models exited non-zero"
+        );
+    }
+
+    #[test]
+    fn sanitize_cli_error_caps_runaway_length() {
+        let raw = "x ".repeat(300);
+        let out = sanitize_cli_error(&raw);
+        assert!(
+            out.chars().count() <= 161,
+            "got {} chars",
+            out.chars().count()
+        );
+        assert!(out.ends_with('…'));
     }
 }

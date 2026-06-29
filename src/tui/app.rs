@@ -190,11 +190,11 @@ enum AppEvent {
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
     /// Result of the background `opencode models opencode` shell-out that
-    /// powers the Dashboard footer's free-model quick-pick.
+    /// powers the AI Settings free-model quick-pick chip row.
     FreeOpencodeModelsFetched(Result<Vec<String>, String>),
     /// Result of the background `opencode models --verbose` shell-out that maps
     /// each `provider/model` to its authoritative reasoning variants, powering
-    /// the Dashboard `ai.model` field's per-model ←/→ reasoning cycle.
+    /// the AI Settings slots' per-model ←/→ reasoning cycle.
     AiModelVariantsFetched(Result<std::collections::HashMap<String, Vec<String>>, String>),
     ShellIntegrationDetected(ShellIntegrationStatus),
 }
@@ -1308,7 +1308,7 @@ impl App {
                         }
                     }
                     SettingsAction::SaveDashboard(dashboard) => {
-                        if let Err(err) = self.save_dashboard(dashboard) {
+                        if let Err(err) = self.save_dashboard(*dashboard) {
                             if let Some(settings) = self.settings.as_mut() {
                                 settings
                                     .set_error(format!("Failed to save dashboard settings: {err}"));
@@ -1619,7 +1619,7 @@ impl App {
             return;
         };
         let request = screen.request().clone();
-        let model = dashboard_config.ai.model.clone();
+        let model = dashboard_config.ai.update.model.clone();
         let base_ref = request
             .base_ref
             .clone()
@@ -2032,7 +2032,8 @@ impl App {
                 ),
                 FixPreparation::AiNotConfigured => self.fail_fix(
                     ToastVariant::Warning,
-                    "Set the `ai.model` setting so the AI can plan review fixes.".to_string(),
+                    "Set the `ai.fix.plan` model (Settings → Dashboard → ai) so the AI can plan review fixes."
+                        .to_string(),
                     tx,
                 ),
                 FixPreparation::AiUnavailable => self.fail_fix(
@@ -2759,7 +2760,7 @@ impl App {
                 }
             }
             SettingsAction::SaveDashboard(dashboard) => {
-                if let Err(err) = self.save_dashboard(dashboard) {
+                if let Err(err) = self.save_dashboard(*dashboard) {
                     if let Some(settings) = self.settings.as_mut() {
                         settings.set_error(format!("Failed to save dashboard settings: {err}"));
                     }
@@ -3258,8 +3259,8 @@ impl App {
             ),
             Ok(UpdateBranchOutcome::ConflictsRequireAi { .. }) => self.show_toast(
                 ToastVariant::Warning,
-                "Conflicts found, please resolve them locally or setup `ai.model` \
-                 setting so we can solve conflicts + merge via AI."
+                "Conflicts found, please resolve them locally or set the `ai.update` \
+                 model so we can solve conflicts + merge via AI."
                     .to_string(),
             ),
             Ok(UpdateBranchOutcome::AiUnavailable { conflicts }) => self.show_toast(
@@ -3504,8 +3505,8 @@ impl App {
                 UpdatePullRequestOutcome::ConflictsRequireAi { .. } => {
                     self.show_toast(
                         ToastVariant::Warning,
-                        "Conflicts found, please resolve them locally or setup `ai.model` \
-                         setting so we can solve conflicts + merge via AI."
+                        "Conflicts found, please resolve them locally or set the `ai.update` \
+                         model so we can solve conflicts + merge via AI."
                             .to_string(),
                     );
                 }
@@ -3624,7 +3625,7 @@ impl App {
                 EnrichPreparation::AiNotConfigured => {
                     self.show_toast(
                         ToastVariant::Warning,
-                        "Set the `ai.model` setting so we can draft the PR description with AI."
+                        "Set the `ai.enrich` model (Settings → Dashboard → ai) so we can draft the PR description with AI."
                             .to_string(),
                     );
                     self.enrich_pr = None;
@@ -4915,9 +4916,9 @@ fn kick_off_fetch_free_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
 }
 
 /// Shell out to `opencode models --verbose` to learn each model's authoritative
-/// reasoning variants, so the Dashboard `ai.model` field's ←/→ cycle offers only
-/// the levels the chosen model actually accepts. Same best-effort posture as
-/// the free-model fetch — failures leave the Settings screen on the generic
+/// reasoning variants, so the AI Settings slots' ←/→ cycle offers only the
+/// levels the chosen model actually accepts. Same best-effort posture as the
+/// free-model fetch — failures leave the Settings screen on the generic
 /// fallback ladder.
 fn kick_off_fetch_ai_model_variants(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {

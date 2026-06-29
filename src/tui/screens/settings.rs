@@ -20,7 +20,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::config::schema::{DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig};
+use crate::config::schema::{
+    AiConfig, AiFixConfig, AiModelConfig, DashboardConfig, LinkStrategy, NotificationsConfig,
+    WorktreeConfig,
+};
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
 use crate::tui::screens::ai_model_picker::REASONING_VARIANTS;
@@ -40,6 +43,9 @@ pub enum SettingsStep {
     IgnorePatterns,
     PathTemplate,
     Dashboard,
+    /// Per-command AI model picker grid, reached from the Dashboard `ai`
+    /// rectangle. Esc returns to the Dashboard editor.
+    AiSettings,
     Notifications,
     PostCmd,
     TerminalCmd,
@@ -89,9 +95,10 @@ pub enum SettingsAction {
     /// An empty string clears the override and falls back to the default root.
     SaveLinkCacheDir(String),
     /// Persist the dashboard settings (refresh interval, show pull requests,
-    /// columns) to the active config file. Invalid numbers or unknown columns
-    /// are normalized by the caller.
-    SaveDashboard(DashboardConfig),
+    /// columns, per-command AI models) to the active config file. Invalid
+    /// numbers or unknown columns are normalized by the caller. Boxed because
+    /// `DashboardConfig` is by far the largest `SettingsAction` payload.
+    SaveDashboard(Box<DashboardConfig>),
     /// Persist the opt-in notification toggles to the active config file.
     SaveNotifications(NotificationsConfig),
     /// Open the fullscreen AI model picker prefilled with the current `ai`
@@ -993,7 +1000,7 @@ impl DashboardField {
                 "Comma-separated: branch, status, ai_status, ahead_behind, diff, last_commit, pull_request"
             }
             DashboardField::Ai => {
-                "Enter picks a model. ←/→ adjust thinking strength. Blank disables AI."
+                "Press Enter to choose a model + thinking strength per AI command"
             }
         }
     }
@@ -1009,12 +1016,6 @@ impl DashboardField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardSelection {
     Rect(usize),
-    /// Cursor lives on the inline "Current free models:" chip row that sits
-    /// directly below the `ai` rectangle. The inner `usize` is the
-    /// focused chip index — Left/Right cycle within the row, Up/Down step
-    /// out to neighbouring rectangles. Only reachable when the screen has
-    /// a non-empty `free_models` list cached.
-    FreeModels(usize),
     Save,
 }
 
@@ -1027,6 +1028,7 @@ enum SettingsMouseTarget {
     LinkStrategySave,
     LinkCacheDirSave,
     DashboardSave,
+    AiSettingsSave,
     NotificationsSave,
     NotificationsToggle(usize),
     PathTemplateSave,
@@ -1040,10 +1042,10 @@ pub struct DashboardEditor {
     base_config: DashboardConfig,
     pub values: Vec<String>,
     pub statuses: Vec<DashboardRectStatus>,
-    /// Thinking strength chosen for the AI model. Not a tab-able rectangle —
-    /// it is staged by the AI model picker alongside the model value and
-    /// persisted on Save. Empty means "default" (no reasoning override).
-    pub thinking: String,
+    /// Staged per-command AI models. The `ai` rectangle is a navigation entry
+    /// into the AI Settings sub-screen, which edits this in place; it is
+    /// persisted alongside the other dashboard fields by the Save button.
+    pub ai: AiConfig,
     pub selection: DashboardSelection,
     edit_backup: Option<(String, DashboardRectStatus)>,
 }
@@ -1055,14 +1057,17 @@ impl DashboardEditor {
             config.show_pull_requests.to_string(),
             config.wise_merge.to_string(),
             config.columns.join(", "),
-            config.ai.model.clone(),
+            // The `ai` rectangle no longer holds a single model — it opens the
+            // AI Settings sub-screen — so its value slot stays empty and the
+            // renderer shows a per-command summary derived from `ai` instead.
+            String::new(),
         ];
         let statuses = vec![DashboardRectStatus::Saved; values.len()];
         Self {
             base_config: config.clone(),
             values,
             statuses,
-            thinking: config.ai.thinking.clone(),
+            ai: config.ai.clone(),
             selection: DashboardSelection::Rect(0),
             edit_backup: None,
         }
@@ -1109,23 +1114,190 @@ impl DashboardEditor {
             .collect();
         let (columns, _warnings) = normalize_dashboard_columns(&raw_columns);
 
-        let model = self.values[4].trim().to_string();
-        // A thinking strength only means something when a model is set; clear
-        // it if the user blanked the model so we never persist an orphan.
-        let thinking = if model.is_empty() {
-            String::new()
-        } else {
-            self.thinking.clone()
-        };
-
         let mut config = self.base_config.clone();
         config.refresh_interval_ms = refresh_interval_ms;
         config.show_pull_requests = show_pull_requests;
         config.wise_merge = wise_merge;
         config.columns = columns;
-        config.ai.model = model;
-        config.ai.thinking = thinking;
+        // Per-command AI models are staged by the AI Settings sub-screen into
+        // `self.ai`; thinking strengths are cleared for any blank model by
+        // `normalize_ai` so we never persist an orphan reasoning level.
+        config.ai = normalize_ai(&self.ai);
         config
+    }
+}
+
+/// Drop the thinking strength of any per-command model whose `model` is blank
+/// — a reasoning level only means something paired with a model. Mirrors the
+/// old single-model behaviour, now applied per command.
+fn normalize_ai(ai: &AiConfig) -> AiConfig {
+    let clean = |m: &AiModelConfig| {
+        let model = m.model.trim().to_string();
+        let thinking = if model.is_empty() {
+            String::new()
+        } else {
+            m.thinking.clone()
+        };
+        AiModelConfig { model, thinking }
+    };
+    AiConfig {
+        enrich: clean(&ai.enrich),
+        fix: AiFixConfig {
+            plan: clean(&ai.fix.plan),
+            apply: clean(&ai.fix.apply),
+        },
+        update: clean(&ai.update),
+    }
+}
+
+/// One AI-assisted command (or sub-step) configurable on the AI Settings
+/// sub-screen. Order matches the rectangles top-to-bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSlot {
+    Enrich,
+    FixPlan,
+    FixApply,
+    Update,
+}
+
+impl AiSlot {
+    pub const ALL: [AiSlot; 4] = [
+        AiSlot::Enrich,
+        AiSlot::FixPlan,
+        AiSlot::FixApply,
+        AiSlot::Update,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            AiSlot::Enrich => "enrich",
+            AiSlot::FixPlan => "fix_plan",
+            AiSlot::FixApply => "fix_apply",
+            AiSlot::Update => "update",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            AiSlot::Enrich => "Drafts the PR title + description (Enrich)",
+            AiSlot::FixPlan => "Plans review-comment fixes — pick a stronger model (Fix · plan)",
+            AiSlot::FixApply => "Applies the approved fix live (Fix · apply)",
+            AiSlot::Update => "Resolves merge conflicts (Update Pull Request / branch)",
+        }
+    }
+
+    fn get(self, ai: &AiConfig) -> &AiModelConfig {
+        match self {
+            AiSlot::Enrich => &ai.enrich,
+            AiSlot::FixPlan => &ai.fix.plan,
+            AiSlot::FixApply => &ai.fix.apply,
+            AiSlot::Update => &ai.update,
+        }
+    }
+
+    fn get_mut(self, ai: &mut AiConfig) -> &mut AiModelConfig {
+        match self {
+            AiSlot::Enrich => &mut ai.enrich,
+            AiSlot::FixPlan => &mut ai.fix.plan,
+            AiSlot::FixApply => &mut ai.fix.apply,
+            AiSlot::Update => &mut ai.update,
+        }
+    }
+}
+
+/// The four leaf models in slot order — used by the dashboard `ai` summary and
+/// the AI Settings editor.
+fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 4] {
+    [&ai.enrich, &ai.fix.plan, &ai.fix.apply, &ai.update]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSettingsSelection {
+    Rect(usize),
+    /// Cursor on the shared "Current free models:" chip row below the slots.
+    /// Inner `usize` is the focused chip; Enter stages it into the
+    /// most-recently-focused slot. Only reachable with a non-empty
+    /// `free_models` list cached.
+    FreeModels(usize),
+    Save,
+}
+
+/// Editor backing the AI Settings sub-screen: one rectangle per AI command,
+/// each opening the model picker (Enter) and cycling its thinking strength
+/// (←/→), plus a shared free-model quick-pick row and a Save button. Mirrors
+/// [`DashboardEditor`] but is scoped to the nested per-command `ai` config.
+pub struct AiSettingsEditor {
+    /// Snapshot taken on open, so Save can mark a clean baseline and Esc can
+    /// tell whether anything was staged.
+    base_ai: AiConfig,
+    pub ai: AiConfig,
+    pub statuses: Vec<DashboardRectStatus>,
+    pub selection: AiSettingsSelection,
+    /// Slot the chip row applies to — the rectangle the cursor was last on.
+    last_rect: usize,
+}
+
+impl AiSettingsEditor {
+    pub fn new(ai: &AiConfig) -> Self {
+        Self {
+            base_ai: ai.clone(),
+            ai: ai.clone(),
+            statuses: vec![DashboardRectStatus::Saved; AiSlot::ALL.len()],
+            selection: AiSettingsSelection::Rect(0),
+            last_rect: 0,
+        }
+    }
+
+    fn slot(idx: usize) -> AiSlot {
+        AiSlot::ALL[idx]
+    }
+
+    /// Index of the slot the picker/chip row should target.
+    fn target_idx(&self) -> usize {
+        match self.selection {
+            AiSettingsSelection::Rect(i) => i,
+            _ => self.last_rect,
+        }
+    }
+
+    /// Model + thinking for the targeted slot, used to pre-fill the picker.
+    pub fn focused_model(&self) -> AiModelConfig {
+        Self::slot(self.target_idx()).get(&self.ai).clone()
+    }
+
+    /// Stamp a picked model + thinking into the targeted slot (Modified, not
+    /// Saved — persisted via the Save button).
+    pub fn apply_selection(&mut self, model: String, thinking: String) {
+        let idx = self.target_idx();
+        let target = Self::slot(idx).get_mut(&mut self.ai);
+        target.model = model;
+        target.thinking = thinking;
+        self.statuses[idx] = DashboardRectStatus::Modified;
+        self.selection = AiSettingsSelection::Rect(idx);
+        self.last_rect = idx;
+    }
+
+    /// Stage a chip-row free model into the most-recently-focused slot,
+    /// clearing its thinking (free models reset to Default).
+    fn apply_free_model(&mut self, pair: String) {
+        let idx = self.last_rect.min(AiSlot::ALL.len() - 1);
+        let target = Self::slot(idx).get_mut(&mut self.ai);
+        target.model = pair;
+        target.thinking.clear();
+        self.statuses[idx] = DashboardRectStatus::Modified;
+    }
+
+    fn mark_saved(&mut self) {
+        for status in &mut self.statuses {
+            *status = DashboardRectStatus::Saved;
+        }
+        self.base_ai = normalize_ai(&self.ai);
+        self.ai = self.base_ai.clone();
+    }
+
+    /// The normalized config to persist / stage back into the dashboard editor.
+    fn build_ai(&self) -> AiConfig {
+        normalize_ai(&self.ai)
     }
 }
 
@@ -1248,17 +1420,19 @@ pub struct SettingsScreen {
     link_cache_dir_input: Option<InputPrompt>,
     dashboard_editor: Option<DashboardEditor>,
     dashboard_input: Option<InputPrompt>,
+    /// Per-command AI model editor, alive only while on the AI Settings
+    /// sub-screen (reached from the Dashboard `ai` rectangle).
+    ai_settings_editor: Option<AiSettingsEditor>,
     notifications_editor: Option<NotificationsEditor>,
     /// Result of the background `opencode models opencode` fetch surfaced
-    /// inline under the `ai` rectangle. `None` while the request is in
+    /// inline under the AI Settings slots. `None` while the request is in
     /// flight; `Some(Ok(_))` after a successful list, `Some(Err(_))` to
     /// render the failure message instead of chips. The cursor lives in
-    /// `DashboardEditor::selection::FreeModels(i)` — there is no separate
-    /// focus field.
+    /// `AiSettingsSelection::FreeModels(i)` — there is no separate focus field.
     free_models: Option<Result<Vec<String>, String>>,
     /// `provider/model` → authoritative reasoning variants (weakest→strongest),
-    /// harvested from `opencode models --verbose`. Drives the `ai` field's
-    /// ←/→ reasoning cycle so it only steps through the levels the chosen model
+    /// harvested from `opencode models --verbose`. Drives each AI slot's ←/→
+    /// reasoning cycle so it only steps through the levels the chosen model
     /// actually accepts. `None` until the background fetch lands; a model
     /// missing from the map falls back to the generic ladder.
     ai_model_variants: Option<std::collections::HashMap<String, Vec<String>>>,
@@ -1309,6 +1483,7 @@ impl SettingsScreen {
             link_cache_dir_input: None,
             dashboard_editor: None,
             dashboard_input: None,
+            ai_settings_editor: None,
             notifications_editor: None,
             free_models: None,
             ai_model_variants: None,
@@ -1537,11 +1712,9 @@ impl SettingsScreen {
     /// onto the ai rectangle so the user isn't stranded.
     pub fn set_free_models_error(&mut self, message: String) {
         self.free_models = Some(Err(message));
-        if let Some(editor) = self.dashboard_editor.as_mut() {
-            if matches!(editor.selection, DashboardSelection::FreeModels(_)) {
-                if let Some(idx) = ai_field_index() {
-                    editor.selection = DashboardSelection::Rect(idx);
-                }
+        if let Some(editor) = self.ai_settings_editor.as_mut() {
+            if let AiSettingsSelection::FreeModels(_) = editor.selection {
+                editor.selection = AiSettingsSelection::Rect(editor.last_rect);
             }
         }
     }
@@ -1575,23 +1748,14 @@ impl SettingsScreen {
         REASONING_VARIANTS.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Stamp the picked model + thinking strength into the still-active
-    /// dashboard editor and put the cursor back on the `ai` rectangle. The
-    /// value is marked `Modified` (not `Saved`) — the user persists it via the
-    /// same Save button as every other dashboard field, matching the rest of
-    /// the page's edit-then-Save model. Leaves the editor on screen so the
-    /// user lands back where they were instead of bouncing to the menu.
+    /// Stamp the picked model + thinking strength into the focused slot of the
+    /// AI Settings sub-screen. The slot is marked `Modified` (not `Saved`) — the
+    /// user persists it via the Save button, matching the edit-then-Save model
+    /// of every other settings page. Leaves the editor on screen.
     pub fn apply_ai_selection(&mut self, model: String, thinking: String) {
-        let Some(editor) = self.dashboard_editor.as_mut() else {
-            return;
-        };
-        let Some(idx) = ai_field_index() else {
-            return;
-        };
-        editor.values[idx] = model;
-        editor.thinking = thinking;
-        editor.statuses[idx] = DashboardRectStatus::Modified;
-        editor.selection = DashboardSelection::Rect(idx);
+        if let Some(editor) = self.ai_settings_editor.as_mut() {
+            editor.apply_selection(model, thinking);
+        }
     }
 
     pub fn start_checking_updates(&mut self) {
@@ -1720,6 +1884,7 @@ impl SettingsScreen {
             SettingsStep::LinkCacheDir => self.handle_link_cache_dir(key),
             SettingsStep::PathTemplate => self.handle_path_template(key),
             SettingsStep::Dashboard => self.handle_dashboard(key),
+            SettingsStep::AiSettings => self.handle_ai_settings(key),
             SettingsStep::Notifications => self.handle_notifications(key),
         }
     }
@@ -1787,8 +1952,6 @@ impl SettingsScreen {
                         if matches!(value, SettingsStep::Dashboard) {
                             self.dashboard_editor =
                                 Some(DashboardEditor::new(&self.config.dashboard));
-                            self.free_models = None;
-                            return SettingsAction::FetchFreeModels;
                         }
                         if matches!(value, SettingsStep::Notifications) {
                             self.notifications_editor =
@@ -1895,6 +2058,12 @@ impl SettingsScreen {
                 }
                 self.handle_dashboard(enter)
             }
+            SettingsMouseTarget::AiSettingsSave => {
+                if let Some(editor) = self.ai_settings_editor.as_mut() {
+                    editor.selection = AiSettingsSelection::Save;
+                }
+                self.handle_ai_settings(enter)
+            }
             SettingsMouseTarget::NotificationsSave => {
                 if let Some(editor) = self.notifications_editor.as_mut() {
                     editor.selection = NotificationsSelection::Save;
@@ -1976,11 +2145,6 @@ impl SettingsScreen {
                 }
                 if matches!(value, SettingsStep::Dashboard) {
                     self.dashboard_editor = Some(DashboardEditor::new(&self.config.dashboard));
-                    // Drop any cached list on each entry — opencode rotates
-                    // its free-model roster regularly, so we always show the
-                    // loading state until the fresh `opencode models opencode`
-                    // shell-out lands.
-                    self.free_models = None;
                 }
                 if matches!(value, SettingsStep::Notifications) {
                     self.notifications_editor =
@@ -1988,9 +2152,6 @@ impl SettingsScreen {
                 }
                 if matches!(value, SettingsStep::CopySettings) {
                     self.copy_settings_select = Some(self.build_copy_settings_select());
-                }
-                if matches!(value, SettingsStep::Dashboard) {
-                    return SettingsAction::FetchFreeModels;
                 }
                 SettingsAction::Continue
             }
@@ -2777,11 +2938,11 @@ impl SettingsScreen {
 
         let mut start_editing = None;
         let mut toggle_idx = None;
+        let mut open_ai_settings: Option<AiConfig> = None;
         let action = match key.code {
             KeyCode::Esc => {
                 self.dashboard_editor = None;
                 self.dashboard_input = None;
-                self.free_models = None;
                 self.step = SettingsStep::Menu;
                 SettingsAction::Continue
             }
@@ -2793,18 +2954,6 @@ impl SettingsScreen {
                 self.dashboard_step_down();
                 SettingsAction::Continue
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if !self.dashboard_adjust_ai_thinking(false) {
-                    self.dashboard_cycle_chip(false);
-                }
-                SettingsAction::Continue
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if !self.dashboard_adjust_ai_thinking(true) {
-                    self.dashboard_cycle_chip(true);
-                }
-                SettingsAction::Continue
-            }
             KeyCode::Enter => match editor.selection {
                 DashboardSelection::Rect(i) => {
                     let field = editor.field(i);
@@ -2812,24 +2961,18 @@ impl SettingsScreen {
                         toggle_idx = Some(i);
                         SettingsAction::Continue
                     } else if matches!(field, DashboardField::Ai) {
-                        // The ai field is selected from a fetched list of
-                        // opencode-known models, not free-typed. Surface the
-                        // current model + thinking strength so the picker
-                        // pre-selects them when the catalogue arrives.
-                        SettingsAction::OpenAiModelPicker {
-                            model: editor.values[i].clone(),
-                            variant: editor.thinking.clone(),
-                        }
+                        // Drill into the AI Settings sub-screen to choose a
+                        // model + thinking strength for each AI command.
+                        open_ai_settings = Some(editor.ai.clone());
+                        SettingsAction::Continue
                     } else {
                         start_editing = Some(i);
                         SettingsAction::Continue
                     }
                 }
-                DashboardSelection::FreeModels(_) => {
-                    self.apply_focused_free_model_inline();
-                    SettingsAction::Continue
+                DashboardSelection::Save => {
+                    SettingsAction::SaveDashboard(Box::new(editor.build_config()))
                 }
-                DashboardSelection::Save => SettingsAction::SaveDashboard(editor.build_config()),
             },
             _ => SettingsAction::Continue,
         };
@@ -2840,8 +2983,113 @@ impl SettingsScreen {
         if let Some(idx) = start_editing {
             self.start_dashboard_editing(idx);
         }
+        if let Some(ai) = open_ai_settings {
+            self.ai_settings_editor = Some(AiSettingsEditor::new(&ai));
+            self.free_models = None;
+            self.step = SettingsStep::AiSettings;
+            // Populate the free-model chip row + per-model variant ladders.
+            return SettingsAction::FetchFreeModels;
+        }
 
         action
+    }
+
+    fn handle_ai_settings(&mut self, key: KeyEvent) -> SettingsAction {
+        let editor = match self.ai_settings_editor.as_mut() {
+            Some(e) => e,
+            None => {
+                self.step = SettingsStep::Dashboard;
+                return SettingsAction::Continue;
+            }
+        };
+
+        let mut open_picker: Option<AiModelConfig> = None;
+        let action = match key.code {
+            KeyCode::Esc => {
+                // Stage the (possibly edited) per-command config back into the
+                // still-open Dashboard editor so its Save persists it, then
+                // return to the Dashboard sub-screen.
+                let staged = editor.build_ai();
+                let changed = staged != normalize_ai(&editor.base_ai);
+                self.ai_settings_editor = None;
+                self.free_models = None;
+                if let Some(dash) = self.dashboard_editor.as_mut() {
+                    dash.ai = staged;
+                    if let Some(idx) = ai_field_index() {
+                        if changed {
+                            dash.statuses[idx] = DashboardRectStatus::Modified;
+                        }
+                        dash.selection = DashboardSelection::Rect(idx);
+                    }
+                }
+                self.step = SettingsStep::Dashboard;
+                SettingsAction::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.ai_settings_step_up();
+                SettingsAction::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.ai_settings_step_down();
+                SettingsAction::Continue
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if !self.ai_settings_adjust_thinking(false) {
+                    self.ai_settings_cycle_chip(false);
+                }
+                SettingsAction::Continue
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if !self.ai_settings_adjust_thinking(true) {
+                    self.ai_settings_cycle_chip(true);
+                }
+                SettingsAction::Continue
+            }
+            KeyCode::Enter => match editor.selection {
+                AiSettingsSelection::Rect(_) => {
+                    // Open the model picker pre-filled with this slot's model +
+                    // thinking. The picker writes back via `apply_ai_selection`.
+                    open_picker = Some(editor.focused_model());
+                    SettingsAction::Continue
+                }
+                AiSettingsSelection::FreeModels(_) => {
+                    self.apply_focused_free_model_ai();
+                    SettingsAction::Continue
+                }
+                AiSettingsSelection::Save => self.save_ai_settings(),
+            },
+            _ => SettingsAction::Continue,
+        };
+
+        if let Some(model) = open_picker {
+            return SettingsAction::OpenAiModelPicker {
+                model: model.model,
+                variant: model.thinking,
+            };
+        }
+
+        action
+    }
+
+    /// Stage the AI sub-screen config into the Dashboard editor and persist the
+    /// whole dashboard config (so the AI page's Save behaves like every other
+    /// Save button). Returns the `SaveDashboard` action for the App to write.
+    fn save_ai_settings(&mut self) -> SettingsAction {
+        let staged = match self.ai_settings_editor.as_mut() {
+            Some(editor) => {
+                editor.mark_saved();
+                editor.build_ai()
+            }
+            None => return SettingsAction::Continue,
+        };
+        let Some(dash) = self.dashboard_editor.as_mut() else {
+            return SettingsAction::Continue;
+        };
+        dash.ai = staged;
+        if let Some(idx) = ai_field_index() {
+            dash.statuses[idx] = DashboardRectStatus::Saved;
+        }
+        SettingsAction::SaveDashboard(Box::new(dash.build_config()))
     }
 
     fn handle_notifications(&mut self, key: KeyEvent) -> SettingsAction {
@@ -2915,75 +3163,83 @@ impl SettingsScreen {
         }
     }
 
-    /// Drive Up navigation across rect / chips / Save. The chip row sits
-    /// between the ai rectangle and the Save button when models are
-    /// available; otherwise the cursor jumps straight between them.
+    /// Up navigation across the dashboard rectangles + Save (no chip row —
+    /// per-command AI models live on the AI Settings sub-screen now).
     fn dashboard_step_up(&mut self) {
-        let chips: Option<Vec<String>> = self.free_models_list().map(|l| l.to_vec());
         let Some(editor) = self.dashboard_editor.as_mut() else {
             return;
         };
-        let ai_idx = ai_field_index();
         editor.selection = match editor.selection {
             DashboardSelection::Rect(0) => DashboardSelection::Rect(0),
-            DashboardSelection::Rect(i)
-                if ai_idx == Some(i - 1) && chips.as_deref().is_some_and(|c| !c.is_empty()) =>
-            {
-                DashboardSelection::FreeModels(starting_chip_index(
-                    editor,
-                    chips.as_deref().unwrap_or(&[]),
-                ))
-            }
             DashboardSelection::Rect(i) => DashboardSelection::Rect(i - 1),
-            DashboardSelection::FreeModels(_) => {
-                DashboardSelection::Rect(ai_idx.unwrap_or(editor.values.len() - 1))
-            }
-            DashboardSelection::Save => match chips.as_deref() {
-                Some(chips) if Some(editor.values.len().saturating_sub(1)) == ai_idx => {
-                    DashboardSelection::FreeModels(starting_chip_index(editor, chips))
-                }
-                _ => DashboardSelection::Rect(editor.values.len() - 1),
-            },
+            DashboardSelection::Save => DashboardSelection::Rect(editor.values.len() - 1),
         };
     }
 
     fn dashboard_step_down(&mut self) {
-        let chips: Option<Vec<String>> = self.free_models_list().map(|l| l.to_vec());
         let Some(editor) = self.dashboard_editor.as_mut() else {
             return;
         };
-        let ai_idx = ai_field_index();
         editor.selection = match editor.selection {
-            DashboardSelection::Rect(i) if Some(i) == ai_idx => match chips.as_deref() {
-                Some(chips) if !chips.is_empty() => {
-                    DashboardSelection::FreeModels(starting_chip_index(editor, chips))
-                }
-                _ if i + 1 < editor.values.len() => DashboardSelection::Rect(i + 1),
-                _ => DashboardSelection::Save,
-            },
             DashboardSelection::Rect(i) if i + 1 < editor.values.len() => {
                 DashboardSelection::Rect(i + 1)
             }
             DashboardSelection::Rect(_) => DashboardSelection::Save,
-            DashboardSelection::FreeModels(_) => match ai_idx {
-                Some(i) if i + 1 < editor.values.len() => DashboardSelection::Rect(i + 1),
-                _ => DashboardSelection::Save,
-            },
             DashboardSelection::Save => DashboardSelection::Save,
         };
     }
 
-    /// Left/Right cycle within the chip row. No-op unless the cursor is
-    /// actually on the chip row and we have at least one chip cached.
-    fn dashboard_cycle_chip(&mut self, forward: bool) {
+    // ── AI Settings sub-screen navigation ──────────────────────────────────
+
+    /// Up navigation across slot rectangles / chip row / Save. The chip row
+    /// sits between the last slot and Save when free models are cached.
+    fn ai_settings_step_up(&mut self) {
+        let has_chips = self.free_models_list().is_some();
+        let Some(editor) = self.ai_settings_editor.as_mut() else {
+            return;
+        };
+        let last = AiSlot::ALL.len() - 1;
+        editor.selection = match editor.selection {
+            AiSettingsSelection::Rect(0) => AiSettingsSelection::Rect(0),
+            AiSettingsSelection::Rect(i) => {
+                editor.last_rect = i - 1;
+                AiSettingsSelection::Rect(i - 1)
+            }
+            AiSettingsSelection::FreeModels(_) => AiSettingsSelection::Rect(last),
+            AiSettingsSelection::Save if has_chips => AiSettingsSelection::FreeModels(0),
+            AiSettingsSelection::Save => AiSettingsSelection::Rect(last),
+        };
+    }
+
+    fn ai_settings_step_down(&mut self) {
+        let has_chips = self.free_models_list().is_some();
+        let Some(editor) = self.ai_settings_editor.as_mut() else {
+            return;
+        };
+        let last = AiSlot::ALL.len() - 1;
+        editor.selection = match editor.selection {
+            AiSettingsSelection::Rect(i) if i < last => {
+                editor.last_rect = i + 1;
+                AiSettingsSelection::Rect(i + 1)
+            }
+            AiSettingsSelection::Rect(_) if has_chips => AiSettingsSelection::FreeModels(0),
+            AiSettingsSelection::Rect(_) => AiSettingsSelection::Save,
+            AiSettingsSelection::FreeModels(_) => AiSettingsSelection::Save,
+            AiSettingsSelection::Save => AiSettingsSelection::Save,
+        };
+    }
+
+    /// Left/Right cycle within the AI Settings chip row. No-op unless the
+    /// cursor is on the chip row with at least one chip cached.
+    fn ai_settings_cycle_chip(&mut self, forward: bool) {
         let chip_count = match self.free_models_list().map(|l| l.len()) {
             Some(n) if n > 0 => n,
             _ => return,
         };
-        let Some(editor) = self.dashboard_editor.as_mut() else {
+        let Some(editor) = self.ai_settings_editor.as_mut() else {
             return;
         };
-        if let DashboardSelection::FreeModels(i) = editor.selection {
+        if let AiSettingsSelection::FreeModels(i) = editor.selection {
             let next = if forward {
                 (i + 1) % chip_count
             } else if i == 0 {
@@ -2991,35 +3247,32 @@ impl SettingsScreen {
             } else {
                 i - 1
             };
-            editor.selection = DashboardSelection::FreeModels(next);
+            editor.selection = AiSettingsSelection::FreeModels(next);
         }
     }
 
-    /// Left/Right on the `ai` rectangle adjusts the staged thinking
-    /// strength. The empty string is the persisted "Default" value; concrete
-    /// variants follow opencode's weakest-to-strongest ladder.
-    fn dashboard_adjust_ai_thinking(&mut self, increase: bool) -> bool {
-        let Some(idx) = ai_field_index() else {
-            return false;
-        };
-        // Read the editor state up front so the immutable borrow is released
-        // before `ai_thinking_ladder` (which also borrows `self`).
-        let (pair, current) = {
-            let Some(editor) = self.dashboard_editor.as_ref() else {
+    /// Left/Right on a slot rectangle adjusts that slot's thinking strength.
+    /// The empty string is the persisted "Default"; concrete variants follow
+    /// the chosen model's own weakest-to-strongest ladder. Returns `true` when
+    /// the cursor was on a rectangle (so the caller skips chip cycling).
+    fn ai_settings_adjust_thinking(&mut self, increase: bool) -> bool {
+        // Read the targeted slot + its model up front so the immutable borrow
+        // is released before `ai_thinking_ladder` (which also borrows `self`).
+        let (idx, pair, current) = {
+            let Some(editor) = self.ai_settings_editor.as_ref() else {
                 return false;
             };
-            if !matches!(editor.selection, DashboardSelection::Rect(i) if i == idx) {
+            let AiSettingsSelection::Rect(idx) = editor.selection else {
                 return false;
-            }
-            let pair = editor.values[idx].trim().to_string();
+            };
+            let model = AiSettingsEditor::slot(idx).get(&editor.ai);
+            let pair = model.model.trim().to_string();
             if pair.is_empty() {
                 return true;
             }
-            (pair, editor.thinking.clone())
+            (idx, pair, model.thinking.clone())
         };
 
-        // Step through the chosen model's own reasoning ladder, not a fixed
-        // one — e.g. Kimi accepts none (cycle is a no-op), GLM only high/max.
         let ladder = self.ai_thinking_ladder(&pair);
         let current_idx = reasoning_level_index(&ladder, &current);
         let next_idx = if increase {
@@ -3028,37 +3281,33 @@ impl SettingsScreen {
             current_idx.saturating_sub(1)
         };
         let next = reasoning_level_at(&ladder, next_idx).unwrap_or_default();
-        let Some(editor) = self.dashboard_editor.as_mut() else {
+        let Some(editor) = self.ai_settings_editor.as_mut() else {
             return false;
         };
-        if next != editor.thinking {
-            editor.thinking = next;
+        let target = AiSettingsEditor::slot(idx).get_mut(&mut editor.ai);
+        if next != target.thinking {
+            target.thinking = next;
             editor.statuses[idx] = DashboardRectStatus::Modified;
         }
         true
     }
 
-    /// Stamp the chip-row cursor's pair into the `ai` rectangle without
-    /// saving — the user persists the change by pressing the screen's Save
-    /// button just like any other dashboard field. Cursor stays on the
-    /// chip row so the user can keep cycling.
-    fn apply_focused_free_model_inline(&mut self) {
+    /// Stage the chip-row cursor's pair into the targeted slot without saving —
+    /// persisted via the Save button. Cursor stays on the chip row so the user
+    /// can keep cycling.
+    fn apply_focused_free_model_ai(&mut self) {
         let models = match self.free_models_list() {
             Some(list) => list.to_vec(),
             None => return,
         };
-        let Some(editor) = self.dashboard_editor.as_mut() else {
+        let Some(editor) = self.ai_settings_editor.as_mut() else {
             return;
         };
-        let DashboardSelection::FreeModels(i) = editor.selection else {
+        let AiSettingsSelection::FreeModels(i) = editor.selection else {
             return;
         };
         let pair = models[i.min(models.len() - 1)].clone();
-        if let Some(idx) = ai_field_index() {
-            editor.values[idx] = pair;
-            editor.thinking.clear();
-            editor.statuses[idx] = DashboardRectStatus::Modified;
-        }
+        editor.apply_free_model(pair);
     }
 
     fn toggle_dashboard_bool(&mut self, idx: usize) {
@@ -3229,6 +3478,7 @@ impl SettingsScreen {
             SettingsStep::LinkCacheDir => self.link_cache_dir_preferred_height(),
             SettingsStep::IgnorePatterns => self.pattern_list_preferred_height(),
             SettingsStep::Dashboard => self.dashboard_preferred_height(),
+            SettingsStep::AiSettings => self.ai_settings_preferred_height(),
             SettingsStep::Notifications => self.notifications_preferred_height(),
             SettingsStep::PathTemplate => self.path_template_preferred_height(),
             SettingsStep::TerminalCmd => self.terminal_cmd_preferred_height(),
@@ -3260,6 +3510,13 @@ impl SettingsScreen {
         // + spacer + Save button (3 rows) + saving-to line + footer hint.
         let rects = DashboardField::ALL.len() as u16;
         2 + rects * 3 + rects + 1 + 3 + 2
+    }
+
+    fn ai_settings_preferred_height(&self) -> u16 {
+        // Title + description + slot rectangles (3 rows each) + hint rows
+        // + chip row + chip hint + spacer + Save button (3 rows) + footer hint.
+        let rects = AiSlot::ALL.len() as u16;
+        2 + rects * 3 + rects + 2 + 1 + 3 + 1
     }
 
     fn path_template_preferred_height(&self) -> u16 {
@@ -3309,6 +3566,7 @@ impl SettingsScreen {
             SettingsStep::IgnorePatterns => self.render_ignore_patterns(frame, area),
             SettingsStep::PathTemplate => self.render_path_template(frame, area),
             SettingsStep::Dashboard => self.render_dashboard(frame, area),
+            SettingsStep::AiSettings => self.render_ai_settings(frame, area),
             SettingsStep::Notifications => self.render_notifications(frame, area),
             SettingsStep::PostCmd => self.render_post_cmd(frame, area),
             SettingsStep::TerminalCmd => self.render_terminal_cmd(frame, area),
@@ -3906,24 +4164,10 @@ impl SettingsScreen {
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
-        // Track where each field's rect chunk ends up so we can splice the
-        // free-model chip rows in immediately after the ai rectangle's
-        // ↳ hint. The chips are scoped to ai, not the whole page, so
-        // they belong next to that one field.
-        let ai_field_idx = DashboardField::ALL
-            .iter()
-            .position(|f| matches!(f, DashboardField::Ai));
         let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
-        let mut chip_chunks: Option<(usize, usize)> = None;
-        for (i, _field) in DashboardField::ALL.iter().enumerate() {
+        for _ in DashboardField::ALL.iter() {
             constraints.push(Constraint::Length(3));
             constraints.push(Constraint::Length(1));
-            if Some(i) == ai_field_idx {
-                let chip_idx = constraints.len();
-                constraints.push(Constraint::Length(1)); // chips line
-                constraints.push(Constraint::Length(1)); // chip-action hint
-                chip_chunks = Some((chip_idx, chip_idx + 1));
-            }
         }
         constraints.push(Constraint::Min(0));
         constraints.push(Constraint::Length(3));
@@ -3953,13 +4197,6 @@ impl SettingsScreen {
             let hint_chunk = chunks[cursor + 1];
             self.render_dashboard_rectangle(frame, rect_chunk, hint_chunk, editor, i, editing_idx);
             cursor += 2;
-            if Some(i) == ai_field_idx {
-                cursor += 2;
-            }
-        }
-
-        if let Some((chips_idx, hint_idx)) = chip_chunks {
-            self.render_dashboard_free_models(frame, chunks[chips_idx], chunks[hint_idx]);
         }
 
         // The cursor now points at `Min(0)`. Save button is one past that,
@@ -3974,11 +4211,8 @@ impl SettingsScreen {
         ]);
         frame.render_widget(Paragraph::new(saving_line), chunks[cursor + 2]);
 
-        let on_chips = matches!(editor.selection, DashboardSelection::FreeModels(_));
         let hint = if editing_idx.is_some() {
             "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
-        } else if on_chips {
-            "← → cycle chips • Enter stages into ai • ↑↓ leave row • Esc to go back"
         } else {
             "↑↓ to move • Enter to edit/toggle/Save • Esc to go back"
         };
@@ -3988,24 +4222,21 @@ impl SettingsScreen {
         );
     }
 
-    /// Render the "Current free models:" chip row that lives right under
-    /// the `ai` rectangle's ↳ hint, plus a per-state action hint. The
-    /// row is navigable: the cursor sits in
-    /// `DashboardSelection::FreeModels(i)`, and the matching chip lights
-    /// up ACCENT. A chip whose value equals the current `ai` rectangle
-    /// is highlighted SUCCESS so the user can tell at a glance which pair
-    /// is staged. Scoped to `ai` because the chips only ever apply to
-    /// that one field.
-    fn render_dashboard_free_models(&self, frame: &mut Frame, chips_area: Rect, hint_area: Rect) {
+    /// Render the shared "Current free models:" chip row beneath the AI
+    /// Settings slots, plus a per-state action hint. The cursor sits in
+    /// `AiSettingsSelection::FreeModels(i)`; the focused chip lights up ACCENT
+    /// and a chip matching the targeted slot's model lights up SUCCESS. Enter
+    /// stages the focused chip into the most-recently-focused command.
+    fn render_ai_settings_free_models(&self, frame: &mut Frame, chips_area: Rect, hint_area: Rect) {
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
         let info_style = Style::default().fg(colors::INFO);
 
         let focused_chip = self
-            .dashboard_editor
+            .ai_settings_editor
             .as_ref()
             .and_then(|e| match e.selection {
-                DashboardSelection::FreeModels(i) => Some(i),
+                AiSettingsSelection::FreeModels(i) => Some(i),
                 _ => None,
             });
 
@@ -4028,9 +4259,15 @@ impl SettingsScreen {
             }
             Some(Ok(models)) => {
                 let active = self
-                    .dashboard_editor
+                    .ai_settings_editor
                     .as_ref()
-                    .and_then(|e| ai_field_index().map(|idx| e.values[idx].trim().to_string()))
+                    .map(|e| {
+                        AiSettingsEditor::slot(e.last_rect)
+                            .get(&e.ai)
+                            .model
+                            .trim()
+                            .to_string()
+                    })
                     .unwrap_or_default();
                 for (i, model) in models.iter().enumerate() {
                     if i > 0 {
@@ -4061,7 +4298,7 @@ impl SettingsScreen {
 
         let action_hint = match &self.free_models {
             Some(Ok(models)) if !models.is_empty() && focused_chip.is_some() => {
-                "    ← →/h l cycle • Enter stages into ai • ↑↓ leave row"
+                "    ← →/h l cycle • Enter stages into the focused command • ↑↓ leave row"
             }
             Some(Ok(models)) if !models.is_empty() => {
                 "    Move down into the row to quick-pick a free model"
@@ -4075,6 +4312,192 @@ impl SettingsScreen {
                 hint_area,
             );
         }
+    }
+
+    /// Render the AI Settings sub-screen: one rectangle per AI command (model +
+    /// thinking strength), a shared free-model chip row, and a Save button.
+    fn render_ai_settings(&self, frame: &mut Frame, area: Rect) {
+        let editor = match &self.ai_settings_editor {
+            Some(e) => e,
+            None => return,
+        };
+
+        let title_style = Style::default()
+            .fg(colors::INFO)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(colors::MUTED);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+
+        let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
+        for _ in AiSlot::ALL.iter() {
+            constraints.push(Constraint::Length(3));
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Length(1)); // chips line
+        constraints.push(Constraint::Length(1)); // chip-action hint
+        constraints.push(Constraint::Min(0));
+        constraints.push(Constraint::Length(3)); // Save
+        constraints.push(Constraint::Length(1)); // bottom hint
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line("AI Models", title_style))),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(branded_line(
+                "Pick a model + thinking strength per AI command:",
+                muted_style,
+            ))),
+            chunks[1],
+        );
+
+        let mut cursor = 2usize;
+        for (i, _slot) in AiSlot::ALL.iter().enumerate() {
+            self.render_ai_settings_rectangle(frame, chunks[cursor], chunks[cursor + 1], editor, i);
+            cursor += 2;
+        }
+
+        self.render_ai_settings_free_models(frame, chunks[cursor], chunks[cursor + 1]);
+        cursor += 2;
+
+        // `cursor` now points at `Min(0)`; Save is one past it.
+        self.render_ai_settings_save_button(frame, chunks[cursor + 1], editor);
+
+        let on_chips = matches!(editor.selection, AiSettingsSelection::FreeModels(_));
+        let hint = if on_chips {
+            "← → cycle chips • Enter stages • ↑↓ leave row • Esc back to Dashboard"
+        } else {
+            "↑↓ move • ← → thinking strength • Enter pick model/Save • Esc back to Dashboard"
+        };
+        frame.render_widget(
+            Paragraph::new(hint).style(dim_muted_style),
+            chunks[cursor + 2],
+        );
+    }
+
+    fn render_ai_settings_rectangle(
+        &self,
+        frame: &mut Frame,
+        rect_area: Rect,
+        hint_area: Rect,
+        editor: &AiSettingsEditor,
+        idx: usize,
+    ) {
+        let muted_style = Style::default().fg(colors::MUTED);
+        let info_style = Style::default().fg(colors::INFO);
+
+        let slot = AiSlot::ALL[idx];
+        let model = slot.get(&editor.ai);
+        let status = editor.statuses[idx];
+        let is_selected = matches!(editor.selection, AiSettingsSelection::Rect(j) if j == idx);
+        let border_color = match status {
+            DashboardRectStatus::Unchanged => colors::WHITE,
+            DashboardRectStatus::Editing => colors::WARNING,
+            DashboardRectStatus::Modified => colors::ACCENT,
+            DashboardRectStatus::Saved => colors::SUCCESS,
+        };
+        let content_style = if is_selected {
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let border_style = Style::default().fg(border_color);
+
+        let mut inner_line = if model.model.trim().is_empty() {
+            Line::from(Span::styled(
+                "(none — press Enter to choose a model)",
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ))
+        } else {
+            Line::from(vec![
+                Span::raw(model.model.clone()),
+                Span::styled(
+                    format!(
+                        "  ·  {}",
+                        reasoning_level_label(
+                            &self.ai_thinking_ladder(model.model.trim()),
+                            &model.thinking,
+                        )
+                    ),
+                    Style::default()
+                        .fg(colors::MUTED)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ])
+        };
+        inner_line.style = content_style;
+
+        let title_line = if is_selected {
+            Line::from(vec![
+                Span::styled(
+                    POST_CMD_SELECTION_MARKER,
+                    Style::default().fg(colors::ACCENT),
+                ),
+                Span::styled(format!("{} ", slot.label()), info_style),
+            ])
+        } else {
+            Line::from(Span::styled(format!(" {} ", slot.label()), info_style))
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(border_style)
+            .padding(Padding::horizontal(1))
+            .title(title_line);
+        frame.render_widget(Paragraph::new(inner_line).block(block), rect_area);
+
+        let hint_line = Line::from(vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled(slot.hint(), muted_style),
+        ]);
+        frame.render_widget(Paragraph::new(hint_line), hint_area);
+    }
+
+    fn render_ai_settings_save_button(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        editor: &AiSettingsEditor,
+    ) {
+        let save_label = "Save";
+        let save_width = save_label.chars().count() as u16 + 4;
+        let side = area.width.saturating_sub(save_width) / 2;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(side),
+                Constraint::Length(save_width),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        let save_selected = editor.selection == AiSettingsSelection::Save;
+        let save_text_style = if save_selected {
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(colors::MUTED)
+        };
+
+        let save_box = Paragraph::new(Line::from(Span::styled(save_label, save_text_style))).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(colors::SUCCESS))
+                .padding(Padding::horizontal(1)),
+        );
+        frame.render_widget(save_box, cols[1]);
+        self.push_mouse_target(SettingsMouseTarget::AiSettingsSave, cols[1]);
     }
 
     fn render_dashboard_rectangle(
@@ -4115,30 +4538,21 @@ impl SettingsScreen {
                 .as_ref()
                 .map(|prompt| prompt.inline_line())
                 .unwrap_or_else(|| Line::from(Span::raw(value.clone())))
+        } else if matches!(field, DashboardField::Ai) {
+            // The `ai` rectangle is a gateway into the AI Settings sub-screen;
+            // show a compact "configured / total" summary rather than a single
+            // model value (per-command models live on the sub-screen).
+            let leaves = ai_slot_models(&editor.ai);
+            let configured = leaves.iter().filter(|m| !m.model.trim().is_empty()).count();
+            Line::from(Span::styled(
+                format!("{configured}/{} AI commands configured", leaves.len()),
+                Style::default().fg(colors::MUTED),
+            ))
         } else if value.is_empty() {
             let placeholder = Style::default()
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM);
             Line::from(Span::styled("(empty — press Enter to edit)", placeholder))
-        } else if matches!(field, DashboardField::Ai) {
-            // Show the staged thinking strength next to the model, e.g.
-            // "anthropic/claude-opus-4-7  ·  high". The variant is stored
-            // separately, so it never bleeds into the saved `ai` value.
-            Line::from(vec![
-                Span::raw(value.clone()),
-                Span::styled(
-                    format!(
-                        "  ·  {}",
-                        reasoning_level_label(
-                            &self.ai_thinking_ladder(value.trim()),
-                            &editor.thinking,
-                        )
-                    ),
-                    Style::default()
-                        .fg(colors::MUTED)
-                        .add_modifier(Modifier::DIM),
-                ),
-            ])
         } else {
             Line::from(Span::raw(value.clone()))
         };
@@ -5490,17 +5904,6 @@ fn reasoning_level_label<'a>(ladder: &[String], variant: &'a str) -> &'a str {
 /// When the cursor enters the chip row, prefer the chip whose value matches
 /// the `ai` rectangle's current contents. Falls back to chip 0 when no
 /// chip matches so the cursor always has somewhere visible to land.
-fn starting_chip_index(editor: &DashboardEditor, chips: &[String]) -> usize {
-    let Some(idx) = ai_field_index() else {
-        return 0;
-    };
-    let current = editor.values[idx].trim();
-    if current.is_empty() {
-        return 0;
-    }
-    chips.iter().position(|m| m == current).unwrap_or(0)
-}
-
 fn contains_position(area: Rect, position: Position) -> bool {
     position.x >= area.left()
         && position.x < area.right()
@@ -5528,14 +5931,6 @@ mod tests {
     use super::*;
     use crate::config::schema::{AiStatusConfig, WorktreeConfig};
 
-    fn dashboard_screen_with_free_models(models: Vec<String>) -> SettingsScreen {
-        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
-        screen.step = SettingsStep::Dashboard;
-        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
-        screen.set_free_models(models);
-        screen
-    }
-
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
@@ -5546,6 +5941,36 @@ mod tests {
         editor.selection = DashboardSelection::Rect(idx);
     }
 
+    /// Open the Dashboard editor, drill into the AI Settings sub-screen via the
+    /// `ai` rectangle, and cache the supplied free-model list.
+    fn ai_settings_screen(free: Vec<String>) -> SettingsScreen {
+        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
+        screen.step = SettingsStep::Dashboard;
+        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+        focus_ai(&mut screen);
+        let _ = screen.handle_dashboard(key(KeyCode::Enter));
+        if !free.is_empty() {
+            screen.set_free_models(free);
+        }
+        screen
+    }
+
+    fn focus_ai_slot(screen: &mut SettingsScreen, idx: usize) {
+        let editor = screen.ai_settings_editor.as_mut().unwrap();
+        editor.selection = AiSettingsSelection::Rect(idx);
+        editor.last_rect = idx;
+    }
+
+    /// Set a slot's model and reset its thinking to Default. Picking a model in
+    /// the real flow restamps both, and tests want a clean baseline now that
+    /// slots are seeded with non-blank per-command defaults.
+    fn set_slot_model(screen: &mut SettingsScreen, idx: usize, model: &str) {
+        let editor = screen.ai_settings_editor.as_mut().unwrap();
+        let leaf = AiSettingsEditor::slot(idx).get_mut(&mut editor.ai);
+        leaf.model = model.to_string();
+        leaf.thinking = String::new();
+    }
+
     fn dashboard_field_index(field: DashboardField) -> usize {
         DashboardField::ALL
             .iter()
@@ -5554,259 +5979,229 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_menu_emits_fetch_free_models_on_entry() {
-        let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
-        let select = screen.select.as_mut().expect("menu built in new()");
-        let dashboard_idx = select
-            .options
-            .iter()
-            .position(|opt| opt.value == SettingsStep::Dashboard)
-            .expect("dashboard option exists");
-        select.selected = dashboard_idx;
-        let action = screen.handle_key(key(KeyCode::Enter));
-        assert_eq!(action, SettingsAction::FetchFreeModels);
-        assert!(screen.dashboard_editor.is_some());
-        // Each entry resets the cache so we always re-fetch — opencode
-        // rotates its free-model roster regularly.
-        assert!(screen.free_models.is_none());
-    }
-
-    #[test]
-    fn down_from_ai_lands_on_chip_row_when_chips_present() {
-        let mut screen = dashboard_screen_with_free_models(vec![
-            "opencode/big-pickle".to_string(),
-            "opencode/deepseek-v4-flash-free".to_string(),
-        ]);
-        focus_ai(&mut screen);
-        let _ = screen.handle_dashboard(key(KeyCode::Down));
-        let editor = screen.dashboard_editor.as_ref().unwrap();
-        assert!(matches!(
-            editor.selection,
-            DashboardSelection::FreeModels(_)
-        ));
-    }
-
-    #[test]
-    fn down_from_ai_skips_chips_when_list_unavailable() {
+    fn entering_ai_settings_emits_fetch_free_models() {
         let mut screen = SettingsScreen::new(WorktreeConfig::default(), "test.json".to_string());
         screen.step = SettingsStep::Dashboard;
         screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
         focus_ai(&mut screen);
-        let _ = screen.handle_dashboard(key(KeyCode::Down));
-        let editor = screen.dashboard_editor.as_ref().unwrap();
-        // ai is the last dashboard field, so Down lands on Save when the
-        // chip row is unavailable.
-        assert_eq!(editor.selection, DashboardSelection::Save);
+        let action = screen.handle_dashboard(key(KeyCode::Enter));
+        assert_eq!(action, SettingsAction::FetchFreeModels);
+        assert_eq!(screen.step, SettingsStep::AiSettings);
+        assert!(screen.ai_settings_editor.is_some());
+        // Each entry resets the cache so we always re-fetch.
+        assert!(screen.free_models.is_none());
+    }
+
+    #[test]
+    fn down_from_last_slot_lands_on_chip_row_when_chips_present() {
+        let mut screen = ai_settings_screen(vec![
+            "opencode/big-pickle".to_string(),
+            "opencode/deepseek-v4-flash-free".to_string(),
+        ]);
+        focus_ai_slot(&mut screen, AiSlot::ALL.len() - 1);
+        let _ = screen.handle_ai_settings(key(KeyCode::Down));
+        let editor = screen.ai_settings_editor.as_ref().unwrap();
+        assert!(matches!(
+            editor.selection,
+            AiSettingsSelection::FreeModels(_)
+        ));
+    }
+
+    #[test]
+    fn down_from_last_slot_skips_chips_when_list_unavailable() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, AiSlot::ALL.len() - 1);
+        let _ = screen.handle_ai_settings(key(KeyCode::Down));
+        let editor = screen.ai_settings_editor.as_ref().unwrap();
+        assert_eq!(editor.selection, AiSettingsSelection::Save);
     }
 
     #[test]
     fn arrows_cycle_chip_selection() {
-        let mut screen = dashboard_screen_with_free_models(vec![
+        let mut screen = ai_settings_screen(vec![
             "a/x".to_string(),
             "b/y".to_string(),
             "c/z".to_string(),
         ]);
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::FreeModels(0);
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
         assert_eq!(
-            screen.dashboard_editor.as_ref().unwrap().selection,
-            DashboardSelection::FreeModels(1)
+            screen.ai_settings_editor.as_ref().unwrap().selection,
+            AiSettingsSelection::FreeModels(1)
         );
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
         // Wraps forward.
         assert_eq!(
-            screen.dashboard_editor.as_ref().unwrap().selection,
-            DashboardSelection::FreeModels(0)
+            screen.ai_settings_editor.as_ref().unwrap().selection,
+            AiSettingsSelection::FreeModels(0)
         );
         // Wraps backward.
-        let _ = screen.handle_dashboard(key(KeyCode::Left));
+        let _ = screen.handle_ai_settings(key(KeyCode::Left));
         assert_eq!(
-            screen.dashboard_editor.as_ref().unwrap().selection,
-            DashboardSelection::FreeModels(2)
+            screen.ai_settings_editor.as_ref().unwrap().selection,
+            AiSettingsSelection::FreeModels(2)
         );
     }
 
     #[test]
-    fn enter_on_chip_stages_value_into_ai_without_saving() {
-        let mut screen = dashboard_screen_with_free_models(vec![
+    fn enter_on_chip_stages_value_into_focused_slot_without_saving() {
+        let mut screen = ai_settings_screen(vec![
             "opencode/big-pickle".to_string(),
             "opencode/deepseek-v4-flash-free".to_string(),
         ]);
-        screen.dashboard_editor.as_mut().unwrap().thinking = "high".to_string();
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(1);
-        let action = screen.handle_dashboard(key(KeyCode::Enter));
-        // Stays on the page — no SaveDashboard, no ApplyFreeModel side-effect.
+        // Focus the fix_plan slot, give it a thinking level, then drop onto the
+        // chip row and stage a free model — which must clear the thinking.
+        focus_ai_slot(&mut screen, 1);
+        AiSettingsEditor::slot(1)
+            .get_mut(&mut screen.ai_settings_editor.as_mut().unwrap().ai)
+            .thinking = "high".to_string();
+        screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::FreeModels(1);
+        let action = screen.handle_ai_settings(key(KeyCode::Enter));
         assert_eq!(action, SettingsAction::Continue);
-        let editor = screen.dashboard_editor.as_ref().unwrap();
-        let idx = ai_field_index().unwrap();
-        assert_eq!(editor.values[idx], "opencode/deepseek-v4-flash-free");
-        assert_eq!(editor.thinking, "");
-        assert_eq!(editor.statuses[idx], DashboardRectStatus::Modified);
+        let editor = screen.ai_settings_editor.as_ref().unwrap();
+        let slot = AiSlot::ALL[1].get(&editor.ai);
+        assert_eq!(slot.model, "opencode/deepseek-v4-flash-free");
+        assert_eq!(slot.thinking, "");
+        assert_eq!(editor.statuses[1], DashboardRectStatus::Modified);
         // Cursor stays on the chip so the user can keep cycling.
-        assert_eq!(editor.selection, DashboardSelection::FreeModels(1));
+        assert_eq!(editor.selection, AiSettingsSelection::FreeModels(1));
     }
 
     #[test]
-    fn arrows_on_ai_adjust_reasoning_strength() {
-        let mut screen = dashboard_screen_with_free_models(vec![]);
-        focus_ai(&mut screen);
-        let idx = ai_field_index().unwrap();
-        screen.dashboard_editor.as_mut().unwrap().values[idx] = "opencode/big-pickle".to_string();
+    fn arrows_on_slot_adjust_reasoning_strength() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 0);
+        set_slot_model(&mut screen, 0, "opencode/big-pickle");
 
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        let editor = screen.dashboard_editor.as_ref().unwrap();
-        assert_eq!(editor.thinking, "minimal");
-        assert_eq!(editor.statuses[idx], DashboardRectStatus::Modified);
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let editor = screen.ai_settings_editor.as_ref().unwrap();
+        assert_eq!(AiSlot::ALL[0].get(&editor.ai).thinking, "minimal");
+        assert_eq!(editor.statuses[0], DashboardRectStatus::Modified);
 
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        assert_eq!(screen.dashboard_editor.as_ref().unwrap().thinking, "low");
-
-        let _ = screen.handle_dashboard(key(KeyCode::Left));
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
         assert_eq!(
-            screen.dashboard_editor.as_ref().unwrap().thinking,
-            "minimal"
+            AiSlot::ALL[0]
+                .get(&screen.ai_settings_editor.as_ref().unwrap().ai)
+                .thinking,
+            "low"
         );
 
-        let _ = screen.handle_dashboard(key(KeyCode::Left));
-        assert_eq!(screen.dashboard_editor.as_ref().unwrap().thinking, "");
+        let _ = screen.handle_ai_settings(key(KeyCode::Left));
+        let _ = screen.handle_ai_settings(key(KeyCode::Left));
+        assert_eq!(
+            AiSlot::ALL[0]
+                .get(&screen.ai_settings_editor.as_ref().unwrap().ai)
+                .thinking,
+            ""
+        );
     }
 
     #[test]
     fn arrows_use_authoritative_per_model_variants() {
-        // GLM-5.2 only accepts high/max. The first Right must jump straight to
-        // "high" (not the generic ladder's "minimal"), and stepping past "max"
-        // must clamp there.
-        let mut screen = dashboard_screen_with_free_models(vec![]);
-        focus_ai(&mut screen);
-        let idx = ai_field_index().unwrap();
-        screen.dashboard_editor.as_mut().unwrap().values[idx] = "opencode-go/glm-5.2".to_string();
+        // GLM-5.2 only accepts high/max. The first Right jumps straight to
+        // "high", and stepping past "max" clamps there.
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 1);
+        set_slot_model(&mut screen, 1, "opencode-go/glm-5.2");
         screen.set_ai_model_variants(std::collections::HashMap::from([(
             "opencode-go/glm-5.2".to_string(),
             vec!["high".to_string(), "max".to_string()],
         )]));
 
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        assert_eq!(screen.dashboard_editor.as_ref().unwrap().thinking, "high");
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        assert_eq!(screen.dashboard_editor.as_ref().unwrap().thinking, "max");
-        // Clamped at the strongest level.
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        assert_eq!(screen.dashboard_editor.as_ref().unwrap().thinking, "max");
+        let slot_thinking = |s: &SettingsScreen| {
+            AiSlot::ALL[1]
+                .get(&s.ai_settings_editor.as_ref().unwrap().ai)
+                .thinking
+                .clone()
+        };
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        assert_eq!(slot_thinking(&screen), "high");
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        assert_eq!(slot_thinking(&screen), "max");
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        assert_eq!(slot_thinking(&screen), "max");
     }
 
     #[test]
     fn arrows_are_inert_for_models_with_no_reasoning_variants() {
         // Kimi is reasoning-capable on models.dev but opencode exposes no
-        // variants for it, so the cycle must stay on "default".
-        let mut screen = dashboard_screen_with_free_models(vec![]);
-        focus_ai(&mut screen);
-        let idx = ai_field_index().unwrap();
-        screen.dashboard_editor.as_mut().unwrap().values[idx] =
-            "opencode-go/kimi-k2.7-code".to_string();
+        // variants, so the cycle stays on "default".
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 2);
+        set_slot_model(&mut screen, 2, "opencode-go/kimi-k2.7-code");
         screen.set_ai_model_variants(std::collections::HashMap::from([(
             "opencode-go/kimi-k2.7-code".to_string(),
             Vec::new(),
         )]));
 
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        assert_eq!(screen.dashboard_editor.as_ref().unwrap().thinking, "");
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        assert_eq!(screen.dashboard_editor.as_ref().unwrap().thinking, "");
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        assert_eq!(
+            AiSlot::ALL[2]
+                .get(&screen.ai_settings_editor.as_ref().unwrap().ai)
+                .thinking,
+            ""
+        );
     }
 
     #[test]
-    fn arrows_on_empty_ai_do_not_stage_orphaned_strength() {
-        let mut screen = dashboard_screen_with_free_models(vec![]);
-        focus_ai(&mut screen);
-
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-
-        let editor = screen.dashboard_editor.as_ref().unwrap();
-        let idx = ai_field_index().unwrap();
-        assert_eq!(editor.thinking, "");
-        assert_eq!(editor.statuses[idx], DashboardRectStatus::Saved);
+    fn arrows_on_empty_slot_do_not_stage_orphaned_strength() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 0);
+        set_slot_model(&mut screen, 0, ""); // clear the seeded default first
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let editor = screen.ai_settings_editor.as_ref().unwrap();
+        assert_eq!(AiSlot::ALL[0].get(&editor.ai).thinking, "");
+        assert_eq!(editor.statuses[0], DashboardRectStatus::Saved);
     }
 
     #[test]
-    fn save_dashboard_after_reasoning_arrow_persists_variant() {
-        let mut screen = dashboard_screen_with_free_models(vec![]);
-        focus_ai(&mut screen);
-        let idx = ai_field_index().unwrap();
-        screen.dashboard_editor.as_mut().unwrap().values[idx] = "opencode/big-pickle".to_string();
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        let _ = screen.handle_dashboard(key(KeyCode::Right));
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::Save;
+    fn save_ai_settings_persists_per_command_config() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 1); // fix_plan
+        set_slot_model(&mut screen, 1, "openai/gpt-5.5");
+        let _ = screen.handle_ai_settings(key(KeyCode::Right)); // minimal thinking
+        screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::Save;
 
-        match screen.handle_dashboard(key(KeyCode::Enter)) {
+        match screen.handle_ai_settings(key(KeyCode::Enter)) {
             SettingsAction::SaveDashboard(cfg) => {
-                assert_eq!(cfg.ai.model, "opencode/big-pickle");
-                assert_eq!(cfg.ai.thinking, "low");
+                assert_eq!(cfg.ai.fix.plan.model, "openai/gpt-5.5");
+                assert_eq!(cfg.ai.fix.plan.thinking, "minimal");
+                // Untouched slots keep their per-command default.
+                assert_eq!(cfg.ai.enrich.model, "opencode-go/deepseek-v4-flash");
             }
             other => panic!("expected SaveDashboard, got {other:?}"),
         }
     }
 
     #[test]
-    fn up_from_chips_returns_to_ai() {
-        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
-        let _ = screen.handle_dashboard(key(KeyCode::Up));
-        let idx = ai_field_index().unwrap();
-        assert_eq!(
-            screen.dashboard_editor.as_ref().unwrap().selection,
-            DashboardSelection::Rect(idx)
-        );
-    }
-
-    #[test]
-    fn down_from_chips_advances_to_save() {
-        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
-        let _ = screen.handle_dashboard(key(KeyCode::Down));
-        // ai (the rect above the chip row) is the last field, so stepping
-        // down out of the chips lands on Save.
-        assert_eq!(
-            screen.dashboard_editor.as_ref().unwrap().selection,
-            DashboardSelection::Save
-        );
-    }
-
-    #[test]
-    fn enter_on_save_after_chip_stage_emits_save_dashboard_with_chosen_model() {
-        let mut screen =
-            dashboard_screen_with_free_models(vec!["opencode/deepseek-v4-flash-free".to_string()]);
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
-        let _ = screen.handle_dashboard(key(KeyCode::Enter)); // stage
-        let _ = screen.handle_dashboard(key(KeyCode::Down)); // chips → Save
-        let action = screen.handle_dashboard(key(KeyCode::Enter));
-        match action {
-            SettingsAction::SaveDashboard(cfg) => {
-                assert_eq!(cfg.ai.model, "opencode/deepseek-v4-flash-free");
-            }
-            other => panic!("expected SaveDashboard, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn apply_ai_selection_marks_modified_and_stays_on_dashboard_step() {
-        let mut screen = dashboard_screen_with_free_models(vec![]);
+    fn apply_ai_selection_targets_focused_slot() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 3); // update
         screen.apply_ai_selection(
             "anthropic/claude-sonnet-4-5".to_string(),
             "high".to_string(),
         );
-        let editor = screen.dashboard_editor.as_ref().unwrap();
-        let idx = ai_field_index().unwrap();
-        assert_eq!(editor.values[idx], "anthropic/claude-sonnet-4-5");
-        assert_eq!(editor.thinking, "high");
-        // The chosen strength rides along into the persisted config, but only
-        // while a model is set.
-        assert_eq!(editor.build_config().ai.thinking, "high");
-        assert_eq!(editor.statuses[idx], DashboardRectStatus::Modified);
-        assert_eq!(editor.selection, DashboardSelection::Rect(idx));
-        // The editor is still on screen — the picker should hand the user
-        // back to the Dashboard editor, not bounce them to the menu.
+        let editor = screen.ai_settings_editor.as_ref().unwrap();
+        let slot = AiSlot::ALL[3].get(&editor.ai);
+        assert_eq!(slot.model, "anthropic/claude-sonnet-4-5");
+        assert_eq!(slot.thinking, "high");
+        assert_eq!(editor.statuses[3], DashboardRectStatus::Modified);
+        assert_eq!(editor.selection, AiSettingsSelection::Rect(3));
+    }
+
+    #[test]
+    fn esc_stages_ai_back_into_dashboard_and_returns() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 0);
+        set_slot_model(&mut screen, 0, "opencode/big-pickle");
+        let _ = screen.handle_ai_settings(key(KeyCode::Esc));
         assert_eq!(screen.step, SettingsStep::Dashboard);
+        assert!(screen.ai_settings_editor.is_none());
+        let dash = screen.dashboard_editor.as_ref().unwrap();
+        assert_eq!(dash.ai.enrich.model, "opencode/big-pickle");
+        let idx = ai_field_index().unwrap();
+        assert_eq!(dash.statuses[idx], DashboardRectStatus::Modified);
     }
 
     #[test]
@@ -5926,14 +6321,15 @@ mod tests {
 
     #[test]
     fn set_free_models_error_pulls_cursor_off_invisible_chip_row() {
-        let mut screen = dashboard_screen_with_free_models(vec!["opencode/big-pickle".to_string()]);
-        screen.dashboard_editor.as_mut().unwrap().selection = DashboardSelection::FreeModels(0);
+        let mut screen = ai_settings_screen(vec!["opencode/big-pickle".to_string()]);
+        let editor = screen.ai_settings_editor.as_mut().unwrap();
+        editor.last_rect = 2;
+        editor.selection = AiSettingsSelection::FreeModels(0);
         screen.set_free_models_error("opencode CLI missing".to_string());
         assert!(matches!(screen.free_models(), Some(Err(_))));
-        let idx = ai_field_index().unwrap();
         assert_eq!(
-            screen.dashboard_editor.as_ref().unwrap().selection,
-            DashboardSelection::Rect(idx)
+            screen.ai_settings_editor.as_ref().unwrap().selection,
+            AiSettingsSelection::Rect(2)
         );
     }
 }
