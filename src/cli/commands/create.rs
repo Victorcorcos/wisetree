@@ -4,7 +4,6 @@
 use crate::cli::args::CliArgs;
 use crate::errors::{Result, WisetreeError};
 use crate::git::types::WorktreeCreateOptions;
-use crate::utils::path::get_worktree_path;
 use crate::utils::validation::{
     normalize_branch_name, validate_branch_name, validate_directory_name, validate_source_ref,
 };
@@ -57,30 +56,14 @@ pub async fn run(args: CliArgs, service: &WorktreeService) -> Result<()> {
     if let Some(err) = validate_branch_name(&new_branch) {
         return Err(WisetreeError::other(format!("Invalid branch name: {err}")));
     }
-    let config = service.config_service().config().clone();
-    let git_root = git_service.git_root().to_path_buf();
-
-    let worktree_path = get_worktree_path(
-        &git_root,
-        name,
-        &config.worktree_path_template,
-        Some(&new_branch),
-        Some(source),
-    )
-    .map_err(|e| WisetreeError::other(e.to_string()))?;
-    let worktree_path_str = worktree_path.to_string_lossy().into_owned();
-    let base_path = worktree_path
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
     let opts = WorktreeCreateOptions {
         name: name.to_string(),
         source_branch: source.to_string(),
         new_branch: new_branch.clone(),
-        base_path,
+        base_path: String::new(),
     };
-    service.create_worktree(&opts, None, None).await?;
+    let outcome = service.create_worktree(&opts, None, None).await?;
+    let worktree_path_str = outcome.worktree_path.to_string_lossy().into_owned();
 
     println!("{worktree_path_str}");
     println!("  source: {source}");

@@ -125,6 +125,28 @@ impl GitService {
         Ok(worktrees)
     }
 
+    /// Return the main/mother worktree path from `git worktree list`.
+    pub async fn main_worktree_path(&self) -> Result<PathBuf> {
+        let result =
+            execute_git_command(&["worktree", "list", "--porcelain"], Some(&self.git_root)).await;
+        if !result.success {
+            return Err(handle_git_error(&result.stderr, "list worktrees"));
+        }
+
+        let mut worktrees = parse_worktree_porcelain(&result.stdout);
+        if !worktrees.iter().any(|w| w.is_main) {
+            if let Some(first) = worktrees.first_mut() {
+                first.is_main = true;
+            }
+        }
+
+        worktrees
+            .into_iter()
+            .find(|w| w.is_main)
+            .map(|w| PathBuf::from(w.path))
+            .ok_or_else(|| WisetreeError::other("No worktrees found"))
+    }
+
     /// List local + remote branches, ordered by recent reflog usage and
     /// deduplicated against `origin/*` mirrors.
     pub async fn list_branches(&self) -> Result<Vec<GitBranch>> {

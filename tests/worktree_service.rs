@@ -104,6 +104,57 @@ async fn create_worktree_full_flow_copies_env_files() {
 }
 
 #[tokio::test]
+async fn create_worktree_from_child_uses_mother_path_as_anchor() {
+    with_isolated_home(|| {
+        let body = async {
+            let fx = build_fixture();
+            let mut mother_svc = WorktreeService::new(Some(fx.repo.clone()));
+            mother_svc.initialize().await.expect("init mother");
+
+            let first = mother_svc
+                .create_worktree(
+                    &WorktreeCreateOptions {
+                        name: "feat-a".into(),
+                        source_branch: "main".into(),
+                        new_branch: "feat-a".into(),
+                        base_path: String::new(),
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .expect("create first worktree");
+
+            let mut child_svc = WorktreeService::new(Some(first.worktree_path.clone()));
+            child_svc.initialize().await.expect("init child");
+            let second = child_svc
+                .create_worktree(
+                    &WorktreeCreateOptions {
+                        name: "feat-b".into(),
+                        source_branch: "main".into(),
+                        new_branch: "feat-b".into(),
+                        base_path: first.worktree_path.to_string_lossy().into_owned(),
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .expect("create second worktree");
+
+            let expected = fx
+                .repo
+                .parent()
+                .expect("repo parent")
+                .join("repo.worktree")
+                .join("feat-b");
+            assert_eq!(second.worktree_path, expected);
+            assert!(second.worktree_path.exists());
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(body);
+    });
+}
+
+#[tokio::test]
 async fn create_worktree_runs_post_create_commands_with_progress() {
     with_isolated_home(|| {
         let body = async {

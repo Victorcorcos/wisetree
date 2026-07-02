@@ -105,7 +105,7 @@ impl WorktreeService {
         mut activity: Option<ActivityCallback<'_>>,
     ) -> Result<CreateOutcome> {
         let config = self.config_service.config().clone();
-        let git_root = self.effective_git_root();
+        let git_root = self.main_worktree_root().await?;
 
         if options.new_branch != options.source_branch
             && self.git_service.branch_exists(&options.new_branch).await
@@ -355,6 +355,10 @@ impl WorktreeService {
         }
         let svc_root: &Path = self.git_service.git_root();
         svc_root.to_path_buf()
+    }
+
+    async fn main_worktree_root(&self) -> Result<PathBuf> {
+        self.git_service.main_worktree_path().await
     }
 
     /// Resolve a template using the current config and provided variables.
