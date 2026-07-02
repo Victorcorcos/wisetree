@@ -3056,9 +3056,6 @@ fn wise_merge_candidate(row: &DashboardRow) -> Option<WiseMergeCandidate> {
         .as_ref()
         .filter(|value| !value.is_empty())?;
     let head_ref_oid = pr.head_ref_oid.as_ref().filter(|value| !value.is_empty())?;
-    if !row.worktree.commit.eq_ignore_ascii_case(head_ref_oid) {
-        return None;
-    }
 
     Some(WiseMergeCandidate {
         number: pr.number,
@@ -6118,10 +6115,11 @@ so the intent reads clearly.
     }
 
     #[test]
-    fn wise_merge_candidate_rejects_remote_head_that_differs_from_worktree_head() {
+    fn wise_merge_candidate_accepts_ready_pr_when_local_worktree_lags_remote_head() {
         let mut row = wise_merge_row(Some(ReviewStatus::Approved));
         row.pull_request.as_mut().unwrap().head_ref_oid = Some("def456".to_string());
-        assert!(wise_merge_candidate(&row).is_none());
+        let candidate = wise_merge_candidate(&row).expect("ready PR should match");
+        assert_eq!(candidate.head_ref_oid, "def456");
     }
 
     #[test]
