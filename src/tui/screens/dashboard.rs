@@ -47,6 +47,7 @@ enum ActionChoice {
     OpenPullRequest,
     EnrichPullRequest,
     FixPullRequest,
+    BugkillPullRequest,
     MergePullRequest,
     UpdatePullRequest,
     PushPullRequest,
@@ -140,6 +141,15 @@ pub struct FixPullRequestRequest {
     pub worktree_path: String,
 }
 
+/// Payload the dashboard hands to the "Bugkill" screen — the interactive
+/// bug-investigation + iterative-fix pipeline. No PR is required: a bug
+/// hunt works on any non-main worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BugkillRequest {
+    pub branch: String,
+    pub worktree_path: String,
+}
+
 /// Status filter for the bulk-delete buttons row rendered above the
 /// footer. The button caption matches the status-column label exactly so
 /// the two surfaces stay in lockstep.
@@ -221,6 +231,10 @@ pub enum DashboardAction {
     /// (plan → apply → commit → reply). Offered on a non-mother worktree
     /// whose PR is open or draft.
     FixPullRequest(Box<FixPullRequestRequest>),
+    /// Investigate a described bug, rank root causes, and iterate fix
+    /// attempts (commit on success, `git revert` on failure). Offered on
+    /// every non-mother worktree — no PR required.
+    Bugkill(Box<BugkillRequest>),
     /// Push the branch's local commits to origin (`git push origin HEAD`).
     /// Offered when the PR is Open and the branch is ahead-but-not-behind —
     /// the "merged-but-not-pushed" state a failed push can leave behind.
@@ -898,6 +912,17 @@ impl DashboardScreen {
                 color: colors::CYAN,
             });
         }
+        // Bugkill investigates a described bug and iterates fix attempts.
+        // Offered on every non-mother worktree — no PR required, so this
+        // button may make the PR-commands section appear on rows that
+        // previously had none (intended).
+        if build_bugkill_request(row).is_some() {
+            commands.push(PrCommand {
+                label: "Bugkill",
+                choice: ActionChoice::BugkillPullRequest,
+                color: colors::DARK_GREEN,
+            });
+        }
         // Update when the branch is behind its base (merge_status or local
         // behind count) or when GitHub reports the PR as conflicting (`Dirty`)
         // — both need an AI-assisted base merge. Mutually exclusive with Push.
@@ -1050,8 +1075,9 @@ impl DashboardScreen {
 
     /// Keyboard handling while a PR command button owns the focus: Left /
     /// Right move between buttons, Enter runs the focused action, Esc
-    /// dismisses the whole menu. Letter shortcuts (O/E/F/U/P/M/C) trigger the
-    /// matching PR command directly without needing to navigate to it first.
+    /// dismisses the whole menu. Letter shortcuts (O/E/F/B/U/P/M/C) trigger
+    /// the matching PR command directly without needing to navigate to it
+    /// first.
     fn handle_pr_command_key(&mut self, key: KeyEvent) -> DashboardAction {
         if self.pr_commands.is_empty() {
             self.action_pr_focus = None;
@@ -1070,6 +1096,7 @@ impl DashboardScreen {
                 KeyCode::Char('o') | KeyCode::Char('O') => &[ActionChoice::OpenPullRequest],
                 KeyCode::Char('e') | KeyCode::Char('E') => &[ActionChoice::EnrichPullRequest],
                 KeyCode::Char('f') | KeyCode::Char('F') => &[ActionChoice::FixPullRequest],
+                KeyCode::Char('b') | KeyCode::Char('B') => &[ActionChoice::BugkillPullRequest],
                 KeyCode::Char('u') | KeyCode::Char('U') => &[
                     ActionChoice::UpdatePullRequest,
                     ActionChoice::PushPullRequest,
@@ -1138,6 +1165,7 @@ impl DashboardScreen {
         let update_request = build_update_request(row);
         let enrich_request = build_enrich_request(row);
         let fix_request = build_fix_request(row);
+        let bugkill_request = build_bugkill_request(row);
         let push_request = build_push_request(row);
         let close_request = build_close_request(row);
         self.reset_action_menu();
@@ -1182,6 +1210,12 @@ impl DashboardScreen {
                 self.mode = DashboardMode::Table;
                 fix_request
                     .map(|request| DashboardAction::FixPullRequest(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::BugkillPullRequest => {
+                self.mode = DashboardMode::Table;
+                bugkill_request
+                    .map(|request| DashboardAction::Bugkill(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
             ActionChoice::PushPullRequest => {
@@ -2822,6 +2856,18 @@ fn build_fix_request(row: &DashboardRow) -> Option<FixPullRequestRequest> {
     })
 }
 
+/// Assemble the payload the "Bugkill" screen needs. Returns `None` only on
+/// the mother worktree — a bug hunt works on any other worktree, PR or not.
+fn build_bugkill_request(row: &DashboardRow) -> Option<BugkillRequest> {
+    if row.worktree.is_main {
+        return None;
+    }
+    Some(BugkillRequest {
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+    })
+}
+
 /// Assemble the payload for the push-only flow. Returns `None` unless the
 /// row's PR is Open and the branch is ahead-but-not-behind — mirrors the
 /// `row_has_unpushed` guard in `build_action_select`. Reuses the
@@ -3350,7 +3396,7 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Enrich", "Fix", "Upload", "Merge", "Close"]
+            vec!["Open", "Enrich", "Fix", "Bugkill", "Upload", "Merge", "Close"]
         );
     }
 
@@ -3359,7 +3405,7 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(1, 3)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Enrich", "Fix", "Update", "Merge", "Close"]
+            vec!["Open", "Enrich", "Fix", "Bugkill", "Update", "Merge", "Close"]
         );
     }
 
@@ -3374,9 +3420,47 @@ mod tests {
     }
 
     #[test]
-    fn pr_commands_empty_without_pull_request() {
+    fn pr_commands_without_pull_request_offer_only_bugkill() {
+        // A non-main row with no PR now shows a PR-commands section
+        // containing just Bugkill (intended: a bug hunt needs no PR).
         let r = row(None, Some(branch_status(0, 0)));
-        assert!(pr_labels(&r).is_empty());
+        assert_eq!(pr_labels(&r), ["Bugkill"]);
+    }
+
+    #[test]
+    fn bugkill_button_absent_on_the_mother_worktree() {
+        let mut r = row(Some(open_pr()), Some(branch_status(0, 0)));
+        r.worktree.is_main = true;
+        assert!(build_bugkill_request(&r).is_none());
+        assert!(!pr_labels(&r).iter().any(|l| l == "Bugkill"));
+    }
+
+    #[test]
+    fn bugkill_button_sits_between_fix_and_update() {
+        let mut pr = open_pr();
+        pr.merge_status = Some(MergeStatus::Behind);
+        let r = row(Some(pr), Some(branch_status(0, 2)));
+        let labels = pr_labels(&r);
+        let fix = labels.iter().position(|l| l == "Fix").expect("Fix");
+        let bugkill = labels.iter().position(|l| l == "Bugkill").expect("Bugkill");
+        let update = labels.iter().position(|l| l == "Update").expect("Update");
+        assert!(fix < bugkill && bugkill < update, "order was {labels:?}");
+    }
+
+    #[test]
+    fn b_shortcut_dispatches_bugkill_action() {
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.handle_key(key_event(KeyCode::Enter));
+        screen.handle_key(key_event(KeyCode::Tab));
+        let action = screen.handle_key(key_event(KeyCode::Char('b')));
+        match action {
+            DashboardAction::Bugkill(request) => {
+                assert_eq!(request.branch, "feature");
+                assert_eq!(request.worktree_path, "/tmp/repo-feature");
+            }
+            other => panic!("expected Bugkill, got {other:?}"),
+        }
+        assert!(screen.pr_commands.is_empty());
     }
 
     #[test]

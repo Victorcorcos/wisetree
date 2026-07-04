@@ -2,6 +2,7 @@
 //! eventually, a small piece of state owned by `App`.
 
 pub mod ai_model_picker;
+pub mod bugkill_pr;
 pub mod cache;
 pub mod create;
 pub mod dashboard;

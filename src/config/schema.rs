@@ -162,6 +162,19 @@ fn default_update_ai() -> AiModelConfig {
         thinking: String::new(),
     }
 }
+// Bugkill defaults mirror the Fix pipeline's split: `investigate` reasons
+// deeply over the whole codebase (same strong model as `fix.plan`), while
+// `fix` edits live and `judge` classifies a short comment (same fast model
+// as `fix.apply`).
+fn default_bugkill_investigate_ai() -> AiModelConfig {
+    default_fix_plan_ai()
+}
+fn default_bugkill_fix_ai() -> AiModelConfig {
+    default_fix_apply_ai()
+}
+fn default_bugkill_judge_ai() -> AiModelConfig {
+    default_fix_apply_ai()
+}
 
 /// Per-step models for the two-phase "Fix Pull Request" pipeline. `plan` judges
 /// and plans each review comment with a non-interactive `opencode run` (so it
@@ -181,6 +194,32 @@ impl Default for AiFixConfig {
         Self {
             plan: default_fix_plan_ai(),
             apply: default_fix_apply_ai(),
+        }
+    }
+}
+
+/// Per-role models for the "Bugkill" pipeline. `investigate` ranks
+/// root-cause hypotheses with a non-interactive `opencode run` (so it can
+/// afford a stronger reasoning model); `fix` applies one selected fix live
+/// in the embedded opencode TUI; `judge` classifies a freeform "Other"
+/// answer as fixed / not fixed with a tiny captured call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiBugkillConfig {
+    #[serde(default = "default_bugkill_investigate_ai")]
+    pub investigate: AiModelConfig,
+    #[serde(default = "default_bugkill_fix_ai")]
+    pub fix: AiModelConfig,
+    #[serde(default = "default_bugkill_judge_ai")]
+    pub judge: AiModelConfig,
+}
+
+impl Default for AiBugkillConfig {
+    fn default() -> Self {
+        Self {
+            investigate: default_bugkill_investigate_ai(),
+            fix: default_bugkill_fix_ai(),
+            judge: default_bugkill_judge_ai(),
         }
     }
 }
@@ -217,6 +256,7 @@ pub struct AiConfig {
     pub enrich: AiModelConfig,
     pub fix: AiFixConfig,
     pub update: AiModelConfig,
+    pub bugkill: AiBugkillConfig,
 }
 
 impl Default for AiConfig {
@@ -225,6 +265,7 @@ impl Default for AiConfig {
             enrich: default_enrich_ai(),
             fix: AiFixConfig::default(),
             update: default_update_ai(),
+            bugkill: AiBugkillConfig::default(),
         }
     }
 }
@@ -252,6 +293,8 @@ impl<'de> Deserialize<'de> for AiConfig {
             fix: Option<AiFixConfig>,
             #[serde(default)]
             update: Option<AiModelConfig>,
+            #[serde(default)]
+            bugkill: Option<AiBugkillConfig>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -284,6 +327,14 @@ impl<'de> Deserialize<'de> for AiConfig {
                 .update
                 .or_else(|| legacy.clone())
                 .unwrap_or_else(default_update_ai),
+            bugkill: raw.bugkill.unwrap_or_else(|| match &legacy {
+                Some(l) => AiBugkillConfig {
+                    investigate: l.clone(),
+                    fix: l.clone(),
+                    judge: l.clone(),
+                },
+                None => AiBugkillConfig::default(),
+            }),
         })
     }
 }
@@ -517,7 +568,15 @@ mod ai_config_tests {
         // `{ model, thinking }`. It must migrate by seeding every command.
         let json = r#"{ "model": "opencode/deepseek-v4-flash-free", "thinking": "max" }"#;
         let ai: AiConfig = serde_json::from_str(json).expect("legacy ai parses");
-        for leaf in [&ai.enrich, &ai.fix.plan, &ai.fix.apply, &ai.update] {
+        for leaf in [
+            &ai.enrich,
+            &ai.fix.plan,
+            &ai.fix.apply,
+            &ai.update,
+            &ai.bugkill.investigate,
+            &ai.bugkill.fix,
+            &ai.bugkill.judge,
+        ] {
             assert_eq!(leaf.model, "opencode/deepseek-v4-flash-free");
             assert_eq!(leaf.thinking, "max");
         }
@@ -555,6 +614,13 @@ mod ai_config_tests {
         assert_eq!(ai.fix.apply.thinking, "");
         assert_eq!(ai.update.model, "opencode-go/kimi-k2.7-code");
         assert_eq!(ai.update.thinking, "");
+        // Bugkill defaults mirror the Fix pipeline's plan/apply split.
+        assert_eq!(ai.bugkill.investigate.model, "opencode-go/glm-5.2");
+        assert_eq!(ai.bugkill.investigate.thinking, "max");
+        assert_eq!(ai.bugkill.fix.model, "opencode-go/kimi-k2.7-code");
+        assert_eq!(ai.bugkill.fix.thinking, "");
+        assert_eq!(ai.bugkill.judge.model, "opencode-go/kimi-k2.7-code");
+        assert_eq!(ai.bugkill.judge.thinking, "");
     }
 
     #[test]
@@ -573,7 +639,15 @@ mod ai_config_tests {
         // explicit choice), seeding all four slots.
         let json = r#"{ "model": "legacy/model", "thinking": "low" }"#;
         let ai: AiConfig = serde_json::from_str(json).unwrap();
-        for leaf in [&ai.enrich, &ai.fix.plan, &ai.fix.apply, &ai.update] {
+        for leaf in [
+            &ai.enrich,
+            &ai.fix.plan,
+            &ai.fix.apply,
+            &ai.update,
+            &ai.bugkill.investigate,
+            &ai.bugkill.fix,
+            &ai.bugkill.judge,
+        ] {
             assert_eq!(leaf.model, "legacy/model");
             assert_eq!(leaf.thinking, "low");
         }
@@ -587,6 +661,26 @@ mod ai_config_tests {
     }
 
     #[test]
+    fn unknown_bugkill_key_is_rejected() {
+        let json = r#"{ "bugkill": { "investigate": { "model": "x" }, "bogus": {} } }"#;
+        assert!(serde_json::from_str::<AiConfig>(json).is_err());
+    }
+
+    #[test]
+    fn partial_bugkill_slot_falls_back_per_slot() {
+        // Only `bugkill.judge` configured → investigate/fix fall back to their
+        // own defaults, never to judge's value.
+        let json = r#"{ "bugkill": { "judge": { "model": "tiny/judge", "thinking": "low" } } }"#;
+        let ai: AiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(ai.bugkill.judge.model, "tiny/judge");
+        assert_eq!(ai.bugkill.judge.thinking, "low");
+        assert_eq!(ai.bugkill.investigate.model, "opencode-go/glm-5.2");
+        assert_eq!(ai.bugkill.investigate.thinking, "max");
+        assert_eq!(ai.bugkill.fix.model, "opencode-go/kimi-k2.7-code");
+        assert_eq!(ai.bugkill.fix.thinking, "");
+    }
+
+    #[test]
     fn round_trips_through_nested_shape() {
         // A legacy config, once loaded, serializes back as the nested shape.
         let legacy = r#"{ "model": "m", "thinking": "high" }"#;
@@ -595,6 +689,7 @@ mod ai_config_tests {
         assert!(serialized.contains("\"enrich\""));
         assert!(serialized.contains("\"fix\""));
         assert!(serialized.contains("\"update\""));
+        assert!(serialized.contains("\"bugkill\""));
         let reparsed: AiConfig = serde_json::from_str(&serialized).unwrap();
         assert_eq!(ai, reparsed);
     }

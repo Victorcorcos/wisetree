@@ -20,6 +20,7 @@ Brown (lighter → selected background color): #3e3d31
 Brown (even lighter → for other texts that needs focus): #75705b
 
 ## New Colors
+Dark Green (for the Bugkill PR command button): #58a300
 Red: #f92672
 Cyan: #a8d8ff
 Blue: #74b8ff

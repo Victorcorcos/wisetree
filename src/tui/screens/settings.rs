@@ -21,8 +21,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::config::schema::{
-    AiConfig, AiFixConfig, AiModelConfig, DashboardConfig, LinkStrategy, NotificationsConfig,
-    WorktreeConfig,
+    AiBugkillConfig, AiConfig, AiFixConfig, AiModelConfig, DashboardConfig, LinkStrategy,
+    NotificationsConfig, WorktreeConfig,
 };
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
@@ -1147,6 +1147,11 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
             apply: clean(&ai.fix.apply),
         },
         update: clean(&ai.update),
+        bugkill: AiBugkillConfig {
+            investigate: clean(&ai.bugkill.investigate),
+            fix: clean(&ai.bugkill.fix),
+            judge: clean(&ai.bugkill.judge),
+        },
     }
 }
 
@@ -1158,14 +1163,20 @@ pub enum AiSlot {
     FixPlan,
     FixApply,
     Update,
+    BugkillInvestigate,
+    BugkillFix,
+    BugkillJudge,
 }
 
 impl AiSlot {
-    pub const ALL: [AiSlot; 4] = [
+    pub const ALL: [AiSlot; 7] = [
         AiSlot::Enrich,
         AiSlot::FixPlan,
         AiSlot::FixApply,
         AiSlot::Update,
+        AiSlot::BugkillInvestigate,
+        AiSlot::BugkillFix,
+        AiSlot::BugkillJudge,
     ];
 
     fn label(self) -> &'static str {
@@ -1174,6 +1185,9 @@ impl AiSlot {
             AiSlot::FixPlan => "fix_plan",
             AiSlot::FixApply => "fix_apply",
             AiSlot::Update => "update",
+            AiSlot::BugkillInvestigate => "bugkill_investigate",
+            AiSlot::BugkillFix => "bugkill_fix",
+            AiSlot::BugkillJudge => "bugkill_judge",
         }
     }
 
@@ -1183,6 +1197,14 @@ impl AiSlot {
             AiSlot::FixPlan => "Plans review-comment fixes — pick a stronger model (Fix · plan)",
             AiSlot::FixApply => "Applies the approved fix live (Fix · apply)",
             AiSlot::Update => "Resolves merge conflicts (Update Pull Request / branch)",
+            AiSlot::BugkillInvestigate => {
+                "Investigates the bug and ranks root causes — pick a stronger model \
+                 (Bugkill · investigate)"
+            }
+            AiSlot::BugkillFix => "Applies the selected bug fix live (Bugkill · fix)",
+            AiSlot::BugkillJudge => {
+                "Judges a freeform \"Other\" answer — fixed or not (Bugkill · judge)"
+            }
         }
     }
 
@@ -1192,6 +1214,9 @@ impl AiSlot {
             AiSlot::FixPlan => &ai.fix.plan,
             AiSlot::FixApply => &ai.fix.apply,
             AiSlot::Update => &ai.update,
+            AiSlot::BugkillInvestigate => &ai.bugkill.investigate,
+            AiSlot::BugkillFix => &ai.bugkill.fix,
+            AiSlot::BugkillJudge => &ai.bugkill.judge,
         }
     }
 
@@ -1201,14 +1226,25 @@ impl AiSlot {
             AiSlot::FixPlan => &mut ai.fix.plan,
             AiSlot::FixApply => &mut ai.fix.apply,
             AiSlot::Update => &mut ai.update,
+            AiSlot::BugkillInvestigate => &mut ai.bugkill.investigate,
+            AiSlot::BugkillFix => &mut ai.bugkill.fix,
+            AiSlot::BugkillJudge => &mut ai.bugkill.judge,
         }
     }
 }
 
-/// The four leaf models in slot order — used by the dashboard `ai` summary and
+/// The seven leaf models in slot order — used by the dashboard `ai` summary and
 /// the AI Settings editor.
-fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 4] {
-    [&ai.enrich, &ai.fix.plan, &ai.fix.apply, &ai.update]
+fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 7] {
+    [
+        &ai.enrich,
+        &ai.fix.plan,
+        &ai.fix.apply,
+        &ai.update,
+        &ai.bugkill.investigate,
+        &ai.bugkill.fix,
+        &ai.bugkill.judge,
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
