@@ -421,6 +421,17 @@ impl InputPrompt {
         }
     }
 
+    pub fn paste(&mut self, text: &str) -> InputOutcome {
+        if self.cursor > self.char_len() {
+            self.cursor = self.char_len();
+        }
+        for c in text.chars() {
+            self.insert_char(c);
+        }
+        self.error = None;
+        InputOutcome::Pending
+    }
+
     /// Render the prompt. `tick` is accepted for signature parity with other
     /// animated widgets but is unused — the cursor is always shown as a solid
     /// reversed block.
@@ -684,6 +695,25 @@ mod tests {
             ));
             type_str(&mut prompt, "second");
             assert_eq!(prompt.value, "first\nsecond");
+        }
+    }
+
+    #[test]
+    fn multiline_paste_inserts_newlines_without_submitting() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        prompt.error = Some("previous error".to_string());
+
+        assert!(matches!(
+            prompt.paste("first\nsecond"),
+            InputOutcome::Pending
+        ));
+        assert_eq!(prompt.value, "first\nsecond");
+        assert_eq!(prompt.cursor, "first\nsecond".chars().count());
+        assert_eq!(prompt.error, None);
+
+        match prompt.handle_key(key(KeyCode::Enter)) {
+            InputOutcome::Submitted(value) => assert_eq!(value, "first\nsecond"),
+            _ => panic!("expected explicit Enter to submit after paste"),
         }
     }
 

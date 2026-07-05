@@ -700,6 +700,21 @@ impl BugkillPullRequestScreen {
         }
     }
 
+    pub fn handle_paste(&mut self, text: &str) -> BugkillAction {
+        match self.step {
+            BugkillStep::DescribeBug | BugkillStep::OtherInput => {
+                if let Some(input) = self.input.as_mut() {
+                    input.paste(text);
+                }
+                if matches!(self.step, BugkillStep::DescribeBug) {
+                    self.describe_warning = false;
+                }
+                BugkillAction::Continue
+            }
+            _ => BugkillAction::Continue,
+        }
+    }
+
     fn handle_describe_key(&mut self, key: KeyEvent) -> BugkillAction {
         let Some(input) = self.input.as_mut() else {
             return BugkillAction::Cancelled;
@@ -2184,6 +2199,29 @@ mod tests {
                 assert_eq!(text, "crash on save\nsteps: open, save");
             }
             other => panic!("expected submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pasted_multiline_description_stays_editable_until_enter() {
+        let mut s = screen();
+        s.show_describe();
+
+        assert_eq!(
+            s.handle_paste("crash on save\nsteps: open, save"),
+            BugkillAction::Continue
+        );
+        assert_eq!(s.step(), BugkillStep::DescribeBug);
+        assert_eq!(
+            s.input.as_ref().map(|input| input.value.as_str()),
+            Some("crash on save\nsteps: open, save")
+        );
+
+        match s.handle_key(key(KeyCode::Enter)) {
+            BugkillAction::DescriptionSubmitted(text) => {
+                assert_eq!(text, "crash on save\nsteps: open, save");
+            }
+            other => panic!("expected submit after explicit Enter, got {other:?}"),
         }
     }
 

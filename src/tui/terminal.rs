@@ -18,8 +18,8 @@ use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::style::available_color_count;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -340,7 +340,7 @@ pub fn enter() -> io::Result<Terminal> {
     enable_raw_mode()?;
     let mut backend = AdaptiveBackend::new(io::stdout());
     enable_keyboard_enhancement(&mut backend);
-    crossterm::execute!(&mut backend, EnableMouseCapture)?;
+    crossterm::execute!(&mut backend, EnableMouseCapture, EnableBracketedPaste)?;
     let size = backend.size()?;
     let viewport = app_viewport(size);
     let mut terminal = RatTerminal::with_options(backend, TerminalOptions { viewport })?;
@@ -355,7 +355,7 @@ pub fn enter_wrapper() -> io::Result<WrapperTerminal> {
     let tty = OpenOptions::new().read(true).write(true).open(TTY_PATH)?;
     let mut backend = AdaptiveBackend::new(tty);
     enable_keyboard_enhancement(&mut backend);
-    crossterm::execute!(&mut backend, EnableMouseCapture)?;
+    crossterm::execute!(&mut backend, EnableMouseCapture, EnableBracketedPaste)?;
     let size = backend.size()?;
     let viewport = app_viewport(size);
     let mut terminal = RatTerminal::with_options(backend, TerminalOptions { viewport })?;
@@ -387,7 +387,7 @@ pub fn restore() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
     disable_keyboard_enhancement(&mut stdout);
-    let _ = crossterm::execute!(&mut stdout, DisableMouseCapture);
+    let _ = crossterm::execute!(&mut stdout, DisableMouseCapture, DisableBracketedPaste);
     let mut backend = AdaptiveBackend::new(io::stdout());
     let _ = backend.clear_region(ClearType::All);
     let _ = backend.set_cursor_position(Position::ORIGIN);
@@ -399,7 +399,7 @@ pub fn restore_wrapper_tty() {
     let _ = disable_raw_mode();
     if let Ok(mut tty) = OpenOptions::new().write(true).open(TTY_PATH) {
         disable_keyboard_enhancement(&mut tty);
-        let _ = crossterm::execute!(&mut tty, DisableMouseCapture);
+        let _ = crossterm::execute!(&mut tty, DisableMouseCapture, DisableBracketedPaste);
     }
 }
 

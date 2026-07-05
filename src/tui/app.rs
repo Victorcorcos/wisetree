@@ -530,6 +530,7 @@ impl App {
 
             match events.next_event()? {
                 Event::Key(key) => self.handle_key(key, &tx),
+                Event::Paste(text) => self.handle_paste(text, &tx),
                 Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
                 Event::Closed => self.quit_requested = true,
                 Event::Tick => {
@@ -1006,6 +1007,21 @@ impl App {
             InitPhase::Errored => self.handle_error_key(key, tx),
             InitPhase::Ready => self.handle_screen_key(key, tx),
             InitPhase::Loading => {}
+        }
+    }
+
+    fn handle_paste(&mut self, text: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.mouse_selection = None;
+        if !matches!(self.phase, InitPhase::Ready) {
+            return;
+        }
+        if matches!(self.screen, Screen::BugkillPullRequest) {
+            let action = self
+                .bugkill_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(BugkillAction::Continue);
+            self.apply_bugkill_action(action, tx);
         }
     }
 
