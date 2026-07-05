@@ -12,9 +12,9 @@
 //!
 //! An opt-in [`InputPrompt::multiline`] mode turns the field into a
 //! fixed-height (8-row) bordered area with wrapping and vertical scrolling
-//! that follows the cursor: **Enter inserts a newline, Ctrl+S submits, Esc
-//! cancels**, ↑/↓ move between lines, and Home/End work per line. Single-line
-//! callers are untouched.
+//! that follows the cursor: **Enter submits, Ctrl+J (or Alt+Enter) inserts a
+//! newline, Esc cancels**, ↑/↓ move between lines, and Home/End plus Ctrl+A/E
+//! work per line. Single-line callers are untouched.
 //!
 //! All cursor math is char-indexed (not byte-indexed) so multi-byte unicode is
 //! handled atomically.
@@ -48,7 +48,7 @@ pub struct InputPrompt {
     /// Cursor position as a char index into `value` (0..=char_count).
     pub cursor: usize,
     pub footer_spacer: bool,
-    /// Multiline mode: Enter inserts a newline, Ctrl+S submits.
+    /// Multiline mode: Enter submits, Ctrl+J inserts a newline.
     multiline: bool,
     validator: Option<Validator>,
 }
@@ -67,9 +67,9 @@ impl InputPrompt {
         }
     }
 
-    /// Opt into multiline mode: Enter inserts a newline, Ctrl+S submits,
-    /// Esc cancels, and the field renders as a fixed-height bordered area
-    /// with wrapping and vertical scrolling that follows the cursor.
+    /// Opt into multiline mode: Enter submits, Ctrl+J (or Alt+Enter) inserts a
+    /// newline, Esc cancels, and the field renders as a fixed-height bordered
+    /// area with wrapping and vertical scrolling that follows the cursor.
     pub fn multiline(mut self) -> Self {
         self.multiline = true;
         self
@@ -273,13 +273,25 @@ impl InputPrompt {
         }
 
         if self.multiline {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             match key.code {
-                KeyCode::Enter => {
+                // Ctrl+J inserts a newline, matching Claude Code. Enter with a
+                // modifier (Alt+Enter / Shift+Enter / Ctrl+Enter) does too, so
+                // terminals without the keyboard-enhancement protocol — where
+                // Ctrl+J collapses onto plain Enter — keep a working newline
+                // via Alt+Enter.
+                KeyCode::Char('j') | KeyCode::Char('J') if ctrl => {
                     self.insert_char('\n');
                     self.error = None;
                     return InputOutcome::Pending;
                 }
-                KeyCode::Char('s') | KeyCode::Char('S') if ctrl => return self.submit(),
+                KeyCode::Enter if ctrl || alt || shift => {
+                    self.insert_char('\n');
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                // Plain Enter submits.
+                KeyCode::Enter => return self.submit(),
                 KeyCode::Up => {
                     self.move_line(false);
                     self.error = None;
@@ -290,12 +302,24 @@ impl InputPrompt {
                     self.error = None;
                     return InputOutcome::Pending;
                 }
+                // Home / End and Ctrl+A / Ctrl+E move within the current line so
+                // the shell-style shortcuts feel right in a multiline field.
                 KeyCode::Home => {
                     self.cursor = self.line_start();
                     self.error = None;
                     return InputOutcome::Pending;
                 }
                 KeyCode::End => {
+                    self.cursor = self.line_end();
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') if ctrl => {
+                    self.cursor = self.line_start();
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') if ctrl => {
                     self.cursor = self.line_end();
                     self.error = None;
                     return InputOutcome::Pending;
@@ -466,7 +490,7 @@ impl InputPrompt {
         }
 
         let hint_text = if self.multiline {
-            "Ctrl+S to submit · Esc to cancel"
+            "Enter to submit · Ctrl+J for newline · Esc to cancel"
         } else {
             "Press Enter to confirm, Esc to cancel"
         };
@@ -609,7 +633,8 @@ mod tests {
     fn type_str(prompt: &mut InputPrompt, text: &str) {
         for c in text.chars() {
             if c == '\n' {
-                prompt.handle_key(key(KeyCode::Enter));
+                // Ctrl+J inserts a newline in multiline mode.
+                prompt.handle_key(ctrl('j'));
             } else {
                 prompt.handle_key(key(KeyCode::Char(c)));
             }
@@ -627,22 +652,54 @@ mod tests {
     }
 
     #[test]
-    fn multiline_enter_inserts_newline_and_ctrl_s_submits() {
+    fn multiline_ctrl_j_inserts_newline_and_enter_submits() {
         let mut prompt = InputPrompt::new("label").multiline();
         type_str(&mut prompt, "first");
+        // Ctrl+J inserts a newline without submitting.
         assert!(matches!(
-            prompt.handle_key(key(KeyCode::Enter)),
+            prompt.handle_key(ctrl('j')),
             InputOutcome::Pending
         ));
         type_str(&mut prompt, "second");
-        match prompt.handle_key(ctrl('s')) {
+        match prompt.handle_key(key(KeyCode::Enter)) {
             InputOutcome::Submitted(value) => assert_eq!(value, "first\nsecond"),
-            _ => panic!("expected submit with newlines intact"),
+            _ => panic!("expected Enter to submit with newlines intact"),
         }
     }
 
     #[test]
-    fn multiline_validator_fires_on_ctrl_s() {
+    fn multiline_modified_enter_inserts_newline_without_submitting() {
+        // Fallback for terminals lacking the keyboard-enhancement protocol,
+        // where Ctrl+J collapses onto plain Enter: Alt+Enter still newlines.
+        for mods in [
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+        ] {
+            let mut prompt = InputPrompt::new("label").multiline();
+            type_str(&mut prompt, "first");
+            assert!(matches!(
+                prompt.handle_key(KeyEvent::new(KeyCode::Enter, mods)),
+                InputOutcome::Pending
+            ));
+            type_str(&mut prompt, "second");
+            assert_eq!(prompt.value, "first\nsecond");
+        }
+    }
+
+    #[test]
+    fn multiline_ctrl_a_and_e_move_within_the_current_line() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "abc\nxyz");
+        // Cursor at end (char index 7). Ctrl+A goes to the current line start.
+        prompt.handle_key(ctrl('a'));
+        assert_eq!(prompt.cursor, 4);
+        prompt.handle_key(ctrl('e'));
+        assert_eq!(prompt.cursor, 7);
+    }
+
+    #[test]
+    fn multiline_validator_fires_on_enter() {
         let mut prompt = InputPrompt::new("label")
             .multiline()
             .with_validator(|value| {
@@ -651,9 +708,9 @@ mod tests {
                     .is_empty()
                     .then(|| "Bug description cannot be empty".to_string())
             });
-        prompt.handle_key(key(KeyCode::Enter)); // newline-only value
+        prompt.handle_key(ctrl('j')); // newline-only value
         assert!(matches!(
-            prompt.handle_key(ctrl('s')),
+            prompt.handle_key(key(KeyCode::Enter)),
             InputOutcome::Pending
         ));
         assert_eq!(
@@ -662,7 +719,7 @@ mod tests {
         );
         type_str(&mut prompt, "real text");
         assert!(matches!(
-            prompt.handle_key(ctrl('s')),
+            prompt.handle_key(key(KeyCode::Enter)),
             InputOutcome::Submitted(_)
         ));
     }

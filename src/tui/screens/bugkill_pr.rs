@@ -3,7 +3,7 @@
 //!
 //! - `Confirm`     : bordered explanation panel (the 5-step pipeline) +
 //!   resolved-config footer + `ConfirmationModal` (**Cancel** default).
-//! - `DescribeBug` : multiline input page (Enter = newline, Ctrl+S = submit).
+//! - `DescribeBug` : multiline input page (Enter = submit, Ctrl+J = newline).
 //! - `Working`     : quiet spinner covering every captured / deterministic
 //!   phase (preflight, investigation, snapshots, commit, revert, judge).
 //! - `ResumePrompt`: native buttons for the three preflight prompts —
@@ -1247,7 +1247,7 @@ impl BugkillPullRequestScreen {
             TableCell::from("Cause"),
             TableCell::from("Ranking"),
             TableCell::from("Quality"),
-            TableCell::from("Impl?"),
+            TableCell::from("Implemented?"),
             TableCell::from("Worked?"),
         ])
         .style(
@@ -1268,7 +1268,7 @@ impl BugkillPullRequestScreen {
                 Constraint::Min(24),
                 Constraint::Length(7),
                 Constraint::Length(11),
-                Constraint::Length(5),
+                Constraint::Length(12),
                 Constraint::Length(7),
             ],
         )
@@ -1955,8 +1955,8 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn ctrl_s() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+    fn ctrl_j() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)
     }
 
     fn render_dump(screen: &mut BugkillPullRequestScreen, w: u16, h: u16) -> String {
@@ -2025,10 +2025,10 @@ mod tests {
         let mut s = screen();
         s.show_describe();
         assert_eq!(s.step(), BugkillStep::DescribeBug);
-        // Enter inserts a newline (multiline mode) — still no submit.
+        // Ctrl+J inserts a newline (multiline mode) — no submit.
+        assert_eq!(s.handle_key(ctrl_j()), BugkillAction::Continue);
+        // Enter on whitespace-only → warning, stays on the page.
         assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Continue);
-        // Ctrl+S on whitespace-only → warning, stays on the page.
-        assert_eq!(s.handle_key(ctrl_s()), BugkillAction::Continue);
         assert!(s.describe_warning);
         assert_eq!(s.step(), BugkillStep::DescribeBug);
         let dump = render_dump(&mut s, 90, 24);
@@ -2043,11 +2043,11 @@ mod tests {
         for c in "crash on save".chars() {
             s.handle_key(key(KeyCode::Char(c)));
         }
-        s.handle_key(key(KeyCode::Enter));
+        s.handle_key(ctrl_j());
         for c in "steps: open, save".chars() {
             s.handle_key(key(KeyCode::Char(c)));
         }
-        match s.handle_key(ctrl_s()) {
+        match s.handle_key(key(KeyCode::Enter)) {
             BugkillAction::DescriptionSubmitted(text) => {
                 assert_eq!(text, "crash on save\nsteps: open, save");
             }
@@ -2288,7 +2288,7 @@ mod tests {
         for c in "hmm".chars() {
             s.handle_key(key(KeyCode::Char(c)));
         }
-        match s.handle_key(ctrl_s()) {
+        match s.handle_key(key(KeyCode::Enter)) {
             BugkillAction::OtherSubmitted(text) => assert_eq!(text, "hmm"),
             other => panic!("expected OtherSubmitted, got {other:?}"),
         }
