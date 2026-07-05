@@ -198,8 +198,13 @@ enum AppEvent {
     BugkillPrepared(Result<Box<BugkillPreflightOutcome>, String>),
     /// Leftover-attempt debris was discarded — re-run the preflight.
     BugkillDiscarded(Result<(), String>),
-    /// The investigate AI's ranked hypotheses (parsed + normalized in Rust).
-    BugkillInvestigated(Result<Vec<BugHypothesis>, String>),
+    /// Spawn params for the live investigation `opencode run` are ready
+    /// (or a gate failed). `corrective` marks the single retry after a
+    /// parse failure.
+    BugkillInvestigateReady {
+        corrective: bool,
+        result: Result<Box<FixApplyHandoff>, String>,
+    },
     /// Pre-attempt snapshot taken and opencode spawn params ready.
     BugkillFixReady {
         row_index: usize,
@@ -557,15 +562,19 @@ impl App {
                     if fix_exited {
                         self.on_fix_apply_done(&tx);
                     }
-                    // Same for the Bugkill fix PTY — a child exit means the
-                    // attempt is over, so scan + commit it now.
+                    // Same for the Bugkill PTYs — an Investigating exit
+                    // means the transcript is ready to parse; a Fixing exit
+                    // means the attempt is over, so scan + commit it now.
                     let bugkill_exited = self
                         .bugkill_pr
                         .as_mut()
-                        .map(|screen| screen.tick_pty(None))
-                        .unwrap_or(false);
-                    if bugkill_exited {
-                        self.on_bugkill_fix_done(&tx);
+                        .map(|screen| (screen.tick_pty(None), screen.step()));
+                    match bugkill_exited {
+                        Some((true, screens::bugkill_pr::BugkillStep::Investigating)) => {
+                            self.on_bugkill_investigated(&tx)
+                        }
+                        Some((true, _)) => self.on_bugkill_fix_done(&tx),
+                        _ => {}
                     }
                 }
                 Event::Resize(width, height) => {
@@ -2167,7 +2176,7 @@ impl App {
                     }
                 }
             }
-            BugkillAction::StartFresh => self.start_bugkill_investigation(tx),
+            BugkillAction::StartFresh => self.start_bugkill_investigation(false, tx),
             BugkillAction::AttemptFix => self.start_bugkill_attempt(None, tx),
             BugkillAction::AbortFix => {
                 let Some(screen) = self.bugkill_pr.as_mut() else {
@@ -2235,20 +2244,28 @@ impl App {
         }
     }
 
-    fn start_bugkill_investigation(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+    /// Kick off one live investigation run: build the `opencode run` spawn
+    /// params, then show it in the embedded PTY. `corrective` is only set
+    /// on the automatic retry after an unparseable transcript.
+    fn start_bugkill_investigation(
+        &mut self,
+        corrective: bool,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
         let Some(screen) = self.bugkill_pr.as_mut() else {
             return;
         };
         let worktree_path = screen.request().worktree_path.clone();
         let description = screen.bug_description().to_string();
         let base_ref = screen.base_ref().map(str::to_string);
-        screen.start_working("Investigating the bug...", false);
-        kick_off_bugkill_investigate(
+        screen.start_working("Preparing the investigation...", false);
+        kick_off_bugkill_prepare_investigate(
             self.git_root.clone(),
             self.current_dashboard_config(),
             worktree_path,
             description,
             base_ref,
+            corrective,
             tx.clone(),
         );
     }
@@ -2424,7 +2441,7 @@ impl App {
                     };
                     screen.set_base_ref(preflight.base_ref);
                     match preflight.resume {
-                        BugkillResumeState::Absent => self.start_bugkill_investigation(tx),
+                        BugkillResumeState::Absent => self.start_bugkill_investigation(false, tx),
                         BugkillResumeState::Unparseable => screen.show_overwrite_prompt(),
                         BugkillResumeState::Parsed {
                             investigation,
@@ -2463,23 +2480,63 @@ impl App {
         }
     }
 
-    fn apply_bugkill_investigated(
+    /// Spawn params ready → show the AI Activity panel and launch the
+    /// captured `opencode run` inside the embedded PTY, so the user watches
+    /// the investigation instead of a bare spinner.
+    fn apply_bugkill_investigate_ready(
         &mut self,
-        result: Result<Vec<BugHypothesis>, String>,
-        tx: &mpsc::UnboundedSender<AppEvent>,
+        corrective: bool,
+        result: Result<Box<FixApplyHandoff>, String>,
     ) {
         let Some(screen) = self.bugkill_pr.as_mut() else {
             return;
         };
         match result {
-            Ok(hypotheses) => {
-                screen.set_hypotheses(hypotheses);
+            Ok(handoff) => {
+                screen.start_investigating(corrective);
+                screen.spawn_investigate_pty(
+                    handoff.opencode_binary,
+                    handoff.opencode_args,
+                    handoff.cwd,
+                );
+            }
+            Err(message) => screen.set_error(message),
+        }
+    }
+
+    /// The investigation `opencode run` exited: parse its captured
+    /// transcript into ranked hypotheses. An unparseable transcript earns
+    /// one corrective retry (stricter prompt); a second failure — or a
+    /// non-zero opencode exit — surfaces the transcript tail.
+    fn on_bugkill_investigated(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        let corrective = screen.investigate_corrective();
+        let Some((raw, exit_code)) = screen.take_investigation_transcript() else {
+            return;
+        };
+        let transcript = crate::services::strip_pty_artifacts(&raw);
+        if let Some(code) = exit_code.filter(|code| *code != 0) {
+            screen.set_error(format!(
+                "opencode exited with code {code}. Raw tail:\n{}",
+                crate::services::transcript_tail(&transcript)
+            ));
+            return;
+        }
+        match crate::services::parse_hypotheses(&transcript) {
+            Some(hypotheses) => {
+                screen.set_hypotheses(crate::services::normalize_hypotheses(hypotheses));
                 self.rewrite_bugkill_file(tx);
                 if let Some(screen) = self.bugkill_pr.as_mut() {
                     screen.enter_select();
                 }
             }
-            Err(message) => screen.set_error(message),
+            None if !corrective => self.start_bugkill_investigation(true, tx),
+            None => screen.set_error(format!(
+                "could not parse ranked hypotheses from the investigation output. Raw tail:\n{}",
+                crate::services::transcript_tail(&transcript)
+            )),
         }
     }
 
@@ -3768,7 +3825,9 @@ impl App {
             }
             AppEvent::BugkillPrepared(result) => self.apply_bugkill_prepared(result, tx),
             AppEvent::BugkillDiscarded(result) => self.apply_bugkill_discarded(result, tx),
-            AppEvent::BugkillInvestigated(result) => self.apply_bugkill_investigated(result, tx),
+            AppEvent::BugkillInvestigateReady { corrective, result } => {
+                self.apply_bugkill_investigate_ready(corrective, result)
+            }
             AppEvent::BugkillFixReady { row_index, result } => {
                 self.apply_bugkill_fix_ready(row_index, result)
             }
@@ -6111,27 +6170,36 @@ fn kick_off_bugkill_discard(
     });
 }
 
-fn kick_off_bugkill_investigate(
+fn kick_off_bugkill_prepare_investigate(
     git_root: Option<String>,
     config: DashboardConfig,
     worktree_path: String,
     bug_description: String,
     base_ref: Option<String>,
+    corrective: bool,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
-        let _ = tx.send(AppEvent::BugkillInvestigated(Err(
-            "Could not resolve git root.".to_string(),
-        )));
+        let _ = tx.send(AppEvent::BugkillInvestigateReady {
+            corrective,
+            result: Err("Could not resolve git root.".to_string()),
+        });
         return;
     };
+    // A task despite the call being synchronous: the opencode-on-PATH gate
+    // inside spawns `opencode --version`, which must not block the UI.
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let result = service
-            .bugkill_investigate(&worktree_path, &bug_description, base_ref.as_deref())
-            .await
+            .prepare_bugkill_investigate(
+                &worktree_path,
+                &bug_description,
+                base_ref.as_deref(),
+                corrective,
+            )
+            .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
-        let _ = tx.send(AppEvent::BugkillInvestigated(result));
+        let _ = tx.send(AppEvent::BugkillInvestigateReady { corrective, result });
     });
 }
 

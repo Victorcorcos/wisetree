@@ -5,7 +5,10 @@
 //!   resolved-config footer + `ConfirmationModal` (**Cancel** default).
 //! - `DescribeBug` : multiline input page (Enter = submit, Ctrl+J = newline).
 //! - `Working`     : quiet spinner covering every captured / deterministic
-//!   phase (preflight, investigation, snapshots, commit, revert, judge).
+//!   phase (preflight, snapshots, commit, revert, judge).
+//! - `Investigating`: the embedded `opencode run` PTY (AI Activity panel,
+//!   read-only Plan agent) streaming the investigation live; the captured
+//!   transcript is parsed by the App when opencode exits.
 //! - `ResumePrompt`: native buttons for the three preflight prompts —
 //!   leftover-attempt recovery, Resume / Start fresh, Overwrite / Cancel.
 //! - `Select`      : the ranked-causes table + detail panel; ↑/↓ skip
@@ -57,6 +60,7 @@ pub enum BugkillStep {
     Confirm,
     DescribeBug,
     Working,
+    Investigating,
     ResumePrompt,
     Select,
     Fixing,
@@ -180,6 +184,9 @@ pub struct BugkillPullRequestScreen {
     pty: Option<PtyView>,
     pty_focused: bool,
     finalize_confirm: Option<ConfirmationModal>,
+    /// True while the `Investigating` PTY run is the corrective retry —
+    /// a second parse failure surfaces the error instead of retrying again.
+    investigate_corrective: bool,
     // ── verdict ─────────────────────────────────────────────────────────
     verdict_focus: usize,
     /// Judge's one-sentence reason, shown in gray above the buttons after
@@ -225,6 +232,7 @@ impl BugkillPullRequestScreen {
             pty: None,
             pty_focused: false,
             finalize_confirm: None,
+            investigate_corrective: false,
             verdict_focus: 0,
             verdict_note: None,
             verdict_button_rects: Cell::new([Rect::default(); 3]),
@@ -430,6 +438,42 @@ impl BugkillPullRequestScreen {
         self.pre_snapshot = Some(snapshot);
     }
 
+    /// Show the AI Activity panel for the live investigation; the App then
+    /// spawns the captured `opencode run` PTY. `corrective` marks the
+    /// single stricter-contract retry after a parse failure.
+    pub fn start_investigating(&mut self, corrective: bool) {
+        self.step = BugkillStep::Investigating;
+        self.phase_message = if corrective {
+            "Investigation output could not be parsed — retrying once...".to_string()
+        } else {
+            "Investigating the bug with opencode...".to_string()
+        };
+        self.investigate_corrective = corrective;
+        self.ai_done = false;
+        self.pty = None;
+        self.pty_focused = false;
+        self.finalize_confirm = None;
+    }
+
+    pub fn investigate_corrective(&self) -> bool {
+        self.investigate_corrective
+    }
+
+    /// Spawn the captured investigation run inside the embedded PTY.
+    pub fn spawn_investigate_pty(&mut self, binary: PathBuf, args: Vec<String>, cwd: PathBuf) {
+        match PtyView::spawn_captured(&binary, &args, Some(&cwd), &[]) {
+            Ok(pty) => self.pty = Some(pty),
+            Err(err) => self.set_error(format!("Could not spawn opencode in PTY: {err}")),
+        }
+    }
+
+    /// Tear the investigation PTY down and hand back its full transcript
+    /// plus the child's exit code. `None` when no PTY is alive.
+    pub fn take_investigation_transcript(&mut self) -> Option<(String, Option<i32>)> {
+        let pty = self.pty.take()?;
+        Some((pty.captured_output(), pty.exit_code()))
+    }
+
     /// Show the AI Activity panel; the App then spawns the PTY.
     pub fn start_fixing(&mut self) {
         self.step = BugkillStep::Fixing;
@@ -593,6 +637,15 @@ impl BugkillPullRequestScreen {
                 }
                 true
             }
+            // `opencode run` prints plainly (no alternate screen), so the
+            // vt100 scrollback is scrolled directly instead of forwarding
+            // page keys to the child.
+            BugkillStep::Investigating => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_up(lines);
+                }
+                true
+            }
             BugkillStep::Select => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(lines);
                 true
@@ -606,6 +659,12 @@ impl BugkillPullRequestScreen {
             BugkillStep::Fixing => {
                 if let Some(pty) = self.pty.as_mut() {
                     pty.send_input(PTY_PAGE_DOWN);
+                }
+                true
+            }
+            BugkillStep::Investigating => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_down(lines);
                 }
                 true
             }
@@ -639,6 +698,7 @@ impl BugkillPullRequestScreen {
                 KeyCode::Esc if !self.working_locked => BugkillAction::Cancelled,
                 _ => BugkillAction::Continue,
             },
+            BugkillStep::Investigating => self.handle_investigating_key(key),
             BugkillStep::ResumePrompt => self.handle_resume_key(key),
             BugkillStep::Select => self.handle_select_key(key),
             BugkillStep::Fixing => self.handle_fixing_key(key),
@@ -758,6 +818,36 @@ impl BugkillPullRequestScreen {
                 self.detail_scroll = 0;
                 return;
             }
+        }
+    }
+
+    /// The investigation run is non-interactive (read-only Plan agent), so
+    /// the keys only drive the scrollback — plus Esc to abandon it. No
+    /// git state has been touched yet, so cancelling needs no rollback.
+    fn handle_investigating_key(&mut self, key: KeyEvent) -> BugkillAction {
+        match key.code {
+            KeyCode::PageUp => {
+                self.handle_mouse_scroll_up(10);
+                BugkillAction::Continue
+            }
+            KeyCode::PageDown => {
+                self.handle_mouse_scroll_down(10);
+                BugkillAction::Continue
+            }
+            KeyCode::Home => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_to_top();
+                }
+                BugkillAction::Continue
+            }
+            KeyCode::End => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.scroll_to_bottom();
+                }
+                BugkillAction::Continue
+            }
+            KeyCode::Esc => BugkillAction::Cancelled,
+            _ => BugkillAction::Continue,
         }
     }
 
@@ -974,6 +1064,7 @@ impl BugkillPullRequestScreen {
                     .with_tick(self.tick)
                     .render(frame, area)
             }
+            BugkillStep::Investigating => self.render_investigating(frame, area),
             BugkillStep::ResumePrompt => self.render_resume_prompt(frame, area),
             BugkillStep::Select => self.render_select(frame, area),
             BugkillStep::Fixing => self.render_fixing(frame, area),
@@ -1399,6 +1490,43 @@ impl BugkillPullRequestScreen {
         }
     }
 
+    /// Same chrome as `render_fixing` (spinner + AI Activity panel), but
+    /// the shortcuts line only offers scrolling and Esc — the run is
+    /// non-interactive and finishes on its own.
+    fn render_investigating(&mut self, frame: &mut Frame, area: Rect) {
+        if area.height < 5 {
+            StatusIndicator::new(Status::Loading, self.phase_message.clone())
+                .with_tick(self.tick)
+                .render(frame, area);
+            return;
+        }
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // spinner
+                Constraint::Length(1), // blank
+                Constraint::Min(3),    // AI Activity panel
+                Constraint::Length(1), // shortcuts
+            ])
+            .split(area);
+        StatusIndicator::new(Status::Loading, self.phase_message.clone())
+            .with_tick(self.tick)
+            .render(frame, chunks[0]);
+        self.render_ai_activity(frame, chunks[2]);
+        let separator = Span::styled("  ·  ".to_string(), muted_dim());
+        let spans: Vec<Span<'static>> = vec![
+            Span::styled("PgUp/PgDn ".to_string(), Style::default().fg(colors::BRAND)),
+            Span::styled("Scroll".to_string(), muted_dim()),
+            separator.clone(),
+            Span::styled("Home/End ".to_string(), Style::default().fg(colors::BRAND)),
+            Span::styled("Top / Live tail".to_string(), muted_dim()),
+            separator,
+            Span::styled("Esc ".to_string(), Style::default().fg(colors::ERROR)),
+            Span::styled("Cancel investigation".to_string(), muted_dim()),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), chunks[3]);
+    }
+
     fn render_fixing(&mut self, frame: &mut Frame, area: Rect) {
         if area.height < 5 {
             StatusIndicator::new(Status::Loading, self.phase_message.clone())
@@ -1437,7 +1565,9 @@ impl BugkillPullRequestScreen {
                     .add_modifier(Modifier::BOLD),
             ),
         ];
-        if pty_alive {
+        // The focus suffix only applies to the interactive fix PTY; the
+        // investigation run takes no input, so there is nothing to focus.
+        if pty_alive && self.step == BugkillStep::Fixing {
             title_spans.push(Span::styled(" · ".to_string(), muted_dim()));
             title_spans.push(Span::styled(
                 if focused_inner {
@@ -1491,7 +1621,11 @@ impl BugkillPullRequestScreen {
         }
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Launching opencode to apply the fix...",
+                if self.step == BugkillStep::Investigating {
+                    "Launching opencode to investigate the bug..."
+                } else {
+                    "Launching opencode to apply the fix..."
+                },
                 muted_dim(),
             ))),
             inner,
@@ -2199,6 +2333,54 @@ mod tests {
             "{dump}"
         );
         assert!(dump.contains("Re-run Bugkill"), "{dump}");
+    }
+
+    // ── Investigating ───────────────────────────────────────────────────
+
+    #[test]
+    fn investigating_shows_the_ai_activity_panel_and_esc_cancels() {
+        let mut s = screen();
+        s.set_bug_description("it crashes".to_string());
+        s.start_investigating(false);
+        assert_eq!(s.step(), BugkillStep::Investigating);
+        assert!(!s.investigate_corrective());
+        assert!(s.wants_full_panel());
+        let dump = render_dump(&mut s, 110, 30);
+        assert!(
+            dump.contains("Investigating the bug with opencode..."),
+            "{dump}"
+        );
+        assert!(dump.contains("AI Activity"), "{dump}");
+        assert!(
+            dump.contains("Launching opencode to investigate the bug..."),
+            "{dump}"
+        );
+        assert!(dump.contains("Cancel investigation"), "{dump}");
+        // No fix-step affordances: nothing to finalize, nothing to focus.
+        assert!(!dump.contains("Fix applied"), "{dump}");
+        assert!(!dump.contains("outer focused"), "{dump}");
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Continue);
+        assert!(s.finalize_confirm.is_none());
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Cancelled);
+    }
+
+    #[test]
+    fn corrective_investigation_announces_the_retry() {
+        let mut s = screen();
+        s.start_investigating(true);
+        assert!(s.investigate_corrective());
+        let dump = render_dump(&mut s, 110, 30);
+        assert!(
+            dump.contains("Investigation output could not be parsed — retrying once..."),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn investigation_transcript_is_none_without_a_pty() {
+        let mut s = screen();
+        s.start_investigating(false);
+        assert!(s.take_investigation_transcript().is_none());
     }
 
     // ── Fixing / commit ─────────────────────────────────────────────────

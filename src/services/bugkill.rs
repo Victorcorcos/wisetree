@@ -167,6 +167,67 @@ pub fn normalize_hypotheses(mut hypotheses: Vec<BugHypothesis>) -> Vec<BugHypoth
     hypotheses
 }
 
+/// Normalize a raw PTY transcript for the contract parser: strip ANSI
+/// escape sequences (CSI, OSC, and lone two-byte escapes) and carriage
+/// returns. `opencode run` on a PTY emits the response text verbatim plus
+/// color resets and `\r\n` line endings — after this pass the transcript is
+/// the same plain text a piped run would have produced.
+pub fn strip_pty_artifacts(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {}
+            '\x1b' => match chars.next() {
+                // CSI: `ESC [` parameters/intermediates, then a final byte
+                // in `@`..=`~`.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: `ESC ]` … BEL or ST (`ESC \`).
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Charset designation (`ESC ( B` etc.): one more byte.
+                Some('(') | Some(')') => {
+                    chars.next();
+                }
+                // Any other two-byte escape (or a trailing lone ESC).
+                _ => {}
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Last ~500 bytes of a transcript (char-boundary safe), surfaced on the
+/// error screen when the investigation output could not be parsed twice.
+pub fn transcript_tail(transcript: &str) -> String {
+    const TAIL_BYTES: usize = 500;
+    let trimmed = transcript.trim_end();
+    if trimmed.len() <= TAIL_BYTES {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len() - TAIL_BYTES;
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &trimmed[start..])
+}
+
 // ── Judge-contract parser ───────────────────────────────────────────────
 
 /// The judge AI's 3-way classification of a freeform "Other" answer.
@@ -704,6 +765,45 @@ RANKING: 3
 QUALITY: inferred
 SOLUTION: s";
         assert_eq!(parse_hypotheses(transcript), None);
+    }
+
+    // ── PTY transcript normalization ────────────────────────────────────
+
+    #[test]
+    fn strip_pty_artifacts_removes_ansi_and_carriage_returns() {
+        let raw = "\x1b[0m\r\n> plan · gpt-5.5\r\n\x1b[0m→ \x1b[0mRead .\r\nplain\r\n";
+        assert_eq!(
+            strip_pty_artifacts(raw),
+            "\n> plan · gpt-5.5\n→ Read .\nplain\n"
+        );
+        // OSC (BEL- and ST-terminated), a lone two-byte escape, and a
+        // trailing lone ESC all vanish without eating following text.
+        let raw = "\x1b]0;title\x07a\x1b]8;;x\x1b\\b\x1b(Bc\x1b";
+        assert_eq!(strip_pty_artifacts(raw), "abc");
+    }
+
+    #[test]
+    fn pty_transcript_round_trips_through_the_contract_parser() {
+        let raw = "\x1b[0m\r\n> plan · gpt-5.5\r\n\x1b[0m→ \x1b[0mRead .\r\n\
+                   ==== HYPOTHESIS ====\r\n\
+                   DESCRIPTION: \x1b[1mbold cause\x1b[0m\r\n\
+                   RANKING: 4\r\n\
+                   QUALITY: observed\r\n\
+                   SOLUTION: fix it\r\n\
+                   ==== END ====\r\n";
+        let parsed = parse_hypotheses(&strip_pty_artifacts(raw)).expect("parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].description, "bold cause");
+    }
+
+    #[test]
+    fn transcript_tail_clips_long_transcripts_on_char_boundaries() {
+        assert_eq!(transcript_tail("short  \n"), "short");
+        let long = format!("{}é", "x".repeat(600));
+        let tail = transcript_tail(&long);
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with('é'));
+        assert!(tail.len() <= 505);
     }
 
     // ── normalization ───────────────────────────────────────────────────

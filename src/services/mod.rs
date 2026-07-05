@@ -15,8 +15,9 @@ pub use ai_status::{
 };
 pub use app_state::AppStateService;
 pub use bugkill::{
-    compute_attempt_changes, AttemptChanges, BugHypothesis, BugkillVerdict, EvidenceQuality,
-    JudgeResult, ParsedInvestigation,
+    compute_attempt_changes, normalize_hypotheses, parse_hypotheses, strip_pty_artifacts,
+    transcript_tail, AttemptChanges, BugHypothesis, BugkillVerdict, EvidenceQuality, JudgeResult,
+    ParsedInvestigation,
 };
 pub use dashboard::{
     default_dashboard_warning, is_behind, parse_pull_request_md, resolve_base_ref,

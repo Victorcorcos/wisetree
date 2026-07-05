@@ -22,9 +22,9 @@ use crate::git::exec::execute_git_command;
 use crate::git::types::{BranchStatus, GitWorktree};
 use crate::services::ai_status::{AiStatusIndex, AiStatusPaths, AiStatusReport, AiStatusService};
 use crate::services::bugkill::{
-    attempt_commit_prefix, attempt_commit_subject, normalize_hypotheses, parse_hypotheses,
-    parse_investigation_md, parse_judge_verdict, parse_porcelain_v2, AttemptChanges, BugHypothesis,
-    BugkillVerdict, JudgeResult, ParsedInvestigation, INVESTIGATION_FILE,
+    attempt_commit_prefix, attempt_commit_subject, parse_investigation_md, parse_judge_verdict,
+    parse_porcelain_v2, AttemptChanges, BugHypothesis, BugkillVerdict, JudgeResult,
+    ParsedInvestigation, INVESTIGATION_FILE,
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
@@ -72,11 +72,10 @@ const FIX_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// past the OS argv limit.
 const FIX_CODE_WINDOW_RADIUS: usize = 40;
 const FIX_CODE_MAX_BYTES: usize = 24_000;
-/// Timeouts for the "Bugkill" pipeline. Investigation drives a full
-/// read-only exploration of the codebase, so it gets a much longer leash
-/// than the 180 s fix-planning calls; the judge classifies one short
-/// comment; git operations (status/add/commit/revert/checkout) are local.
-const BUGKILL_INVESTIGATE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
+/// embedded PTY (the user watches it and can Esc out), so only the judge —
+/// which classifies one short comment — and the local git operations
+/// (status/add/commit/revert/checkout) run captured under a timeout.
 const BUGKILL_JUDGE_TIMEOUT: Duration = Duration::from_secs(120);
 const BUGKILL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Byte caps applied to Bugkill prompt inputs before templating so the
@@ -2470,16 +2469,19 @@ impl DashboardService {
         })))
     }
 
-    /// Run the investigate AI once (captured, read-only via `--agent plan`)
-    /// and parse its ranked hypotheses. On a parse failure the call is
-    /// retried once with a corrective suffix; a second failure surfaces the
-    /// raw transcript tail.
-    pub async fn bugkill_investigate(
+    /// Build the spawn parameters for the live investigation run: a
+    /// non-interactive `opencode run` pinned to the read-only Plan agent,
+    /// shown in the embedded PTY so the user watches the AI work; the
+    /// captured transcript is parsed by the caller after exit. `corrective`
+    /// appends the stricter-contract suffix used on the single retry after
+    /// a parse failure.
+    pub fn prepare_bugkill_investigate(
         &self,
         worktree_path: &str,
         bug_description: &str,
         base_ref: Option<&str>,
-    ) -> Result<Vec<BugHypothesis>> {
+        corrective: bool,
+    ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.investigate;
         let model = slot.model.trim().to_string();
         if model.is_empty() {
@@ -2487,28 +2489,31 @@ impl DashboardService {
                 "ai.bugkill.investigate model is not configured.",
             ));
         }
+        if !binary_available(&self.opencode_binary) {
+            return Err(WisetreeError::other("opencode CLI is not on PATH."));
+        }
         let cwd = PathBuf::from(worktree_path);
-        let prompt = build_bug_investigate_prompt(bug_description, base_ref);
-        let transcript = self
-            .run_bugkill_captured(&cwd, &prompt, &model, &slot.thinking)
-            .await?;
-        if let Some(hypotheses) = parse_hypotheses(&transcript) {
-            return Ok(normalize_hypotheses(hypotheses));
+        let mut prompt = build_bug_investigate_prompt(bug_description, base_ref);
+        if corrective {
+            prompt = format!(
+                "{prompt}\n\nYour previous output could not be parsed. Reply with ONLY the \
+                 delimited block, exactly as specified."
+            );
         }
-        let corrective = format!(
-            "{prompt}\n\nYour previous output could not be parsed. Reply with ONLY the \
-             delimited block, exactly as specified."
-        );
-        let transcript = self
-            .run_bugkill_captured(&cwd, &corrective, &model, &slot.thinking)
-            .await?;
-        match parse_hypotheses(&transcript) {
-            Some(hypotheses) => Ok(normalize_hypotheses(hypotheses)),
-            None => Err(WisetreeError::other(format!(
-                "could not parse ranked hypotheses from the investigation output. Raw tail:\n{}",
-                transcript_tail(&transcript)
-            ))),
-        }
+        let mut opencode_args: Vec<String> = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+        ];
+        opencode_args.extend(run_variant_args(&slot.thinking));
+        Ok(FixApplyHandoff {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+        })
     }
 
     /// Build the spawn parameters for one live fix attempt. The fix AI
@@ -2760,34 +2765,6 @@ impl DashboardService {
             let (sha, subject) = line.split_once('\t')?;
             subject.starts_with(&prefix).then(|| sha.trim().to_string())
         })
-    }
-
-    /// Captured (non-interactive) opencode call pinned to the read-only Plan
-    /// agent, shared by the investigate step and its corrective retry.
-    async fn run_bugkill_captured(
-        &self,
-        cwd: &Path,
-        prompt: &str,
-        model: &str,
-        thinking: &str,
-    ) -> Result<String> {
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt.to_string(),
-            "-m".to_string(),
-            model.to_string(),
-            "--agent".to_string(),
-            "plan".to_string(),
-        ];
-        run_args.extend(run_variant_args(thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        time::timeout(
-            BUGKILL_INVESTIGATE_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(cwd)),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("the investigation timed out after 600s"))?
-        .map_err(WisetreeError::other)
     }
 
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
@@ -4819,21 +4796,6 @@ fn truncate_bugkill_field(text: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}…[truncated]", &text[..end])
-}
-
-/// Last ~500 bytes of a transcript (char-boundary safe), surfaced on the
-/// error screen when the investigation output could not be parsed twice.
-fn transcript_tail(transcript: &str) -> String {
-    const TAIL_BYTES: usize = 500;
-    let trimmed = transcript.trim_end();
-    if trimmed.len() <= TAIL_BYTES {
-        return trimmed.to_string();
-    }
-    let mut start = trimmed.len() - TAIL_BYTES;
-    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &trimmed[start..])
 }
 
 /// Render `prompts/bug_investigate.md` for the one-shot investigation call.
