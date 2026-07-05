@@ -888,8 +888,8 @@ impl App {
             }
             Screen::BugkillPullRequest => {
                 // Expanded steps (Confirm, DescribeBug, Select, the live
-                // Fixing PTY, Verdict…) want the whole bottom region; the
-                // compact Working / ResumePrompt / Done steps stay sized.
+                // Fixing PTY, Verdict, Done…) want the whole bottom region;
+                // the compact Working / ResumePrompt steps stay sized.
                 let expand = self
                     .bugkill_pr
                     .as_ref()

@@ -294,27 +294,18 @@ impl BugkillPullRequestScreen {
     pub fn render_investigation(&self) -> String {
         render_investigation_md(&self.bug_description, &self.hypotheses, &self.notes)
     }
-    /// Expanded steps want the whole bottom region; Working / ResumePrompt /
-    /// Done render in a sized panel.
+    /// Expanded steps want the whole bottom region; Working / ResumePrompt
+    /// render in a sized panel. Done fills too so its closing details get
+    /// room to wrap and the return-to-dashboard hint pins to the panel
+    /// bottom like the dashboard footer.
     pub fn wants_full_panel(&self) -> bool {
-        !matches!(
-            self.step,
-            BugkillStep::Working | BugkillStep::ResumePrompt | BugkillStep::Done
-        )
+        !matches!(self.step, BugkillStep::Working | BugkillStep::ResumePrompt)
     }
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
             BugkillStep::Working => 3,
             BugkillStep::ResumePrompt => 8,
-            BugkillStep::Done => {
-                let attempted = self
-                    .hypotheses
-                    .iter()
-                    .filter(|h| h.implemented || h.worked.is_some())
-                    .count() as u16;
-                (attempted.min(10) + 14).max(16)
-            }
             _ => 22,
         }
     }
@@ -1871,8 +1862,9 @@ impl BugkillPullRequestScreen {
             .constraints([
                 Constraint::Length(2),            // headline
                 Constraint::Length(table_height), // summary table
+                Constraint::Length(1),            // spacer
                 Constraint::Min(3),               // closing panel
-                Constraint::Length(1),            // hint
+                Constraint::Length(1),            // footer hint (panel bottom)
             ])
             .split(area);
         StatusIndicator::new(status, headline)
@@ -1882,12 +1874,12 @@ impl BugkillPullRequestScreen {
             render_summary_table(&rows, frame, chunks[1]);
         }
         frame.render_widget(
-            Paragraph::new(self.closing_lines()).wrap(Wrap { trim: true }),
-            chunks[2],
+            Paragraph::new(self.closing_lines()).wrap(Wrap { trim: false }),
+            chunks[3],
         );
         frame.render_widget(
             Paragraph::new("Press any key to return to the dashboard").style(muted_dim()),
-            chunks[3],
+            chunks[4],
         );
     }
 
@@ -1917,13 +1909,19 @@ impl BugkillPullRequestScreen {
             ]));
         }
         if !self.attempt_changes.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("Files       ".to_string(), muted_dim()),
-                Span::styled(
-                    self.attempt_changes.join(", "),
-                    Style::default().fg(colors::EMPHASIS),
-                ),
-            ]));
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(Span::styled("Files".to_string(), muted_dim())));
+            for file in &self.attempt_changes {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ".to_string(), muted_dim()),
+                    Span::styled(file.clone(), Style::default().fg(colors::EMPHASIS)),
+                ]));
+            }
+        }
+        if !lines.is_empty() {
+            lines.push(Line::default());
         }
         lines.push(Line::from(vec![
             Span::styled("Commit      ".to_string(), muted_dim()),
