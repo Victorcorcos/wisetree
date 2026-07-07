@@ -41,13 +41,15 @@ use ratatui::Frame;
 
 use crate::config::schema::AiBugkillConfig;
 use crate::messages::colors;
-use crate::services::bugkill::{render_investigation_md, BugHypothesis, EvidenceQuality};
+use crate::services::bugkill::{
+    render_investigation_md, strip_pty_artifacts, BugHypothesis, EvidenceQuality,
+};
 use crate::services::{BugkillSnapshot, BugkillUnverdicted, ParsedInvestigation};
 use crate::tui::screens::dashboard::BugkillRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
     render_summary_table, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
-    InputPrompt, PtyView, Status, StatusIndicator, SummaryRow,
+    InputPrompt, PtyView, RunTranscriptView, Status, StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -183,6 +185,9 @@ pub struct BugkillPullRequestScreen {
     ai_done: bool,
     pty: Option<PtyView>,
     pty_focused: bool,
+    /// Monokai-styled view of the live investigation transcript — the
+    /// `Investigating` panel renders this instead of the raw PTY cells.
+    investigate_view: RunTranscriptView,
     finalize_confirm: Option<ConfirmationModal>,
     /// True while the `Investigating` PTY run is the corrective retry —
     /// a second parse failure surfaces the error instead of retrying again.
@@ -231,6 +236,7 @@ impl BugkillPullRequestScreen {
             ai_done: false,
             pty: None,
             pty_focused: false,
+            investigate_view: RunTranscriptView::default(),
             finalize_confirm: None,
             investigate_corrective: false,
             verdict_focus: 0,
@@ -443,6 +449,7 @@ impl BugkillPullRequestScreen {
         self.ai_done = false;
         self.pty = None;
         self.pty_focused = false;
+        self.investigate_view = RunTranscriptView::default();
         self.finalize_confirm = None;
     }
 
@@ -628,13 +635,11 @@ impl BugkillPullRequestScreen {
                 }
                 true
             }
-            // `opencode run` prints plainly (no alternate screen), so the
-            // vt100 scrollback is scrolled directly instead of forwarding
-            // page keys to the child.
+            // `opencode run` prints plainly (no alternate screen); the
+            // Monokai transcript view owns its own scrollback, so scroll it
+            // directly instead of forwarding page keys to the child.
             BugkillStep::Investigating => {
-                if let Some(pty) = self.pty.as_mut() {
-                    pty.scroll_up(lines);
-                }
+                self.investigate_view.scroll_up(lines);
                 true
             }
             BugkillStep::Select => {
@@ -654,9 +659,7 @@ impl BugkillPullRequestScreen {
                 true
             }
             BugkillStep::Investigating => {
-                if let Some(pty) = self.pty.as_mut() {
-                    pty.scroll_down(lines);
-                }
+                self.investigate_view.scroll_down(lines);
                 true
             }
             BugkillStep::Select => {
@@ -841,15 +844,11 @@ impl BugkillPullRequestScreen {
                 BugkillAction::Continue
             }
             KeyCode::Home => {
-                if let Some(pty) = self.pty.as_mut() {
-                    pty.scroll_to_top();
-                }
+                self.investigate_view.scroll_to_top();
                 BugkillAction::Continue
             }
             KeyCode::End => {
-                if let Some(pty) = self.pty.as_mut() {
-                    pty.scroll_to_bottom();
-                }
+                self.investigate_view.scroll_to_bottom();
                 BugkillAction::Continue
             }
             KeyCode::Esc => BugkillAction::Cancelled,
@@ -1607,7 +1606,18 @@ impl BugkillPullRequestScreen {
         if inner.height == 0 || inner.width == 0 {
             return;
         }
-        if let Some(pty) = self.pty.as_mut() {
+        // The investigation is a non-interactive `opencode run`, whose
+        // output is nearly unstyled — render its captured transcript through
+        // the Monokai view (matching opencode's own TUI) instead of blitting
+        // the raw PTY cells. The interactive fix PTY keeps the raw blit:
+        // there opencode's full TUI does its own theming.
+        if self.step == BugkillStep::Investigating {
+            if let Some(pty) = self.pty.as_ref() {
+                let transcript = strip_pty_artifacts(&pty.captured_output());
+                self.investigate_view.render(frame, inner, &transcript);
+                return;
+            }
+        } else if let Some(pty) = self.pty.as_mut() {
             pty.resize(inner.height, inner.width);
             pty.render(frame, inner);
             let scrollback_len = pty.scrollback_len();
