@@ -1010,6 +1010,12 @@ impl App {
         }
     }
 
+    /// Route a bracketed-paste payload to the focused surface. The Bugkill
+    /// screen consumes the whole payload atomically (multi-line bug reports);
+    /// every other screen replays the text as plain key presses so the focused
+    /// text input receives it, reusing the normal key dispatch without extra
+    /// plumbing. Control characters (newlines, tabs, escapes) are dropped so a
+    /// pasted trailing newline can't submit or cancel a prompt mid-paste.
     fn handle_paste(&mut self, text: String, tx: &mpsc::UnboundedSender<AppEvent>) {
         self.mouse_selection = None;
         if !matches!(self.phase, InitPhase::Ready) {
@@ -1022,6 +1028,13 @@ impl App {
                 .map(|screen| screen.handle_paste(&text))
                 .unwrap_or(BugkillAction::Continue);
             self.apply_bugkill_action(action, tx);
+            return;
+        }
+        for ch in text.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            self.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), tx);
         }
     }
 
@@ -8268,6 +8281,40 @@ mod tests {
 
         assert!(app.quit_requested);
         assert_eq!(app.selected_path(), Some("/tmp/repo/feat-x"));
+    }
+
+    #[test]
+    fn paste_fills_directory_input_and_drops_control_chars() {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::Create;
+        app.menu = None;
+        app.create = Some(CreateScreen::new());
+        if let Some(create) = app.create.as_mut() {
+            create.set_branches(Vec::new());
+        }
+
+        // Simulate a bracketed paste carrying a trailing newline (as most
+        // clipboard copies do). The newline must not submit the prompt.
+        app.handle_paste("pasted-dir-name\n".to_string(), &app_event_tx());
+
+        // Still on the directory-input step — the newline was dropped, not
+        // treated as Enter.
+        assert_eq!(app.screen, Screen::Create);
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let dumped = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            dumped.contains("pasted-dir-name"),
+            "pasted text should appear in the input: {dumped}"
+        );
     }
 
     #[test]
