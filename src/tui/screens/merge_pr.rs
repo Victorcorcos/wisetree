@@ -23,7 +23,8 @@ use crate::messages::colors;
 use crate::services::CheckStatus;
 use crate::tui::screens::dashboard::MergePullRequestRequest;
 use crate::tui::widgets::{
-    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, Status, StatusIndicator,
+    labeled_line, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, PrConfirmView,
+    Status, StatusIndicator,
 };
 
 const MERGE_LOADING_MESSAGE: &str = "Loading pull request details...";
@@ -184,33 +185,8 @@ impl MergePullRequestScreen {
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
             MergeStep::Loading | MergeStep::Merging => 3,
-            MergeStep::Confirm => {
-                // Title (1) + blank (1) + detail rows + body preview +
-                // ConfirmationModal (footprint ~10) + breathing room.
-                let detail_rows = self.detail_line_count() as u16;
-                let body_rows = body_preview_lines(self.body.as_deref()).len() as u16;
-                detail_rows
-                    .saturating_add(body_rows)
-                    .saturating_add(12)
-                    .max(14)
-            }
+            MergeStep::Confirm => self.confirm_view().content_height().max(14),
         }
-    }
-
-    fn detail_line_count(&self) -> usize {
-        let mut rows = 0;
-        // # + State / Title / URL / Branch / Worktree path
-        rows += 5;
-        if self.request.checks_status.is_some() {
-            rows += 1;
-        }
-        if self.request.ahead_behind.is_some() {
-            rows += 1;
-        }
-        if self.request.last_commit.is_some() {
-            rows += 1;
-        }
-        rows
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -252,49 +228,31 @@ impl MergePullRequestScreen {
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
-        let title_line = Line::from(Span::styled(
-            format!("Merge Pull Request #{}?", self.request.number),
-            Style::default()
-                .fg(colors::BRAND)
-                .add_modifier(Modifier::BOLD),
-        ));
-        let body_lines = body_preview_lines(self.body.as_deref());
-        let detail_lines = build_detail_lines(&self.request);
+        self.confirm_view().render(frame, area);
+    }
 
-        let confirm_height: u16 = 12;
-        let body_height = (body_lines.len() as u16).max(1);
-        let detail_height = detail_lines.len() as u16;
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),              // title
-                Constraint::Length(1),              // blank
-                Constraint::Length(detail_height),  // labeled rows
-                Constraint::Length(1),              // blank
-                Constraint::Length(1),              // "Description:" label
-                Constraint::Length(body_height),    // body preview
-                Constraint::Length(1),              // blank
-                Constraint::Length(confirm_height), // ConfirmationModal
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        frame.render_widget(Paragraph::new(title_line), chunks[0]);
-        frame.render_widget(Paragraph::new(detail_lines), chunks[2]);
-
-        let description_label = Line::from(Span::styled(
+    /// The shared confirm layout: labeled PR details, the `Will run:` preview
+    /// (`gh pr merge --squash`), and the description snippet. Merge spends no
+    /// AI, so there is no "which AIs run" table. Built in one place so
+    /// [`Self::preferred_content_height`] and the render agree on the height.
+    fn confirm_view(&self) -> PrConfirmView<'_> {
+        // The PR description, under a bold "Description:" header, as one block.
+        let mut description = vec![Line::from(Span::styled(
             "Description:",
             Style::default()
                 .fg(colors::INFO)
                 .add_modifier(Modifier::BOLD),
-        ));
-        frame.render_widget(Paragraph::new(description_label), chunks[4]);
-        frame.render_widget(Paragraph::new(body_lines), chunks[5]);
+        ))];
+        description.extend(body_preview_lines(self.body.as_deref()));
 
-        if let Some(dialog) = self.confirm.as_ref() {
-            dialog.render(frame, chunks[7]);
-        }
+        PrConfirmView::new(format!("Merge Pull Request #{}?", self.request.number))
+            .block(build_detail_lines(&self.request))
+            .steps(&[format!(
+                "gh pr merge #{} --squash (all commits squashed into base)",
+                self.request.number
+            )])
+            .block(description)
+            .modal(self.confirm.as_ref())
     }
 }
 
@@ -407,25 +365,6 @@ fn build_detail_lines(request: &MergePullRequestRequest) -> Vec<Line<'static>> {
     }
 
     rows
-}
-
-fn labeled_line(
-    label: &str,
-    value: Span<'static>,
-    trailing: Option<Span<'static>>,
-) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
-    spans.push(Span::styled(
-        format!("{label:<12}"),
-        Style::default()
-            .fg(colors::MUTED)
-            .add_modifier(Modifier::DIM),
-    ));
-    spans.push(value);
-    if let Some(extra) = trailing {
-        spans.push(extra);
-    }
-    Line::from(spans)
 }
 
 fn check_status_descriptor(

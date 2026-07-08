@@ -30,12 +30,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::config::schema::AiModelConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
-    render_summary_table, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, PtyView,
-    Status, StatusIndicator, SummaryRow,
+    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
+    ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
 };
 
 const UPDATE_LOADING_MESSAGE: &str = "Resolving base ref...";
@@ -100,6 +101,10 @@ pub enum UpdateAction {
 
 pub struct UpdatePullRequestScreen {
     request: UpdatePullRequestRequest,
+    /// Resolved `ai.update` config, shown on the confirm panel's "which AIs
+    /// run" table (the model that resolves merge conflicts). Omitted from the
+    /// table on the push-only flow, which never merges.
+    ai: AiModelConfig,
     confirm: Option<ConfirmationModal>,
     /// Scroll offset from the bottom of the AI activity log. `0` means
     /// "follow the latest output". When the user wheels upward we increase
@@ -178,7 +183,7 @@ pub struct UpdatePullRequestScreen {
 }
 
 impl UpdatePullRequestScreen {
-    pub fn new(request: UpdatePullRequestRequest) -> Self {
+    pub fn new(request: UpdatePullRequestRequest, ai: AiModelConfig) -> Self {
         // If the caller already resolved the base ref (rare — usually the
         // app kicks off resolution after mounting), jump straight to
         // Confirm. Otherwise show a loading spinner until `set_base_ref`
@@ -190,6 +195,7 @@ impl UpdatePullRequestScreen {
         };
         Self {
             request,
+            ai,
             confirm,
             ai_scroll: 0,
             phase_message: UPDATE_RUNNING_MESSAGE.to_string(),
@@ -219,13 +225,13 @@ impl UpdatePullRequestScreen {
     /// Construct the screen for the push-only flow (dashboard "Push Pull
     /// Request" action). A push needs no base ref, so we land straight on
     /// the Confirm step regardless of whether `base_ref` was populated.
-    pub fn new_push(request: UpdatePullRequestRequest) -> Self {
+    pub fn new_push(request: UpdatePullRequestRequest, ai: AiModelConfig) -> Self {
         let confirm = build_confirm(&request, true);
         Self {
             push_only: true,
             confirm: Some(confirm),
             step: UpdateStep::Confirm,
-            ..Self::new(request)
+            ..Self::new(request, ai)
         }
     }
 
@@ -235,12 +241,12 @@ impl UpdatePullRequestScreen {
     /// with the AI panel active. The caller spawns the opencode PTY via
     /// `spawn_opencode_pty` right after constructing. Finishing commits the
     /// merge locally (no push).
-    pub fn new_local_conflict(request: UpdatePullRequestRequest) -> Self {
+    pub fn new_local_conflict(request: UpdatePullRequestRequest, ai: AiModelConfig) -> Self {
         Self {
             local_only: true,
             step: UpdateStep::Updating,
             ai_active: true,
-            ..Self::new(request)
+            ..Self::new(request, ai)
         }
     }
 
@@ -1003,39 +1009,7 @@ impl UpdatePullRequestScreen {
                     3
                 }
             }
-            UpdateStep::Confirm => {
-                let detail_rows = self.detail_line_count() as u16;
-                let steps_rows = self.steps_line_count() as u16;
-                detail_rows
-                    .saturating_add(steps_rows)
-                    .saturating_add(14)
-                    .max(16)
-            }
-        }
-    }
-
-    fn detail_line_count(&self) -> usize {
-        // PR / Title / URL / Branch / Worktree are always shown.
-        let mut rows = 5;
-        if self.request.base_ref.is_some() {
-            rows += 1;
-        }
-        if self.request.behind > 0 {
-            rows += 1;
-        }
-        if self.request.ahead > 0 {
-            rows += 1;
-        }
-        rows
-    }
-
-    fn steps_line_count(&self) -> usize {
-        if self.push_only {
-            // header + 1 bullet
-            2
-        } else {
-            // header + 4 bullets
-            5
+            UpdateStep::Confirm => self.confirm_view().content_height().max(16),
         }
     }
 
@@ -1075,43 +1049,36 @@ impl UpdatePullRequestScreen {
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
+        self.confirm_view().render(frame, area);
+    }
+
+    /// The shared confirm layout: labeled details, the `Will run:` preview,
+    /// and — for the full update flow — the `ai.update` conflict-resolution
+    /// row. Built in one place so [`Self::preferred_content_height`] and the
+    /// render agree on the height.
+    fn confirm_view(&self) -> PrConfirmView<'_> {
         let title_verb = if self.push_only { "Push" } else { "Update" };
-        let title_line = Line::from(Span::styled(
-            format!("{title_verb} Pull Request #{}?", self.request.number),
-            Style::default()
-                .fg(colors::BRAND)
-                .add_modifier(Modifier::BOLD),
-        ));
-        let detail_lines = build_detail_lines(&self.request);
-        let steps_lines = build_steps_lines(
-            self.request.base_ref.as_deref().unwrap_or("?"),
-            self.push_only,
-        );
-
-        let confirm_height: u16 = 12;
-        let detail_height = detail_lines.len() as u16;
-        let steps_height = steps_lines.len() as u16;
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),              // title
-                Constraint::Length(1),              // blank
-                Constraint::Length(detail_height),  // labeled rows
-                Constraint::Length(1),              // blank
-                Constraint::Length(steps_height),   // steps preview
-                Constraint::Length(1),              // blank
-                Constraint::Length(confirm_height), // ConfirmationModal
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        frame.render_widget(Paragraph::new(title_line), chunks[0]);
-        frame.render_widget(Paragraph::new(detail_lines), chunks[2]);
-        frame.render_widget(Paragraph::new(steps_lines), chunks[4]);
-        if let Some(dialog) = self.confirm.as_ref() {
-            dialog.render(frame, chunks[6]);
-        }
+        let base_ref = self.request.base_ref.as_deref().unwrap_or("?");
+        // Push-only never merges, so it spends no AI; the full update flow may
+        // fall into opencode conflict resolution (`ai.update`).
+        let ai_roles = if self.push_only {
+            Vec::new()
+        } else {
+            vec![AiRoleRow::new(
+                "update",
+                colors::INFO,
+                self.ai.model.clone(),
+                self.ai.thinking.clone(),
+            )]
+        };
+        PrConfirmView::new(format!(
+            "{title_verb} Pull Request #{}?",
+            self.request.number
+        ))
+        .block(build_detail_lines(&self.request))
+        .steps(&build_steps(base_ref, self.push_only))
+        .ai_roles(ai_roles)
+        .modal(self.confirm.as_ref())
     }
 }
 
@@ -2333,32 +2300,17 @@ fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> 
     rows
 }
 
-fn build_steps_lines(base_ref: &str, push_only: bool) -> Vec<Line<'static>> {
-    let header_style = Style::default()
-        .fg(colors::INFO)
-        .add_modifier(Modifier::BOLD);
-    let bullet_style = Style::default().fg(colors::EMPHASIS);
-    let muted = Style::default()
-        .fg(colors::MUTED)
-        .add_modifier(Modifier::DIM);
-    let bullet = |cmd: String| {
-        Line::from(vec![
-            Span::styled("  • ".to_string(), muted),
-            Span::styled(cmd, bullet_style),
-        ])
-    };
+/// `Will run:` step text for the confirm panel; the shared [`PrConfirmView`]
+/// owns the numbering + styling.
+fn build_steps(base_ref: &str, push_only: bool) -> Vec<String> {
     if push_only {
-        return vec![
-            Line::from(Span::styled("Will run:".to_string(), header_style)),
-            bullet("git push origin HEAD".to_string()),
-        ];
+        return vec!["git push origin HEAD".to_string()];
     }
     vec![
-        Line::from(Span::styled("Will run:".to_string(), header_style)),
-        bullet("git fetch --all --prune".to_string()),
-        bullet(format!("git merge {base_ref}")),
-        bullet("on conflict: opencode streams resolution, then Complete/Cancel".to_string()),
-        bullet("git push origin HEAD".to_string()),
+        "git fetch --all --prune".to_string(),
+        format!("git merge {base_ref}"),
+        "on conflict: opencode streams resolution, then Complete/Cancel".to_string(),
+        "git push origin HEAD".to_string(),
     ]
 }
 
@@ -2455,25 +2407,6 @@ fn build_finalize_modal() -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Confirm)
 }
 
-fn labeled_line(
-    label: &str,
-    value: Span<'static>,
-    trailing: Option<Span<'static>>,
-) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
-    spans.push(Span::styled(
-        format!("{label:<12}"),
-        Style::default()
-            .fg(colors::MUTED)
-            .add_modifier(Modifier::DIM),
-    ));
-    spans.push(value);
-    if let Some(extra) = trailing {
-        spans.push(extra);
-    }
-    Line::from(spans)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2509,16 +2442,23 @@ mod tests {
         }
     }
 
+    fn test_ai() -> AiModelConfig {
+        AiModelConfig {
+            model: "opencode/update-model".to_string(),
+            thinking: String::new(),
+        }
+    }
+
     #[test]
     fn screen_starts_in_loading_when_base_ref_unknown() {
-        let screen = UpdatePullRequestScreen::new(sample_request());
+        let screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         assert_eq!(screen.step(), UpdateStep::Loading);
         assert!(screen.error().is_none());
     }
 
     #[test]
     fn set_base_ref_transitions_to_confirm_default_no() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         assert_eq!(screen.step(), UpdateStep::Confirm);
         let dialog = screen
@@ -2530,7 +2470,7 @@ mod tests {
 
     #[test]
     fn enter_on_no_returns_cancelled() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(enter), UpdateAction::Cancelled);
@@ -2538,7 +2478,7 @@ mod tests {
 
     #[test]
     fn tab_then_enter_confirms() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(tab), UpdateAction::Continue);
@@ -2548,7 +2488,7 @@ mod tests {
 
     #[test]
     fn new_local_conflict_starts_in_updating_with_ai_active() {
-        let screen = UpdatePullRequestScreen::new_local_conflict(sample_request());
+        let screen = UpdatePullRequestScreen::new_local_conflict(sample_request(), test_ai());
         assert!(screen.local_only());
         assert_eq!(screen.step(), UpdateStep::Updating);
         assert!(screen.ai_active());
@@ -2556,7 +2496,7 @@ mod tests {
 
     #[test]
     fn local_only_done_page_drops_push_wording() {
-        let mut screen = UpdatePullRequestScreen::new_local_conflict(sample_request());
+        let mut screen = UpdatePullRequestScreen::new_local_conflict(sample_request(), test_ai());
         // Jump to the finished commit page as if the local `git commit`
         // succeeded.
         screen.step = UpdateStep::CommitPush;
@@ -2577,7 +2517,7 @@ mod tests {
 
     #[test]
     fn pr_flow_done_page_keeps_push_wording() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.step = UpdateStep::CommitPush;
         screen.commit_push_succeeded = true;
         screen.commit_push_summary = vec![SummaryRow::success(screen.commit_action_label())];
@@ -2592,14 +2532,14 @@ mod tests {
 
     #[test]
     fn esc_during_loading_cancels() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(esc), UpdateAction::Cancelled);
     }
 
     #[test]
     fn keys_are_ignored_while_updating_before_ai_done() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -2611,7 +2551,7 @@ mod tests {
 
     #[test]
     fn set_error_clears_confirm_and_any_key_dismisses() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_error("boom".to_string());
         let any = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(screen.handle_key(any), UpdateAction::Cancelled);
@@ -2619,7 +2559,7 @@ mod tests {
 
     #[test]
     fn enter_on_complete_returns_ai_complete() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2631,7 +2571,7 @@ mod tests {
 
     #[test]
     fn right_then_enter_returns_ai_cancel() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2645,7 +2585,7 @@ mod tests {
 
     #[test]
     fn mark_ai_done_is_idempotent_and_preserves_button_selection() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2668,7 +2608,7 @@ mod tests {
 
     #[test]
     fn esc_after_ai_done_returns_ai_cancel() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2679,7 +2619,7 @@ mod tests {
 
     #[test]
     fn ai_log_truncates_at_cap() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         for i in 0..(AI_LOG_MAX_LINES + 50) {
             screen.append_ai_line(format!("line {i}"));
         }
@@ -2693,7 +2633,7 @@ mod tests {
 
     #[test]
     fn assistant_activity_deltas_coalesce_into_one_row() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.append_ai_line(AiActivityEvent::AssistantText {
             content: "git".to_string(),
         });
@@ -2733,7 +2673,7 @@ mod tests {
 
     #[test]
     fn phase_message_updates_during_updating() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.set_phase_message("Conflict found — opencode resolving...");
@@ -2745,7 +2685,7 @@ mod tests {
 
     #[test]
     fn mouse_wheel_scrolls_ai_activity_when_ai_active() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2761,7 +2701,7 @@ mod tests {
 
     #[test]
     fn ai_activity_scroll_stays_stable_when_new_lines_arrive() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2778,7 +2718,7 @@ mod tests {
 
     #[test]
     fn ai_activity_panel_hidden_until_marked_active() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         assert!(!screen.ai_active());
@@ -2800,7 +2740,7 @@ mod tests {
 
     #[test]
     fn apply_and_cancel_buttons_visible_after_ai_done() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2816,7 +2756,7 @@ mod tests {
 
     #[test]
     fn updating_height_is_compact_until_ai_active() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         let compact = screen.preferred_content_height();
@@ -2830,7 +2770,7 @@ mod tests {
 
     #[test]
     fn start_updating_resets_ai_active_flag() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2869,7 +2809,7 @@ mod tests {
 
     #[test]
     fn pty_focus_defaults_to_outer_after_start_updating() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2878,7 +2818,7 @@ mod tests {
 
     #[test]
     fn footer_includes_scroll_hint_during_streaming_when_log_has_content() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2897,7 +2837,7 @@ mod tests {
 
     #[test]
     fn pty_focus_indicator_renders_below_ai_activity_panel() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2916,7 +2856,7 @@ mod tests {
 
     #[test]
     fn enter_on_outer_focus_while_streaming_opens_finalize_modal() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2931,7 +2871,7 @@ mod tests {
 
     #[test]
     fn tab_inside_finalize_modal_toggles_selection() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2952,7 +2892,7 @@ mod tests {
 
     #[test]
     fn enter_on_yes_in_finalize_modal_transitions_to_review() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2970,7 +2910,7 @@ mod tests {
 
     #[test]
     fn enter_on_no_in_finalize_modal_dismisses_and_keeps_streaming() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -2991,7 +2931,7 @@ mod tests {
 
     #[test]
     fn esc_inside_finalize_modal_dismisses_without_finalizing() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -3006,7 +2946,7 @@ mod tests {
 
     #[test]
     fn finalize_modal_renders_centered_overlay() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
@@ -3034,7 +2974,7 @@ mod tests {
     fn enter_with_outer_focus_does_not_open_modal_before_ai_active() {
         // Pre-AI Activity (e.g. fetching base ref) — Enter is still a
         // swallowed no-op, not a modal trigger.
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -3044,10 +2984,11 @@ mod tests {
 
     #[test]
     fn render_confirm_shows_base_ref_and_buttons() {
-        let mut screen = UpdatePullRequestScreen::new(sample_request());
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
 
-        let dumped = render_dump(&mut screen, 100, 28);
+        // Tall enough for details + Will-run steps + the ai.update table + modal.
+        let dumped = render_dump(&mut screen, 100, 34);
 
         assert!(
             dumped.contains("Update Pull Request #21?"),
@@ -3057,11 +2998,16 @@ mod tests {
         assert!(dumped.contains("-7"));
         assert!(dumped.contains("Yes"));
         assert!(dumped.contains("No"));
+        // The resolved ai.update model appears in the "which AIs run" table.
+        assert!(
+            dumped.contains("opencode/update-model"),
+            "expected ai.update row in:\n{dumped}"
+        );
     }
 
     #[test]
     fn new_push_lands_on_confirm_in_push_only_mode() {
-        let screen = UpdatePullRequestScreen::new_push(sample_request());
+        let screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
         assert_eq!(screen.step(), UpdateStep::Confirm);
         assert!(screen.is_push_only());
         assert!(screen.error().is_none());
@@ -3069,7 +3015,7 @@ mod tests {
 
     #[test]
     fn render_push_confirm_shows_push_wording_only() {
-        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
         let dumped = render_dump(&mut screen, 100, 24);
         assert!(
             dumped.contains("Push Pull Request #21?"),
@@ -3092,7 +3038,7 @@ mod tests {
 
     #[test]
     fn terminal_mode_grows_preferred_height() {
-        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
         screen.enter_terminal_mode_for_test();
         assert!(screen.terminal_active());
         assert!(
@@ -3104,7 +3050,7 @@ mod tests {
 
     #[test]
     fn terminal_outer_enter_accepts_and_esc_discards() {
-        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
         screen.enter_terminal_mode_for_test();
 
         // Default focus is Accept → Enter re-pushes.
@@ -3119,7 +3065,7 @@ mod tests {
 
     #[test]
     fn terminal_arrows_switch_button_then_enter_discards() {
-        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
         screen.enter_terminal_mode_for_test();
 
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -3133,7 +3079,7 @@ mod tests {
 
     #[test]
     fn render_terminal_panel_shows_terminal_activity_title() {
-        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
         screen.enter_terminal_mode_for_test();
         let dumped = render_dump(&mut screen, 100, 28);
         assert!(
@@ -3157,7 +3103,7 @@ mod tests {
 
     #[test]
     fn terminal_error_box_shows_full_error_wrapped_not_truncated() {
-        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
         // A realistic multi-line git push rejection. A nonexistent shell makes
         // the spawn fail (pty = None) without affecting the error-box render.
         screen.start_terminal_recovery(
@@ -3229,7 +3175,7 @@ mod tests {
         let Some(shell) = shell else {
             return;
         };
-        let mut screen = UpdatePullRequestScreen::new_push(sample_request());
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
         screen.start_updating();
         screen.start_terminal_recovery(
             shell,

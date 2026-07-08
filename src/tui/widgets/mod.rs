@@ -9,6 +9,7 @@ pub mod command_list_progress;
 pub mod command_progress;
 pub mod confirmation_modal;
 pub mod input_prompt;
+pub mod pr_confirm;
 pub mod pty_view;
 pub mod scrollbar;
 pub mod select_prompt;
@@ -27,6 +28,7 @@ pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
 pub use confirmation_modal::{ConfirmationChoice, ConfirmationModal, ConfirmationOutcome};
 pub use input_prompt::{InputOutcome, InputPrompt};
+pub use pr_confirm::{labeled_line, will_run_lines, AiRoleRow, PrConfirmView};
 pub use pty_view::PtyView;
 pub use scrollbar::render_vertical_scrollbar;
 pub use select_prompt::{

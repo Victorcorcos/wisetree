@@ -48,8 +48,9 @@ use crate::services::{BugkillSnapshot, BugkillUnverdicted, ParsedInvestigation};
 use crate::tui::screens::dashboard::BugkillRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    render_summary_table, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
-    InputPrompt, PtyView, Status, StatusIndicator, SummaryRow,
+    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
+    ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView, Status,
+    StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -1099,122 +1100,90 @@ impl BugkillPullRequestScreen {
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
-        let detail_lines = vec![
-            labeled_line(
-                "Branch",
-                Span::styled(
-                    self.request.branch.clone(),
-                    Style::default()
-                        .fg(colors::SUCCESS)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ),
-            labeled_line(
-                "Worktree",
-                Span::styled(
-                    self.request.worktree_path.clone(),
-                    Style::default().fg(colors::EMPHASIS),
-                ),
-            ),
+        // Numbered pipeline preview — the Bugkill "Will run:" steps other PR
+        // commands now mirror through the shared confirm view.
+        let steps = [
+            "You describe the bug.",
+            "The investigate AI explores the code read-only and ranks likely root causes \
+             into BUG_INVESTIGATION.md.",
+            "You pick one proposed fix from the ranked table.",
+            "The fix AI applies only that fix, live, in an embedded opencode terminal.",
+            "You confirm whether the bug is gone — Yes keeps the fix (committed on the \
+             branch), No reverts it with git revert (history preserved) and returns you to \
+             the table.",
+            "Loop until a fix works or all fixes fail.",
         ];
-        let steps_lines = build_steps_lines();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),                         // title
-                Constraint::Length(1),                         // blank
-                Constraint::Length(detail_lines.len() as u16), // details
-                Constraint::Length(1),                         // blank
-                Constraint::Length(steps_lines.len() as u16),  // steps
-                Constraint::Length(1),                         // blank
-                Constraint::Length(4),                         // resolved AI config table
-                Constraint::Length(1),                         // blank
-                Constraint::Length(12),                        // modal
-                Constraint::Min(0),
-            ])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Hunt a bug on this worktree?",
-                Style::default()
-                    .fg(colors::BRAND)
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            chunks[0],
-        );
-        frame.render_widget(Paragraph::new(detail_lines), chunks[2]);
-        frame.render_widget(Paragraph::new(steps_lines), chunks[4]);
-        self.render_config_table(frame, chunks[6]);
-        if let Some(dialog) = self.confirm.as_ref() {
-            dialog.render(frame, chunks[8]);
-        }
+        PrConfirmView::new("Hunt a bug on this worktree?")
+            .block(self.confirm_detail_lines())
+            .steps(&steps)
+            .ai_roles(self.confirm_ai_roles())
+            .modal(self.confirm.as_ref())
+            .render(frame, area);
     }
 
-    /// The resolved per-role config, so the user sees what will be spent.
-    fn render_config_table(&self, frame: &mut Frame, area: Rect) {
-        let thinking_label = |thinking: &str| {
-            let thinking = if thinking.trim().is_empty() {
-                "default"
-            } else {
-                thinking
-            };
-            thinking.to_string()
-        };
+    /// Labeled detail rows for the confirm panel: an optional `PR` row (when
+    /// the worktree has an associated open PR), then Branch + Worktree.
+    fn confirm_detail_lines(&self) -> Vec<Line<'static>> {
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        if let Some(number) = self.request.number {
+            rows.push(labeled_line(
+                "PR",
+                Span::styled(
+                    format!("#{number} "),
+                    Style::default()
+                        .fg(colors::INFO)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                self.request
+                    .title
+                    .clone()
+                    .map(|title| Span::styled(title, Style::default().fg(colors::WHITE))),
+            ));
+        }
+        rows.push(labeled_line(
+            "Branch",
+            Span::styled(
+                self.request.branch.clone(),
+                Style::default()
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None,
+        ));
+        rows.push(labeled_line(
+            "Worktree",
+            Span::styled(
+                self.request.worktree_path.clone(),
+                Style::default().fg(colors::EMPHASIS),
+            ),
+            None,
+        ));
+        rows
+    }
 
-        let header = Row::new(vec![
-            TableCell::from("Role"),
-            TableCell::from("Model"),
-            TableCell::from("Thinking"),
-        ])
-        .style(
-            Style::default()
-                .fg(colors::GRAY_DARK)
-                .add_modifier(Modifier::BOLD),
-        );
-        let rows = vec![
-            Row::new(vec![
-                TableCell::from("investigate").style(Style::default().fg(colors::BRAND)),
-                TableCell::from(self.ai.investigate.model.clone())
-                    .style(Style::default().fg(colors::GRAY_LIGHT)),
-                TableCell::from(thinking_label(&self.ai.investigate.thinking))
-                    .style(Style::default().fg(colors::EMPHASIS)),
-            ]),
-            Row::new(vec![
-                TableCell::from("fix").style(Style::default().fg(colors::SUCCESS)),
-                TableCell::from(self.ai.fix.model.clone())
-                    .style(Style::default().fg(colors::GRAY_LIGHT)),
-                TableCell::from(thinking_label(&self.ai.fix.thinking))
-                    .style(Style::default().fg(colors::EMPHASIS)),
-            ]),
-            Row::new(vec![
-                TableCell::from("judge").style(Style::default().fg(colors::INFO)),
-                TableCell::from(self.ai.judge.model.clone())
-                    .style(Style::default().fg(colors::GRAY_LIGHT)),
-                TableCell::from(thinking_label(&self.ai.judge.thinking))
-                    .style(Style::default().fg(colors::EMPHASIS)),
-            ]),
-        ];
-        let table_width = area.width.min(62);
-        let table_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(area.width.saturating_sub(table_width) / 2),
-                Constraint::Length(table_width),
-                Constraint::Min(0),
-            ])
-            .split(area)[1];
-
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(12),
-                Constraint::Min(24),
-                Constraint::Length(10),
-            ],
-        )
-        .header(header)
-        .column_spacing(2);
-        frame.render_widget(table, table_area);
+    /// The resolved `ai.bugkill` roles, so the user sees which models (and
+    /// reasoning effort) each pipeline phase will spend before confirming.
+    fn confirm_ai_roles(&self) -> Vec<AiRoleRow> {
+        vec![
+            AiRoleRow::new(
+                "investigate",
+                colors::BRAND,
+                self.ai.investigate.model.clone(),
+                self.ai.investigate.thinking.clone(),
+            ),
+            AiRoleRow::new(
+                "fix",
+                colors::SUCCESS,
+                self.ai.fix.model.clone(),
+                self.ai.fix.thinking.clone(),
+            ),
+            AiRoleRow::new(
+                "judge",
+                colors::INFO,
+                self.ai.judge.model.clone(),
+                self.ai.judge.thinking.clone(),
+            ),
+        ]
     }
 
     fn render_describe(&self, frame: &mut Frame, area: Rect) {
@@ -1990,13 +1959,6 @@ fn muted_dim() -> Style {
         .add_modifier(Modifier::DIM)
 }
 
-fn labeled_line(label: &str, value: Span<'static>) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label:<10}"), muted_dim()),
-        value,
-    ])
-}
-
 /// Clip to `max` chars with an ellipsis.
 fn clip_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -2055,40 +2017,6 @@ fn build_investigate_continue_modal() -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Cancel)
 }
 
-fn build_steps_lines() -> Vec<Line<'static>> {
-    let header = Style::default()
-        .fg(colors::INFO)
-        .add_modifier(Modifier::BOLD);
-    let bullet = Style::default().fg(colors::EMPHASIS);
-    let step = |n: usize, text: &str| {
-        Line::from(vec![
-            Span::styled(format!("  {n}. "), muted_dim()),
-            Span::styled(text.to_string(), bullet),
-        ])
-    };
-    vec![
-        Line::from(Span::styled("Will run:".to_string(), header)),
-        step(1, "You describe the bug."),
-        step(
-            2,
-            "The investigate AI explores the code read-only and ranks likely root causes \
-             into BUG_INVESTIGATION.md.",
-        ),
-        step(3, "You pick one proposed fix from the ranked table."),
-        step(
-            4,
-            "The fix AI applies only that fix, live, in an embedded opencode terminal.",
-        ),
-        step(
-            5,
-            "You confirm whether the bug is gone — Yes keeps the fix (committed on the \
-             branch), No reverts it with git revert (history preserved) and returns you to \
-             the table.",
-        ),
-        step(6, "Loop until a fix works or all fixes fail."),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2101,6 +2029,8 @@ mod tests {
         BugkillRequest {
             branch: "fix/save-crash".to_string(),
             worktree_path: "/tmp/repo-save".to_string(),
+            number: None,
+            title: None,
         }
     }
 
@@ -2202,6 +2132,28 @@ mod tests {
         assert!(dump.contains("judge"), "{dump}");
         assert!(dump.contains("tiny/model"), "{dump}");
         assert!(dump.contains("low"), "{dump}");
+    }
+
+    #[test]
+    fn confirm_shows_pr_row_only_when_a_pr_is_associated() {
+        // No PR → no PR row.
+        let mut s = screen();
+        let dump = render_dump(&mut s, 110, 30);
+        assert!(!dump.contains("PR "), "unexpected PR row:\n{dump}");
+
+        // Associated PR → a `PR #n title` row appears above Branch/Worktree.
+        let request = BugkillRequest {
+            number: Some(7),
+            title: Some("Fix the save crash".to_string()),
+            ..request()
+        };
+        let mut s = BugkillPullRequestScreen::new(request, ai());
+        let dump = render_dump(&mut s, 110, 32);
+        assert!(dump.contains("#7"), "expected PR number in:\n{dump}");
+        assert!(
+            dump.contains("Fix the save crash"),
+            "expected PR title in:\n{dump}"
+        );
     }
 
     // ── DescribeBug ─────────────────────────────────────────────────────
