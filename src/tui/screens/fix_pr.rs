@@ -1350,14 +1350,14 @@ fn build_comment_lines(group: &CommentGroup) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(
-            format!("@{}", comment.author),
+            sanitize_row(&format!("@{}", comment.author)),
             Style::default()
                 .fg(colors::ACCENT)
                 .add_modifier(Modifier::BOLD),
         )));
         for raw in comment.body.trim().lines() {
             lines.push(Line::from(Span::styled(
-                raw.to_string(),
+                sanitize_row(raw),
                 Style::default().fg(colors::WHITE),
             )));
         }
@@ -1437,7 +1437,7 @@ fn build_proposal_lines(group: &CommentGroup, plan: &FixPlan, width: usize) -> V
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                comment.body.trim().replace('\n', " "),
+                sanitize_row(&comment.body.trim().replace('\n', " ")),
                 Style::default().fg(colors::WHITE),
             ),
         ]));
@@ -1480,7 +1480,7 @@ fn section_label(text: &str) -> Line<'static> {
 fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
     for raw in text.lines() {
         lines.push(Line::from(Span::styled(
-            raw.to_string(),
+            sanitize_row(raw),
             Style::default().fg(color),
         )));
     }
@@ -1500,7 +1500,7 @@ fn push_change(lines: &mut Vec<Line<'static>>, change: &str, width: usize) {
         }
         if !in_fence {
             lines.push(Line::from(Span::styled(
-                raw.to_string(),
+                sanitize_row(raw),
                 Style::default().fg(colors::GRAY_LIGHT),
             )));
             continue;
@@ -1515,13 +1515,13 @@ fn push_change(lines: &mut Vec<Line<'static>>, change: &str, width: usize) {
                 width,
             ),
             _ if raw.starts_with("@@") => lines.push(Line::from(Span::styled(
-                expand_tabs(raw),
+                sanitize_row(raw),
                 Style::default()
                     .fg(colors::DIFF_HUNK_FG)
                     .add_modifier(Modifier::BOLD),
             ))),
             _ => lines.push(Line::from(Span::styled(
-                expand_tabs(raw),
+                sanitize_row(raw),
                 Style::default().fg(colors::GRAY_MEDIUM),
             ))),
         }
@@ -1534,7 +1534,7 @@ fn push_change(lines: &mut Vec<Line<'static>>, change: &str, width: usize) {
 /// a grapheme, so the padding is what extends the bar).
 fn push_diff_bar(lines: &mut Vec<Line<'static>>, raw: &str, fg: Color, bg: Color, width: usize) {
     let style = Style::default().fg(fg).bg(bg);
-    let text = expand_tabs(raw);
+    let text = sanitize_row(raw);
     if width == 0 {
         lines.push(Line::from(Span::styled(text, style)));
         return;
@@ -1554,10 +1554,24 @@ fn push_diff_bar(lines: &mut Vec<Line<'static>>, raw: &str, fg: Color, bg: Color
     }
 }
 
-/// Expand tabs to four spaces so diff alignment and bar widths are predictable
-/// (ratatui renders a raw tab as a single cell, which skews indentation).
-fn expand_tabs(s: &str) -> String {
-    s.replace('\t', "    ")
+/// Sanitize one display row before it becomes a rendered cell. Tabs expand to
+/// four spaces so diff alignment and bar widths stay predictable (ratatui draws
+/// a raw tab as a single cell, which skews indentation), and every other
+/// control character is dropped. GitHub comment bodies arrive with CRLF endings
+/// and can embed raw escape codes; a stray `\r` or `\x1b` written into a cell is
+/// re-emitted verbatim to the terminal, which acts on it as a cursor-control
+/// code and shreds the panel — borders land mid-line and text spills past the
+/// frame. Stripping them keeps rendering literal and the layout intact.
+fn sanitize_row(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn labeled_line(
@@ -2130,6 +2144,57 @@ mod tests {
         assert!(dump.contains("Resolved 1 review comment"), "{dump}");
         assert!(dump.contains("Applied"), "{dump}");
         assert!(dump.contains("Press any key"), "{dump}");
+    }
+
+    #[test]
+    fn sanitize_row_drops_control_chars_and_expands_tabs() {
+        // \r (CRLF leftover), the \x1b escape byte, and \0 are dropped; a tab
+        // becomes four spaces; printable text (incl. emoji) is untouched.
+        // Dropping the escape byte neutralizes the ANSI sequence — the leftover
+        // `[31m` is inert literal text, so no color/cursor control ever fires.
+        assert_eq!(sanitize_row("a\rb\x1b[31mc\0d"), "ab[31mcd");
+        assert_eq!(sanitize_row("x\ty"), "x    y");
+        assert_eq!(sanitize_row("💡 ok"), "💡 ok");
+    }
+
+    #[test]
+    fn proposed_fix_panel_strips_control_chars_from_comment() {
+        // Real GitHub comment: CRLF endings, emoji, an <img> tag with a very
+        // long URL, HTML <details>/<summary>. This is the Codex review comment
+        // that corrupted the Proposed fix panel on a real terminal — a cell
+        // holding a lone `\r` is re-sent to the terminal as a carriage return,
+        // jumping the cursor to column 0 and shredding the layout. No rendered
+        // cell may carry a control character.
+        let body = "### 💡 Codex Review\r\n\r\nHere are some automated review suggestions.\r\n\r\n<details> <summary>ℹ️ About Codex</summary>\r\n<br/>\r\n\r\n<img width=\"1389\" height=\"958\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/ec1aeeef-cb58-4921-8a6f-206db1d2ee1c\" />\r\n\r\n</details>";
+        let mut screen = FixPullRequestScreen::new(request());
+        screen.set_groups(
+            vec![group_with(
+                Some("lib/player.dart"),
+                Some(117),
+                "chatgpt-codex-connector",
+                body,
+            )],
+            "o".into(),
+            "r".into(),
+        );
+        screen.show_decision(plan());
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| screen.render(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut offenders = Vec::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let sym = buffer[(x, y)].symbol();
+                if sym.chars().any(|c| c.is_control()) {
+                    offenders.push((x, y, sym.escape_debug().to_string()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "control chars leaked into rendered cells: {offenders:?}"
+        );
     }
 
     #[test]

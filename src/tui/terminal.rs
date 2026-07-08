@@ -87,21 +87,24 @@ impl<W: Write> RatatuiBackend for AdaptiveBackend<W> {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        if self.color_count == u16::MAX {
-            return self.inner.draw(content);
-        }
-
-        let downgraded: Vec<(u16, u16, Cell)> = content
+        // Every cell is inspected for control characters (see `sanitize_cell`),
+        // so we always materialize; color downgrade piggybacks on the same pass
+        // when the terminal lacks truecolor support.
+        let downgrade = self.color_count != u16::MAX;
+        let prepared: Vec<(u16, u16, Cell)> = content
             .map(|(x, y, cell)| {
                 let mut cell = cell.clone();
-                cell.fg = downgrade_color(cell.fg, self.color_count);
-                cell.bg = downgrade_color(cell.bg, self.color_count);
+                if downgrade {
+                    cell.fg = downgrade_color(cell.fg, self.color_count);
+                    cell.bg = downgrade_color(cell.bg, self.color_count);
+                }
+                sanitize_cell(&mut cell);
                 (x, y, cell)
             })
             .collect();
 
         self.inner
-            .draw(downgraded.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .draw(prepared.iter().map(|(x, y, cell)| (*x, *y, cell)))
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
@@ -142,6 +145,27 @@ impl<W: Write> RatatuiBackend for AdaptiveBackend<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         RatatuiBackend::flush(&mut self.inner)
+    }
+}
+
+/// Neutralize any control character that reached a rendered cell — the last
+/// line of defense against terminal corruption. External text (PR comments,
+/// git/gh output, AI transcripts, pasted input) can carry a stray `\r` from
+/// CRLF endings, a raw `\x1b` escape, or other C0/C1 codes. Ratatui lays each
+/// into a cell verbatim and Crossterm re-emits it to the terminal, which acts
+/// on it as a cursor/format control code and shreds the layout — borders land
+/// mid-line, text spills past the frame. A cell is one fixed grid slot, so the
+/// only width-preserving substitution is a blank; that keeps the frame intact.
+/// Callers that own their text should still format it deliberately (e.g. expand
+/// tabs) — this guard only guarantees nothing corrupts the screen.
+fn sanitize_cell(cell: &mut Cell) {
+    if cell.symbol().chars().any(char::is_control) {
+        let cleaned: String = cell.symbol().chars().filter(|c| !c.is_control()).collect();
+        if cleaned.is_empty() {
+            cell.set_symbol(" ");
+        } else {
+            cell.set_symbol(&cleaned);
+        }
     }
 }
 
@@ -408,6 +432,68 @@ mod tests {
             app_viewport(Size::new(80, 20)),
             Viewport::Fixed(Rect::new(0, 0, 80, 20))
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn draw_never_emits_a_carriage_return_byte() {
+        // End-to-end through the real backend: a cell carrying `\r` must not
+        // reach the writer as a raw 0x0D, even on the truecolor fast-path where
+        // color downgrade is skipped. Crossterm positions the cursor with CSI
+        // sequences, never a bare `\r`, so any 0x0D in the output is content.
+        let buf = SharedBuf::default();
+        let mut backend = AdaptiveBackend::with_color_count(buf.clone(), u16::MAX);
+        let mut dirty = Cell::default();
+        dirty.set_symbol("\r");
+        let content = [(0u16, 0u16, dirty), (1, 0, styled_cell())];
+        RatatuiBackend::draw(&mut backend, content.iter().map(|(x, y, c)| (*x, *y, c))).unwrap();
+        RatatuiBackend::flush(&mut backend).unwrap();
+        assert!(
+            !buf.0.borrow().contains(&b'\r'),
+            "raw carriage return leaked to the terminal writer"
+        );
+    }
+
+    #[test]
+    fn sanitize_cell_replaces_lone_control_char_with_blank() {
+        // A cell whose whole symbol is a control char (the CRLF `\r` that broke
+        // the Proposed fix panel) becomes a blank so the terminal never sees it.
+        let mut cell = Cell::default();
+        cell.set_symbol("\r");
+        sanitize_cell(&mut cell);
+        assert_eq!(cell.symbol(), " ");
+    }
+
+    #[test]
+    fn sanitize_cell_leaves_printable_symbols_untouched() {
+        for sym in ["A", " ", "💡", "é"] {
+            let mut cell = Cell::default();
+            cell.set_symbol(sym);
+            sanitize_cell(&mut cell);
+            assert_eq!(cell.symbol(), sym, "printable symbol {sym:?} was altered");
+        }
+    }
+
+    #[test]
+    fn sanitize_cell_strips_control_from_mixed_grapheme() {
+        // Defensive: if a control byte rides along in a multi-char symbol, drop
+        // just the control char and keep the visible remainder.
+        let mut cell = Cell::default();
+        cell.set_symbol("a\u{7}");
+        sanitize_cell(&mut cell);
+        assert_eq!(cell.symbol(), "a");
     }
 
     #[test]

@@ -237,9 +237,10 @@ impl<T: Clone> SelectPrompt<T> {
                     self.selected = 0;
                 }
                 KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !c.is_control()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.query.push(c);
                     self.selected = 0;
