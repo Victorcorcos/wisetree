@@ -19,6 +19,7 @@ use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
 use crate::files::{strip_ansi, ActivityKind};
 use crate::git::exec::execute_git_command;
+use crate::git::lock::{git_lock_path, retry_on_git_lock};
 use crate::git::types::{BranchStatus, GitWorktree};
 use crate::services::ai_status::{AiStatusIndex, AiStatusPaths, AiStatusReport, AiStatusService};
 use crate::services::bugkill::{
@@ -78,18 +79,6 @@ const FIX_CODE_MAX_BYTES: usize = 24_000;
 /// (status/add/commit/revert/checkout) run captured under a timeout.
 const BUGKILL_JUDGE_TIMEOUT: Duration = Duration::from_secs(120);
 const BUGKILL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Recovery budget for a git op that fails because another process holds
-/// `index.lock`. A concurrent git process (wisetree's own dashboard status
-/// poll, an editor's git integration) releases the lock within milliseconds,
-/// so we back off and retry; a lock that sits untouched past
-/// `INDEX_LOCK_STALE_AFTER` was orphaned by a crashed or killed git process,
-/// so we reclaim it before retrying. `RETRIES * BACKOFF` (~3s) comfortably
-/// exceeds the stale window, so a genuinely-orphaned lock is always removed
-/// with retries to spare, while a lock a live process is actively cycling is
-/// only ever waited on, never deleted.
-const INDEX_LOCK_RETRIES: usize = 12;
-const INDEX_LOCK_BACKOFF: Duration = Duration::from_millis(250);
-const INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(2);
 /// Byte caps applied to Bugkill prompt inputs before templating so the
 /// prompt argv never approaches OS limits.
 const BUGKILL_DESCRIPTION_MAX_BYTES: usize = 16_000;
@@ -2703,37 +2692,19 @@ impl DashboardService {
         Ok(())
     }
 
-    /// Run one git command inside `cwd`, transparently recovering from
-    /// `index.lock` contention so a stale lock never aborts the pipeline.
-    /// Same return shape as [`run_command`] (`Ok(stdout)` / `Err(stderr)`),
-    /// plus a `"git <sub> timed out"` error on timeout. Every failure other
-    /// than lock contention is surfaced unchanged on the first try — only the
-    /// lock case is retried. See [`INDEX_LOCK_RETRIES`] for the strategy.
+    /// Run one git command inside `cwd` under the Bugkill timeout, returning
+    /// [`run_command`]'s shape (`Ok(stdout)` / `Err(stderr)`) plus a
+    /// `"git <sub> timed out"` error on timeout. Lock contention is recovered
+    /// transparently inside `run_command` ([`retry_on_git_lock`]); the timeout
+    /// bounds the whole recovery sequence.
     async fn bugkill_git(&self, cwd: &Path, args: &[&str]) -> std::result::Result<String, String> {
         let subcommand = args.first().copied().unwrap_or("command");
-        for attempt in 0..=INDEX_LOCK_RETRIES {
-            let err = match time::timeout(
-                BUGKILL_GIT_TIMEOUT,
-                run_command(&self.git_binary, args, Some(cwd)),
-            )
-            .await
-            {
-                Err(_) => return Err(format!("git {subcommand} timed out")),
-                Ok(Ok(out)) => return Ok(out),
-                Ok(Err(err)) => err,
-            };
-            // Only `index.lock` contention is recoverable; surface anything
-            // else immediately, and give up once the retry budget is spent.
-            let Some(lock_path) = index_lock_path(&err) else {
-                return Err(err);
-            };
-            if attempt == INDEX_LOCK_RETRIES {
-                return Err(err);
-            }
-            time::sleep(INDEX_LOCK_BACKOFF).await;
-            remove_stale_lock(&lock_path, INDEX_LOCK_STALE_AFTER).await;
-        }
-        unreachable!("the final attempt returns instead of looping")
+        time::timeout(
+            BUGKILL_GIT_TIMEOUT,
+            run_command(&self.git_binary, args, Some(cwd)),
+        )
+        .await
+        .unwrap_or_else(|_| Err(format!("git {subcommand} timed out")))
     }
 
     /// History-preserving rollback of a committed attempt:
@@ -4174,47 +4145,32 @@ async fn with_timeout<T>(
         .map_err(|_| WisetreeError::other(format!("{name} timed out after {}s", timeout.as_secs())))
 }
 
-/// Extract the `*.lock` path from a git "unable to create lock" stderr, or
-/// `None` when the failure is something else. git reports the offending file
-/// first and single-quoted — e.g. `Unable to create '<dir>/index.lock': File
-/// exists.` — so we key off the quoted path and its `.lock` suffix, both of
-/// which are stable across locales, rather than the surrounding prose (which
-/// is not).
-fn index_lock_path(stderr: &str) -> Option<PathBuf> {
-    let start = stderr.find('\'')? + 1;
-    let rest = &stderr[start..];
-    let end = rest.find('\'')?;
-    let path = &rest[..end];
-    path.ends_with(".lock").then(|| PathBuf::from(path))
-}
-
-/// Best-effort removal of an orphaned git lock. A live git operation creates
-/// and unlinks its lock within milliseconds, so a lock untouched for at least
-/// `stale_after` was left behind by a crashed or killed process and is safe to
-/// reclaim; a fresher lock is left alone so we never delete one a running
-/// process still owns. Any error (already gone, unreadable mtime, permissions)
-/// is ignored — the caller simply retries.
-async fn remove_stale_lock(lock_path: &Path, stale_after: Duration) {
-    let Ok(meta) = tokio::fs::metadata(lock_path).await else {
-        return;
-    };
-    // Treat an unreadable/future mtime as stale: better to reclaim than to
-    // wedge the pipeline on a lock we can't reason about.
-    let stale = meta
-        .modified()
-        .map(|modified| {
-            modified
-                .elapsed()
-                .map(|age| age >= stale_after)
-                .unwrap_or(true)
-        })
-        .unwrap_or(true);
-    if stale {
-        let _ = tokio::fs::remove_file(lock_path).await;
-    }
-}
-
+/// Run `binary <args>` in `cwd`, capturing both streams. Used for both `git`
+/// and `gh`; git-lock contention is recovered transparently
+/// ([`retry_on_git_lock`]) so every mutating dashboard git op (merge, push,
+/// fetch, add, commit, revert, …) survives a crashed git process or a
+/// concurrent lock holder. `gh` failures never match the lock signature, so
+/// they pass straight through on the first try.
 async fn run_command(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> std::result::Result<String, String> {
+    retry_on_git_lock(
+        || run_command_once(binary, args, cwd),
+        |result: &std::result::Result<String, String>| {
+            result
+                .as_ref()
+                .err()
+                .and_then(|stderr| git_lock_path(stderr))
+        },
+    )
+    .await
+}
+
+/// One `binary <args>` spawn, with no lock recovery — the retryable unit
+/// behind [`run_command`].
+async fn run_command_once(
     binary: &Path,
     args: &[&str],
     cwd: Option<&Path>,
@@ -7290,50 +7246,5 @@ so the intent reads clearly.
     fn pr_url_from_output_finds_last_url_line() {
         let out = "Warning: 3 uncommitted changes\nhttps://github.com/o/r/pull/9";
         assert_eq!(pr_url_from_output(out), "https://github.com/o/r/pull/9");
-    }
-
-    #[test]
-    fn index_lock_path_extracts_lock_from_git_error() {
-        let stderr = "error: Unable to create \
-             '/repo/.git/worktrees/wt/index.lock': File exists.\n\n\
-             Another git process seems to be running in this repository";
-        assert_eq!(
-            index_lock_path(stderr),
-            Some(PathBuf::from("/repo/.git/worktrees/wt/index.lock"))
-        );
-    }
-
-    #[test]
-    fn index_lock_path_ignores_unrelated_and_non_lock_quotes() {
-        // A quoted path that isn't a lock file must not be treated as one.
-        assert_eq!(
-            index_lock_path("error: pathspec 'src/main.rs' did not match any files"),
-            None
-        );
-        // A failure with no quoted path at all is not lock contention.
-        assert_eq!(index_lock_path("fatal: bad revision 'HEAD~9'"), None);
-        assert_eq!(index_lock_path("merge conflict in file"), None);
-    }
-
-    #[tokio::test]
-    async fn remove_stale_lock_deletes_orphaned_lock_but_keeps_fresh_one() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-
-        // A lock younger than the window is left alone — a live process may
-        // still own it (a one-hour threshold makes any just-written file young).
-        let fresh = tmp.path().join("fresh.lock");
-        std::fs::write(&fresh, b"").unwrap();
-        remove_stale_lock(&fresh, Duration::from_secs(3600)).await;
-        assert!(fresh.exists(), "a freshly-created lock must be preserved");
-
-        // A lock older than the window is reclaimed (zero threshold => any
-        // existing lock counts as stale).
-        let stale = tmp.path().join("stale.lock");
-        std::fs::write(&stale, b"").unwrap();
-        remove_stale_lock(&stale, Duration::ZERO).await;
-        assert!(!stale.exists(), "an orphaned lock must be removed");
-
-        // A missing lock is a no-op, never an error.
-        remove_stale_lock(&tmp.path().join("gone.lock"), Duration::ZERO).await;
     }
 }

@@ -9,10 +9,31 @@ use std::path::Path;
 
 use tokio::process::Command;
 
+use crate::git::lock::{git_lock_path, retry_on_git_lock};
 use crate::git::types::GitCommandResult;
 
 /// Run `git <args>` in `cwd` (or the current directory when `None`).
+///
+/// Lock contention (`index.lock`, ref locks, …) is recovered transparently
+/// via [`retry_on_git_lock`] — a git op that failed only to *acquire* its lock
+/// changed nothing, so re-running it is safe — so every caller of this
+/// wrapper (worktree create/delete, status, branch ops, …) is resilient to a
+/// crashed git process or a concurrent lock holder without any per-caller code.
 pub async fn execute_git_command(args: &[&str], cwd: Option<&Path>) -> GitCommandResult {
+    retry_on_git_lock(
+        || execute_git_command_once(args, cwd),
+        |result: &GitCommandResult| {
+            (!result.success)
+                .then(|| git_lock_path(&result.stderr))
+                .flatten()
+        },
+    )
+    .await
+}
+
+/// One `git <args>` spawn, with no lock recovery — the retryable unit behind
+/// [`execute_git_command`].
+async fn execute_git_command_once(args: &[&str], cwd: Option<&Path>) -> GitCommandResult {
     let mut cmd = Command::new("git");
     cmd.args(args);
     // If wisetree exits (signal, panic), the awaiting task is aborted and
