@@ -6,9 +6,12 @@
 //!   default). Enter on Yes returns `EnrichAction::Confirmed`.
 //! - `Enriching` : spinner + a bordered "AI Activity" panel that embeds the
 //!   real opencode TUI inside a PTY. opencode drafts `pull_request.md`.
-//!   Tab toggles focus between Wisetree and opencode; Enter (outer focus)
-//!   opens a confirmation that the draft is ready; opencode exiting on its
-//!   own does the same. Either way the screen surfaces `ReadyToReview`.
+//!   The TUI never exits on its own, so the App watches opencode's
+//!   database with an `OpencodeTurnWatcher` and advances automatically
+//!   when the turn completes. Tab toggles focus between Wisetree and
+//!   opencode; Enter (outer focus) opens a manual "draft ready?" confirm as
+//!   a fallback, and opencode exiting on its own is also treated as done.
+//!   Either way the screen surfaces `ReadyToReview`.
 //! - `Review`  : shows the drafted title and a `[ Open/Update PR ] [ Finish ]`
 //!   button row. Open submits (create or update); Finish keeps
 //!   `pull_request.md` on disk and returns to the dashboard.
@@ -554,7 +557,10 @@ impl EnrichPullRequestScreen {
             return EnrichAction::Continue;
         }
         match key.code {
-            // Enter on outer focus → confirm the draft is ready, then review.
+            // Enter on outer focus → manual "draft ready?" fallback for when
+            // the App's `OpencodeTurnWatcher` hasn't detected completion yet
+            // (e.g. an unreadable opencode.db); normally the turn watcher
+            // advances the screen on its own.
             KeyCode::Enter => {
                 self.finalize_confirm = Some(build_finalize_modal());
                 EnrichAction::Continue

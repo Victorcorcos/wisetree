@@ -384,6 +384,14 @@ pub struct App {
     /// turn to complete — the TUI never exits on its own, so this is what
     /// advances the `Investigating` step. `Some` only while investigating.
     bugkill_investigation: Option<OpencodeTurnWatcher>,
+    /// Same idea for the Enrich screen's drafting TUI — advances straight
+    /// to Review once opencode finishes writing `pull_request.md`. `Some`
+    /// only while the `Enriching` step is active.
+    enrich_draft: Option<OpencodeTurnWatcher>,
+    /// Same idea for Update PR's (and "Update branch (locally)"'s) conflict-
+    /// resolution TUI — marks the AI done automatically once opencode
+    /// finishes. `Some` only while that AI is actively streaming.
+    update_conflict: Option<OpencodeTurnWatcher>,
     update_branch: Option<UpdateBranchScreen>,
     /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
     /// top of the Settings screen — when active the Settings state is
@@ -498,6 +506,8 @@ impl App {
             fix_pr: None,
             bugkill_pr: None,
             bugkill_investigation: None,
+            enrich_draft: None,
+            update_conflict: None,
             update_branch: None,
             ai_model_picker: None,
             shell_integration_status: None,
@@ -607,6 +617,29 @@ impl App {
                         // its last known size between resize events.
                         screen.tick_pty(None);
                     }
+                    // The conflict-resolution TUI never exits on its own, so
+                    // completion comes from the turn watcher polling
+                    // opencode's database and marking the AI done
+                    // automatically (same effect as the manual "Merge
+                    // finalized?" confirm or a PTY exit, just without
+                    // waiting on the user). Only poll while the AI is
+                    // actively streaming; otherwise drop the watcher so a
+                    // finished/absent screen doesn't linger.
+                    let update_conflict_active = self
+                        .update_pr
+                        .as_ref()
+                        .is_some_and(|s| s.ai_active() && !s.ai_done() && !s.terminal_active());
+                    if update_conflict_active {
+                        if let Some(turn) = self
+                            .update_conflict
+                            .as_mut()
+                            .and_then(OpencodeTurnWatcher::poll)
+                        {
+                            self.on_update_conflict_turn(turn);
+                        }
+                    } else {
+                        self.update_conflict = None;
+                    }
                     // Drive the "Update all" batch: auto-commit once opencode
                     // finishes resolving conflicts, then advance the queue.
                     if self.update_all.is_some() {
@@ -614,14 +647,31 @@ impl App {
                     }
                     // Same for the Enrich PR PTY — but here a child exit means
                     // opencode finished drafting `pull_request.md`, so read
-                    // the file and flip the screen into Review.
-                    let enrich_exited = self
+                    // the file and flip the screen into Review. The Enriching
+                    // TUI also never exits on its own, so the turn watcher is
+                    // the primary completion signal; PTY exit remains a
+                    // fallback for a user who quits opencode manually.
+                    let enrich_status = self
                         .enrich_pr
                         .as_mut()
-                        .map(|screen| screen.tick_pty(None))
-                        .unwrap_or(false);
-                    if enrich_exited {
-                        self.on_enrich_ready_to_review(&tx);
+                        .map(|screen| (screen.tick_pty(None), screen.is_enriching()));
+                    match enrich_status {
+                        Some((true, _)) => {
+                            self.enrich_draft = None;
+                            self.on_enrich_ready_to_review(&tx);
+                        }
+                        Some((false, true)) => {
+                            if let Some(turn) = self
+                                .enrich_draft
+                                .as_mut()
+                                .and_then(OpencodeTurnWatcher::poll)
+                            {
+                                self.on_enrich_turn(turn, &tx);
+                            }
+                        }
+                        Some((false, false)) | None => {
+                            self.enrich_draft = None;
+                        }
                     }
                     // Same for the Fix PR apply PTY — a child exit means
                     // opencode finished editing, so commit + reply now.
@@ -2021,6 +2071,28 @@ impl App {
                 "pull_request.md not found at {}. Wait for opencode to write it before confirming.",
                 path.display()
             )),
+        }
+    }
+
+    /// The Enrich turn watcher fired — advance exactly like a PTY exit
+    /// would (reading `pull_request.md` off disk), just without requiring
+    /// the user to quit opencode or confirm the draft is ready themselves.
+    /// Clears the watcher immediately on a terminal outcome — `set_error`
+    /// does not change the screen's step, so the tick loop's `is_enriching`
+    /// gate alone would keep re-polling (and re-erroring) every second.
+    fn on_enrich_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match turn {
+            OpencodeTurn::Working => {}
+            OpencodeTurn::Finished { .. } => {
+                self.enrich_draft = None;
+                self.on_enrich_ready_to_review(tx);
+            }
+            OpencodeTurn::Failed { message } => {
+                self.enrich_draft = None;
+                if let Some(screen) = self.enrich_pr.as_mut() {
+                    screen.set_error(format!("opencode reported an error: {message}"));
+                }
+            }
         }
     }
 
@@ -3483,6 +3555,23 @@ impl App {
         self.dispatch_next_update_all_pr(tx);
     }
 
+    /// The Update-PR conflict-resolution turn watcher fired — mark the AI
+    /// done automatically, exactly like the manual "Merge finalized?"
+    /// confirm or a PTY exit would, so the Complete/Cancel buttons appear
+    /// without the user needing to tell wisetree opencode is finished.
+    /// Success and failure aren't distinguished here (same as PTY exit
+    /// today): the human reviews the AI Activity panel and decides via
+    /// Complete/Cancel either way.
+    fn on_update_conflict_turn(&mut self, turn: OpencodeTurn) {
+        if matches!(turn, OpencodeTurn::Working) {
+            return;
+        }
+        self.update_conflict = None;
+        if let Some(screen) = self.update_pr.as_mut() {
+            screen.mark_ai_done();
+        }
+    }
+
     /// Called every tick while a batch is active. Drives the conflict-
     /// resolution screen to completion without user input: auto-commit once
     /// opencode exits, then advance once the commit shell exits. Step
@@ -4451,6 +4540,9 @@ impl App {
         // same profile-sourced environment as a freshly opened terminal
         // (matching the Update Pull Request flow).
         let (shell, wrapped_args) = login_shell_command(&opencode_binary, &opencode_args);
+        // Watcher must exist before the spawn so its start timestamp
+        // precedes the session row opencode creates.
+        self.update_conflict = Some(OpencodeTurnWatcher::new(&cwd));
         screen.spawn_opencode_pty(shell, wrapped_args, cwd, Vec::new());
         self.update_branch = None;
         self.update_pr = Some(screen);
@@ -4668,6 +4760,9 @@ impl App {
                 // with the same profile-sourced environment as a freshly
                 // opened terminal (matching the recovery shell below).
                 let (shell, wrapped_args) = login_shell_command(opencode_binary, opencode_args);
+                // Watcher must exist before the spawn so its start timestamp
+                // precedes the session row opencode creates.
+                self.update_conflict = Some(OpencodeTurnWatcher::new(cwd));
                 screen.spawn_opencode_pty(shell, wrapped_args, cwd.clone(), Vec::new());
                 return;
             }
@@ -4856,6 +4951,9 @@ impl App {
                     ..
                 } => {
                     if let Some(screen) = self.enrich_pr.as_mut() {
+                        // Watcher must exist before the spawn so its start
+                        // timestamp precedes the session row opencode creates.
+                        self.enrich_draft = Some(OpencodeTurnWatcher::new(&cwd));
                         screen.spawn_opencode_pty(opencode_binary, opencode_args, cwd, Vec::new());
                     }
                 }
