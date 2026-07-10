@@ -21,6 +21,11 @@ use crate::files::{strip_ansi, ActivityKind};
 use crate::git::exec::execute_git_command;
 use crate::git::types::{BranchStatus, GitWorktree};
 use crate::services::ai_status::{AiStatusIndex, AiStatusPaths, AiStatusReport, AiStatusService};
+use crate::services::bugkill::{
+    attempt_commit_prefix, attempt_commit_subject, parse_investigation_md, parse_judge_verdict,
+    parse_porcelain_v2, AttemptChanges, BugHypothesis, BugkillVerdict, JudgeResult,
+    ParsedInvestigation, INVESTIGATION_FILE,
+};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// `gh api graphql` may include the network round-trip — give it more headroom
@@ -67,6 +72,28 @@ const FIX_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// past the OS argv limit.
 const FIX_CODE_WINDOW_RADIUS: usize = 40;
 const FIX_CODE_MAX_BYTES: usize = 24_000;
+/// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
+/// embedded PTY (the user watches it and can Esc out), so only the judge —
+/// which classifies one short comment — and the local git operations
+/// (status/add/commit/revert/checkout) run captured under a timeout.
+const BUGKILL_JUDGE_TIMEOUT: Duration = Duration::from_secs(120);
+const BUGKILL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Recovery budget for a git op that fails because another process holds
+/// `index.lock`. A concurrent git process (wisetree's own dashboard status
+/// poll, an editor's git integration) releases the lock within milliseconds,
+/// so we back off and retry; a lock that sits untouched past
+/// `INDEX_LOCK_STALE_AFTER` was orphaned by a crashed or killed git process,
+/// so we reclaim it before retrying. `RETRIES * BACKOFF` (~3s) comfortably
+/// exceeds the stale window, so a genuinely-orphaned lock is always removed
+/// with retries to spare, while a lock a live process is actively cycling is
+/// only ever waited on, never deleted.
+const INDEX_LOCK_RETRIES: usize = 12;
+const INDEX_LOCK_BACKOFF: Duration = Duration::from_millis(250);
+const INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(2);
+/// Byte caps applied to Bugkill prompt inputs before templating so the
+/// prompt argv never approaches OS limits.
+const BUGKILL_DESCRIPTION_MAX_BYTES: usize = 16_000;
+const BUGKILL_FIELD_MAX_BYTES: usize = 8_000;
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -677,6 +704,77 @@ pub enum FixCommitOutcome {
     /// satisfied the comment. No commit was created; the reviewer was told it
     /// is already addressed. Not a failure.
     AlreadyResolved,
+}
+
+/// Snapshot of a Bugkill worktree: tracked-change paths plus the untracked
+/// files with a content hash each. Taken before an attempt as the baseline
+/// and after it to compute the attempt change-set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BugkillSnapshot {
+    pub tracked: Vec<String>,
+    /// `(path, content hash)` for every untracked file, excluding
+    /// `BUG_INVESTIGATION.md`.
+    pub untracked: Vec<(String, String)>,
+}
+
+/// An attempt row recovered from `BUG_INVESTIGATION.md` that was committed
+/// but never got its Verdict answer (wisetree crashed in between). Resume
+/// re-enters the Verdict step for this row instead of stranding it
+/// permanently ineligible. `sha` is recovered from `git log` by the
+/// `bugkill: attempt #N — ` subject prefix; `None` when no such commit
+/// exists (the No path then records the failure without reverting).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BugkillUnverdicted {
+    pub row_number: usize,
+    pub sha: Option<String>,
+}
+
+/// What the preflight found on disk about a previous Bugkill run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BugkillResumeState {
+    /// No `BUG_INVESTIGATION.md` — continue straight to the investigation.
+    Absent,
+    /// The file exists but is not in Bugkill's format — Overwrite/Cancel.
+    Unparseable,
+    /// The file parses — offer Resume / Start fresh.
+    Parsed {
+        investigation: ParsedInvestigation,
+        unverdicted: Option<BugkillUnverdicted>,
+    },
+}
+
+/// Everything the deterministic pre-flight gathered for a Bugkill run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BugkillPreflight {
+    /// Baseline `(path, hash)` of pre-existing untracked files — later
+    /// distinguishes attempt-created files from the user's own.
+    pub untracked_snapshot: Vec<(String, String)>,
+    /// First reachable ref in `BASE_REF_PRIORITY`; `None` is not fatal (it
+    /// is only prompt context, rendered as `(none resolved)`).
+    pub base_ref: Option<String>,
+    pub resume: BugkillResumeState,
+}
+
+/// Outcome of [`DashboardService::bugkill_preflight`]. The non-`Ready`
+/// variants map straight to a toast or prompt in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BugkillPreflightOutcome {
+    Ready(Box<BugkillPreflight>),
+    /// `ai.bugkill.investigate.model` is blank.
+    AiNotConfigured,
+    /// `opencode` is not on PATH.
+    AiUnavailable,
+    /// Tracked changes and no parseable investigation file — the user must
+    /// commit or stash before running Bugkill.
+    DirtyTree {
+        count: usize,
+    },
+    /// Tracked changes *plus* a parseable `BUG_INVESTIGATION.md` — almost
+    /// certainly debris from a fix attempt interrupted mid-`Fixing`. The UI
+    /// asks before discarding; never discard automatically.
+    LeftoverAttempt {
+        tracked: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2308,6 +2406,389 @@ impl DashboardService {
         Ok(())
     }
 
+    // ── "Bugkill" pipeline ─────────────────────────────────────────────
+    //
+    // AI is called in exactly three places: investigate (once, captured),
+    // fix (per selected attempt, live PTY), and the judge micro-call behind
+    // the "Other" button. Everything else — gates, snapshots, change-set
+    // scans, commits, reverts, cleanup — is deterministic git work below.
+    // No `gh`, no pushes anywhere in this pipeline.
+
+    /// Deterministic Bugkill pre-flight: model + opencode gates, the
+    /// clean-tree gate, the untracked baseline snapshot, base-ref
+    /// resolution, and detection of a resumable `BUG_INVESTIGATION.md`.
+    pub async fn bugkill_preflight(&self, worktree_path: &str) -> Result<BugkillPreflightOutcome> {
+        if self.config.ai.bugkill.investigate.model.trim().is_empty() {
+            return Ok(BugkillPreflightOutcome::AiNotConfigured);
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Ok(BugkillPreflightOutcome::AiUnavailable);
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let status = self.bugkill_git_status(&cwd).await?;
+
+        let investigation = tokio::fs::read_to_string(cwd.join(INVESTIGATION_FILE))
+            .await
+            .ok()
+            .map(|content| parse_investigation_md(&content));
+
+        // Clean-tree gate: untracked files are allowed; tracked changes
+        // block. With a parseable investigation file the changes are almost
+        // certainly leftovers from an interrupted attempt (by I2 the tracked
+        // tree was clean when it started) — offer to discard; otherwise the
+        // user must commit or stash first.
+        if !status.tracked.is_empty() {
+            return Ok(match &investigation {
+                Some(Some(_)) => BugkillPreflightOutcome::LeftoverAttempt {
+                    tracked: status.tracked,
+                },
+                _ => BugkillPreflightOutcome::DirtyTree {
+                    count: status.tracked.len(),
+                },
+            });
+        }
+
+        let untracked_snapshot = hash_untracked(&cwd, &status.untracked).await;
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd).await;
+        let resume = match investigation {
+            None => BugkillResumeState::Absent,
+            Some(None) => BugkillResumeState::Unparseable,
+            Some(Some(investigation)) => {
+                // Unverdicted-attempt recovery: a row committed but never
+                // answered strands as implemented + no verdict. Recover its
+                // commit sha so Resume can re-ask the Verdict question.
+                let mut unverdicted = None;
+                if let Some(row) = investigation
+                    .hypotheses
+                    .iter()
+                    .find(|h| h.implemented && h.worked.is_none())
+                {
+                    unverdicted = Some(BugkillUnverdicted {
+                        row_number: row.number,
+                        sha: self.bugkill_recover_attempt_sha(&cwd, row.number).await,
+                    });
+                }
+                BugkillResumeState::Parsed {
+                    investigation,
+                    unverdicted,
+                }
+            }
+        };
+        Ok(BugkillPreflightOutcome::Ready(Box::new(BugkillPreflight {
+            untracked_snapshot,
+            base_ref,
+            resume,
+        })))
+    }
+
+    /// Build the spawn parameters for the live investigation run: a
+    /// non-interactive `opencode run` pinned to the read-only Plan agent,
+    /// shown in the embedded PTY so the user watches the AI work; the
+    /// captured transcript is parsed by the caller after exit. `corrective`
+    /// appends the stricter-contract suffix used on the single retry after
+    /// a parse failure.
+    pub fn prepare_bugkill_investigate(
+        &self,
+        worktree_path: &str,
+        bug_description: &str,
+        base_ref: Option<&str>,
+        corrective: bool,
+    ) -> Result<FixApplyHandoff> {
+        let slot = &self.config.ai.bugkill.investigate;
+        let model = slot.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other(
+                "ai.bugkill.investigate model is not configured.",
+            ));
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Err(WisetreeError::other("opencode CLI is not on PATH."));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let mut prompt = build_bug_investigate_prompt(bug_description, base_ref);
+        if corrective {
+            prompt = format!(
+                "{prompt}\n\nYour previous output could not be parsed. Reply with ONLY the \
+                 delimited block, exactly as specified."
+            );
+        }
+        let mut opencode_args: Vec<String> = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+        ];
+        opencode_args.extend(run_variant_args(&slot.thinking));
+        Ok(FixApplyHandoff {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+        })
+    }
+
+    /// Build the spawn parameters for one live fix attempt. The fix AI
+    /// receives the bug description plus exactly one hypothesis row
+    /// (invariant I3) — never the table, never prior attempts.
+    pub async fn prepare_bugkill_fix(
+        &self,
+        worktree_path: &str,
+        bug_description: &str,
+        row: &BugHypothesis,
+        feedback: Option<&str>,
+    ) -> Result<FixApplyHandoff> {
+        let slot = &self.config.ai.bugkill.fix;
+        let model = slot.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other(
+                "ai.bugkill.fix model is not configured.",
+            ));
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Err(WisetreeError::other("opencode CLI is not on PATH."));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let prompt = build_bug_fix_prompt(bug_description, row, feedback);
+        // The opencode TUI takes no `--variant`; it honors reasoning effort
+        // solely via the persisted `model.json`, so seed it before spawning.
+        seed_opencode_tui_variant(&model, &slot.thinking);
+        let mut opencode_args: Vec<String> =
+            vec!["--prompt".to_string(), prompt, "-m".to_string(), model];
+        opencode_args.push(cwd.to_string_lossy().to_string());
+        Ok(FixApplyHandoff {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+        })
+    }
+
+    /// Classify the user's freeform "Other" answer as fixed / not fixed /
+    /// unclear with one tiny captured call. A parse failure — or a failed
+    /// call — is treated as `Unclear`, never as an error screen: the user
+    /// still owes a Yes/No and loses nothing.
+    pub async fn bugkill_judge(
+        &self,
+        worktree_path: &str,
+        row: &BugHypothesis,
+        user_text: &str,
+    ) -> Result<BugkillVerdict> {
+        let slot = &self.config.ai.bugkill.judge;
+        let model = slot.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other(
+                "ai.bugkill.judge model is not configured.",
+            ));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let prompt = build_bug_judge_prompt(row, user_text);
+        let mut run_args: Vec<String> = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+        ];
+        run_args.extend(run_variant_args(&slot.thinking));
+        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
+        let transcript = time::timeout(
+            BUGKILL_JUDGE_TIMEOUT,
+            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
+        )
+        .await
+        .unwrap_or_else(|_| Err("the judge call timed out".to_string()));
+        Ok(match transcript {
+            Ok(output) => parse_judge_verdict(&output).unwrap_or(BugkillVerdict {
+                result: JudgeResult::Unclear,
+                reason: String::new(),
+            }),
+            Err(_) => BugkillVerdict {
+                result: JudgeResult::Unclear,
+                reason: "The judge call failed — please answer Yes or No.".to_string(),
+            },
+        })
+    }
+
+    /// Fresh tracked/untracked snapshot of the worktree, with content hashes
+    /// for the untracked files. Used right before an attempt (baseline) and
+    /// right after opencode exits (change-set scan).
+    pub async fn bugkill_snapshot(&self, worktree_path: &str) -> Result<BugkillSnapshot> {
+        let cwd = PathBuf::from(worktree_path);
+        let status = self.bugkill_git_status(&cwd).await?;
+        let untracked = hash_untracked(&cwd, &status.untracked).await;
+        Ok(BugkillSnapshot {
+            tracked: status.tracked,
+            untracked,
+        })
+    }
+
+    /// Commit one applied attempt — the harness, never the AI. Stages each
+    /// change-set path individually (never `git add -A`/`-u`; the modified
+    /// pre-existing untracked files and `BUG_INVESTIGATION.md` are already
+    /// excluded from `commit_paths`), then commits as
+    /// `bugkill: attempt #N — <solution first line>`, or amends the existing
+    /// attempt commit on a retry-with-feedback (safe: that commit is
+    /// unpushed `HEAD`). Returns the (new) commit sha.
+    pub async fn bugkill_commit_attempt(
+        &self,
+        worktree_path: &str,
+        changes: &AttemptChanges,
+        number: usize,
+        solution: &str,
+        amend: bool,
+    ) -> Result<String> {
+        let cwd = PathBuf::from(worktree_path);
+        if changes.commit_paths.is_empty() {
+            return Err(WisetreeError::other("nothing to commit for this attempt."));
+        }
+        for path in &changes.commit_paths {
+            self.bugkill_git(&cwd, &["add", "--", path])
+                .await
+                .map_err(WisetreeError::other)?;
+        }
+        let subject = attempt_commit_subject(number, solution);
+        let commit_args: Vec<&str> = if amend {
+            vec!["commit", "--amend", "--no-edit"]
+        } else {
+            vec!["commit", "-m", &subject]
+        };
+        self.bugkill_git(&cwd, &commit_args).await.map_err(|err| {
+            WisetreeError::other(if err.trim().is_empty() {
+                "git commit failed after staging the attempt.".to_string()
+            } else {
+                err
+            })
+        })?;
+        let sha = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+        Ok(sha.trim().to_string())
+    }
+
+    /// Discard *uncommitted* attempt changes: for each path, unstage it and
+    /// either restore it from `HEAD` or delete it from disk when `HEAD`
+    /// never had it. Used by the Esc-abort during `Fixing` and by the
+    /// preflight leftover-attempt recovery. A *committed* attempt is always
+    /// undone with [`Self::bugkill_rollback`] instead — never this.
+    pub async fn bugkill_abort_cleanup(&self, worktree_path: &str, paths: &[String]) -> Result<()> {
+        let cwd = PathBuf::from(worktree_path);
+        for path in paths {
+            // Unstage in case opencode (against instructions) staged it.
+            let _ = self.bugkill_git(&cwd, &["reset", "-q", "--", path]).await;
+            let head_spec = format!("HEAD:{path}");
+            let in_head = time::timeout(
+                BUGKILL_GIT_TIMEOUT,
+                run_command(
+                    &self.git_binary,
+                    &["cat-file", "-e", &head_spec],
+                    Some(&cwd),
+                ),
+            )
+            .await
+            .map(|result| result.is_ok())
+            .unwrap_or(false);
+            if in_head {
+                self.bugkill_git(&cwd, &["checkout", "HEAD", "--", path])
+                    .await
+                    .map_err(WisetreeError::other)?;
+            } else {
+                let _ = tokio::fs::remove_file(cwd.join(path)).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one git command inside `cwd`, transparently recovering from
+    /// `index.lock` contention so a stale lock never aborts the pipeline.
+    /// Same return shape as [`run_command`] (`Ok(stdout)` / `Err(stderr)`),
+    /// plus a `"git <sub> timed out"` error on timeout. Every failure other
+    /// than lock contention is surfaced unchanged on the first try — only the
+    /// lock case is retried. See [`INDEX_LOCK_RETRIES`] for the strategy.
+    async fn bugkill_git(&self, cwd: &Path, args: &[&str]) -> std::result::Result<String, String> {
+        let subcommand = args.first().copied().unwrap_or("command");
+        for attempt in 0..=INDEX_LOCK_RETRIES {
+            let err = match time::timeout(
+                BUGKILL_GIT_TIMEOUT,
+                run_command(&self.git_binary, args, Some(cwd)),
+            )
+            .await
+            {
+                Err(_) => return Err(format!("git {subcommand} timed out")),
+                Ok(Ok(out)) => return Ok(out),
+                Ok(Err(err)) => err,
+            };
+            // Only `index.lock` contention is recoverable; surface anything
+            // else immediately, and give up once the retry budget is spent.
+            let Some(lock_path) = index_lock_path(&err) else {
+                return Err(err);
+            };
+            if attempt == INDEX_LOCK_RETRIES {
+                return Err(err);
+            }
+            time::sleep(INDEX_LOCK_BACKOFF).await;
+            remove_stale_lock(&lock_path, INDEX_LOCK_STALE_AFTER).await;
+        }
+        unreachable!("the final attempt returns instead of looping")
+    }
+
+    /// History-preserving rollback of a committed attempt:
+    /// `git revert --no-edit <sha>`. By invariant I2 the attempt commit is
+    /// still `HEAD` when this runs, so the revert applies cleanly by
+    /// construction. Lock contention is recovered transparently
+    /// ([`Self::bugkill_git`]); any other non-zero exit is a hard error.
+    pub async fn bugkill_rollback(&self, worktree_path: &str, sha: &str) -> Result<()> {
+        let cwd = PathBuf::from(worktree_path);
+        self.bugkill_git(&cwd, &["revert", "--no-edit", sha])
+            .await
+            .map_err(|err| {
+                WisetreeError::other(format!("git revert --no-edit {sha} failed: {err}"))
+            })?;
+        Ok(())
+    }
+
+    async fn bugkill_git_status(
+        &self,
+        cwd: &Path,
+    ) -> Result<crate::services::bugkill::PorcelainStatus> {
+        // `--untracked-files=all` lists files inside untracked directories
+        // individually, so the per-path snapshot/commit/cleanup always works
+        // on real files, never on a `dir/` placeholder.
+        let output = time::timeout(
+            BUGKILL_GIT_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["status", "--porcelain=v2", "--untracked-files=all"],
+                Some(cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git status timed out"))?
+        .map_err(WisetreeError::other)?;
+        Ok(parse_porcelain_v2(&output))
+    }
+
+    /// Newest commit whose subject starts `bugkill: attempt #N — `, for the
+    /// unverdicted-attempt recovery. `None` when no such commit exists.
+    async fn bugkill_recover_attempt_sha(&self, cwd: &Path, number: usize) -> Option<String> {
+        let output = time::timeout(
+            BUGKILL_GIT_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["log", "-n", "200", "--format=%H%x09%s"],
+                Some(cwd),
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let prefix = attempt_commit_prefix(number);
+        output.lines().find_map(|line| {
+            let (sha, subject) = line.split_once('\t')?;
+            subject.starts_with(&prefix).then(|| sha.trim().to_string())
+        })
+    }
+
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
     /// for every worktree in parallel, then layer cached PR data on top. No
     /// network calls — safe to emit immediately so the UI can render before
@@ -3689,6 +4170,46 @@ async fn with_timeout<T>(
         .map_err(|_| WisetreeError::other(format!("{name} timed out after {}s", timeout.as_secs())))
 }
 
+/// Extract the `*.lock` path from a git "unable to create lock" stderr, or
+/// `None` when the failure is something else. git reports the offending file
+/// first and single-quoted — e.g. `Unable to create '<dir>/index.lock': File
+/// exists.` — so we key off the quoted path and its `.lock` suffix, both of
+/// which are stable across locales, rather than the surrounding prose (which
+/// is not).
+fn index_lock_path(stderr: &str) -> Option<PathBuf> {
+    let start = stderr.find('\'')? + 1;
+    let rest = &stderr[start..];
+    let end = rest.find('\'')?;
+    let path = &rest[..end];
+    path.ends_with(".lock").then(|| PathBuf::from(path))
+}
+
+/// Best-effort removal of an orphaned git lock. A live git operation creates
+/// and unlinks its lock within milliseconds, so a lock untouched for at least
+/// `stale_after` was left behind by a crashed or killed process and is safe to
+/// reclaim; a fresher lock is left alone so we never delete one a running
+/// process still owns. Any error (already gone, unreadable mtime, permissions)
+/// is ignored — the caller simply retries.
+async fn remove_stale_lock(lock_path: &Path, stale_after: Duration) {
+    let Ok(meta) = tokio::fs::metadata(lock_path).await else {
+        return;
+    };
+    // Treat an unreadable/future mtime as stale: better to reclaim than to
+    // wedge the pipeline on a lock we can't reason about.
+    let stale = meta
+        .modified()
+        .map(|modified| {
+            modified
+                .elapsed()
+                .map(|age| age >= stale_after)
+                .unwrap_or(true)
+        })
+        .unwrap_or(true);
+    if stale {
+        let _ = tokio::fs::remove_file(lock_path).await;
+    }
+}
+
 async fn run_command(
     binary: &Path,
     args: &[&str],
@@ -4323,6 +4844,96 @@ fn build_fix_apply_prompt(group: &CommentGroup, plan: &FixPlan) -> String {
         .replace("TARGET_FILES", &files)
         .replace("REVIEW_COMMENT", &group.combined_text())
         .replace("APPROVED_PLAN", &plan_text)
+}
+
+/// Truncate a Bugkill prompt input to `max_bytes` on a char boundary,
+/// appending the truncation marker. Applied before templating so the
+/// rendered prompt argv never approaches OS limits.
+fn truncate_bugkill_field(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &text[..end])
+}
+
+/// Render `prompts/bug_investigate.md` for the one-shot investigation call.
+fn build_bug_investigate_prompt(bug_description: &str, base_ref: Option<&str>) -> String {
+    const PROMPT: &str = include_str!("../../prompts/bug_investigate.md");
+    PROMPT
+        .replace(
+            "BUG_DESCRIPTION",
+            &truncate_bugkill_field(bug_description, BUGKILL_DESCRIPTION_MAX_BYTES),
+        )
+        .replace("BASE_REF", base_ref.unwrap_or("(none resolved)"))
+}
+
+/// Render `prompts/bug_fix.md` for one live fix attempt. Exactly one
+/// hypothesis row goes in (invariant I3); `feedback` is only present on a
+/// retry after the judge inferred `NOT_FIXED` from an "Other" answer.
+fn build_bug_fix_prompt(
+    bug_description: &str,
+    row: &BugHypothesis,
+    feedback: Option<&str>,
+) -> String {
+    const PROMPT: &str = include_str!("../../prompts/bug_fix.md");
+    PROMPT
+        .replace(
+            "BUG_DESCRIPTION",
+            &truncate_bugkill_field(bug_description, BUGKILL_DESCRIPTION_MAX_BYTES),
+        )
+        .replace(
+            "CAUSE_DESCRIPTION",
+            &truncate_bugkill_field(&row.description, BUGKILL_FIELD_MAX_BYTES),
+        )
+        .replace(
+            "SOLUTION",
+            &truncate_bugkill_field(&row.solution, BUGKILL_FIELD_MAX_BYTES),
+        )
+        .replace(
+            "USER_FEEDBACK",
+            &truncate_bugkill_field(feedback.unwrap_or(""), BUGKILL_FIELD_MAX_BYTES),
+        )
+}
+
+/// Render `prompts/bug_judge.md` for the "Other"-answer micro-call.
+fn build_bug_judge_prompt(row: &BugHypothesis, user_text: &str) -> String {
+    const PROMPT: &str = include_str!("../../prompts/bug_judge.md");
+    PROMPT
+        .replace(
+            "CAUSE_DESCRIPTION",
+            &truncate_bugkill_field(&row.description, BUGKILL_FIELD_MAX_BYTES),
+        )
+        .replace(
+            "SOLUTION",
+            &truncate_bugkill_field(&row.solution, BUGKILL_FIELD_MAX_BYTES),
+        )
+        .replace(
+            "USER_FEEDBACK",
+            &truncate_bugkill_field(user_text, BUGKILL_FIELD_MAX_BYTES),
+        )
+}
+
+/// Hash every untracked file (excluding `BUG_INVESTIGATION.md`) so a later
+/// scan can tell attempt-created files from pre-existing ones and detect
+/// modifications to the latter. Unreadable files hash as an empty string —
+/// equal before and after, so they never show up as attempt changes.
+async fn hash_untracked(cwd: &Path, untracked: &[String]) -> Vec<(String, String)> {
+    let mut snapshot = Vec::new();
+    for path in untracked {
+        if path == INVESTIGATION_FILE {
+            continue;
+        }
+        let hash = match tokio::fs::read(cwd.join(path)).await {
+            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+            Err(_) => String::new(),
+        };
+        snapshot.push((path.clone(), hash));
+    }
+    snapshot
 }
 
 /// Parse the single machine-readable verdict block the planning AI emits.
@@ -6675,5 +7286,50 @@ so the intent reads clearly.
     fn pr_url_from_output_finds_last_url_line() {
         let out = "Warning: 3 uncommitted changes\nhttps://github.com/o/r/pull/9";
         assert_eq!(pr_url_from_output(out), "https://github.com/o/r/pull/9");
+    }
+
+    #[test]
+    fn index_lock_path_extracts_lock_from_git_error() {
+        let stderr = "error: Unable to create \
+             '/repo/.git/worktrees/wt/index.lock': File exists.\n\n\
+             Another git process seems to be running in this repository";
+        assert_eq!(
+            index_lock_path(stderr),
+            Some(PathBuf::from("/repo/.git/worktrees/wt/index.lock"))
+        );
+    }
+
+    #[test]
+    fn index_lock_path_ignores_unrelated_and_non_lock_quotes() {
+        // A quoted path that isn't a lock file must not be treated as one.
+        assert_eq!(
+            index_lock_path("error: pathspec 'src/main.rs' did not match any files"),
+            None
+        );
+        // A failure with no quoted path at all is not lock contention.
+        assert_eq!(index_lock_path("fatal: bad revision 'HEAD~9'"), None);
+        assert_eq!(index_lock_path("merge conflict in file"), None);
+    }
+
+    #[tokio::test]
+    async fn remove_stale_lock_deletes_orphaned_lock_but_keeps_fresh_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // A lock younger than the window is left alone — a live process may
+        // still own it (a one-hour threshold makes any just-written file young).
+        let fresh = tmp.path().join("fresh.lock");
+        std::fs::write(&fresh, b"").unwrap();
+        remove_stale_lock(&fresh, Duration::from_secs(3600)).await;
+        assert!(fresh.exists(), "a freshly-created lock must be preserved");
+
+        // A lock older than the window is reclaimed (zero threshold => any
+        // existing lock counts as stale).
+        let stale = tmp.path().join("stale.lock");
+        std::fs::write(&stale, b"").unwrap();
+        remove_stale_lock(&stale, Duration::ZERO).await;
+        assert!(!stale.exists(), "an orphaned lock must be removed");
+
+        // A missing lock is a no-op, never an error.
+        remove_stale_lock(&tmp.path().join("gone.lock"), Duration::ZERO).await;
     }
 }

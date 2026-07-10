@@ -10,6 +10,12 @@
 //!   Ctrl+K kills to end.
 //! - **Submit/cancel**: Enter / Esc as before.
 //!
+//! An opt-in [`InputPrompt::multiline`] mode turns the field into a
+//! fixed-height (8-row) bordered area with wrapping and vertical scrolling
+//! that follows the cursor: **Enter submits, Ctrl+J (or Alt+Enter) inserts a
+//! newline, Esc cancels**, ↑/↓ move between lines, and Home/End plus Ctrl+A/E
+//! work per line. Single-line callers are untouched.
+//!
 //! All cursor math is char-indexed (not byte-indexed) so multi-byte unicode is
 //! handled atomically.
 
@@ -31,6 +37,9 @@ pub enum InputOutcome {
 
 type Validator = Box<dyn Fn(&str) -> Option<String>>;
 
+/// Total height of the bordered multiline input box (borders included).
+const MULTILINE_BOX_ROWS: u16 = 8;
+
 pub struct InputPrompt {
     pub label: String,
     pub placeholder: String,
@@ -39,6 +48,8 @@ pub struct InputPrompt {
     /// Cursor position as a char index into `value` (0..=char_count).
     pub cursor: usize,
     pub footer_spacer: bool,
+    /// Multiline mode: Enter submits, Ctrl+J inserts a newline.
+    multiline: bool,
     validator: Option<Validator>,
 }
 
@@ -51,8 +62,17 @@ impl InputPrompt {
             error: None,
             cursor: 0,
             footer_spacer: false,
+            multiline: false,
             validator: None,
         }
+    }
+
+    /// Opt into multiline mode: Enter submits, Ctrl+J (or Alt+Enter) inserts a
+    /// newline, Esc cancels, and the field renders as a fixed-height bordered
+    /// area with wrapping and vertical scrolling that follows the cursor.
+    pub fn multiline(mut self) -> Self {
+        self.multiline = true;
+        self
     }
 
     pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
@@ -190,6 +210,65 @@ impl InputPrompt {
         self.value.drain(start..);
     }
 
+    /// Char index of the start of the line the cursor is on.
+    fn line_start(&self) -> usize {
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        while i > 0 && chars[i - 1] != '\n' {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Char index of the end of the line the cursor is on (before the `\n`).
+    fn line_end(&self) -> usize {
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        while i < chars.len() && chars[i] != '\n' {
+            i += 1;
+        }
+        i
+    }
+
+    /// Move the cursor one logical line up/down, keeping the column when the
+    /// target line is long enough (clamped to its end otherwise).
+    fn move_line(&mut self, down: bool) {
+        let chars: Vec<char> = self.value.chars().collect();
+        let start = self.line_start();
+        let column = self.cursor - start;
+        if down {
+            let end = self.line_end();
+            if end >= chars.len() {
+                return; // last line
+            }
+            let next_start = end + 1;
+            let mut next_end = next_start;
+            while next_end < chars.len() && chars[next_end] != '\n' {
+                next_end += 1;
+            }
+            self.cursor = (next_start + column).min(next_end);
+        } else {
+            if start == 0 {
+                return; // first line
+            }
+            let mut prev_start = start - 1; // the `\n` before this line
+            while prev_start > 0 && chars[prev_start - 1] != '\n' {
+                prev_start -= 1;
+            }
+            self.cursor = (prev_start + column).min(start - 1);
+        }
+    }
+
+    fn submit(&mut self) -> InputOutcome {
+        if let Some(err) = self.validate() {
+            self.error = Some(err);
+            InputOutcome::Pending
+        } else {
+            self.error = None;
+            InputOutcome::Submitted(self.value.clone())
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> InputOutcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -199,17 +278,65 @@ impl InputPrompt {
             self.cursor = self.char_len();
         }
 
+        if self.multiline {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            match key.code {
+                // Ctrl+J inserts a newline, matching Claude Code. Enter with a
+                // modifier (Alt+Enter / Shift+Enter / Ctrl+Enter) does too, so
+                // terminals without the keyboard-enhancement protocol — where
+                // Ctrl+J collapses onto plain Enter — keep a working newline
+                // via Alt+Enter.
+                KeyCode::Char('j') | KeyCode::Char('J') if ctrl => {
+                    self.insert_char('\n');
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                KeyCode::Enter if ctrl || alt || shift => {
+                    self.insert_char('\n');
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                // Plain Enter submits.
+                KeyCode::Enter => return self.submit(),
+                KeyCode::Up => {
+                    self.move_line(false);
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                KeyCode::Down => {
+                    self.move_line(true);
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                // Home / End and Ctrl+A / Ctrl+E move within the current line so
+                // the shell-style shortcuts feel right in a multiline field.
+                KeyCode::Home => {
+                    self.cursor = self.line_start();
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                KeyCode::End => {
+                    self.cursor = self.line_end();
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') if ctrl => {
+                    self.cursor = self.line_start();
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') if ctrl => {
+                    self.cursor = self.line_end();
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc => InputOutcome::Cancelled,
-            KeyCode::Enter => {
-                if let Some(err) = self.validate() {
-                    self.error = Some(err);
-                    InputOutcome::Pending
-                } else {
-                    self.error = None;
-                    InputOutcome::Submitted(self.value.clone())
-                }
-            }
+            KeyCode::Enter => self.submit(),
             KeyCode::Left if ctrl || alt => {
                 self.move_word_left();
                 self.error = None;
@@ -300,6 +427,17 @@ impl InputPrompt {
         }
     }
 
+    pub fn paste(&mut self, text: &str) -> InputOutcome {
+        if self.cursor > self.char_len() {
+            self.cursor = self.char_len();
+        }
+        for c in text.chars() {
+            self.insert_char(c);
+        }
+        self.error = None;
+        InputOutcome::Pending
+    }
+
     /// Render the prompt. `tick` is accepted for signature parity with other
     /// animated widgets but is unused — the cursor is always shown as a solid
     /// reversed block.
@@ -316,9 +454,14 @@ impl InputPrompt {
             colors::SUCCESS
         };
 
+        let box_height = if self.multiline {
+            MULTILINE_BOX_ROWS
+        } else {
+            3
+        };
         let mut constraints = vec![
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(box_height),
             Constraint::Length(1),
         ];
         if self.footer_spacer {
@@ -337,14 +480,23 @@ impl InputPrompt {
         );
 
         let _ = tick;
-        let inner_line = self.inline_line();
-        let field = Paragraph::new(inner_line).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color))
-                .padding(Padding::horizontal(1)),
-        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .padding(Padding::horizontal(1));
+        let field = if self.multiline {
+            // Hard-wrapped rows with a scroll window that follows the
+            // cursor, so the cursor never renders outside the box.
+            let inner_width = chunks[1].width.saturating_sub(4).max(1) as usize;
+            let visible = box_height.saturating_sub(2).max(1) as usize;
+            let (rows, cursor_row) = self.multiline_rows(inner_width);
+            let start = cursor_row.saturating_sub(visible - 1);
+            let window: Vec<Line<'static>> = rows.into_iter().skip(start).take(visible).collect();
+            Paragraph::new(window).block(block)
+        } else {
+            Paragraph::new(self.inline_line()).block(block)
+        };
         frame.render_widget(field, chunks[1]);
 
         if let Some(msg) = display_error {
@@ -354,13 +506,85 @@ impl InputPrompt {
             );
         }
 
-        let hint = Paragraph::new("Press Enter to confirm, Esc to cancel").style(
+        let hint_text = if self.multiline {
+            "Enter to submit · Ctrl+J for newline · Esc to cancel"
+        } else {
+            "Press Enter to confirm, Esc to cancel"
+        };
+        let hint = Paragraph::new(hint_text).style(
             Style::default()
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM),
         );
         let hint_idx = if self.footer_spacer { 4 } else { 3 };
         frame.render_widget(hint, chunks[hint_idx]);
+    }
+
+    /// Hard-wrap the value into display rows of `width` columns (logical
+    /// lines split on `\n`, long lines wrapped) with the block cursor
+    /// embedded, returning the rows and the row the cursor falls on. Empty
+    /// value renders the cursor at column 0 with the placeholder trailing.
+    fn multiline_rows(&self, width: usize) -> (Vec<Line<'static>>, usize) {
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+        if self.value.is_empty() {
+            let placeholder_style = Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM);
+            let mut spans = vec![Span::styled(" ", cursor_style)];
+            spans.extend(
+                branded_line(&self.placeholder, placeholder_style)
+                    .into_iter()
+                    .map(|span| Span::styled(span.content.into_owned(), span.style)),
+            );
+            return (vec![Line::from(spans)], 0);
+        }
+
+        let chars: Vec<char> = self.value.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        let width = width.max(1);
+        let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+        let mut col = 0usize;
+        let mut cursor_row = 0usize;
+        for (i, &c) in chars.iter().enumerate() {
+            let at_cursor = i == cursor;
+            if c == '\n' {
+                if at_cursor {
+                    cursor_row = rows.len() - 1;
+                    rows.last_mut()
+                        .expect("rows never empty")
+                        .push(Span::styled(" ".to_string(), cursor_style));
+                }
+                rows.push(Vec::new());
+                col = 0;
+                continue;
+            }
+            if col >= width {
+                rows.push(Vec::new());
+                col = 0;
+            }
+            if at_cursor {
+                cursor_row = rows.len() - 1;
+            }
+            let style = if at_cursor {
+                cursor_style
+            } else {
+                Style::default()
+            };
+            rows.last_mut()
+                .expect("rows never empty")
+                .push(Span::styled(c.to_string(), style));
+            col += 1;
+        }
+        if cursor == chars.len() {
+            if col >= width {
+                rows.push(Vec::new());
+            }
+            cursor_row = rows.len() - 1;
+            rows.last_mut()
+                .expect("rows never empty")
+                .push(Span::styled(" ".to_string(), cursor_style));
+        }
+        (rows.into_iter().map(Line::from).collect(), cursor_row)
     }
 
     /// Renderable single-line content with the same solid block cursor used by
@@ -409,4 +633,199 @@ impl InputPrompt {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn type_str(prompt: &mut InputPrompt, text: &str) {
+        for c in text.chars() {
+            if c == '\n' {
+                // Ctrl+J inserts a newline in multiline mode.
+                prompt.handle_key(ctrl('j'));
+            } else {
+                prompt.handle_key(key(KeyCode::Char(c)));
+            }
+        }
+    }
+
+    #[test]
+    fn single_line_enter_still_submits() {
+        let mut prompt = InputPrompt::new("label");
+        type_str(&mut prompt, "hello");
+        match prompt.handle_key(key(KeyCode::Enter)) {
+            InputOutcome::Submitted(value) => assert_eq!(value, "hello"),
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn multiline_ctrl_j_inserts_newline_and_enter_submits() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "first");
+        // Ctrl+J inserts a newline without submitting.
+        assert!(matches!(
+            prompt.handle_key(ctrl('j')),
+            InputOutcome::Pending
+        ));
+        type_str(&mut prompt, "second");
+        match prompt.handle_key(key(KeyCode::Enter)) {
+            InputOutcome::Submitted(value) => assert_eq!(value, "first\nsecond"),
+            _ => panic!("expected Enter to submit with newlines intact"),
+        }
+    }
+
+    #[test]
+    fn multiline_modified_enter_inserts_newline_without_submitting() {
+        // Fallback for terminals lacking the keyboard-enhancement protocol,
+        // where Ctrl+J collapses onto plain Enter: Alt+Enter still newlines.
+        for mods in [
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+        ] {
+            let mut prompt = InputPrompt::new("label").multiline();
+            type_str(&mut prompt, "first");
+            assert!(matches!(
+                prompt.handle_key(KeyEvent::new(KeyCode::Enter, mods)),
+                InputOutcome::Pending
+            ));
+            type_str(&mut prompt, "second");
+            assert_eq!(prompt.value, "first\nsecond");
+        }
+    }
+
+    #[test]
+    fn multiline_paste_inserts_newlines_without_submitting() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        prompt.error = Some("previous error".to_string());
+
+        assert!(matches!(
+            prompt.paste("first\nsecond"),
+            InputOutcome::Pending
+        ));
+        assert_eq!(prompt.value, "first\nsecond");
+        assert_eq!(prompt.cursor, "first\nsecond".chars().count());
+        assert_eq!(prompt.error, None);
+
+        match prompt.handle_key(key(KeyCode::Enter)) {
+            InputOutcome::Submitted(value) => assert_eq!(value, "first\nsecond"),
+            _ => panic!("expected explicit Enter to submit after paste"),
+        }
+    }
+
+    #[test]
+    fn multiline_ctrl_a_and_e_move_within_the_current_line() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "abc\nxyz");
+        // Cursor at end (char index 7). Ctrl+A goes to the current line start.
+        prompt.handle_key(ctrl('a'));
+        assert_eq!(prompt.cursor, 4);
+        prompt.handle_key(ctrl('e'));
+        assert_eq!(prompt.cursor, 7);
+    }
+
+    #[test]
+    fn multiline_validator_fires_on_enter() {
+        let mut prompt = InputPrompt::new("label")
+            .multiline()
+            .with_validator(|value| {
+                value
+                    .trim()
+                    .is_empty()
+                    .then(|| "Bug description cannot be empty".to_string())
+            });
+        prompt.handle_key(ctrl('j')); // newline-only value
+        assert!(matches!(
+            prompt.handle_key(key(KeyCode::Enter)),
+            InputOutcome::Pending
+        ));
+        assert_eq!(
+            prompt.error.as_deref(),
+            Some("Bug description cannot be empty")
+        );
+        type_str(&mut prompt, "real text");
+        assert!(matches!(
+            prompt.handle_key(key(KeyCode::Enter)),
+            InputOutcome::Submitted(_)
+        ));
+    }
+
+    #[test]
+    fn multiline_esc_cancels() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "abc");
+        assert!(matches!(
+            prompt.handle_key(key(KeyCode::Esc)),
+            InputOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn multiline_cursor_moves_across_newlines_with_multibyte_chars() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "áé\nüñ");
+        // Cursor at end (char index 5). Up keeps the column on the first line.
+        prompt.handle_key(key(KeyCode::Up));
+        assert_eq!(prompt.cursor, 2);
+        prompt.handle_key(key(KeyCode::Home));
+        assert_eq!(prompt.cursor, 0);
+        prompt.handle_key(key(KeyCode::End));
+        assert_eq!(prompt.cursor, 2);
+        prompt.handle_key(key(KeyCode::Down));
+        assert_eq!(prompt.cursor, 5);
+        // Left crosses the newline boundary one char at a time.
+        prompt.handle_key(key(KeyCode::Left));
+        prompt.handle_key(key(KeyCode::Left));
+        prompt.handle_key(key(KeyCode::Left));
+        assert_eq!(prompt.cursor, 2);
+        assert_eq!(prompt.value, "áé\nüñ");
+    }
+
+    #[test]
+    fn multiline_rows_wrap_and_report_the_cursor_row() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "abcdef\nxy");
+        // Width 3: "abcdef" wraps to two rows, "xy" is the third.
+        let (rows, cursor_row) = prompt.multiline_rows(3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(cursor_row, 2); // cursor at end, on the last row
+
+        // Text taller than the 6 visible rows: the cursor row is always
+        // within the window the renderer slices.
+        let mut tall = InputPrompt::new("label").multiline();
+        type_str(&mut tall, &"line\n".repeat(9));
+        let (rows, cursor_row) = tall.multiline_rows(40);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(cursor_row, 9);
+        let visible = (MULTILINE_BOX_ROWS - 2) as usize;
+        let start = cursor_row.saturating_sub(visible - 1);
+        assert!((start..start + visible).contains(&cursor_row));
+    }
+
+    #[test]
+    fn single_line_behavior_ignores_multiline_keys() {
+        let mut prompt = InputPrompt::new("label");
+        type_str(&mut prompt, "abc");
+        // Ctrl+S is a no-op in single-line mode.
+        assert!(matches!(
+            prompt.handle_key(ctrl('s')),
+            InputOutcome::Pending
+        ));
+        assert_eq!(prompt.value, "abc");
+        // Home/End keep their whole-value semantics.
+        prompt.handle_key(key(KeyCode::Home));
+        assert_eq!(prompt.cursor, 0);
+        prompt.handle_key(key(KeyCode::End));
+        assert_eq!(prompt.cursor, 3);
+    }
 }

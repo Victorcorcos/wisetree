@@ -45,6 +45,10 @@ pub struct PtyView {
     reader_handle: Option<JoinHandle<()>>,
     done: Arc<AtomicBool>,
     exit_status: Arc<Mutex<Option<i32>>>,
+    /// Raw output bytes accumulated by the reader thread — only for
+    /// `spawn_captured` children whose transcript the caller parses after
+    /// exit (the vt100 screen is lossy: wrapped lines, capped scrollback).
+    capture: Option<Arc<Mutex<Vec<u8>>>>,
     /// Last (rows, cols) the parser/PTY were resized to. Avoids a
     /// resize ioctl on every frame when the area hasn't actually changed.
     last_size: (u16, u16),
@@ -56,6 +60,27 @@ impl PtyView {
         args: &[String],
         cwd: Option<&Path>,
         env: &[(String, String)],
+    ) -> std::io::Result<Self> {
+        Self::spawn_inner(binary, args, cwd, env, false)
+    }
+
+    /// Like [`PtyView::spawn`], but also retains the child's raw output so
+    /// [`PtyView::captured_output`] can hand back the full transcript.
+    pub fn spawn_captured(
+        binary: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+    ) -> std::io::Result<Self> {
+        Self::spawn_inner(binary, args, cwd, env, true)
+    }
+
+    fn spawn_inner(
+        binary: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+        capture_output: bool,
     ) -> std::io::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -109,9 +134,11 @@ impl PtyView {
         )));
         let done = Arc::new(AtomicBool::new(false));
         let exit_status: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let capture = capture_output.then(|| Arc::new(Mutex::new(Vec::new())));
 
         let reader_parser = Arc::clone(&parser);
         let reader_done = Arc::clone(&done);
+        let reader_capture = capture.clone();
         let reader_handle = thread::Builder::new()
             .name("wisetree-pty-reader".into())
             .spawn(move || {
@@ -123,6 +150,11 @@ impl PtyView {
                         Ok(n) => {
                             if let Ok(mut parser) = reader_parser.lock() {
                                 parser.process(&buf[..n]);
+                            }
+                            if let Some(capture) = reader_capture.as_ref() {
+                                if let Ok(mut bytes) = capture.lock() {
+                                    bytes.extend_from_slice(&buf[..n]);
+                                }
                             }
                         }
                         Err(err) => {
@@ -145,8 +177,20 @@ impl PtyView {
             reader_handle,
             done,
             exit_status,
+            capture,
             last_size: (DEFAULT_ROWS, DEFAULT_COLS),
         })
+    }
+
+    /// Everything the child has written so far, as lossy UTF-8. Empty for
+    /// children spawned without capture. Meaningful as a full transcript
+    /// only after `poll_exited` has returned `true`.
+    pub fn captured_output(&self) -> String {
+        self.capture
+            .as_ref()
+            .and_then(|capture| capture.lock().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
     }
 
     /// Returns true on the first call after the child has exited. The
@@ -382,8 +426,8 @@ mod tests {
         })
     }
 
-    fn spawn_echo() -> PtyView {
-        let echo = resolve_on_path("echo")
+    fn echo_binary() -> std::path::PathBuf {
+        resolve_on_path("echo")
             .or_else(|| {
                 ["/bin/echo", "/usr/bin/echo"]
                     .into_iter()
@@ -391,8 +435,11 @@ mod tests {
                     .map(std::path::PathBuf::from)
                     .find(|path| path.is_file())
             })
-            .expect("echo available on PATH");
-        PtyView::spawn(&echo, &["hello".to_string()], None, &[]).expect("spawn echo")
+            .expect("echo available on PATH")
+    }
+
+    fn spawn_echo() -> PtyView {
+        PtyView::spawn(&echo_binary(), &["hello".to_string()], None, &[]).expect("spawn echo")
     }
 
     fn wait_for_exit(pty: &mut PtyView) {
@@ -423,5 +470,18 @@ mod tests {
         // scrollback_len matches what vt100 actually retains; for a
         // single-line echo this is 0, but the accessor must still work.
         let _ = pty.scrollback_len();
+    }
+
+    #[test]
+    fn captured_spawn_retains_the_raw_transcript() {
+        let mut pty = PtyView::spawn_captured(&echo_binary(), &["hello".to_string()], None, &[])
+            .expect("spawn echo");
+        wait_for_exit(&mut pty);
+        assert!(pty.captured_output().contains("hello"));
+
+        // An uncaptured spawn always hands back an empty transcript.
+        let mut plain = spawn_echo();
+        wait_for_exit(&mut plain);
+        assert_eq!(plain.captured_output(), "");
     }
 }

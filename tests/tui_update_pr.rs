@@ -70,7 +70,7 @@ fn sh_quote(path: &Path) -> String {
 /// An explicitly-blank per-command AI config (every slot empty), since the
 /// schema default now seeds free opencode models.
 fn blank_ai() -> wisetree::config::schema::AiConfig {
-    use wisetree::config::schema::{AiConfig, AiFixConfig, AiModelConfig};
+    use wisetree::config::schema::{AiBugkillConfig, AiConfig, AiFixConfig, AiModelConfig};
     AiConfig {
         enrich: AiModelConfig::default(),
         fix: AiFixConfig {
@@ -78,6 +78,11 @@ fn blank_ai() -> wisetree::config::schema::AiConfig {
             apply: AiModelConfig::default(),
         },
         update: AiModelConfig::default(),
+        bugkill: AiBugkillConfig {
+            investigate: AiModelConfig::default(),
+            fix: AiModelConfig::default(),
+            judge: AiModelConfig::default(),
+        },
     }
 }
 

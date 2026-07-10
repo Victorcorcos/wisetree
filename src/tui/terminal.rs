@@ -15,8 +15,12 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::style::available_color_count;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::{Backend as RatatuiBackend, ClearType, CrosstermBackend, WindowSize};
@@ -324,11 +328,43 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Tracks whether we successfully pushed keyboard-enhancement flags, so
+/// `restore` only pops when there is something to pop.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+/// Best-effort: ask the terminal to disambiguate escape codes (the kitty
+/// keyboard protocol) so combos like `Ctrl+J` arrive distinct from `Enter`
+/// (both are otherwise reported as plain `Enter` in legacy mode, leaving
+/// multiline inputs unable to tell "submit" from "insert newline").
+///
+/// We push unconditionally rather than probing support first: probing is a
+/// blocking terminal round-trip that stalls startup on terminals that never
+/// reply (dumb terminals, pipes, the PTY test harness), while terminals that
+/// don't implement the protocol simply ignore the escape.
+fn enable_keyboard_enhancement<W: Write>(w: &mut W) {
+    if crossterm::execute!(
+        w,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
+    {
+        KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Pop the enhancement flags pushed by [`enable_keyboard_enhancement`], if any.
+fn disable_keyboard_enhancement<W: Write>(w: &mut W) {
+    if KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::execute!(w, PopKeyboardEnhancementFlags);
+    }
+}
+
 /// Set raw mode and return a top-anchored ratatui terminal handle.
 pub fn enter() -> io::Result<Terminal> {
     enable_raw_mode()?;
     let mut backend = AdaptiveBackend::new(io::stdout());
-    crossterm::execute!(&mut backend, EnableMouseCapture)?;
+    enable_keyboard_enhancement(&mut backend);
+    crossterm::execute!(&mut backend, EnableMouseCapture, EnableBracketedPaste)?;
     let size = backend.size()?;
     let viewport = app_viewport(size);
     let mut terminal = RatTerminal::with_options(backend, TerminalOptions { viewport })?;
@@ -342,7 +378,8 @@ pub fn enter_wrapper() -> io::Result<WrapperTerminal> {
     enable_raw_mode()?;
     let tty = OpenOptions::new().read(true).write(true).open(TTY_PATH)?;
     let mut backend = AdaptiveBackend::new(tty);
-    crossterm::execute!(&mut backend, EnableMouseCapture)?;
+    enable_keyboard_enhancement(&mut backend);
+    crossterm::execute!(&mut backend, EnableMouseCapture, EnableBracketedPaste)?;
     let size = backend.size()?;
     let viewport = app_viewport(size);
     let mut terminal = RatTerminal::with_options(backend, TerminalOptions { viewport })?;
@@ -373,7 +410,8 @@ pub fn clear_wrapper_for_shell(terminal: &mut WrapperTerminal) -> io::Result<()>
 pub fn restore() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
-    let _ = crossterm::execute!(&mut stdout, DisableMouseCapture);
+    disable_keyboard_enhancement(&mut stdout);
+    let _ = crossterm::execute!(&mut stdout, DisableMouseCapture, DisableBracketedPaste);
     let mut backend = AdaptiveBackend::new(io::stdout());
     let _ = backend.clear_region(ClearType::All);
     let _ = backend.set_cursor_position(Position::ORIGIN);
@@ -384,7 +422,8 @@ pub fn restore() {
 pub fn restore_wrapper_tty() {
     let _ = disable_raw_mode();
     if let Ok(mut tty) = OpenOptions::new().write(true).open(TTY_PATH) {
-        let _ = crossterm::execute!(&mut tty, DisableMouseCapture);
+        disable_keyboard_enhancement(&mut tty);
+        let _ = crossterm::execute!(&mut tty, DisableMouseCapture, DisableBracketedPaste);
     }
 }
 

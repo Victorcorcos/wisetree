@@ -116,9 +116,10 @@ pub fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) 
         })
         .collect();
 
+    // Status must fit the widest explicit label ("Worked 🟢" / "No change").
     let widths = [
         Constraint::Percentage(40),
-        Constraint::Length(8),
+        Constraint::Length(10),
         Constraint::Min(10),
     ];
 

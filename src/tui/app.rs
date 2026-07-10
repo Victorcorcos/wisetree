@@ -33,23 +33,26 @@ use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
-    check_for_updates_all_sources, default_dashboard_warning, detect_shell_integration,
-    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
-    install_shell_integration, parse_pull_request_md, resolve_dashboard_columns, AiStatus,
-    CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService,
-    DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest,
-    FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    MultiSourceUpdateResult, OpencodeModel, PrState, Shell, ShellIntegrationStatus,
-    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    check_for_updates_all_sources, compute_attempt_changes, default_dashboard_warning,
+    detect_shell_integration, fetch_free_opencode_models, fetch_opencode_model_variants,
+    fetch_opencode_models, install_shell_integration, parse_pull_request_md,
+    resolve_dashboard_columns, AiStatus, AttemptChanges, BugHypothesis, BugkillPreflightOutcome,
+    BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus, CommentGroup,
+    DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
+    EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
+    FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult, OpencodeModel,
+    PrState, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
+    UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
+use crate::tui::screens::bugkill_pr::{BugkillAction, BugkillPullRequestScreen};
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
-    BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
+    BugkillRequest, BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
     EnrichPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
     UpdatePullRequestRequest,
 };
@@ -190,6 +193,36 @@ enum AppEvent {
     },
     /// The final `git push` finished; show the results page.
     FixPrPushed(Result<(), String>),
+    /// "Bugkill": deterministic preflight finished (gates, clean-tree check,
+    /// untracked baseline, base ref, resume detection).
+    BugkillPrepared(Result<Box<BugkillPreflightOutcome>, String>),
+    /// Leftover-attempt debris was discarded — re-run the preflight.
+    BugkillDiscarded(Result<(), String>),
+    /// Spawn params for the live investigation `opencode run` are ready
+    /// (or a gate failed). `corrective` marks the single retry after a
+    /// parse failure.
+    BugkillInvestigateReady {
+        corrective: bool,
+        result: Result<Box<FixApplyHandoff>, String>,
+    },
+    /// Pre-attempt snapshot taken and opencode spawn params ready.
+    BugkillFixReady {
+        row_index: usize,
+        result: Result<Box<(BugkillSnapshot, FixApplyHandoff)>, String>,
+    },
+    /// Post-attempt scan + harness commit finished.
+    BugkillCommitted(Result<BugkillCommitOutcome, String>),
+    /// Esc-abort cleanup finished (uncommitted partial edits discarded).
+    BugkillAborted(Result<(), String>),
+    /// The judge classified the user's freeform "Other" answer.
+    BugkillJudged {
+        user_text: String,
+        result: Result<BugkillVerdict, String>,
+    },
+    /// `git revert` of the attempt commit finished.
+    BugkillRolledBack(Result<(), String>),
+    /// Rewriting `BUG_INVESTIGATION.md` failed (best-effort warning).
+    BugkillFileWriteFailed(String),
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
@@ -201,6 +234,17 @@ enum AppEvent {
     /// the AI Settings slots' per-model ←/→ reasoning cycle.
     AiModelVariantsFetched(Result<std::collections::HashMap<String, Vec<String>>, String>),
     ShellIntegrationDetected(ShellIntegrationStatus),
+}
+
+/// Outcome of the post-attempt scan + commit task: either the fix AI made
+/// no committable change (the row stays eligible), or the attempt was
+/// committed by the harness.
+enum BugkillCommitOutcome {
+    NoChanges,
+    Committed {
+        sha: String,
+        changes: AttemptChanges,
+    },
 }
 
 struct MergePrDetailsPayload {
@@ -335,6 +379,7 @@ pub struct App {
     update_pr: Option<UpdatePullRequestScreen>,
     enrich_pr: Option<EnrichPullRequestScreen>,
     fix_pr: Option<FixPullRequestScreen>,
+    bugkill_pr: Option<BugkillPullRequestScreen>,
     update_branch: Option<UpdateBranchScreen>,
     /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
     /// top of the Settings screen — when active the Settings state is
@@ -388,6 +433,7 @@ impl App {
             update_pr: None,
             enrich_pr: None,
             fix_pr: None,
+            bugkill_pr: None,
             update_branch: None,
             ai_model_picker: None,
             shell_integration_status: None,
@@ -484,6 +530,7 @@ impl App {
 
             match events.next_event()? {
                 Event::Key(key) => self.handle_key(key, &tx),
+                Event::Paste(text) => self.handle_paste(text, &tx),
                 Event::Mouse(mouse) => self.handle_mouse(mouse, &tx),
                 Event::Closed => self.quit_requested = true,
                 Event::Tick => {
@@ -516,6 +563,20 @@ impl App {
                     if fix_exited {
                         self.on_fix_apply_done(&tx);
                     }
+                    // Same for the Bugkill PTYs — an Investigating exit
+                    // means the transcript is ready to parse; a Fixing exit
+                    // means the attempt is over, so scan + commit it now.
+                    let bugkill_exited = self
+                        .bugkill_pr
+                        .as_mut()
+                        .map(|screen| (screen.tick_pty(None), screen.step()));
+                    match bugkill_exited {
+                        Some((true, screens::bugkill_pr::BugkillStep::Investigating)) => {
+                            self.on_bugkill_investigated(&tx)
+                        }
+                        Some((true, _)) => self.on_bugkill_fix_done(&tx),
+                        _ => {}
+                    }
                 }
                 Event::Resize(width, height) => {
                     // `Viewport::Fixed` (see `terminal::app_viewport`) does
@@ -542,6 +603,7 @@ impl App {
     fn pty_active(&self) -> bool {
         self.enrich_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.update_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.bugkill_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -825,6 +887,28 @@ impl App {
                     fix_pr.render(frame, panel);
                 }
             }
+            Screen::BugkillPullRequest => {
+                // Expanded steps (Confirm, DescribeBug, Select, the live
+                // Fixing PTY, Verdict, Done…) want the whole bottom region;
+                // the compact Working / ResumePrompt steps stay sized.
+                let expand = self
+                    .bugkill_pr
+                    .as_ref()
+                    .is_some_and(|s| s.wants_full_panel());
+                let panel = if expand {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .bugkill_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
+                if let Some(bugkill_pr) = self.bugkill_pr.as_mut() {
+                    bugkill_pr.tick = self.tick;
+                    bugkill_pr.render(frame, panel);
+                }
+            }
             Screen::UpdateBranch => {
                 let h = self
                     .update_branch
@@ -926,6 +1010,34 @@ impl App {
         }
     }
 
+    /// Route a bracketed-paste payload to the focused surface. The Bugkill
+    /// screen consumes the whole payload atomically (multi-line bug reports);
+    /// every other screen replays the text as plain key presses so the focused
+    /// text input receives it, reusing the normal key dispatch without extra
+    /// plumbing. Control characters (newlines, tabs, escapes) are dropped so a
+    /// pasted trailing newline can't submit or cancel a prompt mid-paste.
+    fn handle_paste(&mut self, text: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.mouse_selection = None;
+        if !matches!(self.phase, InitPhase::Ready) {
+            return;
+        }
+        if matches!(self.screen, Screen::BugkillPullRequest) {
+            let action = self
+                .bugkill_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(BugkillAction::Continue);
+            self.apply_bugkill_action(action, tx);
+            return;
+        }
+        for ch in text.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            self.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), tx);
+        }
+    }
+
     fn scroll_screen(&mut self, direction: ScrollDirection, lines: u16) {
         match self.screen {
             Screen::UpdatePullRequest => {
@@ -954,6 +1066,14 @@ impl App {
             }
             Screen::FixPullRequest => {
                 if let Some(screen) = self.fix_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
+            Screen::BugkillPullRequest => {
+                if let Some(screen) = self.bugkill_pr.as_mut() {
                     match direction {
                         ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
                         ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
@@ -1081,6 +1201,7 @@ impl App {
             Screen::UpdatePullRequest => self.handle_update_pr_key(key, tx),
             Screen::EnrichPullRequest => self.handle_enrich_pr_key(key, tx),
             Screen::FixPullRequest => self.handle_fix_pr_key(key, tx),
+            Screen::BugkillPullRequest => self.handle_bugkill_key(key, tx),
             Screen::UpdateBranch => {
                 if let Some(screen) = self.update_branch.as_mut() {
                     screen.handle_key(key);
@@ -1468,6 +1589,14 @@ impl App {
                     .map(|screen| screen.handle_mouse_click(position))
                     .unwrap_or(FixAction::Continue);
                 self.apply_fix_action(action, tx);
+            }
+            Screen::BugkillPullRequest => {
+                let action = self
+                    .bugkill_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(BugkillAction::Continue);
+                self.apply_bugkill_action(action, tx);
             }
             Screen::UpdateBranch => {}
             Screen::AiModelPicker => {
@@ -1993,6 +2122,588 @@ impl App {
         );
     }
 
+    // ── "Bugkill" orchestration ─────────────────────────────────────────
+
+    fn start_bugkill_flow(
+        &mut self,
+        request: BugkillRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // Lands on the Confirm step immediately; the preflight only runs
+        // once the user has confirmed and described the bug.
+        let ai = self.current_dashboard_config().ai.bugkill.clone();
+        self.bugkill_pr = Some(BugkillPullRequestScreen::new(request, ai));
+        self.screen = Screen::BugkillPullRequest;
+    }
+
+    fn handle_bugkill_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.bugkill_pr.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+        self.apply_bugkill_action(action, tx);
+    }
+
+    /// Single handler for `BugkillAction`s from keyboard or mouse. Drives
+    /// the screen transitions and kicks off each async stage; all loops,
+    /// questions, and git operations stay in Rust (invariant I4).
+    fn apply_bugkill_action(
+        &mut self,
+        action: BugkillAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match action {
+            BugkillAction::Continue => {}
+            BugkillAction::Cancelled => {
+                self.bugkill_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+            BugkillAction::Confirmed => {
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.show_describe();
+                }
+            }
+            BugkillAction::DescriptionSubmitted(description) => {
+                let Some(screen) = self.bugkill_pr.as_mut() else {
+                    return;
+                };
+                screen.set_bug_description(description);
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_working("Preparing...", false);
+                kick_off_bugkill_preflight(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    tx.clone(),
+                );
+            }
+            BugkillAction::DiscardLeftovers => {
+                let Some(screen) = self.bugkill_pr.as_mut() else {
+                    return;
+                };
+                let worktree_path = screen.request().worktree_path.clone();
+                let paths = screen.leftover_tracked();
+                screen.start_working("Discarding leftover changes...", true);
+                kick_off_bugkill_discard(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    paths,
+                    tx.clone(),
+                );
+            }
+            BugkillAction::Resume => {
+                let Some(screen) = self.bugkill_pr.as_mut() else {
+                    return;
+                };
+                match screen.apply_resume() {
+                    // An applied-but-unanswered attempt must be resolved
+                    // before anything else — re-ask the Verdict question.
+                    Some(unverdicted) => screen.enter_verdict_for_resume(unverdicted),
+                    None => {
+                        screen.enter_select();
+                    }
+                }
+            }
+            BugkillAction::StartFresh => self.start_bugkill_investigation(false, tx),
+            BugkillAction::AttemptFix => self.start_bugkill_attempt(None, tx),
+            BugkillAction::AbortFix => {
+                let Some(screen) = self.bugkill_pr.as_mut() else {
+                    return;
+                };
+                let Some(pre) = screen.pre_snapshot() else {
+                    return;
+                };
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.kill_pty();
+                screen.start_working("Rolling back the attempt...", true);
+                kick_off_bugkill_abort(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    pre,
+                    tx.clone(),
+                );
+            }
+            BugkillAction::FixFinished => self.on_bugkill_fix_done(tx),
+            BugkillAction::VerdictYes => {
+                let Some(screen) = self.bugkill_pr.as_mut() else {
+                    return;
+                };
+                // The attempt commit *is* the delivered fix — nothing
+                // further happens in git (no push).
+                screen.mark_worked(true);
+                self.rewrite_bugkill_file(tx);
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.enter_done(true);
+                }
+            }
+            BugkillAction::VerdictNo | BugkillAction::RollbackAndChoose => {
+                self.rollback_bugkill_attempt(tx)
+            }
+            BugkillAction::OtherSubmitted(text) => {
+                let Some(screen) = self.bugkill_pr.as_mut() else {
+                    return;
+                };
+                let Some(row) = screen.current_row() else {
+                    return;
+                };
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_working("Judging the outcome...", false);
+                kick_off_bugkill_judge(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    row,
+                    text,
+                    tx.clone(),
+                );
+            }
+            BugkillAction::RetryWithFeedback => {
+                // Re-enter the fix phase for the same row, without reverting:
+                // the previous edits stay committed and the retry's edits are
+                // folded into the same attempt commit via --amend.
+                let feedback = self.bugkill_pr.as_ref().and_then(|s| s.attempt_feedback());
+                self.start_bugkill_attempt(feedback, tx);
+            }
+            BugkillAction::Done => {
+                self.bugkill_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+        }
+    }
+
+    /// Kick off one live investigation run: build the `opencode run` spawn
+    /// params, then show it in the embedded PTY. `corrective` is only set
+    /// on the automatic retry after an unparseable transcript.
+    fn start_bugkill_investigation(
+        &mut self,
+        corrective: bool,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        let worktree_path = screen.request().worktree_path.clone();
+        let description = screen.bug_description().to_string();
+        let base_ref = screen.base_ref().map(str::to_string);
+        screen.start_working("Preparing the investigation...", false);
+        kick_off_bugkill_prepare_investigate(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            worktree_path,
+            description,
+            base_ref,
+            corrective,
+            tx.clone(),
+        );
+    }
+
+    /// Kick off one fix attempt for the targeted row: fresh untracked
+    /// snapshot + opencode spawn params. `feedback` is only set on a
+    /// retry-with-feedback re-entry.
+    fn start_bugkill_attempt(
+        &mut self,
+        feedback: Option<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        let Some(row_index) = screen.attempt_target_index() else {
+            return;
+        };
+        let Some(row) = screen.current_row() else {
+            return;
+        };
+        let worktree_path = screen.request().worktree_path.clone();
+        let bug_description = screen.bug_description().to_string();
+        screen.start_working("Preparing the fix...", false);
+        kick_off_bugkill_prepare_fix(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            BugkillPrepareFixRequest {
+                worktree_path,
+                bug_description,
+                row,
+                row_index,
+                feedback,
+            },
+            tx.clone(),
+        );
+    }
+
+    /// opencode finished (exited or the user confirmed): scan the worktree
+    /// against the pre-attempt snapshot and commit (or amend) the attempt.
+    fn on_bugkill_fix_done(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        let Some(pre) = screen.pre_snapshot() else {
+            return;
+        };
+        let Some(row) = screen.current_row() else {
+            return;
+        };
+        let amend = screen.attempt_feedback().is_some();
+        let worktree_path = screen.request().worktree_path.clone();
+        screen.kill_pty();
+        screen.start_working("Scanning the attempt...", true);
+        kick_off_bugkill_commit(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            BugkillCommitRequest {
+                worktree_path,
+                pre,
+                number: row.number,
+                solution: row.solution,
+                amend,
+            },
+            tx.clone(),
+        );
+    }
+
+    /// History-preserving rollback of the current attempt (the No path).
+    /// The revert runs *first*; only after it succeeds is the row marked
+    /// failed and the file rewritten (crash-safety ordering). A resume-
+    /// recovered attempt without an identified commit skips the revert and
+    /// records a note instead.
+    fn rollback_bugkill_attempt(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        match screen.attempt_sha() {
+            Some(sha) => {
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_working("Rolling back the attempt...", true);
+                kick_off_bugkill_rollback(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    sha,
+                    tx.clone(),
+                );
+            }
+            None => {
+                screen.note_unidentified_attempt();
+                screen.mark_worked(false);
+                self.rewrite_bugkill_file(tx);
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.enter_select();
+                }
+            }
+        }
+    }
+
+    /// Surface a terminal preflight failure as a toast and return to the
+    /// dashboard, dropping the Bugkill screen.
+    fn fail_bugkill(
+        &mut self,
+        variant: ToastVariant,
+        message: impl Into<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.show_toast(variant, message.into());
+        self.bugkill_pr = None;
+        self.enter_screen(Screen::Dashboard, tx);
+    }
+
+    /// Re-render `BUG_INVESTIGATION.md` from the in-memory model and write
+    /// it to the worktree root (invariant I1: called after every mutation).
+    fn rewrite_bugkill_file(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.bugkill_pr.as_ref() else {
+            return;
+        };
+        let path = PathBuf::from(&screen.request().worktree_path)
+            .join(crate::services::bugkill::INVESTIGATION_FILE);
+        let content = screen.render_investigation();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = tokio::fs::write(&path, content).await {
+                let _ = tx.send(AppEvent::BugkillFileWriteFailed(err.to_string()));
+            }
+        });
+    }
+
+    fn apply_bugkill_prepared(
+        &mut self,
+        result: Result<Box<BugkillPreflightOutcome>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.bugkill_pr.is_none() {
+            return;
+        }
+        match result {
+            Err(message) => self.fail_bugkill(
+                ToastVariant::Error,
+                format!("Bugkill preparation failed: {}", truncate_error(&message)),
+                tx,
+            ),
+            Ok(outcome) => match *outcome {
+                BugkillPreflightOutcome::AiNotConfigured => self.fail_bugkill(
+                    ToastVariant::Warning,
+                    "ai.bugkill.investigate model is not configured.",
+                    tx,
+                ),
+                BugkillPreflightOutcome::AiUnavailable => self.fail_bugkill(
+                    ToastVariant::Error,
+                    "`opencode` CLI is not on PATH — install it from https://opencode.ai then \
+                     retry.",
+                    tx,
+                ),
+                BugkillPreflightOutcome::DirtyTree { count } => self.fail_bugkill(
+                    ToastVariant::Warning,
+                    format!(
+                        "{count} uncommitted tracked change(s) in the worktree — commit or \
+                         stash them before running Bugkill."
+                    ),
+                    tx,
+                ),
+                BugkillPreflightOutcome::LeftoverAttempt { tracked } => {
+                    if let Some(screen) = self.bugkill_pr.as_mut() {
+                        screen.show_leftover_prompt(tracked);
+                    }
+                }
+                BugkillPreflightOutcome::Ready(preflight) => {
+                    let Some(screen) = self.bugkill_pr.as_mut() else {
+                        return;
+                    };
+                    screen.set_base_ref(preflight.base_ref);
+                    match preflight.resume {
+                        BugkillResumeState::Absent => self.start_bugkill_investigation(false, tx),
+                        BugkillResumeState::Unparseable => screen.show_overwrite_prompt(),
+                        BugkillResumeState::Parsed {
+                            investigation,
+                            unverdicted,
+                        } => screen.show_resume_prompt(investigation, unverdicted),
+                    }
+                }
+            },
+        }
+    }
+
+    fn apply_bugkill_discarded(
+        &mut self,
+        result: Result<(), String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                // Debris gone — continue the preflight from the clean tree.
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_working("Preparing...", false);
+                kick_off_bugkill_preflight(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    tx.clone(),
+                );
+            }
+            Err(message) => screen.set_error(format!(
+                "could not discard the leftover changes: {}",
+                truncate_error(&message)
+            )),
+        }
+    }
+
+    /// Spawn params ready → show the AI Activity panel and launch the
+    /// captured `opencode run` inside the embedded PTY, so the user watches
+    /// the investigation instead of a bare spinner.
+    fn apply_bugkill_investigate_ready(
+        &mut self,
+        corrective: bool,
+        result: Result<Box<FixApplyHandoff>, String>,
+    ) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(handoff) => {
+                screen.start_investigating(corrective);
+                screen.spawn_investigate_pty(
+                    handoff.opencode_binary,
+                    handoff.opencode_args,
+                    handoff.cwd,
+                );
+            }
+            Err(message) => screen.set_error(message),
+        }
+    }
+
+    /// The investigation `opencode run` exited: parse its captured
+    /// transcript into ranked hypotheses. An unparseable transcript earns
+    /// one corrective retry (stricter prompt); a second failure — or a
+    /// non-zero opencode exit — surfaces the transcript tail.
+    fn on_bugkill_investigated(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        let corrective = screen.investigate_corrective();
+        let Some((raw, exit_code)) = screen.take_investigation_transcript() else {
+            return;
+        };
+        let transcript = crate::services::strip_pty_artifacts(&raw);
+        if let Some(code) = exit_code.filter(|code| *code != 0) {
+            screen.set_error(format!(
+                "opencode exited with code {code}. Raw tail:\n{}",
+                crate::services::transcript_tail(&transcript)
+            ));
+            return;
+        }
+        match crate::services::parse_hypotheses(&transcript) {
+            Some(hypotheses) => {
+                screen.set_hypotheses(crate::services::normalize_hypotheses(hypotheses));
+                self.rewrite_bugkill_file(tx);
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.enter_select();
+                }
+            }
+            None if !corrective => self.start_bugkill_investigation(true, tx),
+            None => screen.set_error(format!(
+                "could not parse ranked hypotheses from the investigation output. Raw tail:\n{}",
+                crate::services::transcript_tail(&transcript)
+            )),
+        }
+    }
+
+    fn apply_bugkill_fix_ready(
+        &mut self,
+        row_index: usize,
+        result: Result<Box<(BugkillSnapshot, FixApplyHandoff)>, String>,
+    ) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(payload) => {
+                let (snapshot, handoff) = *payload;
+                screen.begin_attempt(row_index, snapshot);
+                screen.start_fixing();
+                screen.spawn_opencode_pty(
+                    handoff.opencode_binary,
+                    handoff.opencode_args,
+                    handoff.cwd,
+                    Vec::new(),
+                );
+            }
+            Err(message) => {
+                // Gate failures (fix model unconfigured, opencode missing)
+                // return to the table — the row stays eligible.
+                self.show_toast(ToastVariant::Error, truncate_error(&message));
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.enter_select();
+                }
+            }
+        }
+    }
+
+    fn apply_bugkill_committed(
+        &mut self,
+        result: Result<BugkillCommitOutcome, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(BugkillCommitOutcome::NoChanges) => {
+                let number = screen.current_row().map(|r| r.number).unwrap_or(0);
+                // Do not mark implemented — the row stays eligible.
+                screen.enter_select();
+                self.show_toast(
+                    ToastVariant::Info,
+                    format!("The fix AI made no changes for row #{number}."),
+                );
+            }
+            Ok(BugkillCommitOutcome::Committed { sha, changes }) => {
+                screen.set_attempt_committed(
+                    sha,
+                    changes.all,
+                    changes.modified_preexisting_untracked,
+                );
+                self.rewrite_bugkill_file(tx);
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.enter_verdict(None);
+                }
+            }
+            Err(message) => screen.set_error(message),
+        }
+    }
+
+    fn apply_bugkill_aborted(&mut self, result: Result<(), String>) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                screen.enter_select();
+                self.show_toast(ToastVariant::Info, "Attempt aborted and rolled back.");
+            }
+            Err(message) => screen.set_error(format!(
+                "could not roll the aborted attempt back: {}",
+                truncate_error(&message)
+            )),
+        }
+    }
+
+    fn apply_bugkill_judged(
+        &mut self,
+        user_text: String,
+        result: Result<BugkillVerdict, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        match result {
+            // Gate failure (judge model unconfigured): the answer is still
+            // required — back to the question.
+            Err(message) => {
+                screen.enter_verdict(None);
+                self.show_toast(ToastVariant::Error, truncate_error(&message));
+            }
+            Ok(verdict) => match verdict.result {
+                JudgeResult::Fixed => self.apply_bugkill_action(BugkillAction::VerdictYes, tx),
+                JudgeResult::NotFixed => screen.show_retry_prompt(user_text),
+                JudgeResult::Unclear => {
+                    let note = if verdict.reason.trim().is_empty() {
+                        "The judge could not tell — please answer Yes or No.".to_string()
+                    } else {
+                        verdict.reason
+                    };
+                    screen.enter_verdict(Some(note));
+                }
+            },
+        }
+    }
+
+    fn apply_bugkill_rolled_back(
+        &mut self,
+        result: Result<(), String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.bugkill_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                // Only after the revert succeeds does the model record the
+                // failure — an interruption between the two leaves the
+                // branch clean and just re-asks the verdict on resume.
+                screen.mark_worked(false);
+                self.rewrite_bugkill_file(tx);
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.enter_select();
+                }
+            }
+            // A failed revert is a hard error, never retried silently.
+            Err(message) => screen.set_error(message),
+        }
+    }
+
     /// Surface a terminal failure and return to the dashboard, dropping the
     /// fix screen. Shared by every non-recoverable prepare-stage outcome.
     fn fail_fix(
@@ -2361,6 +3072,9 @@ impl App {
             }
             DashboardAction::FixPullRequest(request) => {
                 self.start_fix_pr_flow(*request, tx);
+            }
+            DashboardAction::Bugkill(request) => {
+                self.start_bugkill_flow(*request, tx);
             }
             DashboardAction::PushPullRequest(request) => {
                 self.start_push_pr_flow(*request, tx);
@@ -3138,6 +3852,24 @@ impl App {
             AppEvent::FixPrCommitted { index, result } => {
                 self.apply_fix_pr_committed(index, result, tx)
             }
+            AppEvent::BugkillPrepared(result) => self.apply_bugkill_prepared(result, tx),
+            AppEvent::BugkillDiscarded(result) => self.apply_bugkill_discarded(result, tx),
+            AppEvent::BugkillInvestigateReady { corrective, result } => {
+                self.apply_bugkill_investigate_ready(corrective, result)
+            }
+            AppEvent::BugkillFixReady { row_index, result } => {
+                self.apply_bugkill_fix_ready(row_index, result)
+            }
+            AppEvent::BugkillCommitted(result) => self.apply_bugkill_committed(result, tx),
+            AppEvent::BugkillAborted(result) => self.apply_bugkill_aborted(result),
+            AppEvent::BugkillJudged { user_text, result } => {
+                self.apply_bugkill_judged(user_text, result, tx)
+            }
+            AppEvent::BugkillRolledBack(result) => self.apply_bugkill_rolled_back(result, tx),
+            AppEvent::BugkillFileWriteFailed(err) => self.show_toast(
+                ToastVariant::Warning,
+                format!("Could not write BUG_INVESTIGATION.md: {err}"),
+            ),
             AppEvent::FixPrPushed(result) => {
                 if let Some(screen) = self.fix_pr.as_mut() {
                     screen.enter_done(result);
@@ -3918,6 +4650,13 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::BugkillPullRequest => {
+                // Only reachable through `start_bugkill_flow`, which seeds
+                // `bugkill_pr` before flipping the screen.
+                if self.bugkill_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
             Screen::UpdateBranch => {
                 // Only reachable through `start_update_branch_flow`,
                 // which seeds `update_branch` before flipping the
@@ -3961,6 +4700,7 @@ impl App {
         self.update_pr = None;
         self.enrich_pr = None;
         self.fix_pr = None;
+        self.bugkill_pr = None;
         self.update_branch = None;
         self.ai_model_picker = None;
         self.mouse_selection = None;
@@ -5390,6 +6130,258 @@ fn kick_off_push_fix(
             .await
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::FixPrPushed(result));
+    });
+}
+
+// ── Bugkill async stages ────────────────────────────────────────────────
+
+/// Inputs for one Bugkill fix attempt (snapshot + opencode spawn params).
+struct BugkillPrepareFixRequest {
+    worktree_path: String,
+    bug_description: String,
+    row: BugHypothesis,
+    row_index: usize,
+    feedback: Option<String>,
+}
+
+/// Inputs for the post-attempt scan + harness commit.
+struct BugkillCommitRequest {
+    worktree_path: String,
+    pre: BugkillSnapshot,
+    number: usize,
+    solution: String,
+    amend: bool,
+}
+
+fn kick_off_bugkill_preflight(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::BugkillPrepared(Err(
+            "Could not resolve git root.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .bugkill_preflight(&worktree_path)
+            .await
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::BugkillPrepared(result));
+    });
+}
+
+fn kick_off_bugkill_discard(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    paths: Vec<String>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::BugkillDiscarded(Err(
+            "Could not resolve git root.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .bugkill_abort_cleanup(&worktree_path, &paths)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::BugkillDiscarded(result));
+    });
+}
+
+fn kick_off_bugkill_prepare_investigate(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    bug_description: String,
+    base_ref: Option<String>,
+    corrective: bool,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::BugkillInvestigateReady {
+            corrective,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    // A task despite the call being synchronous: the opencode-on-PATH gate
+    // inside spawns `opencode --version`, which must not block the UI.
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .prepare_bugkill_investigate(
+                &worktree_path,
+                &bug_description,
+                base_ref.as_deref(),
+                corrective,
+            )
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::BugkillInvestigateReady { corrective, result });
+    });
+}
+
+fn kick_off_bugkill_prepare_fix(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: BugkillPrepareFixRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let row_index = req.row_index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::BugkillFixReady {
+            row_index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        // Snapshot first (the pre-attempt baseline), then the spawn params.
+        let result = async {
+            let snapshot = service.bugkill_snapshot(&req.worktree_path).await?;
+            let handoff = service
+                .prepare_bugkill_fix(
+                    &req.worktree_path,
+                    &req.bug_description,
+                    &req.row,
+                    req.feedback.as_deref(),
+                )
+                .await?;
+            Ok::<_, crate::errors::WisetreeError>(Box::new((snapshot, handoff)))
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::BugkillFixReady { row_index, result });
+    });
+}
+
+fn kick_off_bugkill_commit(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: BugkillCommitRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::BugkillCommitted(Err(
+            "Could not resolve git root.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = async {
+            let post = service.bugkill_snapshot(&req.worktree_path).await?;
+            let changes =
+                compute_attempt_changes(&post.tracked, &post.untracked, &req.pre.untracked);
+            // Only tracked/committable paths make an attempt: a change-set
+            // that is empty (or holds only modified pre-existing untracked
+            // files) cannot be committed or reverted — the row stays
+            // eligible and the user is told the AI made no changes.
+            if changes.commit_paths.is_empty() {
+                return Ok(BugkillCommitOutcome::NoChanges);
+            }
+            let sha = service
+                .bugkill_commit_attempt(
+                    &req.worktree_path,
+                    &changes,
+                    req.number,
+                    &req.solution,
+                    req.amend,
+                )
+                .await?;
+            Ok::<_, crate::errors::WisetreeError>(BugkillCommitOutcome::Committed { sha, changes })
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::BugkillCommitted(result));
+    });
+}
+
+fn kick_off_bugkill_abort(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    pre: BugkillSnapshot,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::BugkillAborted(Err(
+            "Could not resolve git root.".to_string()
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = async {
+            let post = service.bugkill_snapshot(&worktree_path).await?;
+            let changes = compute_attempt_changes(&post.tracked, &post.untracked, &pre.untracked);
+            service
+                .bugkill_abort_cleanup(&worktree_path, &changes.all)
+                .await
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::BugkillAborted(result));
+    });
+}
+
+fn kick_off_bugkill_judge(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    row: BugHypothesis,
+    user_text: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::BugkillJudged {
+            user_text,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .bugkill_judge(&worktree_path, &row, &user_text)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::BugkillJudged { user_text, result });
+    });
+}
+
+fn kick_off_bugkill_rollback(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    sha: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::BugkillRolledBack(Err(
+            "Could not resolve git root.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .bugkill_rollback(&worktree_path, &sha)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::BugkillRolledBack(result));
     });
 }
 
@@ -7289,6 +8281,40 @@ mod tests {
 
         assert!(app.quit_requested);
         assert_eq!(app.selected_path(), Some("/tmp/repo/feat-x"));
+    }
+
+    #[test]
+    fn paste_fills_directory_input_and_drops_control_chars() {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::Create;
+        app.menu = None;
+        app.create = Some(CreateScreen::new());
+        if let Some(create) = app.create.as_mut() {
+            create.set_branches(Vec::new());
+        }
+
+        // Simulate a bracketed paste carrying a trailing newline (as most
+        // clipboard copies do). The newline must not submit the prompt.
+        app.handle_paste("pasted-dir-name\n".to_string(), &app_event_tx());
+
+        // Still on the directory-input step — the newline was dropped, not
+        // treated as Enter.
+        assert_eq!(app.screen, Screen::Create);
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let dumped = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            dumped.contains("pasted-dir-name"),
+            "pasted text should appear in the input: {dumped}"
+        );
     }
 
     #[test]

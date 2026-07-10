@@ -120,6 +120,10 @@ pub mod colors {
     /// the "Fix" PR command button so it reads distinct from the teal/purple
     /// lifecycle buttons next to it.
     pub const CYAN: Color = Color::Rgb(0xa8, 0xd8, 0xff);
+    /// Dark green `#58a300` — darker than [`GREEN`]. Used for the "Bugkill"
+    /// PR command button so it reads distinct from the Merge button's
+    /// success green next to it.
+    pub const DARK_GREEN: Color = Color::Rgb(0x58, 0xa3, 0x00);
 
     // ── Background colors ───────────────────────────────────────────────
 

@@ -2,6 +2,7 @@
 
 pub mod ai_status;
 pub mod app_state;
+pub mod bugkill;
 pub mod dashboard;
 pub mod opencode_models;
 pub mod presets;
@@ -13,9 +14,15 @@ pub use ai_status::{
     AiStatusReport, AiStatusService,
 };
 pub use app_state::AppStateService;
+pub use bugkill::{
+    compute_attempt_changes, normalize_hypotheses, parse_hypotheses, strip_pty_artifacts,
+    transcript_tail, AttemptChanges, BugHypothesis, BugkillVerdict, EvidenceQuality, JudgeResult,
+    ParsedInvestigation,
+};
 pub use dashboard::{
     default_dashboard_warning, is_behind, parse_pull_request_md, resolve_base_ref,
-    resolve_dashboard_columns, CheckStatus, CommentGroup, CommitSummary, DashboardNotice,
+    resolve_dashboard_columns, BugkillPreflight, BugkillPreflightOutcome, BugkillResumeState,
+    BugkillSnapshot, BugkillUnverdicted, CheckStatus, CommentGroup, CommitSummary, DashboardNotice,
     DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
     EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
     FixPlan, FixPreparation, FixVerdict, MergeStatus, PrState, PullRequest, PullRequestDetails,

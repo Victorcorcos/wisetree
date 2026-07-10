@@ -28,6 +28,7 @@ const INSTANT_POLL_THRESHOLD: Duration = Duration::from_micros(500);
 #[derive(Debug, Clone)]
 pub enum Event {
     Key(KeyEvent),
+    Paste(String),
     Mouse(MouseEvent),
     Resize(u16, u16),
     /// Crossterm can surface a dead TTY as an endless streak of immediate
@@ -74,6 +75,7 @@ impl EventLoop {
             self.spin_guard.note_real_input();
             return Ok(match event::read()? {
                 CtEvent::Key(k) => Event::Key(k),
+                CtEvent::Paste(text) => Event::Paste(text),
                 CtEvent::Mouse(m) => Event::Mouse(m),
                 CtEvent::Resize(w, h) => Event::Resize(w, h),
                 _ => Event::Tick,
