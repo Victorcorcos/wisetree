@@ -399,11 +399,70 @@ pub struct App {
     /// Remaining `(path, force)` items still to delete in the current
     /// bulk run, processed one at a time via `kick_off_delete_worktree`.
     bulk_delete_queue: Vec<(String, bool)>,
+    /// In-flight "Update all" batch (Branches or Pull Requests). `None` when
+    /// idle. Drives sequential per-worktree updates, auto-resolving conflicts
+    /// via opencode and advancing without user interaction.
+    update_all: Option<UpdateAllRun>,
     /// Whether an embedded opencode PTY was alive on the previous frame.
     /// A torn-down PTY can leave the primary-screen terminal scrolled out
     /// of sync with Ratatui's diff model, so we force one full repaint on
     /// the frame after the PTY disappears. See `event_loop_inner`.
     pty_was_active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateAllKind {
+    Branches,
+    PullRequests,
+}
+
+/// State for an in-flight "Update all" batch: a queue of worktrees to update
+/// one at a time, plus running tallies for the final summary toast. Conflict
+/// resolution reuses the single-worktree opencode PTY machinery; the tick
+/// driver (`on_update_all_tick`) auto-commits and advances the queue.
+struct UpdateAllRun {
+    kind: UpdateAllKind,
+    /// Remaining `(worktree_path, branch)` targets for a Branches run.
+    branch_queue: Vec<(String, String)>,
+    /// Remaining PR update requests for a Pull Requests run.
+    pr_queue: Vec<UpdatePullRequestRequest>,
+    total: usize,
+    /// Clean fetch/merge (or push) with no AI needed.
+    updated: usize,
+    /// Merge conflicts resolved by opencode and committed.
+    resolved: usize,
+    /// Already up to date / dirty tree / no base ref — nothing to do.
+    skipped: usize,
+    /// Per-worktree failure messages surfaced as warning toasts at the end.
+    failed: Vec<String>,
+}
+
+impl UpdateAllRun {
+    fn branches(targets: Vec<(String, String)>) -> Self {
+        Self {
+            kind: UpdateAllKind::Branches,
+            total: targets.len(),
+            branch_queue: targets,
+            pr_queue: Vec::new(),
+            updated: 0,
+            resolved: 0,
+            skipped: 0,
+            failed: Vec::new(),
+        }
+    }
+
+    fn pull_requests(targets: Vec<UpdatePullRequestRequest>) -> Self {
+        Self {
+            kind: UpdateAllKind::PullRequests,
+            total: targets.len(),
+            branch_queue: Vec::new(),
+            pr_queue: targets,
+            updated: 0,
+            resolved: 0,
+            skipped: 0,
+            failed: Vec::new(),
+        }
+    }
 }
 
 impl App {
@@ -444,6 +503,7 @@ impl App {
             pending_delete_path: None,
             pending_bulk_delete_paths: Vec::new(),
             bulk_delete_queue: Vec::new(),
+            update_all: None,
             pty_was_active: false,
         }
     }
@@ -541,6 +601,11 @@ impl App {
                         // child-exit detection. `None` keeps the PTY at
                         // its last known size between resize events.
                         screen.tick_pty(None);
+                    }
+                    // Drive the "Update all" batch: auto-commit once opencode
+                    // finishes resolving conflicts, then advance the queue.
+                    if self.update_all.is_some() {
+                        self.on_update_all_tick(&tx);
                     }
                     // Same for the Enrich PR PTY — but here a child exit means
                     // opencode finished drafting `pull_request.md`, so read
@@ -3050,6 +3115,12 @@ impl App {
             DashboardAction::BulkDelete(status, paths) => {
                 self.start_bulk_delete_flow(status, paths, tx);
             }
+            DashboardAction::UpdateAllBranches(targets) => {
+                self.start_update_all_branches(targets, tx);
+            }
+            DashboardAction::UpdateAllPullRequests(targets) => {
+                self.start_update_all_prs(targets, tx);
+            }
             DashboardAction::CopyPath(path) => {
                 let success_message = format!("Copied {} to clipboard.", fold_path(&path));
                 kick_off_clipboard_copy(path, success_message, tx.clone());
@@ -3126,6 +3197,306 @@ impl App {
         self.update_branch = Some(UpdateBranchScreen::new(worktree_path.clone(), branch));
         self.screen = Screen::UpdateBranch;
         kick_off_update_branch(self.current_dashboard_config(), worktree_path, tx.clone());
+    }
+
+    // ---- "Update all" batch (dashboard footer) ----------------------------
+    //
+    // Runs "Update branch (locally)" (Branches) or the full "Update"
+    // (Pull Requests) across every displayed worktree, one at a time. Clean
+    // updates advance immediately; merge conflicts hand off to opencode in
+    // the embedded PTY, and `on_update_all_tick` auto-commits (Branches) or
+    // commits + pushes (Pull Requests) once opencode exits, then advances —
+    // all without user interaction, mirroring the single-worktree flows.
+
+    fn start_update_all_branches(
+        &mut self,
+        targets: Vec<(String, String)>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if targets.is_empty() {
+            self.show_toast(ToastVariant::Info, "No worktrees to update.");
+            return;
+        }
+        self.update_all = Some(UpdateAllRun::branches(targets));
+        self.dispatch_next_update_all_branch(tx);
+    }
+
+    fn start_update_all_prs(
+        &mut self,
+        targets: Vec<UpdatePullRequestRequest>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if targets.is_empty() {
+            self.show_toast(ToastVariant::Info, "No pull requests need updating.");
+            return;
+        }
+        self.update_all = Some(UpdateAllRun::pull_requests(targets));
+        self.dispatch_next_update_all_pr(tx);
+    }
+
+    /// Pop the next Branches target and run its fetch + merge, or finish the
+    /// batch when the queue is empty.
+    fn dispatch_next_update_all_branch(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let next = self.update_all.as_mut().and_then(|run| {
+            if run.branch_queue.is_empty() {
+                return None;
+            }
+            let (path, branch) = run.branch_queue.remove(0);
+            let done = run.total - run.branch_queue.len();
+            Some((path, branch, done, run.total))
+        });
+        let Some((path, branch, done, total)) = next else {
+            self.finish_update_all(tx);
+            return;
+        };
+        let message = format!("Updating {branch} ({done}/{total})...");
+        self.update_branch =
+            Some(UpdateBranchScreen::new(path.clone(), branch).with_message(message));
+        self.screen = Screen::UpdateBranch;
+        kick_off_update_branch(self.current_dashboard_config(), path, tx.clone());
+    }
+
+    /// Pop the next Pull Requests target and run the full update pipeline
+    /// (base ref resolved inside `kick_off_update_pull_request`), or finish
+    /// the batch when the queue is empty. Skips the Confirm step — the batch
+    /// runs unattended.
+    fn dispatch_next_update_all_pr(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let next = self.update_all.as_mut().and_then(|run| {
+            if run.pr_queue.is_empty() {
+                return None;
+            }
+            let request = run.pr_queue.remove(0);
+            let done = run.total - run.pr_queue.len();
+            Some((request, done, run.total))
+        });
+        let Some((request, done, total)) = next else {
+            self.finish_update_all(tx);
+            return;
+        };
+        let number = request.number;
+        let mut screen = UpdatePullRequestScreen::new(request.clone());
+        screen.start_updating();
+        screen.set_phase_message(format!("Updating PR #{number} ({done}/{total})..."));
+        self.update_pr = Some(screen);
+        self.screen = Screen::UpdatePullRequest;
+        kick_off_update_pull_request(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request,
+            tx.clone(),
+        );
+    }
+
+    /// Branches-batch counterpart to `apply_update_branch_finished`: tally the
+    /// outcome and advance, or hand conflicts to opencode (the tick driver
+    /// finishes and advances that worktree).
+    fn apply_update_all_branch_finished(
+        &mut self,
+        result: Result<UpdateBranchOutcome, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let branch = self
+            .update_branch
+            .as_ref()
+            .map(|s| s.branch().to_string())
+            .unwrap_or_default();
+        if let Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
+            opencode_binary,
+            opencode_args,
+            cwd,
+            model,
+            base_ref,
+            ..
+        }) = result
+        {
+            self.start_local_conflict_resolution(
+                branch,
+                opencode_binary,
+                opencode_args,
+                cwd,
+                model,
+                base_ref,
+            );
+            return;
+        }
+        match result {
+            Ok(UpdateBranchOutcome::AlreadyUpToDate { .. })
+            | Ok(UpdateBranchOutcome::FastForwarded { .. })
+            | Ok(UpdateBranchOutcome::Merged { .. }) => self.record_update_all_updated(),
+            Ok(UpdateBranchOutcome::NoBaseRef)
+            | Ok(UpdateBranchOutcome::WorkingTreeDirty { .. }) => self.record_update_all_skipped(),
+            Ok(UpdateBranchOutcome::ConflictsRequireAi { conflicts }) => self
+                .record_update_all_failure(format!(
+                    "{branch}: {} conflict(s) need the `ai.update` model configured.",
+                    conflicts.len()
+                )),
+            Ok(UpdateBranchOutcome::AiUnavailable { conflicts }) => {
+                self.record_update_all_failure(format!(
+                    "{branch}: {} conflict(s) but opencode is not on PATH.",
+                    conflicts.len()
+                ))
+            }
+            Ok(UpdateBranchOutcome::FetchFailed(message)) => {
+                self.record_update_all_failure(format!("{branch}: git fetch failed: {message}"))
+            }
+            Ok(UpdateBranchOutcome::MergeFailed { message, .. }) => {
+                self.record_update_all_failure(format!("{branch}: merge failed: {message}"))
+            }
+            // Handled by the early return above.
+            Ok(UpdateBranchOutcome::ConflictsHandedOffToUi { .. }) => {}
+            Err(message) => self.record_update_all_failure(format!("{branch}: {message}")),
+        }
+        self.dispatch_next_update_all_branch(tx);
+    }
+
+    /// Pull-Requests-batch counterpart: tally the terminal outcome and
+    /// advance. Conflicts never reach here — `apply_update_pr_finished`
+    /// spawns the opencode PTY and returns before delegating to this method.
+    fn apply_update_all_pr_finished(
+        &mut self,
+        result: Result<UpdatePrSuccess, UpdatePrFailure>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        use crate::services::UpdatePullRequestOutcome;
+        match result {
+            Ok(UpdatePrSuccess {
+                number, outcome, ..
+            }) => match outcome {
+                UpdatePullRequestOutcome::AlreadyUpToDate => self.record_update_all_skipped(),
+                UpdatePullRequestOutcome::MergedCleanly | UpdatePullRequestOutcome::Pushed => {
+                    self.record_update_all_updated()
+                }
+                UpdatePullRequestOutcome::MergedWithAiResolution => {
+                    self.record_update_all_resolved()
+                }
+                UpdatePullRequestOutcome::ConflictsRequireAi { conflicts } => self
+                    .record_update_all_failure(format!(
+                        "PR #{number}: {} conflict(s) need the `ai.update` model configured.",
+                        conflicts.len()
+                    )),
+                UpdatePullRequestOutcome::AiUnavailable { conflicts } => self
+                    .record_update_all_failure(format!(
+                        "PR #{number}: {} conflict(s) but opencode is not on PATH.",
+                        conflicts.len()
+                    )),
+                UpdatePullRequestOutcome::FetchFailed(message) => self.record_update_all_failure(
+                    format!("PR #{number}: git fetch failed: {message}"),
+                ),
+                UpdatePullRequestOutcome::MergeFailed(message) => {
+                    self.record_update_all_failure(format!("PR #{number}: merge failed: {message}"))
+                }
+                UpdatePullRequestOutcome::PushFailed(message) => {
+                    self.record_update_all_failure(format!("PR #{number}: push failed: {message}"))
+                }
+                // These come only from explicit Complete/Cancel actions the
+                // batch never issues; treat defensively as failures.
+                UpdatePullRequestOutcome::ConflictsHandedOffToUi { .. }
+                | UpdatePullRequestOutcome::DiscardedAiMerge
+                | UpdatePullRequestOutcome::AbortFailed(_) => self
+                    .record_update_all_failure(format!("PR #{number}: update did not complete.")),
+            },
+            Err(UpdatePrFailure { number, message }) => {
+                self.record_update_all_failure(format!("PR #{number}: {message}"))
+            }
+        }
+        self.dispatch_next_update_all_pr(tx);
+    }
+
+    /// Called every tick while a batch is active. Drives the conflict-
+    /// resolution screen to completion without user input: auto-commit once
+    /// opencode exits, then advance once the commit shell exits. Step
+    /// transitions (`Updating → CommitPush → torn down`) are the one-shot
+    /// guards, since `tick_pty`/`poll_exited` keep reporting `true` every
+    /// tick after a child exits.
+    fn on_update_all_tick(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.update_pr.as_ref() else {
+            return;
+        };
+        let step = screen.step();
+        let opencode_finished = screen.ai_active() && screen.ai_done();
+        let commit_done = screen.commit_push_done();
+        let commit_ok = screen.commit_push_succeeded();
+        let branch = screen.request().branch.clone();
+
+        if opencode_finished && matches!(step, UpdateStep::Updating) {
+            // opencode resolved the conflicts → commit (local for Branches,
+            // commit + push for Pull Requests). The step flips to CommitPush,
+            // which prevents this branch from firing again.
+            self.start_commit_after_ai();
+            return;
+        }
+        if matches!(step, UpdateStep::CommitPush) && commit_done {
+            if commit_ok {
+                self.record_update_all_resolved();
+            } else {
+                self.record_update_all_failure(format!(
+                    "{branch}: committing the resolved merge failed."
+                ));
+            }
+            match self.update_all.as_ref().map(|run| run.kind) {
+                Some(UpdateAllKind::Branches) => self.dispatch_next_update_all_branch(tx),
+                Some(UpdateAllKind::PullRequests) => self.dispatch_next_update_all_pr(tx),
+                None => {}
+            }
+        }
+    }
+
+    fn record_update_all_updated(&mut self) {
+        if let Some(run) = self.update_all.as_mut() {
+            run.updated += 1;
+        }
+    }
+
+    fn record_update_all_resolved(&mut self) {
+        if let Some(run) = self.update_all.as_mut() {
+            run.resolved += 1;
+        }
+    }
+
+    fn record_update_all_skipped(&mut self) {
+        if let Some(run) = self.update_all.as_mut() {
+            run.skipped += 1;
+        }
+    }
+
+    fn record_update_all_failure(&mut self, message: String) {
+        if let Some(run) = self.update_all.as_mut() {
+            run.failed.push(message);
+        }
+    }
+
+    /// Tear down the batch: drop the update screens, return to the dashboard,
+    /// and surface a summary toast plus one warning per failed worktree
+    /// (mirrors the bulk-delete summary).
+    fn finish_update_all(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(run) = self.update_all.take() else {
+            return;
+        };
+        self.update_branch = None;
+        self.update_pr = None;
+        let noun = match run.kind {
+            UpdateAllKind::Branches => "branches",
+            UpdateAllKind::PullRequests => "pull requests",
+        };
+        self.enter_screen(Screen::Dashboard, tx);
+        let variant = if run.failed.is_empty() {
+            ToastVariant::Success
+        } else {
+            ToastVariant::Warning
+        };
+        self.show_toast(
+            variant,
+            format!(
+                "Update all {noun}: {} updated, {} AI-resolved, {} skipped, {} failed.",
+                run.updated,
+                run.resolved,
+                run.skipped,
+                run.failed.len()
+            ),
+        );
+        for failure in run.failed {
+            self.show_toast(ToastVariant::Warning, failure);
+        }
     }
 
     fn start_merge_pr_flow(
@@ -3917,6 +4288,16 @@ impl App {
         result: Result<UpdateBranchOutcome, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
+        // During an "Update all → Branches" batch this event belongs to the
+        // batch driver, which tallies + advances instead of toasting and
+        // returning to the dashboard.
+        if matches!(
+            self.update_all.as_ref().map(|run| run.kind),
+            Some(UpdateAllKind::Branches)
+        ) {
+            self.apply_update_all_branch_finished(result, tx);
+            return;
+        }
         // Capture the branch off the splash before we replace it — the
         // conflict-resolution screen uses it for its synthetic request.
         let branch = self
@@ -4209,6 +4590,16 @@ impl App {
                 screen.spawn_opencode_pty(shell, wrapped_args, cwd.clone(), Vec::new());
                 return;
             }
+        }
+        // During an "Update all → Pull Requests" batch, every non-conflict
+        // outcome (including a failed push) is tallied and advances the queue
+        // rather than toasting or opening the interactive recovery panel.
+        if matches!(
+            self.update_all.as_ref().map(|run| run.kind),
+            Some(UpdateAllKind::PullRequests)
+        ) {
+            self.apply_update_all_pr_finished(result, tx);
+            return;
         }
         // A failed `git push` (clean-merge push, AI commit+push, or the
         // dedicated Push action) does NOT dead-end on a toast. We hand off
@@ -6456,15 +6847,30 @@ fn kick_off_update_pull_request(
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        // `base_ref` must be Some here — `handle_update_pr_key` only
-        // fires Confirmed after the resolver event populated it. Guard
-        // anyway so a race can't blow up the worker.
-        let Some(base_ref) = request.base_ref.clone() else {
-            let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
-                number,
-                message: "Base ref was not resolved before confirmation.".to_string(),
-            })));
-            return;
+        // The single-worktree flow resolves `base_ref` before confirming, so
+        // it is `Some` here. The "Update all" batch skips the Confirm step and
+        // passes `None`, so resolve it inline (falls back to a failure event
+        // if nothing in `BASE_REF_PRIORITY` is reachable).
+        let base_ref = match request.base_ref.clone() {
+            Some(base_ref) => base_ref,
+            None => {
+                match crate::services::dashboard::resolve_base_ref(&PathBuf::from(
+                    &request.worktree_path,
+                ))
+                .await
+                {
+                    Some(base_ref) => base_ref,
+                    None => {
+                        let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
+                            number,
+                            message: "No base ref reachable (looked for upstream/main, \
+                                      upstream/master, origin/main, origin/master)."
+                                .to_string(),
+                        })));
+                        return;
+                    }
+                }
+            }
         };
 
         // Bridge: pipe `UpdateProgress` events from the service into the
@@ -8745,5 +9151,64 @@ mod tests {
             .collect::<String>();
         assert!(dumped.contains("Choose wisely"));
         assert!(dumped.contains("Copied to clipboard"));
+    }
+
+    #[test]
+    fn update_all_branches_finishes_when_queue_drains() {
+        let mut app = App::new(AppMode::Dashboard, false);
+        // A `None` git root makes the return-to-dashboard step skip spawning a
+        // watch, keeping the test free of a Tokio runtime.
+        app.git_root = None;
+        // Final worktree of a two-item Branches run: one already updated, the
+        // queue now empty.
+        app.update_all = Some(UpdateAllRun {
+            kind: UpdateAllKind::Branches,
+            branch_queue: Vec::new(),
+            pr_queue: Vec::new(),
+            total: 2,
+            updated: 1,
+            resolved: 0,
+            skipped: 0,
+            failed: Vec::new(),
+        });
+        app.handle_app_event(
+            AppEvent::UpdateBranchFinished(Ok(UpdateBranchOutcome::AlreadyUpToDate {
+                base_ref: "origin/main".to_string(),
+            })),
+            &app_event_tx(),
+        );
+        assert!(
+            app.update_all.is_none(),
+            "batch should end when queue drains"
+        );
+        assert_eq!(app.screen, Screen::Dashboard);
+        let toast = app.toast.current().expect("summary toast");
+        assert_eq!(toast.variant, ToastVariant::Success);
+    }
+
+    #[test]
+    fn update_all_branches_failure_yields_warning_summary() {
+        let mut app = App::new(AppMode::Dashboard, false);
+        app.git_root = None;
+        app.update_all = Some(UpdateAllRun {
+            kind: UpdateAllKind::Branches,
+            branch_queue: Vec::new(),
+            pr_queue: Vec::new(),
+            total: 1,
+            updated: 0,
+            resolved: 0,
+            skipped: 0,
+            failed: Vec::new(),
+        });
+        app.handle_app_event(
+            AppEvent::UpdateBranchFinished(Ok(UpdateBranchOutcome::FetchFailed(
+                "network down".to_string(),
+            ))),
+            &app_event_tx(),
+        );
+        assert!(app.update_all.is_none());
+        // A recorded failure downgrades the summary to a warning.
+        let toast = app.toast.current().expect("failure toast");
+        assert_eq!(toast.variant, ToastVariant::Warning);
     }
 }

@@ -441,8 +441,10 @@ impl UpdatePullRequestScreen {
         self.pty.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn ai_done(&self) -> bool {
+    /// `true` once opencode has exited (the AI Activity panel is showing the
+    /// Complete/Cancel decision). Read by the "Update all" batch driver to
+    /// know when to auto-commit and advance.
+    pub fn ai_done(&self) -> bool {
         self.ai_done
     }
 
@@ -479,6 +481,19 @@ impl UpdatePullRequestScreen {
     /// Used by `App` to decide whether to give the panel full-screen height.
     pub fn commit_push_running(&self) -> bool {
         matches!(self.step, UpdateStep::CommitPush) && !self.commit_push_done
+    }
+
+    /// `true` once the commit(+push) PTY has exited. Read by the "Update all"
+    /// batch driver to know the conflict resolution for the current worktree
+    /// is finished so it can advance to the next one.
+    pub fn commit_push_done(&self) -> bool {
+        self.commit_push_done
+    }
+
+    /// Whether the finished commit(+push) exited 0. Only meaningful once
+    /// [`Self::commit_push_done`] is `true`.
+    pub fn commit_push_succeeded(&self) -> bool {
+        self.commit_push_succeeded
     }
 
     /// Spawn a shell that runs `git add -A && git commit && git push` inside a
