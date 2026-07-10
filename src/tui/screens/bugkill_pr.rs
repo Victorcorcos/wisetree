@@ -6,9 +6,11 @@
 //! - `DescribeBug` : multiline input page (Enter = submit, Ctrl+J = newline).
 //! - `Working`     : quiet spinner covering every captured / deterministic
 //!   phase (preflight, snapshots, commit, revert, judge).
-//! - `Investigating`: the embedded `opencode run` PTY (AI Activity panel,
-//!   read-only Plan agent) streaming the investigation live; the captured
-//!   transcript is parsed by the App when opencode exits.
+//! - `Investigating`: the embedded opencode **TUI** (AI Activity panel,
+//!   read-only Plan agent) showing the investigation live. The TUI never
+//!   exits on its own, so the App watches opencode's database with an
+//!   `OpencodeTurnWatcher` and advances automatically when the turn
+//!   completes, reading the transcript from that database too.
 //! - `ResumePrompt`: native buttons for the three preflight prompts —
 //!   leftover-attempt recovery, Resume / Start fresh, Overwrite / Cancel.
 //! - `Select`      : the ranked-causes table + detail panel; ↑/↓ skip
@@ -41,15 +43,13 @@ use ratatui::Frame;
 
 use crate::config::schema::AiBugkillConfig;
 use crate::messages::colors;
-use crate::services::bugkill::{
-    render_investigation_md, strip_pty_artifacts, BugHypothesis, EvidenceQuality,
-};
+use crate::services::bugkill::{render_investigation_md, BugHypothesis, EvidenceQuality};
 use crate::services::{BugkillSnapshot, BugkillUnverdicted, ParsedInvestigation};
 use crate::tui::screens::dashboard::BugkillRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
     render_summary_table, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
-    InputPrompt, PtyView, RunTranscriptView, Status, StatusIndicator, SummaryRow,
+    InputPrompt, PtyView, Status, StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -123,6 +123,10 @@ pub enum BugkillAction {
     StartFresh,
     /// Select: attempt the highlighted eligible row.
     AttemptFix,
+    /// Enter during `Investigating`, confirmed: the user says opencode is
+    /// done even though the automatic detection has not fired — the App
+    /// tries to read the transcript from opencode's database anyway.
+    ForceInvestigationDone,
     /// Esc during `Fixing`: kill the PTY and roll the partial edits back.
     AbortFix,
     /// `Fixing` finished (opencode exited or the user confirmed) — scan and
@@ -185,9 +189,6 @@ pub struct BugkillPullRequestScreen {
     ai_done: bool,
     pty: Option<PtyView>,
     pty_focused: bool,
-    /// Monokai-styled view of the live investigation transcript — the
-    /// `Investigating` panel renders this instead of the raw PTY cells.
-    investigate_view: RunTranscriptView,
     finalize_confirm: Option<ConfirmationModal>,
     /// True while the `Investigating` PTY run is the corrective retry —
     /// a second parse failure surfaces the error instead of retrying again.
@@ -236,7 +237,6 @@ impl BugkillPullRequestScreen {
             ai_done: false,
             pty: None,
             pty_focused: false,
-            investigate_view: RunTranscriptView::default(),
             finalize_confirm: None,
             investigate_corrective: false,
             verdict_focus: 0,
@@ -449,7 +449,6 @@ impl BugkillPullRequestScreen {
         self.ai_done = false;
         self.pty = None;
         self.pty_focused = false;
-        self.investigate_view = RunTranscriptView::default();
         self.finalize_confirm = None;
     }
 
@@ -457,19 +456,11 @@ impl BugkillPullRequestScreen {
         self.investigate_corrective
     }
 
-    /// Spawn the captured investigation run inside the embedded PTY.
-    pub fn spawn_investigate_pty(&mut self, binary: PathBuf, args: Vec<String>, cwd: PathBuf) {
-        match PtyView::spawn_captured(&binary, &args, Some(&cwd), &[]) {
-            Ok(pty) => self.pty = Some(pty),
-            Err(err) => self.set_error(format!("Could not spawn opencode in PTY: {err}")),
-        }
-    }
-
-    /// Tear the investigation PTY down and hand back its full transcript
-    /// plus the child's exit code. `None` when no PTY is alive.
-    pub fn take_investigation_transcript(&mut self) -> Option<(String, Option<i32>)> {
-        let pty = self.pty.take()?;
-        Some((pty.captured_output(), pty.exit_code()))
+    /// Completion detection missed on a user-forced continue: tell the user
+    /// the App is still watching for opencode to finish.
+    pub fn note_investigation_waiting(&mut self) {
+        self.phase_message =
+            "opencode has not finished the investigation yet — still watching...".to_string();
     }
 
     /// Show the AI Activity panel; the App then spawns the PTY.
@@ -629,17 +620,13 @@ impl BugkillPullRequestScreen {
 
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
         match self.step {
-            BugkillStep::Fixing => {
+            // Both live steps embed the opencode TUI on its alternate
+            // screen, whose scrollback is unreachable from vt100 — forward
+            // page keys to the child instead.
+            BugkillStep::Fixing | BugkillStep::Investigating => {
                 if let Some(pty) = self.pty.as_mut() {
                     pty.send_input(PTY_PAGE_UP);
                 }
-                true
-            }
-            // `opencode run` prints plainly (no alternate screen); the
-            // Monokai transcript view owns its own scrollback, so scroll it
-            // directly instead of forwarding page keys to the child.
-            BugkillStep::Investigating => {
-                self.investigate_view.scroll_up(lines);
                 true
             }
             BugkillStep::Select => {
@@ -652,14 +639,10 @@ impl BugkillPullRequestScreen {
 
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
         match self.step {
-            BugkillStep::Fixing => {
+            BugkillStep::Fixing | BugkillStep::Investigating => {
                 if let Some(pty) = self.pty.as_mut() {
                     pty.send_input(PTY_PAGE_DOWN);
                 }
-                true
-            }
-            BugkillStep::Investigating => {
-                self.investigate_view.scroll_down(lines);
                 true
             }
             BugkillStep::Select => {
@@ -830,10 +813,30 @@ impl BugkillPullRequestScreen {
         }
     }
 
-    /// The investigation run is non-interactive (read-only Plan agent), so
-    /// the keys only drive the scrollback — plus Esc to abandon it. No
-    /// git state has been touched yet, so cancelling needs no rollback.
+    /// The investigation embeds the interactive opencode TUI, so the key
+    /// handling mirrors `Fixing`: Tab toggles focus, a focused panel
+    /// forwards keys to opencode (e.g. to answer a permission prompt).
+    /// Completion is detected automatically by the App's
+    /// `OpencodeTurnWatcher`; Enter is only the manual "continue now"
+    /// fallback for when that detection cannot see opencode's database.
+    /// Esc abandons the investigation — no git state has been touched yet,
+    /// so cancelling needs no rollback.
     fn handle_investigating_key(&mut self, key: KeyEvent) -> BugkillAction {
+        if self.finalize_confirm.is_some() {
+            return self.handle_investigate_continue_modal_key(key);
+        }
+        if self.pty.is_some() && matches!(key.code, KeyCode::Tab) {
+            self.pty_focused = !self.pty_focused;
+            return BugkillAction::Continue;
+        }
+        if self.pty_focused {
+            if let Some(pty) = self.pty.as_mut() {
+                if let Some(bytes) = key_event_to_pty_bytes(&key) {
+                    pty.send_input(&bytes);
+                }
+            }
+            return BugkillAction::Continue;
+        }
         match key.code {
             KeyCode::PageUp => {
                 self.handle_mouse_scroll_up(10);
@@ -843,16 +846,31 @@ impl BugkillPullRequestScreen {
                 self.handle_mouse_scroll_down(10);
                 BugkillAction::Continue
             }
-            KeyCode::Home => {
-                self.investigate_view.scroll_to_top();
-                BugkillAction::Continue
-            }
-            KeyCode::End => {
-                self.investigate_view.scroll_to_bottom();
+            // Enter on outer focus → the manual continue-now fallback.
+            KeyCode::Enter => {
+                self.finalize_confirm = Some(build_investigate_continue_modal());
                 BugkillAction::Continue
             }
             KeyCode::Esc => BugkillAction::Cancelled,
             _ => BugkillAction::Continue,
+        }
+    }
+
+    fn handle_investigate_continue_modal_key(&mut self, key: KeyEvent) -> BugkillAction {
+        let modal = self
+            .finalize_confirm
+            .as_mut()
+            .expect("handle_investigate_continue_modal_key called with no modal open");
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => BugkillAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.finalize_confirm = None;
+                BugkillAction::ForceInvestigationDone
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.finalize_confirm = None;
+                BugkillAction::Continue
+            }
         }
     }
 
@@ -1495,9 +1513,9 @@ impl BugkillPullRequestScreen {
         }
     }
 
-    /// Same chrome as `render_fixing` (spinner + AI Activity panel), but
-    /// the shortcuts line only offers scrolling and Esc — the run is
-    /// non-interactive and finishes on its own.
+    /// Same chrome as `render_fixing` (spinner + AI Activity panel). The
+    /// shortcuts differ: completion is detected automatically, so Enter is
+    /// only the continue-now fallback and Esc abandons the investigation.
     fn render_investigating(&mut self, frame: &mut Frame, area: Rect) {
         if area.height < 5 {
             StatusIndicator::new(Status::Loading, self.phase_message.clone())
@@ -1520,16 +1538,22 @@ impl BugkillPullRequestScreen {
         self.render_ai_activity(frame, chunks[2]);
         let separator = Span::styled("  ·  ".to_string(), muted_dim());
         let spans: Vec<Span<'static>> = vec![
+            Span::styled("Tab ".to_string(), Style::default().fg(colors::BRAND)),
+            Span::styled("Focus opencode".to_string(), muted_dim()),
+            separator.clone(),
             Span::styled("PgUp/PgDn ".to_string(), Style::default().fg(colors::BRAND)),
             Span::styled("Scroll".to_string(), muted_dim()),
             separator.clone(),
-            Span::styled("Home/End ".to_string(), Style::default().fg(colors::BRAND)),
-            Span::styled("Top / Live tail".to_string(), muted_dim()),
+            Span::styled("Enter ".to_string(), Style::default().fg(colors::BRAND)),
+            Span::styled("Continue now".to_string(), muted_dim()),
             separator,
             Span::styled("Esc ".to_string(), Style::default().fg(colors::ERROR)),
             Span::styled("Cancel investigation".to_string(), muted_dim()),
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)), chunks[3]);
+        if let Some(modal) = self.finalize_confirm.as_ref() {
+            modal.render(frame, area);
+        }
     }
 
     fn render_fixing(&mut self, frame: &mut Frame, area: Rect) {
@@ -1570,9 +1594,9 @@ impl BugkillPullRequestScreen {
                     .add_modifier(Modifier::BOLD),
             ),
         ];
-        // The focus suffix only applies to the interactive fix PTY; the
-        // investigation run takes no input, so there is nothing to focus.
-        if pty_alive && self.step == BugkillStep::Fixing {
+        // Both live steps embed the interactive opencode TUI, so the focus
+        // suffix applies whenever a PTY is alive.
+        if pty_alive {
             title_spans.push(Span::styled(" · ".to_string(), muted_dim()));
             title_spans.push(Span::styled(
                 if focused_inner {
@@ -1606,18 +1630,7 @@ impl BugkillPullRequestScreen {
         if inner.height == 0 || inner.width == 0 {
             return;
         }
-        // The investigation is a non-interactive `opencode run`, whose
-        // output is nearly unstyled — render its captured transcript through
-        // the Monokai view (matching opencode's own TUI) instead of blitting
-        // the raw PTY cells. The interactive fix PTY keeps the raw blit:
-        // there opencode's full TUI does its own theming.
-        if self.step == BugkillStep::Investigating {
-            if let Some(pty) = self.pty.as_ref() {
-                let transcript = strip_pty_artifacts(&pty.captured_output());
-                self.investigate_view.render(frame, inner, &transcript);
-                return;
-            }
-        } else if let Some(pty) = self.pty.as_mut() {
+        if let Some(pty) = self.pty.as_mut() {
             pty.resize(inner.height, inner.width);
             pty.render(frame, inner);
             let scrollback_len = pty.scrollback_len();
@@ -2026,6 +2039,22 @@ fn build_finalize_modal() -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Confirm)
 }
 
+/// The continue-now fallback behind Enter on `Investigating`. Completion is
+/// normally detected automatically, so defaulting to "Keep waiting" protects
+/// against an accidental Enter cutting a running investigation short.
+fn build_investigate_continue_modal() -> ConfirmationModal {
+    ConfirmationModal::new()
+        .with_title("Continue now?")
+        .with_subtitle(
+            "wisetree has not detected the investigation as finished yet. \
+             Use opencode's reply as it is?",
+        )
+        .with_confirm_text("Continue")
+        .with_cancel_text("Keep waiting")
+        .with_color_value(colors::WARNING)
+        .with_selected(ConfirmationChoice::Cancel)
+}
+
 fn build_steps_lines() -> Vec<Line<'static>> {
     let header = Style::default()
         .fg(colors::INFO)
@@ -2402,11 +2431,9 @@ mod tests {
             "{dump}"
         );
         assert!(dump.contains("Cancel investigation"), "{dump}");
-        // No fix-step affordances: nothing to finalize, nothing to focus.
+        assert!(dump.contains("Continue now"), "{dump}");
+        // No fix-step affordances leak in.
         assert!(!dump.contains("Fix applied"), "{dump}");
-        assert!(!dump.contains("outer focused"), "{dump}");
-        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Continue);
-        assert!(s.finalize_confirm.is_none());
         assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Cancelled);
     }
 
@@ -2423,10 +2450,38 @@ mod tests {
     }
 
     #[test]
-    fn investigation_transcript_is_none_without_a_pty() {
+    fn investigating_enter_opens_the_continue_now_modal() {
         let mut s = screen();
         s.start_investigating(false);
-        assert!(s.take_investigation_transcript().is_none());
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Continue);
+        assert!(s.finalize_confirm.is_some());
+        // Default is "Keep waiting" — Enter dismisses without forcing, so an
+        // accidental double-Enter can't cut a running investigation short.
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Continue);
+        assert!(s.finalize_confirm.is_none());
+        // Re-open and pick "Continue" → the force action for the App.
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Continue);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('y'))),
+            BugkillAction::Continue
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            BugkillAction::ForceInvestigationDone
+        );
+        assert!(s.finalize_confirm.is_none());
+    }
+
+    #[test]
+    fn investigating_waiting_note_replaces_the_phase_message() {
+        let mut s = screen();
+        s.start_investigating(false);
+        s.note_investigation_waiting();
+        let dump = render_dump(&mut s, 110, 30);
+        assert!(
+            dump.contains("opencode has not finished the investigation yet"),
+            "{dump}"
+        );
     }
 
     // ── Fixing / commit ─────────────────────────────────────────────────

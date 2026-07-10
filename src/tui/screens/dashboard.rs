@@ -207,6 +207,32 @@ impl BulkDeleteStatus {
     }
 }
 
+/// The two "Update all" buttons rendered to the right of the bulk-delete
+/// row. `Branches` runs "Update branch (locally)" on every displayed
+/// worktree; `PullRequests` runs the full "Update" (merge base + push) on
+/// every displayed worktree with an Update-eligible PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateAllTarget {
+    Branches,
+    PullRequests,
+}
+
+impl UpdateAllTarget {
+    fn button_label(self) -> &'static str {
+        match self {
+            UpdateAllTarget::Branches => "Branches",
+            UpdateAllTarget::PullRequests => "Pull Requests",
+        }
+    }
+
+    fn color(self) -> ratatui::style::Color {
+        match self {
+            UpdateAllTarget::Branches => colors::TEAL,
+            UpdateAllTarget::PullRequests => colors::GREEN,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardAction {
     Continue,
@@ -219,6 +245,12 @@ pub enum DashboardAction {
     },
     JumpToDelete(String),
     BulkDelete(BulkDeleteStatus, Vec<String>),
+    /// "Update all → Branches": run "Update branch (locally)" on each
+    /// displayed worktree. Carries `(worktree_path, branch)` per target.
+    UpdateAllBranches(Vec<(String, String)>),
+    /// "Update all → Pull Requests": run the full "Update" (merge base +
+    /// push) on each displayed worktree with an Update-eligible PR.
+    UpdateAllPullRequests(Vec<UpdatePullRequestRequest>),
     CopyPath(String),
     OpenPullRequest(String),
     MergePullRequest(Box<MergePullRequestRequest>),
@@ -376,6 +408,10 @@ pub struct DashboardScreen {
     /// Captured during render so mouse clicks on the footer buttons can
     /// be hit-tested by the app.
     bulk_button_rects: Vec<(BulkDeleteStatus, Rect)>,
+    /// Captured during render so mouse clicks on the "Update all" buttons
+    /// can be hit-tested. These buttons are click-only (not part of the
+    /// Tab/arrow `bulk_focus` navigation).
+    update_all_button_rects: Vec<(UpdateAllTarget, Rect)>,
     /// Captured during render so mouse clicks on table rows can select
     /// the clicked row and open its action menu (same as pressing Enter).
     row_rects: Vec<(usize, Rect)>,
@@ -420,6 +456,7 @@ impl DashboardScreen {
             bulk_focus: None,
             last_bulk_focus: BulkDeleteStatus::ALL[0],
             bulk_button_rects: Vec::new(),
+            update_all_button_rects: Vec::new(),
             row_rects: Vec::new(),
             close_pr_modal: None,
             tick: 0,
@@ -610,6 +647,7 @@ impl DashboardScreen {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.bulk_button_rects.clear();
+        self.update_all_button_rects.clear();
         self.row_rects.clear();
         self.pr_button_rects.clear();
 
@@ -829,7 +867,54 @@ impl DashboardScreen {
                 return self.trigger_bulk_delete(status);
             }
         }
+        for (target, rect) in self.update_all_button_rects.clone() {
+            if position.x >= rect.left()
+                && position.x < rect.right()
+                && position.y >= rect.top()
+                && position.y < rect.bottom()
+            {
+                return self.trigger_update_all(target);
+            }
+        }
         DashboardAction::Continue
+    }
+
+    /// Build the batch action for an "Update all" button. The target set is
+    /// the currently displayed (filtered) rows: every worktree for
+    /// `Branches`, only Update-eligible PRs for `PullRequests`. An empty set
+    /// is reported via a toast by the app layer, so this stays
+    /// side-effect-free.
+    fn trigger_update_all(&self, target: UpdateAllTarget) -> DashboardAction {
+        match target {
+            UpdateAllTarget::Branches => {
+                DashboardAction::UpdateAllBranches(self.update_all_branch_targets())
+            }
+            UpdateAllTarget::PullRequests => {
+                DashboardAction::UpdateAllPullRequests(self.update_all_pr_targets())
+            }
+        }
+    }
+
+    /// `(worktree_path, branch)` for every displayed worktree — the mother
+    /// checkout included, since "Update branch (locally)" is a harmless
+    /// fast-forward there.
+    fn update_all_branch_targets(&self) -> Vec<(String, String)> {
+        self.filtered_indices()
+            .into_iter()
+            .filter_map(|index| self.rows.get(index))
+            .map(|row| (row.worktree.path.clone(), row.worktree.branch.clone()))
+            .collect()
+    }
+
+    /// One `UpdatePullRequestRequest` per displayed worktree whose PR is
+    /// Update-eligible (active PR that is behind its base or GitHub reports
+    /// as conflicting) — the same gate the single "Update" button uses.
+    fn update_all_pr_targets(&self) -> Vec<UpdatePullRequestRequest> {
+        self.filtered_indices()
+            .into_iter()
+            .filter_map(|index| self.rows.get(index))
+            .filter_map(build_update_request)
+            .collect()
     }
 
     /// Build the searchable "General Commands" list — every action that
@@ -2031,6 +2116,97 @@ impl DashboardScreen {
                     );
             frame.render_widget(button, rect);
             self.bulk_button_rects.push((*status, rect));
+        }
+
+        // Right-aligned "Update all: | Branches | | Pull Requests |" cluster,
+        // rendered only when it fits in the width left over after the
+        // delete buttons (same graceful-degradation policy as above).
+        self.render_update_all_buttons(frame, area, used_width, gap, muted_dim);
+    }
+
+    /// Render the "Update all" label + the teal Branches / green Pull
+    /// Requests buttons, right-aligned within `area`. `delete_width` is how
+    /// much of `area` the delete cluster already consumed; the update-all
+    /// cluster is omitted entirely if it would collide with it. These
+    /// buttons are click-only, so there is no focus highlight.
+    fn render_update_all_buttons(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        delete_width: u16,
+        gap: u16,
+        muted_dim: Style,
+    ) {
+        let prefix = "Update all:";
+        let prefix_width = prefix.chars().count() as u16 + 1; // trailing space
+        let branches_width = UpdateAllTarget::Branches.button_label().chars().count() as u16 + 4;
+        let pr_width = UpdateAllTarget::PullRequests.button_label().chars().count() as u16 + 4;
+        let cluster_width = prefix_width + branches_width + gap + pr_width;
+
+        // Need a separating gap between the delete cluster and this one, plus
+        // the cluster itself, all inside the row.
+        let separator: u16 = 4;
+        if delete_width
+            .saturating_add(separator)
+            .saturating_add(cluster_width)
+            > area.width
+        {
+            return;
+        }
+
+        let cluster_area = Rect {
+            x: area.x + area.width - cluster_width,
+            y: area.y,
+            width: cluster_width,
+            height: area.height,
+        };
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(prefix_width),
+                Constraint::Length(branches_width),
+                Constraint::Length(gap),
+                Constraint::Length(pr_width),
+            ])
+            .split(cluster_area);
+
+        // Label on the middle row so it aligns with the button contents.
+        if cols[0].width > 0 {
+            let label_row = Rect {
+                x: cols[0].x,
+                y: cols[0].y + cols[0].height / 2,
+                width: cols[0].width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(prefix, muted_dim))),
+                label_row,
+            );
+        }
+
+        for (target, rect) in [
+            (UpdateAllTarget::Branches, cols[1]),
+            (UpdateAllTarget::PullRequests, cols[3]),
+        ] {
+            if rect.width == 0 {
+                continue;
+            }
+            let button = Paragraph::new(Line::from(Span::styled(
+                target.button_label(),
+                Style::default()
+                    .fg(target.color())
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Plain)
+                    .border_style(Style::default().fg(target.color()))
+                    .padding(Padding::horizontal(1)),
+            );
+            frame.render_widget(button, rect);
+            self.update_all_button_rects.push((target, rect));
         }
     }
 
@@ -3527,5 +3703,170 @@ mod tests {
         let action = screen.handle_key(key_event(KeyCode::Char('x')));
         assert!(matches!(action, DashboardAction::Continue));
         assert!(!screen.pr_commands.is_empty());
+    }
+
+    fn named_row(
+        path: &str,
+        branch: &str,
+        is_main: bool,
+        pr: Option<PullRequest>,
+        status: Option<BranchStatus>,
+    ) -> DashboardRow {
+        DashboardRow {
+            worktree: GitWorktree {
+                path: path.to_string(),
+                branch: branch.to_string(),
+                commit: "abc123".to_string(),
+                is_main,
+                is_clean: true,
+                branch_status: status,
+            },
+            last_commit: None,
+            pull_request: pr,
+            ai_status: None,
+            error: None,
+        }
+    }
+
+    fn screen_with_rows(rows: Vec<DashboardRow>) -> DashboardScreen {
+        let mut screen = DashboardScreen::new(true, true, true, Vec::new(), Vec::new(), true);
+        screen.set_rows(rows);
+        screen
+    }
+
+    #[test]
+    fn update_all_branch_targets_includes_every_displayed_worktree() {
+        // Branches targets every displayed row, mother included.
+        let screen = screen_with_rows(vec![
+            named_row("/tmp/repo", "main", true, None, Some(branch_status(0, 0))),
+            named_row(
+                "/tmp/repo-a",
+                "feature-a",
+                false,
+                Some(open_pr()),
+                Some(branch_status(1, 2)),
+            ),
+            named_row("/tmp/repo-b", "feature-b", false, None, None),
+        ]);
+        assert_eq!(
+            screen.update_all_branch_targets(),
+            vec![
+                ("/tmp/repo".to_string(), "main".to_string()),
+                ("/tmp/repo-a".to_string(), "feature-a".to_string()),
+                ("/tmp/repo-b".to_string(), "feature-b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_all_pr_targets_only_update_eligible_prs() {
+        // PRs targets only rows where the single "Update" command is offered:
+        // an active PR that is behind (or conflicting). Ahead-only PRs, PR-less
+        // rows, and the mother are all skipped.
+        let screen = screen_with_rows(vec![
+            named_row("/tmp/repo", "main", true, None, Some(branch_status(0, 0))),
+            named_row(
+                "/tmp/repo-a",
+                "feature-a",
+                false,
+                Some(open_pr()),
+                Some(branch_status(1, 2)),
+            ),
+            named_row(
+                "/tmp/repo-b",
+                "feature-b",
+                false,
+                Some(open_pr()),
+                Some(branch_status(3, 0)),
+            ),
+            named_row(
+                "/tmp/repo-c",
+                "feature-c",
+                false,
+                None,
+                Some(branch_status(0, 5)),
+            ),
+        ]);
+        let branches: Vec<String> = screen
+            .update_all_pr_targets()
+            .into_iter()
+            .map(|request| request.branch)
+            .collect();
+        assert_eq!(branches, vec!["feature-a".to_string()]);
+    }
+
+    #[test]
+    fn update_all_targets_respect_the_search_filter() {
+        let mut screen = screen_with_rows(vec![
+            named_row("/tmp/repo-a", "feature-a", false, None, None),
+            named_row("/tmp/repo-b", "feature-b", false, None, None),
+        ]);
+        // Only the row whose branch matches the query is "displayed".
+        screen.query = "feature-a".to_string();
+        assert_eq!(
+            screen.update_all_branch_targets(),
+            vec![("/tmp/repo-a".to_string(), "feature-a".to_string())]
+        );
+    }
+
+    #[test]
+    fn trigger_update_all_builds_matching_actions() {
+        let screen = screen_with_rows(vec![named_row(
+            "/tmp/repo-a",
+            "feature-a",
+            false,
+            Some(open_pr()),
+            Some(branch_status(1, 2)),
+        )]);
+        match screen.trigger_update_all(UpdateAllTarget::Branches) {
+            DashboardAction::UpdateAllBranches(targets) => assert_eq!(targets.len(), 1),
+            other => panic!("expected UpdateAllBranches, got {other:?}"),
+        }
+        match screen.trigger_update_all(UpdateAllTarget::PullRequests) {
+            DashboardAction::UpdateAllPullRequests(targets) => assert_eq!(targets.len(), 1),
+            other => panic!("expected UpdateAllPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_all_target_colors_and_labels() {
+        assert_eq!(UpdateAllTarget::Branches.button_label(), "Branches");
+        assert_eq!(
+            UpdateAllTarget::PullRequests.button_label(),
+            "Pull Requests"
+        );
+        assert_eq!(UpdateAllTarget::Branches.color(), colors::TEAL);
+        assert_eq!(UpdateAllTarget::PullRequests.color(), colors::GREEN);
+    }
+
+    #[test]
+    fn footer_renders_update_all_cluster_and_captures_rects() {
+        let mut screen = screen_with_rows(vec![named_row(
+            "/tmp/repo-a",
+            "feature-a",
+            false,
+            Some(open_pr()),
+            Some(branch_status(1, 2)),
+        )]);
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                screen.render(frame, area);
+            })
+            .unwrap();
+        let dumped: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(dumped.contains("Update all"), "label missing: {dumped}");
+        assert!(dumped.contains("Branches"));
+        assert!(dumped.contains("Pull Requests"));
+        // Both buttons captured a hit-test rect for mouse clicks.
+        assert_eq!(screen.update_all_button_rects.len(), 2);
     }
 }

@@ -20,6 +20,7 @@ const UPDATE_BRANCH_LOADING_MESSAGE: &str = "Updating branch...";
 pub struct UpdateBranchScreen {
     worktree_path: String,
     branch: String,
+    message: String,
     pub tick: usize,
 }
 
@@ -28,8 +29,16 @@ impl UpdateBranchScreen {
         Self {
             worktree_path,
             branch,
+            message: UPDATE_BRANCH_LOADING_MESSAGE.to_string(),
             tick: 0,
         }
+    }
+
+    /// Override the spinner label — used by the "Update all" batch to show
+    /// per-worktree progress (e.g. `Updating my-feature (3/10)...`).
+    pub fn with_message(mut self, message: String) -> Self {
+        self.message = message;
+        self
     }
 
     pub fn worktree_path(&self) -> &str {
@@ -55,7 +64,7 @@ impl UpdateBranchScreen {
     pub fn handle_key(&mut self, _key: KeyEvent) {}
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        StatusIndicator::new(Status::Loading, UPDATE_BRANCH_LOADING_MESSAGE)
+        StatusIndicator::new(Status::Loading, self.message.as_str())
             .with_tick(self.tick)
             .render(frame, area);
     }

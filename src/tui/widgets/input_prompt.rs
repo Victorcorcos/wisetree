@@ -158,7 +158,9 @@ impl InputPrompt {
         // Drop control characters (a pasted `\r`, an escape byte, …) so they
         // never enter the value — they would corrupt the terminal when the
         // field re-renders and would be passed on verbatim to git/gh commands.
-        if c.is_control() {
+        // `\n` is exempted: multiline mode inserts it deliberately (Ctrl+J,
+        // Alt+Enter, paste) and it renders/round-trips safely.
+        if c.is_control() && c != '\n' {
             return;
         }
         let byte = self.byte_offset(self.cursor);

@@ -8,10 +8,14 @@
 //!   `UpdateAction::Confirmed`.
 //! - `Updating` : spinner with a phase-specific label on top, plus a
 //!   bordered "AI Activity" panel that streams the opencode subprocess's
-//!   stdout/stderr lines as they arrive (auto-scrolled to the latest).
-//!   Once opencode exits the panel grows a `[ Complete ] [ Cancel ]`
-//!   button row at the bottom; **Complete** commits + pushes the AI
-//!   resolution, **Cancel** aborts the merge.
+//!   stdout/stderr lines as they arrive (auto-scrolled to the latest). The
+//!   conflict-resolution TUI never exits on its own, so the App watches
+//!   opencode's database with an `OpencodeTurnWatcher` and marks the AI
+//!   done automatically when the turn completes (a PTY exit or the manual
+//!   "Merge finalized?" confirm both do the same as a fallback). Once the
+//!   AI is done the panel grows a `[ Complete ] [ Cancel ]` button row at
+//!   the bottom; **Complete** commits + pushes the AI resolution,
+//!   **Cancel** aborts the merge.
 //!
 //! Async work is owned by `App`; this screen is purely a presentation
 //! state machine.
@@ -441,8 +445,10 @@ impl UpdatePullRequestScreen {
         self.pty.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn ai_done(&self) -> bool {
+    /// `true` once opencode has exited (the AI Activity panel is showing the
+    /// Complete/Cancel decision). Read by the "Update all" batch driver to
+    /// know when to auto-commit and advance.
+    pub fn ai_done(&self) -> bool {
         self.ai_done
     }
 
@@ -479,6 +485,19 @@ impl UpdatePullRequestScreen {
     /// Used by `App` to decide whether to give the panel full-screen height.
     pub fn commit_push_running(&self) -> bool {
         matches!(self.step, UpdateStep::CommitPush) && !self.commit_push_done
+    }
+
+    /// `true` once the commit(+push) PTY has exited. Read by the "Update all"
+    /// batch driver to know the conflict resolution for the current worktree
+    /// is finished so it can advance to the next one.
+    pub fn commit_push_done(&self) -> bool {
+        self.commit_push_done
+    }
+
+    /// Whether the finished commit(+push) exited 0. Only meaningful once
+    /// [`Self::commit_push_done`] is `true`.
+    pub fn commit_push_succeeded(&self) -> bool {
+        self.commit_push_succeeded
     }
 
     /// Spawn a shell that runs `git add -A && git commit && git push` inside a
@@ -842,12 +861,14 @@ impl UpdatePullRequestScreen {
                 if self.handle_outer_scroll_key(&key) {
                     return UpdateAction::Continue;
                 }
-                // Outer focus + AI streaming + Enter is the documented
-                // "I'm done with opencode, let me review and decide" cue.
-                // We don't transition straight to the review buttons —
-                // an accidental Enter while opencode is mid-edit would
-                // be destructive — so we surface a confirmation modal
-                // first. The PTY keeps running underneath.
+                // Outer focus + AI streaming + Enter is the manual
+                // "I'm done with opencode, let me review and decide" cue —
+                // a fallback for when the App's `OpencodeTurnWatcher` hasn't
+                // detected completion yet (it normally marks the AI done
+                // automatically). We don't transition straight to the
+                // review buttons — an accidental Enter while opencode is
+                // mid-edit would be destructive — so we surface a
+                // confirmation modal first. The PTY keeps running underneath.
                 if self.ai_active && matches!(key.code, KeyCode::Enter) {
                     self.finalize_confirm = Some(build_finalize_modal());
                     return UpdateAction::Continue;
