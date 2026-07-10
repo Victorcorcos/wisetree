@@ -5,6 +5,7 @@ pub mod app_state;
 pub mod bugkill;
 pub mod dashboard;
 pub mod opencode_models;
+pub mod opencode_turn;
 pub mod presets;
 pub mod shell_integration;
 pub mod update;
@@ -15,8 +16,8 @@ pub use ai_status::{
 };
 pub use app_state::AppStateService;
 pub use bugkill::{
-    compute_attempt_changes, normalize_hypotheses, parse_hypotheses, strip_pty_artifacts,
-    transcript_tail, AttemptChanges, BugHypothesis, BugkillVerdict, EvidenceQuality, JudgeResult,
+    compute_attempt_changes, normalize_hypotheses, parse_hypotheses, transcript_tail,
+    AttemptChanges, BugHypothesis, BugkillVerdict, EvidenceQuality, JudgeResult,
     ParsedInvestigation,
 };
 pub use dashboard::{
@@ -32,6 +33,7 @@ pub use dashboard::{
 pub use opencode_models::{
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,
 };
+pub use opencode_turn::{OpencodeTurn, OpencodeTurnWatcher};
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,

@@ -41,8 +41,8 @@ use crate::services::{
     DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
     EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
     FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult, OpencodeModel,
-    PrState, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
-    UpdateSource,
+    OpencodeTurn, OpencodeTurnWatcher, PrState, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -380,6 +380,10 @@ pub struct App {
     enrich_pr: Option<EnrichPullRequestScreen>,
     fix_pr: Option<FixPullRequestScreen>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
+    /// Watches opencode's database for the embedded investigation TUI's
+    /// turn to complete — the TUI never exits on its own, so this is what
+    /// advances the `Investigating` step. `Some` only while investigating.
+    bugkill_investigation: Option<OpencodeTurnWatcher>,
     update_branch: Option<UpdateBranchScreen>,
     /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
     /// top of the Settings screen — when active the Settings state is
@@ -493,6 +497,7 @@ impl App {
             enrich_pr: None,
             fix_pr: None,
             bugkill_pr: None,
+            bugkill_investigation: None,
             update_branch: None,
             ai_model_picker: None,
             shell_integration_status: None,
@@ -628,18 +633,30 @@ impl App {
                     if fix_exited {
                         self.on_fix_apply_done(&tx);
                     }
-                    // Same for the Bugkill PTYs — an Investigating exit
-                    // means the transcript is ready to parse; a Fixing exit
-                    // means the attempt is over, so scan + commit it now.
+                    // Same for the Bugkill PTYs. The Investigating TUI never
+                    // exits on its own, so completion comes from the turn
+                    // watcher polling opencode's database; an early PTY exit
+                    // there means the user quit opencode (or it crashed). A
+                    // Fixing exit means the attempt is over, so scan +
+                    // commit it now.
                     let bugkill_exited = self
                         .bugkill_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step()));
                     match bugkill_exited {
                         Some((true, screens::bugkill_pr::BugkillStep::Investigating)) => {
-                            self.on_bugkill_investigated(&tx)
+                            self.on_bugkill_investigation_pty_exited(&tx)
                         }
                         Some((true, _)) => self.on_bugkill_fix_done(&tx),
+                        Some((false, screens::bugkill_pr::BugkillStep::Investigating)) => {
+                            if let Some(turn) = self
+                                .bugkill_investigation
+                                .as_mut()
+                                .and_then(OpencodeTurnWatcher::poll)
+                            {
+                                self.on_bugkill_turn(turn, &tx);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -2221,6 +2238,7 @@ impl App {
             BugkillAction::Continue => {}
             BugkillAction::Cancelled => {
                 self.bugkill_pr = None;
+                self.bugkill_investigation = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
             BugkillAction::Confirmed => {
@@ -2271,6 +2289,7 @@ impl App {
                 }
             }
             BugkillAction::StartFresh => self.start_bugkill_investigation(false, tx),
+            BugkillAction::ForceInvestigationDone => self.force_bugkill_investigation_done(tx),
             BugkillAction::AttemptFix => self.start_bugkill_attempt(None, tx),
             BugkillAction::AbortFix => {
                 let Some(screen) = self.bugkill_pr.as_mut() else {
@@ -2338,7 +2357,7 @@ impl App {
         }
     }
 
-    /// Kick off one live investigation run: build the `opencode run` spawn
+    /// Kick off one live investigation: build the opencode TUI spawn
     /// params, then show it in the embedded PTY. `corrective` is only set
     /// on the automatic retry after an unparseable transcript.
     fn start_bugkill_investigation(
@@ -2346,6 +2365,7 @@ impl App {
         corrective: bool,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
+        self.bugkill_investigation = None;
         let Some(screen) = self.bugkill_pr.as_mut() else {
             return;
         };
@@ -2575,8 +2595,10 @@ impl App {
     }
 
     /// Spawn params ready → show the AI Activity panel and launch the
-    /// captured `opencode run` inside the embedded PTY, so the user watches
-    /// the investigation instead of a bare spinner.
+    /// opencode TUI inside the embedded PTY, so the user watches the
+    /// investigation exactly as opencode itself renders it. The watcher is
+    /// created **before** the spawn so its start timestamp precedes the
+    /// session row the TUI creates.
     fn apply_bugkill_investigate_ready(
         &mut self,
         corrective: bool,
@@ -2587,37 +2609,51 @@ impl App {
         };
         match result {
             Ok(handoff) => {
+                self.bugkill_investigation = Some(OpencodeTurnWatcher::new(&handoff.cwd));
                 screen.start_investigating(corrective);
-                screen.spawn_investigate_pty(
+                screen.spawn_opencode_pty(
                     handoff.opencode_binary,
                     handoff.opencode_args,
                     handoff.cwd,
+                    Vec::new(),
                 );
             }
             Err(message) => screen.set_error(message),
         }
     }
 
-    /// The investigation `opencode run` exited: parse its captured
-    /// transcript into ranked hypotheses. An unparseable transcript earns
-    /// one corrective retry (stricter prompt); a second failure — or a
-    /// non-zero opencode exit — surfaces the transcript tail.
-    fn on_bugkill_investigated(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+    /// The turn watcher fired while `Investigating` — advance on Finished
+    /// or Failed, keep waiting on Working.
+    fn on_bugkill_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match turn {
+            OpencodeTurn::Working => {}
+            OpencodeTurn::Finished { transcript } => {
+                self.finish_bugkill_investigation(transcript, tx)
+            }
+            OpencodeTurn::Failed { message } => {
+                self.bugkill_investigation = None;
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(format!("opencode reported an error: {message}"));
+                }
+            }
+        }
+    }
+
+    /// The investigation transcript is in: tear the TUI down and parse the
+    /// ranked hypotheses. An unparseable transcript earns one corrective
+    /// retry (stricter prompt); a second failure surfaces the tail.
+    fn finish_bugkill_investigation(
+        &mut self,
+        transcript: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.bugkill_investigation = None;
         let Some(screen) = self.bugkill_pr.as_mut() else {
             return;
         };
         let corrective = screen.investigate_corrective();
-        let Some((raw, exit_code)) = screen.take_investigation_transcript() else {
-            return;
-        };
-        let transcript = crate::services::strip_pty_artifacts(&raw);
-        if let Some(code) = exit_code.filter(|code| *code != 0) {
-            screen.set_error(format!(
-                "opencode exited with code {code}. Raw tail:\n{}",
-                crate::services::transcript_tail(&transcript)
-            ));
-            return;
-        }
+        screen.kill_pty();
         match crate::services::parse_hypotheses(&transcript) {
             Some(hypotheses) => {
                 screen.set_hypotheses(crate::services::normalize_hypotheses(hypotheses));
@@ -2631,6 +2667,51 @@ impl App {
                 "could not parse ranked hypotheses from the investigation output. Raw tail:\n{}",
                 crate::services::transcript_tail(&transcript)
             )),
+        }
+    }
+
+    /// The investigation TUI exited before the watcher saw a completed turn
+    /// (the user quit opencode, or it crashed). Check the database once —
+    /// the turn may have completed right before the exit — otherwise error.
+    fn on_bugkill_investigation_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = self
+            .bugkill_investigation
+            .as_mut()
+            .map(OpencodeTurnWatcher::check_now)
+            .unwrap_or(OpencodeTurn::Working);
+        match turn {
+            OpencodeTurn::Working => {
+                self.bugkill_investigation = None;
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(
+                        "opencode exited before the investigation finished.".to_string(),
+                    );
+                }
+            }
+            turn => self.on_bugkill_turn(turn, tx),
+        }
+    }
+
+    /// Enter → "Continue now" confirmed: the user says opencode is done but
+    /// the automatic detection has not fired. Re-check once; if the turn
+    /// still looks unfinished, try whatever transcript exists — if even the
+    /// contract parser accepts it the detection was simply blind (e.g. an
+    /// unreadable database), otherwise keep waiting and say so.
+    fn force_bugkill_investigation_done(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(watcher) = self.bugkill_investigation.as_mut() else {
+            return;
+        };
+        match watcher.check_now() {
+            OpencodeTurn::Working => {
+                let transcript = watcher.transcript_now().unwrap_or_default();
+                if crate::services::parse_hypotheses(&transcript).is_some() {
+                    self.finish_bugkill_investigation(transcript, tx);
+                } else if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.note_investigation_waiting();
+                }
+            }
+            turn => self.on_bugkill_turn(turn, tx),
         }
     }
 

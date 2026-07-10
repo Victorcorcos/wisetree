@@ -2481,12 +2481,13 @@ impl DashboardService {
         })))
     }
 
-    /// Build the spawn parameters for the live investigation run: a
-    /// non-interactive `opencode run` pinned to the read-only Plan agent,
-    /// shown in the embedded PTY so the user watches the AI work; the
-    /// captured transcript is parsed by the caller after exit. `corrective`
-    /// appends the stricter-contract suffix used on the single retry after
-    /// a parse failure.
+    /// Build the spawn parameters for the live investigation: the full
+    /// opencode **TUI** pinned to the read-only Plan agent, embedded in the
+    /// AI Activity panel so the user watches opencode's own rendering. The
+    /// TUI never exits on its own — the App detects completion through an
+    /// `OpencodeTurnWatcher` and reads the transcript from opencode's
+    /// database. `corrective` appends the stricter-contract suffix used on
+    /// the single retry after a parse failure.
     pub fn prepare_bugkill_investigate(
         &self,
         worktree_path: &str,
@@ -2512,15 +2513,18 @@ impl DashboardService {
                  delimited block, exactly as specified."
             );
         }
-        let mut opencode_args: Vec<String> = vec![
-            "run".to_string(),
+        // The opencode TUI takes no `--variant`; it honors reasoning effort
+        // solely via the persisted `model.json`, so seed it before spawning.
+        seed_opencode_tui_variant(&model, &slot.thinking);
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
             prompt,
             "-m".to_string(),
             model,
             "--agent".to_string(),
             "plan".to_string(),
+            cwd.to_string_lossy().to_string(),
         ];
-        opencode_args.extend(run_variant_args(&slot.thinking));
         Ok(FixApplyHandoff {
             opencode_binary: self.opencode_binary.clone(),
             opencode_args,

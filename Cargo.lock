@@ -2628,7 +2628,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "unicode-width 0.2.0",
  "vt100",
  "walkdir",
 ]
