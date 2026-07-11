@@ -3,7 +3,7 @@
 //! top-to-bottom stack on every page so all five read as one component:
 //!
 //! ```text
-//! <title>                        ← BRAND, bold
+//! <title>                        ← command color, bold
 //!
 //! PR          #12 (Open)         ← labeled detail rows (optional PR line)
 //! Branch      feat/thing
@@ -120,6 +120,10 @@ pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
 /// that apply, then `render` into the panel area.
 pub struct PrConfirmView<'a> {
     title: String,
+    /// Color for the title heading. Defaults to `BRAND`; each PR command
+    /// overrides it with its signature color (Enrich purple, Merge green,
+    /// …) so the confirm screen matches the command's dashboard button.
+    title_color: Color,
     /// Ordered text blocks (details, `Will run:` preview, description snippet,
     /// …) rendered blank-line-separated after the title. Empty blocks are
     /// dropped so they take up no space.
@@ -129,15 +133,25 @@ pub struct PrConfirmView<'a> {
 }
 
 impl<'a> PrConfirmView<'a> {
-    /// Start a view with `title` (rendered BRAND + bold, like Bugkill's
-    /// "Hunt a bug on this worktree?").
+    /// Start a view with `title` (rendered in the command color + bold, like
+    /// Bugkill's "Hunt a bug on this worktree?"). Defaults to `BRAND` until a
+    /// command overrides it via [`Self::title_color`].
     pub fn new(title: impl Into<String>) -> Self {
         Self {
             title: title.into(),
+            title_color: colors::BRAND,
             blocks: Vec::new(),
             ai_roles: Vec::new(),
             modal: None,
         }
+    }
+
+    /// Set the title heading color to the command's signature color so the
+    /// confirm screen's heading matches both the dashboard button and the
+    /// accent of the confirmation modal drawn below it.
+    pub fn title_color(mut self, color: Color) -> Self {
+        self.title_color = color;
+        self
     }
 
     /// Append a text block (e.g. the labeled detail rows). No-op when empty.
@@ -223,7 +237,7 @@ impl<'a> PrConfirmView<'a> {
             Paragraph::new(Line::from(Span::styled(
                 self.title.clone(),
                 Style::default()
-                    .fg(colors::BRAND)
+                    .fg(self.title_color)
                     .add_modifier(Modifier::BOLD),
             ))),
             chunks[0],

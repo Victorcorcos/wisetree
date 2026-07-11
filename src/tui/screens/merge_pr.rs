@@ -246,6 +246,7 @@ impl MergePullRequestScreen {
         description.extend(body_preview_lines(self.body.as_deref()));
 
         PrConfirmView::new(format!("Merge Pull Request #{}?", self.request.number))
+            .title_color(colors::SUCCESS)
             .block(build_detail_lines(&self.request))
             .steps(&[format!(
                 "gh pr merge #{} --squash (all commits squashed into base)",
@@ -266,7 +267,7 @@ fn build_confirm(request: &MergePullRequestRequest) -> ConfirmationModal {
         .with_subtitle(prompt)
         .with_confirm_text("Yes")
         .with_cancel_text("No")
-        .with_color_value(colors::INFO)
+        .with_color_value(colors::SUCCESS)
         .with_selected(ConfirmationChoice::Cancel)
 }
 

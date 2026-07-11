@@ -1123,6 +1123,7 @@ impl BugkillPullRequestScreen {
             "Loop until a fix works or all fixes fail.",
         ];
         PrConfirmView::new("Hunt a bug on this worktree?")
+            .title_color(colors::DARK_GREEN)
             .block(self.confirm_detail_lines())
             .steps(&steps)
             .ai_roles(self.confirm_ai_roles())
