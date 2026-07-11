@@ -48,8 +48,9 @@ use crate::services::{BugkillSnapshot, BugkillUnverdicted, ParsedInvestigation};
 use crate::tui::screens::dashboard::BugkillRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    render_summary_table, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
-    InputPrompt, PtyView, Status, StatusIndicator, SummaryRow,
+    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
+    ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView, Status,
+    StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -538,6 +539,7 @@ impl BugkillPullRequestScreen {
         self.verdict_focus = 0;
         self.verdict_note = note;
         self.input = None;
+        self.detail_scroll = 0;
         self.step = BugkillStep::Verdict;
     }
 
@@ -629,7 +631,7 @@ impl BugkillPullRequestScreen {
                 }
                 true
             }
-            BugkillStep::Select => {
+            BugkillStep::Select | BugkillStep::Verdict => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(lines);
                 true
             }
@@ -645,7 +647,7 @@ impl BugkillPullRequestScreen {
                 }
                 true
             }
-            BugkillStep::Select => {
+            BugkillStep::Select | BugkillStep::Verdict => {
                 self.detail_scroll = self.detail_scroll.saturating_add(lines);
                 true
             }
@@ -950,6 +952,14 @@ impl BugkillPullRequestScreen {
                 self.verdict_focus = (self.verdict_focus + 1) % 3;
                 BugkillAction::Continue
             }
+            KeyCode::PageUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(5);
+                BugkillAction::Continue
+            }
+            KeyCode::PageDown => {
+                self.detail_scroll = self.detail_scroll.saturating_add(5);
+                BugkillAction::Continue
+            }
             KeyCode::Enter => match self.verdict_focus {
                 0 => BugkillAction::VerdictYes,
                 1 => BugkillAction::VerdictNo,
@@ -1099,122 +1109,90 @@ impl BugkillPullRequestScreen {
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
-        let detail_lines = vec![
-            labeled_line(
-                "Branch",
-                Span::styled(
-                    self.request.branch.clone(),
-                    Style::default()
-                        .fg(colors::SUCCESS)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ),
-            labeled_line(
-                "Worktree",
-                Span::styled(
-                    self.request.worktree_path.clone(),
-                    Style::default().fg(colors::EMPHASIS),
-                ),
-            ),
+        // Numbered pipeline preview — the Bugkill "Will run:" steps other PR
+        // commands now mirror through the shared confirm view.
+        let steps = [
+            "You describe the bug.",
+            "The investigate AI explores the code read-only and ranks likely root causes \
+             into BUG_INVESTIGATION.md.",
+            "You pick one proposed fix from the ranked table.",
+            "The fix AI applies only that fix, live, in an embedded opencode terminal.",
+            "You confirm whether the bug is gone — Yes keeps the fix (committed on the \
+             branch), No reverts it with git revert (history preserved) and returns you to \
+             the table.",
+            "Loop until a fix works or all fixes fail.",
         ];
-        let steps_lines = build_steps_lines();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),                         // title
-                Constraint::Length(1),                         // blank
-                Constraint::Length(detail_lines.len() as u16), // details
-                Constraint::Length(1),                         // blank
-                Constraint::Length(steps_lines.len() as u16),  // steps
-                Constraint::Length(1),                         // blank
-                Constraint::Length(4),                         // resolved AI config table
-                Constraint::Length(1),                         // blank
-                Constraint::Length(12),                        // modal
-                Constraint::Min(0),
-            ])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Hunt a bug on this worktree?",
-                Style::default()
-                    .fg(colors::BRAND)
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            chunks[0],
-        );
-        frame.render_widget(Paragraph::new(detail_lines), chunks[2]);
-        frame.render_widget(Paragraph::new(steps_lines), chunks[4]);
-        self.render_config_table(frame, chunks[6]);
-        if let Some(dialog) = self.confirm.as_ref() {
-            dialog.render(frame, chunks[8]);
-        }
+        PrConfirmView::new("Hunt a bug on this worktree?")
+            .block(self.confirm_detail_lines())
+            .steps(&steps)
+            .ai_roles(self.confirm_ai_roles())
+            .modal(self.confirm.as_ref())
+            .render(frame, area);
     }
 
-    /// The resolved per-role config, so the user sees what will be spent.
-    fn render_config_table(&self, frame: &mut Frame, area: Rect) {
-        let thinking_label = |thinking: &str| {
-            let thinking = if thinking.trim().is_empty() {
-                "default"
-            } else {
-                thinking
-            };
-            thinking.to_string()
-        };
+    /// Labeled detail rows for the confirm panel: an optional `PR` row (when
+    /// the worktree has an associated open PR), then Branch + Worktree.
+    fn confirm_detail_lines(&self) -> Vec<Line<'static>> {
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        if let Some(number) = self.request.number {
+            rows.push(labeled_line(
+                "PR",
+                Span::styled(
+                    format!("#{number} "),
+                    Style::default()
+                        .fg(colors::INFO)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                self.request
+                    .title
+                    .clone()
+                    .map(|title| Span::styled(title, Style::default().fg(colors::WHITE))),
+            ));
+        }
+        rows.push(labeled_line(
+            "Branch",
+            Span::styled(
+                self.request.branch.clone(),
+                Style::default()
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None,
+        ));
+        rows.push(labeled_line(
+            "Worktree",
+            Span::styled(
+                self.request.worktree_path.clone(),
+                Style::default().fg(colors::EMPHASIS),
+            ),
+            None,
+        ));
+        rows
+    }
 
-        let header = Row::new(vec![
-            TableCell::from("Role"),
-            TableCell::from("Model"),
-            TableCell::from("Thinking"),
-        ])
-        .style(
-            Style::default()
-                .fg(colors::GRAY_DARK)
-                .add_modifier(Modifier::BOLD),
-        );
-        let rows = vec![
-            Row::new(vec![
-                TableCell::from("investigate").style(Style::default().fg(colors::BRAND)),
-                TableCell::from(self.ai.investigate.model.clone())
-                    .style(Style::default().fg(colors::GRAY_LIGHT)),
-                TableCell::from(thinking_label(&self.ai.investigate.thinking))
-                    .style(Style::default().fg(colors::EMPHASIS)),
-            ]),
-            Row::new(vec![
-                TableCell::from("fix").style(Style::default().fg(colors::SUCCESS)),
-                TableCell::from(self.ai.fix.model.clone())
-                    .style(Style::default().fg(colors::GRAY_LIGHT)),
-                TableCell::from(thinking_label(&self.ai.fix.thinking))
-                    .style(Style::default().fg(colors::EMPHASIS)),
-            ]),
-            Row::new(vec![
-                TableCell::from("judge").style(Style::default().fg(colors::INFO)),
-                TableCell::from(self.ai.judge.model.clone())
-                    .style(Style::default().fg(colors::GRAY_LIGHT)),
-                TableCell::from(thinking_label(&self.ai.judge.thinking))
-                    .style(Style::default().fg(colors::EMPHASIS)),
-            ]),
-        ];
-        let table_width = area.width.min(62);
-        let table_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(area.width.saturating_sub(table_width) / 2),
-                Constraint::Length(table_width),
-                Constraint::Min(0),
-            ])
-            .split(area)[1];
-
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(12),
-                Constraint::Min(24),
-                Constraint::Length(10),
-            ],
-        )
-        .header(header)
-        .column_spacing(2);
-        frame.render_widget(table, table_area);
+    /// The resolved `ai.bugkill` roles, so the user sees which models (and
+    /// reasoning effort) each pipeline phase will spend before confirming.
+    fn confirm_ai_roles(&self) -> Vec<AiRoleRow> {
+        vec![
+            AiRoleRow::new(
+                "investigate",
+                colors::BRAND,
+                self.ai.investigate.model.clone(),
+                self.ai.investigate.thinking.clone(),
+            ),
+            AiRoleRow::new(
+                "fix",
+                colors::SUCCESS,
+                self.ai.fix.model.clone(),
+                self.ai.fix.thinking.clone(),
+            ),
+            AiRoleRow::new(
+                "judge",
+                colors::INFO,
+                self.ai.judge.model.clone(),
+                self.ai.judge.thinking.clone(),
+            ),
+        ]
     }
 
     fn render_describe(&self, frame: &mut Frame, area: Rect) {
@@ -1421,12 +1399,7 @@ impl BugkillPullRequestScreen {
             first_line
         };
         let dim = Style::default().fg(colors::GRAY_DARK);
-        let quality_color = match h.quality {
-            EvidenceQuality::Confirmed => colors::GREEN,
-            EvidenceQuality::Observed => colors::TEAL,
-            EvidenceQuality::Inferred => colors::YELLOW,
-            EvidenceQuality::Speculative => colors::GRAY_MEDIUM,
-        };
+        let quality_color = quality_color(h.quality);
         let cells = vec![
             TableCell::from(format!("{}", h.number)).style(if eligible {
                 Style::default().fg(colors::BRAND)
@@ -1461,56 +1434,29 @@ impl BugkillPullRequestScreen {
     /// Detail panel: the highlighted row's full description + solution, so
     /// the user reads the complete plan before spending fix tokens.
     fn render_detail_panel(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::BG_FOCUS))
-            .style(Style::default().bg(colors::BG_SELECTED));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if inner.height == 0 || inner.width == 0 {
-            return;
-        }
-        let Some(h) = self.hypotheses.get(self.selected) else {
-            return;
-        };
         let mut lines: Vec<Line<'static>> = Vec::new();
-        for raw in h.description.lines() {
+        if let Some(h) = self.hypotheses.get(self.selected) {
+            for raw in h.description.lines() {
+                lines.push(Line::from(Span::styled(
+                    raw.to_string(),
+                    Style::default().fg(colors::WHITE),
+                )));
+            }
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::default().fg(colors::WHITE),
+                "How this fix works:",
+                Style::default()
+                    .fg(colors::INFO)
+                    .add_modifier(Modifier::BOLD),
             )));
+            for raw in h.solution.lines() {
+                lines.push(Line::from(Span::styled(
+                    raw.to_string(),
+                    Style::default().fg(colors::GRAY_LIGHT),
+                )));
+            }
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "How this fix works:",
-            Style::default()
-                .fg(colors::INFO)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for raw in h.solution.lines() {
-            lines.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::default().fg(colors::GRAY_LIGHT),
-            )));
-        }
-        let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
-        let scroll = self.detail_scroll.min(max_scroll);
-        frame.render_widget(
-            Paragraph::new(lines.clone())
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0)),
-            inner,
-        );
-        if lines.len() as u16 > inner.height {
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .style(Style::default().fg(colors::MUTED))
-                .thumb_style(Style::default().fg(colors::INFO));
-            let mut state = ScrollbarState::new(lines.len())
-                .viewport_content_length(inner.height as usize)
-                .position(scroll as usize);
-            frame.render_stateful_widget(scrollbar, inner, &mut state);
-        }
+        render_text_panel(frame, area, lines, self.detail_scroll);
     }
 
     /// Same chrome as `render_fixing` (spinner + AI Activity panel). The
@@ -1714,44 +1660,57 @@ impl BugkillPullRequestScreen {
     }
 
     fn render_verdict(&self, frame: &mut Frame, area: Rect) {
-        let row = self
+        let number = self
             .current_attempt
-            .and_then(|idx| self.hypotheses.get(idx));
-        let (number, solution) = row
-            .map(|h| (h.number, h.solution.as_str()))
-            .unwrap_or((0, ""));
-        let question = format!(
-            "Bugfix #{number} (\"{}\") applied. Did it really fix the bug?",
-            clip_chars(solution.lines().next().unwrap_or(""), 60)
-        );
+            .and_then(|idx| self.hypotheses.get(idx))
+            .map(|h| h.number)
+            .unwrap_or(0);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2), // question
-                Constraint::Length(1), // judge note (gray)
+                Constraint::Length(1), // question
+                Constraint::Length(1), // commit context
                 Constraint::Length(1), // blank
+                Constraint::Min(5),    // bug → cause → fix panel
+                Constraint::Length(1), // judge note (gray)
                 Constraint::Length(3), // buttons
                 Constraint::Length(1), // hint
-                Constraint::Min(0),
             ])
             .split(area);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                question,
+                format!("🐛 Bugfix #{number} applied — did it really fix the bug?"),
                 Style::default()
                     .fg(colors::WHITE)
                     .add_modifier(Modifier::BOLD),
-            )))
-            .wrap(Wrap { trim: true }),
+            ))),
             chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    "Committed as {} on {} — answering No reverts it (git revert, history \
+                     preserved).",
+                    self.attempt_sha.as_deref().unwrap_or("(not identified)"),
+                    self.request.branch
+                ),
+                Style::default().fg(colors::GRAY_DARK),
+            ))),
+            chunks[1],
+        );
+        render_text_panel(
+            frame,
+            chunks[3],
+            self.verdict_detail_lines(),
+            self.detail_scroll,
         );
         if let Some(note) = self.verdict_note.as_deref() {
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    note.to_string(),
-                    Style::default().fg(colors::GRAY_DARK),
-                ))),
-                chunks[1],
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Judge: ".to_string(), muted_dim()),
+                    Span::styled(note.to_string(), Style::default().fg(colors::GRAY_DARK)),
+                ])),
+                chunks[4],
             );
         }
         // Yes (green) / No (pink) / Other (orange).
@@ -1766,7 +1725,7 @@ impl BugkillPullRequestScreen {
                 Constraint::Length(13),
                 Constraint::Min(0),
             ])
-            .split(chunks[3]);
+            .split(chunks[5]);
         frame.render_widget(
             button_paragraph("  Yes  ", colors::GREEN, self.verdict_focus == 0),
             cols[1],
@@ -1787,9 +1746,101 @@ impl BugkillPullRequestScreen {
                 Span::styled("  ·  ".to_string(), muted_dim()),
                 Span::styled("↵ ".to_string(), Style::default().fg(colors::SUCCESS)),
                 Span::styled("Answer".to_string(), muted_dim()),
+                Span::styled("  ·  ".to_string(), muted_dim()),
+                Span::styled("PgUp PgDn ".to_string(), Style::default().fg(colors::INFO)),
+                Span::styled("Scroll details".to_string(), muted_dim()),
             ])),
-            chunks[4],
+            chunks[6],
         );
+    }
+
+    /// The Verdict context panel: the bug's observed effect (the user's own
+    /// report), the suspected root cause behind this attempt, what the fix
+    /// changed, and the files it touched — everything needed to judge the
+    /// attempt without opening BUG_INVESTIGATION.md.
+    fn verdict_detail_lines(&self) -> Vec<Line<'static>> {
+        let header = |text: &str, color| {
+            Line::from(Span::styled(
+                text.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))
+        };
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(header("The bug (what you reported)", colors::WARNING));
+        if self.bug_description.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (no description recorded)".to_string(),
+                Style::default().fg(colors::GRAY_DARK),
+            )));
+        } else {
+            for raw in self.bug_description.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {raw}"),
+                    Style::default().fg(colors::WHITE),
+                )));
+            }
+        }
+        if let Some(h) = self
+            .current_attempt
+            .and_then(|idx| self.hypotheses.get(idx))
+        {
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Suspected root cause".to_string(),
+                    Style::default()
+                        .fg(colors::INFO)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  #{}", h.number),
+                    Style::default().fg(colors::BRAND),
+                ),
+                Span::styled("  ·  ".to_string(), muted_dim()),
+                Span::styled(
+                    "★".repeat(h.ranking as usize),
+                    Style::default().fg(colors::YELLOW),
+                ),
+                Span::styled("  ·  ".to_string(), muted_dim()),
+                Span::styled(
+                    h.quality.as_str().to_string(),
+                    Style::default().fg(quality_color(h.quality)),
+                ),
+            ]));
+            for raw in h.description.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {raw}"),
+                    Style::default().fg(colors::WHITE),
+                )));
+            }
+            lines.push(Line::default());
+            lines.push(header("What the fix changed", colors::SUCCESS));
+            for raw in h.solution.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {raw}"),
+                    Style::default().fg(colors::GRAY_LIGHT),
+                )));
+            }
+        }
+        if !self.attempt_changes.is_empty() {
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Files touched".to_string(),
+                    Style::default()
+                        .fg(colors::GRAY_LIGHT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" ({})", self.attempt_changes.len()), muted_dim()),
+            ]));
+            for file in &self.attempt_changes {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ".to_string(), muted_dim()),
+                    Span::styled(file.clone(), Style::default().fg(colors::EMPHASIS)),
+                ]));
+            }
+        }
+        lines
     }
 
     fn render_other(&self, frame: &mut Frame, area: Rect) {
@@ -1990,11 +2041,47 @@ fn muted_dim() -> Style {
         .add_modifier(Modifier::DIM)
 }
 
-fn labeled_line(label: &str, value: Span<'static>) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label:<10}"), muted_dim()),
-        value,
-    ])
+/// Color for an evidence-quality tag (Select table + Verdict panel).
+fn quality_color(quality: EvidenceQuality) -> ratatui::style::Color {
+    match quality {
+        EvidenceQuality::Confirmed => colors::GREEN,
+        EvidenceQuality::Observed => colors::TEAL,
+        EvidenceQuality::Inferred => colors::YELLOW,
+        EvidenceQuality::Speculative => colors::GRAY_MEDIUM,
+    }
+}
+
+/// Bordered, scrollable text panel shared by Select's detail view and the
+/// Verdict context view.
+fn render_text_panel(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, scroll: u16) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(colors::BG_FOCUS))
+        .style(Style::default().bg(colors::BG_SELECTED));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let line_count = lines.len();
+    let max_scroll = (line_count as u16).saturating_sub(inner.height);
+    let scroll = scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        inner,
+    );
+    if line_count as u16 > inner.height {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(colors::MUTED))
+            .thumb_style(Style::default().fg(colors::INFO));
+        let mut state = ScrollbarState::new(line_count)
+            .viewport_content_length(inner.height as usize)
+            .position(scroll as usize);
+        frame.render_stateful_widget(scrollbar, inner, &mut state);
+    }
 }
 
 /// Clip to `max` chars with an ellipsis.
@@ -2055,40 +2142,6 @@ fn build_investigate_continue_modal() -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Cancel)
 }
 
-fn build_steps_lines() -> Vec<Line<'static>> {
-    let header = Style::default()
-        .fg(colors::INFO)
-        .add_modifier(Modifier::BOLD);
-    let bullet = Style::default().fg(colors::EMPHASIS);
-    let step = |n: usize, text: &str| {
-        Line::from(vec![
-            Span::styled(format!("  {n}. "), muted_dim()),
-            Span::styled(text.to_string(), bullet),
-        ])
-    };
-    vec![
-        Line::from(Span::styled("Will run:".to_string(), header)),
-        step(1, "You describe the bug."),
-        step(
-            2,
-            "The investigate AI explores the code read-only and ranks likely root causes \
-             into BUG_INVESTIGATION.md.",
-        ),
-        step(3, "You pick one proposed fix from the ranked table."),
-        step(
-            4,
-            "The fix AI applies only that fix, live, in an embedded opencode terminal.",
-        ),
-        step(
-            5,
-            "You confirm whether the bug is gone — Yes keeps the fix (committed on the \
-             branch), No reverts it with git revert (history preserved) and returns you to \
-             the table.",
-        ),
-        step(6, "Loop until a fix works or all fixes fail."),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2101,6 +2154,8 @@ mod tests {
         BugkillRequest {
             branch: "fix/save-crash".to_string(),
             worktree_path: "/tmp/repo-save".to_string(),
+            number: None,
+            title: None,
         }
     }
 
@@ -2202,6 +2257,28 @@ mod tests {
         assert!(dump.contains("judge"), "{dump}");
         assert!(dump.contains("tiny/model"), "{dump}");
         assert!(dump.contains("low"), "{dump}");
+    }
+
+    #[test]
+    fn confirm_shows_pr_row_only_when_a_pr_is_associated() {
+        // No PR → no PR row.
+        let mut s = screen();
+        let dump = render_dump(&mut s, 110, 30);
+        assert!(!dump.contains("PR "), "unexpected PR row:\n{dump}");
+
+        // Associated PR → a `PR #n title` row appears above Branch/Worktree.
+        let request = BugkillRequest {
+            number: Some(7),
+            title: Some("Fix the save crash".to_string()),
+            ..request()
+        };
+        let mut s = BugkillPullRequestScreen::new(request, ai());
+        let dump = render_dump(&mut s, 110, 32);
+        assert!(dump.contains("#7"), "expected PR number in:\n{dump}");
+        assert!(
+            dump.contains("Fix the save crash"),
+            "expected PR title in:\n{dump}"
+        );
     }
 
     // ── DescribeBug ─────────────────────────────────────────────────────
@@ -2540,15 +2617,44 @@ mod tests {
     }
 
     #[test]
-    fn verdict_renders_question_with_clipped_solution() {
+    fn verdict_renders_bug_cause_fix_and_commit_context() {
         let mut s = screen_on_verdict();
-        let dump = render_dump(&mut s, 110, 24);
+        let dump = render_dump(&mut s, 110, 30);
         assert!(
-            dump.contains("Bugfix #1 (\"solution 1\") applied. Did it really fix the bug?"),
+            dump.contains("Bugfix #1 applied — did it really fix the bug?"),
             "{dump}"
         );
+        // The context panel shows the bug's effect, its suspected cause
+        // (with ranking + evidence quality), and the full fix plan.
+        assert!(dump.contains("The bug (what you reported)"), "{dump}");
+        assert!(dump.contains("it crashes"), "{dump}");
+        assert!(dump.contains("Suspected root cause"), "{dump}");
+        assert!(dump.contains("★★★★"), "{dump}");
+        assert!(dump.contains("observed"), "{dump}");
+        assert!(dump.contains("cause 1"), "{dump}");
+        assert!(dump.contains("with details"), "{dump}");
+        assert!(dump.contains("What the fix changed"), "{dump}");
+        assert!(dump.contains("solution 1"), "{dump}");
+        // Commit + files context so the user knows what No would revert.
+        assert!(dump.contains("Committed as abc123"), "{dump}");
+        assert!(dump.contains("Files touched"), "{dump}");
+        assert!(dump.contains("src.rs"), "{dump}");
         assert!(dump.contains("Yes"), "{dump}");
         assert!(dump.contains("Other"), "{dump}");
+    }
+
+    #[test]
+    fn verdict_page_keys_scroll_the_context_panel() {
+        let mut s = screen_on_verdict();
+        assert_eq!(
+            s.handle_key(key(KeyCode::PageDown)),
+            BugkillAction::Continue
+        );
+        assert_eq!(s.detail_scroll, 5);
+        assert_eq!(s.handle_key(key(KeyCode::PageUp)), BugkillAction::Continue);
+        assert_eq!(s.detail_scroll, 0);
+        // Scrolling never answers the question.
+        assert_eq!(s.step(), BugkillStep::Verdict);
     }
 
     #[test]

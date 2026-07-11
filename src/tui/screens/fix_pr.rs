@@ -34,13 +34,15 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use crate::config::schema::AiFixConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{CommentGroup, FixPlan};
 use crate::tui::screens::dashboard::FixPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    render_summary_table, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
-    InputPrompt, PtyView, Status, StatusIndicator, SummaryRow,
+    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
+    ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView, Status,
+    StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -127,6 +129,9 @@ pub enum FixAction {
 
 pub struct FixPullRequestScreen {
     request: FixPullRequestRequest,
+    /// Resolved `ai.fix` config (plan + apply models), shown on the confirm
+    /// panel's "which AIs run" table.
+    ai: AiFixConfig,
     confirm: Option<ConfirmationModal>,
     phase_message: String,
     /// True only during the "Analyzing comment #N…" planning phase, so the
@@ -168,10 +173,11 @@ pub struct FixPullRequestScreen {
 }
 
 impl FixPullRequestScreen {
-    pub fn new(request: FixPullRequestRequest) -> Self {
+    pub fn new(request: FixPullRequestRequest, ai: AiFixConfig) -> Self {
         Self {
             confirm: Some(build_confirm(&request)),
             request,
+            ai,
             phase_message: String::new(),
             analyzing: false,
             owner: String::new(),
@@ -836,38 +842,28 @@ impl FixPullRequestScreen {
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
-        let detail_lines = build_detail_lines(&self.request);
-        let steps_lines = build_steps_lines();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),                         // title
-                Constraint::Length(1),                         // blank
-                Constraint::Length(detail_lines.len() as u16), // details
-                Constraint::Length(1),                         // blank
-                Constraint::Length(steps_lines.len() as u16),  // steps
-                Constraint::Length(1),                         // blank
-                Constraint::Length(12),                        // modal
-                Constraint::Min(0),
-            ])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(
-                    "Fix review comments on Pull Request #{}?",
-                    self.request.number
-                ),
-                Style::default()
-                    .fg(colors::BRAND)
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            chunks[0],
-        );
-        frame.render_widget(Paragraph::new(detail_lines), chunks[2]);
-        frame.render_widget(Paragraph::new(steps_lines), chunks[4]);
-        if let Some(dialog) = self.confirm.as_ref() {
-            dialog.render(frame, chunks[6]);
-        }
+        PrConfirmView::new(format!(
+            "Fix review comments on Pull Request #{}?",
+            self.request.number
+        ))
+        .block(build_detail_lines(&self.request))
+        .steps(&FIX_STEPS)
+        .ai_roles(vec![
+            AiRoleRow::new(
+                "plan",
+                colors::BRAND,
+                self.ai.plan.model.clone(),
+                self.ai.plan.thinking.clone(),
+            ),
+            AiRoleRow::new(
+                "apply",
+                colors::SUCCESS,
+                self.ai.apply.model.clone(),
+                self.ai.apply.thinking.clone(),
+            ),
+        ])
+        .modal(self.confirm.as_ref())
+        .render(frame, area);
     }
 
     fn render_decision(&self, frame: &mut Frame, area: Rect) {
@@ -1288,26 +1284,15 @@ fn build_detail_lines(request: &FixPullRequestRequest) -> Vec<Line<'static>> {
     ]
 }
 
-fn build_steps_lines() -> Vec<Line<'static>> {
-    let header = Style::default()
-        .fg(colors::INFO)
-        .add_modifier(Modifier::BOLD);
-    let bullet = Style::default().fg(colors::EMPHASIS);
-    let step = |text: &str| {
-        Line::from(vec![
-            Span::styled("  • ".to_string(), muted_dim()),
-            Span::styled(text.to_string(), bullet),
-        ])
-    };
-    vec![
-        Line::from(Span::styled("Will run:".to_string(), header)),
-        step("sync the branch + fetch the PR's review comments"),
-        step("for each comment: AI judges it and plans a fix (no edits yet)"),
-        step("you choose Apply / Other / Skip per comment"),
-        step("applied fixes are committed and the reviewer is replied to"),
-        step("push every review-fix commit at the end"),
-    ]
-}
+/// `Will run:` step text for the confirm panel; the shared [`PrConfirmView`]
+/// owns the numbering + styling.
+const FIX_STEPS: [&str; 5] = [
+    "sync the branch + fetch the PR's review comments",
+    "for each comment: AI judges it and plans a fix (no edits yet)",
+    "you choose Apply / Other / Skip per comment",
+    "applied fixes are committed and the reviewer is replied to",
+    "push every review-fix commit at the end",
+];
 
 /// Reviewer-comment panel shown under the spinner while the AI analyzes a
 /// comment. Mirrors the Terminal / AI Activity panels: rounded border, bold
@@ -1574,21 +1559,6 @@ fn sanitize_row(s: &str) -> String {
     out
 }
 
-fn labeled_line(
-    label: &str,
-    value: Span<'static>,
-    trailing: Option<Span<'static>>,
-) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
-    spans.push(Span::styled(format!("{label:<10}"), muted_dim()));
-    spans.push(value);
-    if let Some(extra) = trailing {
-        spans.push(Span::raw(" "));
-        spans.push(extra);
-    }
-    Line::from(spans)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,6 +1574,19 @@ mod tests {
             url: "https://github.com/o/r/pull/42".to_string(),
             branch: "digit-3131-retry".to_string(),
             worktree_path: "/tmp/repo-retry".to_string(),
+        }
+    }
+
+    fn test_ai() -> AiFixConfig {
+        AiFixConfig {
+            plan: crate::config::schema::AiModelConfig {
+                model: "opencode/fix-plan".to_string(),
+                thinking: "max".to_string(),
+            },
+            apply: crate::config::schema::AiModelConfig {
+                model: "opencode/fix-apply".to_string(),
+                thinking: String::new(),
+            },
         }
     }
 
@@ -1675,7 +1658,7 @@ mod tests {
 
     #[test]
     fn starts_on_confirm_with_no_default() {
-        let screen = FixPullRequestScreen::new(request());
+        let screen = FixPullRequestScreen::new(request(), test_ai());
         assert_eq!(screen.step(), FixStep::Confirm);
         assert_eq!(
             screen.confirm.as_ref().unwrap().selected(),
@@ -1684,24 +1667,43 @@ mod tests {
     }
 
     #[test]
+    fn confirm_renders_pr_row_steps_and_plan_apply_ai_table() {
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
+        let dump = render_dump(&mut screen, 110, 34);
+        assert!(
+            dump.contains("Fix review comments on Pull Request #42?"),
+            "{dump}"
+        );
+        // PR row carries the number + title.
+        assert!(dump.contains("#42"), "{dump}");
+        assert!(dump.contains("Add retry logic"), "{dump}");
+        // Will-run preview + both AI roles from ai.fix.
+        assert!(dump.contains("Will run:"), "{dump}");
+        assert!(dump.contains("plan"), "{dump}");
+        assert!(dump.contains("opencode/fix-plan"), "{dump}");
+        assert!(dump.contains("apply"), "{dump}");
+        assert!(dump.contains("opencode/fix-apply"), "{dump}");
+    }
+
+    #[test]
     fn confirm_default_no_cancels_but_tab_confirms() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         // Default is No → Enter cancels.
         assert_eq!(screen.handle_key(key(KeyCode::Enter)), FixAction::Cancelled);
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         assert_eq!(screen.handle_key(key(KeyCode::Tab)), FixAction::Continue);
         assert_eq!(screen.handle_key(key(KeyCode::Enter)), FixAction::Confirmed);
     }
 
     #[test]
     fn esc_on_confirm_cancels() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         assert_eq!(screen.handle_key(key(KeyCode::Esc)), FixAction::Cancelled);
     }
 
     #[test]
     fn start_preparing_then_planning_sets_working() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.start_preparing();
         assert_eq!(screen.step(), FixStep::Working);
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
@@ -1714,7 +1716,7 @@ mod tests {
 
     #[test]
     fn analyzing_shows_reviewer_comment_panel() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.start_planning(1, 1);
         let dump = render_dump(&mut screen, 80, 14);
@@ -1770,7 +1772,7 @@ mod tests {
                 },
             ],
         };
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group], "o".into(), "r".into());
         screen.start_planning(1, 1);
 
@@ -1788,7 +1790,7 @@ mod tests {
     #[test]
     fn non_analyzing_working_has_no_comment_panel() {
         // Committing is also a Working phase but must not show the panel.
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.start_committing();
         let dump = render_dump(&mut screen, 80, 14);
@@ -1800,7 +1802,7 @@ mod tests {
 
     #[test]
     fn decision_buttons_emit_each_action() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.show_decision(plan());
         assert_eq!(screen.step(), FixStep::Decision);
@@ -1818,7 +1820,7 @@ mod tests {
 
     #[test]
     fn other_input_submits_as_replan() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.show_decision(plan());
         screen.show_other_input();
@@ -1838,7 +1840,7 @@ mod tests {
 
     #[test]
     fn other_input_cancel_returns_to_decision() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.show_decision(plan());
         screen.show_other_input();
@@ -1850,7 +1852,7 @@ mod tests {
     fn replan_retains_previous_plan_through_planning() {
         // The "Other" path re-plans while the previous proposal must stay in
         // hand, so a re-plan that yields no revision can fall back to it.
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.show_decision(plan());
         screen.start_planning(1, 1);
@@ -1863,7 +1865,7 @@ mod tests {
 
     #[test]
     fn reshow_decision_returns_to_decision_with_the_prior_plan() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.show_decision(plan());
         screen.show_other_input();
@@ -1881,7 +1883,7 @@ mod tests {
 
     #[test]
     fn applying_enter_then_confirm_yields_apply_ready() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.show_decision(plan());
         screen.start_applying();
@@ -1898,7 +1900,7 @@ mod tests {
 
     #[test]
     fn record_outcome_builds_colored_rows_and_advances() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(
             vec![
                 group("a.rs", 10),
@@ -1944,7 +1946,7 @@ mod tests {
         // Mirrors the real failure: three line comments (praise + two fixes)
         // followed by a PR-level "good job, but we have misalignments." remark.
         // The trailing remark must be planned with the prior context, not alone.
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(
             vec![
                 group_with(
@@ -2015,7 +2017,7 @@ mod tests {
 
     #[test]
     fn history_folds_in_the_reply_text_and_clears_on_advance() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(
             vec![group("a.rs", 10), group("b.rs", 20)],
             "o".into(),
@@ -2037,7 +2039,7 @@ mod tests {
 
     #[test]
     fn set_groups_resets_history_from_a_prior_run() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.record_outcome(FixRowOutcome::Applied);
         assert!(screen.history_text().is_some());
@@ -2048,7 +2050,7 @@ mod tests {
 
     #[test]
     fn already_resolved_outcome_is_a_non_failure_no_change_row() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.record_outcome(FixRowOutcome::AlreadyResolved);
         let row = &screen.summary_rows[0];
@@ -2063,7 +2065,7 @@ mod tests {
 
     #[test]
     fn enter_done_appends_push_failure_row() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.record_outcome(FixRowOutcome::Applied);
         screen.enter_done(Err("rejected".to_string()));
@@ -2076,7 +2078,7 @@ mod tests {
 
     #[test]
     fn decision_renders_proposal_and_buttons() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("src/retry.rs", 12)], "o".into(), "r".into());
         screen.show_decision(plan());
         let dump = render_dump(&mut screen, 100, 24);
@@ -2135,7 +2137,7 @@ mod tests {
 
     #[test]
     fn done_renders_results_table() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
         screen.record_outcome(FixRowOutcome::Applied);
         let _ = screen.advance();
@@ -2166,7 +2168,7 @@ mod tests {
         // jumping the cursor to column 0 and shredding the layout. No rendered
         // cell may carry a control character.
         let body = "### 💡 Codex Review\r\n\r\nHere are some automated review suggestions.\r\n\r\n<details> <summary>ℹ️ About Codex</summary>\r\n<br/>\r\n\r\n<img width=\"1389\" height=\"958\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/ec1aeeef-cb58-4921-8a6f-206db1d2ee1c\" />\r\n\r\n</details>";
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_groups(
             vec![group_with(
                 Some("lib/player.dart"),
@@ -2199,7 +2201,7 @@ mod tests {
 
     #[test]
     fn set_error_shows_error_view() {
-        let mut screen = FixPullRequestScreen::new(request());
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
         screen.set_error("boom".to_string());
         assert_eq!(
             screen.handle_key(key(KeyCode::Char('x'))),

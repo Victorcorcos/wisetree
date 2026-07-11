@@ -143,11 +143,18 @@ pub struct FixPullRequestRequest {
 
 /// Payload the dashboard hands to the "Bugkill" screen — the interactive
 /// bug-investigation + iterative-fix pipeline. No PR is required: a bug
-/// hunt works on any non-main worktree.
+/// hunt works on any non-main worktree. When the worktree *does* have an
+/// associated PR its details are carried through so the confirm panel can
+/// surface a `PR` row like the other commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BugkillRequest {
     pub branch: String,
     pub worktree_path: String,
+    /// `Some(n)` when an open/draft PR exists for the branch, so the confirm
+    /// panel shows a `PR #n` row; `None` for a worktree with no PR yet.
+    pub number: Option<u64>,
+    /// Existing PR title, shown next to the `PR` row when `number` is set.
+    pub title: Option<String>,
 }
 
 /// Status filter for the bulk-delete buttons row rendered above the
@@ -3038,9 +3045,18 @@ fn build_bugkill_request(row: &DashboardRow) -> Option<BugkillRequest> {
     if row.worktree.is_main {
         return None;
     }
+    // Carry through an active (open/draft) PR's details so the confirm panel
+    // can show a `PR` row; a closed/merged PR is left off (nothing to fix
+    // against) and a PR-less worktree simply omits the row.
+    let pr = row
+        .pull_request
+        .as_ref()
+        .filter(|pr| pr_accepts_lifecycle_commands(pr.state));
     Some(BugkillRequest {
         branch: row.worktree.branch.clone(),
         worktree_path: row.worktree.path.clone(),
+        number: pr.map(|pr| pr.number),
+        title: pr.map(|pr| pr.title.clone()),
     })
 }
 

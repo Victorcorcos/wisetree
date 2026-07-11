@@ -1,6 +1,7 @@
 //! Git command wrapper and high-level git service.
 
 pub mod exec;
+pub mod lock;
 pub mod service;
 pub mod types;
 

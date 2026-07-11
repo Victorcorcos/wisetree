@@ -2105,7 +2105,8 @@ impl App {
     ) {
         // Lands on the Confirm step immediately — no base ref to resolve. The
         // prepare pipeline only runs once the user confirms.
-        self.fix_pr = Some(FixPullRequestScreen::new(request));
+        let ai = self.current_dashboard_config().ai.fix.clone();
+        self.fix_pr = Some(FixPullRequestScreen::new(request, ai));
         self.screen = Screen::FixPullRequest;
     }
 
@@ -3427,7 +3428,8 @@ impl App {
             return;
         };
         let number = request.number;
-        let mut screen = UpdatePullRequestScreen::new(request.clone());
+        let ai_update = self.current_dashboard_config().ai.update.clone();
+        let mut screen = UpdatePullRequestScreen::new(request.clone(), ai_update);
         screen.start_updating();
         screen.set_phase_message(format!("Updating PR #{number} ({done}/{total})..."));
         self.update_pr = Some(screen);
@@ -3692,10 +3694,11 @@ impl App {
     ) {
         let worktree_path = request.worktree_path.clone();
         let number = request.number;
+        let ai = self.current_dashboard_config().ai.update.clone();
         // Mount the screen with `base_ref = None` first so the confirm
         // panel renders immediately; the resolver runs in the background
         // and populates the field before the user can answer.
-        self.update_pr = Some(UpdatePullRequestScreen::new(request));
+        self.update_pr = Some(UpdatePullRequestScreen::new(request, ai));
         self.screen = Screen::UpdatePullRequest;
         kick_off_resolve_base_ref(worktree_path, number, tx.clone());
     }
@@ -3706,9 +3709,10 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let worktree_path = request.worktree_path.clone();
+        let ai = self.current_dashboard_config().ai.enrich.clone();
         // Mount with `base_ref = None` so the confirm panel renders straight
         // away; the resolver populates the field in the background.
-        self.enrich_pr = Some(EnrichPullRequestScreen::new(request));
+        self.enrich_pr = Some(EnrichPullRequestScreen::new(request, ai));
         self.screen = Screen::EnrichPullRequest;
         kick_off_resolve_enrich_base_ref(worktree_path, tx.clone());
     }
@@ -3721,7 +3725,8 @@ impl App {
         request: UpdatePullRequestRequest,
         _tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        self.update_pr = Some(UpdatePullRequestScreen::new_push(request));
+        let ai = self.current_dashboard_config().ai.update.clone();
+        self.update_pr = Some(UpdatePullRequestScreen::new_push(request, ai));
         self.screen = Screen::UpdatePullRequest;
     }
 
@@ -4534,7 +4539,8 @@ impl App {
             behind: 0,
             base_ref: Some(base_ref),
         };
-        let mut screen = UpdatePullRequestScreen::new_local_conflict(request);
+        let ai = self.current_dashboard_config().ai.update.clone();
+        let mut screen = UpdatePullRequestScreen::new_local_conflict(request, ai);
         screen.set_phase_message(format!("{model} is resolving conflicts..."));
         // Launch opencode through the user's login shell so it runs with the
         // same profile-sourced environment as a freshly opened terminal
@@ -8906,15 +8912,18 @@ mod tests {
     fn enrich_opening_terminal_activity_uses_full_height_panel() {
         let mut app = initialized_menu_app();
         app.screen = Screen::EnrichPullRequest;
-        app.enrich_pr = Some(EnrichPullRequestScreen::new(EnrichPullRequestRequest {
-            branch: "feature/enrich".into(),
-            worktree_path: "/tmp/repo/feature/enrich".into(),
-            base_ref: Some("upstream/main".into()),
-            number: None,
-            title: None,
-            url: None,
-            existing_labels: Vec::new(),
-        }));
+        app.enrich_pr = Some(EnrichPullRequestScreen::new(
+            EnrichPullRequestRequest {
+                branch: "feature/enrich".into(),
+                worktree_path: "/tmp/repo/feature/enrich".into(),
+                base_ref: Some("upstream/main".into()),
+                number: None,
+                title: None,
+                url: None,
+                existing_labels: Vec::new(),
+            },
+            crate::config::schema::AiModelConfig::default(),
+        ));
         let screen = app.enrich_pr.as_mut().unwrap();
         screen.start_opening();
         screen.append_terminal_line("running tests".into(), crate::files::ActivityKind::Stdout);
