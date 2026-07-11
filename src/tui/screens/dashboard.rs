@@ -612,13 +612,7 @@ impl DashboardScreen {
                 let Some(index) = self.selected_row_index() else {
                     return DashboardAction::Continue;
                 };
-                let row = self.rows[index].clone();
-                self.action_select = Some(self.build_action_select());
-                self.pr_commands = self.build_pr_commands(&row);
-                self.action_pr_focus = None;
-                self.last_pr_focus = 0;
-                self.action_target = Some(index);
-                self.mode = DashboardMode::ActionMenu;
+                self.open_action_menu(index);
                 DashboardAction::Continue
             }
             KeyCode::Backspace | KeyCode::Delete => {
@@ -855,13 +849,7 @@ impl DashboardScreen {
                 let Some(index) = self.selected_row_index() else {
                     return DashboardAction::Continue;
                 };
-                let row = self.rows[index].clone();
-                self.action_select = Some(self.build_action_select());
-                self.pr_commands = self.build_pr_commands(&row);
-                self.action_pr_focus = None;
-                self.last_pr_focus = 0;
-                self.action_target = Some(index);
-                self.mode = DashboardMode::ActionMenu;
+                self.open_action_menu(index);
                 return DashboardAction::Continue;
             }
         }
@@ -1083,6 +1071,40 @@ impl DashboardScreen {
         self.action_target = None;
         self.pr_commands.clear();
         self.action_pr_focus = None;
+    }
+
+    /// Open the action menu (General Commands + Pull Request Commands) for
+    /// `self.rows[index]`. Shared by the Enter-key and row-click handlers so
+    /// both land on identical menu state.
+    fn open_action_menu(&mut self, index: usize) {
+        let row = self.rows[index].clone();
+        self.action_select = Some(self.build_action_select());
+        self.pr_commands = self.build_pr_commands(&row);
+        self.action_pr_focus = None;
+        self.last_pr_focus = 0;
+        self.action_target = Some(index);
+        self.mode = DashboardMode::ActionMenu;
+    }
+
+    /// Reopen the action menu for the worktree at `worktree_path`. Used when
+    /// a PR command screen (Merge/Update/Enrich/Fix/Bugkill) is cancelled —
+    /// Esc there should land back on the menu it was launched from rather
+    /// than the bare table. Falls back to the plain table if the worktree
+    /// is no longer present (e.g. it was deleted while the command screen
+    /// was open).
+    pub fn reopen_action_menu_for_worktree(&mut self, worktree_path: &str) {
+        let Some(index) = self
+            .rows
+            .iter()
+            .position(|row| row.worktree.path == worktree_path)
+        else {
+            self.mode = DashboardMode::Table;
+            return;
+        };
+        if let Some(filtered_pos) = self.filtered_indices().iter().position(|&i| i == index) {
+            self.selected = filtered_pos;
+        }
+        self.open_action_menu(index);
     }
 
     /// Move the action-menu's PR button focus one step in `delta` direction,
@@ -3719,6 +3741,34 @@ mod tests {
         let action = screen.handle_key(key_event(KeyCode::Char('x')));
         assert!(matches!(action, DashboardAction::Continue));
         assert!(!screen.pr_commands.is_empty());
+    }
+
+    #[test]
+    fn reopen_action_menu_for_worktree_restores_the_action_menu() {
+        // Launching a PR command (e.g. Enrich) resets the menu and drops the
+        // dashboard into Table mode. Cancelling that command should be able
+        // to restore the exact menu state Esc is expected to land back on.
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.handle_key(key_event(KeyCode::Enter));
+        screen.handle_key(key_event(KeyCode::Tab));
+        let action = screen.handle_key(key_event(KeyCode::Char('e')));
+        assert!(matches!(action, DashboardAction::EnrichPullRequest(_)));
+        assert!(matches!(screen.mode, DashboardMode::Table));
+        assert!(screen.pr_commands.is_empty());
+
+        screen.reopen_action_menu_for_worktree("/tmp/repo-feature");
+
+        assert!(matches!(screen.mode, DashboardMode::ActionMenu));
+        assert_eq!(screen.action_target, Some(0));
+        assert!(!screen.pr_commands.is_empty());
+        assert!(!screen.general_command_labels().is_empty());
+    }
+
+    #[test]
+    fn reopen_action_menu_for_worktree_falls_back_to_table_when_worktree_is_gone() {
+        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
+        screen.reopen_action_menu_for_worktree("/tmp/does-not-exist");
+        assert!(matches!(screen.mode, DashboardMode::Table));
     }
 
     fn named_row(
