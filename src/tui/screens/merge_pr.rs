@@ -1,16 +1,24 @@
-//! Merge Pull Request confirmation screen. Three-step state machine
-//! mirroring `DeleteScreen`:
+//! Merge Pull Request confirmation screen. State machine mirroring
+//! `DeleteScreen`:
 //!
-//! - `Loading` : spinner while the PR body is fetched via
-//!   `DashboardService::fetch_pr_details`.
-//! - `Confirm` : details panel on top, `ConfirmationModal` (Yes/No, **No**
-//!   default) on the bottom. Enter on Yes returns `MergeAction::Confirmed`.
-//! - `Merging` : spinner while `gh pr merge --squash` runs.
+//! - `Loading`     : spinner while the PR body + unpushed-commit count are
+//!   fetched via `DashboardService`.
+//! - `Confirm`     : details panel on top, `ConfirmationModal` (Yes/No,
+//!   **No** default) on the bottom. When the worktree has unpushed local
+//!   commits the panel warns about them.
+//! - `ConfirmPush` : reached only when unpushed commits exist and the user
+//!   confirmed the merge — a second modal asks whether to `git push origin
+//!   HEAD` first (**default**) or merge without pushing, so a squash-merge
+//!   never silently drops local work. Both choices return
+//!   `MergeAction::Confirmed`, carrying `push_first`.
+//! - `Merging`     : spinner while the (optional) push and `gh pr merge
+//!   --squash` run.
 //!
-//! Async work is owned by `App`: it kicks off the body fetch when this
-//! screen is entered, feeds the result into `set_body` / `set_error`,
-//! starts the merge via `start_merging`, then routes back to the
-//! dashboard once the merge resolves (the toast is shown by `App`).
+//! Async work is owned by `App`: it kicks off the details + unpushed-count
+//! fetch when this screen is entered, feeds the result into `set_body` /
+//! `set_unpushed_commits` / `set_error`, starts the merge via
+//! `start_merging`, then routes back to the dashboard once the merge
+//! resolves (the toast is shown by `App`).
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -29,12 +37,17 @@ use crate::tui::widgets::{
 
 const MERGE_LOADING_MESSAGE: &str = "Loading pull request details...";
 const MERGE_RUNNING_MESSAGE: &str = "Squash-merging pull request...";
+const MERGE_PUSH_RUNNING_MESSAGE: &str = "Pushing local commits, then squash-merging...";
 const BODY_PREVIEW_MAX_LINES: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeStep {
     Loading,
     Confirm,
+    /// Shown only when the worktree has unpushed local commits: after the
+    /// user confirms the merge, a second modal asks whether to push them
+    /// first (default) or merge without pushing.
+    ConfirmPush,
     Merging,
 }
 
@@ -46,6 +59,10 @@ pub enum MergeAction {
         number: u64,
         title: String,
         body: String,
+        worktree_path: String,
+        /// Run `git push origin HEAD` in the worktree before merging so
+        /// local commits reach the PR first.
+        push_first: bool,
     },
 }
 
@@ -54,6 +71,15 @@ pub struct MergePullRequestScreen {
     body: Option<String>,
     error: Option<String>,
     confirm: Option<ConfirmationModal>,
+    /// Second modal for the `ConfirmPush` step. Built lazily once the user
+    /// confirms the merge and there are unpushed commits to warn about.
+    push_confirm: Option<ConfirmationModal>,
+    /// Count of local commits not yet pushed to the tracking remote. `0`
+    /// keeps the original merge-straight-away flow.
+    unpushed_commits: u64,
+    /// Whether the in-flight merge is preceded by a push (drives the
+    /// spinner message on the `Merging` step).
+    pushing_before_merge: bool,
     step: MergeStep,
     pub tick: usize,
 }
@@ -65,6 +91,9 @@ impl MergePullRequestScreen {
             body: None,
             error: None,
             confirm: None,
+            push_confirm: None,
+            unpushed_commits: 0,
+            pushing_before_merge: false,
             step: MergeStep::Loading,
             tick: 0,
         }
@@ -101,13 +130,21 @@ impl MergePullRequestScreen {
         self.request.title = title;
     }
 
+    /// Record how many local commits are still unpushed. When non-zero the
+    /// confirm panel warns the user and the merge is gated behind a
+    /// push-or-not prompt (see [`MergeStep::ConfirmPush`]).
+    pub fn set_unpushed_commits(&mut self, count: u64) {
+        self.unpushed_commits = count;
+    }
+
     pub fn set_error(&mut self, message: String) {
         self.error = Some(message);
         self.step = MergeStep::Confirm;
         self.confirm = None;
     }
 
-    pub fn start_merging(&mut self) {
+    pub fn start_merging(&mut self, push_first: bool) {
+        self.pushing_before_merge = push_first;
         self.step = MergeStep::Merging;
     }
 
@@ -134,23 +171,21 @@ impl MergePullRequestScreen {
                 _ => MergeAction::Continue,
             };
         }
-        let dialog = match self.confirm.as_mut() {
-            Some(d) => d,
-            None => return MergeAction::Cancelled,
-        };
-        match dialog.handle_key(key) {
-            ConfirmationOutcome::Confirmed => {
-                let body = self.body.clone().unwrap_or_default();
-                MergeAction::Confirmed {
-                    number: self.request.number,
-                    title: self.request.title.clone(),
-                    body,
-                }
+        match self.step {
+            MergeStep::ConfirmPush => {
+                let Some(dialog) = self.push_confirm.as_mut() else {
+                    return MergeAction::Cancelled;
+                };
+                let outcome = dialog.handle_key(key);
+                self.resolve_push_outcome(outcome)
             }
-            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
-                MergeAction::Cancelled
+            _ => {
+                let Some(dialog) = self.confirm.as_mut() else {
+                    return MergeAction::Cancelled;
+                };
+                let outcome = dialog.handle_key(key);
+                self.resolve_merge_outcome(outcome)
             }
-            ConfirmationOutcome::Pending => MergeAction::Continue,
         }
     }
 
@@ -161,16 +196,37 @@ impl MergePullRequestScreen {
         {
             return MergeAction::Continue;
         }
-        let Some(dialog) = self.confirm.as_mut() else {
-            return MergeAction::Cancelled;
-        };
-        match dialog.handle_mouse_click(position) {
+        match self.step {
+            MergeStep::ConfirmPush => {
+                let Some(dialog) = self.push_confirm.as_mut() else {
+                    return MergeAction::Cancelled;
+                };
+                let outcome = dialog.handle_mouse_click(position);
+                self.resolve_push_outcome(outcome)
+            }
+            _ => {
+                let Some(dialog) = self.confirm.as_mut() else {
+                    return MergeAction::Cancelled;
+                };
+                let outcome = dialog.handle_mouse_click(position);
+                self.resolve_merge_outcome(outcome)
+            }
+        }
+    }
+
+    /// Map an outcome from the first (merge Yes/No) modal into a
+    /// [`MergeAction`]. Confirming with unpushed commits present routes to
+    /// the [`MergeStep::ConfirmPush`] prompt instead of merging immediately.
+    fn resolve_merge_outcome(&mut self, outcome: ConfirmationOutcome) -> MergeAction {
+        match outcome {
             ConfirmationOutcome::Confirmed => {
-                let body = self.body.clone().unwrap_or_default();
-                MergeAction::Confirmed {
-                    number: self.request.number,
-                    title: self.request.title.clone(),
-                    body,
+                if self.unpushed_commits > 0 {
+                    self.push_confirm =
+                        Some(build_push_confirm(&self.request, self.unpushed_commits));
+                    self.step = MergeStep::ConfirmPush;
+                    MergeAction::Continue
+                } else {
+                    self.confirmed_action(false)
                 }
             }
             ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
@@ -180,12 +236,35 @@ impl MergePullRequestScreen {
         }
     }
 
+    /// Map an outcome from the push-before-merge modal. Confirm (default)
+    /// pushes then merges; Decline merges without pushing; Esc aborts.
+    fn resolve_push_outcome(&mut self, outcome: ConfirmationOutcome) -> MergeAction {
+        match outcome {
+            ConfirmationOutcome::Confirmed => self.confirmed_action(true),
+            ConfirmationOutcome::Declined => self.confirmed_action(false),
+            ConfirmationOutcome::Cancelled => MergeAction::Cancelled,
+            ConfirmationOutcome::Pending => MergeAction::Continue,
+        }
+    }
+
+    fn confirmed_action(&self, push_first: bool) -> MergeAction {
+        MergeAction::Confirmed {
+            number: self.request.number,
+            title: self.request.title.clone(),
+            body: self.body.clone().unwrap_or_default(),
+            worktree_path: self.request.worktree_path.clone(),
+            push_first,
+        }
+    }
+
     /// Inner content height for the framed panel (excludes the rounded
     /// border drawn by `App::render_framed_panel`).
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
             MergeStep::Loading | MergeStep::Merging => 3,
-            MergeStep::Confirm => self.confirm_view().content_height().max(14),
+            MergeStep::Confirm | MergeStep::ConfirmPush => {
+                self.confirm_view().content_height().max(14)
+            }
         }
     }
 
@@ -219,11 +298,16 @@ impl MergePullRequestScreen {
                     .render(frame, area);
             }
             MergeStep::Merging => {
-                StatusIndicator::new(Status::Loading, MERGE_RUNNING_MESSAGE)
+                let message = if self.pushing_before_merge {
+                    MERGE_PUSH_RUNNING_MESSAGE
+                } else {
+                    MERGE_RUNNING_MESSAGE
+                };
+                StatusIndicator::new(Status::Loading, message)
                     .with_tick(self.tick)
                     .render(frame, area);
             }
-            MergeStep::Confirm => self.render_confirm(frame, area),
+            MergeStep::Confirm | MergeStep::ConfirmPush => self.render_confirm(frame, area),
         }
     }
 
@@ -245,15 +329,53 @@ impl MergePullRequestScreen {
         ))];
         description.extend(body_preview_lines(self.body.as_deref()));
 
-        PrConfirmView::new(format!("Merge Pull Request #{}?", self.request.number))
-            .block(build_detail_lines(&self.request))
-            .steps(&[format!(
-                "gh pr merge #{} --squash (all commits squashed into base)",
-                self.request.number
-            )])
-            .block(description)
-            .modal(self.confirm.as_ref())
+        // While the push prompt is up, the active modal is `push_confirm`;
+        // otherwise it's the merge Yes/No modal.
+        let modal = match self.step {
+            MergeStep::ConfirmPush => self.push_confirm.as_ref(),
+            _ => self.confirm.as_ref(),
+        };
+
+        let mut view = PrConfirmView::new(format!("Merge Pull Request #{}?", self.request.number))
+            .block(build_detail_lines(&self.request));
+        if self.unpushed_commits > 0 {
+            view = view.block(unpushed_warning_lines(self.unpushed_commits));
+        }
+        view.steps(&[format!(
+            "gh pr merge #{} --squash (all commits squashed into base)",
+            self.request.number
+        )])
+        .block(description)
+        .modal(modal)
     }
+}
+
+/// A bold warning block shown on the confirm panel whenever the worktree
+/// carries local commits that have not reached the PR yet.
+fn unpushed_warning_lines(count: u64) -> Vec<Line<'static>> {
+    let plural = if count == 1 { "commit" } else { "commits" };
+    vec![Line::from(Span::styled(
+        format!(
+            "⚠ {count} local {plural} not pushed — a squash-merge drops them unless pushed first."
+        ),
+        Style::default()
+            .fg(colors::WARNING)
+            .add_modifier(Modifier::BOLD),
+    ))]
+}
+
+fn build_push_confirm(request: &MergePullRequestRequest, count: u64) -> ConfirmationModal {
+    let plural = if count == 1 { "commit" } else { "commits" };
+    ConfirmationModal::new()
+        .with_title(format!("Push before merging PR #{}?", request.number))
+        .with_subtitle(format!(
+            "This worktree has {count} local {plural} not on the PR. Push them \
+             (git push origin HEAD) before the squash-merge so they aren't lost?"
+        ))
+        .with_confirm_text("Push & merge")
+        .with_cancel_text("Merge only")
+        .with_color_value(colors::WARNING)
+        .with_selected(ConfirmationChoice::Confirm)
 }
 
 fn build_confirm(request: &MergePullRequestRequest) -> ConfirmationModal {
@@ -477,10 +599,15 @@ mod tests {
                 number,
                 title,
                 body,
+                worktree_path,
+                push_first,
             } => {
                 assert_eq!(number, 42);
                 assert_eq!(title, "Improve dashboard footer details");
                 assert_eq!(body, "Multi-line\nbody preserved verbatim");
+                assert_eq!(worktree_path, "/tmp/repo-bug");
+                // No unpushed commits recorded → merge straight away.
+                assert!(!push_first);
             }
             other => panic!("expected Confirmed, got {other:?}"),
         }
@@ -490,7 +617,7 @@ mod tests {
     fn keys_are_ignored_while_merging() {
         let mut screen = MergePullRequestScreen::new(sample_request());
         screen.set_body("body".to_string());
-        screen.start_merging();
+        screen.start_merging(false);
         let esc = KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
         assert_eq!(screen.handle_key(esc), MergeAction::Continue);
         let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
@@ -505,6 +632,89 @@ mod tests {
         assert!(screen.confirm.is_none());
         let any = KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE);
         assert_eq!(screen.handle_key(any), MergeAction::Cancelled);
+    }
+
+    /// Advance the merge Yes/No modal (which defaults to No) to Yes and press
+    /// Enter, returning the resulting action.
+    fn confirm_merge_yes(screen: &mut MergePullRequestScreen) -> MergeAction {
+        let tab = KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(tab), MergeAction::Continue);
+        let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        screen.handle_key(enter)
+    }
+
+    #[test]
+    fn no_unpushed_commits_merges_without_push_prompt() {
+        let mut screen = MergePullRequestScreen::new(sample_request());
+        screen.set_body("body".to_string());
+        // set_unpushed_commits is never called → count stays 0.
+        match confirm_merge_yes(&mut screen) {
+            MergeAction::Confirmed { push_first, .. } => assert!(!push_first),
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+        assert_ne!(screen.step(), MergeStep::ConfirmPush);
+    }
+
+    #[test]
+    fn unpushed_commits_route_confirm_to_push_prompt_defaulting_to_push() {
+        let mut screen = MergePullRequestScreen::new(sample_request());
+        screen.set_body("body".to_string());
+        screen.set_unpushed_commits(2);
+        // Confirming the merge does NOT merge yet — it opens the push prompt.
+        assert_eq!(confirm_merge_yes(&mut screen), MergeAction::Continue);
+        assert_eq!(screen.step(), MergeStep::ConfirmPush);
+        let dialog = screen
+            .push_confirm
+            .as_ref()
+            .expect("push modal built on ConfirmPush");
+        // The push option is pre-selected by default.
+        assert_eq!(dialog.selected(), ConfirmationChoice::Confirm);
+    }
+
+    #[test]
+    fn push_prompt_enter_pushes_then_merges() {
+        let mut screen = MergePullRequestScreen::new(sample_request());
+        screen.set_body("body".to_string());
+        screen.set_unpushed_commits(1);
+        confirm_merge_yes(&mut screen);
+        let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        match screen.handle_key(enter) {
+            MergeAction::Confirmed {
+                push_first,
+                worktree_path,
+                ..
+            } => {
+                assert!(push_first, "default choice pushes before merging");
+                assert_eq!(worktree_path, "/tmp/repo-bug");
+            }
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_prompt_decline_merges_without_pushing() {
+        let mut screen = MergePullRequestScreen::new(sample_request());
+        screen.set_body("body".to_string());
+        screen.set_unpushed_commits(3);
+        confirm_merge_yes(&mut screen);
+        // Tab moves off the default "Push & merge" to "Merge only".
+        let tab = KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(tab), MergeAction::Continue);
+        let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        match screen.handle_key(enter) {
+            MergeAction::Confirmed { push_first, .. } => assert!(!push_first),
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_prompt_esc_cancels_the_whole_flow() {
+        let mut screen = MergePullRequestScreen::new(sample_request());
+        screen.set_body("body".to_string());
+        screen.set_unpushed_commits(2);
+        confirm_merge_yes(&mut screen);
+        let esc = KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(esc), MergeAction::Cancelled);
     }
 
     #[test]

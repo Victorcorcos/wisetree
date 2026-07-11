@@ -250,11 +250,25 @@ enum BugkillCommitOutcome {
 struct MergePrDetailsPayload {
     title: String,
     body: String,
+    /// Local commits on the worktree not yet pushed to its tracking remote.
+    /// Drives the "push before merging?" guard on the confirm screen.
+    unpushed_commits: u64,
 }
 
 struct MergePrFailure {
     number: u64,
     message: String,
+}
+
+/// Everything the background merge task needs: the `gh pr merge` subject +
+/// body, plus the worktree to (optionally) `git push origin HEAD` from
+/// before merging so unpushed local commits reach the PR first.
+struct MergeExecution {
+    number: u64,
+    subject: String,
+    body: String,
+    worktree_path: String,
+    push_first: bool,
 }
 
 struct UpdatePrSuccess {
@@ -1650,16 +1664,22 @@ impl App {
                         number,
                         title,
                         body,
+                        worktree_path,
+                        push_first,
                     } => {
                         if let Some(screen) = self.merge_pr.as_mut() {
-                            screen.start_merging();
+                            screen.start_merging(push_first);
                         }
                         kick_off_merge_pull_request(
                             self.git_root.clone(),
                             self.current_dashboard_config(),
-                            number,
-                            title,
-                            body,
+                            MergeExecution {
+                                number,
+                                subject: title,
+                                body,
+                                worktree_path,
+                                push_first,
+                            },
                             tx.clone(),
                         );
                     }
@@ -1820,16 +1840,22 @@ impl App {
                 number,
                 title,
                 body,
+                worktree_path,
+                push_first,
             } => {
                 if let Some(screen) = self.merge_pr.as_mut() {
-                    screen.start_merging();
+                    screen.start_merging(push_first);
                 }
                 kick_off_merge_pull_request(
                     self.git_root.clone(),
                     self.current_dashboard_config(),
-                    number,
-                    title,
-                    body,
+                    MergeExecution {
+                        number,
+                        subject: title,
+                        body,
+                        worktree_path,
+                        push_first,
+                    },
                     tx.clone(),
                 );
             }
@@ -3677,12 +3703,14 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let number = request.number;
+        let worktree_path = request.worktree_path.clone();
         self.merge_pr = Some(MergePullRequestScreen::new(request));
         self.screen = Screen::MergePullRequest;
         kick_off_fetch_pr_details(
             self.git_root.clone(),
             self.current_dashboard_config(),
             number,
+            worktree_path,
             tx.clone(),
         );
     }
@@ -4702,6 +4730,7 @@ impl App {
             Ok(payload) => {
                 screen.override_title(payload.title);
                 screen.set_body(payload.body);
+                screen.set_unpushed_commits(payload.unpushed_commits);
             }
             Err(message) => {
                 self.show_toast(
@@ -6306,6 +6335,7 @@ fn kick_off_fetch_pr_details(
     git_root: Option<String>,
     config: DashboardConfig,
     number: u64,
+    worktree_path: String,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -6316,12 +6346,16 @@ fn kick_off_fetch_pr_details(
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
+        // Detect unpushed local commits alongside the body fetch so the
+        // confirm screen can warn before a squash-merge silently drops them.
+        let unpushed_commits = service.unpushed_commit_count(&worktree_path).await;
         let result = service
             .fetch_pr_details(number)
             .await
             .map(|details| MergePrDetailsPayload {
                 title: details.title,
                 body: details.body,
+                unpushed_commits,
             })
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::MergePrDetailsLoaded(result));
@@ -6331,11 +6365,10 @@ fn kick_off_fetch_pr_details(
 fn kick_off_merge_pull_request(
     git_root: Option<String>,
     config: DashboardConfig,
-    number: u64,
-    subject: String,
-    body: String,
+    exec: MergeExecution,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let number = exec.number;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::MergePrFinished(Err(MergePrFailure {
             number,
@@ -6345,7 +6378,25 @@ fn kick_off_merge_pull_request(
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = match service.merge_pull_request(number, &subject, &body).await {
+        // Flush local commits into the PR before merging so the squash
+        // doesn't drop them. A push failure aborts the merge — better to
+        // stop than to merge a stale PR and lose the commits.
+        if exec.push_first {
+            if let Err(err) = service.push_head_to_origin(&exec.worktree_path).await {
+                let _ = tx.send(AppEvent::MergePrFinished(Err(MergePrFailure {
+                    number,
+                    message: format!(
+                        "Failed to push local commits before merge: {}",
+                        user_friendly_message(&err)
+                    ),
+                })));
+                return;
+            }
+        }
+        let result = match service
+            .merge_pull_request(number, &exec.subject, &exec.body)
+            .await
+        {
             Ok(()) => Ok(number),
             Err(err) => Err(MergePrFailure {
                 number,
