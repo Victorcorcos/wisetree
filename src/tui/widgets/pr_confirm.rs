@@ -40,6 +40,13 @@ use crate::messages::colors;
 /// modal auto-centers into on the Bugkill confirm page.
 const MODAL_HEIGHT: u16 = 12;
 
+/// Fixed column width every detail label is padded to. Keeps values aligned
+/// across commands. Labels must stay shorter than this so a space always
+/// separates the label from its value — a label of exactly `LABEL_WIDTH`
+/// chars would butt straight up against the value (which is why the Merge
+/// page splits the 12-char "Ahead/Behind" into short "Ahead"/"Behind" rows).
+const LABEL_WIDTH: usize = 12;
+
 /// One `Role / Model / Thinking` row in the "which AIs will run" table. The
 /// `role` label mirrors the command's `ai.*` config key (e.g. `investigate`,
 /// `plan`, `apply`, `enrich`, `update`) so a reader can map the row straight
@@ -69,25 +76,35 @@ impl AiRoleRow {
 }
 
 /// The canonical detail row shared by every PR confirm panel: a `label`
-/// padded to a fixed width in muted/dim, followed by the styled `value` and
-/// an optional dim `trailing` note. Padding to 12 keeps labels aligned across
-/// commands ("Base ref", "Ahead/Behind", "Last commit", …).
+/// padded to [`LABEL_WIDTH`] in muted/dim, followed by the styled `value` and
+/// an optional dim `trailing` note. The fixed width keeps labels aligned
+/// across commands ("Base ref", "Worktree", "Last commit", …).
 pub fn labeled_line(
     label: &str,
     value: Span<'static>,
     trailing: Option<Span<'static>>,
 ) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
+    let mut values: Vec<Span<'static>> = Vec::with_capacity(2);
+    values.push(value);
+    if let Some(extra) = trailing {
+        values.push(extra);
+    }
+    labeled_spans(label, values)
+}
+
+/// Like [`labeled_line`] but for a value made of several independently styled
+/// spans — e.g. a commit's sha, summary, and relative time each in their own
+/// color. The `label` is padded to the same [`LABEL_WIDTH`] so these rows line
+/// up with plain `labeled_line`s on the same panel.
+pub fn labeled_spans(label: &str, values: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(values.len() + 1);
     spans.push(Span::styled(
-        format!("{label:<12}"),
+        format!("{label:<LABEL_WIDTH$}"),
         Style::default()
             .fg(colors::MUTED)
             .add_modifier(Modifier::DIM),
     ));
-    spans.push(value);
-    if let Some(extra) = trailing {
-        spans.push(extra);
-    }
+    spans.extend(values);
     Line::from(spans)
 }
 
