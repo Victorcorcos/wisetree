@@ -1192,6 +1192,32 @@ impl DashboardService {
             .await
     }
 
+    /// Number of commits on the worktree's local `HEAD` that have not yet
+    /// been pushed to its tracking remote (`@{upstream}`). Powers the Merge
+    /// confirm guard: a squash-merge only ever includes what GitHub already
+    /// has, so unpushed local commits are silently dropped unless the user
+    /// pushes them first. Returns 0 when the tracking ref is unconfigured or
+    /// the count can't be parsed — a safe fallback that leaves the existing
+    /// merge-straight-away flow untouched.
+    pub async fn unpushed_commit_count(&self, worktree_path: &str) -> u64 {
+        local_ahead_of_tracking(&self.git_binary, &PathBuf::from(worktree_path)).await
+    }
+
+    /// Push the worktree's `HEAD` to `origin` (`git push origin HEAD`). Used
+    /// by the Merge flow to flush local commits into the PR before it is
+    /// squash-merged, so nothing is lost.
+    pub async fn push_head_to_origin(&self, worktree_path: &str) -> Result<()> {
+        let cwd = PathBuf::from(worktree_path);
+        with_timeout(
+            "git push",
+            UPDATE_PUSH_TIMEOUT,
+            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+        )
+        .await?
+        .map_err(WisetreeError::other)?;
+        Ok(())
+    }
+
     async fn merge_pull_request_in_repo(
         &self,
         number: u64,
@@ -6068,6 +6094,48 @@ so the intent reads clearly.
             !did_advance,
             "fetch_base_ref should report no change when the base ref is already current"
         );
+    }
+
+    #[tokio::test]
+    async fn unpushed_commit_count_tracks_local_commits_until_pushed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let remote_str = remote.to_str().unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        // Bare remote with a `main` clone that is fully pushed to start.
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("a.txt"), "1").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+
+        let service = DashboardService::new(work.clone(), DashboardConfig::default());
+        let work_str = work.to_str().unwrap();
+
+        // Fully pushed → nothing to warn about.
+        assert_eq!(service.unpushed_commit_count(work_str).await, 0);
+
+        // Two local commits that never reached the remote.
+        std::fs::write(work.join("b.txt"), "2").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "second"]);
+        std::fs::write(work.join("c.txt"), "3").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "third"]);
+        assert_eq!(service.unpushed_commit_count(work_str).await, 2);
+
+        // Pushing HEAD flushes them, so the count drops back to zero.
+        service
+            .push_head_to_origin(work_str)
+            .await
+            .expect("push HEAD");
+        assert_eq!(service.unpushed_commit_count(work_str).await, 0);
     }
 
     #[tokio::test]
