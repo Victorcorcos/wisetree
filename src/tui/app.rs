@@ -1657,8 +1657,11 @@ impl App {
                 match action {
                     MergeAction::Continue => {}
                     MergeAction::Cancelled => {
-                        self.merge_pr = None;
-                        self.enter_screen(Screen::Dashboard, tx);
+                        let worktree_path = self
+                            .merge_pr
+                            .take()
+                            .map(|s| s.request().worktree_path.clone());
+                        self.back_to_dashboard_action_menu(worktree_path, tx);
                     }
                     MergeAction::Confirmed {
                         number,
@@ -1694,6 +1697,10 @@ impl App {
                 match action {
                     UpdateAction::Continue => {}
                     UpdateAction::Cancelled => {
+                        let worktree_path = self
+                            .update_pr
+                            .as_ref()
+                            .map(|s| s.request().worktree_path.clone());
                         if let Some(screen) = self.update_pr.as_ref() {
                             if screen.ai_active() {
                                 let request = screen.request().clone();
@@ -1708,7 +1715,7 @@ impl App {
                             }
                         }
                         self.update_pr = None;
-                        self.enter_screen(Screen::Dashboard, tx);
+                        self.back_to_dashboard_action_menu(worktree_path, tx);
                     }
                     UpdateAction::Confirmed => self.confirm_update_pr(tx),
                     UpdateAction::AiComplete => self.start_commit_after_ai(),
@@ -1833,8 +1840,11 @@ impl App {
         match action {
             MergeAction::Continue => {}
             MergeAction::Cancelled => {
-                self.merge_pr = None;
-                self.enter_screen(Screen::Dashboard, tx);
+                let worktree_path = self
+                    .merge_pr
+                    .take()
+                    .map(|s| s.request().worktree_path.clone());
+                self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             MergeAction::Confirmed {
                 number,
@@ -1875,6 +1885,10 @@ impl App {
                 // `git merge --abort` strands the worktree with conflict
                 // markers and a half-applied merge. Run the same cleanup
                 // path as AiCancel before we navigate away.
+                let worktree_path = self
+                    .update_pr
+                    .as_ref()
+                    .map(|s| s.request().worktree_path.clone());
                 if let Some(screen) = self.update_pr.as_ref() {
                     if screen.ai_active() {
                         let request = screen.request().clone();
@@ -1884,7 +1898,7 @@ impl App {
                     }
                 }
                 self.update_pr = None;
-                self.enter_screen(Screen::Dashboard, tx);
+                self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             UpdateAction::Confirmed => self.confirm_update_pr(tx),
             UpdateAction::AiComplete => self.start_commit_after_ai(),
@@ -2017,8 +2031,11 @@ impl App {
         match action {
             EnrichAction::Continue => {}
             EnrichAction::Cancelled => {
-                self.enrich_pr = None;
-                self.enter_screen(Screen::Dashboard, tx);
+                let worktree_path = self
+                    .enrich_pr
+                    .take()
+                    .map(|s| s.request().worktree_path.clone());
+                self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             EnrichAction::Confirmed => {
                 let Some(screen) = self.enrich_pr.as_mut() else {
@@ -2151,8 +2168,11 @@ impl App {
         match action {
             FixAction::Continue => {}
             FixAction::Cancelled => {
-                self.fix_pr = None;
-                self.enter_screen(Screen::Dashboard, tx);
+                let worktree_path = self
+                    .fix_pr
+                    .take()
+                    .map(|s| s.request().worktree_path.clone());
+                self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             FixAction::Confirmed => {
                 let Some(screen) = self.fix_pr.as_mut() else {
@@ -2336,9 +2356,12 @@ impl App {
         match action {
             BugkillAction::Continue => {}
             BugkillAction::Cancelled => {
-                self.bugkill_pr = None;
+                let worktree_path = self
+                    .bugkill_pr
+                    .take()
+                    .map(|s| s.request().worktree_path.clone());
                 self.bugkill_investigation = None;
-                self.enter_screen(Screen::Dashboard, tx);
+                self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             BugkillAction::Confirmed => {
                 if let Some(screen) = self.bugkill_pr.as_mut() {
@@ -5318,6 +5341,26 @@ impl App {
         self.pending_bulk_delete_paths.clear();
         self.bulk_delete_queue.clear();
         self.menu = Some(self.build_menu_screen());
+    }
+
+    /// Return from a cancelled PR-command screen (Merge/Update/Enrich/Fix/
+    /// Bugkill) to the dashboard's action menu for the worktree the command
+    /// was launched from, instead of the bare table. Cancel only ever fires
+    /// before any git state changes, so the dashboard's already-loaded rows
+    /// are still accurate — no rebuild/refetch needed. Falls back to a fresh
+    /// dashboard if the underlying instance was somehow lost.
+    fn back_to_dashboard_action_menu(
+        &mut self,
+        worktree_path: Option<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match (self.dashboard.as_mut(), worktree_path) {
+            (Some(dashboard), Some(path)) => {
+                self.screen = Screen::Dashboard;
+                dashboard.reopen_action_menu_for_worktree(&path);
+            }
+            _ => self.enter_screen(Screen::Dashboard, tx),
+        }
     }
 
     fn finish_create_success(&mut self) {

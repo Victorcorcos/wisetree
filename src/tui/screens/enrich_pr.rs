@@ -792,6 +792,7 @@ impl EnrichPullRequestScreen {
     /// [`Self::preferred_content_height`] and the render agree on the height.
     fn confirm_view(&self) -> PrConfirmView<'_> {
         PrConfirmView::new(confirm_title(&self.request))
+            .title_color(colors::BRAND)
             .block(build_detail_lines(&self.request))
             .steps(&build_steps(&self.request))
             .ai_roles(vec![AiRoleRow::new(
@@ -1133,7 +1134,7 @@ fn build_confirm(request: &EnrichPullRequestRequest) -> ConfirmationModal {
         .with_subtitle(subtitle)
         .with_confirm_text("Yes")
         .with_cancel_text("No")
-        .with_color_value(colors::INFO)
+        .with_color_value(colors::BRAND)
         .with_selected(ConfirmationChoice::Cancel)
 }
 

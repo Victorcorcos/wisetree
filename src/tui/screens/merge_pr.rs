@@ -337,6 +337,7 @@ impl MergePullRequestScreen {
         };
 
         let mut view = PrConfirmView::new(format!("Merge Pull Request #{}?", self.request.number))
+            .title_color(colors::SUCCESS)
             .block(build_detail_lines(&self.request));
         if self.unpushed_commits > 0 {
             view = view.block(unpushed_warning_lines(self.unpushed_commits));
@@ -388,7 +389,7 @@ fn build_confirm(request: &MergePullRequestRequest) -> ConfirmationModal {
         .with_subtitle(prompt)
         .with_confirm_text("Yes")
         .with_cancel_text("No")
-        .with_color_value(colors::INFO)
+        .with_color_value(colors::SUCCESS)
         .with_selected(ConfirmationChoice::Cancel)
 }
 
