@@ -31,8 +31,8 @@ use crate::messages::colors;
 use crate::services::CheckStatus;
 use crate::tui::screens::dashboard::MergePullRequestRequest;
 use crate::tui::widgets::{
-    labeled_line, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, PrConfirmView,
-    Status, StatusIndicator,
+    labeled_line, labeled_spans, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+    PrConfirmView, Status, StatusIndicator,
 };
 
 const MERGE_LOADING_MESSAGE: &str = "Loading pull request details...";
@@ -320,13 +320,25 @@ impl MergePullRequestScreen {
     /// AI, so there is no "which AIs run" table. Built in one place so
     /// [`Self::preferred_content_height`] and the render agree on the height.
     fn confirm_view(&self) -> PrConfirmView<'_> {
-        // The PR description, under a bold "Description:" header, as one block.
-        let mut description = vec![Line::from(Span::styled(
-            "Description:",
-            Style::default()
-                .fg(colors::INFO)
-                .add_modifier(Modifier::BOLD),
-        ))];
+        // Preview of the message the squash commit will carry: the PR title
+        // becomes the subject (shown above) and the PR description becomes the
+        // body previewed here. Labeling it as the *commit message* — rather
+        // than a generic "Description:" snippet — tells the user why the text
+        // matters before they merge.
+        let mut description = vec![Line::from(vec![
+            Span::styled(
+                "Squash commit message",
+                Style::default()
+                    .fg(colors::INFO)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  (subject = PR title, body below)".to_string(),
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ])];
         description.extend(body_preview_lines(self.body.as_deref()));
 
         // While the push prompt is up, the active modal is `push_confirm`;
@@ -458,33 +470,73 @@ fn build_detail_lines(request: &MergePullRequestRequest) -> Vec<Line<'static>> {
         ));
     }
 
+    // Divergence from the base, split into short "Behind"/"Ahead" rows with
+    // colored `-N`/`+N` values (mirrors the Update PR confirm panel). Kept as
+    // two rows so neither label hits the 12-char width that would jam the
+    // value straight against it.
     if let Some((ahead, behind)) = request.ahead_behind {
-        let summary = if ahead == 0 && behind == 0 {
-            "up to date with base".to_string()
+        if ahead == 0 && behind == 0 {
+            rows.push(labeled_line(
+                "Sync",
+                Span::styled(
+                    "up to date with base".to_string(),
+                    Style::default().fg(colors::SUCCESS),
+                ),
+                None,
+            ));
         } else {
-            let mut parts: Vec<String> = Vec::new();
-            if ahead > 0 {
-                parts.push(format!("ahead {ahead}"));
-            }
             if behind > 0 {
-                parts.push(format!("behind {behind}"));
+                rows.push(labeled_line(
+                    "Behind",
+                    Span::styled(
+                        format!("-{behind}"),
+                        Style::default()
+                            .fg(colors::ERROR)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    None,
+                ));
             }
-            parts.join(" / ")
-        };
-        rows.push(labeled_line(
-            "Ahead/Behind",
-            Span::styled(summary, Style::default().fg(colors::EMPHASIS)),
-            None,
-        ));
+            if ahead > 0 {
+                rows.push(labeled_line(
+                    "Ahead",
+                    Span::styled(
+                        format!("+{ahead}"),
+                        Style::default()
+                            .fg(colors::SUCCESS)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    None,
+                ));
+            }
+        }
     }
 
+    // The commit at the tip of the branch, rendered as distinct spans. The
+    // sha (accent) and relative time (dim) lead because they are always short
+    // and worth keeping visible; the summary follows in white and, being the
+    // long/variable part, is the piece that clips at the panel edge — just
+    // like the URL and Worktree rows above.
     if let Some(commit) = request.last_commit.as_ref() {
-        let value = format!("{}  {}", short_sha(&commit.sha), commit.summary);
-        rows.push(labeled_line(
-            "Last commit",
-            Span::styled(value, Style::default().fg(colors::EMPHASIS)),
-            None,
+        let mut spans = vec![Span::styled(
+            short_sha(&commit.sha),
+            Style::default()
+                .fg(colors::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if !commit.relative_time.trim().is_empty() {
+            spans.push(Span::styled(
+                format!(" · {}", commit.relative_time),
+                Style::default()
+                    .fg(colors::MUTED)
+                    .add_modifier(Modifier::DIM),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("  {}", commit.summary.trim()),
+            Style::default().fg(colors::WHITE),
         ));
+        rows.push(labeled_spans("Last commit", spans));
     }
 
     rows
@@ -512,7 +564,7 @@ fn body_preview_lines(body: Option<&str>) -> Vec<Line<'static>> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return vec![Line::from(Span::styled(
-            "(no description)".to_string(),
+            "(the squash commit will have an empty body)".to_string(),
             muted,
         ))];
     }
@@ -723,7 +775,10 @@ mod tests {
         let lines = body_preview_lines(Some("   \n   "));
         assert_eq!(lines.len(), 1);
         let first_span = &lines[0].spans[0];
-        assert_eq!(first_span.content, "(no description)");
+        assert_eq!(
+            first_span.content,
+            "(the squash commit will have an empty body)"
+        );
     }
 
     #[test]
@@ -736,6 +791,74 @@ mod tests {
         assert_eq!(lines.len(), BODY_PREVIEW_MAX_LINES + 1);
         let last = lines.last().unwrap();
         assert_eq!(last.spans[0].content, "…");
+    }
+
+    #[test]
+    fn ahead_behind_split_into_signed_rows_without_label_collision() {
+        // Regression for the jammed "Ahead/Behindahead 4" row: the divergence
+        // is now two short, aligned rows with signed values — never a 12-char
+        // label butting straight against its value.
+        let rows = build_detail_lines(&sample_request());
+        let text =
+            |line: &Line| -> String { line.spans.iter().map(|s| s.content.to_string()).collect() };
+        // sample_request is 2 ahead / 0 behind → one "Ahead +2" row, no behind.
+        assert!(
+            rows.iter()
+                .any(|l| text(l).starts_with("Ahead") && text(l).contains("+2")),
+            "expected a signed Ahead row"
+        );
+        assert!(
+            !rows.iter().any(|l| text(l).contains("Ahead/Behind")),
+            "the old jammed combined label must be gone"
+        );
+    }
+
+    #[test]
+    fn behind_row_renders_signed_and_bold() {
+        let mut request = sample_request();
+        request.ahead_behind = Some((0, 3));
+        let rows = build_detail_lines(&request);
+        let behind = rows
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content == "-3"))
+            .expect("expected a Behind row with -3");
+        // The signed count is the styled value span, not the label.
+        let value = behind.spans.iter().find(|s| s.content == "-3").unwrap();
+        assert_eq!(value.style.fg, Some(colors::ERROR));
+    }
+
+    #[test]
+    fn last_commit_leads_with_sha_and_relative_time() {
+        use crate::services::CommitSummary;
+        let mut request = sample_request();
+        request.last_commit = Some(CommitSummary {
+            sha: "4fd1c7edeadbeef".to_string(),
+            summary: "Tighten dashboard layout".to_string(),
+            relative_time: "5 minutes ago".to_string(),
+            author: "Test".to_string(),
+        });
+        let rows = build_detail_lines(&request);
+        let commit = rows
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.starts_with("Last commit")))
+            .expect("expected a Last commit row");
+        let joined: String = commit.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(joined.contains("4fd1c7e"), "short sha shown: {joined}");
+        assert!(
+            joined.contains("· 5 minutes ago"),
+            "relative time shown: {joined}"
+        );
+        assert!(
+            joined.contains("Tighten dashboard layout"),
+            "summary shown: {joined}"
+        );
+        // The accent sha leads the value, right after the padded label.
+        let sha_span = commit
+            .spans
+            .iter()
+            .find(|s| s.content == "4fd1c7e")
+            .unwrap();
+        assert_eq!(sha_span.style.fg, Some(colors::ACCENT));
     }
 
     #[test]
@@ -767,6 +890,8 @@ mod tests {
         assert!(dumped.contains("https://github.com/example/repo/pull/42"));
         assert!(dumped.contains("Yes"));
         assert!(dumped.contains("No"));
+        // The description snippet is framed as the squash commit's message.
+        assert!(dumped.contains("Squash commit message"));
         assert!(dumped.contains("Some PR description here."));
     }
 }
