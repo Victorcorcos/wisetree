@@ -846,6 +846,7 @@ impl FixPullRequestScreen {
             "Fix review comments on Pull Request #{}?",
             self.request.number
         ))
+        .title_color(colors::CYAN)
         .block(build_detail_lines(&self.request))
         .steps(&FIX_STEPS)
         .ai_roles(vec![
@@ -1236,7 +1237,7 @@ fn build_confirm(request: &FixPullRequestRequest) -> ConfirmationModal {
         ))
         .with_confirm_text("Yes")
         .with_cancel_text("No")
-        .with_color_value(colors::INFO)
+        .with_color_value(colors::CYAN)
         .with_selected(ConfirmationChoice::Cancel)
 }
 

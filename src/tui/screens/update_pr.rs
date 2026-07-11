@@ -1075,6 +1075,7 @@ impl UpdatePullRequestScreen {
             "{title_verb} Pull Request #{}?",
             self.request.number
         ))
+        .title_color(colors::WARNING)
         .block(build_detail_lines(&self.request))
         .steps(&build_steps(base_ref, self.push_only))
         .ai_roles(ai_roles)
@@ -1103,7 +1104,7 @@ fn build_confirm(request: &UpdatePullRequestRequest, push_only: bool) -> Confirm
         .with_subtitle(prompt)
         .with_confirm_text("Yes")
         .with_cancel_text("No")
-        .with_color_value(colors::INFO)
+        .with_color_value(colors::WARNING)
         .with_selected(ConfirmationChoice::Cancel)
 }
 
