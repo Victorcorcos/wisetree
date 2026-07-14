@@ -23,7 +23,7 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -414,6 +414,18 @@ impl EnrichPullRequestScreen {
             self.ai_log.drain(0..drop);
             self.ai_scroll = self.ai_scroll.saturating_sub(drop as u16);
         }
+    }
+
+    /// Forward a host mouse event to the embedded opencode PTY while the inner
+    /// panel is focused, so opencode tracks the cursor exactly as it would when
+    /// run standalone. Returns true when opencode consumed the event.
+    pub fn forward_pty_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !self.pty_focused {
+            return false;
+        }
+        self.pty
+            .as_mut()
+            .is_some_and(|pty| pty.send_mouse(mouse.kind, mouse.column, mouse.row, mouse.modifiers))
     }
 
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {

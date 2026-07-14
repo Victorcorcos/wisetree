@@ -10,6 +10,7 @@
 //! whether the child has exited. When the user navigates away or the
 //! screen tears down, `Drop` kills the child and joins the reader thread.
 
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,12 +18,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use ratatui::buffer::Cell as BufferCell;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as RatColor, Modifier, Style};
 use ratatui::Frame;
-use vt100::{Color as VtColor, Parser};
+use vt100::{Color as VtColor, MouseProtocolEncoding, MouseProtocolMode, Parser};
 
 /// Initial PTY dimensions used before the first render-driven resize.
 /// vt100 happily handles resizes once we know the panel area, so this
@@ -48,6 +50,10 @@ pub struct PtyView {
     /// Last (rows, cols) the parser/PTY were resized to. Avoids a
     /// resize ioctl on every frame when the area hasn't actually changed.
     last_size: (u16, u16),
+    /// The panel `Rect` the PTY was last rendered into. Used to translate
+    /// absolute host mouse coordinates into the child's cell grid when
+    /// forwarding mouse reports.
+    last_area: Cell<Rect>,
 }
 
 impl PtyView {
@@ -146,6 +152,7 @@ impl PtyView {
             done,
             exit_status,
             last_size: (DEFAULT_ROWS, DEFAULT_COLS),
+            last_area: Cell::new(Rect::default()),
         })
     }
 
@@ -198,6 +205,55 @@ impl PtyView {
     pub fn send_input(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+    }
+
+    /// Forward a host mouse event to the child, encoded per the mouse
+    /// protocol the child has enabled (opencode turns on SGR any-motion
+    /// tracking through opentui). `abs_col` / `abs_row` are absolute host
+    /// terminal coordinates; they're translated into the child's cell grid
+    /// using the last render area.
+    ///
+    /// Returns `true` when the child is tracking the mouse and the event was
+    /// handed off — the host then treats the event as consumed instead of
+    /// running its own text-selection / scrollback handling. Returns `false`
+    /// when the child has no mouse mode active, so the host keeps its native
+    /// wheel + selection behavior (e.g. a plain recovery shell that never
+    /// enabled mouse reporting).
+    pub fn send_mouse(
+        &mut self,
+        kind: MouseEventKind,
+        abs_col: u16,
+        abs_row: u16,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        let (mode, encoding) = match self.parser.lock() {
+            Ok(parser) => {
+                let screen = parser.screen();
+                (
+                    screen.mouse_protocol_mode(),
+                    screen.mouse_protocol_encoding(),
+                )
+            }
+            Err(_) => return false,
+        };
+        if mode == MouseProtocolMode::None {
+            return false;
+        }
+        let area = self.last_area.get();
+        if area.width == 0 || area.height == 0 {
+            return false;
+        }
+        // Clamp into the rendered grid so an event that strays outside the
+        // panel (a drag past its edge) still reports a valid edge cell.
+        let col = abs_col.saturating_sub(area.x).min(area.width - 1);
+        let row = abs_row.saturating_sub(area.y).min(area.height - 1);
+        if let Some(bytes) = encode_mouse_report(kind, col, row, modifiers, mode, encoding) {
+            self.send_input(&bytes);
+        }
+        // The child owns the mouse whenever it is tracking — even for an event
+        // this mode doesn't report (e.g. a bare move under button-motion mode),
+        // the host must not also act on it.
+        true
     }
 
     /// Total scrollback rows currently retained by the vt100 parser.
@@ -270,6 +326,7 @@ impl PtyView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        self.last_area.set(area);
         let parser = match self.parser.lock() {
             Ok(p) => p,
             Err(_) => return,
@@ -342,6 +399,88 @@ impl Drop for PtyView {
     }
 }
 
+/// Encode a mouse event as an xterm mouse report for the child terminal.
+/// `col` / `row` are 0-based cell coordinates. Returns `None` when the active
+/// `mode` doesn't report this event kind (e.g. a bare move while the child
+/// only asked for button-motion tracking), so the caller writes nothing.
+fn encode_mouse_report(
+    kind: MouseEventKind,
+    col: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    // Low two bits select the button (0 left, 1 middle, 2 right, 3 none);
+    // bit 5 (0x20) flags motion; bit 6 (0x40) flags a wheel button.
+    const MOTION: u8 = 0x20;
+    let (mut cb, is_release, reportable) = match kind {
+        MouseEventKind::Down(button) => (button_code(button), false, true),
+        // X10 press-only mode never reports releases.
+        MouseEventKind::Up(button) => (button_code(button), true, mode != MouseProtocolMode::Press),
+        MouseEventKind::Drag(button) => (
+            button_code(button) | MOTION,
+            false,
+            matches!(
+                mode,
+                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+            ),
+        ),
+        MouseEventKind::Moved => (0x03 | MOTION, false, mode == MouseProtocolMode::AnyMotion),
+        MouseEventKind::ScrollUp => (0x40, false, true),
+        MouseEventKind::ScrollDown => (0x41, false, true),
+        MouseEventKind::ScrollLeft => (0x42, false, true),
+        MouseEventKind::ScrollRight => (0x43, false, true),
+    };
+    if !reportable {
+        return None;
+    }
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        cb |= 0x04;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        cb |= 0x08;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        cb |= 0x10;
+    }
+
+    match encoding {
+        MouseProtocolEncoding::Sgr => {
+            let final_byte = if is_release { 'm' } else { 'M' };
+            Some(
+                format!(
+                    "\x1b[<{};{};{}{}",
+                    cb,
+                    u32::from(col) + 1,
+                    u32::from(row) + 1,
+                    final_byte
+                )
+                .into_bytes(),
+            )
+        }
+        // Legacy single-byte encoding (Default) and its UTF-8 variant, which
+        // only diverge for coordinates past 95 — rare inside a panel. A
+        // release sets the button bits to 3.
+        MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => {
+            let cb = if is_release { (cb & !0x03) | 0x03 } else { cb };
+            // Each field is offset by 32; coordinates are 1-based and clamp at
+            // the 223-cell ceiling the single-byte form can express.
+            let coord = |v: u16| -> u8 { (v.min(222) as u8) + 1 + 32 };
+            Some(vec![0x1b, b'[', b'M', cb + 32, coord(col), coord(row)])
+        }
+    }
+}
+
+/// The xterm button code for a mouse button (before motion / modifier bits).
+fn button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
 fn convert_color(c: VtColor, _is_fg: bool) -> RatColor {
     match c {
         VtColor::Default => RatColor::Reset,
@@ -406,6 +545,186 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn sgr(bytes: Option<Vec<u8>>) -> String {
+        String::from_utf8(bytes.expect("expected a mouse report")).unwrap()
+    }
+
+    #[test]
+    fn sgr_encodes_press_release_and_motion_with_one_based_coords() {
+        // Left press at cell (0,0) → button 0, `M` terminator, 1-based coords.
+        assert_eq!(
+            sgr(encode_mouse_report(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE,
+                MouseProtocolMode::AnyMotion,
+                MouseProtocolEncoding::Sgr,
+            )),
+            "\x1b[<0;1;1M"
+        );
+        // Release uses the lowercase `m` terminator, keeping the button code.
+        assert_eq!(
+            sgr(encode_mouse_report(
+                MouseEventKind::Up(MouseButton::Left),
+                3,
+                1,
+                KeyModifiers::NONE,
+                MouseProtocolMode::AnyMotion,
+                MouseProtocolEncoding::Sgr,
+            )),
+            "\x1b[<0;4;2m"
+        );
+        // Bare move → no button + motion flag (0x03 | 0x20 = 35).
+        assert_eq!(
+            sgr(encode_mouse_report(
+                MouseEventKind::Moved,
+                4,
+                2,
+                KeyModifiers::NONE,
+                MouseProtocolMode::AnyMotion,
+                MouseProtocolEncoding::Sgr,
+            )),
+            "\x1b[<35;5;3M"
+        );
+        // Wheel-up carries button bit 6 (0x40 = 64).
+        assert_eq!(
+            sgr(encode_mouse_report(
+                MouseEventKind::ScrollUp,
+                0,
+                0,
+                KeyModifiers::NONE,
+                MouseProtocolMode::AnyMotion,
+                MouseProtocolEncoding::Sgr,
+            )),
+            "\x1b[<64;1;1M"
+        );
+    }
+
+    #[test]
+    fn mouse_reports_are_gated_by_the_childs_tracking_mode() {
+        // A bare move is only reported under any-motion tracking.
+        assert!(encode_mouse_report(
+            MouseEventKind::Moved,
+            1,
+            1,
+            KeyModifiers::NONE,
+            MouseProtocolMode::ButtonMotion,
+            MouseProtocolEncoding::Sgr,
+        )
+        .is_none());
+        // A drag needs at least button-motion tracking.
+        assert!(encode_mouse_report(
+            MouseEventKind::Drag(MouseButton::Left),
+            1,
+            1,
+            KeyModifiers::NONE,
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Sgr,
+        )
+        .is_none());
+        // X10 press-only mode never reports releases.
+        assert!(encode_mouse_report(
+            MouseEventKind::Up(MouseButton::Left),
+            1,
+            1,
+            KeyModifiers::NONE,
+            MouseProtocolMode::Press,
+            MouseProtocolEncoding::Sgr,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn default_encoding_offsets_every_field_by_32() {
+        // Left press at (0,0): button 32, coords (1+32)=33 → matches the
+        // classic single-byte `CSI M` report.
+        assert_eq!(
+            encode_mouse_report(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default,
+            ),
+            Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+        // Release collapses the button bits to 3 (32 + 3 = 35).
+        assert_eq!(
+            encode_mouse_report(
+                MouseEventKind::Up(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default,
+            ),
+            Some(vec![0x1b, b'[', b'M', 35, 33, 33])
+        );
+    }
+
+    #[test]
+    fn send_mouse_is_a_no_op_when_the_child_isnt_tracking() {
+        // A freshly spawned `echo` never enables mouse reporting, so the host
+        // keeps ownership of the event (returns false).
+        let mut pty = spawn_echo();
+        assert!(!pty.send_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            0,
+            KeyModifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn send_mouse_forwards_once_the_child_enables_tracking() {
+        // End-to-end proof of the mechanism: a real child that turns on
+        // any-motion + SGR tracking (exactly what opencode's opentui does)
+        // must flip `send_mouse` from a no-op into a forwarded report.
+        let Some(sh) = resolve_on_path("sh") else {
+            return; // no POSIX shell — skip rather than fail on odd hosts.
+        };
+        let mut pty = PtyView::spawn(
+            &sh,
+            &[
+                "-c".to_string(),
+                "printf '\\033[?1003h\\033[?1006h'; sleep 2".to_string(),
+            ],
+            None,
+            &[],
+        )
+        .expect("spawn sh");
+        // Pretend the panel was rendered so coordinate translation has an area.
+        pty.last_area.set(Rect::new(0, 0, 80, 24));
+
+        // Wait for the reader thread to feed the mode-enable escape into vt100.
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let mut enabled = false;
+        while Instant::now() < deadline {
+            if pty
+                .parser
+                .lock()
+                .map(|p| p.screen().mouse_protocol_mode() != MouseProtocolMode::None)
+                .unwrap_or(false)
+            {
+                enabled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(enabled, "child never enabled mouse tracking");
+        assert!(
+            pty.send_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE
+            ),
+            "a tracking child must consume the mouse event"
+        );
     }
 
     #[test]

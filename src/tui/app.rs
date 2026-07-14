@@ -1230,7 +1230,40 @@ impl App {
         }
     }
 
+    /// Hand a mouse event to the active screen's focused inner PTY, if any.
+    /// Returns true when the child (opencode) is tracking the mouse and took
+    /// the event — the four PR-command screens that embed an opencode PTY each
+    /// forward only while their inner panel holds focus.
+    fn forward_mouse_to_focused_pty(&mut self, mouse: MouseEvent) -> bool {
+        match self.screen {
+            Screen::UpdatePullRequest => self
+                .update_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            Screen::EnrichPullRequest => self
+                .enrich_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            Screen::FixPullRequest => self
+                .fix_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            Screen::BugkillPullRequest => self
+                .bugkill_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            _ => false,
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        // When an embedded opencode PTY is focused, the mouse belongs to it:
+        // opencode draws its own cursor and hover state from the reports we
+        // forward, exactly as it would running standalone. If the child
+        // consumed the event, skip the host's own selection / scroll handling.
+        if self.forward_mouse_to_focused_pty(mouse) {
+            return;
+        }
         let Some(snapshot) = self.last_rendered_buffer.as_ref() else {
             return;
         };
