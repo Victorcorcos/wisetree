@@ -95,6 +95,11 @@ pub struct UpdatePullRequestRequest {
     pub ahead: u64,
     pub behind: u64,
     pub base_ref: Option<String>,
+    /// GitHub's `baseRefName` for this PR (a bare branch name like
+    /// `release-0.41`), used to resolve the actual base ref to merge in even
+    /// after the branch has been pushed and its local upstream tracking now
+    /// points at `origin/<branch>`. `None` when unknown.
+    pub pr_base_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +121,10 @@ pub struct EnrichPullRequestRequest {
     pub branch: String,
     pub worktree_path: String,
     pub base_ref: Option<String>,
+    /// GitHub's `baseRefName` for the existing PR (a bare branch name), used
+    /// to resolve the true base ref for the diff prompt even after the branch
+    /// has been pushed. `None` when opening a brand-new PR.
+    pub pr_base_ref: Option<String>,
     /// `Some(n)` when an open PR already exists for the branch → the draft
     /// updates PR #n. `None` when no PR exists yet → the draft opens one.
     pub number: Option<u64>,
@@ -2987,8 +2996,11 @@ fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> 
         ahead,
         behind,
         // App resolves the actual reachable base ref before mounting the
-        // screen; the dashboard never runs git itself.
+        // screen; the dashboard never runs git itself. The PR's GitHub base
+        // branch is carried through so that resolution can recover the real
+        // base even after the branch tracks `origin/<branch>`.
         base_ref: None,
+        pr_base_ref: pr.base_ref_name.clone(),
     })
 }
 
@@ -3011,6 +3023,7 @@ fn build_enrich_request(row: &DashboardRow) -> Option<EnrichPullRequestRequest> 
             branch,
             worktree_path,
             base_ref: None,
+            pr_base_ref: pr.base_ref_name.clone(),
             number: Some(pr.number),
             title: Some(pr.title.clone()),
             url: Some(pr.url.clone()),
@@ -3033,6 +3046,9 @@ fn build_enrich_request(row: &DashboardRow) -> Option<EnrichPullRequestRequest> 
                 branch,
                 worktree_path,
                 base_ref: None,
+                // No PR yet → no GitHub base to recover; the branch's own
+                // tracked upstream (its source branch) drives resolution.
+                pr_base_ref: None,
                 number: None,
                 title: None,
                 url: None,
@@ -3109,7 +3125,9 @@ fn build_push_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
         worktree_path: row.worktree.path.clone(),
         ahead,
         behind,
+        // A push needs no base ref, so resolution never runs for this payload.
         base_ref: None,
+        pr_base_ref: pr.base_ref_name.clone(),
     })
 }
 

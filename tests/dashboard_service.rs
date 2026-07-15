@@ -7,7 +7,7 @@ use wisetree::config::schema::DashboardConfig;
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::services::{
     is_behind, resolve_base_ref, CheckStatus, DashboardNoticeLevel, DashboardRow, DashboardService,
-    MergeStatus, PrState, PullRequest,
+    EnrichSubmitOutcome, EnrichSubmitRequest, MergeStatus, PrState, PullRequest,
 };
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
@@ -754,21 +754,21 @@ async fn resolve_base_ref_picks_upstream_main_when_all_four_present() {
         "origin/main",
         "origin/master",
     ]);
-    let chosen = resolve_base_ref(&repo).await;
+    let chosen = resolve_base_ref(&repo, None).await;
     assert_eq!(chosen.as_deref(), Some("upstream/main"));
 }
 
 #[tokio::test]
 async fn resolve_base_ref_falls_through_to_origin_master() {
     let (_dir, repo) = repo_with_remote_refs(&["origin/master"]);
-    let chosen = resolve_base_ref(&repo).await;
+    let chosen = resolve_base_ref(&repo, None).await;
     assert_eq!(chosen.as_deref(), Some("origin/master"));
 }
 
 #[tokio::test]
 async fn resolve_base_ref_returns_none_when_no_remote_refs_exist() {
     let (_dir, repo) = repo_with_remote_refs(&[]);
-    let chosen = resolve_base_ref(&repo).await;
+    let chosen = resolve_base_ref(&repo, None).await;
     assert!(
         chosen.is_none(),
         "expected None when no remote refs exist, got {chosen:?}"
@@ -778,8 +778,182 @@ async fn resolve_base_ref_returns_none_when_no_remote_refs_exist() {
 #[tokio::test]
 async fn resolve_base_ref_priority_skips_missing_upstream_to_origin_main() {
     let (_dir, repo) = repo_with_remote_refs(&["origin/main", "origin/master"]);
-    let chosen = resolve_base_ref(&repo).await;
+    let chosen = resolve_base_ref(&repo, None).await;
     assert_eq!(chosen.as_deref(), Some("origin/main"));
+}
+
+/// HEAD of the repo at `path`.
+fn rev_parse_head(path: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .expect("rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Build a repo whose current branch `local` tracks the remote-tracking ref
+/// `tracks` (`<remote>/<branch>`) — exactly the config `git worktree add -b
+/// <name> <remote>/<source>` seeds — so `@{upstream}` names the branch the
+/// worktree was cut from. `remote_refs` (which must include `tracks`) are
+/// seeded at `refs/remotes/<r>`.
+fn repo_with_tracking_branch(
+    local: &str,
+    tracks: &str,
+    remote_refs: &[&str],
+) -> (TempDir, PathBuf) {
+    let (dir, path) = repo_with_remote_refs(remote_refs);
+    let (remote, source) = tracks.split_once('/').expect("tracks is <remote>/<branch>");
+    let sha = rev_parse_head(&path);
+    git(&path, &["config", &format!("remote.{remote}.url"), "."]);
+    git(
+        &path,
+        &[
+            "config",
+            &format!("remote.{remote}.fetch"),
+            &format!("+refs/heads/*:refs/remotes/{remote}/*"),
+        ],
+    );
+    git(&path, &["branch", local, &sha]);
+    git(
+        &path,
+        &["config", &format!("branch.{local}.remote"), remote],
+    );
+    git(
+        &path,
+        &[
+            "config",
+            &format!("branch.{local}.merge"),
+            &format!("refs/heads/{source}"),
+        ],
+    );
+    git(&path, &["switch", "-q", local]);
+    (dir, path)
+}
+
+/// The reported bug: a worktree cut from `upstream/release-0.41` must resolve
+/// to that branch, not the first entry of the priority list (`upstream/main`).
+#[tokio::test]
+async fn resolve_base_ref_prefers_branch_source_over_priority_list() {
+    let (_dir, repo) = repo_with_tracking_branch(
+        "feat",
+        "upstream/release-0.41",
+        &["upstream/main", "upstream/release-0.41"],
+    );
+    let chosen = resolve_base_ref(&repo, None).await;
+    assert_eq!(chosen.as_deref(), Some("upstream/release-0.41"));
+}
+
+/// Once the branch is pushed with `-u` it tracks its own `origin/<branch>`,
+/// which is never a base — resolution must skip it and fall back rather than
+/// diff the branch against itself.
+#[tokio::test]
+async fn resolve_base_ref_skips_own_pushed_tracking_ref() {
+    let (_dir, repo) =
+        repo_with_tracking_branch("feat", "origin/feat", &["upstream/main", "origin/feat"]);
+    let chosen = resolve_base_ref(&repo, None).await;
+    assert_eq!(chosen.as_deref(), Some("upstream/main"));
+}
+
+/// After a push clobbers the tracked upstream, GitHub's own base ref (passed
+/// as the hint) still recovers the real base, mapped onto the matching
+/// remote-tracking ref — preferring `upstream/` over `origin/`.
+#[tokio::test]
+async fn resolve_base_ref_hint_recovers_base_after_push() {
+    let (_dir, repo) = repo_with_tracking_branch(
+        "feat",
+        "origin/feat",
+        &[
+            "upstream/main",
+            "upstream/release-0.41",
+            "origin/release-0.41",
+        ],
+    );
+    let chosen = resolve_base_ref(&repo, Some("release-0.41")).await;
+    assert_eq!(chosen.as_deref(), Some("upstream/release-0.41"));
+}
+
+/// The hint falls back to `origin/<name>` when no `upstream/<name>` exists.
+#[tokio::test]
+async fn resolve_base_ref_hint_falls_back_to_origin() {
+    let (_dir, repo) = repo_with_remote_refs(&["upstream/main", "origin/release-0.41"]);
+    let chosen = resolve_base_ref(&repo, Some("release-0.41")).await;
+    assert_eq!(chosen.as_deref(), Some("origin/release-0.41"));
+}
+
+/// Bug B: opening a new PR must pass `--base <branch>` to `gh pr create` so
+/// the PR targets the branch the worktree was cut from — not the repo
+/// default. The remote-tracking prefix of the resolved base ref is stripped
+/// to the bare branch name `gh` expects.
+#[tokio::test]
+async fn submit_new_pr_passes_resolved_base_to_gh_create() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+
+    // A real bare repo stands in for `origin` so `git push -u origin …`
+    // actually lands somewhere and the create path is reached.
+    let origin = parent.path().join("origin.git");
+    git(
+        parent.path(),
+        &["init", "-q", "--bare", origin.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+
+    git(&repo, &["switch", "-q", "-c", "feat-base"]);
+    fs::write(repo.join("f.txt"), "x\n").unwrap();
+    git(&repo, &["add", "f.txt"]);
+    git(&repo, &["commit", "-q", "-m", "feature"]);
+
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf 'https://github.com/example/repo/pull/7\\n'\n",
+            log = log_path.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let service =
+        DashboardService::new(repo.clone(), DashboardConfig::default()).with_gh_binary(gh_path);
+
+    let request = EnrichSubmitRequest {
+        worktree_path: repo.to_string_lossy().to_string(),
+        branch: "feat-base".to_string(),
+        number: None,
+        base_ref: Some("upstream/release-0.41".to_string()),
+        title: "My title".to_string(),
+        body: "Body".to_string(),
+        labels: vec![],
+        existing_title: None,
+        existing_labels: vec![],
+    };
+    let outcome = service
+        .submit_pull_request(&request, None)
+        .await
+        .expect("submit");
+    assert!(
+        matches!(outcome, EnrichSubmitOutcome::Created { number: 7, .. }),
+        "expected a created PR, got {outcome:?}"
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("pr create") && log.contains("--base release-0.41"),
+        "gh pr create should target the resolved base branch, got log: {log}"
+    );
 }
 
 fn row_with(merge_status: Option<MergeStatus>, behind: Option<u64>) -> DashboardRow {
