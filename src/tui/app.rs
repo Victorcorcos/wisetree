@@ -2098,6 +2098,7 @@ impl App {
                     worktree_path: request.worktree_path.clone(),
                     branch: request.branch.clone(),
                     number: request.number,
+                    base_ref: request.base_ref.clone(),
                     title,
                     body: screen.draft_body().map(str::to_string).unwrap_or_default(),
                     labels: screen.draft_labels().to_vec(),
@@ -3778,13 +3779,14 @@ impl App {
     ) {
         let worktree_path = request.worktree_path.clone();
         let number = request.number;
+        let pr_base_ref = request.pr_base_ref.clone();
         let ai = self.current_dashboard_config().ai.update.clone();
         // Mount the screen with `base_ref = None` first so the confirm
         // panel renders immediately; the resolver runs in the background
         // and populates the field before the user can answer.
         self.update_pr = Some(UpdatePullRequestScreen::new(request, ai));
         self.screen = Screen::UpdatePullRequest;
-        kick_off_resolve_base_ref(worktree_path, number, tx.clone());
+        kick_off_resolve_base_ref(worktree_path, number, pr_base_ref, tx.clone());
     }
 
     fn start_enrich_pr_flow(
@@ -3793,12 +3795,13 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let worktree_path = request.worktree_path.clone();
+        let pr_base_ref = request.pr_base_ref.clone();
         let ai = self.current_dashboard_config().ai.enrich.clone();
         // Mount with `base_ref = None` so the confirm panel renders straight
         // away; the resolver populates the field in the background.
         self.enrich_pr = Some(EnrichPullRequestScreen::new(request, ai));
         self.screen = Screen::EnrichPullRequest;
-        kick_off_resolve_enrich_base_ref(worktree_path, tx.clone());
+        kick_off_resolve_enrich_base_ref(worktree_path, pr_base_ref, tx.clone());
     }
     /// Mount the push-only confirmation screen. A push needs no base ref,
     /// so — unlike `start_update_pr_flow` — there's no resolver kick-off;
@@ -4622,6 +4625,7 @@ impl App {
             ahead: 0,
             behind: 0,
             base_ref: Some(base_ref),
+            pr_base_ref: None,
         };
         let ai = self.current_dashboard_config().ai.update.clone();
         let mut screen = UpdatePullRequestScreen::new_local_conflict(request, ai);
@@ -6508,19 +6512,30 @@ fn kick_off_close_pull_request(
 fn kick_off_resolve_base_ref(
     worktree_path: String,
     number: u64,
+    pr_base_ref: Option<String>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        let base_ref =
-            crate::services::dashboard::resolve_base_ref(&PathBuf::from(&worktree_path)).await;
+        let base_ref = crate::services::dashboard::resolve_base_ref(
+            &PathBuf::from(&worktree_path),
+            pr_base_ref.as_deref(),
+        )
+        .await;
         let _ = tx.send(AppEvent::UpdatePrBaseRefResolved { number, base_ref });
     });
 }
 
-fn kick_off_resolve_enrich_base_ref(worktree_path: String, tx: mpsc::UnboundedSender<AppEvent>) {
+fn kick_off_resolve_enrich_base_ref(
+    worktree_path: String,
+    pr_base_ref: Option<String>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
     tokio::spawn(async move {
-        let base_ref =
-            crate::services::dashboard::resolve_base_ref(&PathBuf::from(&worktree_path)).await;
+        let base_ref = crate::services::dashboard::resolve_base_ref(
+            &PathBuf::from(&worktree_path),
+            pr_base_ref.as_deref(),
+        )
+        .await;
         let _ = tx.send(AppEvent::EnrichPrBaseRefResolved { base_ref });
     });
 }
@@ -7166,9 +7181,10 @@ fn kick_off_update_pull_request(
         let base_ref = match request.base_ref.clone() {
             Some(base_ref) => base_ref,
             None => {
-                match crate::services::dashboard::resolve_base_ref(&PathBuf::from(
-                    &request.worktree_path,
-                ))
+                match crate::services::dashboard::resolve_base_ref(
+                    &PathBuf::from(&request.worktree_path),
+                    request.pr_base_ref.as_deref(),
+                )
                 .await
                 {
                     Some(base_ref) => base_ref,
@@ -9044,6 +9060,7 @@ mod tests {
                 branch: "feature/enrich".into(),
                 worktree_path: "/tmp/repo/feature/enrich".into(),
                 base_ref: Some("upstream/main".into()),
+                pr_base_ref: None,
                 number: None,
                 title: None,
                 url: None,

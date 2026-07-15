@@ -528,6 +528,12 @@ pub struct EnrichSubmitRequest {
     pub branch: String,
     /// `Some` → update an existing PR; `None` → push + create a new one.
     pub number: Option<u64>,
+    /// The resolved base ref (`upstream/release-0.41`, `origin/main`, …) the
+    /// new PR should target. Passed to `gh pr create --base <branch>` (the
+    /// remote prefix is stripped) so a worktree cut from a non-default branch
+    /// opens its PR against that branch instead of the repo default. `None`
+    /// when unresolved, or on the update path where the base is fixed.
+    pub base_ref: Option<String>,
     pub title: String,
     pub body: String,
     pub labels: Vec<String>,
@@ -1333,9 +1339,10 @@ impl DashboardService {
 
     async fn wise_merge(&self, candidate: WiseMergeCandidate) -> Result<String> {
         let cwd = PathBuf::from(&candidate.worktree_path);
-        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd)
-            .await
-            .ok_or_else(|| {
+        let base_ref =
+            resolve_base_ref_with_binary(&self.git_binary, &cwd, Some(&candidate.base_ref_name))
+                .await
+                .ok_or_else(|| {
                 WisetreeError::other(
                     "No base ref reachable (looked for upstream/main, upstream/master, upstream/develop, origin/main, origin/master, origin/develop).",
                 )
@@ -1702,7 +1709,8 @@ impl DashboardService {
             return Ok(UpdateBranchOutcome::FetchFailed(err));
         }
 
-        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd).await else {
+        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await
+        else {
             return Ok(UpdateBranchOutcome::NoBaseRef);
         };
 
@@ -1917,6 +1925,7 @@ impl DashboardService {
             worktree_path,
             branch,
             number,
+            base_ref,
             title,
             body,
             labels,
@@ -2018,8 +2027,22 @@ impl DashboardService {
                     Some(owner) => format!("{owner}:{branch}"),
                     None => branch.to_string(),
                 };
+                // The PR targets the branch the worktree was cut from — the
+                // remote-tracking prefix (`upstream/`, `origin/`) is stripped
+                // to the bare branch name `gh pr create --base` expects. When
+                // the base is unresolved we omit `--base` and let `gh` use the
+                // repo default, preserving the prior behavior.
+                let base_branch = base_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(|b| branch_name_from_ref(b).to_string());
+                let base_display = base_branch
+                    .as_deref()
+                    .map(|b| format!(" --base {b}"))
+                    .unwrap_or_default();
                 emit(&format!(
-                    "$ gh pr create --title <title> --body <body> --head {head} --assignee @me"
+                    "$ gh pr create --title <title> --body <body> --head {head}{base_display} --assignee @me"
                 ));
                 let mut create_args: Vec<String> = vec![
                     "pr".into(),
@@ -2030,9 +2053,12 @@ impl DashboardService {
                     body.to_string(),
                     "--head".into(),
                     head.clone(),
-                    "--assignee".into(),
-                    "@me".into(),
                 ];
+                if let Some(base_branch) = base_branch.as_deref() {
+                    create_args.push("--base".into());
+                    create_args.push(base_branch.into());
+                }
+                create_args.extend(["--assignee".into(), "@me".into()]);
                 for label in labels {
                     create_args.push("--label".into());
                     create_args.push(label.clone());
@@ -2464,7 +2490,7 @@ impl DashboardService {
         }
 
         let untracked_snapshot = hash_untracked(&cwd, &status.untracked).await;
-        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd).await;
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await;
         let resume = match investigation {
             None => BugkillResumeState::Absent,
             Some(None) => BugkillResumeState::Unparseable,
@@ -2973,7 +2999,7 @@ impl DashboardService {
     /// line-level change set. Returns `None` when none of those remote refs are
     /// reachable.
     async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
-        let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd).await?;
+        let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd, None).await?;
         let spec = format!("{upstream}...HEAD");
         let result = time::timeout(
             COMMAND_TIMEOUT,
@@ -3043,7 +3069,8 @@ impl DashboardService {
     /// behind-count exactly when there is new data — and skip the churn when
     /// the ref was already current.
     async fn fetch_base_ref(&self) -> bool {
-        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &self.git_root).await
+        let Some(base_ref) =
+            resolve_base_ref_with_binary(&self.git_binary, &self.git_root, None).await
         else {
             return false;
         };
@@ -4301,31 +4328,112 @@ fn send_ai_activity(
     }
 }
 
-/// Return the first reachable base ref in `BASE_REF_PRIORITY`. Probes each
-/// ref with `git rev-parse --verify` against the supplied worktree. Used
-/// by both the dashboard's behind probe and the "Update Pull Request"
-/// flow so the priority order can never drift.
-pub async fn resolve_base_ref(cwd: &Path) -> Option<String> {
-    resolve_base_ref_with_binary(Path::new("git"), cwd).await
+/// Resolve the base ref for a worktree — the branch it was cut from, which
+/// is what every PR command diffs and merges against. Preference order:
+///
+/// 1. `pr_base_ref` — GitHub's own `baseRefName` for an existing PR, mapped
+///    onto a reachable remote-tracking ref. Authoritative when a PR exists.
+/// 2. The branch's tracked upstream (`@{upstream}`), which `git worktree add`
+///    seeds from the source branch (e.g. `upstream/release-0.41`). Skipped
+///    once the branch has been pushed with `-u` and now tracks its own
+///    `origin/<branch>` counterpart — that is never a base.
+/// 3. The conventional `BASE_REF_PRIORITY` list, as a last resort.
+///
+/// This replaces the old "first reachable in `BASE_REF_PRIORITY`" behavior,
+/// which always resolved to `upstream/master` regardless of the branch's
+/// real base. Used by the dashboard's behind probe and every PR command so
+/// the resolution can never drift between them.
+pub async fn resolve_base_ref(cwd: &Path, pr_base_ref: Option<&str>) -> Option<String> {
+    resolve_base_ref_with_binary(Path::new("git"), cwd, pr_base_ref).await
 }
 
-pub(crate) async fn resolve_base_ref_with_binary(git_binary: &Path, cwd: &Path) -> Option<String> {
+pub(crate) async fn resolve_base_ref_with_binary(
+    git_binary: &Path,
+    cwd: &Path,
+    pr_base_ref: Option<&str>,
+) -> Option<String> {
+    // 1. Prefer GitHub's known base branch for the PR, mapped to whichever
+    //    remote-tracking ref we actually have locally.
+    if let Some(name) = pr_base_ref.map(str::trim).filter(|n| !n.is_empty()) {
+        for remote in ["upstream", "origin"] {
+            let candidate = format!("{remote}/{name}");
+            if ref_is_reachable(git_binary, cwd, &candidate).await {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // 2. Trust the branch's own tracked upstream, unless it is the branch's
+    //    own pushed ref (`origin/<self>`), which a PR is never based on.
+    if let Some(upstream) = tracked_upstream(git_binary, cwd).await {
+        let is_own_push_ref = remote_name_from_ref(&upstream) == Some("origin")
+            && current_branch_name(git_binary, cwd)
+                .await
+                .is_some_and(|branch| branch_name_from_ref(&upstream) == branch);
+        if !is_own_push_ref && ref_is_reachable(git_binary, cwd, &upstream).await {
+            return Some(upstream);
+        }
+    }
+
+    // 3. Fall back to the conventional priority list.
     for candidate in BASE_REF_PRIORITY {
-        let result = time::timeout(
-            COMMAND_TIMEOUT,
-            run_command(
-                git_binary,
-                &["rev-parse", "--verify", "--quiet", candidate],
-                Some(cwd),
-            ),
-        )
-        .await
-        .ok()?;
-        if result.is_ok() {
+        if ref_is_reachable(git_binary, cwd, candidate).await {
             return Some(candidate.to_string());
         }
     }
     None
+}
+
+/// `true` when `git rev-parse --verify` resolves `refname` in `cwd`. A
+/// timeout or non-zero exit reads as unreachable so one slow/missing ref
+/// never aborts the whole resolution.
+async fn ref_is_reachable(git_binary: &Path, cwd: &Path, refname: &str) -> bool {
+    time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(
+            git_binary,
+            &["rev-parse", "--verify", "--quiet", refname],
+            Some(cwd),
+        ),
+    )
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false)
+}
+
+/// The remote-tracking branch the worktree's current branch is configured to
+/// track (`branch.<name>.remote`/`.merge`), e.g. `upstream/release-0.41`.
+/// `git worktree add` seeds this from the source branch, so before the branch
+/// is pushed it names exactly the ref the worktree was cut from. `None` when
+/// the branch tracks nothing (detached HEAD, or created from a raw commit).
+async fn tracked_upstream(git_binary: &Path, cwd: &Path) -> Option<String> {
+    run_command(
+        git_binary,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+        Some(cwd),
+    )
+    .await
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// The worktree's current branch name, or `None` on a detached HEAD.
+async fn current_branch_name(git_binary: &Path, cwd: &Path) -> Option<String> {
+    run_command(
+        git_binary,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        Some(cwd),
+    )
+    .await
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty() && s != "HEAD")
 }
 
 /// True when the row's branch is behind its base — either the PR's

@@ -2454,6 +2454,7 @@ mod tests {
             ahead: 4,
             behind: 7,
             base_ref: None,
+            pr_base_ref: Some("main".to_string()),
         }
     }
 
