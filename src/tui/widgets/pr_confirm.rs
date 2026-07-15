@@ -161,9 +161,7 @@ pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
         .fg(colors::MUTED)
         .add_modifier(Modifier::DIM);
     let text_style = Style::default().fg(colors::EMPHASIS);
-    let code_style = Style::default()
-        .fg(colors::WHITE)
-        .bg(colors::BG_SELECTED);
+    let code_style = Style::default().fg(colors::WHITE).bg(colors::BG_SELECTED);
     let mut lines = vec![Line::from(Span::styled(
         "Will run:".to_string(),
         header_style,
