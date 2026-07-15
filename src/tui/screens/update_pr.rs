@@ -2319,13 +2319,13 @@ fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> 
 /// owns the numbering + styling.
 fn build_steps(base_ref: &str, push_only: bool) -> Vec<String> {
     if push_only {
-        return vec!["Git push origin HEAD".to_string()];
+        return vec!["`git push origin HEAD`".to_string()];
     }
     vec![
-        "Git fetch --all --prune".to_string(),
-        format!("Git merge {base_ref}"),
+        "`git fetch --all --prune`".to_string(),
+        format!("`git merge {base_ref}`"),
         "On conflict: opencode streams resolution, then Complete/Cancel".to_string(),
-        "Git push origin HEAD".to_string(),
+        "`git push origin HEAD`".to_string(),
     ]
 }
 
@@ -3037,16 +3037,16 @@ mod tests {
             "expected push title in:\n{dumped}"
         );
         assert!(
-            dumped.contains("Git push origin HEAD"),
+            dumped.contains("git push origin HEAD"),
             "expected push step in:\n{dumped}"
         );
         // The push-only flow never fetches or merges.
         assert!(
-            !dumped.contains("Git fetch"),
+            !dumped.contains("git fetch"),
             "push confirm must not mention fetch:\n{dumped}"
         );
         assert!(
-            !dumped.contains("Git merge"),
+            !dumped.contains("git merge"),
             "push confirm must not mention merge:\n{dumped}"
         );
     }

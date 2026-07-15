@@ -108,9 +108,51 @@ pub fn labeled_spans(label: &str, values: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Split text by backtick-delimited code spans and return styled spans.
+/// Code (text between backticks) gets `code_style`; everything else gets `base_style`.
+/// Nesting is not supported — inner backticks are treated as regular text.
+fn code_spans(text: &str, base_style: Style, code_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        match rest.find('`') {
+            None => {
+                spans.push(Span::styled(text[cursor..].to_string(), base_style));
+                break;
+            }
+            Some(rel_open) => {
+                let open = cursor + rel_open;
+                if open > cursor {
+                    spans.push(Span::styled(text[cursor..open].to_string(), base_style));
+                }
+                let after_open = &text[open + 1..];
+                match after_open.find('`') {
+                    None => {
+                        spans.push(Span::styled(text[open..].to_string(), base_style));
+                        break;
+                    }
+                    Some(rel_close) => {
+                        let close = open + 1 + rel_close;
+                        spans.push(Span::styled(text[open + 1..close].to_string(), code_style));
+                        cursor = close + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base_style));
+    }
+    spans
+}
+
 /// A `Will run:` header followed by numbered steps, matching the Bugkill
 /// pipeline preview. Callers pass the human-readable step text; the widget
 /// owns the numbering + styling so every command's preview looks the same.
+/// Backtick-delimited text (`` `like this` ``) renders as inline code.
 pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
     let header_style = Style::default()
         .fg(colors::INFO)
@@ -119,15 +161,17 @@ pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
         .fg(colors::MUTED)
         .add_modifier(Modifier::DIM);
     let text_style = Style::default().fg(colors::EMPHASIS);
+    let code_style = Style::default()
+        .fg(colors::WHITE)
+        .bg(colors::BG_SELECTED);
     let mut lines = vec![Line::from(Span::styled(
         "Will run:".to_string(),
         header_style,
     ))];
     for (i, text) in steps.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {}. ", i + 1), number_style),
-            Span::styled(text.as_ref().to_string(), text_style),
-        ]));
+        let mut spans = vec![Span::styled(format!("  {}. ", i + 1), number_style)];
+        spans.extend(code_spans(text.as_ref(), text_style, code_style));
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -370,7 +414,7 @@ mod tests {
         ];
         let view = PrConfirmView::new("Do the thing?")
             .block(details)
-            .steps(&["Git fetch", "Git merge base"])
+            .steps(&["`git fetch`", "`git merge base`"])
             .ai_roles(vec![AiRoleRow::new(
                 "resolve",
                 colors::INFO,
@@ -382,7 +426,7 @@ mod tests {
         assert!(out.contains("Branch"), "{out}");
         assert!(out.contains("Worktree"), "{out}");
         assert!(out.contains("Will run:"), "{out}");
-        assert!(out.contains("1. Git fetch"), "{out}");
+        assert!(out.contains("1. git fetch"), "{out}");
         assert!(out.contains("Role"), "{out}");
         assert!(out.contains("Model"), "{out}");
         assert!(out.contains("Thinking"), "{out}");

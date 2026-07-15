@@ -1126,7 +1126,7 @@ impl BugkillPullRequestScreen {
         let steps = [
             "You describe the bug.",
             "The investigate AI explores the code read-only and ranks likely root causes \
-             into BUG_INVESTIGATION.md.",
+             into `BUG_INVESTIGATION.md`.",
             "You pick one proposed fix from the ranked table.",
             "The fix AI applies only that fix, live, in an embedded opencode terminal.",
             "You confirm whether the bug is gone — Yes keeps the fix (committed on the \

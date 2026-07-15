@@ -1258,12 +1258,14 @@ fn build_detail_lines(request: &EnrichPullRequestRequest) -> Vec<Line<'static>> 
 /// whether an existing PR is being updated or a new one opened.
 fn build_steps(request: &EnrichPullRequestRequest) -> Vec<String> {
     let submit_step = match request.number {
-        Some(number) => format!("On confirm: gh pr edit #{number} (existing media preserved)"),
-        None => "On confirm: git push + gh pr create".to_string(),
+        Some(number) => {
+            format!("On confirm: `gh pr edit` #{number} (existing media preserved)")
+        }
+        None => "On confirm: `git push` + `gh pr create`".to_string(),
     };
     vec![
         "Gather commit log + diff vs base ref".to_string(),
-        "Opencode drafts pull_request.md (title + description)".to_string(),
+        "Opencode drafts `pull_request.md` (title + description)".to_string(),
         "You review the draft, then Open/Update or Finish".to_string(),
         submit_step,
     ]
