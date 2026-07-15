@@ -33,16 +33,17 @@ use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
-    check_for_updates_all_sources, compute_attempt_changes, default_dashboard_warning,
-    detect_shell_integration, fetch_free_opencode_models, fetch_opencode_model_variants,
-    fetch_opencode_models, install_shell_integration, parse_pull_request_md,
-    resolve_dashboard_columns, AiStatus, AttemptChanges, BugHypothesis, BugkillPreflightOutcome,
-    BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus, CommentGroup,
-    DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
-    EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
-    FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult, OpencodeModel,
-    OpencodeTurn, OpencodeTurnWatcher, PrState, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdateSource,
+    build_review_summary, check_for_updates_all_sources, compute_attempt_changes,
+    default_dashboard_warning, detect_shell_integration, fetch_free_opencode_models,
+    fetch_opencode_model_variants, fetch_opencode_models, install_shell_integration,
+    parse_pull_request_md, resolve_dashboard_columns, AiStatus, AttemptChanges, BugHypothesis,
+    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
+    CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
+    DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
+    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
+    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
+    ReviewPreparation, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase,
+    UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -54,7 +55,7 @@ use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BugkillRequest, BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
     EnrichPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
-    UpdatePullRequestRequest,
+    ReviewPullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
@@ -63,6 +64,7 @@ use crate::tui::screens::enrich_pr::{EnrichAction, EnrichPullRequestScreen, Enri
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
+use crate::tui::screens::review_pr::{ReviewAction, ReviewPullRequestScreen, ReviewRowOutcome};
 use crate::tui::screens::settings::{
     CopyDirection, SettingsAction, SettingsScreen, SettingsStep, UpgradeOutcome,
 };
@@ -184,6 +186,31 @@ enum AppEvent {
     FixPrApplyReady {
         index: usize,
         result: Result<Box<FixApplyHandoff>, String>,
+    },
+    /// "Review Pull Request": sync + diff fetch + per-file split finished.
+    ReviewPrPrepared(Result<Box<ReviewPreparation>, String>),
+    /// One per-file scan (or a single-finding revision) returned.
+    ReviewPrScanned {
+        /// File index the scan belongs to — guards against a stale result.
+        file_index: usize,
+        /// True when this was already the one retry after unparseable output.
+        retried: bool,
+        result: Result<Vec<ReviewFinding>, String>,
+    },
+    /// An "Other" revision of the current finding returned.
+    ReviewPrRevised {
+        index: usize,
+        result: Result<Vec<ReviewFinding>, String>,
+    },
+    /// One approved finding was posted (or failed to post) on the PR.
+    ReviewPrPosted {
+        index: usize,
+        result: Result<(), String>,
+    },
+    /// The review summary submission finished.
+    ReviewPrSummarySubmitted {
+        request_changes: bool,
+        result: Result<(), String>,
     },
     /// A fix apply finished: either committed + replied, or no change was
     /// needed and the reviewer was told it's already addressed.
@@ -393,6 +420,7 @@ pub struct App {
     update_pr: Option<UpdatePullRequestScreen>,
     enrich_pr: Option<EnrichPullRequestScreen>,
     fix_pr: Option<FixPullRequestScreen>,
+    review_pr: Option<ReviewPullRequestScreen>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
     /// Watches opencode's database for the embedded investigation TUI's
     /// turn to complete — the TUI never exits on its own, so this is what
@@ -518,6 +546,7 @@ impl App {
             update_pr: None,
             enrich_pr: None,
             fix_pr: None,
+            review_pr: None,
             bugkill_pr: None,
             bugkill_investigation: None,
             enrich_draft: None,
@@ -1033,6 +1062,28 @@ impl App {
                     fix_pr.render(frame, panel);
                 }
             }
+            Screen::ReviewPullRequest => {
+                // Full-panel steps (Confirm, Decision, Other, Summary) want
+                // the whole bottom region; the compact Working / Done steps
+                // stay sized.
+                let expand = self
+                    .review_pr
+                    .as_ref()
+                    .is_some_and(|s| s.wants_full_panel());
+                let panel = if expand {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .review_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
+                if let Some(review_pr) = self.review_pr.as_mut() {
+                    review_pr.tick = self.tick;
+                    review_pr.render(frame, panel);
+                }
+            }
             Screen::BugkillPullRequest => {
                 // Expanded steps (Confirm, DescribeBug, Select, the live
                 // Fixing PTY, Verdict, Done…) want the whole bottom region;
@@ -1218,6 +1269,14 @@ impl App {
                     };
                 }
             }
+            Screen::ReviewPullRequest => {
+                if let Some(screen) = self.review_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
             Screen::BugkillPullRequest => {
                 if let Some(screen) = self.bugkill_pr.as_mut() {
                     match direction {
@@ -1380,6 +1439,7 @@ impl App {
             Screen::UpdatePullRequest => self.handle_update_pr_key(key, tx),
             Screen::EnrichPullRequest => self.handle_enrich_pr_key(key, tx),
             Screen::FixPullRequest => self.handle_fix_pr_key(key, tx),
+            Screen::ReviewPullRequest => self.handle_review_pr_key(key, tx),
             Screen::BugkillPullRequest => self.handle_bugkill_key(key, tx),
             Screen::UpdateBranch => {
                 if let Some(screen) = self.update_branch.as_mut() {
@@ -1781,6 +1841,14 @@ impl App {
                     .map(|screen| screen.handle_mouse_click(position))
                     .unwrap_or(FixAction::Continue);
                 self.apply_fix_action(action, tx);
+            }
+            Screen::ReviewPullRequest => {
+                let action = self
+                    .review_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(ReviewAction::Continue);
+                self.apply_review_action(action, tx);
             }
             Screen::BugkillPullRequest => {
                 let action = self
@@ -2354,6 +2422,391 @@ impl App {
             },
             tx.clone(),
         );
+    }
+
+    // ── "Review Pull Request" orchestration ────────────────────────────
+
+    fn start_review_pr_flow(
+        &mut self,
+        request: ReviewPullRequestRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // Lands on the Confirm step immediately. The prepare pipeline only
+        // runs once the user confirms.
+        let ai = self.current_dashboard_config().ai.review.clone();
+        self.review_pr = Some(ReviewPullRequestScreen::new(request, ai));
+        self.screen = Screen::ReviewPullRequest;
+    }
+
+    fn handle_review_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.review_pr.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+        self.apply_review_action(action, tx);
+    }
+
+    /// Single handler for `ReviewAction`s from keyboard or mouse. Drives the
+    /// screen transitions and kicks off each async stage of the two loops
+    /// (per-file scan, then per-finding walkthrough) plus the summary.
+    fn apply_review_action(&mut self, action: ReviewAction, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match action {
+            ReviewAction::Continue => {}
+            ReviewAction::Cancelled => {
+                let worktree_path = self
+                    .review_pr
+                    .take()
+                    .map(|s| s.request().worktree_path.clone());
+                self.back_to_dashboard_action_menu(worktree_path, tx);
+            }
+            ReviewAction::Confirmed => {
+                let Some(screen) = self.review_pr.as_mut() else {
+                    return;
+                };
+                let number = screen.request().number;
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_preparing();
+                kick_off_prepare_review(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    number,
+                    tx.clone(),
+                );
+            }
+            ReviewAction::Post => {
+                let Some(screen) = self.review_pr.as_mut() else {
+                    return;
+                };
+                let Some(finding) = screen.current_finding() else {
+                    return;
+                };
+                let request = ReviewPostRequest {
+                    worktree_path: screen.request().worktree_path.clone(),
+                    owner: screen.owner().to_string(),
+                    repo: screen.repo().to_string(),
+                    number: screen.request().number,
+                    head_sha: screen.head_sha().to_string(),
+                    finding,
+                    index: screen.current_index(),
+                };
+                screen.start_posting();
+                kick_off_post_review_finding(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    request,
+                    tx.clone(),
+                );
+            }
+            ReviewAction::Other => {
+                if let Some(screen) = self.review_pr.as_mut() {
+                    screen.show_other_input();
+                }
+            }
+            ReviewAction::Skip => {
+                if let Some(screen) = self.review_pr.as_mut() {
+                    screen.record_outcome(ReviewRowOutcome::Skipped);
+                }
+                self.advance_review_finding(tx);
+            }
+            ReviewAction::Revise(feedback) => {
+                let Some(screen) = self.review_pr.as_mut() else {
+                    return;
+                };
+                let Some(finding) = screen.current_finding() else {
+                    return;
+                };
+                // The scanned file is re-rendered into the prompt so the
+                // revision judges the same diff the original scan saw.
+                let Some(file) = screen.file_for(&finding) else {
+                    screen.reshow_decision();
+                    return;
+                };
+                let request = ReviewReviseRequest {
+                    worktree_path: screen.request().worktree_path.clone(),
+                    file,
+                    previous_finding: finding.rendered_for_revision(),
+                    feedback,
+                    index: screen.current_index(),
+                };
+                screen.start_revising();
+                kick_off_revise_review_finding(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    request,
+                    tx.clone(),
+                );
+            }
+            ReviewAction::SubmitSummary { request_changes } => {
+                let Some(screen) = self.review_pr.as_mut() else {
+                    return;
+                };
+                let worktree_path = screen.request().worktree_path.clone();
+                let number = screen.request().number;
+                let body = screen.summary_body().to_string();
+                screen.start_submitting_summary();
+                kick_off_submit_review_summary(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    number,
+                    body,
+                    request_changes,
+                    tx.clone(),
+                );
+            }
+            ReviewAction::SkipSummary => {
+                if let Some(screen) = self.review_pr.as_mut() {
+                    screen.enter_done();
+                }
+            }
+            ReviewAction::Done => {
+                self.review_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+        }
+    }
+
+    /// Kick off the scan of the current file, or close the scan loop when
+    /// every file is done: sort the findings and enter the walkthrough (or
+    /// jump straight to Done on a clean review).
+    fn scan_next_review_file(&mut self, tx: &mpsc::UnboundedSender<AppEvent>, retry: bool) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        let Some(file) = screen.current_scan_file() else {
+            if screen.finish_scanning() {
+                screen.enter_decision();
+            } else {
+                screen.enter_done();
+            }
+            return;
+        };
+        let file_index = screen.scan_index();
+        let worktree_path = screen.request().worktree_path.clone();
+        if retry {
+            screen.start_rescanning();
+        } else {
+            screen.start_scanning();
+        }
+        kick_off_scan_review_file(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            ReviewScanRequest {
+                worktree_path,
+                file,
+                file_index,
+                retried: retry,
+            },
+            tx.clone(),
+        );
+    }
+
+    /// Advance the walkthrough to the next finding, or close it: with posted
+    /// comments the deterministic summary is shown, otherwise straight to
+    /// the final report.
+    fn advance_review_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let _ = tx;
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if screen.advance_finding() {
+            screen.enter_decision();
+        } else if screen.posted_findings().is_empty() {
+            screen.enter_done();
+        } else {
+            let body = build_review_summary(screen.posted_findings());
+            screen.enter_summary(body);
+        }
+    }
+
+    fn fail_review(
+        &mut self,
+        variant: ToastVariant,
+        message: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.show_toast(variant, message);
+        self.review_pr = None;
+        self.enter_screen(Screen::Dashboard, tx);
+    }
+
+    fn apply_review_pr_prepared(
+        &mut self,
+        result: Result<Box<ReviewPreparation>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.review_pr.is_none() {
+            return;
+        }
+        match result {
+            Ok(prep) => match *prep {
+                ReviewPreparation::Ready {
+                    files,
+                    owner,
+                    repo,
+                    head_sha,
+                } => {
+                    if let Some(screen) = self.review_pr.as_mut() {
+                        screen.set_files(files, owner, repo, head_sha);
+                    }
+                    self.scan_next_review_file(tx, false);
+                }
+                ReviewPreparation::NoChanges => self.fail_review(
+                    ToastVariant::Info,
+                    "This PR has no reviewable text changes.".to_string(),
+                    tx,
+                ),
+                ReviewPreparation::GhUnavailable => self.fail_review(
+                    ToastVariant::Error,
+                    "gh CLI not found — install `gh` and run `gh auth login` to review pull \
+                     requests."
+                        .to_string(),
+                    tx,
+                ),
+                ReviewPreparation::AiNotConfigured => self.fail_review(
+                    ToastVariant::Warning,
+                    "Set the `ai.review` model (Settings → Dashboard → ai) so the AI can scan \
+                     the diff."
+                        .to_string(),
+                    tx,
+                ),
+                ReviewPreparation::AiUnavailable => self.fail_review(
+                    ToastVariant::Error,
+                    "`opencode` CLI is not on PATH — install it from https://opencode.ai then \
+                     retry."
+                        .to_string(),
+                    tx,
+                ),
+                ReviewPreparation::SyncFailed(err) => self.fail_review(
+                    ToastVariant::Error,
+                    format!("Could not prepare the review: {}", truncate_error(&err)),
+                    tx,
+                ),
+            },
+            Err(message) => self.fail_review(
+                ToastVariant::Error,
+                format!("Failed to fetch the PR diff: {}", truncate_error(&message)),
+                tx,
+            ),
+        }
+    }
+
+    fn apply_review_pr_scanned(
+        &mut self,
+        file_index: usize,
+        retried: bool,
+        result: Result<Vec<ReviewFinding>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // Guard against a late arrival after the user moved on.
+        let current = self
+            .review_pr
+            .as_ref()
+            .is_some_and(|s| s.scan_index() == file_index);
+        if !current {
+            return;
+        }
+        match result {
+            Ok(findings) => {
+                if let Some(screen) = self.review_pr.as_mut() {
+                    screen.record_scan_result(findings);
+                    screen.advance_scan();
+                }
+                self.scan_next_review_file(tx, false);
+            }
+            // One retry per file for unparseable output; a second failure
+            // records a Failed row and the loop moves on — one bad file
+            // never aborts the whole review.
+            Err(_) if !retried => self.scan_next_review_file(tx, true),
+            Err(message) => {
+                if let Some(screen) = self.review_pr.as_mut() {
+                    screen.record_scan_failure(truncate_error(&message));
+                    screen.advance_scan();
+                }
+                self.scan_next_review_file(tx, false);
+            }
+        }
+    }
+
+    fn apply_review_pr_revised(
+        &mut self,
+        index: usize,
+        result: Result<Vec<ReviewFinding>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let _ = tx;
+        if !self.review_at_index(index) {
+            return;
+        }
+        // A revision must always return to the Decision screen — with the
+        // revised comment when the model obeyed, otherwise with the previous
+        // one so the user keeps their place and can refine their feedback.
+        match result {
+            Ok(findings) if !findings.is_empty() => {
+                if let Some(screen) = self.review_pr.as_mut() {
+                    let mut revised = findings.into_iter().next().expect("non-empty checked");
+                    // A revision can never migrate to another file.
+                    revised.file = screen
+                        .current_finding()
+                        .map(|f| f.file)
+                        .unwrap_or(revised.file);
+                    screen.show_revised(revised);
+                }
+            }
+            other => {
+                if let Some(screen) = self.review_pr.as_mut() {
+                    screen.reshow_decision();
+                }
+                let message = match other {
+                    Err(msg) => format!("Could not revise the comment: {}", truncate_error(&msg)),
+                    _ => "The AI didn't return a revised comment — kept the previous one. \
+                          Adjust your feedback and try Other again."
+                        .to_string(),
+                };
+                self.show_toast(ToastVariant::Warning, message);
+            }
+        }
+    }
+
+    fn apply_review_pr_posted(
+        &mut self,
+        index: usize,
+        result: Result<(), String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.review_at_index(index) {
+            return;
+        }
+        if let Some(screen) = self.review_pr.as_mut() {
+            match result {
+                Ok(()) => screen.record_outcome(ReviewRowOutcome::Posted),
+                Err(msg) => screen.record_outcome(ReviewRowOutcome::Failed(format!(
+                    "post failed: {}",
+                    truncate_error(&msg)
+                ))),
+            }
+        }
+        self.advance_review_finding(tx);
+    }
+
+    fn apply_review_pr_summary_submitted(
+        &mut self,
+        request_changes: bool,
+        result: Result<(), String>,
+    ) {
+        if let Some(screen) = self.review_pr.as_mut() {
+            screen.record_summary_outcome(request_changes, result.map_err(|e| truncate_error(&e)));
+            screen.enter_done();
+        }
+    }
+
+    /// `true` when the review screen is still on finding `index` — guards
+    /// every async result against a late arrival after the user moved on.
+    fn review_at_index(&self, index: usize) -> bool {
+        self.review_pr
+            .as_ref()
+            .is_some_and(|s| s.current_index() == index)
     }
 
     // ── "Bugkill" orchestration ─────────────────────────────────────────
@@ -3379,6 +3832,9 @@ impl App {
             }
             DashboardAction::FixPullRequest(request) => {
                 self.start_fix_pr_flow(*request, tx);
+            }
+            DashboardAction::ReviewPullRequest(request) => {
+                self.start_review_pr_flow(*request, tx);
             }
             DashboardAction::Bugkill(request) => {
                 self.start_bugkill_flow(*request, tx);
@@ -4482,6 +4938,22 @@ impl App {
             AppEvent::FixPrCommitted { index, result } => {
                 self.apply_fix_pr_committed(index, result, tx)
             }
+            AppEvent::ReviewPrPrepared(result) => self.apply_review_pr_prepared(result, tx),
+            AppEvent::ReviewPrScanned {
+                file_index,
+                retried,
+                result,
+            } => self.apply_review_pr_scanned(file_index, retried, result, tx),
+            AppEvent::ReviewPrRevised { index, result } => {
+                self.apply_review_pr_revised(index, result, tx)
+            }
+            AppEvent::ReviewPrPosted { index, result } => {
+                self.apply_review_pr_posted(index, result, tx)
+            }
+            AppEvent::ReviewPrSummarySubmitted {
+                request_changes,
+                result,
+            } => self.apply_review_pr_summary_submitted(request_changes, result),
             AppEvent::BugkillPrepared(result) => self.apply_bugkill_prepared(result, tx),
             AppEvent::BugkillDiscarded(result) => self.apply_bugkill_discarded(result, tx),
             AppEvent::BugkillInvestigateReady { corrective, result } => {
@@ -5308,6 +5780,13 @@ impl App {
                 // Only reachable through `start_fix_pr_flow`, which seeds
                 // `fix_pr` before flipping the screen.
                 if self.fix_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
+            Screen::ReviewPullRequest => {
+                // Only reachable through `start_review_pr_flow`, which seeds
+                // `review_pr` before flipping the screen.
+                if self.review_pr.is_none() {
                     self.back_to_menu();
                 }
             }
@@ -6833,6 +7312,180 @@ fn kick_off_push_fix(
             .await
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::FixPrPushed(result));
+    });
+}
+
+// ── Review Pull Request async stages ────────────────────────────────────
+
+/// Inputs for one captured per-file scan call. `file_index` rides along so
+/// the result handler can ignore a stale response; `retried` marks the one
+/// retry allowed after unparseable output.
+struct ReviewScanRequest {
+    worktree_path: String,
+    file: ReviewFile,
+    file_index: usize,
+    retried: bool,
+}
+
+/// Inputs for an "Other" revision of a single finding.
+struct ReviewReviseRequest {
+    worktree_path: String,
+    file: ReviewFile,
+    previous_finding: String,
+    feedback: String,
+    index: usize,
+}
+
+/// Inputs for posting one approved finding on the PR.
+struct ReviewPostRequest {
+    worktree_path: String,
+    owner: String,
+    repo: String,
+    number: u64,
+    head_sha: String,
+    finding: ReviewFinding,
+    index: usize,
+}
+
+fn kick_off_prepare_review(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    number: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrPrepared(Err(
+            "Could not resolve git root for the review.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let event = match service.prepare_review(&worktree_path, number).await {
+            Ok(prep) => Ok(Box::new(prep)),
+            Err(err) => Err(user_friendly_message(&err)),
+        };
+        let _ = tx.send(AppEvent::ReviewPrPrepared(event));
+    });
+}
+
+fn kick_off_scan_review_file(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: ReviewScanRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let file_index = req.file_index;
+    let retried = req.retried;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrScanned {
+            file_index,
+            retried,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .scan_review_file(&req.worktree_path, &req.file, None, None)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrScanned {
+            file_index,
+            retried,
+            result,
+        });
+    });
+}
+
+fn kick_off_revise_review_finding(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: ReviewReviseRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let index = req.index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrRevised {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .scan_review_file(
+                &req.worktree_path,
+                &req.file,
+                Some(&req.feedback),
+                Some(&req.previous_finding),
+            )
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrRevised { index, result });
+    });
+}
+
+fn kick_off_post_review_finding(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: ReviewPostRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let index = req.index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrPosted {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .post_review_finding(
+                &req.worktree_path,
+                &req.owner,
+                &req.repo,
+                req.number,
+                &req.head_sha,
+                &req.finding,
+            )
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrPosted { index, result });
+    });
+}
+
+fn kick_off_submit_review_summary(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    number: u64,
+    body: String,
+    request_changes: bool,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrSummarySubmitted {
+            request_changes,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .submit_review_summary(&worktree_path, number, &body, request_changes)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrSummarySubmitted {
+            request_changes,
+            result,
+        });
     });
 }
 

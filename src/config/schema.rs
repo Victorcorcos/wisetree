@@ -162,6 +162,12 @@ fn default_update_ai() -> AiModelConfig {
         thinking: String::new(),
     }
 }
+// Review scans one file's diff per captured call and must reason across
+// code smells / security / performance / tests — same strong model as
+// `fix.plan`.
+fn default_review_ai() -> AiModelConfig {
+    default_fix_plan_ai()
+}
 // Bugkill defaults mirror the Fix pipeline's split: `investigate` reasons
 // deeply over the whole codebase (same strong model as `fix.plan`), while
 // `fix` edits live and `judge` classifies a short comment (same fast model
@@ -255,6 +261,8 @@ impl Default for AiBugkillConfig {
 pub struct AiConfig {
     pub enrich: AiModelConfig,
     pub fix: AiFixConfig,
+    /// Drives the "Review Pull Request" per-file diff scan.
+    pub review: AiModelConfig,
     pub update: AiModelConfig,
     pub bugkill: AiBugkillConfig,
 }
@@ -264,6 +272,7 @@ impl Default for AiConfig {
         Self {
             enrich: default_enrich_ai(),
             fix: AiFixConfig::default(),
+            review: default_review_ai(),
             update: default_update_ai(),
             bugkill: AiBugkillConfig::default(),
         }
@@ -291,6 +300,8 @@ impl<'de> Deserialize<'de> for AiConfig {
             enrich: Option<AiModelConfig>,
             #[serde(default)]
             fix: Option<AiFixConfig>,
+            #[serde(default)]
+            review: Option<AiModelConfig>,
             #[serde(default)]
             update: Option<AiModelConfig>,
             #[serde(default)]
@@ -323,6 +334,10 @@ impl<'de> Deserialize<'de> for AiConfig {
                 },
                 None => AiFixConfig::default(),
             }),
+            review: raw
+                .review
+                .or_else(|| legacy.clone())
+                .unwrap_or_else(default_review_ai),
             update: raw
                 .update
                 .or_else(|| legacy.clone())
@@ -572,6 +587,7 @@ mod ai_config_tests {
             &ai.enrich,
             &ai.fix.plan,
             &ai.fix.apply,
+            &ai.review,
             &ai.update,
             &ai.bugkill.investigate,
             &ai.bugkill.fix,
@@ -643,6 +659,7 @@ mod ai_config_tests {
             &ai.enrich,
             &ai.fix.plan,
             &ai.fix.apply,
+            &ai.review,
             &ai.update,
             &ai.bugkill.investigate,
             &ai.bugkill.fix,

@@ -13,6 +13,7 @@ pub mod fix_pr;
 pub mod loading;
 pub mod menu;
 pub mod merge_pr;
+pub mod review_pr;
 pub mod settings;
 pub mod setup;
 pub mod setup_project;

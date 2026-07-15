@@ -124,6 +124,11 @@ pub mod colors {
     /// PR command button so it reads distinct from the Merge button's
     /// success green next to it.
     pub const DARK_GREEN: Color = Color::Rgb(0x58, 0xa3, 0x00);
+    /// Navy blue `#4d7cfe` — deeper than [`CYAN`]. Used for the "Review"
+    /// PR command button (and its confirm screen) so it reads distinct from
+    /// the soft-blue Fix button next to it while staying legible on the
+    /// brown background.
+    pub const NAVY: Color = Color::Rgb(0x4d, 0x7c, 0xfe);
 
     // ── Background colors ───────────────────────────────────────────────
 
