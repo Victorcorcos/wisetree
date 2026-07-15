@@ -1155,12 +1155,12 @@ fn build_detail_lines(request: &ReviewPullRequestRequest) -> Vec<Line<'static>> 
 /// `Will run:` step text for the confirm panel; the shared [`PrConfirmView`]
 /// owns the numbering + styling.
 const REVIEW_STEPS: [&str; 6] = [
-    "sync the branch + fetch the PR diff and its existing comments",
-    "for each changed file: AI scans the diff and drafts findings (no edits)",
-    "you choose Post / Other / Skip per finding",
-    "approved findings are posted as inline PR comments (with suggestions)",
-    "a review summary is assembled from the posted comments (no AI)",
-    "you choose Request changes / Comment / Skip for the summary",
+    "Sync the branch + fetch the PR diff and its existing comments",
+    "For each changed file: AI scans the diff and drafts findings (no edits)",
+    "You choose Post / Other / Skip per finding",
+    "Approved findings are posted as inline PR comments (with suggestions)",
+    "A review summary is assembled from the posted comments (no AI)",
+    "You choose Request changes / Comment / Skip for the summary",
 ];
 
 /// Build the body of the `Proposed comment` panel: the exact comment header,

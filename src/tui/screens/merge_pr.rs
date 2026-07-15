@@ -355,7 +355,7 @@ impl MergePullRequestScreen {
             view = view.block(unpushed_warning_lines(self.unpushed_commits));
         }
         view.steps(&[format!(
-            "gh pr merge #{} --squash (all commits squashed into base)",
+            "Gh pr merge #{} --squash (all commits squashed into base)",
             self.request.number
         )])
         .block(description)

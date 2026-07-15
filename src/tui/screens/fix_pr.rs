@@ -1300,11 +1300,11 @@ fn build_detail_lines(request: &FixPullRequestRequest) -> Vec<Line<'static>> {
 /// `Will run:` step text for the confirm panel; the shared [`PrConfirmView`]
 /// owns the numbering + styling.
 const FIX_STEPS: [&str; 5] = [
-    "sync the branch + fetch the PR's review comments",
-    "for each comment: AI judges it and plans a fix (no edits yet)",
-    "you choose Apply / Other / Skip per comment",
-    "applied fixes are committed and the reviewer is replied to",
-    "push every review-fix commit at the end",
+    "Sync the branch + fetch the PR's review comments",
+    "For each comment: AI judges it and plans a fix (no edits yet)",
+    "You choose Apply / Other / Skip per comment",
+    "Applied fixes are committed and the reviewer is replied to",
+    "Push every review-fix commit at the end",
 ];
 
 /// Reviewer-comment panel shown under the spinner while the AI analyzes a

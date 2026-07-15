@@ -370,7 +370,7 @@ mod tests {
         ];
         let view = PrConfirmView::new("Do the thing?")
             .block(details)
-            .steps(&["git fetch", "git merge base"])
+            .steps(&["Git fetch", "Git merge base"])
             .ai_roles(vec![AiRoleRow::new(
                 "resolve",
                 colors::INFO,
@@ -382,7 +382,7 @@ mod tests {
         assert!(out.contains("Branch"), "{out}");
         assert!(out.contains("Worktree"), "{out}");
         assert!(out.contains("Will run:"), "{out}");
-        assert!(out.contains("1. git fetch"), "{out}");
+        assert!(out.contains("1. Git fetch"), "{out}");
         assert!(out.contains("Role"), "{out}");
         assert!(out.contains("Model"), "{out}");
         assert!(out.contains("Thinking"), "{out}");
