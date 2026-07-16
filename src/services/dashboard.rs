@@ -741,6 +741,10 @@ pub struct ReviewFile {
 pub enum ReviewPreparation {
     Ready {
         files: Vec<ReviewFile>,
+        /// Changed files nobody reviews by hand (lockfiles, minified
+        /// bundles, snapshots, …), filtered out deterministically before
+        /// any AI call. Reported on the final table with their reason.
+        skipped: Vec<ReviewSkippedFile>,
         owner: String,
         repo: String,
         /// PR head commit sha — required by the inline-comment API.
@@ -756,6 +760,14 @@ pub enum ReviewPreparation {
     AiUnavailable,
     /// `git pull --ff-only` or the PR lookup failed. stderr included.
     SyncFailed(String),
+}
+
+/// One changed file excluded from the review before any AI call, with the
+/// human-readable reason shown on the final report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSkippedFile {
+    pub path: String,
+    pub reason: &'static str,
 }
 
 /// Severity the scan AI assigns to a finding. Ordered so the walkthrough can
@@ -2701,10 +2713,14 @@ impl DashboardService {
         .await
         .map_err(|_| WisetreeError::other("gh pr diff timed out after 30s"))?
         .map_err(WisetreeError::other)?;
-        let mut files = parse_review_diff(&diff);
-        if files.is_empty() {
+        let parsed = parse_review_diff(&diff);
+        if parsed.is_empty() {
             return Ok(ReviewPreparation::NoChanges);
         }
+        // Lockfiles, minified bundles, snapshots, … are excluded here, before
+        // any AI call — they still reach the screen so the final report can
+        // show each one with its reason.
+        let (mut files, skipped) = partition_reviewable_files(parsed);
 
         // Existing review comments, grouped per file — dedup context only,
         // so a fetch failure just means the AI scans without it.
@@ -2725,6 +2741,7 @@ impl DashboardService {
 
         Ok(ReviewPreparation::Ready {
             files,
+            skipped,
             owner,
             repo,
             head_sha,
@@ -5711,6 +5728,72 @@ async fn materialize_review_tables() -> String {
     path.to_string_lossy().to_string()
 }
 
+/// Deterministic pre-filter: files nobody reviews by hand are excluded
+/// before any AI call — each skipped file would otherwise cost a full
+/// scan (prompt + diff) for feedback no author wants. Path-based only, so
+/// the decision is reproducible and visible on the final report.
+pub(crate) fn review_skip_reason(path: &str) -> Option<&'static str> {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let mut parts = lower.rsplit('/');
+    let name = parts.next().unwrap_or_default();
+    if parts.any(|dir| matches!(dir, "vendor" | "vendors" | "node_modules" | "third_party")) {
+        return Some("vendored code");
+    }
+    if lower.split('/').any(|dir| dir == "__snapshots__") || name.ends_with(".snap") {
+        return Some("test snapshot");
+    }
+    const LOCKFILES: [&str; 16] = [
+        "cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+        "go.sum",
+        "gemfile.lock",
+        "composer.lock",
+        "poetry.lock",
+        "uv.lock",
+        "pipfile.lock",
+        "podfile.lock",
+        "mix.lock",
+        "flake.lock",
+        "packages.lock.json",
+    ];
+    if LOCKFILES.contains(&name) || name.ends_with(".lockfile") {
+        return Some("lockfile");
+    }
+    if name.ends_with(".min.js") || name.ends_with(".min.css") || name.ends_with(".min.mjs") {
+        return Some("minified asset");
+    }
+    if name.ends_with(".map") {
+        return Some("source map");
+    }
+    if name.contains(".generated.") || name.ends_with(".pb.go") || name.ends_with("_pb2.py") {
+        return Some("generated code");
+    }
+    None
+}
+
+/// Split the parsed diff into the files worth an AI scan and the ones the
+/// deterministic filter excludes (with their reasons).
+pub(crate) fn partition_reviewable_files(
+    files: Vec<ReviewFile>,
+) -> (Vec<ReviewFile>, Vec<ReviewSkippedFile>) {
+    let mut reviewable = Vec::new();
+    let mut skipped = Vec::new();
+    for file in files {
+        match review_skip_reason(&file.path) {
+            Some(reason) => skipped.push(ReviewSkippedFile {
+                path: file.path,
+                reason,
+            }),
+            None => reviewable.push(file),
+        }
+    }
+    (reviewable, skipped)
+}
+
 /// Classify a changed file as a test file so its scan uses the dedicated
 /// test-quality prompt profile instead of the source one. Path-based
 /// heuristic covering the common layouts: `tests`/`spec`/`__tests__`
@@ -6488,6 +6571,55 @@ new file mode 100644
         let revised = build_review_scan_prompt(&file, "/tmp/t.md", Some("too harsh"), Some("prev"));
         assert!(revised.contains("too harsh"));
         assert!(revised.contains("prev"));
+    }
+
+    #[test]
+    fn review_skip_reason_filters_unreviewable_files() {
+        for (path, reason) in [
+            ("Cargo.lock", "lockfile"),
+            ("frontend/package-lock.json", "lockfile"),
+            ("gradle/deps.lockfile", "lockfile"),
+            ("dist/app.min.js", "minified asset"),
+            ("dist/app.js.map", "source map"),
+            ("src/__snapshots__/app.tsx.snap", "test snapshot"),
+            ("components/Button.snap", "test snapshot"),
+            ("vendor/lib/util.rb", "vendored code"),
+            ("api/types.generated.ts", "generated code"),
+            ("proto/events.pb.go", "generated code"),
+            ("proto/events_pb2.py", "generated code"),
+        ] {
+            assert_eq!(review_skip_reason(path), Some(reason), "{path}");
+        }
+        for path in [
+            "src/services/dashboard.rs",
+            "Cargo.toml",
+            "src/locker.rs",
+            "docs/lockfile-strategy.md",
+            "src/snapshot.rs",
+        ] {
+            assert_eq!(review_skip_reason(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn partition_reviewable_files_splits_and_keeps_reasons() {
+        let file = |path: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: String::new(),
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+        };
+        let (reviewable, skipped) =
+            partition_reviewable_files(vec![file("src/lib.rs"), file("Cargo.lock")]);
+        assert_eq!(reviewable.len(), 1);
+        assert_eq!(reviewable[0].path, "src/lib.rs");
+        assert_eq!(
+            skipped,
+            vec![ReviewSkippedFile {
+                path: "Cargo.lock".to_string(),
+                reason: "lockfile",
+            }]
+        );
     }
 
     #[test]

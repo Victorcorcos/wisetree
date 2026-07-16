@@ -2688,13 +2688,18 @@ impl App {
             Ok(prep) => match *prep {
                 ReviewPreparation::Ready {
                     files,
+                    skipped,
                     owner,
                     repo,
                     head_sha,
                 } => {
                     if let Some(screen) = self.review_pr.as_mut() {
                         screen.set_files(files, owner, repo, head_sha);
+                        screen.record_skipped_files(&skipped);
                     }
+                    // With every changed file filtered out (e.g. a
+                    // lockfile-only PR) this goes straight to the Done
+                    // report, which lists each skip and its reason.
                     self.start_review_scans(tx);
                 }
                 ReviewPreparation::NoChanges => self.fail_review(

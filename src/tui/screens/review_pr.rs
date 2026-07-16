@@ -12,8 +12,14 @@
 //!   scan phase shows the files currently being scanned in a panel below
 //!   the spinner.
 //! - `Decision`  : one finding at a time — category/severity badge, the exact
-//!   comment body that would be posted, then native **Post / Other / Skip**
-//!   buttons.
+//!   comment body that would be posted, then native **Post / Edit / Other /
+//!   Skip** buttons.
+//! - `EditFinding`: deterministic, AI-free editing of the current finding —
+//!   severity cycle, title/explanation text fields, suggestion keep/remove —
+//!   with a live preview of the comment. Entirely local to this screen (the
+//!   `App` never hears about it); `S` saves back into the finding, Esc
+//!   cancels. This absorbs the mechanical revisions ("lower the severity",
+//!   "reword the title") that would otherwise pay for an "Other" AI call.
 //! - `OtherInput`: freeform feedback box (the "Other" path); submitting
 //!   returns `ReviewAction::Revise(feedback)` so the `App` re-scans that one
 //!   finding.
@@ -38,7 +44,7 @@ use ratatui::Frame;
 
 use crate::config::schema::AiModelConfig;
 use crate::messages::colors;
-use crate::services::dashboard::{ReviewFile, ReviewFinding, ReviewSeverity};
+use crate::services::dashboard::{ReviewFile, ReviewFinding, ReviewSeverity, ReviewSkippedFile};
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
 use crate::tui::widgets::{
@@ -55,18 +61,93 @@ pub enum ReviewStep {
     /// AI only reads, so there is nothing to watch live).
     Working,
     Decision,
+    /// Deterministic edit form for the current finding — no AI, no tokens.
+    EditFinding,
     OtherInput,
     /// The deterministic review summary + Request changes / Comment / Skip.
     Summary,
     Done,
 }
 
-/// The three native decision buttons for one finding.
+/// The four native decision buttons for one finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecisionButton {
     Post,
+    Edit,
     Other,
     Skip,
+}
+
+/// The editable rows of the `EditFinding` form, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditRow {
+    Severity,
+    Title,
+    Explanation,
+    Suggestion,
+}
+
+const EDIT_ROWS: [EditRow; 4] = [
+    EditRow::Severity,
+    EditRow::Title,
+    EditRow::Explanation,
+    EditRow::Suggestion,
+];
+
+/// Working state of the `EditFinding` form: a draft copy of the finding the
+/// user mutates field by field. `S` commits the draft back into the
+/// walkthrough, Esc throws it away — the original finding is never touched
+/// until save.
+struct EditState {
+    draft: ReviewFinding,
+    /// A removed suggestion is parked here so the toggle can restore it.
+    removed_suggestion: Option<String>,
+    row: EditRow,
+    /// Open text editor for Title (single-line) or Explanation (multiline).
+    input: Option<InputPrompt>,
+    row_rects: Cell<[Rect; 4]>,
+}
+
+impl EditState {
+    fn new(finding: ReviewFinding) -> Self {
+        Self {
+            draft: finding,
+            removed_suggestion: None,
+            row: EditRow::Severity,
+            input: None,
+            row_rects: Cell::new([Rect::default(); 4]),
+        }
+    }
+
+    /// Cycle the draft severity: ←/→ move through Critical…Low.
+    fn cycle_severity(&mut self, forward: bool) {
+        const ORDER: [ReviewSeverity; 4] = [
+            ReviewSeverity::Critical,
+            ReviewSeverity::High,
+            ReviewSeverity::Medium,
+            ReviewSeverity::Low,
+        ];
+        let at = ORDER
+            .iter()
+            .position(|s| *s == self.draft.severity)
+            .unwrap_or(0);
+        let next = if forward {
+            (at + 1) % ORDER.len()
+        } else {
+            (at + ORDER.len() - 1) % ORDER.len()
+        };
+        self.draft.severity = ORDER[next];
+    }
+
+    /// Keep ↔ remove the suggestion block. A finding that never carried one
+    /// has nothing to toggle.
+    fn toggle_suggestion(&mut self) {
+        if self.draft.suggestion.is_some() {
+            self.removed_suggestion = self.draft.suggestion.take();
+        } else if self.removed_suggestion.is_some() {
+            self.draft.suggestion = self.removed_suggestion.take();
+        }
+    }
 }
 
 /// The three summary buttons.
@@ -148,7 +229,10 @@ pub struct ReviewPullRequestScreen {
     /// The deterministic summary markdown, built when the walkthrough ends.
     summary_body: String,
     decision_button: DecisionButton,
-    decision_button_rects: Cell<[Rect; 3]>,
+    decision_button_rects: Cell<[Rect; 4]>,
+    /// Live state of the deterministic edit form; `Some` only on
+    /// `EditFinding`.
+    edit: Option<EditState>,
     summary_button: SummaryButton,
     summary_button_rects: Cell<[Rect; 3]>,
     /// Scroll offset for the (potentially long) comment preview / summary.
@@ -181,7 +265,8 @@ impl ReviewPullRequestScreen {
             posted: Vec::new(),
             summary_body: String::new(),
             decision_button: DecisionButton::Post,
-            decision_button_rects: Cell::new([Rect::default(); 3]),
+            decision_button_rects: Cell::new([Rect::default(); 4]),
+            edit: None,
             summary_button: SummaryButton::Comment,
             summary_button_rects: Cell::new([Rect::default(); 3]),
             decision_scroll: 0,
@@ -251,6 +336,7 @@ impl ReviewPullRequestScreen {
             self.step,
             ReviewStep::Confirm
                 | ReviewStep::Decision
+                | ReviewStep::EditFinding
                 | ReviewStep::OtherInput
                 | ReviewStep::Summary
         )
@@ -326,6 +412,20 @@ impl ReviewPullRequestScreen {
         self.scans_done < self.files.len()
     }
 
+    /// Files the deterministic filter excluded before any AI call: one
+    /// muted row each on the final report, reason in the status label —
+    /// the user sees why a changed file never produced findings.
+    pub fn record_skipped_files(&mut self, skipped: &[ReviewSkippedFile]) {
+        for file in skipped {
+            self.summary_rows.push(SummaryRow::with_status(
+                format!("skip {}", file.path),
+                format!("Skipped ({})", file.reason),
+                colors::MUTED,
+                None,
+            ));
+        }
+    }
+
     /// Fold one file's findings into the aggregate.
     pub fn record_scan_result(&mut self, findings: Vec<ReviewFinding>) {
         self.findings.extend(findings);
@@ -366,12 +466,34 @@ impl ReviewPullRequestScreen {
         !self.findings.is_empty()
     }
 
-    /// Present the current finding with the Post / Other / Skip buttons.
+    /// Present the current finding with the Post / Edit / Other / Skip
+    /// buttons.
     pub fn enter_decision(&mut self) {
         self.decision_button = DecisionButton::Post;
         self.decision_scroll = 0;
         self.other_input = None;
+        self.edit = None;
         self.step = ReviewStep::Decision;
+    }
+
+    /// Open the deterministic edit form on a draft copy of the current
+    /// finding. Local to the screen — no `App` involvement, no AI call.
+    fn show_edit(&mut self) {
+        let Some(finding) = self.findings.get(self.current) else {
+            return;
+        };
+        self.edit = Some(EditState::new(finding.clone()));
+        self.step = ReviewStep::EditFinding;
+    }
+
+    /// Commit the edit draft into the walkthrough and return to Decision.
+    fn save_edit(&mut self) {
+        if let Some(edit) = self.edit.take() {
+            if let Some(slot) = self.findings.get_mut(self.current) {
+                *slot = edit.draft;
+            }
+        }
+        self.enter_decision();
     }
 
     /// Replace the current finding with its revision and re-enter Decision.
@@ -520,6 +642,7 @@ impl ReviewPullRequestScreen {
                 _ => ReviewAction::Continue,
             },
             ReviewStep::Decision => self.handle_decision_key(key),
+            ReviewStep::EditFinding => self.handle_edit_key(key),
             ReviewStep::OtherInput => self.handle_other_key(key),
             ReviewStep::Summary => self.handle_summary_key(key),
             ReviewStep::Done => ReviewAction::Done,
@@ -546,6 +669,10 @@ impl ReviewPullRequestScreen {
             }
             KeyCode::Enter => match self.decision_button {
                 DecisionButton::Post => ReviewAction::Post,
+                DecisionButton::Edit => {
+                    self.show_edit();
+                    ReviewAction::Continue
+                }
                 DecisionButton::Other => ReviewAction::Other,
                 DecisionButton::Skip => ReviewAction::Skip,
             },
@@ -554,6 +681,91 @@ impl ReviewPullRequestScreen {
             // summary on the floor.
             KeyCode::Esc => ReviewAction::Skip,
             _ => ReviewAction::Continue,
+        }
+    }
+
+    /// Bugkill-select-style navigation: ↑/↓ move across the field rows,
+    /// ←/→ (or Enter) change the focused field, `S` saves, Esc cancels.
+    /// While a text editor is open it owns the keyboard.
+    fn handle_edit_key(&mut self, key: KeyEvent) -> ReviewAction {
+        let Some(edit) = self.edit.as_mut() else {
+            self.step = ReviewStep::Decision;
+            return ReviewAction::Continue;
+        };
+        if let Some(input) = edit.input.as_mut() {
+            match input.handle_key(key) {
+                InputOutcome::Submitted(text) => {
+                    let text = text.trim().to_string();
+                    match edit.row {
+                        EditRow::Title => edit.draft.title = text,
+                        EditRow::Explanation => edit.draft.explanation = text,
+                        _ => {}
+                    }
+                    edit.input = None;
+                }
+                InputOutcome::Cancelled => edit.input = None,
+                InputOutcome::Pending => {}
+            }
+            return ReviewAction::Continue;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                let at = EDIT_ROWS.iter().position(|r| *r == edit.row).unwrap_or(0);
+                edit.row = EDIT_ROWS[(at + EDIT_ROWS.len() - 1) % EDIT_ROWS.len()];
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                let at = EDIT_ROWS.iter().position(|r| *r == edit.row).unwrap_or(0);
+                edit.row = EDIT_ROWS[(at + 1) % EDIT_ROWS.len()];
+            }
+            KeyCode::Left => match edit.row {
+                EditRow::Severity => edit.cycle_severity(false),
+                EditRow::Suggestion => edit.toggle_suggestion(),
+                _ => {}
+            },
+            KeyCode::Right => match edit.row {
+                EditRow::Severity => edit.cycle_severity(true),
+                EditRow::Suggestion => edit.toggle_suggestion(),
+                _ => {}
+            },
+            KeyCode::Enter => Self::activate_edit_row(edit),
+            KeyCode::Char('s') | KeyCode::Char('S') => self.save_edit(),
+            KeyCode::Esc => self.enter_decision(),
+            _ => {}
+        }
+        ReviewAction::Continue
+    }
+
+    /// Enter on a field row: cycle/toggle in place, or open the matching
+    /// text editor prefilled with the draft value.
+    fn activate_edit_row(edit: &mut EditState) {
+        match edit.row {
+            EditRow::Severity => edit.cycle_severity(true),
+            EditRow::Suggestion => edit.toggle_suggestion(),
+            EditRow::Title => {
+                edit.input = Some(
+                    InputPrompt::new("Edit the title:")
+                        .with_default(edit.draft.title.clone())
+                        .with_validator(|value| {
+                            value
+                                .trim()
+                                .is_empty()
+                                .then(|| "The title cannot be empty.".to_string())
+                        }),
+                );
+            }
+            EditRow::Explanation => {
+                edit.input = Some(
+                    InputPrompt::new("Edit the explanation (Ctrl+J for a new line):")
+                        .multiline()
+                        .with_default(edit.draft.explanation.clone())
+                        .with_validator(|value| {
+                            value
+                                .trim()
+                                .is_empty()
+                                .then(|| "The explanation cannot be empty.".to_string())
+                        }),
+                );
+            }
         }
     }
 
@@ -631,10 +843,15 @@ impl ReviewPullRequestScreen {
                 }
             }
             ReviewStep::Decision => {
-                let [post, other, skip] = self.decision_button_rects.get();
+                let [post, edit, other, skip] = self.decision_button_rects.get();
                 if contains_position(post, position) {
                     self.decision_button = DecisionButton::Post;
                     return ReviewAction::Post;
+                }
+                if contains_position(edit, position) {
+                    self.decision_button = DecisionButton::Edit;
+                    self.show_edit();
+                    return ReviewAction::Continue;
                 }
                 if contains_position(other, position) {
                     self.decision_button = DecisionButton::Other;
@@ -643,6 +860,23 @@ impl ReviewPullRequestScreen {
                 if contains_position(skip, position) {
                     self.decision_button = DecisionButton::Skip;
                     return ReviewAction::Skip;
+                }
+                ReviewAction::Continue
+            }
+            // A click on a field row focuses and activates it (cycle /
+            // toggle / open the text editor) — same as ↑↓ + Enter.
+            ReviewStep::EditFinding => {
+                if let Some(edit) = self.edit.as_mut() {
+                    if edit.input.is_none() {
+                        let rects = edit.row_rects.get();
+                        for (i, rect) in rects.iter().enumerate() {
+                            if contains_position(*rect, position) {
+                                edit.row = EDIT_ROWS[i];
+                                Self::activate_edit_row(edit);
+                                break;
+                            }
+                        }
+                    }
                 }
                 ReviewAction::Continue
             }
@@ -724,6 +958,7 @@ impl ReviewPullRequestScreen {
             ReviewStep::Confirm => self.render_confirm(frame, area),
             ReviewStep::Working => self.render_working(frame, area),
             ReviewStep::Decision => self.render_decision(frame, area),
+            ReviewStep::EditFinding => self.render_edit(frame, area),
             ReviewStep::OtherInput => self.render_other(frame, area),
             ReviewStep::Summary => self.render_summary(frame, area),
             ReviewStep::Done => self.render_done(frame, area),
@@ -884,6 +1119,8 @@ impl ReviewPullRequestScreen {
                 Constraint::Length(13),
                 Constraint::Length(2),
                 Constraint::Length(13),
+                Constraint::Length(2),
+                Constraint::Length(13),
                 Constraint::Min(0),
             ])
             .split(area);
@@ -897,11 +1134,19 @@ impl ReviewPullRequestScreen {
         );
         frame.render_widget(
             button_paragraph(
+                "  Edit  ",
+                colors::INFO,
+                matches!(self.decision_button, DecisionButton::Edit),
+            ),
+            chunks[3],
+        );
+        frame.render_widget(
+            button_paragraph(
                 "  Other  ",
                 colors::BRAND,
                 matches!(self.decision_button, DecisionButton::Other),
             ),
-            chunks[3],
+            chunks[5],
         );
         frame.render_widget(
             button_paragraph(
@@ -909,10 +1154,126 @@ impl ReviewPullRequestScreen {
                 colors::WARNING,
                 matches!(self.decision_button, DecisionButton::Skip),
             ),
-            chunks[5],
+            chunks[7],
         );
         self.decision_button_rects
-            .set([chunks[1], chunks[3], chunks[5]]);
+            .set([chunks[1], chunks[3], chunks[5], chunks[7]]);
+    }
+
+    /// The deterministic edit form: Bugkill-style field rows (selected row
+    /// highlighted, value column colored by meaning) over a live preview of
+    /// the comment as it would be posted, closed by a colored-keys footer.
+    fn render_edit(&self, frame: &mut Frame, area: Rect) {
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        let n = self.current + 1;
+        let total = self.findings.len();
+        let fields_height = if edit.input.is_some() {
+            11
+        } else {
+            EDIT_ROWS.len() as u16
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),             // title
+                Constraint::Length(1),             // subtitle
+                Constraint::Length(1),             // blank
+                Constraint::Length(fields_height), // field rows / text editor
+                Constraint::Length(1),             // blank
+                Constraint::Min(3),                // live preview
+                Constraint::Length(1),             // shortcuts
+            ])
+            .split(area);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("Edit finding #{n} of {total}"),
+                    Style::default()
+                        .fg(colors::NAVY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ·  ".to_string(), muted_dim()),
+                Span::styled(
+                    sanitize_row(&edit.draft.descriptor()),
+                    Style::default().fg(colors::EMPHASIS),
+                ),
+            ])),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Deterministic edit — no AI call, no tokens. The AI-written original is \
+                 restored on Cancel.",
+                Style::default().fg(colors::GRAY_DARK),
+            ))),
+            chunks[1],
+        );
+
+        if let Some(input) = edit.input.as_ref() {
+            input.render(frame, chunks[3], self.tick);
+            edit.row_rects.set([Rect::default(); 4]);
+        } else {
+            self.render_edit_rows(frame, chunks[3], edit);
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(colors::NAVY))
+            .title(Line::from(Span::styled(
+                " Preview ".to_string(),
+                Style::default()
+                    .fg(colors::NAVY)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        let inner = block.inner(chunks[5]);
+        frame.render_widget(block, chunks[5]);
+        frame.render_widget(
+            Paragraph::new(build_comment_preview_lines(
+                &edit.draft,
+                inner.width as usize,
+            ))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+
+        render_edit_shortcut_line(frame, chunks[6], edit.input.is_some());
+    }
+
+    fn render_edit_rows(&self, frame: &mut Frame, area: Rect, edit: &EditState) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1); 4])
+            .split(area);
+        let mut rects = [Rect::default(); 4];
+        for (i, row) in EDIT_ROWS.iter().enumerate() {
+            rects[i] = rows[i];
+            let selected = edit.row == *row;
+            let (label, value) = edit_row_content(edit, *row);
+            let marker = if selected { "▸ " } else { "  " };
+            let mut line = Line::from(vec![
+                Span::styled(marker.to_string(), Style::default().fg(colors::NAVY)),
+                Span::styled(
+                    format!("{label:<13}"),
+                    Style::default()
+                        .fg(if selected {
+                            colors::WHITE
+                        } else {
+                            colors::GRAY_LIGHT
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                value,
+            ]);
+            if selected {
+                line = line.style(Style::default().bg(colors::BG_SELECTED));
+            }
+            frame.render_widget(Paragraph::new(line), rows[i]);
+        }
+        edit.row_rects.set(rects);
     }
 
     fn render_other(&self, frame: &mut Frame, area: Rect) {
@@ -1093,7 +1454,8 @@ impl ReviewPullRequestScreen {
 
 fn next_decision_button(b: DecisionButton) -> DecisionButton {
     match b {
-        DecisionButton::Post => DecisionButton::Other,
+        DecisionButton::Post => DecisionButton::Edit,
+        DecisionButton::Edit => DecisionButton::Other,
         DecisionButton::Other => DecisionButton::Skip,
         DecisionButton::Skip => DecisionButton::Post,
     }
@@ -1102,7 +1464,8 @@ fn next_decision_button(b: DecisionButton) -> DecisionButton {
 fn prev_decision_button(b: DecisionButton) -> DecisionButton {
     match b {
         DecisionButton::Post => DecisionButton::Skip,
-        DecisionButton::Other => DecisionButton::Post,
+        DecisionButton::Edit => DecisionButton::Post,
+        DecisionButton::Other => DecisionButton::Edit,
         DecisionButton::Skip => DecisionButton::Other,
     }
 }
@@ -1127,6 +1490,94 @@ fn muted_dim() -> Style {
     Style::default()
         .fg(colors::MUTED)
         .add_modifier(Modifier::DIM)
+}
+
+/// One edit-form row: its label and the styled value span.
+fn edit_row_content(edit: &EditState, row: EditRow) -> (&'static str, Span<'static>) {
+    match row {
+        EditRow::Severity => (
+            "Severity",
+            Span::styled(
+                format!("‹ {} ›", edit.draft.severity.label()),
+                Style::default()
+                    .fg(severity_color(edit.draft.severity))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ),
+        EditRow::Title => (
+            "Title",
+            Span::styled(
+                sanitize_row(&edit.draft.title),
+                Style::default().fg(colors::WHITE),
+            ),
+        ),
+        EditRow::Explanation => {
+            let mut lines = edit.draft.explanation.lines();
+            let first = lines.next().unwrap_or("").to_string();
+            let more = lines.next().is_some();
+            let shown = if more { format!("{first} …") } else { first };
+            (
+                "Explanation",
+                Span::styled(
+                    sanitize_row(&shown),
+                    Style::default().fg(colors::GRAY_LIGHT),
+                ),
+            )
+        }
+        EditRow::Suggestion => match (&edit.draft.suggestion, &edit.removed_suggestion) {
+            (Some(_), _) => (
+                "Suggestion",
+                Span::styled(
+                    "Kept — ← → removes the one-click suggestion block".to_string(),
+                    Style::default().fg(colors::SUCCESS),
+                ),
+            ),
+            (None, Some(_)) => (
+                "Suggestion",
+                Span::styled(
+                    "Removed — ← → restores it".to_string(),
+                    Style::default().fg(colors::WARNING),
+                ),
+            ),
+            (None, None) => (
+                "Suggestion",
+                Span::styled("(this finding has none)".to_string(), muted_dim()),
+            ),
+        },
+    }
+}
+
+/// Footer for the edit form. While a text editor is open the editor owns
+/// the keys, so only its own submit/cancel hints apply.
+fn render_edit_shortcut_line(frame: &mut Frame, area: Rect, input_open: bool) {
+    let separator = Span::styled("  ·  ".to_string(), muted_dim());
+    let spans = if input_open {
+        vec![
+            Span::styled("↵ ".to_string(), Style::default().fg(colors::SUCCESS)),
+            Span::styled("Apply".to_string(), muted_dim()),
+            separator,
+            Span::styled("Esc ".to_string(), Style::default().fg(colors::WARNING)),
+            Span::styled("Back to the form".to_string(), muted_dim()),
+        ]
+    } else {
+        vec![
+            Span::styled("↑ ↓ ".to_string(), Style::default().fg(colors::INFO)),
+            Span::styled("Field".to_string(), muted_dim()),
+            separator.clone(),
+            Span::styled("← → ".to_string(), Style::default().fg(colors::INFO)),
+            Span::styled("Change".to_string(), muted_dim()),
+            separator.clone(),
+            Span::styled("↵ ".to_string(), Style::default().fg(colors::INFO)),
+            Span::styled("Edit / toggle".to_string(), muted_dim()),
+            separator.clone(),
+            Span::styled("S ".to_string(), Style::default().fg(colors::SUCCESS)),
+            Span::styled("Save".to_string(), muted_dim()),
+            separator,
+            Span::styled("Esc ".to_string(), Style::default().fg(colors::WARNING)),
+            Span::styled("Cancel".to_string(), muted_dim()),
+        ]
+    };
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The severity badge color: Critical reads as an error, Low as info.
@@ -1188,10 +1639,11 @@ fn build_detail_lines(request: &ReviewPullRequestRequest) -> Vec<Line<'static>> 
 
 /// `Will run:` step text for the confirm panel; the shared [`PrConfirmView`]
 /// owns the numbering + styling.
-const REVIEW_STEPS: [&str; 6] = [
+const REVIEW_STEPS: [&str; 7] = [
     "Sync the branch + fetch the PR diff and its existing comments",
-    "AI scans the changed files in parallel (test files get a dedicated prompt)",
-    "You choose Post / Other / Skip per finding",
+    "Lockfiles, minified/generated files and snapshots are skipped (no AI cost)",
+    "AI scans the remaining files in parallel (test files get a dedicated prompt)",
+    "You choose Post / Edit / Other / Skip per finding (Edit is AI-free)",
     "Approved findings are posted as inline PR comments (with suggestions)",
     "A review summary is assembled from the posted comments (no AI)",
     "You choose Request changes / Comment / Skip for the summary",
@@ -1532,12 +1984,10 @@ mod tests {
         screen.finish_scanning();
         screen.enter_decision();
         assert_eq!(screen.step(), ReviewStep::Decision);
-        // Default focus = Post.
+        // Default focus = Post; cycle Post → Edit → Other → Skip.
         assert_eq!(screen.handle_key(key(KeyCode::Enter)), ReviewAction::Post);
-        assert_eq!(
-            screen.handle_key(key(KeyCode::Right)),
-            ReviewAction::Continue
-        );
+        screen.handle_key(key(KeyCode::Right)); // Edit — exercised in its own tests
+        screen.handle_key(key(KeyCode::Right));
         assert_eq!(screen.handle_key(key(KeyCode::Enter)), ReviewAction::Other);
         assert_eq!(
             screen.handle_key(key(KeyCode::Right)),
@@ -1546,6 +1996,106 @@ mod tests {
         assert_eq!(screen.handle_key(key(KeyCode::Enter)), ReviewAction::Skip);
         // Esc on a finding skips it (keeps the loop going).
         assert_eq!(screen.handle_key(key(KeyCode::Esc)), ReviewAction::Skip);
+    }
+
+    fn screen_on_decision() -> ReviewPullRequestScreen {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::High)]);
+        screen.finish_scanning();
+        screen.enter_decision();
+        screen
+    }
+
+    fn enter_edit(screen: &mut ReviewPullRequestScreen) {
+        screen.handle_key(key(KeyCode::Right)); // focus Edit
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ReviewAction::Continue
+        );
+        assert_eq!(screen.step(), ReviewStep::EditFinding);
+    }
+
+    #[test]
+    fn edit_saves_severity_title_and_suggestion_changes() {
+        let mut screen = screen_on_decision();
+        enter_edit(&mut screen);
+        // Severity row: → cycles High → Medium.
+        screen.handle_key(key(KeyCode::Right));
+        // Title row: Enter opens the prefilled editor; append " v2".
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Enter));
+        for c in " v2".chars() {
+            screen.handle_key(key(KeyCode::Char(c)));
+        }
+        screen.handle_key(key(KeyCode::Enter));
+        // Suggestion row: Enter toggles the block off.
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Enter));
+        // Save with S — back on Decision with the draft committed.
+        screen.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(screen.step(), ReviewStep::Decision);
+        let f = screen.current_finding().unwrap();
+        assert_eq!(f.severity, ReviewSeverity::Medium);
+        assert_eq!(f.title, "Hardcoded API key v2");
+        assert_eq!(f.suggestion, None);
+    }
+
+    #[test]
+    fn edit_cancel_discards_every_draft_change() {
+        let mut screen = screen_on_decision();
+        enter_edit(&mut screen);
+        screen.handle_key(key(KeyCode::Right)); // severity High → Medium
+        screen.handle_key(key(KeyCode::Esc));
+        assert_eq!(screen.step(), ReviewStep::Decision);
+        let f = screen.current_finding().unwrap();
+        assert_eq!(f.severity, ReviewSeverity::High);
+        assert!(f.suggestion.is_some());
+    }
+
+    #[test]
+    fn edit_suggestion_toggle_restores_the_removed_block() {
+        let mut screen = screen_on_decision();
+        let original = screen.current_finding().unwrap().suggestion;
+        enter_edit(&mut screen);
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Down)); // Suggestion row
+        screen.handle_key(key(KeyCode::Left)); // remove
+        screen.handle_key(key(KeyCode::Left)); // restore
+        screen.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(screen.current_finding().unwrap().suggestion, original);
+    }
+
+    #[test]
+    fn edit_page_renders_fields_live_preview_and_footer() {
+        let mut screen = screen_on_decision();
+        enter_edit(&mut screen);
+        let dump = render_dump(&mut screen, 110, 30);
+        assert!(dump.contains("Edit finding #1 of 1"), "{dump}");
+        assert!(dump.contains("no AI call, no tokens"), "{dump}");
+        assert!(dump.contains("Severity"), "{dump}");
+        assert!(dump.contains("‹ High ›"), "{dump}");
+        assert!(dump.contains("Hardcoded API key"), "{dump}");
+        assert!(dump.contains("Explanation"), "{dump}");
+        assert!(dump.contains("Kept"), "{dump}");
+        assert!(dump.contains("Preview"), "{dump}");
+        assert!(dump.contains("Save"), "{dump}");
+        assert!(dump.contains("Cancel"), "{dump}");
+    }
+
+    #[test]
+    fn skipped_files_get_muted_success_rows_with_the_reason() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.record_skipped_files(&[ReviewSkippedFile {
+            path: "Cargo.lock".to_string(),
+            reason: "lockfile",
+        }]);
+        let row = &screen.summary_rows[0];
+        assert!(row.success, "a skip is not a failure");
+        assert_eq!(row.status.as_ref().unwrap().label, "Skipped (lockfile)");
+        assert!(row.command.contains("Cargo.lock"));
     }
 
     #[test]
@@ -1574,6 +2124,7 @@ mod tests {
         assert!(dump.contains("Suggested replacement"), "{dump}");
         assert!(dump.contains("env::var"), "{dump}");
         assert!(dump.contains("Post"), "{dump}");
+        assert!(dump.contains("Edit"), "{dump}");
         assert!(dump.contains("Other"), "{dump}");
         assert!(dump.contains("Skip"), "{dump}");
     }

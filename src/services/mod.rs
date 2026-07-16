@@ -28,8 +28,8 @@ pub use dashboard::{
     DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest,
     FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, MergeStatus, PrState,
     PullRequest, PullRequestDetails, ReviewComment, ReviewFile, ReviewFinding, ReviewPreparation,
-    ReviewSeverity, ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase,
-    UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
+    ReviewSeverity, ReviewSkippedFile, ReviewStatus, ReviewerSummary, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
     PR_REFRESH_PERIOD_MS,
 };
 pub use opencode_models::{
