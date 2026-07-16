@@ -109,8 +109,10 @@ pub fn labeled_spans(label: &str, values: Vec<Span<'static>>) -> Line<'static> {
 }
 
 /// Split text by backtick-delimited code spans and return styled spans.
-/// Code (text between backticks) gets `code_style`; everything else gets `base_style`.
-/// Nesting is not supported — inner backticks are treated as regular text.
+/// Code (text between backticks) gets `code_style`, padded with a leading and
+/// trailing space so the highlight reads as a chip rather than a tight
+/// underline; everything else gets `base_style`. Nesting is not supported —
+/// inner backticks are treated as regular text.
 fn code_spans(text: &str, base_style: Style, code_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cursor = 0usize;
@@ -135,7 +137,10 @@ fn code_spans(text: &str, base_style: Style, code_style: Style) -> Vec<Span<'sta
                     }
                     Some(rel_close) => {
                         let close = open + 1 + rel_close;
-                        spans.push(Span::styled(text[open + 1..close].to_string(), code_style));
+                        spans.push(Span::styled(
+                            format!(" {} ", &text[open + 1..close]),
+                            code_style,
+                        ));
                         cursor = close + 1;
                     }
                 }
@@ -161,7 +166,7 @@ pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
         .fg(colors::MUTED)
         .add_modifier(Modifier::DIM);
     let text_style = Style::default().fg(colors::EMPHASIS);
-    let code_style = Style::default().fg(colors::WHITE).bg(colors::BG_SELECTED);
+    let code_style = Style::default().fg(colors::ACCENT).bg(colors::CODE_BG);
     let mut lines = vec![Line::from(Span::styled(
         "Will run:".to_string(),
         header_style,
@@ -424,7 +429,7 @@ mod tests {
         assert!(out.contains("Branch"), "{out}");
         assert!(out.contains("Worktree"), "{out}");
         assert!(out.contains("Will run:"), "{out}");
-        assert!(out.contains("1. git fetch"), "{out}");
+        assert!(out.contains("1.  git fetch "), "{out}");
         assert!(out.contains("Role"), "{out}");
         assert!(out.contains("Model"), "{out}");
         assert!(out.contains("Thinking"), "{out}");
