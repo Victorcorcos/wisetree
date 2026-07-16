@@ -108,12 +108,26 @@ pub fn labeled_spans(label: &str, values: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Shared style for inline code chips: orange text on a neutral gray
+/// background, distinct from the app's brown-tinted panel colors.
+pub fn code_style() -> Style {
+    Style::default().fg(colors::ACCENT).bg(colors::CODE_BG)
+}
+
+/// A single value rendered as an inline code chip (orange on gray, padded
+/// with a leading/trailing space), matching the backtick-delimited spans in
+/// [`will_run_lines`]. Use for standalone values like a ref or branch name
+/// that deserve the same "code" treatment outside of a `Will run:` step.
+pub fn code_span(text: impl Into<String>) -> Span<'static> {
+    Span::styled(format!(" {} ", text.into()), code_style())
+}
+
 /// Split text by backtick-delimited code spans and return styled spans.
 /// Code (text between backticks) gets `code_style`, padded with a leading and
 /// trailing space so the highlight reads as a chip rather than a tight
 /// underline; everything else gets `base_style`. Nesting is not supported —
 /// inner backticks are treated as regular text.
-fn code_spans(text: &str, base_style: Style, code_style: Style) -> Vec<Span<'static>> {
+pub fn code_spans(text: &str, base_style: Style, code_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cursor = 0usize;
 
@@ -154,6 +168,18 @@ fn code_spans(text: &str, base_style: Style, code_style: Style) -> Vec<Span<'sta
     spans
 }
 
+/// Backtick-aware lines for a whole block of text, one [`Line`] per `\n`
+/// segment. Non-code spans are left unstyled (`Style::default()`) so callers
+/// that already set a fallback style on the surrounding `Paragraph` (toasts,
+/// the confirmation modal) keep their existing look; only backtick-delimited
+/// segments get the code-chip treatment. Use [`code_spans`] directly when a
+/// caller needs a specific base style instead of the paragraph fallback.
+pub fn code_lines(text: &str) -> Vec<Line<'static>> {
+    text.lines()
+        .map(|line| Line::from(code_spans(line, Style::default(), code_style())))
+        .collect()
+}
+
 /// A `Will run:` header followed by numbered steps, matching the Bugkill
 /// pipeline preview. Callers pass the human-readable step text; the widget
 /// owns the numbering + styling so every command's preview looks the same.
@@ -166,7 +192,7 @@ pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
         .fg(colors::MUTED)
         .add_modifier(Modifier::DIM);
     let text_style = Style::default().fg(colors::EMPHASIS);
-    let code_style = Style::default().fg(colors::ACCENT).bg(colors::CODE_BG);
+    let code_style = code_style();
     let mut lines = vec![Line::from(Span::styled(
         "Will run:".to_string(),
         header_style,

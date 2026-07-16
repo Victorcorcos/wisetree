@@ -94,7 +94,7 @@ pub fn render_toast(frame: &mut Frame, area: Rect, toast: &ToastSnapshot) {
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
     frame.render_widget(
-        Paragraph::new(toast.message.as_str())
+        Paragraph::new(super::pr_confirm::code_lines(&toast.message))
             .style(Style::default().fg(colors::WHITE).bg(colors::MENU_BG))
             .wrap(Wrap { trim: false }),
         inner,
@@ -226,5 +226,44 @@ mod tests {
         let area = Rect::new(0, 0, 80, 20);
         let rect = toast_rect(area, "Copied to clipboard");
         assert_eq!(rect.width, "Copied to clipboard".chars().count() as u16 + 2);
+    }
+
+    #[test]
+    fn message_backticks_render_as_code_chip_not_literal_backticks() {
+        let area = Rect::new(0, 0, 80, 20);
+        let toast = ToastSnapshot {
+            message: "Pull Request #7 updated with `upstream/main` and pushed.".into(),
+            variant: ToastVariant::Success,
+        };
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_toast(frame, area, &toast))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let mut out = String::new();
+        let mut code_cell_style = None;
+        for y in 0..buffer.area.height {
+            let mut row = String::new();
+            for x in 0..buffer.area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            if let Some(col) = row.find("upstream/main") {
+                let cell = &buffer[(col as u16, y)];
+                code_cell_style = Some((cell.fg, cell.bg));
+            }
+            out.push_str(&row);
+            out.push('\n');
+        }
+
+        assert!(!out.contains('`'), "literal backtick leaked:\n{out}");
+        assert!(out.contains("upstream/main"), "{out}");
+        assert!(out.contains("and pushed."), "{out}");
+        assert_eq!(
+            code_cell_style,
+            Some((colors::ACCENT, colors::CODE_BG)),
+            "code chip should be orange-on-gray:\n{out}"
+        );
     }
 }

@@ -17,8 +17,8 @@ use crate::services::{
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, SelectOption, SelectOutcome,
-    SelectPrompt, Status, StatusIndicator,
+    code_spans, code_style, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 const SELECT_MARKER: &str = " ➤ ";
@@ -1823,9 +1823,11 @@ impl DashboardScreen {
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
         if let Some(notice) = &self.notice {
-            return Line::from(Span::styled(
-                truncate(&notice.message, width.max(1) as usize),
+            let truncated = truncate(&notice.message, width.max(1) as usize);
+            return Line::from(code_spans(
+                &truncated,
                 notice_style(notice.level),
+                code_style(),
             ));
         }
         if let Some(row) = self.selected_row() {

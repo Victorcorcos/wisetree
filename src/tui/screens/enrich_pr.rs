@@ -42,8 +42,9 @@ use crate::tui::screens::update_pr::{
     ai_activity_event_to_line, button_paragraph, contains_position, key_event_to_pty_bytes,
 };
 use crate::tui::widgets::{
-    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
+    code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator,
+    SummaryRow,
 };
 
 const ENRICH_LOADING_MESSAGE: &str = "Resolving base ref...";
@@ -1239,15 +1240,15 @@ fn build_detail_lines(request: &EnrichPullRequestRequest) -> Vec<Line<'static>> 
     ));
     rows.push(labeled_line(
         "Base ref",
-        Span::styled(
-            request
-                .base_ref
-                .clone()
-                .unwrap_or_else(|| "(resolving...)".to_string()),
-            Style::default()
-                .fg(colors::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
+        match request.base_ref.clone() {
+            Some(base_ref) => code_span(base_ref),
+            None => Span::styled(
+                "(resolving...)".to_string(),
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        },
         None,
     ));
     rows
