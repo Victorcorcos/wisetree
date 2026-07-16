@@ -81,6 +81,12 @@ const REVIEW_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_SCAN_TIMEOUT: Duration = Duration::from_secs(240);
 const REVIEW_POST_TIMEOUT: Duration = Duration::from_secs(30);
+/// GitHub's API occasionally answers a healthy PR with a transient 5xx (a
+/// blip in their infra, not a real problem with the PR or its diff). Retried
+/// a couple of times in [`run_gh_command`] so a single blip during Review/Fix
+/// prep doesn't force the user back to the Dashboard.
+const GH_TRANSIENT_RETRIES: u32 = 2;
+const GH_TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// Byte caps applied before templating the per-file scan prompt, so the
 /// rendered prompt argv never approaches OS limits: one file's annotated
 /// diff, and the existing-comments dedup context.
@@ -2339,7 +2345,7 @@ impl DashboardService {
         let number_arg = number.to_string();
         let view = time::timeout(
             FIX_FETCH_TIMEOUT,
-            run_command(
+            run_gh_command(
                 &self.gh_binary,
                 &["pr", "view", &number_arg, "--json", "url"],
                 Some(&cwd),
@@ -2364,7 +2370,7 @@ impl DashboardService {
         let arg = format!("query={query}");
         let output = time::timeout(
             FIX_FETCH_TIMEOUT,
-            run_command(&self.gh_binary, &["api", "graphql", "-f", &arg], Some(&cwd)),
+            run_gh_command(&self.gh_binary, &["api", "graphql", "-f", &arg], Some(&cwd)),
         )
         .await
         .map_err(|_| WisetreeError::other("gh api graphql timed out after 15s"))?
@@ -2697,7 +2703,7 @@ impl DashboardService {
         let number_arg = number.to_string();
         let view = time::timeout(
             REVIEW_FETCH_TIMEOUT,
-            run_command(
+            run_gh_command(
                 &self.gh_binary,
                 &["pr", "view", &number_arg, "--json", "url,headRefOid"],
                 Some(&cwd),
@@ -2721,7 +2727,7 @@ impl DashboardService {
         // inline comments on.
         let diff = time::timeout(
             REVIEW_FETCH_TIMEOUT,
-            run_command(&self.gh_binary, &["pr", "diff", &number_arg], Some(&cwd)),
+            run_gh_command(&self.gh_binary, &["pr", "diff", &number_arg], Some(&cwd)),
         )
         .await
         .map_err(|_| WisetreeError::other("gh pr diff timed out after 30s"))?
@@ -4675,6 +4681,32 @@ async fn run_command(
         },
     )
     .await
+}
+
+/// `gh <args>`, retrying a couple of times when it fails with a transient
+/// GitHub-side 5xx ([`is_transient_gh_error`]) — anything else (404, auth,
+/// …) returns on the first try, same as [`run_command`].
+async fn run_gh_command(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> std::result::Result<String, String> {
+    let mut attempt = 0;
+    loop {
+        match run_command(binary, args, cwd).await {
+            Err(err) if attempt < GH_TRANSIENT_RETRIES && is_transient_gh_error(&err) => {
+                attempt += 1;
+                time::sleep(GH_TRANSIENT_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_transient_gh_error(err: &str) -> bool {
+    ["HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504"]
+        .iter()
+        .any(|code| err.contains(code))
 }
 
 /// One `binary <args>` spawn, with no lock recovery — the retryable unit
@@ -7893,6 +7925,84 @@ so the intent reads clearly.
         ));
         assert!(is_rate_limit_error("Secondary rate-limit triggered"));
         assert!(!is_rate_limit_error("network is unreachable"));
+    }
+
+    #[test]
+    fn detects_transient_gh_5xx_errors() {
+        assert!(is_transient_gh_error(
+            "could not find pull request diff: HTTP 503: 503 Service Unavailable \
+             (https://api.github.com/repos/oxeanbits/digitalize-front/pulls/4651)"
+        ));
+        assert!(is_transient_gh_error("HTTP 502: Bad Gateway"));
+        assert!(!is_transient_gh_error(
+            "HTTP 404: Not Found (https://api.github.com/repos/o/r/pulls/1)"
+        ));
+        assert!(!is_transient_gh_error("network is unreachable"));
+    }
+
+    #[tokio::test]
+    async fn run_gh_command_retries_transient_5xx_then_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter_path = dir.path().join("attempts");
+        let gh_path = dir.path().join("fake-gh.sh");
+        std::fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\n\
+                 n=$(cat \"{counter}\" 2>/dev/null || echo 0)\n\
+                 n=$((n + 1))\n\
+                 printf '%s' \"$n\" > \"{counter}\"\n\
+                 if [ \"$n\" -lt 3 ]; then\n\
+                 echo 'HTTP 503: 503 Service Unavailable' >&2\n\
+                 exit 1\n\
+                 fi\n\
+                 printf 'diff --git a/x b/x\\n'\n",
+                counter = counter_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&gh_path);
+
+        let out = run_gh_command(&gh_path, &["pr", "diff", "1"], Some(dir.path()))
+            .await
+            .expect("should succeed after retries");
+        assert_eq!(out, "diff --git a/x b/x");
+        assert_eq!(
+            std::fs::read_to_string(&counter_path).unwrap(),
+            "3",
+            "should have retried twice before succeeding on the third attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_gh_command_does_not_retry_permanent_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter_path = dir.path().join("attempts");
+        let gh_path = dir.path().join("fake-gh.sh");
+        std::fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\n\
+                 n=$(cat \"{counter}\" 2>/dev/null || echo 0)\n\
+                 n=$((n + 1))\n\
+                 printf '%s' \"$n\" > \"{counter}\"\n\
+                 echo 'HTTP 404: Not Found' >&2\n\
+                 exit 1\n",
+                counter = counter_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&gh_path);
+
+        let err = run_gh_command(&gh_path, &["pr", "diff", "1"], Some(dir.path()))
+            .await
+            .expect_err("permanent failure should surface");
+        assert!(err.contains("HTTP 404"), "unexpected error: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&counter_path).unwrap(),
+            "1",
+            "a non-transient error must return on the first attempt"
+        );
     }
 
     #[test]
