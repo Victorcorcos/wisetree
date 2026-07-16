@@ -1,14 +1,16 @@
 //! "Review Pull Request" screen. Scans the PR's changed files with one
-//! captured AI call per file, then walks the findings one at a time and posts
-//! the approved ones as PR comments. State machine:
+//! captured AI call per file — a small pool of files in parallel, test files
+//! with a dedicated test-quality prompt — then walks the findings one at a
+//! time and posts the approved ones as PR comments. State machine:
 //!
 //! - `Confirm`   : explanation panel + `ConfirmationModal` (Yes/No, **No**
 //!   default). Enter on Yes returns `ReviewAction::Confirmed`.
 //! - `Working`   : a quiet spinner + step toast. Covers every captured /
 //!   deterministic phase the `App` drives: syncing + fetching the diff,
-//!   scanning a file (`Scanning file #N…`), posting a comment, revising a
-//!   finding, and submitting the review summary. The scan phase shows the
-//!   file under review in a panel below the spinner.
+//!   scanning the files (`Scanning N changed files (M done)…`), posting a
+//!   comment, revising a finding, and submitting the review summary. The
+//!   scan phase shows the files currently being scanned in a panel below
+//!   the spinner.
 //! - `Decision`  : one finding at a time — category/severity badge, the exact
 //!   comment body that would be posted, then native **Post / Other / Skip**
 //!   buttons.
@@ -129,8 +131,13 @@ pub struct ReviewPullRequestScreen {
     /// The changed files to scan, in diff order. Empty until preparation.
     /// Kept whole so an "Other" revision can re-render the file's prompt.
     files: Vec<ReviewFile>,
-    /// Index of the file currently being scanned.
-    scan_index: usize,
+    /// Index of the next file not yet handed to a scan task.
+    next_scan: usize,
+    /// Paths currently being scanned in parallel — the Working panel's
+    /// content while the scan phase runs.
+    in_flight: Vec<String>,
+    /// Files whose scan reached a terminal state (parsed or failed twice).
+    scans_done: usize,
     /// Findings aggregated across every scanned file, sorted by severity
     /// once scanning completes.
     findings: Vec<ReviewFinding>,
@@ -166,7 +173,9 @@ impl ReviewPullRequestScreen {
             repo: String::new(),
             head_sha: String::new(),
             files: Vec::new(),
-            scan_index: 0,
+            next_scan: 0,
+            in_flight: Vec::new(),
+            scans_done: 0,
             findings: Vec::new(),
             current: 0,
             posted: Vec::new(),
@@ -207,11 +216,13 @@ impl ReviewPullRequestScreen {
     pub fn files_len(&self) -> usize {
         self.files.len()
     }
-    pub fn scan_index(&self) -> usize {
-        self.scan_index
+    pub fn file_at(&self, index: usize) -> Option<ReviewFile> {
+        self.files.get(index).cloned()
     }
-    pub fn current_scan_file(&self) -> Option<ReviewFile> {
-        self.files.get(self.scan_index).cloned()
+    /// True while per-file scans may still deliver results — the App drops
+    /// any scan event arriving outside this window.
+    pub fn scan_phase_active(&self) -> bool {
+        self.scanning
     }
     pub fn findings_len(&self) -> usize {
         self.findings.len()
@@ -259,37 +270,60 @@ impl ReviewPullRequestScreen {
         self.confirm = None;
     }
 
-    /// Store the prepared files + repo context and reset both loop cursors.
+    /// Store the prepared files + repo context and reset the scan pool.
     pub fn set_files(&mut self, files: Vec<ReviewFile>, owner: String, repo: String, sha: String) {
         self.files = files;
         self.owner = owner;
         self.repo = repo;
         self.head_sha = sha;
-        self.scan_index = 0;
+        self.next_scan = 0;
+        self.in_flight.clear();
+        self.scans_done = 0;
         self.findings.clear();
         self.posted.clear();
     }
 
-    /// Working step with the "Scanning file #N of M…" message.
-    pub fn start_scanning(&mut self) {
+    /// Working step for the parallel scan phase: the spinner message tracks
+    /// completed files and the panel below lists the files being scanned.
+    pub fn begin_scan_phase(&mut self) {
         self.step = ReviewStep::Working;
-        self.phase_message = format!(
-            "Scanning file #{} of {}...",
-            self.scan_index + 1,
-            self.files.len()
-        );
         self.scanning = true;
+        self.refresh_scan_message();
     }
 
-    /// Same Working step after an unparseable scan — one retry per file.
-    pub fn start_rescanning(&mut self) {
-        self.step = ReviewStep::Working;
+    fn refresh_scan_message(&mut self) {
         self.phase_message = format!(
-            "Retrying file #{} of {} (unparseable output)...",
-            self.scan_index + 1,
-            self.files.len()
+            "Scanning {} changed files ({} done)...",
+            self.files.len(),
+            self.scans_done
         );
-        self.scanning = true;
+    }
+
+    /// Hand out the next file to scan, tracking it as in-flight. `None`
+    /// once every file has been dispatched.
+    pub fn take_next_scan_file(&mut self) -> Option<(usize, ReviewFile)> {
+        let file = self.files.get(self.next_scan)?.clone();
+        let index = self.next_scan;
+        self.next_scan += 1;
+        self.in_flight.push(file.path.clone());
+        Some((index, file))
+    }
+
+    /// One file's scan reached a terminal state (result recorded or failed
+    /// twice): update the progress message and the in-flight panel.
+    pub fn note_scan_done(&mut self, file_index: usize) {
+        self.scans_done += 1;
+        if let Some(path) = self.files.get(file_index).map(|f| f.path.as_str()) {
+            if let Some(pos) = self.in_flight.iter().position(|p| p == path) {
+                self.in_flight.remove(pos);
+            }
+        }
+        self.refresh_scan_message();
+    }
+
+    /// True while some scan hasn't reached its terminal state yet.
+    pub fn scans_pending(&self) -> bool {
+        self.scans_done < self.files.len()
     }
 
     /// Fold one file's findings into the aggregate.
@@ -297,12 +331,12 @@ impl ReviewPullRequestScreen {
         self.findings.extend(findings);
     }
 
-    /// A file whose scan failed twice gets its own Failed row and the loop
+    /// A file whose scan failed twice gets its own Failed row and the pool
     /// moves on — one bad file never aborts the whole review.
-    pub fn record_scan_failure(&mut self, message: String) {
+    pub fn record_scan_failure(&mut self, file_index: usize, message: String) {
         let path = self
             .files
-            .get(self.scan_index)
+            .get(file_index)
             .map(|f| f.path.clone())
             .unwrap_or_default();
         self.summary_rows.push(SummaryRow::with_status(
@@ -313,17 +347,21 @@ impl ReviewPullRequestScreen {
         ));
     }
 
-    /// Advance to the next file. Returns `true` when one remains.
-    pub fn advance_scan(&mut self) -> bool {
-        self.scan_index += 1;
-        self.scan_index < self.files.len()
-    }
-
-    /// Scanning finished: sort the aggregate by severity (Critical first,
-    /// stable within a severity so diff order is preserved). Returns `true`
-    /// when at least one finding awaits the walkthrough.
+    /// Scanning finished: sort the aggregate by severity (Critical first)
+    /// and by diff order within a severity, so the walkthrough order is
+    /// deterministic even though parallel scans finish in arbitrary order.
+    /// Returns `true` when at least one finding awaits the walkthrough.
     pub fn finish_scanning(&mut self) -> bool {
-        self.findings.sort_by_key(|f| f.severity.rank());
+        self.scanning = false;
+        self.in_flight.clear();
+        let files = &self.files;
+        self.findings.sort_by_key(|f| {
+            let file_order = files
+                .iter()
+                .position(|x| x.path == f.file)
+                .unwrap_or(usize::MAX);
+            (f.severity.rank(), file_order)
+        });
         self.current = 0;
         !self.findings.is_empty()
     }
@@ -707,9 +745,9 @@ impl ReviewPullRequestScreen {
             .render(frame, area);
     }
 
-    /// Working spinner. While scanning, the file under review is shown in a
-    /// panel below (same rounded-border, bold-title treatment as the other
-    /// PR-command panels).
+    /// Working spinner. While scanning, the files currently under review are
+    /// shown in a panel below (same rounded-border, bold-title treatment as
+    /// the other PR-command panels).
     fn render_working(&self, frame: &mut Frame, area: Rect) {
         if !self.scanning || area.height < 5 {
             StatusIndicator::new(Status::Loading, self.phase_message.clone())
@@ -732,11 +770,7 @@ impl ReviewPullRequestScreen {
     }
 
     fn render_scan_panel(&self, frame: &mut Frame, area: Rect) {
-        let path = self
-            .files
-            .get(self.scan_index)
-            .map(|f| f.path.clone())
-            .unwrap_or_default();
+        let paths = self.in_flight.join("  ·  ");
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -759,7 +793,7 @@ impl ReviewPullRequestScreen {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    sanitize_row(&path),
+                    sanitize_row(&paths),
                     Style::default().fg(colors::EMPHASIS),
                 )),
                 Line::from(Span::styled(
@@ -1156,7 +1190,7 @@ fn build_detail_lines(request: &ReviewPullRequestRequest) -> Vec<Line<'static>> 
 /// owns the numbering + styling.
 const REVIEW_STEPS: [&str; 6] = [
     "Sync the branch + fetch the PR diff and its existing comments",
-    "For each changed file: AI scans the diff and drafts findings (no edits)",
+    "AI scans the changed files in parallel (test files get a dedicated prompt)",
     "You choose Post / Other / Skip per finding",
     "Approved findings are posted as inline PR comments (with suggestions)",
     "A review summary is assembled from the posted comments (no AI)",
@@ -1390,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_loop_tracks_files_and_aggregates_findings() {
+    fn scan_pool_tracks_files_and_aggregates_findings() {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.start_preparing();
         assert_eq!(screen.step(), ReviewStep::Working);
@@ -1403,40 +1437,36 @@ mod tests {
         assert_eq!(screen.files_len(), 2);
         assert_eq!(screen.head_sha(), "sha1");
 
-        screen.start_scanning();
-        assert!(screen.phase_message.contains("file #1 of 2"));
-        screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::Low)]);
-        assert!(screen.advance_scan());
+        screen.begin_scan_phase();
+        assert!(screen.scan_phase_active());
+        assert!(screen.phase_message.contains("2 changed files (0 done)"));
+        let (first, file_a) = screen.take_next_scan_file().unwrap();
+        let (second, file_b) = screen.take_next_scan_file().unwrap();
+        assert_eq!((first, second), (0, 1));
+        assert_eq!(
+            (file_a.path.as_str(), file_b.path.as_str()),
+            ("a.rs", "b.rs")
+        );
+        assert!(screen.take_next_scan_file().is_none());
 
-        screen.start_scanning();
-        assert!(screen.phase_message.contains("file #2 of 2"));
+        // Results arrive out of order — the second file finishes first.
         screen.record_scan_result(vec![finding("b.rs", Some(3), ReviewSeverity::Critical)]);
-        assert!(!screen.advance_scan());
+        screen.note_scan_done(1);
+        assert!(screen.phase_message.contains("(1 done)"));
+        assert!(screen.scans_pending());
+        screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::Low)]);
+        screen.note_scan_done(0);
+        assert!(!screen.scans_pending());
 
         // Aggregation sorts Critical first, and the walkthrough starts at 0.
         assert!(screen.finish_scanning());
+        assert!(!screen.scan_phase_active());
         assert_eq!(screen.findings_len(), 2);
         assert_eq!(screen.current_finding().unwrap().file, "b.rs");
     }
 
     #[test]
-    fn scanning_working_view_names_the_file() {
-        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
-        screen.set_files(
-            vec![file("src/lib/deep.rs")],
-            "o".into(),
-            "r".into(),
-            "sha".into(),
-        );
-        screen.start_scanning();
-        let dump = render_dump(&mut screen, 80, 10);
-        assert!(dump.contains("Scanning file #1 of 1"), "{dump}");
-        assert!(dump.contains("Reviewing"), "{dump}");
-        assert!(dump.contains("src/lib/deep.rs"), "{dump}");
-    }
-
-    #[test]
-    fn scan_failure_records_row_and_loop_continues() {
+    fn findings_of_equal_severity_keep_diff_order_despite_arrival_order() {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.set_files(
             vec![file("a.rs"), file("b.rs")],
@@ -1444,8 +1474,51 @@ mod tests {
             "r".into(),
             "sha".into(),
         );
-        screen.record_scan_failure("model returned garbage".to_string());
-        assert!(screen.advance_scan());
+        screen.begin_scan_phase();
+        screen.take_next_scan_file();
+        screen.take_next_scan_file();
+        // b.rs (second in the diff) finishes before a.rs.
+        screen.record_scan_result(vec![finding("b.rs", Some(3), ReviewSeverity::High)]);
+        screen.note_scan_done(1);
+        screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::High)]);
+        screen.note_scan_done(0);
+        screen.finish_scanning();
+        assert_eq!(screen.current_finding().unwrap().file, "a.rs");
+    }
+
+    #[test]
+    fn scanning_working_view_names_the_in_flight_files() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![file("src/lib/deep.rs"), file("src/other.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        screen.begin_scan_phase();
+        screen.take_next_scan_file();
+        screen.take_next_scan_file();
+        let dump = render_dump(&mut screen, 80, 10);
+        assert!(dump.contains("Scanning 2 changed files (0 done)"), "{dump}");
+        assert!(dump.contains("Reviewing"), "{dump}");
+        assert!(dump.contains("src/lib/deep.rs"), "{dump}");
+        assert!(dump.contains("src/other.rs"), "{dump}");
+    }
+
+    #[test]
+    fn scan_failure_records_row_and_pool_continues() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![file("a.rs"), file("b.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        screen.begin_scan_phase();
+        screen.take_next_scan_file();
+        screen.record_scan_failure(0, "model returned garbage".to_string());
+        screen.note_scan_done(0);
+        assert!(screen.scans_pending());
         let row = &screen.summary_rows[0];
         assert_eq!(row.status.as_ref().unwrap().label, "Failed");
         assert!(row.command.contains("a.rs"));

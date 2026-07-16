@@ -2732,8 +2732,10 @@ impl DashboardService {
     }
 
     /// Scan one changed file with a single captured (non-interactive)
-    /// opencode call and parse its findings. The AI only reads and emits
-    /// structured text — `--agent plan` disables every write tool. When
+    /// opencode call and parse its findings. Test files get the dedicated
+    /// test-quality prompt profile; everything else the source profile. The
+    /// AI only reads and emits structured text — `--agent plan` disables
+    /// every write tool. When
     /// `feedback` is set the user chose "Other" on a finding: the previous
     /// finding + their feedback are threaded back in so the model revises
     /// exactly one finding rather than re-scanning.
@@ -5709,24 +5711,52 @@ async fn materialize_review_tables() -> String {
     path.to_string_lossy().to_string()
 }
 
-/// Render `prompts/reviewer.md` for one per-file scan (or revision) call.
-/// Fixed tokens are substituted first and the user-controlled blocks last so
-/// an earlier placeholder can't be clobbered by a value containing a later
-/// token. `feedback` / `previous_finding` are only present on an "Other"
-/// revision of a single finding.
+/// Classify a changed file as a test file so its scan uses the dedicated
+/// test-quality prompt profile instead of the source one. Path-based
+/// heuristic covering the common layouts: `tests`/`spec`/`__tests__`
+/// directories, `test_*` / `*_test.*` / `*.test.*` / `*_spec.*` / `*.spec.*`
+/// file names, and `conftest.py`.
+pub(crate) fn is_test_file(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let mut parts = lower.rsplit('/');
+    let name = parts.next().unwrap_or_default();
+    if parts.any(|dir| matches!(dir, "test" | "tests" | "spec" | "specs" | "__tests__")) {
+        return true;
+    }
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    stem == "conftest"
+        || stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with(".test")
+        || stem.ends_with("_spec")
+        || stem.ends_with(".spec")
+}
+
+/// Render the per-file scan (or revision) prompt: `prompts/reviewer_tester.md`
+/// for test files (test-quality lens), `prompts/reviewer.md` for everything
+/// else. Fixed tokens are substituted first and the user-controlled blocks
+/// last so an earlier placeholder can't be clobbered by a value containing a
+/// later token. `feedback` / `previous_finding` are only present on an
+/// "Other" revision of a single finding.
 fn build_review_scan_prompt(
     file: &ReviewFile,
     tables_path: &str,
     feedback: Option<&str>,
     previous_finding: Option<&str>,
 ) -> String {
-    const PROMPT: &str = include_str!("../../prompts/reviewer.md");
+    const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer.md");
+    const TESTER_PROMPT: &str = include_str!("../../prompts/reviewer_tester.md");
+    let template = if is_test_file(&file.path) {
+        TESTER_PROMPT
+    } else {
+        SOURCE_PROMPT
+    };
     let existing = if file.existing_comments.trim().is_empty() {
         "(none)".to_string()
     } else {
         truncate_for_prompt(&file.existing_comments, REVIEW_COMMENTS_MAX_BYTES)
     };
-    PROMPT
+    template
         .replace("TABLES_PATH", tables_path)
         .replace("FILE_PATH", &file.path)
         .replace("USER_FEEDBACK", feedback.unwrap_or("(none)"))
@@ -6458,6 +6488,56 @@ new file mode 100644
         let revised = build_review_scan_prompt(&file, "/tmp/t.md", Some("too harsh"), Some("prev"));
         assert!(revised.contains("too harsh"));
         assert!(revised.contains("prev"));
+    }
+
+    #[test]
+    fn is_test_file_matches_common_layouts() {
+        for path in [
+            "tests/tui_update_pr.rs",
+            "spec/models/user_spec.rb",
+            "src/__tests__/app.tsx",
+            "app/services/specs/billing.py",
+            "pkg/store_test.go",
+            "src/app.test.ts",
+            "src/app.spec.js",
+            "tests/test_parser.py",
+            "conftest.py",
+        ] {
+            assert!(is_test_file(path), "{path} should be a test file");
+        }
+        for path in [
+            "src/services/dashboard.rs",
+            "src/latest.rs",
+            "app/contest_controller.rb",
+            "docs/testing.md",
+            "src/protest/mod.rs",
+        ] {
+            assert!(!is_test_file(path), "{path} should be a source file");
+        }
+    }
+
+    #[test]
+    fn build_review_scan_prompt_picks_the_profile_by_file_kind() {
+        let source = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "     1 +let x = 1;".to_string(),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+        };
+        let test = ReviewFile {
+            path: "tests/lib_test.rs".to_string(),
+            ..source.clone()
+        };
+        let source_prompt = build_review_scan_prompt(&source, "/tmp/t.md", None, None);
+        let test_prompt = build_review_scan_prompt(&test, "/tmp/t.md", None, None);
+        assert!(source_prompt.starts_with("You are reviewing the changed lines of ONE file"));
+        assert!(test_prompt.starts_with("You are reviewing the changed lines of ONE test file"));
+        assert!(test_prompt.contains("test-quality specialist"));
+        // Both profiles share the same machine-parsed output contract.
+        for prompt in [&source_prompt, &test_prompt] {
+            assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
+            assert!(prompt.contains("---END-FINDING---"));
+        }
     }
 
     // ── Fix pipeline: verdict parsing ──────────────────────────────────

@@ -2568,28 +2568,31 @@ impl App {
         }
     }
 
-    /// Kick off the scan of the current file, or close the scan loop when
-    /// every file is done: sort the findings and enter the walkthrough (or
-    /// jump straight to Done on a clean review).
-    fn scan_next_review_file(&mut self, tx: &mpsc::UnboundedSender<AppEvent>, retry: bool) {
-        let Some(screen) = self.review_pr.as_mut() else {
-            return;
-        };
-        let Some(file) = screen.current_scan_file() else {
-            if screen.finish_scanning() {
-                screen.enter_decision();
-            } else {
-                screen.enter_done();
-            }
-            return;
-        };
-        let file_index = screen.scan_index();
-        let worktree_path = screen.request().worktree_path.clone();
-        if retry {
-            screen.start_rescanning();
-        } else {
-            screen.start_scanning();
+    /// Start the scan phase: dispatch up to `REVIEW_SCAN_CONCURRENCY`
+    /// per-file scans at once; each completion hands the next pending file
+    /// to the freed slot.
+    fn start_review_scans(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if let Some(screen) = self.review_pr.as_mut() {
+            screen.begin_scan_phase();
         }
+        for _ in 0..REVIEW_SCAN_CONCURRENCY {
+            if !self.dispatch_next_review_scan(tx) {
+                break;
+            }
+        }
+        self.settle_review_scans();
+    }
+
+    /// Hand the next un-dispatched file to a scan task. `false` once every
+    /// file has been dispatched.
+    fn dispatch_next_review_scan(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) -> bool {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return false;
+        };
+        let Some((file_index, file)) = screen.take_next_scan_file() else {
+            return false;
+        };
+        let worktree_path = screen.request().worktree_path.clone();
         kick_off_scan_review_file(
             self.git_root.clone(),
             self.current_dashboard_config(),
@@ -2597,10 +2600,51 @@ impl App {
                 worktree_path,
                 file,
                 file_index,
-                retried: retry,
+                retried: false,
             },
             tx.clone(),
         );
+        true
+    }
+
+    /// Re-kick one file after unparseable output — its slot in the pool
+    /// stays occupied, so no extra scan starts.
+    fn retry_review_scan(&mut self, file_index: usize, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        let Some(file) = screen.file_at(file_index) else {
+            return;
+        };
+        let worktree_path = screen.request().worktree_path.clone();
+        kick_off_scan_review_file(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            ReviewScanRequest {
+                worktree_path,
+                file,
+                file_index,
+                retried: true,
+            },
+            tx.clone(),
+        );
+    }
+
+    /// Close the scan phase once every file reached a terminal state: sort
+    /// the findings and enter the walkthrough (or jump straight to Done on
+    /// a clean review).
+    fn settle_review_scans(&mut self) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if screen.scans_pending() {
+            return;
+        }
+        if screen.finish_scanning() {
+            screen.enter_decision();
+        } else {
+            screen.enter_done();
+        }
     }
 
     /// Advance the walkthrough to the next finding, or close it: with posted
@@ -2651,7 +2695,7 @@ impl App {
                     if let Some(screen) = self.review_pr.as_mut() {
                         screen.set_files(files, owner, repo, head_sha);
                     }
-                    self.scan_next_review_file(tx, false);
+                    self.start_review_scans(tx);
                 }
                 ReviewPreparation::NoChanges => self.fail_review(
                     ToastVariant::Info,
@@ -2700,32 +2744,37 @@ impl App {
         result: Result<Vec<ReviewFinding>, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // Guard against a late arrival after the user moved on.
-        let current = self
+        // Guard against a late arrival after the user cancelled or the scan
+        // phase already closed.
+        let active = self
             .review_pr
             .as_ref()
-            .is_some_and(|s| s.scan_index() == file_index);
-        if !current {
+            .is_some_and(|s| s.scan_phase_active());
+        if !active {
             return;
         }
         match result {
             Ok(findings) => {
                 if let Some(screen) = self.review_pr.as_mut() {
                     screen.record_scan_result(findings);
-                    screen.advance_scan();
+                    screen.note_scan_done(file_index);
                 }
-                self.scan_next_review_file(tx, false);
+                if !self.dispatch_next_review_scan(tx) {
+                    self.settle_review_scans();
+                }
             }
             // One retry per file for unparseable output; a second failure
-            // records a Failed row and the loop moves on — one bad file
-            // never aborts the whole review.
-            Err(_) if !retried => self.scan_next_review_file(tx, true),
+            // records a Failed row and frees the slot — one bad file never
+            // aborts the whole review.
+            Err(_) if !retried => self.retry_review_scan(file_index, tx),
             Err(message) => {
                 if let Some(screen) = self.review_pr.as_mut() {
-                    screen.record_scan_failure(truncate_error(&message));
-                    screen.advance_scan();
+                    screen.record_scan_failure(file_index, truncate_error(&message));
+                    screen.note_scan_done(file_index);
                 }
-                self.scan_next_review_file(tx, false);
+                if !self.dispatch_next_review_scan(tx) {
+                    self.settle_review_scans();
+                }
             }
         }
     }
@@ -7332,9 +7381,14 @@ fn kick_off_push_fix(
 
 // ── Review Pull Request async stages ────────────────────────────────────
 
-/// Inputs for one captured per-file scan call. `file_index` rides along so
-/// the result handler can ignore a stale response; `retried` marks the one
-/// retry allowed after unparseable output.
+/// Per-file review scans kept in flight at once. Each scan is an independent
+/// captured opencode call, so a small pool cuts wall-clock time without
+/// hammering the provider.
+const REVIEW_SCAN_CONCURRENCY: usize = 3;
+
+/// Inputs for one captured per-file scan call. `file_index` identifies the
+/// file the result belongs to (scans run in parallel); `retried` marks the
+/// one retry allowed after unparseable output.
 struct ReviewScanRequest {
     worktree_path: String,
     file: ReviewFile,
