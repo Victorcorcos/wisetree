@@ -36,14 +36,14 @@ use crate::services::{
     build_review_summary, check_for_updates_all_sources, compute_attempt_changes,
     default_dashboard_warning, detect_shell_integration, fetch_free_opencode_models,
     fetch_opencode_model_variants, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, AiStatus, AttemptChanges, BugHypothesis,
-    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
-    CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
-    DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
-    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
-    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
-    ReviewPreparation, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase,
-    UpdateProgress, UpdateSource,
+    parse_pull_request_md, resolve_dashboard_columns, split_duplicate_findings, AiStatus,
+    AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
+    BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
+    DashboardService, DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome,
+    EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
+    JudgeResult, MultiSourceUpdateResult, OpencodeModel, OpencodeTurn, OpencodeTurnWatcher,
+    PrState, ReviewFile, ReviewFinding, ReviewPreparation, Shell, ShellIntegrationStatus,
+    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -2761,7 +2761,16 @@ impl App {
         match result {
             Ok(findings) => {
                 if let Some(screen) = self.review_pr.as_mut() {
-                    screen.record_scan_result(findings);
+                    // Deterministic dedup: findings the PR already carries
+                    // as a wisetree comment never re-enter the walkthrough,
+                    // regardless of whether the model honored the
+                    // existing-comments instruction.
+                    let (fresh, duplicates) = match screen.file_at(file_index) {
+                        Some(file) => split_duplicate_findings(findings, &file.existing_keys),
+                        None => (findings, Vec::new()),
+                    };
+                    screen.record_duplicate_findings(&duplicates);
+                    screen.record_scan_result(fresh);
                     screen.note_scan_done(file_index);
                 }
                 if !self.dispatch_next_review_scan(tx) {

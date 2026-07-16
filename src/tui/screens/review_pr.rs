@@ -426,6 +426,20 @@ impl ReviewPullRequestScreen {
         }
     }
 
+    /// Findings the deterministic dedup dropped because the PR already
+    /// carries them as a wisetree comment: one muted row each on the final
+    /// report — the walkthrough shrinks, but never silently.
+    pub fn record_duplicate_findings(&mut self, duplicates: &[ReviewFinding]) {
+        for finding in duplicates {
+            self.summary_rows.push(SummaryRow::with_status(
+                format!("dedup {}", finding.descriptor()),
+                "Already posted",
+                colors::MUTED,
+                None,
+            ));
+        }
+    }
+
     /// Fold one file's findings into the aggregate.
     pub fn record_scan_result(&mut self, findings: Vec<ReviewFinding>) {
         self.findings.extend(findings);
@@ -1803,6 +1817,7 @@ mod tests {
                     .to_string(),
             commentable_lines: BTreeSet::from([1, 2, 3]),
             existing_comments: String::new(),
+            existing_keys: Vec::new(),
         }
     }
 
@@ -2096,6 +2111,16 @@ mod tests {
         assert!(row.success, "a skip is not a failure");
         assert_eq!(row.status.as_ref().unwrap().label, "Skipped (lockfile)");
         assert!(row.command.contains("Cargo.lock"));
+    }
+
+    #[test]
+    fn deduped_findings_get_already_posted_rows() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.record_duplicate_findings(&[finding("a.rs", Some(2), ReviewSeverity::High)]);
+        let row = &screen.summary_rows[0];
+        assert!(row.success, "a dedup is not a failure");
+        assert_eq!(row.status.as_ref().unwrap().label, "Already posted");
+        assert!(row.command.contains("a.rs:2"));
     }
 
     #[test]

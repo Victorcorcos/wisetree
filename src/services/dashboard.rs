@@ -731,6 +731,19 @@ pub struct ReviewFile {
     /// `@author (line N): body` blocks — dedup context for the scan call.
     /// Empty when the PR has none.
     pub existing_comments: String,
+    /// Structured dedup keys of the wisetree-format comments already on
+    /// this file. Unlike `existing_comments` (advice the model may ignore),
+    /// these back the deterministic duplicate filter in Rust.
+    pub existing_keys: Vec<ExistingFindingKey>,
+}
+
+/// Dedup key of one wisetree-format comment already posted on the PR: its
+/// anchor line and its normalized (lowercased) finding title. Human-written
+/// comments never produce a key, so they never suppress a finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingFindingKey {
+    pub line: Option<u64>,
+    pub title: String,
 }
 
 /// Outcome of the read-only Review preparation (`prepare_review`): sync the
@@ -2733,8 +2746,9 @@ impl DashboardService {
         {
             let by_path = parse_existing_review_comments(&json);
             for file in &mut files {
-                if let Some(text) = by_path.get(&file.path) {
-                    file.existing_comments = text.clone();
+                if let Some(existing) = by_path.get(&file.path) {
+                    file.existing_comments = existing.rendered.clone();
+                    file.existing_keys = existing.keys.clone();
                 }
             }
         }
@@ -2788,9 +2802,13 @@ impl DashboardService {
         .map_err(|_| WisetreeError::other("opencode review scan timed out after 240s"))?
         .map_err(WisetreeError::other)?;
 
-        parse_review_findings(&output, &file.path, &file.commentable_lines).ok_or_else(|| {
-            WisetreeError::other("could not parse findings from the review AI output.")
-        })
+        parse_review_findings(
+            &output,
+            &file.path,
+            &file.commentable_lines,
+            &file.annotated_diff,
+        )
+        .ok_or_else(|| WisetreeError::other("could not parse findings from the review AI output."))
     }
 
     /// Post one approved finding to the PR — inline when it carries a
@@ -5585,6 +5603,7 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
                     annotated_diff: std::mem::take(annotated).trim_end().to_string(),
                     commentable_lines: std::mem::take(commentable),
                     existing_comments: String::new(),
+                    existing_keys: Vec::new(),
                 });
             }
         }
@@ -5675,18 +5694,28 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
     files
 }
 
+/// Per-file context extracted from the PR's existing inline comments: the
+/// rendered block the scan prompt shows the AI, plus the structured keys of
+/// the wisetree-format ones that back the deterministic duplicate filter.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ExistingComments {
+    pub(crate) rendered: String,
+    pub(crate) keys: Vec<ExistingFindingKey>,
+}
+
 /// Group the PR's existing inline review comments per file path, rendered as
 /// `@author (line N): body` blocks. Input is the REST
 /// `pulls/{n}/comments` JSON array; anything unparsable yields no context
 /// (the scan just runs without dedup awareness).
-pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, String> {
+pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, ExistingComments> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         return HashMap::new();
     };
     let Some(items) = value.as_array() else {
         return HashMap::new();
     };
-    let mut by_path: HashMap<String, Vec<String>> = HashMap::new();
+    let mut rendered: HashMap<String, Vec<String>> = HashMap::new();
+    let mut keys: HashMap<String, Vec<ExistingFindingKey>> = HashMap::new();
     for item in items {
         let Some(path) = item.get("path").and_then(|v| v.as_str()) else {
             continue;
@@ -5704,15 +5733,65 @@ pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, Stri
             .and_then(|v| v.as_u64())
             .or_else(|| item.get("original_line").and_then(|v| v.as_u64()));
         let anchor = line.map(|l| format!(" (line {l})")).unwrap_or_default();
-        by_path
+        rendered
             .entry(path.to_string())
             .or_default()
             .push(format!("@{author}{anchor}: {}", body.trim()));
+        if let Some(title) = wisetree_finding_title(body) {
+            keys.entry(path.to_string())
+                .or_default()
+                .push(ExistingFindingKey { line, title });
+        }
     }
-    by_path
+    rendered
         .into_iter()
-        .map(|(path, comments)| (path, comments.join("\n\n")))
+        .map(|(path, comments)| {
+            let keys = keys.remove(&path).unwrap_or_default();
+            (
+                path,
+                ExistingComments {
+                    rendered: comments.join("\n\n"),
+                    keys,
+                },
+            )
+        })
         .collect()
+}
+
+/// The normalized title of a wisetree-format review comment — its body
+/// leads with the header this command posts (`**[Cat] [Sev]**: title`).
+/// Only the first lines are inspected so a quoted header deep inside a
+/// long human comment can't produce a key.
+fn wisetree_finding_title(body: &str) -> Option<String> {
+    for line in body.lines().take(3) {
+        if let Some(rest) = line.trim().strip_prefix("**[") {
+            if let Some((_, title)) = rest.split_once("]**: ") {
+                let title = title.trim();
+                if !title.is_empty() {
+                    return Some(title.to_lowercase());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// #5 of the token-saving plan: drop findings the PR already carries as a
+/// wisetree comment (same line anchor + same normalized title) instead of
+/// trusting the model to honor the EXISTING_COMMENTS instruction — the
+/// least reliable link on a re-run. Returns `(fresh, duplicates)`; the
+/// duplicates surface as "Already posted" rows on the final report, never
+/// silently.
+pub fn split_duplicate_findings(
+    findings: Vec<ReviewFinding>,
+    existing: &[ExistingFindingKey],
+) -> (Vec<ReviewFinding>, Vec<ReviewFinding>) {
+    findings.into_iter().partition(|finding| {
+        let title = finding.title.trim().to_lowercase();
+        !existing
+            .iter()
+            .any(|key| key.line == finding.line && key.title == title)
+    })
 }
 
 /// Write the curated reference tables next to the temp dir so the scan AI
@@ -5857,11 +5936,14 @@ fn build_review_scan_prompt(
 /// disobeyed the contract); `Some(vec![])` — a clean scan — when the block
 /// carries no findings. Every line anchor is validated against
 /// `commentable`; an invalid anchor downgrades the finding to file-level
-/// rather than letting GitHub reject the comment.
+/// rather than letting GitHub reject the comment. Suggestions that
+/// reproduce the diff's current lines verbatim (checked against
+/// `annotated_diff`) are stripped as no-ops.
 pub(crate) fn parse_review_findings(
     output: &str,
     file: &str,
     commentable: &BTreeSet<u64>,
+    annotated_diff: &str,
 ) -> Option<Vec<ReviewFinding>> {
     const BEGIN: &str = "===WISETREE-REVIEW-BEGIN===";
     const END: &str = "===WISETREE-REVIEW-END===";
@@ -5871,7 +5953,8 @@ pub(crate) fn parse_review_findings(
     let mut findings = Vec::new();
     for chunk in block.split("---FINDING---").skip(1) {
         let chunk = chunk.split("---END-FINDING---").next().unwrap_or(chunk);
-        if let Some(finding) = parse_review_finding_chunk(chunk, file, commentable) {
+        if let Some(finding) = parse_review_finding_chunk(chunk, file, commentable, annotated_diff)
+        {
             findings.push(finding);
         }
     }
@@ -5886,6 +5969,7 @@ fn parse_review_finding_chunk(
     chunk: &str,
     file: &str,
     commentable: &BTreeSet<u64>,
+    annotated_diff: &str,
 ) -> Option<ReviewFinding> {
     let header = |name: &str| -> Option<String> {
         let prefix = format!("{name}:");
@@ -5931,6 +6015,19 @@ fn parse_review_finding_chunk(
         _ => None,
     };
 
+    // #6 of the token-saving plan: a SUGGESTION that reproduces the current
+    // lines verbatim is a no-op the author could "apply" for nothing — a
+    // known model failure. Strip the block and keep the finding as prose.
+    let suggestion = suggestion.filter(|body| {
+        let Some(end) = line else {
+            return true; // file-level: no lines to compare against
+        };
+        match diff_lines_text(annotated_diff, start_line.unwrap_or(end), end) {
+            Some(current) => !code_lines_equal(body, &current),
+            None => true,
+        }
+    });
+
     Some(ReviewFinding {
         category: normalize_review_category(&header("CATEGORY").unwrap_or_default()),
         severity: ReviewSeverity::parse(&header("SEVERITY").unwrap_or_default()),
@@ -5941,6 +6038,33 @@ fn parse_review_finding_chunk(
         explanation,
         suggestion,
     })
+}
+
+/// The current text of the new-side lines `start..=end`, recovered from the
+/// annotated diff: each numbered line is `{n:>6} {marker}{content}` where
+/// the marker is the diff's `+`/space. `None` when any line of the range is
+/// absent from the diff (then no no-op check is possible).
+fn diff_lines_text(annotated_diff: &str, start: u64, end: u64) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for n in start..=end {
+        let prefix = format!("{n:>6} ");
+        let numbered = annotated_diff
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))?;
+        let mut chars = numbered.chars();
+        chars.next(); // drop the +/space diff marker
+        out.push(chars.as_str());
+    }
+    Some(out.join("\n"))
+}
+
+/// Line-by-line code equality ignoring trailing whitespace — the tolerance
+/// a no-op suggestion hides behind.
+fn code_lines_equal(a: &str, b: &str) -> bool {
+    fn normalize(s: &str) -> Vec<&str> {
+        s.lines().map(str::trim_end).collect()
+    }
+    normalize(a) == normalize(b)
 }
 
 /// Map the AI's `CATEGORY:` value onto the five canonical labels, tolerating
@@ -6374,7 +6498,7 @@ new file mode 100644
             ---END-FINDING---\n\
             ===WISETREE-REVIEW-END===\ntrailing";
         let commentable = BTreeSet::from([10, 11, 12]);
-        let findings = parse_review_findings(out, "src/lib.rs", &commentable).unwrap();
+        let findings = parse_review_findings(out, "src/lib.rs", &commentable, "").unwrap();
         assert_eq!(findings.len(), 2, "{findings:?}");
 
         let first = &findings[0];
@@ -6399,13 +6523,13 @@ new file mode 100644
     #[test]
     fn parse_review_findings_accepts_a_clean_scan() {
         let out = "===WISETREE-REVIEW-BEGIN===\nNO-FINDINGS\n===WISETREE-REVIEW-END===";
-        let findings = parse_review_findings(out, "a.rs", &BTreeSet::new()).unwrap();
+        let findings = parse_review_findings(out, "a.rs", &BTreeSet::new(), "").unwrap();
         assert!(findings.is_empty());
     }
 
     #[test]
     fn parse_review_findings_rejects_output_without_markers() {
-        assert!(parse_review_findings("no block at all", "a.rs", &BTreeSet::new()).is_none());
+        assert!(parse_review_findings("no block at all", "a.rs", &BTreeSet::new(), "").is_none());
     }
 
     #[test]
@@ -6423,7 +6547,7 @@ new file mode 100644
             ---END-FINDING---\n\
             ===WISETREE-REVIEW-END===";
         let commentable = BTreeSet::from([1, 2, 3]);
-        let findings = parse_review_findings(out, "a.rs", &commentable).unwrap();
+        let findings = parse_review_findings(out, "a.rs", &commentable, "").unwrap();
         assert_eq!(findings[0].line, None);
         assert_eq!(findings[0].start_line, None);
     }
@@ -6440,9 +6564,9 @@ new file mode 100644
             )
         };
         let commentable = BTreeSet::from([3, 4, 5]);
-        let ok = parse_review_findings(&block("3"), "a.rs", &commentable).unwrap();
+        let ok = parse_review_findings(&block("3"), "a.rs", &commentable, "").unwrap();
         assert_eq!((ok[0].start_line, ok[0].line), (Some(3), Some(5)));
-        let inverted = parse_review_findings(&block("9"), "a.rs", &commentable).unwrap();
+        let inverted = parse_review_findings(&block("9"), "a.rs", &commentable, "").unwrap();
         assert_eq!((inverted[0].start_line, inverted[0].line), (None, Some(5)));
     }
 
@@ -6515,13 +6639,112 @@ new file mode 100644
         ]"#;
         let by_path = parse_existing_review_comments(json);
         let a = by_path.get("a.rs").unwrap();
-        assert!(a.contains("@alice (line 7): prefer a constant"));
-        assert!(a.contains("@bob (line 9): typo"));
-        assert!(by_path.get("b.rs").unwrap().contains("@alice: structure"));
+        assert!(a.rendered.contains("@alice (line 7): prefer a constant"));
+        assert!(a.rendered.contains("@bob (line 9): typo"));
+        assert!(by_path
+            .get("b.rs")
+            .unwrap()
+            .rendered
+            .contains("@alice: structure"));
         // Blank bodies contribute nothing.
         assert!(!by_path.contains_key("c.rs"));
         // Garbage input degrades to "no context", never an error.
         assert!(parse_existing_review_comments("not json").is_empty());
+        // Human comments never produce dedup keys.
+        assert!(a.keys.is_empty());
+    }
+
+    #[test]
+    fn wisetree_comments_produce_dedup_keys_humans_do_not() {
+        let json = r#"[
+            {"path": "a.rs", "line": 7,
+             "body": "**[Security] [High]**: Hardcoded API key\n\nSecrets leak.",
+             "user": {"login": "wisetree"}},
+            {"path": "a.rs", "line": 9, "body": "please rename this", "user": {"login": "bob"}}
+        ]"#;
+        let by_path = parse_existing_review_comments(json);
+        assert_eq!(
+            by_path.get("a.rs").unwrap().keys,
+            vec![ExistingFindingKey {
+                line: Some(7),
+                title: "hardcoded api key".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn split_duplicate_findings_drops_only_matching_line_and_title() {
+        let finding = |line: Option<u64>, title: &str| ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: "a.rs".to_string(),
+            start_line: None,
+            line,
+            title: title.to_string(),
+            explanation: "why".to_string(),
+            suggestion: None,
+        };
+        let existing = vec![ExistingFindingKey {
+            line: Some(7),
+            title: "hardcoded api key".to_string(),
+        }];
+        let (fresh, duplicates) = split_duplicate_findings(
+            vec![
+                finding(Some(7), "Hardcoded API key"), // same line + title → dup
+                finding(Some(9), "Hardcoded API key"), // other line → fresh
+                finding(Some(7), "Magic number"),      // other title → fresh
+            ],
+            &existing,
+        );
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].line, Some(7));
+        assert_eq!(fresh.len(), 2);
+        // No keys → everything is fresh.
+        let (all, none) = split_duplicate_findings(vec![finding(Some(7), "x")], &[]);
+        assert_eq!((all.len(), none.len()), (1, 0));
+    }
+
+    #[test]
+    fn noop_suggestions_are_stripped_but_real_ones_survive() {
+        let diff = "     6 +let a = 1;\n     7 +let key = \"abc\";\n     8  }";
+        let commentable = BTreeSet::from([6, 7, 8]);
+        let block = |suggestion: &str| {
+            format!(
+                "===WISETREE-REVIEW-BEGIN===\n---FINDING---\nCATEGORY: Security\nSEVERITY: High\n\
+                 LINE: 7\nSTART_LINE:\nTITLE: Hardcoded key\n---EXPLANATION---\nwhy\n\
+                 ---SUGGESTION---\n{suggestion}\n---END-FINDING---\n===WISETREE-REVIEW-END==="
+            )
+        };
+        // Reproduces line 7 verbatim (modulo trailing spaces) → no-op, stripped.
+        let noop =
+            parse_review_findings(&block("let key = \"abc\";  "), "a.rs", &commentable, diff)
+                .unwrap();
+        assert_eq!(noop[0].suggestion, None);
+        assert_eq!(noop[0].title, "Hardcoded key"); // the finding itself survives
+                                                    // An actual change is kept.
+        let real = parse_review_findings(
+            &block("let key = env(\"KEY\");"),
+            "a.rs",
+            &commentable,
+            diff,
+        )
+        .unwrap();
+        assert_eq!(
+            real[0].suggestion.as_deref(),
+            Some("let key = env(\"KEY\");")
+        );
+    }
+
+    #[test]
+    fn noop_check_covers_multi_line_ranges() {
+        let diff = "     6 +let a = 1;\n     7 +let b = 2;";
+        let commentable = BTreeSet::from([6, 7]);
+        let out = "===WISETREE-REVIEW-BEGIN===\n---FINDING---\nCATEGORY: Code Smell\n\
+                   SEVERITY: Low\nLINE: 7\nSTART_LINE: 6\nTITLE: t\n---EXPLANATION---\ne\n\
+                   ---SUGGESTION---\nlet a = 1;\nlet b = 2;\n---END-FINDING---\n\
+                   ===WISETREE-REVIEW-END===";
+        let findings = parse_review_findings(out, "a.rs", &commentable, diff).unwrap();
+        assert_eq!(findings[0].suggestion, None, "{findings:?}");
     }
 
     #[test]
@@ -6550,6 +6773,7 @@ new file mode 100644
             annotated_diff: "@@ -1 +1 @@\n     1 +let x = 1;".to_string(),
             commentable_lines: BTreeSet::from([1]),
             existing_comments: "@alice (line 1): rename this".to_string(),
+            existing_keys: Vec::new(),
         };
         let prompt = build_review_scan_prompt(&file, "/tmp/tables.md", None, None);
         assert!(prompt.contains("src/lib.rs"));
@@ -6608,6 +6832,7 @@ new file mode 100644
             annotated_diff: String::new(),
             commentable_lines: BTreeSet::new(),
             existing_comments: String::new(),
+            existing_keys: Vec::new(),
         };
         let (reviewable, skipped) =
             partition_reviewable_files(vec![file("src/lib.rs"), file("Cargo.lock")]);
@@ -6655,6 +6880,7 @@ new file mode 100644
             annotated_diff: "     1 +let x = 1;".to_string(),
             commentable_lines: BTreeSet::from([1]),
             existing_comments: String::new(),
+            existing_keys: Vec::new(),
         };
         let test = ReviewFile {
             path: "tests/lib_test.rs".to_string(),
