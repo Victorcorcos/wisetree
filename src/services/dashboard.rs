@@ -6243,26 +6243,46 @@ fn normalize_review_category(raw: &str) -> String {
 /// Build the review-summary markdown from the findings that were actually
 /// posted — a fixed template over structured data, zero AI involvement.
 pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
+    let noun = if posted.len() == 1 { "issue" } else { "issues" };
     let mut body = format!(
-        "## Review Summary\n\nI reviewed this PR and found {} issue(s) that should be \
-         addressed before merge.\n\n### Requested Improvements\n",
+        "## Review Summary\n\nI reviewed this PR and found {} {noun} that should be \
+         addressed before merge.\n\n### Requested Improvements\n\n\
+         | Type | Description | Severity | Where? |\n\
+         | --- | --- | --- | --- |\n",
         posted.len()
     );
-    for (i, finding) in posted.iter().enumerate() {
+    for finding in posted {
         body.push_str(&format!(
-            "{}. **[{}] [{}]** — `{}` — {}\n",
-            i + 1,
-            finding.category,
-            finding.severity.label(),
-            finding.descriptor(),
-            finding.title
+            "| {} | {} | {} | `{}` |\n",
+            md_table_cell(&finding.category),
+            md_table_cell(&review_description(finding)),
+            md_table_cell(finding.severity.label()),
+            md_table_cell(&finding.descriptor()),
         ));
     }
-    body.push_str(
-        "\n### Notes\n- Inline comments were added on the relevant files with concrete \
-         details and, when appropriate, code suggestions.\n",
-    );
     body
+}
+
+/// The "Description" cell for one finding: the title, plus the explanation of
+/// why it matters when the model supplied one.
+fn review_description(finding: &ReviewFinding) -> String {
+    let explanation = finding.explanation.trim();
+    if explanation.is_empty() {
+        finding.title.trim().to_string()
+    } else {
+        format!("**{}** — {explanation}", finding.title.trim())
+    }
+}
+
+/// Flatten a value into a single GitHub-table cell: collapse every run of
+/// whitespace (newlines included) to one space and escape pipes so they stay
+/// inside the column instead of splitting it.
+fn md_table_cell(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('|', "\\|")
 }
 
 /// Build the commit subject + body for one applied review fix, in the format
@@ -6763,7 +6783,7 @@ new file mode 100644
     }
 
     #[test]
-    fn build_review_summary_lists_only_posted_findings() {
+    fn build_review_summary_renders_findings_as_a_table() {
         let posted = vec![ReviewFinding {
             category: "Performance".to_string(),
             severity: ReviewSeverity::High,
@@ -6771,14 +6791,56 @@ new file mode 100644
             start_line: None,
             line: Some(23),
             title: "N+1 query in loop".to_string(),
-            explanation: "irrelevant for the summary".to_string(),
+            explanation: "each iteration hits the DB again".to_string(),
             suggestion: None,
         }];
         let body = build_review_summary(&posted);
         assert!(body.contains("## Review Summary"));
-        assert!(body.contains("found 1 issue(s)"));
-        assert!(body.contains("1. **[Performance] [High]** — `src/db.rs:23` — N+1 query in loop"));
-        assert!(body.contains("### Notes"));
+        // Singular noun, no robotic "(s)".
+        assert!(body.contains("found 1 issue that should be addressed"));
+        assert!(!body.contains("issue(s)"));
+        // A markdown table, not a numbered list.
+        assert!(body.contains("| Type | Description | Severity | Where? |"));
+        assert!(body.contains("| --- | --- | --- | --- |"));
+        assert!(body.contains(
+            "| Performance | **N+1 query in loop** — each iteration hits the DB again \
+             | High | `src/db.rs:23` |"
+        ));
+        // The redundant Notes section is gone.
+        assert!(!body.contains("### Notes"));
+    }
+
+    #[test]
+    fn build_review_summary_pluralizes_and_escapes_table_cells() {
+        let posted = vec![
+            ReviewFinding {
+                category: "Security".to_string(),
+                severity: ReviewSeverity::Critical,
+                file: "src/a.rs".to_string(),
+                start_line: None,
+                line: Some(1),
+                title: "unsanitized input".to_string(),
+                // Newlines and a pipe must not break the table layout.
+                explanation: "flows into a query\nvia the `a | b` path".to_string(),
+                suggestion: None,
+            },
+            ReviewFinding {
+                category: "Code Smell".to_string(),
+                severity: ReviewSeverity::Low,
+                file: "src/b.rs".to_string(),
+                start_line: Some(4),
+                line: Some(6),
+                title: "dead branch".to_string(),
+                explanation: String::new(),
+                suggestion: None,
+            },
+        ];
+        let body = build_review_summary(&posted);
+        assert!(body.contains("found 2 issues that should be addressed"));
+        // Pipe escaped, newline collapsed to a single space.
+        assert!(body.contains("flows into a query via the `a \\| b` path"));
+        // No explanation → title only, and a line range in the Where? cell.
+        assert!(body.contains("| Code Smell | dead branch | Low | `src/b.rs:4-6` |"));
     }
 
     #[test]
