@@ -6270,36 +6270,81 @@ fn normalize_review_category(raw: &str) -> String {
 
 /// Build the review-summary markdown from the findings that were actually
 /// posted — a fixed template over structured data, zero AI involvement.
+/// Findings that share an issue title collapse into one row so the table stays
+/// scannable; the "Where?" cell then lists each location the issue occurs at.
 pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
-    let noun = if posted.len() == 1 { "issue" } else { "issues" };
+    let groups = group_findings_by_issue(posted);
+    let noun = if groups.len() == 1 { "issue" } else { "issues" };
     let mut body = format!(
         "## Review Summary\n\nI reviewed this PR and found {} {noun} that should be \
          addressed before merge.\n\n### Requested Improvements\n\n\
-         | Type | Description | Severity | Where? |\n\
+         | Type | Issue | Severity | Where? |\n\
          | --- | --- | --- | --- |\n",
-        posted.len()
+        groups.len()
     );
-    for finding in posted {
+    for group in &groups {
+        let where_cell = group
+            .locations
+            .iter()
+            .map(|loc| format!("`{}`", md_table_cell(loc)))
+            .collect::<Vec<_>>()
+            .join("<br>");
         body.push_str(&format!(
-            "| {} | {} | {} | `{}` |\n",
-            md_table_cell(&finding.category),
-            md_table_cell(&review_description(finding)),
-            md_table_cell(finding.severity.label()),
-            md_table_cell(&finding.descriptor()),
+            "| {} | {} | {} | {} |\n",
+            md_table_cell(&group.category),
+            md_table_cell(&group.title),
+            md_table_cell(group.severity.label()),
+            where_cell,
         ));
     }
     body
 }
 
-/// The "Description" cell for one finding: the title, plus the explanation of
-/// why it matters when the model supplied one.
-fn review_description(finding: &ReviewFinding) -> String {
-    let explanation = finding.explanation.trim();
-    if explanation.is_empty() {
-        finding.title.trim().to_string()
-    } else {
-        format!("**{}** — {explanation}", finding.title.trim())
+/// One summary-table row: an issue (by title) with every location it was
+/// posted at. Distinct findings that share a title merge into a single group.
+struct IssueGroup {
+    category: String,
+    title: String,
+    severity: ReviewSeverity,
+    locations: Vec<String>,
+}
+
+/// Collapse posted findings into one [`IssueGroup`] per distinct title (case-
+/// and whitespace-insensitive), preserving first-appearance order. Each group
+/// keeps the highest severity seen and accumulates its distinct locations.
+fn group_findings_by_issue(posted: &[ReviewFinding]) -> Vec<IssueGroup> {
+    let mut groups: Vec<IssueGroup> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for finding in posted {
+        let key = finding
+            .title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let descriptor = finding.descriptor();
+        match index.get(&key) {
+            Some(&i) => {
+                let group = &mut groups[i];
+                if !group.locations.contains(&descriptor) {
+                    group.locations.push(descriptor);
+                }
+                if finding.severity.rank() < group.severity.rank() {
+                    group.severity = finding.severity;
+                }
+            }
+            None => {
+                index.insert(key, groups.len());
+                groups.push(IssueGroup {
+                    category: finding.category.clone(),
+                    title: finding.title.trim().to_string(),
+                    severity: finding.severity,
+                    locations: vec![descriptor],
+                });
+            }
+        }
     }
+    groups
 }
 
 /// Flatten a value into a single GitHub-table cell: collapse every run of
@@ -6815,7 +6860,7 @@ new file mode 100644
     }
 
     #[test]
-    fn build_review_summary_renders_findings_as_a_table() {
+    fn build_review_summary_lists_the_issue_title_only() {
         let posted = vec![ReviewFinding {
             category: "Performance".to_string(),
             severity: ReviewSeverity::High,
@@ -6831,15 +6876,37 @@ new file mode 100644
         // Singular noun, no robotic "(s)".
         assert!(body.contains("found 1 issue that should be addressed"));
         assert!(!body.contains("issue(s)"));
-        // A markdown table, not a numbered list.
-        assert!(body.contains("| Type | Description | Severity | Where? |"));
-        assert!(body.contains("| --- | --- | --- | --- |"));
-        assert!(body.contains(
-            "| Performance | **N+1 query in loop** — each iteration hits the DB again \
-             | High | `src/db.rs:23` |"
-        ));
+        // "Issue" column, title only — the explanation stays out of the table.
+        assert!(body.contains("| Type | Issue | Severity | Where? |"));
+        assert!(body.contains("| Performance | N+1 query in loop | High | `src/db.rs:23` |"));
+        assert!(!body.contains("each iteration hits the DB again"));
         // The redundant Notes section is gone.
         assert!(!body.contains("### Notes"));
+    }
+
+    #[test]
+    fn build_review_summary_groups_shared_issues_and_lists_each_location() {
+        let make = |file: &str, line: u64, severity: ReviewSeverity| ReviewFinding {
+            category: "Test Quality".to_string(),
+            severity,
+            file: file.to_string(),
+            start_line: None,
+            line: Some(line),
+            title: "Missing coverage".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        };
+        let posted = vec![
+            make("src/a.rs", 12, ReviewSeverity::Low),
+            make("src/b.rs", 40, ReviewSeverity::High),
+        ];
+        let body = build_review_summary(&posted);
+        // Two findings, one shared issue → one row, counted as a single issue.
+        assert!(body.contains("found 1 issue that should be addressed"));
+        // Both locations in one cell, each on its own line; highest severity wins.
+        assert!(body.contains(
+            "| Test Quality | Missing coverage | High | `src/a.rs:12`<br>`src/b.rs:40` |"
+        ));
     }
 
     #[test]
@@ -6851,9 +6918,9 @@ new file mode 100644
                 file: "src/a.rs".to_string(),
                 start_line: None,
                 line: Some(1),
-                title: "unsanitized input".to_string(),
-                // Newlines and a pipe must not break the table layout.
-                explanation: "flows into a query\nvia the `a | b` path".to_string(),
+                // A pipe in the title must not break the table layout.
+                title: "Unsanitized `a | b` input".to_string(),
+                explanation: String::new(),
                 suggestion: None,
             },
             ReviewFinding {
@@ -6862,17 +6929,18 @@ new file mode 100644
                 file: "src/b.rs".to_string(),
                 start_line: Some(4),
                 line: Some(6),
-                title: "dead branch".to_string(),
+                title: "Dead branch".to_string(),
                 explanation: String::new(),
                 suggestion: None,
             },
         ];
         let body = build_review_summary(&posted);
+        // Two distinct issues → plural noun.
         assert!(body.contains("found 2 issues that should be addressed"));
-        // Pipe escaped, newline collapsed to a single space.
-        assert!(body.contains("flows into a query via the `a \\| b` path"));
-        // No explanation → title only, and a line range in the Where? cell.
-        assert!(body.contains("| Code Smell | dead branch | Low | `src/b.rs:4-6` |"));
+        // Pipe in the title escaped.
+        assert!(body.contains("Unsanitized `a \\| b` input"));
+        // A line range renders in the Where? cell.
+        assert!(body.contains("| Code Smell | Dead branch | Low | `src/b.rs:4-6` |"));
     }
 
     #[test]
