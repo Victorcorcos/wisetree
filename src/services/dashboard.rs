@@ -5895,6 +5895,57 @@ pub fn split_duplicate_findings(
     })
 }
 
+/// Collapse findings that duplicate one another *within a single run*, which
+/// the per-file parallel scans can produce with different wording for the
+/// same underlying issue. Two findings in the same file collapse when they
+/// propose the same fix — identical [`normalize_suggestion`] text — or land
+/// on the same line, since either way one comment already covers it. Callers
+/// pass the findings already ordered by priority (severity, then diff order),
+/// so the first occurrence — the one kept — is the highest-severity one and
+/// the rest are returned as `duplicates`, surfaced as muted report rows
+/// rather than dropped silently.
+pub fn split_run_duplicate_findings(
+    findings: Vec<ReviewFinding>,
+) -> (Vec<ReviewFinding>, Vec<ReviewFinding>) {
+    let mut seen_fixes: HashSet<(String, String)> = HashSet::new();
+    let mut seen_anchors: HashSet<(String, u64)> = HashSet::new();
+    let mut kept = Vec::with_capacity(findings.len());
+    let mut duplicates = Vec::new();
+    for finding in findings {
+        let fix = normalize_suggestion(finding.suggestion.as_deref());
+        let fix_key = (!fix.is_empty()).then(|| (finding.file.clone(), fix));
+        let anchor_key = finding.line.map(|line| (finding.file.clone(), line));
+
+        let is_duplicate = fix_key.as_ref().is_some_and(|k| seen_fixes.contains(k))
+            || anchor_key
+                .as_ref()
+                .is_some_and(|k| seen_anchors.contains(k));
+        if is_duplicate {
+            duplicates.push(finding);
+            continue;
+        }
+        if let Some(k) = fix_key {
+            seen_fixes.insert(k);
+        }
+        if let Some(k) = anchor_key {
+            seen_anchors.insert(k);
+        }
+        kept.push(finding);
+    }
+    (kept, duplicates)
+}
+
+/// Whitespace-insensitive form of a suggestion body, so two findings that
+/// propose the same fix modulo indentation/blank lines compare equal. An
+/// absent or blank suggestion normalizes to the empty string (no fix key).
+fn normalize_suggestion(suggestion: Option<&str>) -> String {
+    suggestion
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Write the curated reference tables next to the temp dir so the scan AI
 /// can read them on demand instead of paying their token cost on every call.
 /// Best-effort: on a write failure the prompt just points at "(unavailable)"
@@ -6803,6 +6854,78 @@ new file mode 100644
         // No keys → everything is fresh.
         let (all, none) = split_duplicate_findings(vec![finding(Some(7), "x")], &[]);
         assert_eq!((all.len(), none.len()), (1, 0));
+    }
+
+    fn run_finding(
+        file: &str,
+        line: Option<u64>,
+        title: &str,
+        suggestion: Option<&str>,
+    ) -> ReviewFinding {
+        ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: file.to_string(),
+            start_line: None,
+            line,
+            title: title.to_string(),
+            explanation: "why".to_string(),
+            suggestion: suggestion.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn run_dedup_collapses_same_fix_even_on_different_lines() {
+        // Same proposed fix in the same file, worded differently and anchored
+        // to different lines: the second is a duplicate.
+        let (kept, dups) = split_run_duplicate_findings(vec![
+            run_finding("a.rs", Some(4), "Use env var", Some("let k = env(\"K\");")),
+            run_finding(
+                "a.rs",
+                Some(9),
+                "Read the key from the environment",
+                Some("let k = env(\"K\");"),
+            ),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line, Some(4)); // the first (highest-priority) one
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].line, Some(9));
+    }
+
+    #[test]
+    fn run_dedup_ignores_whitespace_only_differences_in_the_fix() {
+        let (kept, dups) = split_run_duplicate_findings(vec![
+            run_finding("a.rs", Some(4), "A", Some("let k = env(\"K\");")),
+            run_finding("a.rs", Some(9), "B", Some("  let   k = env(\"K\");\n")),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dups.len(), 1);
+    }
+
+    #[test]
+    fn run_dedup_collapses_same_line_regardless_of_fix() {
+        // Two findings on the same anchor collapse even without a shared fix.
+        let (kept, dups) = split_run_duplicate_findings(vec![
+            run_finding("a.rs", Some(7), "Naming", None),
+            run_finding("a.rs", Some(7), "Magic number", Some("const N = 3;")),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dups.len(), 1);
+    }
+
+    #[test]
+    fn run_dedup_keeps_distinct_findings() {
+        // Different files with the same fix, and distinct fixes on distinct
+        // lines — none are duplicates.
+        let (kept, dups) = split_run_duplicate_findings(vec![
+            run_finding("a.rs", Some(4), "A", Some("same();")),
+            run_finding("b.rs", Some(4), "B", Some("same();")), // other file
+            run_finding("a.rs", Some(9), "C", Some("different();")),
+            run_finding("a.rs", None, "D", None), // file-level, no fix key
+        ]);
+        assert_eq!(kept.len(), 4);
+        assert!(dups.is_empty());
     }
 
     #[test]

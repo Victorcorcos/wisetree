@@ -44,7 +44,9 @@ use ratatui::Frame;
 
 use crate::config::schema::AiModelConfig;
 use crate::messages::colors;
-use crate::services::dashboard::{ReviewFile, ReviewFinding, ReviewSeverity, ReviewSkippedFile};
+use crate::services::dashboard::{
+    split_run_duplicate_findings, ReviewFile, ReviewFinding, ReviewSeverity, ReviewSkippedFile,
+};
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
 use crate::tui::widgets::{
@@ -440,6 +442,20 @@ impl ReviewPullRequestScreen {
         }
     }
 
+    /// Findings collapsed as same-run duplicates (a second finding proposing
+    /// the same fix, or on the same line, as one already kept): one muted row
+    /// each, so the walkthrough shrinks visibly rather than silently.
+    fn record_run_duplicate_findings(&mut self, duplicates: &[ReviewFinding]) {
+        for finding in duplicates {
+            self.summary_rows.push(SummaryRow::with_status(
+                format!("dedup {}", finding.descriptor()),
+                "Duplicate",
+                colors::MUTED,
+                None,
+            ));
+        }
+    }
+
     /// Fold one file's findings into the aggregate.
     pub fn record_scan_result(&mut self, findings: Vec<ReviewFinding>) {
         self.findings.extend(findings);
@@ -476,6 +492,12 @@ impl ReviewPullRequestScreen {
                 .unwrap_or(usize::MAX);
             (f.severity.rank(), file_order)
         });
+        // Collapse same-run duplicates the parallel per-file scans can emit
+        // with different wording. Sorted above, so the first occurrence — the
+        // highest-severity one — is kept and the rest become muted rows.
+        let (kept, duplicates) = split_run_duplicate_findings(std::mem::take(&mut self.findings));
+        self.findings = kept;
+        self.record_run_duplicate_findings(&duplicates);
         self.current = 0;
         !self.findings.is_empty()
     }
@@ -1838,6 +1860,18 @@ mod tests {
         }
     }
 
+    fn finding_with(
+        path: &str,
+        line: Option<u64>,
+        severity: ReviewSeverity,
+        suggestion: Option<&str>,
+    ) -> ReviewFinding {
+        ReviewFinding {
+            suggestion: suggestion.map(str::to_string),
+            ..finding(path, line, severity)
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1934,6 +1968,36 @@ mod tests {
         assert!(!screen.scan_phase_active());
         assert_eq!(screen.findings_len(), 2);
         assert_eq!(screen.current_finding().unwrap().file, "b.rs");
+    }
+
+    #[test]
+    fn finish_scanning_collapses_same_run_duplicates() {
+        // Two scans of the same file surface the same fix with different
+        // wording/severity. finish_scanning keeps the highest-severity one and
+        // records the other as a muted "Duplicate" row — not in the walkthrough.
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "s".into());
+        screen.record_scan_result(vec![finding_with(
+            "a.rs",
+            Some(9),
+            ReviewSeverity::Low,
+            Some("let k = env(\"K\");"),
+        )]);
+        screen.record_scan_result(vec![finding_with(
+            "a.rs",
+            Some(4),
+            ReviewSeverity::Critical,
+            Some("let k = env(\"K\");"),
+        )]);
+        assert!(screen.finish_scanning());
+        assert_eq!(screen.findings_len(), 1);
+        assert_eq!(screen.current_finding().unwrap().line, Some(4)); // Critical kept
+        let dup_row = screen
+            .summary_rows
+            .iter()
+            .find(|r| r.status.as_ref().is_some_and(|s| s.label == "Duplicate"))
+            .expect("a Duplicate row should be recorded");
+        assert!(dup_row.command.contains("a.rs:9"));
     }
 
     #[test]
@@ -2244,10 +2308,12 @@ mod tests {
     fn record_outcome_builds_colored_rows_and_tracks_posted() {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "s".into());
+        // Three genuinely distinct findings (distinct fixes), so the same-run
+        // dedup keeps all three.
         screen.record_scan_result(vec![
-            finding("a.rs", Some(2), ReviewSeverity::Critical),
-            finding("a.rs", Some(3), ReviewSeverity::High),
-            finding("a.rs", None, ReviewSeverity::Low),
+            finding_with("a.rs", Some(2), ReviewSeverity::Critical, Some("fix a")),
+            finding_with("a.rs", Some(3), ReviewSeverity::High, Some("fix b")),
+            finding_with("a.rs", None, ReviewSeverity::Low, Some("fix c")),
         ]);
         screen.finish_scanning();
         screen.record_outcome(ReviewRowOutcome::Posted);
