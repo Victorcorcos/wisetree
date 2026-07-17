@@ -1692,7 +1692,7 @@ impl BugkillPullRequestScreen {
             .split(area);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("🐛 Bugfix #{number} applied — did it really fix the bug?"),
+                format!("🐛 Bugfix #{number} applied"),
                 Style::default()
                     .fg(colors::WHITE)
                     .add_modifier(Modifier::BOLD),
@@ -1853,6 +1853,20 @@ impl BugkillPullRequestScreen {
                 ]));
             }
         }
+        // The verdict question, centered and emphasized right above the
+        // Yes / No / Other buttons so it sits next to the choice it asks about.
+        // (Terminals can't scale font size; bold is the closest emphasis.)
+        lines.push(Line::default());
+        lines.push(Line::default());
+        lines.push(
+            Line::from(Span::styled(
+                "Did it fix the bug?".to_string(),
+                Style::default()
+                    .fg(colors::WHITE)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(ratatui::layout::Alignment::Center),
+        );
         lines
     }
 
@@ -2634,10 +2648,9 @@ mod tests {
     fn verdict_renders_bug_cause_fix_and_commit_context() {
         let mut s = screen_on_verdict();
         let dump = render_dump(&mut s, 110, 30);
-        assert!(
-            dump.contains("Bugfix #1 applied — did it really fix the bug?"),
-            "{dump}"
-        );
+        assert!(dump.contains("Bugfix #1 applied"), "{dump}");
+        // The question now sits inside the panel, right above the buttons.
+        assert!(dump.contains("Did it fix the bug?"), "{dump}");
         // The context panel shows the bug's effect, its suspected cause
         // (with ranking + evidence quality), and the full fix plan.
         assert!(dump.contains("The bug (what you reported)"), "{dump}");
