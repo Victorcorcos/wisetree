@@ -6247,10 +6247,11 @@ fn code_lines_equal(a: &str, b: &str) -> bool {
     normalize(a) == normalize(b)
 }
 
-/// Map the AI's `CATEGORY:` value onto the five canonical labels, tolerating
-/// case/spacing drift. An unrecognized non-empty value passes through as-is
-/// (better an odd label than a lost finding); empty falls back to the most
-/// generic category.
+/// Map the AI's `CATEGORY:` value onto the emoji shown for each of the five
+/// categories, tolerating case/spacing drift. The emoji is compact enough that
+/// the summary's "Type" column never wraps. An unrecognized non-empty value
+/// passes through as-is (better an odd label than a lost finding); empty falls
+/// back to the most generic category.
 fn normalize_review_category(raw: &str) -> String {
     let key: String = raw
         .chars()
@@ -6258,12 +6259,12 @@ fn normalize_review_category(raw: &str) -> String {
         .collect::<String>()
         .to_lowercase();
     match key.as_str() {
-        "codesmell" | "cleancode" | "smell" => "Code Smell".to_string(),
-        "security" => "Security".to_string(),
-        "performance" => "Performance".to_string(),
-        "testquality" | "test" | "tests" | "testing" => "Test".to_string(),
-        "convention" | "conventions" => "Convention".to_string(),
-        _ if raw.trim().is_empty() => "Code Smell".to_string(),
+        "codesmell" | "cleancode" | "smell" => "🧹".to_string(),
+        "security" => "🛡️".to_string(),
+        "performance" => "🚀".to_string(),
+        "testquality" | "test" | "tests" | "testing" => "🧪".to_string(),
+        "convention" | "conventions" => "🤝".to_string(),
+        _ if raw.trim().is_empty() => "🧹".to_string(),
         _ => raw.trim().to_string(),
     }
 }
@@ -6757,7 +6758,7 @@ new file mode 100644
         assert_eq!(findings.len(), 2, "{findings:?}");
 
         let first = &findings[0];
-        assert_eq!(first.category, "Security");
+        assert_eq!(first.category, "🛡️");
         assert_eq!(first.severity, ReviewSeverity::Critical);
         assert_eq!(first.file, "src/lib.rs");
         assert_eq!(first.line, Some(11));
@@ -6770,7 +6771,7 @@ new file mode 100644
 
         // Case-insensitive category + severity normalization.
         let second = &findings[1];
-        assert_eq!(second.category, "Code Smell");
+        assert_eq!(second.category, "🧹");
         assert_eq!(second.severity, ReviewSeverity::Low);
         assert!(second.suggestion.is_none());
     }
@@ -6975,13 +6976,15 @@ new file mode 100644
     }
 
     #[test]
-    fn normalize_review_category_shortens_test_quality_to_test() {
-        // Shortened so the Type column doesn't wrap; the various aliases the AI
-        // may emit all land on the short label.
-        assert_eq!(normalize_review_category("Test Quality"), "Test");
-        assert_eq!(normalize_review_category("testing"), "Test");
-        // Other canonical labels are unchanged.
-        assert_eq!(normalize_review_category("security"), "Security");
+    fn normalize_review_category_maps_to_emoji() {
+        // Categories render as a compact emoji so the Type column never wraps;
+        // the various aliases the AI may emit all land on the same emoji.
+        assert_eq!(normalize_review_category("Test Quality"), "🧪");
+        assert_eq!(normalize_review_category("testing"), "🧪");
+        assert_eq!(normalize_review_category("code smell"), "🧹");
+        assert_eq!(normalize_review_category("security"), "🛡️");
+        assert_eq!(normalize_review_category("Performance"), "🚀");
+        assert_eq!(normalize_review_category("convention"), "🤝");
     }
 
     #[test]
