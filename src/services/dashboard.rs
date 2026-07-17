@@ -6286,18 +6286,33 @@ pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
         let where_cell = group
             .locations
             .iter()
-            .map(|loc| format!("`{}`", md_table_cell(loc)))
+            .map(|loc| where_location(loc))
             .collect::<Vec<_>>()
             .join("<br>");
         body.push_str(&format!(
             "| {} | {} | {} | {} |\n",
-            md_table_cell(&group.category),
+            md_table_cell_nowrap(&group.category),
             md_table_cell(&group.title),
-            md_table_cell(group.severity.label()),
+            md_table_cell_nowrap(group.severity.label()),
             where_cell,
         ));
     }
     body
+}
+
+/// One location for the "Where?" cell. A long `path/file:line` is hard-broken
+/// between its directory and filename (two code spans joined by `<br>`) so the
+/// column stops demanding the full path width — that demand is what starves the
+/// narrow columns and force-wraps their single-word headers.
+fn where_location(descriptor: &str) -> String {
+    const MAX: usize = 28;
+    if descriptor.len() > MAX {
+        if let Some(cut) = descriptor.rfind('/') {
+            let (dir, file) = descriptor.split_at(cut + 1);
+            return format!("`{}`<br>`{}`", md_table_cell(dir), md_table_cell(file));
+        }
+    }
+    format!("`{}`", md_table_cell(descriptor))
 }
 
 /// One summary-table row: an issue (by title) with every location it was
@@ -6356,6 +6371,13 @@ fn md_table_cell(value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .replace('|', "\\|")
+}
+
+/// Like [`md_table_cell`] but joins words with non-breaking spaces, for the
+/// narrow columns (Type, Severity) whose short labels must not wrap mid-value
+/// (e.g. "Test Quality" splitting onto two lines).
+fn md_table_cell_nowrap(value: &str) -> String {
+    md_table_cell(value).replace(' ', "\u{00A0}")
 }
 
 /// Build the commit subject + body for one applied review fix, in the format
@@ -6904,8 +6926,9 @@ new file mode 100644
         // Two findings, one shared issue → one row, counted as a single issue.
         assert!(body.contains("found 1 issue that should be addressed"));
         // Both locations in one cell, each on its own line; highest severity wins.
+        // The Type value keeps its words together with a non-breaking space.
         assert!(body.contains(
-            "| Test Quality | Missing coverage | High | `src/a.rs:12`<br>`src/b.rs:40` |"
+            "| Test\u{00A0}Quality | Missing coverage | High | `src/a.rs:12`<br>`src/b.rs:40` |"
         ));
     }
 
@@ -6939,8 +6962,35 @@ new file mode 100644
         assert!(body.contains("found 2 issues that should be addressed"));
         // Pipe in the title escaped.
         assert!(body.contains("Unsanitized `a \\| b` input"));
-        // A line range renders in the Where? cell.
-        assert!(body.contains("| Code Smell | Dead branch | Low | `src/b.rs:4-6` |"));
+        // A line range renders in the Where? cell; "Code Smell" stays on one line.
+        assert!(body.contains("| Code\u{00A0}Smell | Dead branch | Low | `src/b.rs:4-6` |"));
+    }
+
+    #[test]
+    fn build_review_summary_breaks_long_paths_in_the_where_cell() {
+        let posted = vec![ReviewFinding {
+            category: "Test Quality".to_string(),
+            severity: ReviewSeverity::Low,
+            file: "lib/components/attachment/attachment_viewer_content_desktop.dart".to_string(),
+            start_line: None,
+            line: Some(155),
+            title: "Hidden mode untested".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        }];
+        let body = build_review_summary(&posted);
+        // The long path hard-breaks between directory and filename so the
+        // column stops starving the narrow ones.
+        assert!(body.contains(
+            "`lib/components/attachment/`<br>`attachment_viewer_content_desktop.dart:155`"
+        ));
+        // A short location is left on a single line.
+        let short = build_review_summary(&[ReviewFinding {
+            file: "a.rs".to_string(),
+            line: Some(3),
+            ..posted[0].clone()
+        }]);
+        assert!(short.contains("| `a.rs:3` |"));
     }
 
     #[test]
