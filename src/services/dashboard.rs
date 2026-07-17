@@ -6261,7 +6261,7 @@ fn normalize_review_category(raw: &str) -> String {
         "codesmell" | "cleancode" | "smell" => "Code Smell".to_string(),
         "security" => "Security".to_string(),
         "performance" => "Performance".to_string(),
-        "testquality" | "test" | "tests" | "testing" => "Test Quality".to_string(),
+        "testquality" | "test" | "tests" | "testing" => "Test".to_string(),
         "convention" | "conventions" => "Convention".to_string(),
         _ if raw.trim().is_empty() => "Code Smell".to_string(),
         _ => raw.trim().to_string(),
@@ -6278,15 +6278,18 @@ pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
     let mut body = format!(
         "## Review Summary\n\nI reviewed this PR and found {} {noun} that should be \
          addressed before merge.\n\n### Requested Improvements\n\n\
-         | Type | Issue | Severity | Where? |\n\
+         | Type | Issue | Level | Where? |\n\
          | --- | --- | --- | --- |\n",
         groups.len()
     );
     for group in &groups {
+        // Each location is one code span. Kept whole (not hard-broken): GitHub
+        // lets a long code span set the column width and keeps the narrow
+        // columns at their natural size, so their short labels don't wrap.
         let where_cell = group
             .locations
             .iter()
-            .map(|loc| where_location(loc))
+            .map(|loc| format!("`{}`", md_table_cell(loc)))
             .collect::<Vec<_>>()
             .join("<br>");
         body.push_str(&format!(
@@ -6298,21 +6301,6 @@ pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
         ));
     }
     body
-}
-
-/// One location for the "Where?" cell. A long `path/file:line` is hard-broken
-/// between its directory and filename (two code spans joined by `<br>`) so the
-/// column stops demanding the full path width — that demand is what starves the
-/// narrow columns and force-wraps their single-word headers.
-fn where_location(descriptor: &str) -> String {
-    const MAX: usize = 28;
-    if descriptor.len() > MAX {
-        if let Some(cut) = descriptor.rfind('/') {
-            let (dir, file) = descriptor.split_at(cut + 1);
-            return format!("`{}`<br>`{}`", md_table_cell(dir), md_table_cell(file));
-        }
-    }
-    format!("`{}`", md_table_cell(descriptor))
 }
 
 /// One summary-table row: an issue (by title) with every location it was
@@ -6374,8 +6362,8 @@ fn md_table_cell(value: &str) -> String {
 }
 
 /// Like [`md_table_cell`] but joins words with non-breaking spaces, for the
-/// narrow columns (Type, Severity) whose short labels must not wrap mid-value
-/// (e.g. "Test Quality" splitting onto two lines).
+/// narrow columns (Type, Level) whose short labels must not wrap mid-value
+/// (e.g. "Code Smell" splitting onto two lines).
 fn md_table_cell_nowrap(value: &str) -> String {
     md_table_cell(value).replace(' ', "\u{00A0}")
 }
@@ -6899,7 +6887,7 @@ new file mode 100644
         assert!(body.contains("found 1 issue that should be addressed"));
         assert!(!body.contains("issue(s)"));
         // "Issue" column, title only — the explanation stays out of the table.
-        assert!(body.contains("| Type | Issue | Severity | Where? |"));
+        assert!(body.contains("| Type | Issue | Level | Where? |"));
         assert!(body.contains("| Performance | N+1 query in loop | High | `src/db.rs:23` |"));
         assert!(!body.contains("each iteration hits the DB again"));
         // The redundant Notes section is gone.
@@ -6967,9 +6955,9 @@ new file mode 100644
     }
 
     #[test]
-    fn build_review_summary_breaks_long_paths_in_the_where_cell() {
+    fn build_review_summary_keeps_a_long_path_as_one_code_span() {
         let posted = vec![ReviewFinding {
-            category: "Test Quality".to_string(),
+            category: "Test".to_string(),
             severity: ReviewSeverity::Low,
             file: "lib/components/attachment/attachment_viewer_content_desktop.dart".to_string(),
             start_line: None,
@@ -6979,18 +6967,21 @@ new file mode 100644
             suggestion: None,
         }];
         let body = build_review_summary(&posted);
-        // The long path hard-breaks between directory and filename so the
-        // column stops starving the narrow ones.
+        // The full path stays in a single code span (no hard breaks inside it),
+        // which renders cleanly without wrapping the narrow columns' labels.
         assert!(body.contains(
-            "`lib/components/attachment/`<br>`attachment_viewer_content_desktop.dart:155`"
+            "| `lib/components/attachment/attachment_viewer_content_desktop.dart:155` |"
         ));
-        // A short location is left on a single line.
-        let short = build_review_summary(&[ReviewFinding {
-            file: "a.rs".to_string(),
-            line: Some(3),
-            ..posted[0].clone()
-        }]);
-        assert!(short.contains("| `a.rs:3` |"));
+    }
+
+    #[test]
+    fn normalize_review_category_shortens_test_quality_to_test() {
+        // Shortened so the Type column doesn't wrap; the various aliases the AI
+        // may emit all land on the short label.
+        assert_eq!(normalize_review_category("Test Quality"), "Test");
+        assert_eq!(normalize_review_category("testing"), "Test");
+        // Other canonical labels are unchanged.
+        assert_eq!(normalize_review_category("security"), "Security");
     }
 
     #[test]
