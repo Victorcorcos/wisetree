@@ -5870,11 +5870,28 @@ pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, Exis
         .collect()
 }
 
-/// The normalized title of a wisetree-format review comment — its body
-/// leads with the header this command posts (`**[Cat] [Sev]**: title`).
-/// Only the first lines are inspected so a quoted header deep inside a
-/// long human comment can't produce a key.
+/// The normalized title of a wisetree-format review comment, or `None` for a
+/// human comment. Current comments lead with a `### {title}` heading and close
+/// with the centered severity/category badge ([`ReviewFinding::comment_body`]);
+/// the badge is the signature that tells them apart from an arbitrary human
+/// heading. Older comments led with a `**[Cat] [Sev]**: {title}` header — still
+/// recognized so dedup keeps working against PRs that carry them. Only the
+/// leading lines are inspected so a quoted header deep in a human reply can't
+/// produce a key.
 fn wisetree_finding_title(body: &str) -> Option<String> {
+    // Current format: the centered badge marks it as ours; the title is the
+    // leading `### ` heading.
+    if body.contains("<p align=\"center\">") {
+        for line in body.lines().take(3) {
+            if let Some(title) = line.trim().strip_prefix("### ") {
+                let title = title.trim();
+                if !title.is_empty() {
+                    return Some(title.to_lowercase());
+                }
+            }
+        }
+    }
+    // Legacy format: `**[Cat] [Sev]**: title`.
     for line in body.lines().take(3) {
         if let Some(rest) = line.trim().strip_prefix("**[") {
             if let Some((_, title)) = rest.split_once("]**: ") {
@@ -6885,19 +6902,45 @@ new file mode 100644
 
     #[test]
     fn wisetree_comments_produce_dedup_keys_humans_do_not() {
-        let json = r#"[
-            {"path": "a.rs", "line": 7,
-             "body": "**[Security] [High]**: Hardcoded API key\n\nSecrets leak.",
+        // Round-trip the *actual* posted comment body through the parser so the
+        // dedup key can never silently drift from the format the command emits.
+        let finding = ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: "a.rs".to_string(),
+            start_line: None,
+            line: Some(7),
+            title: "Hardcoded API key".to_string(),
+            explanation: "Secrets leak.".to_string(),
+            suggestion: None,
+        };
+        let json = serde_json::json!([
+            {"path": "a.rs", "line": 7, "body": finding.comment_body(),
              "user": {"login": "wisetree"}},
             {"path": "a.rs", "line": 9, "body": "please rename this", "user": {"login": "bob"}}
-        ]"#;
-        let by_path = parse_existing_review_comments(json);
+        ])
+        .to_string();
+        let by_path = parse_existing_review_comments(&json);
         assert_eq!(
             by_path.get("a.rs").unwrap().keys,
             vec![ExistingFindingKey {
                 line: Some(7),
                 title: "hardcoded api key".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn wisetree_finding_title_still_reads_legacy_header() {
+        // Comments posted before the format change must keep producing keys.
+        assert_eq!(
+            wisetree_finding_title("**[Security] [High]**: Hardcoded API key\n\nSecrets leak."),
+            Some("hardcoded api key".to_string())
+        );
+        // A plain human heading with no badge is not one of ours.
+        assert_eq!(
+            wisetree_finding_title("### Just my two cents\n\nlooks fine"),
+            None
         );
     }
 
