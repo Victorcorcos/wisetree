@@ -894,8 +894,9 @@ impl ReviewFinding {
             }
         }
         body.push_str(&format!(
-            "\n\n<p align=\"center\">\n{} [{}] [{}]\n</p>",
+            "\n\n<p align=\"center\">\n{} [{} {}] [{}]\n</p>",
             self.severity.emoji(),
+            category_emoji(&self.category),
             self.category,
             self.severity.label()
         ));
@@ -6247,10 +6248,10 @@ fn code_lines_equal(a: &str, b: &str) -> bool {
     normalize(a) == normalize(b)
 }
 
-/// Map the AI's `CATEGORY:` value onto the five canonical labels, tolerating
-/// case/spacing drift. An unrecognized non-empty value passes through as-is
-/// (better an odd label than a lost finding); empty falls back to the most
-/// generic category.
+/// Map the AI's `CATEGORY:` value onto the canonical category name, tolerating
+/// case/spacing drift. [`category_emoji`] derives the emoji shown for it. An
+/// unrecognized non-empty value passes through as-is (better an odd label than
+/// a lost finding); empty falls back to the most generic category.
 fn normalize_review_category(raw: &str) -> String {
     let key: String = raw
         .chars()
@@ -6265,6 +6266,20 @@ fn normalize_review_category(raw: &str) -> String {
         "convention" | "conventions" => "Convention".to_string(),
         _ if raw.trim().is_empty() => "Code Smell".to_string(),
         _ => raw.trim().to_string(),
+    }
+}
+
+/// Emoji shown for a review category, keyed on the canonical name from
+/// [`normalize_review_category`]. The summary's "Type" column shows the emoji
+/// alone; the inline comment badge pairs it with the name.
+fn category_emoji(category: &str) -> &'static str {
+    match category {
+        "Security" => "🛡️",
+        "Performance" => "🚀",
+        "Test" => "🧪",
+        "Convention" => "🤝",
+        "Code Smell" => "🧹",
+        _ => "🏷️",
     }
 }
 
@@ -6294,9 +6309,9 @@ pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
             .join("<br>");
         body.push_str(&format!(
             "| {} | {} | {} | {} |\n",
-            md_table_cell_nowrap(&group.category),
+            category_emoji(&group.category),
             md_table_cell(&group.title),
-            md_table_cell_nowrap(group.severity.label()),
+            md_table_cell(group.severity.label()),
             where_cell,
         ));
     }
@@ -6359,13 +6374,6 @@ fn md_table_cell(value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .replace('|', "\\|")
-}
-
-/// Like [`md_table_cell`] but joins words with non-breaking spaces, for the
-/// narrow columns (Type, Level) whose short labels must not wrap mid-value
-/// (e.g. "Code Smell" splitting onto two lines).
-fn md_table_cell_nowrap(value: &str) -> String {
-    md_table_cell(value).replace(' ', "\u{00A0}")
 }
 
 /// Build the commit subject + body for one applied review fix, in the format
@@ -6842,7 +6850,7 @@ new file mode 100644
         assert!(body.starts_with("### Hardcoded API key"));
         assert!(body.contains("Secrets in source leak through history."));
         assert!(body.contains("```suggestion\nlet key = env::var(\"API_KEY\")?;\n```"));
-        assert!(body.ends_with("<p align=\"center\">\n🔴 [Security] [Critical]\n</p>"));
+        assert!(body.ends_with("<p align=\"center\">\n🔴 [🛡️ Security] [Critical]\n</p>"));
         // Inline comments don't repeat the path — GitHub anchors them.
         assert!(!body.contains("📄"));
     }
@@ -6850,7 +6858,7 @@ new file mode 100644
     #[test]
     fn review_finding_comment_body_downgrades_file_level_suggestions() {
         let finding = ReviewFinding {
-            category: "Test Quality".to_string(),
+            category: "Test".to_string(),
             severity: ReviewSeverity::High,
             file: "src/auth.rs".to_string(),
             start_line: None,
@@ -6866,7 +6874,7 @@ new file mode 100644
         assert!(body.contains("📄 `src/auth.rs`"));
         assert!(!body.contains("```suggestion"));
         assert!(body.contains("**Proposed code:**\n```\nassert!(auth(bad).is_err());\n```"));
-        assert!(body.ends_with("<p align=\"center\">\n🟠 [Test Quality] [High]\n</p>"));
+        assert!(body.ends_with("<p align=\"center\">\n🟠 [🧪 Test] [High]\n</p>"));
     }
 
     #[test]
@@ -6888,7 +6896,8 @@ new file mode 100644
         assert!(!body.contains("issue(s)"));
         // "Issue" column, title only — the explanation stays out of the table.
         assert!(body.contains("| Type | Issue | Level | Where? |"));
-        assert!(body.contains("| Performance | N+1 query in loop | High | `src/db.rs:23` |"));
+        // The Type column shows the category emoji alone.
+        assert!(body.contains("| 🚀 | N+1 query in loop | High | `src/db.rs:23` |"));
         assert!(!body.contains("each iteration hits the DB again"));
         // The redundant Notes section is gone.
         assert!(!body.contains("### Notes"));
@@ -6897,7 +6906,7 @@ new file mode 100644
     #[test]
     fn build_review_summary_groups_shared_issues_and_lists_each_location() {
         let make = |file: &str, line: u64, severity: ReviewSeverity| ReviewFinding {
-            category: "Test Quality".to_string(),
+            category: "Test".to_string(),
             severity,
             file: file.to_string(),
             start_line: None,
@@ -6914,10 +6923,7 @@ new file mode 100644
         // Two findings, one shared issue → one row, counted as a single issue.
         assert!(body.contains("found 1 issue that should be addressed"));
         // Both locations in one cell, each on its own line; highest severity wins.
-        // The Type value keeps its words together with a non-breaking space.
-        assert!(body.contains(
-            "| Test\u{00A0}Quality | Missing coverage | High | `src/a.rs:12`<br>`src/b.rs:40` |"
-        ));
+        assert!(body.contains("| 🧪 | Missing coverage | High | `src/a.rs:12`<br>`src/b.rs:40` |"));
     }
 
     #[test]
@@ -6950,8 +6956,8 @@ new file mode 100644
         assert!(body.contains("found 2 issues that should be addressed"));
         // Pipe in the title escaped.
         assert!(body.contains("Unsanitized `a \\| b` input"));
-        // A line range renders in the Where? cell; "Code Smell" stays on one line.
-        assert!(body.contains("| Code\u{00A0}Smell | Dead branch | Low | `src/b.rs:4-6` |"));
+        // A line range renders in the Where? cell; the Type shows the emoji alone.
+        assert!(body.contains("| 🧹 | Dead branch | Low | `src/b.rs:4-6` |"));
     }
 
     #[test]
@@ -6975,13 +6981,25 @@ new file mode 100644
     }
 
     #[test]
-    fn normalize_review_category_shortens_test_quality_to_test() {
-        // Shortened so the Type column doesn't wrap; the various aliases the AI
-        // may emit all land on the short label.
+    fn normalize_review_category_returns_canonical_names() {
+        // The various aliases the AI may emit collapse onto one canonical name.
         assert_eq!(normalize_review_category("Test Quality"), "Test");
         assert_eq!(normalize_review_category("testing"), "Test");
-        // Other canonical labels are unchanged.
+        assert_eq!(normalize_review_category("code smell"), "Code Smell");
         assert_eq!(normalize_review_category("security"), "Security");
+        assert_eq!(normalize_review_category("Performance"), "Performance");
+        assert_eq!(normalize_review_category("convention"), "Convention");
+    }
+
+    #[test]
+    fn category_emoji_maps_each_canonical_name() {
+        // The summary "Type" column shows this emoji alone; the comment badge
+        // pairs it with the name.
+        assert_eq!(category_emoji("Test"), "🧪");
+        assert_eq!(category_emoji("Code Smell"), "🧹");
+        assert_eq!(category_emoji("Performance"), "🚀");
+        assert_eq!(category_emoji("Convention"), "🤝");
+        assert_eq!(category_emoji("Security"), "🛡️");
     }
 
     #[test]
