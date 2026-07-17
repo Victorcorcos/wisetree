@@ -2705,7 +2705,13 @@ impl DashboardService {
             REVIEW_FETCH_TIMEOUT,
             run_gh_command(
                 &self.gh_binary,
-                &["pr", "view", &number_arg, "--json", "url,headRefOid"],
+                &[
+                    "pr",
+                    "view",
+                    &number_arg,
+                    "--json",
+                    "url,headRefOid,baseRefName",
+                ],
                 Some(&cwd),
             ),
         )
@@ -2715,7 +2721,7 @@ impl DashboardService {
             Ok(out) => out,
             Err(err) => return Ok(ReviewPreparation::SyncFailed(err)),
         };
-        let Some((owner, repo, head_sha)) = parse_review_pr_json(&view) else {
+        let Some((owner, repo, head_sha, base_ref_name)) = parse_review_pr_json(&view) else {
             return Ok(ReviewPreparation::SyncFailed(
                 "could not resolve the PR's repository and head sha from gh pr view output."
                     .to_string(),
@@ -2724,14 +2730,29 @@ impl DashboardService {
 
         // `gh pr diff` returns the diff exactly as GitHub renders it, so the
         // new-side line numbers we extract match the lines GitHub accepts
-        // inline comments on.
-        let diff = time::timeout(
+        // inline comments on. GitHub's diff endpoint, though, returns a
+        // persistent 5xx when a PR's diff is too large for its service to
+        // generate; retrying can't help. In that case fall back to
+        // reproducing the same three-dot diff locally from the synced branch,
+        // which has no size limit.
+        let gh_diff = time::timeout(
             REVIEW_FETCH_TIMEOUT,
-            run_gh_command(&self.gh_binary, &["pr", "diff", &number_arg], Some(&cwd)),
+            run_command(&self.gh_binary, &["pr", "diff", &number_arg], Some(&cwd)),
         )
         .await
-        .map_err(|_| WisetreeError::other("gh pr diff timed out after 30s"))?
-        .map_err(WisetreeError::other)?;
+        .unwrap_or_else(|_| Err("gh pr diff timed out after 30s".to_string()));
+        let diff = match gh_diff {
+            Ok(diff) => diff,
+            Err(gh_err) => self
+                .local_pr_diff(&cwd, &base_ref_name)
+                .await
+                .map_err(|local_err| {
+                    WisetreeError::other(format!(
+                        "gh pr diff failed ({gh_err}); local diff fallback also failed \
+                         ({local_err})"
+                    ))
+                })?,
+        };
         let parsed = parse_review_diff(&diff);
         if parsed.is_empty() {
             return Ok(ReviewPreparation::NoChanges);
@@ -2766,6 +2787,50 @@ impl DashboardService {
             repo,
             head_sha,
         })
+    }
+
+    /// Reproduce a PR's diff locally when `gh pr diff` is unavailable —
+    /// notably when GitHub's diff endpoint returns a persistent 5xx because a
+    /// PR's diff is too large for its service to generate. GitHub renders a
+    /// PR's "Files changed" as a three-dot diff (`base...head`, i.e. from the
+    /// merge-base to the head), and the PR branch is already checked out and
+    /// fast-forwarded in this worktree, so `git diff <base>...HEAD` reproduces
+    /// it. The new-side line numbers match GitHub's regardless — they are
+    /// intrinsic to the head file contents, not to how GitHub renders them —
+    /// so the anchors we later post inline stay valid. Unlike the API, local
+    /// git has no diff-size limit.
+    async fn local_pr_diff(
+        &self,
+        cwd: &Path,
+        base_ref_name: &str,
+    ) -> std::result::Result<String, String> {
+        // Map GitHub's base branch onto a local remote-tracking ref (falls
+        // back to the branch's own base when the name is unknown).
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, cwd, Some(base_ref_name))
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "could not resolve a local base ref for the PR's base branch \
+                     '{base_ref_name}'"
+                )
+            })?;
+        // Refresh the base so its merge-base with HEAD matches GitHub's
+        // current base tip, and thus the exact set of changed lines.
+        if let Some((remote, branch)) = base_ref.split_once('/') {
+            let refspec = format!("+{branch}:refs/remotes/{remote}/{branch}");
+            let _ = time::timeout(
+                REVIEW_FETCH_TIMEOUT,
+                run_command(&self.git_binary, &["fetch", remote, &refspec], Some(cwd)),
+            )
+            .await;
+        }
+        let range = format!("{base_ref}...HEAD");
+        time::timeout(
+            REVIEW_FETCH_TIMEOUT,
+            run_command(&self.git_binary, &["diff", "--no-color", &range], Some(cwd)),
+        )
+        .await
+        .map_err(|_| "git diff for the local PR-diff fallback timed out".to_string())?
     }
 
     /// Scan one changed file with a single captured (non-interactive)
@@ -5588,23 +5653,27 @@ fn extract_fix_section(block: &str, name: &str) -> Option<String> {
     Some(body.join("\n"))
 }
 
-/// Parse `gh pr view --json url,headRefOid` output into
-/// `(owner, repo, head_sha)`. The slug comes off the URL — like
-/// [`parse_pr_repo_json`] — so fork-opened PRs resolve to their base repo.
-fn parse_review_pr_json(body: &str) -> Option<(String, String, String)> {
+/// Parse `gh pr view --json url,headRefOid,baseRefName` output into
+/// `(owner, repo, head_sha, base_ref_name)`. The slug comes off the URL —
+/// like [`parse_pr_repo_json`] — so fork-opened PRs resolve to their base
+/// repo. `base_ref_name` is GitHub's target branch, used to reproduce the PR
+/// diff locally when the API diff endpoint is unavailable.
+fn parse_review_pr_json(body: &str) -> Option<(String, String, String, String)> {
     #[derive(Deserialize)]
     struct ReviewPrJson {
         #[serde(default)]
         url: String,
         #[serde(default, rename = "headRefOid")]
         head_ref_oid: String,
+        #[serde(default, rename = "baseRefName")]
+        base_ref_name: String,
     }
     let parsed: ReviewPrJson = serde_json::from_str(body).ok()?;
     if parsed.head_ref_oid.trim().is_empty() {
         return None;
     }
     let (owner, repo) = parse_github_slug(&parsed.url)?;
-    Some((owner, repo, parsed.head_ref_oid))
+    Some((owner, repo, parsed.head_ref_oid, parsed.base_ref_name))
 }
 
 /// Split a unified diff (`gh pr diff` output) into per-file [`ReviewFile`]s.
@@ -6780,15 +6849,15 @@ new file mode 100644
     }
 
     #[test]
-    fn parse_review_pr_json_reads_slug_and_head_sha() {
-        let json =
-            r#"{"url": "https://github.com/victorcorcos/wisetree/pull/9", "headRefOid": "abc123"}"#;
+    fn parse_review_pr_json_reads_slug_head_sha_and_base_ref() {
+        let json = r#"{"url": "https://github.com/victorcorcos/wisetree/pull/9", "headRefOid": "abc123", "baseRefName": "main"}"#;
         assert_eq!(
             parse_review_pr_json(json),
             Some((
                 "victorcorcos".to_string(),
                 "wisetree".to_string(),
-                "abc123".to_string()
+                "abc123".to_string(),
+                "main".to_string()
             ))
         );
         // A missing head sha is unusable for inline comments.
@@ -7698,6 +7767,91 @@ so the intent reads clearly.
             git(&local, &["rev-parse", "origin/main"]),
             advanced,
             "fetch_base_ref should advance origin/main to the newly pushed commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_pr_diff_reproduces_three_dot_diff_from_synced_branch() {
+        // The fallback used when GitHub's diff endpoint 5xx's on an oversized
+        // PR: compute the same three-dot diff locally. Set up a base branch, a
+        // feature branch checked out in the worktree, and confirm the fallback
+        // produces a unified diff our parser turns into commentable findings.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // Seed `main` with a multi-line file and push it to the remote.
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // The reviewer's worktree: a clone with a feature branch checked out
+        // (as it would be after `git pull --ff-only` synced the PR head).
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, local.to_str().unwrap()],
+        );
+        git(&local, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(local.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        git(&local, &["add", "."]);
+        git(&local, &["commit", "-q", "-m", "edit"]);
+
+        let service = DashboardService::new(local.clone(), DashboardConfig::default());
+        let diff = service
+            .local_pr_diff(&local, "main")
+            .await
+            .expect("local diff fallback should succeed");
+
+        assert!(
+            diff.contains("diff --git a/a.txt b/a.txt"),
+            "expected a unified diff header, got: {diff}"
+        );
+        assert!(diff.contains("+TWO"), "diff should show the edit: {diff}");
+        assert!(
+            diff.contains("+four"),
+            "diff should show the addition: {diff}"
+        );
+
+        // The parser turns it into a reviewable file with new-side line
+        // numbers — the same anchors GitHub accepts inline comments on.
+        let files = parse_review_diff(&diff);
+        assert_eq!(files.len(), 1, "one changed file expected: {files:?}");
+        assert_eq!(files[0].path, "a.txt");
+        assert!(files[0].commentable_lines.contains(&2)); // the changed "TWO"
+        assert!(files[0].commentable_lines.contains(&4)); // the added "four"
+    }
+
+    #[tokio::test]
+    async fn local_pr_diff_reports_error_when_base_ref_unresolvable() {
+        // No remote-tracking base ref exists, so the fallback can't reproduce
+        // the diff — it must surface a clear error rather than an empty diff.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["symbolic-ref", "HEAD", "refs/heads/feature"]);
+        std::fs::write(repo.join("a.txt"), "x\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default());
+        let err = service
+            .local_pr_diff(&repo, "main")
+            .await
+            .expect_err("no base ref means no fallback diff");
+        assert!(
+            err.contains("could not resolve a local base ref"),
+            "unexpected error: {err}"
         );
     }
 
