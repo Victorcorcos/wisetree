@@ -809,6 +809,16 @@ impl ReviewSeverity {
         }
     }
 
+    /// Colored circle that fronts the severity in the comment footer badge.
+    pub fn emoji(self) -> &'static str {
+        match self {
+            ReviewSeverity::Critical => "🔴",
+            ReviewSeverity::High => "🟠",
+            ReviewSeverity::Medium => "🟡",
+            ReviewSeverity::Low => "⚪",
+        }
+    }
+
     /// Sort key: Critical first.
     pub fn rank(self) -> u8 {
         match self {
@@ -867,12 +877,7 @@ impl ReviewFinding {
     /// downgrade the suggestion to a plain code block (suggestion blocks only
     /// work anchored to diff lines).
     pub fn comment_body(&self) -> String {
-        let mut body = format!(
-            "**[{}] [{}]**: {}",
-            self.category,
-            self.severity.label(),
-            self.title
-        );
+        let mut body = format!("### {}", self.title);
         if self.line.is_none() {
             body.push_str(&format!("\n\n📄 `{}`", self.file));
         }
@@ -888,6 +893,12 @@ impl ReviewFinding {
                 body.push_str(&format!("\n\n**Proposed code:**\n```\n{suggestion}\n```"));
             }
         }
+        body.push_str(&format!(
+            "\n\n<p align=\"center\">\n{} [{}] [{}]\n</p>",
+            self.severity.emoji(),
+            self.category,
+            self.severity.label()
+        ));
         body
     }
 
@@ -6755,9 +6766,11 @@ new file mode 100644
             suggestion: Some("let key = env::var(\"API_KEY\")?;".to_string()),
         };
         let body = finding.comment_body();
-        assert!(body.starts_with("**[Security] [Critical]**: Hardcoded API key"));
+        // Title leads as a heading; category/severity moved to a centered footer.
+        assert!(body.starts_with("### Hardcoded API key"));
         assert!(body.contains("Secrets in source leak through history."));
         assert!(body.contains("```suggestion\nlet key = env::var(\"API_KEY\")?;\n```"));
+        assert!(body.ends_with("<p align=\"center\">\n🔴 [Security] [Critical]\n</p>"));
         // Inline comments don't repeat the path — GitHub anchors them.
         assert!(!body.contains("📄"));
     }
@@ -6775,11 +6788,13 @@ new file mode 100644
             suggestion: Some("assert!(auth(bad).is_err());".to_string()),
         };
         let body = finding.comment_body();
+        assert!(body.starts_with("### Missing failure-path test"));
         // File-level comments name the file and must NOT use a ```suggestion
         // block (those only work anchored to diff lines).
         assert!(body.contains("📄 `src/auth.rs`"));
         assert!(!body.contains("```suggestion"));
         assert!(body.contains("**Proposed code:**\n```\nassert!(auth(bad).is_err());\n```"));
+        assert!(body.ends_with("<p align=\"center\">\n🟠 [Test Quality] [High]\n</p>"));
     }
 
     #[test]
