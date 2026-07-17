@@ -1124,54 +1124,33 @@ impl ReviewPullRequestScreen {
     }
 
     fn render_decision_buttons(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(0),
-                Constraint::Length(13),
-                Constraint::Length(2),
-                Constraint::Length(13),
-                Constraint::Length(2),
-                Constraint::Length(13),
-                Constraint::Length(2),
-                Constraint::Length(13),
-                Constraint::Min(0),
-            ])
-            .split(area);
-        frame.render_widget(
-            button_paragraph(
-                "  Post  ",
-                colors::SUCCESS,
-                matches!(self.decision_button, DecisionButton::Post),
-            ),
-            chunks[1],
+        let rects = render_button_row(
+            frame,
+            area,
+            [
+                (
+                    "  Post  ",
+                    colors::SUCCESS,
+                    matches!(self.decision_button, DecisionButton::Post),
+                ),
+                (
+                    "  Edit  ",
+                    colors::INFO,
+                    matches!(self.decision_button, DecisionButton::Edit),
+                ),
+                (
+                    "  Other  ",
+                    colors::BRAND,
+                    matches!(self.decision_button, DecisionButton::Other),
+                ),
+                (
+                    "  Skip  ",
+                    colors::WARNING,
+                    matches!(self.decision_button, DecisionButton::Skip),
+                ),
+            ],
         );
-        frame.render_widget(
-            button_paragraph(
-                "  Edit  ",
-                colors::INFO,
-                matches!(self.decision_button, DecisionButton::Edit),
-            ),
-            chunks[3],
-        );
-        frame.render_widget(
-            button_paragraph(
-                "  Other  ",
-                colors::BRAND,
-                matches!(self.decision_button, DecisionButton::Other),
-            ),
-            chunks[5],
-        );
-        frame.render_widget(
-            button_paragraph(
-                "  Skip  ",
-                colors::WARNING,
-                matches!(self.decision_button, DecisionButton::Skip),
-            ),
-            chunks[7],
-        );
-        self.decision_button_rects
-            .set([chunks[1], chunks[3], chunks[5], chunks[7]]);
+        self.decision_button_rects.set(rects);
     }
 
     /// The deterministic edit form: Bugkill-style field rows (selected row
@@ -1377,44 +1356,28 @@ impl ReviewPullRequestScreen {
     }
 
     fn render_summary_buttons(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(0),
-                Constraint::Length(21),
-                Constraint::Length(2),
-                Constraint::Length(14),
-                Constraint::Length(2),
-                Constraint::Length(13),
-                Constraint::Min(0),
-            ])
-            .split(area);
-        frame.render_widget(
-            button_paragraph(
-                "  Request changes  ",
-                colors::ERROR,
-                matches!(self.summary_button, SummaryButton::RequestChanges),
-            ),
-            chunks[1],
+        let rects = render_button_row(
+            frame,
+            area,
+            [
+                (
+                    "  Request changes  ",
+                    colors::ERROR,
+                    matches!(self.summary_button, SummaryButton::RequestChanges),
+                ),
+                (
+                    "  Comment  ",
+                    colors::INFO,
+                    matches!(self.summary_button, SummaryButton::Comment),
+                ),
+                (
+                    "  Skip  ",
+                    colors::WARNING,
+                    matches!(self.summary_button, SummaryButton::Skip),
+                ),
+            ],
         );
-        frame.render_widget(
-            button_paragraph(
-                "  Comment  ",
-                colors::INFO,
-                matches!(self.summary_button, SummaryButton::Comment),
-            ),
-            chunks[3],
-        );
-        frame.render_widget(
-            button_paragraph(
-                "  Skip  ",
-                colors::WARNING,
-                matches!(self.summary_button, SummaryButton::Skip),
-            ),
-            chunks[5],
-        );
-        self.summary_button_rects
-            .set([chunks[1], chunks[3], chunks[5]]);
+        self.summary_button_rects.set(rects);
     }
 
     fn render_done(&self, frame: &mut Frame, area: Rect) {
@@ -1464,6 +1427,47 @@ impl ReviewPullRequestScreen {
             chunks[2],
         );
     }
+}
+
+/// Render a centered row of bordered buttons, each sized to exactly its own
+/// (already symmetrically padded) label so the text stays perfectly centered.
+///
+/// `button_paragraph` centers with `Alignment::Center`, which biases the odd
+/// remainder to one side. A fixed button width therefore de-centers any label
+/// whose width has the opposite parity — e.g. `"  Edit  "` (8) or
+/// `"  Comment  "` (11) in a wider field leaves an odd gap and drifts left.
+/// Making each inner width equal its label width keeps the remainder zero, so
+/// every label centers regardless of length. Buttons are separated by
+/// two-column gaps and centered as a group; the returned rects feed mouse
+/// hit-testing.
+fn render_button_row<const N: usize>(
+    frame: &mut Frame,
+    area: Rect,
+    buttons: [(&str, Color, bool); N],
+) -> [Rect; N] {
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(N * 2 + 1);
+    constraints.push(Constraint::Min(0));
+    for (i, (label, _, _)) in buttons.iter().enumerate() {
+        if i > 0 {
+            constraints.push(Constraint::Length(2));
+        }
+        // +2 for the left/right borders around the label.
+        constraints.push(Constraint::Length(label.chars().count() as u16 + 2));
+    }
+    constraints.push(Constraint::Min(0));
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    let mut rects = [Rect::default(); N];
+    for (i, (label, color, focused)) in buttons.iter().enumerate() {
+        // Layout: [Min, b0, gap, b1, gap, …] — button i sits at 1 + i*2.
+        let rect = chunks[1 + i * 2];
+        frame.render_widget(button_paragraph(label, *color, *focused), rect);
+        rects[i] = rect;
+    }
+    rects
 }
 
 fn next_decision_button(b: DecisionButton) -> DecisionButton {
@@ -2011,6 +2015,29 @@ mod tests {
         assert_eq!(screen.handle_key(key(KeyCode::Enter)), ReviewAction::Skip);
         // Esc on a finding skips it (keeps the loop going).
         assert_eq!(screen.handle_key(key(KeyCode::Esc)), ReviewAction::Skip);
+    }
+
+    #[test]
+    fn decision_buttons_center_their_labels() {
+        // Each button is sized to its symmetrically padded label, so the text
+        // sits with equal space on both sides — no `Alignment::Center` parity
+        // drift regardless of whether the label width is odd or even.
+        let mut screen = screen_on_decision();
+        let dump = render_dump(&mut screen, 110, 20);
+        assert!(dump.contains("│  Post  │"), "{dump}");
+        assert!(dump.contains("│  Edit  │"), "{dump}");
+        assert!(dump.contains("│  Other  │"), "{dump}");
+        assert!(dump.contains("│  Skip  │"), "{dump}");
+    }
+
+    #[test]
+    fn summary_buttons_center_their_labels() {
+        let mut screen = screen_on_decision();
+        screen.enter_summary("Review summary body".into());
+        let dump = render_dump(&mut screen, 110, 20);
+        assert!(dump.contains("│  Request changes  │"), "{dump}");
+        assert!(dump.contains("│  Comment  │"), "{dump}");
+        assert!(dump.contains("│  Skip  │"), "{dump}");
     }
 
     fn screen_on_decision() -> ReviewPullRequestScreen {
