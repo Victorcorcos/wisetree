@@ -259,7 +259,7 @@ impl ConfirmationModal {
         );
 
         frame.render_widget(
-            Paragraph::new(self.subtitle.clone())
+            Paragraph::new(super::pr_confirm::code_lines(&self.subtitle))
                 .style(Style::default().fg(colors::WHITE))
                 .wrap(Wrap { trim: true }),
             chunks[2],
@@ -508,5 +508,45 @@ mod tests {
         assert_eq!(wrap_line_count("alpha\nbeta\ngamma", 40), 3);
         // Blank line between paragraphs is preserved as its own row.
         assert_eq!(wrap_line_count("alpha\n\nbeta", 40), 3);
+    }
+
+    #[test]
+    fn subtitle_backticks_render_as_code_chip_not_literal_backticks() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let modal = ConfirmationModal::new().with_subtitle(
+            "Investigate a bug on `review-prs-with-AI`, then apply fixes one at a time until one works.",
+        );
+        let backend = TestBackend::new(70, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| modal.render(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let mut out = String::new();
+        let mut code_cell_style = None;
+        for y in 0..buffer.area.height {
+            let mut row = String::new();
+            for x in 0..buffer.area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            if let Some(col) = row.find("review-prs-with-AI") {
+                let cell = &buffer[(col as u16, y)];
+                code_cell_style = Some((cell.fg, cell.bg));
+            }
+            out.push_str(&row);
+            out.push('\n');
+        }
+
+        assert!(!out.contains('`'), "literal backtick leaked:\n{out}");
+        assert!(out.contains("review-prs-with-AI"), "{out}");
+        assert!(out.contains("one works."), "{out}");
+        assert_eq!(
+            code_cell_style,
+            Some((colors::ACCENT, colors::CODE_BG)),
+            "code chip should be orange-on-gray:\n{out}"
+        );
     }
 }

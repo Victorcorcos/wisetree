@@ -1,6 +1,6 @@
 //! Live dashboard polling service.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -73,6 +73,25 @@ const FIX_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// past the OS argv limit.
 const FIX_CODE_WINDOW_RADIUS: usize = 40;
 const FIX_CODE_MAX_BYTES: usize = 24_000;
+/// Timeouts for the "Review Pull Request" pipeline (scan the diff, post
+/// comments). Sync + fetch are network paths; each captured per-file scan
+/// drives a full model turn so it gets the longest leash; posting a comment
+/// and submitting the review summary are single API calls.
+const REVIEW_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+const REVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const REVIEW_SCAN_TIMEOUT: Duration = Duration::from_secs(240);
+const REVIEW_POST_TIMEOUT: Duration = Duration::from_secs(30);
+/// GitHub's API occasionally answers a healthy PR with a transient 5xx (a
+/// blip in their infra, not a real problem with the PR or its diff). Retried
+/// a couple of times in [`run_gh_command`] so a single blip during Review/Fix
+/// prep doesn't force the user back to the Dashboard.
+const GH_TRANSIENT_RETRIES: u32 = 2;
+const GH_TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(3);
+/// Byte caps applied before templating the per-file scan prompt, so the
+/// rendered prompt argv never approaches OS limits: one file's annotated
+/// diff, and the existing-comments dedup context.
+const REVIEW_DIFF_MAX_BYTES: usize = 60_000;
+const REVIEW_COMMENTS_MAX_BYTES: usize = 12_000;
 /// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
 /// embedded PTY (the user watches it and can Esc out), so only the judge —
 /// which classifies one short comment — and the local git operations
@@ -699,6 +718,210 @@ pub enum FixCommitOutcome {
     /// satisfied the comment. No commit was created; the reviewer was told it
     /// is already addressed. Not a failure.
     AlreadyResolved,
+}
+
+/// One changed file extracted from the PR diff by the Review pipeline. The
+/// annotated diff (new-side line numbers inlined) and the existing comments
+/// are everything one per-file scan call needs; `commentable_lines` is the
+/// deterministic ground truth the AI's line anchors are validated against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFile {
+    pub path: String,
+    /// This file's hunks with every new-side line prefixed by its line
+    /// number, so the AI cites anchors the harness can verify.
+    pub annotated_diff: String,
+    /// New-side line numbers GitHub accepts inline comments on (additions +
+    /// context lines present in the diff).
+    pub commentable_lines: BTreeSet<u64>,
+    /// Review comments already posted on this file, rendered as
+    /// `@author (line N): body` blocks — dedup context for the scan call.
+    /// Empty when the PR has none.
+    pub existing_comments: String,
+    /// Structured dedup keys of the wisetree-format comments already on
+    /// this file. Unlike `existing_comments` (advice the model may ignore),
+    /// these back the deterministic duplicate filter in Rust.
+    pub existing_keys: Vec<ExistingFindingKey>,
+}
+
+/// Dedup key of one wisetree-format comment already posted on the PR: its
+/// anchor line and its normalized (lowercased) finding title. Human-written
+/// comments never produce a key, so they never suppress a finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingFindingKey {
+    pub line: Option<u64>,
+    pub title: String,
+}
+
+/// Outcome of the read-only Review preparation (`prepare_review`): sync the
+/// branch, resolve the PR, fetch its diff + existing comments, and split the
+/// diff per changed file. `Ready` hands the files to the UI which drives the
+/// per-file scan loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewPreparation {
+    Ready {
+        files: Vec<ReviewFile>,
+        /// Changed files nobody reviews by hand (lockfiles, minified
+        /// bundles, snapshots, …), filtered out deterministically before
+        /// any AI call. Reported on the final table with their reason.
+        skipped: Vec<ReviewSkippedFile>,
+        owner: String,
+        repo: String,
+        /// PR head commit sha — required by the inline-comment API.
+        head_sha: String,
+    },
+    /// The PR diff contains no reviewable text changes.
+    NoChanges,
+    /// `gh` CLI is missing.
+    GhUnavailable,
+    /// `ai.review.model` is blank — no model configured to scan the diff.
+    AiNotConfigured,
+    /// `ai.review.model` set but `opencode` is not on PATH.
+    AiUnavailable,
+    /// `git pull --ff-only` or the PR lookup failed. stderr included.
+    SyncFailed(String),
+}
+
+/// One changed file excluded from the review before any AI call, with the
+/// human-readable reason shown on the final report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSkippedFile {
+    pub path: String,
+    pub reason: &'static str,
+}
+
+/// Severity the scan AI assigns to a finding. Ordered so the walkthrough can
+/// sort Critical → Low.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl ReviewSeverity {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewSeverity::Critical => "Critical",
+            ReviewSeverity::High => "High",
+            ReviewSeverity::Medium => "Medium",
+            ReviewSeverity::Low => "Low",
+        }
+    }
+
+    /// Colored circle that fronts the severity in the comment footer badge.
+    pub fn emoji(self) -> &'static str {
+        match self {
+            ReviewSeverity::Critical => "🔴",
+            ReviewSeverity::High => "🟠",
+            ReviewSeverity::Medium => "🟡",
+            ReviewSeverity::Low => "⚪",
+        }
+    }
+
+    /// Sort key: Critical first.
+    pub fn rank(self) -> u8 {
+        match self {
+            ReviewSeverity::Critical => 0,
+            ReviewSeverity::High => 1,
+            ReviewSeverity::Medium => 2,
+            ReviewSeverity::Low => 3,
+        }
+    }
+
+    /// Tolerant parse of the AI's `SEVERITY:` value. Anything unrecognized
+    /// lands on `Medium` — never inflate an unknown label to Critical.
+    fn parse(value: &str) -> Self {
+        match value.trim().to_lowercase().as_str() {
+            "critical" => ReviewSeverity::Critical,
+            "high" => ReviewSeverity::High,
+            "low" => ReviewSeverity::Low,
+            _ => ReviewSeverity::Medium,
+        }
+    }
+}
+
+/// One issue the scan AI found in a changed file. `line` / `start_line` are
+/// already validated against the file's commentable lines — `line == None`
+/// means the finding is posted as a general PR comment instead of inline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFinding {
+    /// One of the five review categories (`Code Smell`, `Security`, …).
+    pub category: String,
+    pub severity: ReviewSeverity,
+    pub file: String,
+    /// First line of a multi-line range; only ever `Some` when `line` is.
+    pub start_line: Option<u64>,
+    /// New-side line the inline comment anchors to; `None` → file-level.
+    pub line: Option<u64>,
+    pub title: String,
+    pub explanation: String,
+    /// Exact replacement code for the targeted line(s), when the fix is
+    /// expressible as one — becomes a GitHub ```suggestion block.
+    pub suggestion: Option<String>,
+}
+
+impl ReviewFinding {
+    /// Short human label for the walkthrough header and the summary table:
+    /// `path:line` (or `path:start-line` for a range), or just the path.
+    pub fn descriptor(&self) -> String {
+        match (self.start_line, self.line) {
+            (Some(start), Some(line)) => format!("{}:{start}-{line}", self.file),
+            (None, Some(line)) => format!("{}:{line}", self.file),
+            _ => self.file.clone(),
+        }
+    }
+
+    /// The exact markdown body posted to GitHub. Inline comments carry a
+    /// one-click ```suggestion block; file-level comments name the file and
+    /// downgrade the suggestion to a plain code block (suggestion blocks only
+    /// work anchored to diff lines).
+    pub fn comment_body(&self) -> String {
+        let mut body = format!("### {}", self.title);
+        if self.line.is_none() {
+            body.push_str(&format!("\n\n📄 `{}`", self.file));
+        }
+        if !self.explanation.trim().is_empty() {
+            body.push_str(&format!("\n\n{}", self.explanation.trim()));
+        }
+        if let Some(suggestion) = &self.suggestion {
+            if self.line.is_some() {
+                body.push_str(&format!(
+                    "\n\n**Suggested fix:**\n```suggestion\n{suggestion}\n```"
+                ));
+            } else {
+                body.push_str(&format!("\n\n**Proposed code:**\n```\n{suggestion}\n```"));
+            }
+        }
+        body.push_str(&format!(
+            "\n\n<p align=\"center\">\n{} [{}] [{}]\n</p>",
+            self.severity.emoji(),
+            self.category,
+            self.severity.label()
+        ));
+        body
+    }
+
+    /// The finding rendered back to text for a revision call, so the model
+    /// revises rather than starts fresh.
+    pub fn rendered_for_revision(&self) -> String {
+        let anchor = match (self.start_line, self.line) {
+            (Some(start), Some(line)) => format!("lines {start}-{line}"),
+            (None, Some(line)) => format!("line {line}"),
+            _ => "file-level (no line anchor)".to_string(),
+        };
+        let mut text = format!(
+            "Category: {}\nSeverity: {}\nAnchor: {anchor}\nTitle: {}\nExplanation: {}",
+            self.category,
+            self.severity.label(),
+            self.title,
+            self.explanation
+        );
+        if let Some(suggestion) = &self.suggestion {
+            text.push_str(&format!("\nSuggestion:\n{suggestion}"));
+        }
+        text
+    }
 }
 
 /// Snapshot of a Bugkill worktree: tracked-change paths plus the untracked
@@ -2133,7 +2356,7 @@ impl DashboardService {
         let number_arg = number.to_string();
         let view = time::timeout(
             FIX_FETCH_TIMEOUT,
-            run_command(
+            run_gh_command(
                 &self.gh_binary,
                 &["pr", "view", &number_arg, "--json", "url"],
                 Some(&cwd),
@@ -2158,7 +2381,7 @@ impl DashboardService {
         let arg = format!("query={query}");
         let output = time::timeout(
             FIX_FETCH_TIMEOUT,
-            run_command(&self.gh_binary, &["api", "graphql", "-f", &arg], Some(&cwd)),
+            run_gh_command(&self.gh_binary, &["api", "graphql", "-f", &arg], Some(&cwd)),
         )
         .await
         .map_err(|_| WisetreeError::other("gh api graphql timed out after 15s"))?
@@ -2443,6 +2666,321 @@ impl DashboardService {
         )
         .await
         .map_err(|_| WisetreeError::other("git push timed out after 60s"))?
+        .map_err(WisetreeError::other)?;
+        Ok(())
+    }
+
+    // ── "Review Pull Request" pipeline ─────────────────────────────────
+    //
+    // AI is called in exactly one place: the captured per-file scan (plus
+    // its "Other" revision variant). Everything else — PR lookup, diff
+    // fetch + per-file split, line-number validation, comment posting, the
+    // review-summary template, and the final `gh pr review` submission —
+    // is deterministic code below.
+
+    /// Deterministic Review preparation: gates (gh / model / opencode),
+    /// branch sync, PR lookup (owner/repo/head sha), `gh pr diff` split per
+    /// changed file, and the existing-comments dedup context.
+    pub async fn prepare_review(
+        &self,
+        worktree_path: &str,
+        number: u64,
+    ) -> Result<ReviewPreparation> {
+        if !self.gh_available {
+            return Ok(ReviewPreparation::GhUnavailable);
+        }
+        if self.config.ai.review.model.trim().is_empty() {
+            return Ok(ReviewPreparation::AiNotConfigured);
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Ok(ReviewPreparation::AiUnavailable);
+        }
+        let cwd = PathBuf::from(worktree_path);
+
+        // Sync the branch with its upstream so the AI reads worktree files
+        // matching the PR head it is reviewing.
+        let pull = time::timeout(
+            REVIEW_SYNC_TIMEOUT,
+            run_command(&self.git_binary, &["pull", "--ff-only"], Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git pull --ff-only timed out after 60s"))?;
+        if let Err(err) = pull {
+            return Ok(ReviewPreparation::SyncFailed(err));
+        }
+
+        // Resolve the repo the PR was opened against (forks included) and
+        // its head sha — the inline-comment API needs `commit_id`.
+        let number_arg = number.to_string();
+        let view = time::timeout(
+            REVIEW_FETCH_TIMEOUT,
+            run_gh_command(
+                &self.gh_binary,
+                &[
+                    "pr",
+                    "view",
+                    &number_arg,
+                    "--json",
+                    "url,headRefOid,baseRefName",
+                ],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh pr view timed out after 30s"))?;
+        let view = match view {
+            Ok(out) => out,
+            Err(err) => return Ok(ReviewPreparation::SyncFailed(err)),
+        };
+        let Some((owner, repo, head_sha, base_ref_name)) = parse_review_pr_json(&view) else {
+            return Ok(ReviewPreparation::SyncFailed(
+                "could not resolve the PR's repository and head sha from gh pr view output."
+                    .to_string(),
+            ));
+        };
+
+        // `gh pr diff` returns the diff exactly as GitHub renders it, so the
+        // new-side line numbers we extract match the lines GitHub accepts
+        // inline comments on. GitHub's diff endpoint, though, returns a
+        // persistent 5xx when a PR's diff is too large for its service to
+        // generate; retrying can't help. In that case fall back to
+        // reproducing the same three-dot diff locally from the synced branch,
+        // which has no size limit.
+        let gh_diff = time::timeout(
+            REVIEW_FETCH_TIMEOUT,
+            run_command(&self.gh_binary, &["pr", "diff", &number_arg], Some(&cwd)),
+        )
+        .await
+        .unwrap_or_else(|_| Err("gh pr diff timed out after 30s".to_string()));
+        let diff = match gh_diff {
+            Ok(diff) => diff,
+            Err(gh_err) => self
+                .local_pr_diff(&cwd, &base_ref_name)
+                .await
+                .map_err(|local_err| {
+                    WisetreeError::other(format!(
+                        "gh pr diff failed ({gh_err}); local diff fallback also failed \
+                         ({local_err})"
+                    ))
+                })?,
+        };
+        let parsed = parse_review_diff(&diff);
+        if parsed.is_empty() {
+            return Ok(ReviewPreparation::NoChanges);
+        }
+        // Lockfiles, minified bundles, snapshots, … are excluded here, before
+        // any AI call — they still reach the screen so the final report can
+        // show each one with its reason.
+        let (mut files, skipped) = partition_reviewable_files(parsed);
+
+        // Existing review comments, grouped per file — dedup context only,
+        // so a fetch failure just means the AI scans without it.
+        let endpoint = format!("repos/{owner}/{repo}/pulls/{number}/comments?per_page=100");
+        if let Ok(Ok(json)) = time::timeout(
+            REVIEW_FETCH_TIMEOUT,
+            run_command(&self.gh_binary, &["api", &endpoint], Some(&cwd)),
+        )
+        .await
+        {
+            let by_path = parse_existing_review_comments(&json);
+            for file in &mut files {
+                if let Some(existing) = by_path.get(&file.path) {
+                    file.existing_comments = existing.rendered.clone();
+                    file.existing_keys = existing.keys.clone();
+                }
+            }
+        }
+
+        Ok(ReviewPreparation::Ready {
+            files,
+            skipped,
+            owner,
+            repo,
+            head_sha,
+        })
+    }
+
+    /// Reproduce a PR's diff locally when `gh pr diff` is unavailable —
+    /// notably when GitHub's diff endpoint returns a persistent 5xx because a
+    /// PR's diff is too large for its service to generate. GitHub renders a
+    /// PR's "Files changed" as a three-dot diff (`base...head`, i.e. from the
+    /// merge-base to the head), and the PR branch is already checked out and
+    /// fast-forwarded in this worktree, so `git diff <base>...HEAD` reproduces
+    /// it. The new-side line numbers match GitHub's regardless — they are
+    /// intrinsic to the head file contents, not to how GitHub renders them —
+    /// so the anchors we later post inline stay valid. Unlike the API, local
+    /// git has no diff-size limit.
+    async fn local_pr_diff(
+        &self,
+        cwd: &Path,
+        base_ref_name: &str,
+    ) -> std::result::Result<String, String> {
+        // Map GitHub's base branch onto a local remote-tracking ref (falls
+        // back to the branch's own base when the name is unknown).
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, cwd, Some(base_ref_name))
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "could not resolve a local base ref for the PR's base branch \
+                     '{base_ref_name}'"
+                )
+            })?;
+        // Refresh the base so its merge-base with HEAD matches GitHub's
+        // current base tip, and thus the exact set of changed lines.
+        if let Some((remote, branch)) = base_ref.split_once('/') {
+            let refspec = format!("+{branch}:refs/remotes/{remote}/{branch}");
+            let _ = time::timeout(
+                REVIEW_FETCH_TIMEOUT,
+                run_command(&self.git_binary, &["fetch", remote, &refspec], Some(cwd)),
+            )
+            .await;
+        }
+        let range = format!("{base_ref}...HEAD");
+        time::timeout(
+            REVIEW_FETCH_TIMEOUT,
+            run_command(&self.git_binary, &["diff", "--no-color", &range], Some(cwd)),
+        )
+        .await
+        .map_err(|_| "git diff for the local PR-diff fallback timed out".to_string())?
+    }
+
+    /// Scan one changed file with a single captured (non-interactive)
+    /// opencode call and parse its findings. Test files get the dedicated
+    /// test-quality prompt profile; everything else the source profile. The
+    /// AI only reads and emits structured text — `--agent plan` disables
+    /// every write tool. When
+    /// `feedback` is set the user chose "Other" on a finding: the previous
+    /// finding + their feedback are threaded back in so the model revises
+    /// exactly one finding rather than re-scanning.
+    pub async fn scan_review_file(
+        &self,
+        worktree_path: &str,
+        file: &ReviewFile,
+        feedback: Option<&str>,
+        previous_finding: Option<&str>,
+    ) -> Result<Vec<ReviewFinding>> {
+        let cwd = PathBuf::from(worktree_path);
+        let model = self.config.ai.review.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other("ai.review model is not configured."));
+        }
+        let tables_path = materialize_review_tables().await;
+        let prompt = build_review_scan_prompt(file, &tables_path, feedback, previous_finding);
+        let mut run_args: Vec<String> = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+        ];
+        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
+        let output = time::timeout(
+            REVIEW_SCAN_TIMEOUT,
+            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("opencode review scan timed out after 240s"))?
+        .map_err(WisetreeError::other)?;
+
+        parse_review_findings(
+            &output,
+            &file.path,
+            &file.commentable_lines,
+            &file.annotated_diff,
+        )
+        .ok_or_else(|| WisetreeError::other("could not parse findings from the review AI output."))
+    }
+
+    /// Post one approved finding to the PR — inline when it carries a
+    /// validated line anchor, as a general PR comment otherwise. All
+    /// deterministic; the body was previewed verbatim to the user.
+    pub async fn post_review_finding(
+        &self,
+        worktree_path: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        head_sha: &str,
+        finding: &ReviewFinding,
+    ) -> Result<()> {
+        let cwd = PathBuf::from(worktree_path);
+        let body = finding.comment_body();
+        let result = match finding.line {
+            Some(line) => {
+                let endpoint = format!("repos/{owner}/{repo}/pulls/{number}/comments");
+                let mut args: Vec<String> = vec![
+                    "api".to_string(),
+                    endpoint,
+                    "-f".to_string(),
+                    format!("body={body}"),
+                    "-f".to_string(),
+                    format!("commit_id={head_sha}"),
+                    "-f".to_string(),
+                    format!("path={}", finding.file),
+                    "-F".to_string(),
+                    format!("line={line}"),
+                    "-f".to_string(),
+                    "side=RIGHT".to_string(),
+                ];
+                if let Some(start) = finding.start_line {
+                    args.push("-F".to_string());
+                    args.push(format!("start_line={start}"));
+                    args.push("-f".to_string());
+                    args.push("start_side=RIGHT".to_string());
+                }
+                let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+                time::timeout(
+                    REVIEW_POST_TIMEOUT,
+                    run_command(&self.gh_binary, &args_ref, Some(&cwd)),
+                )
+                .await
+                .map_err(|_| WisetreeError::other("gh api comment timed out"))?
+            }
+            None => {
+                let number_arg = number.to_string();
+                time::timeout(
+                    REVIEW_POST_TIMEOUT,
+                    run_command(
+                        &self.gh_binary,
+                        &["pr", "comment", &number_arg, "--body", &body],
+                        Some(&cwd),
+                    ),
+                )
+                .await
+                .map_err(|_| WisetreeError::other("gh pr comment timed out"))?
+            }
+        };
+        result.map(|_| ()).map_err(WisetreeError::other)
+    }
+
+    /// Submit the review summary built from the posted findings, either as a
+    /// blocking `--request-changes` review or a non-blocking `--comment` one.
+    pub async fn submit_review_summary(
+        &self,
+        worktree_path: &str,
+        number: u64,
+        body: &str,
+        request_changes: bool,
+    ) -> Result<()> {
+        let cwd = PathBuf::from(worktree_path);
+        let number_arg = number.to_string();
+        let mode = if request_changes {
+            "--request-changes"
+        } else {
+            "--comment"
+        };
+        time::timeout(
+            REVIEW_POST_TIMEOUT,
+            run_command(
+                &self.gh_binary,
+                &["pr", "review", &number_arg, mode, "--body", body],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh pr review timed out"))?
         .map_err(WisetreeError::other)?;
         Ok(())
     }
@@ -4221,6 +4759,32 @@ async fn run_command(
     .await
 }
 
+/// `gh <args>`, retrying a couple of times when it fails with a transient
+/// GitHub-side 5xx ([`is_transient_gh_error`]) — anything else (404, auth,
+/// …) returns on the first try, same as [`run_command`].
+async fn run_gh_command(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> std::result::Result<String, String> {
+    let mut attempt = 0;
+    loop {
+        match run_command(binary, args, cwd).await {
+            Err(err) if attempt < GH_TRANSIENT_RETRIES && is_transient_gh_error(&err) => {
+                attempt += 1;
+                time::sleep(GH_TRANSIENT_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_transient_gh_error(err: &str) -> bool {
+    ["HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504"]
+        .iter()
+        .any(|code| err.contains(code))
+}
+
 /// One `binary <args>` spawn, with no lock recovery — the retryable unit
 /// behind [`run_command`].
 async fn run_command_once(
@@ -5100,6 +5664,710 @@ fn extract_fix_section(block: &str, name: &str) -> Option<String> {
     Some(body.join("\n"))
 }
 
+/// Parse `gh pr view --json url,headRefOid,baseRefName` output into
+/// `(owner, repo, head_sha, base_ref_name)`. The slug comes off the URL —
+/// like [`parse_pr_repo_json`] — so fork-opened PRs resolve to their base
+/// repo. `base_ref_name` is GitHub's target branch, used to reproduce the PR
+/// diff locally when the API diff endpoint is unavailable.
+fn parse_review_pr_json(body: &str) -> Option<(String, String, String, String)> {
+    #[derive(Deserialize)]
+    struct ReviewPrJson {
+        #[serde(default)]
+        url: String,
+        #[serde(default, rename = "headRefOid")]
+        head_ref_oid: String,
+        #[serde(default, rename = "baseRefName")]
+        base_ref_name: String,
+    }
+    let parsed: ReviewPrJson = serde_json::from_str(body).ok()?;
+    if parsed.head_ref_oid.trim().is_empty() {
+        return None;
+    }
+    let (owner, repo) = parse_github_slug(&parsed.url)?;
+    Some((owner, repo, parsed.head_ref_oid, parsed.base_ref_name))
+}
+
+/// Split a unified diff (`gh pr diff` output) into per-file [`ReviewFile`]s.
+/// Every line present in the new version of a file gets its new-side line
+/// number inlined (removed lines stay unnumbered), and those numbers double
+/// as the commentable-lines set the AI's anchors are validated against.
+/// Binary and deleted files are skipped — there is nothing to comment on.
+pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
+    let mut files: Vec<ReviewFile> = Vec::new();
+    let mut path: Option<String> = None;
+    let mut annotated = String::new();
+    let mut commentable: BTreeSet<u64> = BTreeSet::new();
+    let mut new_line: u64 = 0;
+    let mut in_hunk = false;
+    let mut skip = false;
+
+    fn flush(
+        files: &mut Vec<ReviewFile>,
+        path: &mut Option<String>,
+        annotated: &mut String,
+        commentable: &mut BTreeSet<u64>,
+        skip: bool,
+    ) {
+        if let Some(p) = path.take() {
+            if !skip && !commentable.is_empty() {
+                files.push(ReviewFile {
+                    path: p,
+                    annotated_diff: std::mem::take(annotated).trim_end().to_string(),
+                    commentable_lines: std::mem::take(commentable),
+                    existing_comments: String::new(),
+                    existing_keys: Vec::new(),
+                });
+            }
+        }
+        annotated.clear();
+        commentable.clear();
+    }
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            flush(
+                &mut files,
+                &mut path,
+                &mut annotated,
+                &mut commentable,
+                skip,
+            );
+            in_hunk = false;
+            skip = false;
+            continue;
+        }
+        if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
+            skip = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            if rest.trim() == "/dev/null" {
+                // Deleted file — no new side to comment on.
+                skip = true;
+            } else {
+                path = Some(
+                    rest.trim()
+                        .strip_prefix("b/")
+                        .unwrap_or(rest.trim())
+                        .to_string(),
+                );
+            }
+            continue;
+        }
+        if line.starts_with("--- ") {
+            continue;
+        }
+        if line.starts_with("@@") {
+            // `@@ -a,b +c,d @@` — the new side starts at line c.
+            let start = line
+                .split_whitespace()
+                .find(|token| token.starts_with('+'))
+                .and_then(|token| token[1..].split(',').next())
+                .and_then(|c| c.parse::<u64>().ok());
+            if let Some(start) = start {
+                new_line = start;
+                in_hunk = true;
+                annotated.push_str(line);
+                annotated.push('\n');
+            }
+            continue;
+        }
+        if !in_hunk || skip {
+            continue;
+        }
+        match line.chars().next() {
+            Some('+') => {
+                annotated.push_str(&format!("{new_line:>6} {line}\n"));
+                commentable.insert(new_line);
+                new_line += 1;
+            }
+            Some('-') => {
+                annotated.push_str(&format!("       {line}\n"));
+            }
+            Some('\\') => {
+                // "\ No newline at end of file" — metadata, not content.
+                annotated.push_str(&format!("       {line}\n"));
+            }
+            _ => {
+                // Context line — part of the new side, commentable on RIGHT.
+                annotated.push_str(&format!("{new_line:>6} {line}\n"));
+                commentable.insert(new_line);
+                new_line += 1;
+            }
+        }
+    }
+    flush(
+        &mut files,
+        &mut path,
+        &mut annotated,
+        &mut commentable,
+        skip,
+    );
+    files
+}
+
+/// Per-file context extracted from the PR's existing inline comments: the
+/// rendered block the scan prompt shows the AI, plus the structured keys of
+/// the wisetree-format ones that back the deterministic duplicate filter.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ExistingComments {
+    pub(crate) rendered: String,
+    pub(crate) keys: Vec<ExistingFindingKey>,
+}
+
+/// Group the PR's existing inline review comments per file path, rendered as
+/// `@author (line N): body` blocks. Input is the REST
+/// `pulls/{n}/comments` JSON array; anything unparsable yields no context
+/// (the scan just runs without dedup awareness).
+pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, ExistingComments> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return HashMap::new();
+    };
+    let Some(items) = value.as_array() else {
+        return HashMap::new();
+    };
+    let mut rendered: HashMap<String, Vec<String>> = HashMap::new();
+    let mut keys: HashMap<String, Vec<ExistingFindingKey>> = HashMap::new();
+    for item in items {
+        let Some(path) = item.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let body = item.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        if body.trim().is_empty() {
+            continue;
+        }
+        let author = item
+            .pointer("/user/login")
+            .and_then(|v| v.as_str())
+            .unwrap_or("reviewer");
+        let line = item
+            .get("line")
+            .and_then(|v| v.as_u64())
+            .or_else(|| item.get("original_line").and_then(|v| v.as_u64()));
+        let anchor = line.map(|l| format!(" (line {l})")).unwrap_or_default();
+        rendered
+            .entry(path.to_string())
+            .or_default()
+            .push(format!("@{author}{anchor}: {}", body.trim()));
+        if let Some(title) = wisetree_finding_title(body) {
+            keys.entry(path.to_string())
+                .or_default()
+                .push(ExistingFindingKey { line, title });
+        }
+    }
+    rendered
+        .into_iter()
+        .map(|(path, comments)| {
+            let keys = keys.remove(&path).unwrap_or_default();
+            (
+                path,
+                ExistingComments {
+                    rendered: comments.join("\n\n"),
+                    keys,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The normalized title of a wisetree-format review comment, or `None` for a
+/// human comment. Current comments lead with a `### {title}` heading and close
+/// with the centered severity/category badge ([`ReviewFinding::comment_body`]);
+/// the badge is the signature that tells them apart from an arbitrary human
+/// heading. Older comments led with a `**[Cat] [Sev]**: {title}` header — still
+/// recognized so dedup keeps working against PRs that carry them. Only the
+/// leading lines are inspected so a quoted header deep in a human reply can't
+/// produce a key.
+fn wisetree_finding_title(body: &str) -> Option<String> {
+    // Current format: the centered badge marks it as ours; the title is the
+    // leading `### ` heading.
+    if body.contains("<p align=\"center\">") {
+        for line in body.lines().take(3) {
+            if let Some(title) = line.trim().strip_prefix("### ") {
+                let title = title.trim();
+                if !title.is_empty() {
+                    return Some(title.to_lowercase());
+                }
+            }
+        }
+    }
+    // Legacy format: `**[Cat] [Sev]**: title`.
+    for line in body.lines().take(3) {
+        if let Some(rest) = line.trim().strip_prefix("**[") {
+            if let Some((_, title)) = rest.split_once("]**: ") {
+                let title = title.trim();
+                if !title.is_empty() {
+                    return Some(title.to_lowercase());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// #5 of the token-saving plan: drop findings the PR already carries as a
+/// wisetree comment (same line anchor + same normalized title) instead of
+/// trusting the model to honor the EXISTING_COMMENTS instruction — the
+/// least reliable link on a re-run. Returns `(fresh, duplicates)`; the
+/// duplicates surface as "Already posted" rows on the final report, never
+/// silently.
+pub fn split_duplicate_findings(
+    findings: Vec<ReviewFinding>,
+    existing: &[ExistingFindingKey],
+) -> (Vec<ReviewFinding>, Vec<ReviewFinding>) {
+    findings.into_iter().partition(|finding| {
+        let title = finding.title.trim().to_lowercase();
+        !existing
+            .iter()
+            .any(|key| key.line == finding.line && key.title == title)
+    })
+}
+
+/// Collapse findings that duplicate one another *within a single run*, which
+/// the per-file parallel scans can produce with different wording for the
+/// same underlying issue. Two findings in the same file collapse when they
+/// propose the same fix — identical [`normalize_suggestion`] text — or land
+/// on the same line, since either way one comment already covers it. Callers
+/// pass the findings already ordered by priority (severity, then diff order),
+/// so the first occurrence — the one kept — is the highest-severity one and
+/// the rest are returned as `duplicates`, surfaced as muted report rows
+/// rather than dropped silently.
+pub fn split_run_duplicate_findings(
+    findings: Vec<ReviewFinding>,
+) -> (Vec<ReviewFinding>, Vec<ReviewFinding>) {
+    let mut seen_fixes: HashSet<(String, String)> = HashSet::new();
+    let mut seen_anchors: HashSet<(String, u64)> = HashSet::new();
+    let mut kept = Vec::with_capacity(findings.len());
+    let mut duplicates = Vec::new();
+    for finding in findings {
+        let fix = normalize_suggestion(finding.suggestion.as_deref());
+        let fix_key = (!fix.is_empty()).then(|| (finding.file.clone(), fix));
+        let anchor_key = finding.line.map(|line| (finding.file.clone(), line));
+
+        let is_duplicate = fix_key.as_ref().is_some_and(|k| seen_fixes.contains(k))
+            || anchor_key
+                .as_ref()
+                .is_some_and(|k| seen_anchors.contains(k));
+        if is_duplicate {
+            duplicates.push(finding);
+            continue;
+        }
+        if let Some(k) = fix_key {
+            seen_fixes.insert(k);
+        }
+        if let Some(k) = anchor_key {
+            seen_anchors.insert(k);
+        }
+        kept.push(finding);
+    }
+    (kept, duplicates)
+}
+
+/// Whitespace-insensitive form of a suggestion body, so two findings that
+/// propose the same fix modulo indentation/blank lines compare equal. An
+/// absent or blank suggestion normalizes to the empty string (no fix key).
+fn normalize_suggestion(suggestion: Option<&str>) -> String {
+    suggestion
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Write the curated reference tables next to the temp dir so the scan AI
+/// can read them on demand instead of paying their token cost on every call.
+/// Best-effort: on a write failure the prompt just points at "(unavailable)"
+/// and the AI reviews from its compact checklists alone.
+async fn materialize_review_tables() -> String {
+    const TABLES: &str = include_str!("../../prompts/reviewer_tables.md");
+    let path = std::env::temp_dir().join("wisetree-reviewer-tables.md");
+    if tokio::fs::write(&path, TABLES).await.is_err() {
+        return "(unavailable)".to_string();
+    }
+    path.to_string_lossy().to_string()
+}
+
+/// Deterministic pre-filter: files nobody reviews by hand are excluded
+/// before any AI call — each skipped file would otherwise cost a full
+/// scan (prompt + diff) for feedback no author wants. Path-based only, so
+/// the decision is reproducible and visible on the final report.
+pub(crate) fn review_skip_reason(path: &str) -> Option<&'static str> {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let mut parts = lower.rsplit('/');
+    let name = parts.next().unwrap_or_default();
+    if parts.any(|dir| matches!(dir, "vendor" | "vendors" | "node_modules" | "third_party")) {
+        return Some("vendored code");
+    }
+    if lower.split('/').any(|dir| dir == "__snapshots__") || name.ends_with(".snap") {
+        return Some("test snapshot");
+    }
+    const LOCKFILES: [&str; 16] = [
+        "cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+        "go.sum",
+        "gemfile.lock",
+        "composer.lock",
+        "poetry.lock",
+        "uv.lock",
+        "pipfile.lock",
+        "podfile.lock",
+        "mix.lock",
+        "flake.lock",
+        "packages.lock.json",
+    ];
+    if LOCKFILES.contains(&name) || name.ends_with(".lockfile") {
+        return Some("lockfile");
+    }
+    if name.ends_with(".min.js") || name.ends_with(".min.css") || name.ends_with(".min.mjs") {
+        return Some("minified asset");
+    }
+    if name.ends_with(".map") {
+        return Some("source map");
+    }
+    if name.contains(".generated.") || name.ends_with(".pb.go") || name.ends_with("_pb2.py") {
+        return Some("generated code");
+    }
+    None
+}
+
+/// Split the parsed diff into the files worth an AI scan and the ones the
+/// deterministic filter excludes (with their reasons).
+pub(crate) fn partition_reviewable_files(
+    files: Vec<ReviewFile>,
+) -> (Vec<ReviewFile>, Vec<ReviewSkippedFile>) {
+    let mut reviewable = Vec::new();
+    let mut skipped = Vec::new();
+    for file in files {
+        match review_skip_reason(&file.path) {
+            Some(reason) => skipped.push(ReviewSkippedFile {
+                path: file.path,
+                reason,
+            }),
+            None => reviewable.push(file),
+        }
+    }
+    (reviewable, skipped)
+}
+
+/// Classify a changed file as a test file so its scan uses the dedicated
+/// test-quality prompt profile instead of the source one. Path-based
+/// heuristic covering the common layouts: `tests`/`spec`/`__tests__`
+/// directories, `test_*` / `*_test.*` / `*.test.*` / `*_spec.*` / `*.spec.*`
+/// file names, and `conftest.py`.
+pub(crate) fn is_test_file(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let mut parts = lower.rsplit('/');
+    let name = parts.next().unwrap_or_default();
+    if parts.any(|dir| matches!(dir, "test" | "tests" | "spec" | "specs" | "__tests__")) {
+        return true;
+    }
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    stem == "conftest"
+        || stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with(".test")
+        || stem.ends_with("_spec")
+        || stem.ends_with(".spec")
+}
+
+/// Render the per-file scan (or revision) prompt: `prompts/reviewer_tester.md`
+/// for test files (test-quality lens), `prompts/reviewer.md` for everything
+/// else. Fixed tokens are substituted first and the user-controlled blocks
+/// last so an earlier placeholder can't be clobbered by a value containing a
+/// later token. `feedback` / `previous_finding` are only present on an
+/// "Other" revision of a single finding.
+fn build_review_scan_prompt(
+    file: &ReviewFile,
+    tables_path: &str,
+    feedback: Option<&str>,
+    previous_finding: Option<&str>,
+) -> String {
+    const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer.md");
+    const TESTER_PROMPT: &str = include_str!("../../prompts/reviewer_tester.md");
+    let template = if is_test_file(&file.path) {
+        TESTER_PROMPT
+    } else {
+        SOURCE_PROMPT
+    };
+    let existing = if file.existing_comments.trim().is_empty() {
+        "(none)".to_string()
+    } else {
+        truncate_for_prompt(&file.existing_comments, REVIEW_COMMENTS_MAX_BYTES)
+    };
+    template
+        .replace("TABLES_PATH", tables_path)
+        .replace("FILE_PATH", &file.path)
+        .replace("USER_FEEDBACK", feedback.unwrap_or("(none)"))
+        .replace("PREVIOUS_FINDING", previous_finding.unwrap_or("(none)"))
+        .replace("EXISTING_COMMENTS", &existing)
+        .replace(
+            "FILE_DIFF",
+            &truncate_for_prompt(&file.annotated_diff, REVIEW_DIFF_MAX_BYTES),
+        )
+}
+
+/// Parse the single machine-readable findings block the scan AI emits.
+/// Tolerant of surrounding transcript noise: locates the BEGIN/END markers
+/// anywhere in `output`. Returns `None` when no block is present (the model
+/// disobeyed the contract); `Some(vec![])` — a clean scan — when the block
+/// carries no findings. Every line anchor is validated against
+/// `commentable`; an invalid anchor downgrades the finding to file-level
+/// rather than letting GitHub reject the comment. Suggestions that
+/// reproduce the diff's current lines verbatim (checked against
+/// `annotated_diff`) are stripped as no-ops.
+pub(crate) fn parse_review_findings(
+    output: &str,
+    file: &str,
+    commentable: &BTreeSet<u64>,
+    annotated_diff: &str,
+) -> Option<Vec<ReviewFinding>> {
+    const BEGIN: &str = "===WISETREE-REVIEW-BEGIN===";
+    const END: &str = "===WISETREE-REVIEW-END===";
+    let after_begin = &output[output.find(BEGIN)? + BEGIN.len()..];
+    let block = &after_begin[..after_begin.find(END)?];
+
+    let mut findings = Vec::new();
+    for chunk in block.split("---FINDING---").skip(1) {
+        let chunk = chunk.split("---END-FINDING---").next().unwrap_or(chunk);
+        if let Some(finding) = parse_review_finding_chunk(chunk, file, commentable, annotated_diff)
+        {
+            findings.push(finding);
+        }
+    }
+    Some(findings)
+}
+
+/// Parse one `---FINDING---` chunk. Header fields (`CATEGORY:` …) are read
+/// only above the first `---SECTION---` marker so an explanation that quotes
+/// a `LINE:` never leaks into the header. A chunk with neither title nor
+/// explanation is model noise, not a finding.
+fn parse_review_finding_chunk(
+    chunk: &str,
+    file: &str,
+    commentable: &BTreeSet<u64>,
+    annotated_diff: &str,
+) -> Option<ReviewFinding> {
+    let header = |name: &str| -> Option<String> {
+        let prefix = format!("{name}:");
+        for line in chunk.lines() {
+            let trimmed = line.trim();
+            if trimmed.len() > 6 && trimmed.starts_with("---") && trimmed.ends_with("---") {
+                break;
+            }
+            if let Some(rest) = trimmed.strip_prefix(&prefix) {
+                return Some(rest.trim().to_string());
+            }
+        }
+        None
+    };
+
+    let explanation = extract_fix_section(chunk, "EXPLANATION")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let suggestion = extract_fix_section(chunk, "SUGGESTION")
+        .map(|s| s.trim_matches('\n').to_string())
+        .filter(|s| !s.trim().is_empty());
+    let mut title = header("TITLE").unwrap_or_default();
+    if title.is_empty() {
+        title = explanation
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| clip(l.trim(), 80))
+            .unwrap_or_default();
+    }
+    if title.is_empty() && explanation.is_empty() {
+        return None;
+    }
+
+    let line = header("LINE")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| commentable.contains(n));
+    let start_line = match (
+        header("START_LINE").and_then(|v| v.parse::<u64>().ok()),
+        line,
+    ) {
+        (Some(start), Some(end)) if start < end && commentable.contains(&start) => Some(start),
+        _ => None,
+    };
+
+    // #6 of the token-saving plan: a SUGGESTION that reproduces the current
+    // lines verbatim is a no-op the author could "apply" for nothing — a
+    // known model failure. Strip the block and keep the finding as prose.
+    let suggestion = suggestion.filter(|body| {
+        let Some(end) = line else {
+            return true; // file-level: no lines to compare against
+        };
+        match diff_lines_text(annotated_diff, start_line.unwrap_or(end), end) {
+            Some(current) => !code_lines_equal(body, &current),
+            None => true,
+        }
+    });
+
+    Some(ReviewFinding {
+        category: normalize_review_category(&header("CATEGORY").unwrap_or_default()),
+        severity: ReviewSeverity::parse(&header("SEVERITY").unwrap_or_default()),
+        file: file.to_string(),
+        start_line,
+        line,
+        title,
+        explanation,
+        suggestion,
+    })
+}
+
+/// The current text of the new-side lines `start..=end`, recovered from the
+/// annotated diff: each numbered line is `{n:>6} {marker}{content}` where
+/// the marker is the diff's `+`/space. `None` when any line of the range is
+/// absent from the diff (then no no-op check is possible).
+fn diff_lines_text(annotated_diff: &str, start: u64, end: u64) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for n in start..=end {
+        let prefix = format!("{n:>6} ");
+        let numbered = annotated_diff
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))?;
+        let mut chars = numbered.chars();
+        chars.next(); // drop the +/space diff marker
+        out.push(chars.as_str());
+    }
+    Some(out.join("\n"))
+}
+
+/// Line-by-line code equality ignoring trailing whitespace — the tolerance
+/// a no-op suggestion hides behind.
+fn code_lines_equal(a: &str, b: &str) -> bool {
+    fn normalize(s: &str) -> Vec<&str> {
+        s.lines().map(str::trim_end).collect()
+    }
+    normalize(a) == normalize(b)
+}
+
+/// Map the AI's `CATEGORY:` value onto the five canonical labels, tolerating
+/// case/spacing drift. An unrecognized non-empty value passes through as-is
+/// (better an odd label than a lost finding); empty falls back to the most
+/// generic category.
+fn normalize_review_category(raw: &str) -> String {
+    let key: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    match key.as_str() {
+        "codesmell" | "cleancode" | "smell" => "Code Smell".to_string(),
+        "security" => "Security".to_string(),
+        "performance" => "Performance".to_string(),
+        "testquality" | "test" | "tests" | "testing" => "Test".to_string(),
+        "convention" | "conventions" => "Convention".to_string(),
+        _ if raw.trim().is_empty() => "Code Smell".to_string(),
+        _ => raw.trim().to_string(),
+    }
+}
+
+/// Build the review-summary markdown from the findings that were actually
+/// posted — a fixed template over structured data, zero AI involvement.
+/// Findings that share an issue title collapse into one row so the table stays
+/// scannable; the "Where?" cell then lists each location the issue occurs at.
+pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
+    let groups = group_findings_by_issue(posted);
+    let noun = if groups.len() == 1 { "issue" } else { "issues" };
+    let mut body = format!(
+        "## Review Summary\n\nI reviewed this PR and found {} {noun} that should be \
+         addressed before merge.\n\n### Requested Improvements\n\n\
+         | Type | Issue | Level | Where? |\n\
+         | --- | --- | --- | --- |\n",
+        groups.len()
+    );
+    for group in &groups {
+        // Each location is one code span. Kept whole (not hard-broken): GitHub
+        // lets a long code span set the column width and keeps the narrow
+        // columns at their natural size, so their short labels don't wrap.
+        let where_cell = group
+            .locations
+            .iter()
+            .map(|loc| format!("`{}`", md_table_cell(loc)))
+            .collect::<Vec<_>>()
+            .join("<br>");
+        body.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            md_table_cell_nowrap(&group.category),
+            md_table_cell(&group.title),
+            md_table_cell_nowrap(group.severity.label()),
+            where_cell,
+        ));
+    }
+    body
+}
+
+/// One summary-table row: an issue (by title) with every location it was
+/// posted at. Distinct findings that share a title merge into a single group.
+struct IssueGroup {
+    category: String,
+    title: String,
+    severity: ReviewSeverity,
+    locations: Vec<String>,
+}
+
+/// Collapse posted findings into one [`IssueGroup`] per distinct title (case-
+/// and whitespace-insensitive), preserving first-appearance order. Each group
+/// keeps the highest severity seen and accumulates its distinct locations.
+fn group_findings_by_issue(posted: &[ReviewFinding]) -> Vec<IssueGroup> {
+    let mut groups: Vec<IssueGroup> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for finding in posted {
+        let key = finding
+            .title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let descriptor = finding.descriptor();
+        match index.get(&key) {
+            Some(&i) => {
+                let group = &mut groups[i];
+                if !group.locations.contains(&descriptor) {
+                    group.locations.push(descriptor);
+                }
+                if finding.severity.rank() < group.severity.rank() {
+                    group.severity = finding.severity;
+                }
+            }
+            None => {
+                index.insert(key, groups.len());
+                groups.push(IssueGroup {
+                    category: finding.category.clone(),
+                    title: finding.title.trim().to_string(),
+                    severity: finding.severity,
+                    locations: vec![descriptor],
+                });
+            }
+        }
+    }
+    groups
+}
+
+/// Flatten a value into a single GitHub-table cell: collapse every run of
+/// whitespace (newlines included) to one space and escape pipes so they stay
+/// inside the column instead of splitting it.
+fn md_table_cell(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('|', "\\|")
+}
+
+/// Like [`md_table_cell`] but joins words with non-breaking spaces, for the
+/// narrow columns (Type, Level) whose short labels must not wrap mid-value
+/// (e.g. "Code Smell" splitting onto two lines).
+fn md_table_cell_nowrap(value: &str) -> String {
+    md_table_cell(value).replace(' ', "\u{00A0}")
+}
+
 /// Build the commit subject + body for one applied review fix, in the format
 /// the resolution flow uses: a `fix (review):` subject and a body citing the
 /// PR + comment and the reviewer's feedback.
@@ -5395,6 +6663,693 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Review pipeline: diff split + findings parsing ─────────────────
+
+    const SAMPLE_DIFF: &str = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 111..222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,4 +10,5 @@ fn setup() {
+ let a = 1;
+-let b = 2;
++let b = compute();
++let c = 3;
+ finish(a);
+diff --git a/gone.rs b/gone.rs
+deleted file mode 100644
+--- a/gone.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-old
+-lines
+diff --git a/logo.png b/logo.png
+index 333..444 100644
+Binary files a/logo.png and b/logo.png differ
+diff --git a/new.rs b/new.rs
+new file mode 100644
+--- /dev/null
++++ b/new.rs
+@@ -0,0 +1,2 @@
++fn fresh() {}
++fn more() {}
+";
+
+    #[test]
+    fn parse_review_diff_splits_files_and_numbers_new_side_lines() {
+        let files = parse_review_diff(SAMPLE_DIFF);
+        // Deleted + binary files are skipped: only the modified and the new
+        // file survive.
+        assert_eq!(files.len(), 2, "{files:?}");
+
+        let lib = &files[0];
+        assert_eq!(lib.path, "src/lib.rs");
+        // Context + added lines are commentable; the removed line is not.
+        assert_eq!(
+            lib.commentable_lines,
+            BTreeSet::from([10, 11, 12, 13]),
+            "{lib:?}"
+        );
+        // The annotated diff numbers the new side and leaves removals bare.
+        assert!(lib.annotated_diff.contains("    10  let a = 1;"), "{lib:?}");
+        assert!(lib.annotated_diff.contains("    11 +let b = compute();"));
+        assert!(lib.annotated_diff.contains("    12 +let c = 3;"));
+        assert!(lib.annotated_diff.contains("       -let b = 2;"));
+
+        let new = &files[1];
+        assert_eq!(new.path, "new.rs");
+        assert_eq!(new.commentable_lines, BTreeSet::from([1, 2]));
+    }
+
+    #[test]
+    fn parse_review_diff_returns_empty_for_no_text_changes() {
+        assert!(parse_review_diff("").is_empty());
+        let binary_only = "diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n";
+        assert!(parse_review_diff(binary_only).is_empty());
+    }
+
+    #[test]
+    fn parse_review_findings_reads_multiple_findings() {
+        let out = "chatter\n===WISETREE-REVIEW-BEGIN===\n\
+            ---FINDING---\n\
+            CATEGORY: Security\n\
+            SEVERITY: Critical\n\
+            LINE: 11\n\
+            START_LINE:\n\
+            TITLE: Unvalidated compute() input\n\
+            ---EXPLANATION---\n\
+            compute() feeds user input straight into the query.\n\
+            ---SUGGESTION---\n\
+            let b = compute_checked()?;\n\
+            ---END-FINDING---\n\
+            ---FINDING---\n\
+            CATEGORY: code smell\n\
+            SEVERITY: low\n\
+            LINE: 12\n\
+            TITLE: Magic number\n\
+            ---EXPLANATION---\n\
+            3 carries no meaning.\n\
+            ---END-FINDING---\n\
+            ===WISETREE-REVIEW-END===\ntrailing";
+        let commentable = BTreeSet::from([10, 11, 12]);
+        let findings = parse_review_findings(out, "src/lib.rs", &commentable, "").unwrap();
+        assert_eq!(findings.len(), 2, "{findings:?}");
+
+        let first = &findings[0];
+        assert_eq!(first.category, "Security");
+        assert_eq!(first.severity, ReviewSeverity::Critical);
+        assert_eq!(first.file, "src/lib.rs");
+        assert_eq!(first.line, Some(11));
+        assert_eq!(first.start_line, None);
+        assert_eq!(first.title, "Unvalidated compute() input");
+        assert_eq!(
+            first.suggestion.as_deref(),
+            Some("let b = compute_checked()?;")
+        );
+
+        // Case-insensitive category + severity normalization.
+        let second = &findings[1];
+        assert_eq!(second.category, "Code Smell");
+        assert_eq!(second.severity, ReviewSeverity::Low);
+        assert!(second.suggestion.is_none());
+    }
+
+    #[test]
+    fn parse_review_findings_accepts_a_clean_scan() {
+        let out = "===WISETREE-REVIEW-BEGIN===\nNO-FINDINGS\n===WISETREE-REVIEW-END===";
+        let findings = parse_review_findings(out, "a.rs", &BTreeSet::new(), "").unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_review_findings_rejects_output_without_markers() {
+        assert!(parse_review_findings("no block at all", "a.rs", &BTreeSet::new(), "").is_none());
+    }
+
+    #[test]
+    fn parse_review_findings_downgrades_invalid_line_anchors() {
+        // Line 99 is not in the diff → the finding must become file-level
+        // instead of letting GitHub reject the comment with a 422.
+        let out = "===WISETREE-REVIEW-BEGIN===\n\
+            ---FINDING---\n\
+            CATEGORY: Performance\n\
+            SEVERITY: High\n\
+            LINE: 99\n\
+            TITLE: N+1 query\n\
+            ---EXPLANATION---\n\
+            Loads one row per iteration.\n\
+            ---END-FINDING---\n\
+            ===WISETREE-REVIEW-END===";
+        let commentable = BTreeSet::from([1, 2, 3]);
+        let findings = parse_review_findings(out, "a.rs", &commentable, "").unwrap();
+        assert_eq!(findings[0].line, None);
+        assert_eq!(findings[0].start_line, None);
+    }
+
+    #[test]
+    fn parse_review_findings_validates_start_line_ranges() {
+        // A valid range keeps both anchors; an inverted or unknown start
+        // drops only the start (single-line comment survives).
+        let block = |start: &str| {
+            format!(
+                "===WISETREE-REVIEW-BEGIN===\n---FINDING---\nCATEGORY: Security\n\
+                 SEVERITY: High\nLINE: 5\nSTART_LINE: {start}\nTITLE: t\n\
+                 ---EXPLANATION---\ne\n---END-FINDING---\n===WISETREE-REVIEW-END==="
+            )
+        };
+        let commentable = BTreeSet::from([3, 4, 5]);
+        let ok = parse_review_findings(&block("3"), "a.rs", &commentable, "").unwrap();
+        assert_eq!((ok[0].start_line, ok[0].line), (Some(3), Some(5)));
+        let inverted = parse_review_findings(&block("9"), "a.rs", &commentable, "").unwrap();
+        assert_eq!((inverted[0].start_line, inverted[0].line), (None, Some(5)));
+    }
+
+    #[test]
+    fn review_finding_comment_body_renders_inline_suggestion() {
+        let finding = ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::Critical,
+            file: "src/auth.rs".to_string(),
+            start_line: None,
+            line: Some(42),
+            title: "Hardcoded API key".to_string(),
+            explanation: "Secrets in source leak through history.".to_string(),
+            suggestion: Some("let key = env::var(\"API_KEY\")?;".to_string()),
+        };
+        let body = finding.comment_body();
+        // Title leads as a heading; category/severity moved to a centered footer.
+        assert!(body.starts_with("### Hardcoded API key"));
+        assert!(body.contains("Secrets in source leak through history."));
+        assert!(body.contains("```suggestion\nlet key = env::var(\"API_KEY\")?;\n```"));
+        assert!(body.ends_with("<p align=\"center\">\n🔴 [Security] [Critical]\n</p>"));
+        // Inline comments don't repeat the path — GitHub anchors them.
+        assert!(!body.contains("📄"));
+    }
+
+    #[test]
+    fn review_finding_comment_body_downgrades_file_level_suggestions() {
+        let finding = ReviewFinding {
+            category: "Test Quality".to_string(),
+            severity: ReviewSeverity::High,
+            file: "src/auth.rs".to_string(),
+            start_line: None,
+            line: None,
+            title: "Missing failure-path test".to_string(),
+            explanation: "The invalid-token flow is untested.".to_string(),
+            suggestion: Some("assert!(auth(bad).is_err());".to_string()),
+        };
+        let body = finding.comment_body();
+        assert!(body.starts_with("### Missing failure-path test"));
+        // File-level comments name the file and must NOT use a ```suggestion
+        // block (those only work anchored to diff lines).
+        assert!(body.contains("📄 `src/auth.rs`"));
+        assert!(!body.contains("```suggestion"));
+        assert!(body.contains("**Proposed code:**\n```\nassert!(auth(bad).is_err());\n```"));
+        assert!(body.ends_with("<p align=\"center\">\n🟠 [Test Quality] [High]\n</p>"));
+    }
+
+    #[test]
+    fn build_review_summary_lists_the_issue_title_only() {
+        let posted = vec![ReviewFinding {
+            category: "Performance".to_string(),
+            severity: ReviewSeverity::High,
+            file: "src/db.rs".to_string(),
+            start_line: None,
+            line: Some(23),
+            title: "N+1 query in loop".to_string(),
+            explanation: "each iteration hits the DB again".to_string(),
+            suggestion: None,
+        }];
+        let body = build_review_summary(&posted);
+        assert!(body.contains("## Review Summary"));
+        // Singular noun, no robotic "(s)".
+        assert!(body.contains("found 1 issue that should be addressed"));
+        assert!(!body.contains("issue(s)"));
+        // "Issue" column, title only — the explanation stays out of the table.
+        assert!(body.contains("| Type | Issue | Level | Where? |"));
+        assert!(body.contains("| Performance | N+1 query in loop | High | `src/db.rs:23` |"));
+        assert!(!body.contains("each iteration hits the DB again"));
+        // The redundant Notes section is gone.
+        assert!(!body.contains("### Notes"));
+    }
+
+    #[test]
+    fn build_review_summary_groups_shared_issues_and_lists_each_location() {
+        let make = |file: &str, line: u64, severity: ReviewSeverity| ReviewFinding {
+            category: "Test Quality".to_string(),
+            severity,
+            file: file.to_string(),
+            start_line: None,
+            line: Some(line),
+            title: "Missing coverage".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        };
+        let posted = vec![
+            make("src/a.rs", 12, ReviewSeverity::Low),
+            make("src/b.rs", 40, ReviewSeverity::High),
+        ];
+        let body = build_review_summary(&posted);
+        // Two findings, one shared issue → one row, counted as a single issue.
+        assert!(body.contains("found 1 issue that should be addressed"));
+        // Both locations in one cell, each on its own line; highest severity wins.
+        // The Type value keeps its words together with a non-breaking space.
+        assert!(body.contains(
+            "| Test\u{00A0}Quality | Missing coverage | High | `src/a.rs:12`<br>`src/b.rs:40` |"
+        ));
+    }
+
+    #[test]
+    fn build_review_summary_pluralizes_and_escapes_table_cells() {
+        let posted = vec![
+            ReviewFinding {
+                category: "Security".to_string(),
+                severity: ReviewSeverity::Critical,
+                file: "src/a.rs".to_string(),
+                start_line: None,
+                line: Some(1),
+                // A pipe in the title must not break the table layout.
+                title: "Unsanitized `a | b` input".to_string(),
+                explanation: String::new(),
+                suggestion: None,
+            },
+            ReviewFinding {
+                category: "Code Smell".to_string(),
+                severity: ReviewSeverity::Low,
+                file: "src/b.rs".to_string(),
+                start_line: Some(4),
+                line: Some(6),
+                title: "Dead branch".to_string(),
+                explanation: String::new(),
+                suggestion: None,
+            },
+        ];
+        let body = build_review_summary(&posted);
+        // Two distinct issues → plural noun.
+        assert!(body.contains("found 2 issues that should be addressed"));
+        // Pipe in the title escaped.
+        assert!(body.contains("Unsanitized `a \\| b` input"));
+        // A line range renders in the Where? cell; "Code Smell" stays on one line.
+        assert!(body.contains("| Code\u{00A0}Smell | Dead branch | Low | `src/b.rs:4-6` |"));
+    }
+
+    #[test]
+    fn build_review_summary_keeps_a_long_path_as_one_code_span() {
+        let posted = vec![ReviewFinding {
+            category: "Test".to_string(),
+            severity: ReviewSeverity::Low,
+            file: "lib/components/attachment/attachment_viewer_content_desktop.dart".to_string(),
+            start_line: None,
+            line: Some(155),
+            title: "Hidden mode untested".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        }];
+        let body = build_review_summary(&posted);
+        // The full path stays in a single code span (no hard breaks inside it),
+        // which renders cleanly without wrapping the narrow columns' labels.
+        assert!(body.contains(
+            "| `lib/components/attachment/attachment_viewer_content_desktop.dart:155` |"
+        ));
+    }
+
+    #[test]
+    fn normalize_review_category_shortens_test_quality_to_test() {
+        // Shortened so the Type column doesn't wrap; the various aliases the AI
+        // may emit all land on the short label.
+        assert_eq!(normalize_review_category("Test Quality"), "Test");
+        assert_eq!(normalize_review_category("testing"), "Test");
+        // Other canonical labels are unchanged.
+        assert_eq!(normalize_review_category("security"), "Security");
+    }
+
+    #[test]
+    fn parse_existing_review_comments_groups_by_path() {
+        let json = r#"[
+            {"path": "a.rs", "line": 7, "body": "prefer a constant", "user": {"login": "alice"}},
+            {"path": "a.rs", "original_line": 9, "body": "typo", "user": {"login": "bob"}},
+            {"path": "b.rs", "body": "structure question", "user": {"login": "alice"}},
+            {"path": "c.rs", "body": "   ", "user": {"login": "alice"}}
+        ]"#;
+        let by_path = parse_existing_review_comments(json);
+        let a = by_path.get("a.rs").unwrap();
+        assert!(a.rendered.contains("@alice (line 7): prefer a constant"));
+        assert!(a.rendered.contains("@bob (line 9): typo"));
+        assert!(by_path
+            .get("b.rs")
+            .unwrap()
+            .rendered
+            .contains("@alice: structure"));
+        // Blank bodies contribute nothing.
+        assert!(!by_path.contains_key("c.rs"));
+        // Garbage input degrades to "no context", never an error.
+        assert!(parse_existing_review_comments("not json").is_empty());
+        // Human comments never produce dedup keys.
+        assert!(a.keys.is_empty());
+    }
+
+    #[test]
+    fn wisetree_comments_produce_dedup_keys_humans_do_not() {
+        // Round-trip the *actual* posted comment body through the parser so the
+        // dedup key can never silently drift from the format the command emits.
+        let finding = ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: "a.rs".to_string(),
+            start_line: None,
+            line: Some(7),
+            title: "Hardcoded API key".to_string(),
+            explanation: "Secrets leak.".to_string(),
+            suggestion: None,
+        };
+        let json = serde_json::json!([
+            {"path": "a.rs", "line": 7, "body": finding.comment_body(),
+             "user": {"login": "wisetree"}},
+            {"path": "a.rs", "line": 9, "body": "please rename this", "user": {"login": "bob"}}
+        ])
+        .to_string();
+        let by_path = parse_existing_review_comments(&json);
+        assert_eq!(
+            by_path.get("a.rs").unwrap().keys,
+            vec![ExistingFindingKey {
+                line: Some(7),
+                title: "hardcoded api key".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn wisetree_finding_title_still_reads_legacy_header() {
+        // Comments posted before the format change must keep producing keys.
+        assert_eq!(
+            wisetree_finding_title("**[Security] [High]**: Hardcoded API key\n\nSecrets leak."),
+            Some("hardcoded api key".to_string())
+        );
+        // A plain human heading with no badge is not one of ours.
+        assert_eq!(
+            wisetree_finding_title("### Just my two cents\n\nlooks fine"),
+            None
+        );
+    }
+
+    #[test]
+    fn split_duplicate_findings_drops_only_matching_line_and_title() {
+        let finding = |line: Option<u64>, title: &str| ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: "a.rs".to_string(),
+            start_line: None,
+            line,
+            title: title.to_string(),
+            explanation: "why".to_string(),
+            suggestion: None,
+        };
+        let existing = vec![ExistingFindingKey {
+            line: Some(7),
+            title: "hardcoded api key".to_string(),
+        }];
+        let (fresh, duplicates) = split_duplicate_findings(
+            vec![
+                finding(Some(7), "Hardcoded API key"), // same line + title → dup
+                finding(Some(9), "Hardcoded API key"), // other line → fresh
+                finding(Some(7), "Magic number"),      // other title → fresh
+            ],
+            &existing,
+        );
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].line, Some(7));
+        assert_eq!(fresh.len(), 2);
+        // No keys → everything is fresh.
+        let (all, none) = split_duplicate_findings(vec![finding(Some(7), "x")], &[]);
+        assert_eq!((all.len(), none.len()), (1, 0));
+    }
+
+    fn run_finding(
+        file: &str,
+        line: Option<u64>,
+        title: &str,
+        suggestion: Option<&str>,
+    ) -> ReviewFinding {
+        ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: file.to_string(),
+            start_line: None,
+            line,
+            title: title.to_string(),
+            explanation: "why".to_string(),
+            suggestion: suggestion.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn run_dedup_collapses_same_fix_even_on_different_lines() {
+        // Same proposed fix in the same file, worded differently and anchored
+        // to different lines: the second is a duplicate.
+        let (kept, dups) = split_run_duplicate_findings(vec![
+            run_finding("a.rs", Some(4), "Use env var", Some("let k = env(\"K\");")),
+            run_finding(
+                "a.rs",
+                Some(9),
+                "Read the key from the environment",
+                Some("let k = env(\"K\");"),
+            ),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line, Some(4)); // the first (highest-priority) one
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].line, Some(9));
+    }
+
+    #[test]
+    fn run_dedup_ignores_whitespace_only_differences_in_the_fix() {
+        let (kept, dups) = split_run_duplicate_findings(vec![
+            run_finding("a.rs", Some(4), "A", Some("let k = env(\"K\");")),
+            run_finding("a.rs", Some(9), "B", Some("  let   k = env(\"K\");\n")),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dups.len(), 1);
+    }
+
+    #[test]
+    fn run_dedup_collapses_same_line_regardless_of_fix() {
+        // Two findings on the same anchor collapse even without a shared fix.
+        let (kept, dups) = split_run_duplicate_findings(vec![
+            run_finding("a.rs", Some(7), "Naming", None),
+            run_finding("a.rs", Some(7), "Magic number", Some("const N = 3;")),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dups.len(), 1);
+    }
+
+    #[test]
+    fn run_dedup_keeps_distinct_findings() {
+        // Different files with the same fix, and distinct fixes on distinct
+        // lines — none are duplicates.
+        let (kept, dups) = split_run_duplicate_findings(vec![
+            run_finding("a.rs", Some(4), "A", Some("same();")),
+            run_finding("b.rs", Some(4), "B", Some("same();")), // other file
+            run_finding("a.rs", Some(9), "C", Some("different();")),
+            run_finding("a.rs", None, "D", None), // file-level, no fix key
+        ]);
+        assert_eq!(kept.len(), 4);
+        assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn noop_suggestions_are_stripped_but_real_ones_survive() {
+        let diff = "     6 +let a = 1;\n     7 +let key = \"abc\";\n     8  }";
+        let commentable = BTreeSet::from([6, 7, 8]);
+        let block = |suggestion: &str| {
+            format!(
+                "===WISETREE-REVIEW-BEGIN===\n---FINDING---\nCATEGORY: Security\nSEVERITY: High\n\
+                 LINE: 7\nSTART_LINE:\nTITLE: Hardcoded key\n---EXPLANATION---\nwhy\n\
+                 ---SUGGESTION---\n{suggestion}\n---END-FINDING---\n===WISETREE-REVIEW-END==="
+            )
+        };
+        // Reproduces line 7 verbatim (modulo trailing spaces) → no-op, stripped.
+        let noop =
+            parse_review_findings(&block("let key = \"abc\";  "), "a.rs", &commentable, diff)
+                .unwrap();
+        assert_eq!(noop[0].suggestion, None);
+        assert_eq!(noop[0].title, "Hardcoded key"); // the finding itself survives
+                                                    // An actual change is kept.
+        let real = parse_review_findings(
+            &block("let key = env(\"KEY\");"),
+            "a.rs",
+            &commentable,
+            diff,
+        )
+        .unwrap();
+        assert_eq!(
+            real[0].suggestion.as_deref(),
+            Some("let key = env(\"KEY\");")
+        );
+    }
+
+    #[test]
+    fn noop_check_covers_multi_line_ranges() {
+        let diff = "     6 +let a = 1;\n     7 +let b = 2;";
+        let commentable = BTreeSet::from([6, 7]);
+        let out = "===WISETREE-REVIEW-BEGIN===\n---FINDING---\nCATEGORY: Code Smell\n\
+                   SEVERITY: Low\nLINE: 7\nSTART_LINE: 6\nTITLE: t\n---EXPLANATION---\ne\n\
+                   ---SUGGESTION---\nlet a = 1;\nlet b = 2;\n---END-FINDING---\n\
+                   ===WISETREE-REVIEW-END===";
+        let findings = parse_review_findings(out, "a.rs", &commentable, diff).unwrap();
+        assert_eq!(findings[0].suggestion, None, "{findings:?}");
+    }
+
+    #[test]
+    fn parse_review_pr_json_reads_slug_head_sha_and_base_ref() {
+        let json = r#"{"url": "https://github.com/victorcorcos/wisetree/pull/9", "headRefOid": "abc123", "baseRefName": "main"}"#;
+        assert_eq!(
+            parse_review_pr_json(json),
+            Some((
+                "victorcorcos".to_string(),
+                "wisetree".to_string(),
+                "abc123".to_string(),
+                "main".to_string()
+            ))
+        );
+        // A missing head sha is unusable for inline comments.
+        assert_eq!(
+            parse_review_pr_json(r#"{"url": "https://github.com/o/r/pull/9"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn build_review_scan_prompt_substitutes_every_placeholder() {
+        let file = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "@@ -1 +1 @@\n     1 +let x = 1;".to_string(),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: "@alice (line 1): rename this".to_string(),
+            existing_keys: Vec::new(),
+        };
+        let prompt = build_review_scan_prompt(&file, "/tmp/tables.md", None, None);
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("     1 +let x = 1;"));
+        assert!(prompt.contains("@alice (line 1): rename this"));
+        assert!(prompt.contains("/tmp/tables.md"));
+        // No unsubstituted tokens survive.
+        for token in [
+            "FILE_PATH",
+            "FILE_DIFF",
+            "EXISTING_COMMENTS",
+            "TABLES_PATH",
+            "USER_FEEDBACK",
+            "PREVIOUS_FINDING",
+        ] {
+            assert!(!prompt.contains(token), "{token} leaked into the prompt");
+        }
+        // The revision pass threads feedback + the previous finding through.
+        let revised = build_review_scan_prompt(&file, "/tmp/t.md", Some("too harsh"), Some("prev"));
+        assert!(revised.contains("too harsh"));
+        assert!(revised.contains("prev"));
+    }
+
+    #[test]
+    fn review_skip_reason_filters_unreviewable_files() {
+        for (path, reason) in [
+            ("Cargo.lock", "lockfile"),
+            ("frontend/package-lock.json", "lockfile"),
+            ("gradle/deps.lockfile", "lockfile"),
+            ("dist/app.min.js", "minified asset"),
+            ("dist/app.js.map", "source map"),
+            ("src/__snapshots__/app.tsx.snap", "test snapshot"),
+            ("components/Button.snap", "test snapshot"),
+            ("vendor/lib/util.rb", "vendored code"),
+            ("api/types.generated.ts", "generated code"),
+            ("proto/events.pb.go", "generated code"),
+            ("proto/events_pb2.py", "generated code"),
+        ] {
+            assert_eq!(review_skip_reason(path), Some(reason), "{path}");
+        }
+        for path in [
+            "src/services/dashboard.rs",
+            "Cargo.toml",
+            "src/locker.rs",
+            "docs/lockfile-strategy.md",
+            "src/snapshot.rs",
+        ] {
+            assert_eq!(review_skip_reason(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn partition_reviewable_files_splits_and_keeps_reasons() {
+        let file = |path: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: String::new(),
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let (reviewable, skipped) =
+            partition_reviewable_files(vec![file("src/lib.rs"), file("Cargo.lock")]);
+        assert_eq!(reviewable.len(), 1);
+        assert_eq!(reviewable[0].path, "src/lib.rs");
+        assert_eq!(
+            skipped,
+            vec![ReviewSkippedFile {
+                path: "Cargo.lock".to_string(),
+                reason: "lockfile",
+            }]
+        );
+    }
+
+    #[test]
+    fn is_test_file_matches_common_layouts() {
+        for path in [
+            "tests/tui_update_pr.rs",
+            "spec/models/user_spec.rb",
+            "src/__tests__/app.tsx",
+            "app/services/specs/billing.py",
+            "pkg/store_test.go",
+            "src/app.test.ts",
+            "src/app.spec.js",
+            "tests/test_parser.py",
+            "conftest.py",
+        ] {
+            assert!(is_test_file(path), "{path} should be a test file");
+        }
+        for path in [
+            "src/services/dashboard.rs",
+            "src/latest.rs",
+            "app/contest_controller.rb",
+            "docs/testing.md",
+            "src/protest/mod.rs",
+        ] {
+            assert!(!is_test_file(path), "{path} should be a source file");
+        }
+    }
+
+    #[test]
+    fn build_review_scan_prompt_picks_the_profile_by_file_kind() {
+        let source = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "     1 +let x = 1;".to_string(),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let test = ReviewFile {
+            path: "tests/lib_test.rs".to_string(),
+            ..source.clone()
+        };
+        let source_prompt = build_review_scan_prompt(&source, "/tmp/t.md", None, None);
+        let test_prompt = build_review_scan_prompt(&test, "/tmp/t.md", None, None);
+        assert!(source_prompt.starts_with("You are reviewing the changed lines of ONE file"));
+        assert!(test_prompt.starts_with("You are reviewing the changed lines of ONE test file"));
+        assert!(test_prompt.contains("test-quality specialist"));
+        // Both profiles share the same machine-parsed output contract.
+        for prompt in [&source_prompt, &test_prompt] {
+            assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
+            assert!(prompt.contains("---END-FINDING---"));
+        }
+    }
 
     // ── Fix pipeline: verdict parsing ──────────────────────────────────
 
@@ -6168,6 +8123,91 @@ so the intent reads clearly.
     }
 
     #[tokio::test]
+    async fn local_pr_diff_reproduces_three_dot_diff_from_synced_branch() {
+        // The fallback used when GitHub's diff endpoint 5xx's on an oversized
+        // PR: compute the same three-dot diff locally. Set up a base branch, a
+        // feature branch checked out in the worktree, and confirm the fallback
+        // produces a unified diff our parser turns into commentable findings.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // Seed `main` with a multi-line file and push it to the remote.
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // The reviewer's worktree: a clone with a feature branch checked out
+        // (as it would be after `git pull --ff-only` synced the PR head).
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, local.to_str().unwrap()],
+        );
+        git(&local, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(local.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        git(&local, &["add", "."]);
+        git(&local, &["commit", "-q", "-m", "edit"]);
+
+        let service = DashboardService::new(local.clone(), DashboardConfig::default());
+        let diff = service
+            .local_pr_diff(&local, "main")
+            .await
+            .expect("local diff fallback should succeed");
+
+        assert!(
+            diff.contains("diff --git a/a.txt b/a.txt"),
+            "expected a unified diff header, got: {diff}"
+        );
+        assert!(diff.contains("+TWO"), "diff should show the edit: {diff}");
+        assert!(
+            diff.contains("+four"),
+            "diff should show the addition: {diff}"
+        );
+
+        // The parser turns it into a reviewable file with new-side line
+        // numbers — the same anchors GitHub accepts inline comments on.
+        let files = parse_review_diff(&diff);
+        assert_eq!(files.len(), 1, "one changed file expected: {files:?}");
+        assert_eq!(files[0].path, "a.txt");
+        assert!(files[0].commentable_lines.contains(&2)); // the changed "TWO"
+        assert!(files[0].commentable_lines.contains(&4)); // the added "four"
+    }
+
+    #[tokio::test]
+    async fn local_pr_diff_reports_error_when_base_ref_unresolvable() {
+        // No remote-tracking base ref exists, so the fallback can't reproduce
+        // the diff — it must surface a clear error rather than an empty diff.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["symbolic-ref", "HEAD", "refs/heads/feature"]);
+        std::fs::write(repo.join("a.txt"), "x\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default());
+        let err = service
+            .local_pr_diff(&repo, "main")
+            .await
+            .expect_err("no base ref means no fallback diff");
+        assert!(
+            err.contains("could not resolve a local base ref"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_base_ref_reports_no_change_when_base_is_current() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let remote = tmp.path().join("remote.git");
@@ -6391,6 +8431,84 @@ so the intent reads clearly.
         ));
         assert!(is_rate_limit_error("Secondary rate-limit triggered"));
         assert!(!is_rate_limit_error("network is unreachable"));
+    }
+
+    #[test]
+    fn detects_transient_gh_5xx_errors() {
+        assert!(is_transient_gh_error(
+            "could not find pull request diff: HTTP 503: 503 Service Unavailable \
+             (https://api.github.com/repos/oxeanbits/digitalize-front/pulls/4651)"
+        ));
+        assert!(is_transient_gh_error("HTTP 502: Bad Gateway"));
+        assert!(!is_transient_gh_error(
+            "HTTP 404: Not Found (https://api.github.com/repos/o/r/pulls/1)"
+        ));
+        assert!(!is_transient_gh_error("network is unreachable"));
+    }
+
+    #[tokio::test]
+    async fn run_gh_command_retries_transient_5xx_then_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter_path = dir.path().join("attempts");
+        let gh_path = dir.path().join("fake-gh.sh");
+        std::fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\n\
+                 n=$(cat \"{counter}\" 2>/dev/null || echo 0)\n\
+                 n=$((n + 1))\n\
+                 printf '%s' \"$n\" > \"{counter}\"\n\
+                 if [ \"$n\" -lt 3 ]; then\n\
+                 echo 'HTTP 503: 503 Service Unavailable' >&2\n\
+                 exit 1\n\
+                 fi\n\
+                 printf 'diff --git a/x b/x\\n'\n",
+                counter = counter_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&gh_path);
+
+        let out = run_gh_command(&gh_path, &["pr", "diff", "1"], Some(dir.path()))
+            .await
+            .expect("should succeed after retries");
+        assert_eq!(out, "diff --git a/x b/x");
+        assert_eq!(
+            std::fs::read_to_string(&counter_path).unwrap(),
+            "3",
+            "should have retried twice before succeeding on the third attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_gh_command_does_not_retry_permanent_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter_path = dir.path().join("attempts");
+        let gh_path = dir.path().join("fake-gh.sh");
+        std::fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\n\
+                 n=$(cat \"{counter}\" 2>/dev/null || echo 0)\n\
+                 n=$((n + 1))\n\
+                 printf '%s' \"$n\" > \"{counter}\"\n\
+                 echo 'HTTP 404: Not Found' >&2\n\
+                 exit 1\n",
+                counter = counter_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&gh_path);
+
+        let err = run_gh_command(&gh_path, &["pr", "diff", "1"], Some(dir.path()))
+            .await
+            .expect_err("permanent failure should surface");
+        assert!(err.contains("HTTP 404"), "unexpected error: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&counter_path).unwrap(),
+            "1",
+            "a non-transient error must return on the first attempt"
+        );
     }
 
     #[test]

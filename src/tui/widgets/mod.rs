@@ -28,7 +28,10 @@ pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
 pub use confirmation_modal::{ConfirmationChoice, ConfirmationModal, ConfirmationOutcome};
 pub use input_prompt::{InputOutcome, InputPrompt};
-pub use pr_confirm::{labeled_line, labeled_spans, will_run_lines, AiRoleRow, PrConfirmView};
+pub use pr_confirm::{
+    code_lines, code_span, code_spans, code_style, labeled_line, labeled_spans, will_run_lines,
+    AiRoleRow, PrConfirmView,
+};
 pub use pty_view::PtyView;
 pub use scrollbar::render_vertical_scrollbar;
 pub use select_prompt::{

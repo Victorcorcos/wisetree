@@ -35,8 +35,9 @@ use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
-    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
+    code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator,
+    SummaryRow,
 };
 
 const UPDATE_LOADING_MESSAGE: &str = "Resolving base ref...";
@@ -2274,16 +2275,7 @@ fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> 
     // Base ref only resolves for the update flow; the push-only flow leaves
     // it `None`, so we omit the row rather than show "(resolving...)".
     if let Some(base_ref) = request.base_ref.clone() {
-        rows.push(labeled_line(
-            "Base ref",
-            Span::styled(
-                base_ref,
-                Style::default()
-                    .fg(colors::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            None,
-        ));
+        rows.push(labeled_line("Base ref", code_span(base_ref), None));
     }
 
     // A push-only row is, by definition, not behind — skip the alarming
@@ -2319,13 +2311,13 @@ fn build_detail_lines(request: &UpdatePullRequestRequest) -> Vec<Line<'static>> 
 /// owns the numbering + styling.
 fn build_steps(base_ref: &str, push_only: bool) -> Vec<String> {
     if push_only {
-        return vec!["git push origin HEAD".to_string()];
+        return vec!["`git push origin HEAD`".to_string()];
     }
     vec![
-        "git fetch --all --prune".to_string(),
-        format!("git merge {base_ref}"),
-        "on conflict: opencode streams resolution, then Complete/Cancel".to_string(),
-        "git push origin HEAD".to_string(),
+        "`git fetch --all --prune`".to_string(),
+        format!("`git merge {base_ref}`"),
+        "On conflict: opencode streams resolution, then Complete/Cancel".to_string(),
+        "`git push origin HEAD`".to_string(),
     ]
 }
 

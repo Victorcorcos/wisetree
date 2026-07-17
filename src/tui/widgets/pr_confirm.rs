@@ -108,9 +108,82 @@ pub fn labeled_spans(label: &str, values: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Shared style for inline code chips: orange text on a neutral gray
+/// background, distinct from the app's brown-tinted panel colors.
+pub fn code_style() -> Style {
+    Style::default().fg(colors::ACCENT).bg(colors::CODE_BG)
+}
+
+/// A single value rendered as an inline code chip (orange on gray, padded
+/// with a leading/trailing space), matching the backtick-delimited spans in
+/// [`will_run_lines`]. Use for standalone values like a ref or branch name
+/// that deserve the same "code" treatment outside of a `Will run:` step.
+pub fn code_span(text: impl Into<String>) -> Span<'static> {
+    Span::styled(format!(" {} ", text.into()), code_style())
+}
+
+/// Split text by backtick-delimited code spans and return styled spans.
+/// Code (text between backticks) gets `code_style`, padded with a leading and
+/// trailing space so the highlight reads as a chip rather than a tight
+/// underline; everything else gets `base_style`. Nesting is not supported —
+/// inner backticks are treated as regular text.
+pub fn code_spans(text: &str, base_style: Style, code_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        match rest.find('`') {
+            None => {
+                spans.push(Span::styled(text[cursor..].to_string(), base_style));
+                break;
+            }
+            Some(rel_open) => {
+                let open = cursor + rel_open;
+                if open > cursor {
+                    spans.push(Span::styled(text[cursor..open].to_string(), base_style));
+                }
+                let after_open = &text[open + 1..];
+                match after_open.find('`') {
+                    None => {
+                        spans.push(Span::styled(text[open..].to_string(), base_style));
+                        break;
+                    }
+                    Some(rel_close) => {
+                        let close = open + 1 + rel_close;
+                        spans.push(Span::styled(
+                            format!(" {} ", &text[open + 1..close]),
+                            code_style,
+                        ));
+                        cursor = close + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base_style));
+    }
+    spans
+}
+
+/// Backtick-aware lines for a whole block of text, one [`Line`] per `\n`
+/// segment. Non-code spans are left unstyled (`Style::default()`) so callers
+/// that already set a fallback style on the surrounding `Paragraph` (toasts,
+/// the confirmation modal) keep their existing look; only backtick-delimited
+/// segments get the code-chip treatment. Use [`code_spans`] directly when a
+/// caller needs a specific base style instead of the paragraph fallback.
+pub fn code_lines(text: &str) -> Vec<Line<'static>> {
+    text.lines()
+        .map(|line| Line::from(code_spans(line, Style::default(), code_style())))
+        .collect()
+}
+
 /// A `Will run:` header followed by numbered steps, matching the Bugkill
 /// pipeline preview. Callers pass the human-readable step text; the widget
 /// owns the numbering + styling so every command's preview looks the same.
+/// Backtick-delimited text (`` `like this` ``) renders as inline code.
 pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
     let header_style = Style::default()
         .fg(colors::INFO)
@@ -119,15 +192,15 @@ pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
         .fg(colors::MUTED)
         .add_modifier(Modifier::DIM);
     let text_style = Style::default().fg(colors::EMPHASIS);
+    let code_style = code_style();
     let mut lines = vec![Line::from(Span::styled(
         "Will run:".to_string(),
         header_style,
     ))];
     for (i, text) in steps.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {}. ", i + 1), number_style),
-            Span::styled(text.as_ref().to_string(), text_style),
-        ]));
+        let mut spans = vec![Span::styled(format!("  {}. ", i + 1), number_style)];
+        spans.extend(code_spans(text.as_ref(), text_style, code_style));
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -370,7 +443,7 @@ mod tests {
         ];
         let view = PrConfirmView::new("Do the thing?")
             .block(details)
-            .steps(&["git fetch", "git merge base"])
+            .steps(&["`git fetch`", "`git merge base`"])
             .ai_roles(vec![AiRoleRow::new(
                 "resolve",
                 colors::INFO,
@@ -382,7 +455,7 @@ mod tests {
         assert!(out.contains("Branch"), "{out}");
         assert!(out.contains("Worktree"), "{out}");
         assert!(out.contains("Will run:"), "{out}");
-        assert!(out.contains("1. git fetch"), "{out}");
+        assert!(out.contains("1.  git fetch "), "{out}");
         assert!(out.contains("Role"), "{out}");
         assert!(out.contains("Model"), "{out}");
         assert!(out.contains("Thinking"), "{out}");

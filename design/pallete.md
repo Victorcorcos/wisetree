@@ -21,6 +21,7 @@ Brown (even lighter → for other texts that needs focus): #75705b
 
 ## New Colors
 Dark Green (for the Bugkill PR command button): #58a300
+Navy Blue (for the Review PR command button): #4d7cfe
 Red: #f92672
 Cyan: #a8d8ff
 Blue: #74b8ff

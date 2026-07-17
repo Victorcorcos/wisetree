@@ -1146,6 +1146,7 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
             plan: clean(&ai.fix.plan),
             apply: clean(&ai.fix.apply),
         },
+        review: clean(&ai.review),
         update: clean(&ai.update),
         bugkill: AiBugkillConfig {
             investigate: clean(&ai.bugkill.investigate),
@@ -1162,6 +1163,7 @@ pub enum AiSlot {
     Enrich,
     FixPlan,
     FixApply,
+    Review,
     Update,
     BugkillInvestigate,
     BugkillFix,
@@ -1169,10 +1171,11 @@ pub enum AiSlot {
 }
 
 impl AiSlot {
-    pub const ALL: [AiSlot; 7] = [
+    pub const ALL: [AiSlot; 8] = [
         AiSlot::Enrich,
         AiSlot::FixPlan,
         AiSlot::FixApply,
+        AiSlot::Review,
         AiSlot::Update,
         AiSlot::BugkillInvestigate,
         AiSlot::BugkillFix,
@@ -1184,6 +1187,7 @@ impl AiSlot {
             AiSlot::Enrich => "enrich",
             AiSlot::FixPlan => "fix_plan",
             AiSlot::FixApply => "fix_apply",
+            AiSlot::Review => "review",
             AiSlot::Update => "update",
             AiSlot::BugkillInvestigate => "bugkill_investigate",
             AiSlot::BugkillFix => "bugkill_fix",
@@ -1196,6 +1200,10 @@ impl AiSlot {
             AiSlot::Enrich => "Drafts the PR title + description (Enrich)",
             AiSlot::FixPlan => "Plans review-comment fixes — pick a stronger model (Fix · plan)",
             AiSlot::FixApply => "Applies the approved fix live (Fix · apply)",
+            AiSlot::Review => {
+                "Scans each changed file and drafts review comments — pick a stronger model \
+                 (Review)"
+            }
             AiSlot::Update => "Resolves merge conflicts (Update Pull Request / branch)",
             AiSlot::BugkillInvestigate => {
                 "Investigates the bug and ranks root causes — pick a stronger model \
@@ -1213,6 +1221,7 @@ impl AiSlot {
             AiSlot::Enrich => &ai.enrich,
             AiSlot::FixPlan => &ai.fix.plan,
             AiSlot::FixApply => &ai.fix.apply,
+            AiSlot::Review => &ai.review,
             AiSlot::Update => &ai.update,
             AiSlot::BugkillInvestigate => &ai.bugkill.investigate,
             AiSlot::BugkillFix => &ai.bugkill.fix,
@@ -1225,6 +1234,7 @@ impl AiSlot {
             AiSlot::Enrich => &mut ai.enrich,
             AiSlot::FixPlan => &mut ai.fix.plan,
             AiSlot::FixApply => &mut ai.fix.apply,
+            AiSlot::Review => &mut ai.review,
             AiSlot::Update => &mut ai.update,
             AiSlot::BugkillInvestigate => &mut ai.bugkill.investigate,
             AiSlot::BugkillFix => &mut ai.bugkill.fix,
@@ -1233,13 +1243,14 @@ impl AiSlot {
     }
 }
 
-/// The seven leaf models in slot order — used by the dashboard `ai` summary and
+/// The eight leaf models in slot order — used by the dashboard `ai` summary and
 /// the AI Settings editor.
-fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 7] {
+fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 8] {
     [
         &ai.enrich,
         &ai.fix.plan,
         &ai.fix.apply,
+        &ai.review,
         &ai.update,
         &ai.bugkill.investigate,
         &ai.bugkill.fix,

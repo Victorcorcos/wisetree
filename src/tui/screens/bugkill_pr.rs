@@ -48,9 +48,9 @@ use crate::services::{BugkillSnapshot, BugkillUnverdicted, ParsedInvestigation};
 use crate::tui::screens::dashboard::BugkillRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView, Status,
-    StatusIndicator, SummaryRow,
+    code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView,
+    Status, StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -1126,7 +1126,7 @@ impl BugkillPullRequestScreen {
         let steps = [
             "You describe the bug.",
             "The investigate AI explores the code read-only and ranks likely root causes \
-             into BUG_INVESTIGATION.md.",
+             into `BUG_INVESTIGATION.md`.",
             "You pick one proposed fix from the ranked table.",
             "The fix AI applies only that fix, live, in an embedded opencode terminal.",
             "You confirm whether the bug is gone — Yes keeps the fix (committed on the \
@@ -2037,12 +2037,13 @@ impl BugkillPullRequestScreen {
         ]));
         lines.push(Line::from(vec![
             Span::styled("Base ref    ".to_string(), muted_dim()),
-            Span::styled(
-                self.base_ref
-                    .clone()
-                    .unwrap_or_else(|| "(none resolved)".to_string()),
-                Style::default().fg(colors::EMPHASIS),
-            ),
+            match self.base_ref.clone() {
+                Some(base_ref) => code_span(base_ref),
+                None => Span::styled(
+                    "(none resolved)".to_string(),
+                    Style::default().fg(colors::EMPHASIS),
+                ),
+            },
         ]));
         lines
     }

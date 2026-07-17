@@ -42,8 +42,9 @@ use crate::tui::screens::update_pr::{
     ai_activity_event_to_line, button_paragraph, contains_position, key_event_to_pty_bytes,
 };
 use crate::tui::widgets::{
-    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
+    code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator,
+    SummaryRow,
 };
 
 const ENRICH_LOADING_MESSAGE: &str = "Resolving base ref...";
@@ -1239,15 +1240,15 @@ fn build_detail_lines(request: &EnrichPullRequestRequest) -> Vec<Line<'static>> 
     ));
     rows.push(labeled_line(
         "Base ref",
-        Span::styled(
-            request
-                .base_ref
-                .clone()
-                .unwrap_or_else(|| "(resolving...)".to_string()),
-            Style::default()
-                .fg(colors::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
+        match request.base_ref.clone() {
+            Some(base_ref) => code_span(base_ref),
+            None => Span::styled(
+                "(resolving...)".to_string(),
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        },
         None,
     ));
     rows
@@ -1258,13 +1259,15 @@ fn build_detail_lines(request: &EnrichPullRequestRequest) -> Vec<Line<'static>> 
 /// whether an existing PR is being updated or a new one opened.
 fn build_steps(request: &EnrichPullRequestRequest) -> Vec<String> {
     let submit_step = match request.number {
-        Some(number) => format!("on confirm: gh pr edit #{number} (existing media preserved)"),
-        None => "on confirm: git push + gh pr create".to_string(),
+        Some(number) => {
+            format!("On confirm: `gh pr edit` #{number} (existing media preserved)")
+        }
+        None => "On confirm: `git push` + `gh pr create`".to_string(),
     };
     vec![
-        "gather commit log + diff vs base ref".to_string(),
-        "opencode drafts pull_request.md (title + description)".to_string(),
-        "you review the draft, then Open/Update or Finish".to_string(),
+        "Gather commit log + diff vs base ref".to_string(),
+        "Opencode drafts `pull_request.md` (title + description)".to_string(),
+        "You review the draft, then Open/Update or Finish".to_string(),
         submit_step,
     ]
 }

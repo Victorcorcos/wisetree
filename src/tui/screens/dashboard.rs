@@ -17,8 +17,8 @@ use crate::services::{
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, SelectOption, SelectOutcome,
-    SelectPrompt, Status, StatusIndicator,
+    code_spans, code_style, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 const SELECT_MARKER: &str = " ➤ ";
@@ -47,6 +47,7 @@ enum ActionChoice {
     OpenPullRequest,
     EnrichPullRequest,
     FixPullRequest,
+    ReviewPullRequest,
     BugkillPullRequest,
     MergePullRequest,
     UpdatePullRequest,
@@ -143,6 +144,19 @@ pub struct EnrichPullRequestRequest {
 /// PR — there is no review feedback to resolve otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixPullRequestRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub branch: String,
+    pub worktree_path: String,
+}
+
+/// Payload the dashboard hands to the "Review Pull Request" screen, which
+/// scans the PR's changed files with per-file AI calls and posts approved
+/// findings as review comments. Only built for a non-mother worktree with an
+/// active (open/draft) PR — there is nothing to comment on otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPullRequestRequest {
     pub number: u64,
     pub title: String,
     pub url: String,
@@ -279,6 +293,10 @@ pub enum DashboardAction {
     /// (plan → apply → commit → reply). Offered on a non-mother worktree
     /// whose PR is open or draft.
     FixPullRequest(Box<FixPullRequestRequest>),
+    /// Scan the PR's changed files with AI and post approved findings as
+    /// review comments (scan → post → summary). Offered on a non-mother
+    /// worktree whose PR is open or draft.
+    ReviewPullRequest(Box<ReviewPullRequestRequest>),
     /// Investigate a described bug, rank root causes, and iterate fix
     /// attempts (commit on success, `git revert` on failure). Offered on
     /// every non-mother worktree — no PR required.
@@ -1001,6 +1019,15 @@ impl DashboardScreen {
                 color: colors::CYAN,
             });
         }
+        // Review scans the PR's changed files with the AI and posts approved
+        // findings as review comments. Same gate as Fix: an active PR.
+        if build_review_request(row).is_some() {
+            commands.push(PrCommand {
+                label: "Review",
+                choice: ActionChoice::ReviewPullRequest,
+                color: colors::NAVY,
+            });
+        }
         // Bugkill investigates a described bug and iterates fix attempts.
         // Offered on every non-mother worktree — no PR required, so this
         // button may make the PR-commands section appear on rows that
@@ -1198,9 +1225,9 @@ impl DashboardScreen {
 
     /// Keyboard handling while a PR command button owns the focus: Left /
     /// Right move between buttons, Enter runs the focused action, Esc
-    /// dismisses the whole menu. Letter shortcuts (O/E/F/B/U/P/M/C) trigger
-    /// the matching PR command directly without needing to navigate to it
-    /// first.
+    /// dismisses the whole menu. Letter shortcuts (O/E/F/R/B/U/P/M/C)
+    /// trigger the matching PR command directly without needing to navigate
+    /// to it first.
     fn handle_pr_command_key(&mut self, key: KeyEvent) -> DashboardAction {
         if self.pr_commands.is_empty() {
             self.action_pr_focus = None;
@@ -1219,6 +1246,7 @@ impl DashboardScreen {
                 KeyCode::Char('o') | KeyCode::Char('O') => &[ActionChoice::OpenPullRequest],
                 KeyCode::Char('e') | KeyCode::Char('E') => &[ActionChoice::EnrichPullRequest],
                 KeyCode::Char('f') | KeyCode::Char('F') => &[ActionChoice::FixPullRequest],
+                KeyCode::Char('r') | KeyCode::Char('R') => &[ActionChoice::ReviewPullRequest],
                 KeyCode::Char('b') | KeyCode::Char('B') => &[ActionChoice::BugkillPullRequest],
                 KeyCode::Char('u') | KeyCode::Char('U') => &[
                     ActionChoice::UpdatePullRequest,
@@ -1288,6 +1316,7 @@ impl DashboardScreen {
         let update_request = build_update_request(row);
         let enrich_request = build_enrich_request(row);
         let fix_request = build_fix_request(row);
+        let review_request = build_review_request(row);
         let bugkill_request = build_bugkill_request(row);
         let push_request = build_push_request(row);
         let close_request = build_close_request(row);
@@ -1333,6 +1362,12 @@ impl DashboardScreen {
                 self.mode = DashboardMode::Table;
                 fix_request
                     .map(|request| DashboardAction::FixPullRequest(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::ReviewPullRequest => {
+                self.mode = DashboardMode::Table;
+                review_request
+                    .map(|request| DashboardAction::ReviewPullRequest(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
             ActionChoice::BugkillPullRequest => {
@@ -1788,9 +1823,11 @@ impl DashboardScreen {
 
     fn notice_line(&self, width: u16, layout: &DashboardTableLayout) -> Line<'static> {
         if let Some(notice) = &self.notice {
-            return Line::from(Span::styled(
-                truncate(&notice.message, width.max(1) as usize),
+            let truncated = truncate(&notice.message, width.max(1) as usize);
+            return Line::from(code_spans(
+                &truncated,
                 notice_style(notice.level),
+                code_style(),
             ));
         }
         if let Some(row) = self.selected_row() {
@@ -3077,6 +3114,26 @@ fn build_fix_request(row: &DashboardRow) -> Option<FixPullRequestRequest> {
     })
 }
 
+/// Assemble the payload the "Review Pull Request" screen needs. Same gate as
+/// the Fix command: a non-mother worktree whose PR is active (open/draft) —
+/// there is nothing to comment on otherwise.
+fn build_review_request(row: &DashboardRow) -> Option<ReviewPullRequestRequest> {
+    if row.worktree.is_main {
+        return None;
+    }
+    let pr = row.pull_request.as_ref()?;
+    if !pr_accepts_lifecycle_commands(pr.state) {
+        return None;
+    }
+    Some(ReviewPullRequestRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+    })
+}
+
 /// Assemble the payload the "Bugkill" screen needs. Returns `None` only on
 /// the mother worktree — a bug hunt works on any other worktree, PR or not.
 fn build_bugkill_request(row: &DashboardRow) -> Option<BugkillRequest> {
@@ -3628,7 +3685,7 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Enrich", "Fix", "Bugkill", "Upload", "Merge", "Close"]
+            vec!["Open", "Enrich", "Fix", "Review", "Bugkill", "Upload", "Merge", "Close"]
         );
     }
 
@@ -3637,7 +3694,7 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(1, 3)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Enrich", "Fix", "Bugkill", "Update", "Merge", "Close"]
+            vec!["Open", "Enrich", "Fix", "Review", "Bugkill", "Update", "Merge", "Close"]
         );
     }
 
@@ -3649,6 +3706,16 @@ mod tests {
         // No PR → Fix is hidden.
         let no_pr = row(None, Some(branch_status(2, 0)));
         assert!(build_fix_request(&no_pr).is_none());
+    }
+
+    #[test]
+    fn review_offered_for_active_pr_only() {
+        // Active PR (open) → Review is present.
+        let active = row(Some(open_pr()), Some(branch_status(0, 0)));
+        assert!(build_review_request(&active).is_some());
+        // No PR → Review is hidden.
+        let no_pr = row(None, Some(branch_status(2, 0)));
+        assert!(build_review_request(&no_pr).is_none());
     }
 
     #[test]
