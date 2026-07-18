@@ -49,6 +49,7 @@ use crate::services::dashboard::{
     is_test_file, split_duplicate_findings, split_run_duplicate_findings, ReviewFile,
     ReviewFinding, ReviewSeverity, ReviewSkippedFile,
 };
+use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
 use crate::tui::widgets::{
@@ -257,6 +258,8 @@ pub struct ReviewPullRequestScreen {
     other_input: Option<InputPrompt>,
     // ── results ─────────────────────────────────────────────────────────
     summary_rows: Vec<SummaryRow>,
+    scan_telemetry: Vec<ReviewScanTelemetry>,
+    telemetry_reported: bool,
     error: Option<String>,
     step: ReviewStep,
     pub tick: usize,
@@ -291,6 +294,8 @@ impl ReviewPullRequestScreen {
             decision_scroll: 0,
             other_input: None,
             summary_rows: Vec::new(),
+            scan_telemetry: Vec::new(),
+            telemetry_reported: false,
             error: None,
             step: ReviewStep::Confirm,
             tick: 0,
@@ -388,6 +393,8 @@ impl ReviewPullRequestScreen {
         self.scans_done = 0;
         self.findings.clear();
         self.posted.clear();
+        self.scan_telemetry.clear();
+        self.telemetry_reported = false;
     }
 
     /// Working step for the parallel scan phase: the spinner message tracks
@@ -537,6 +544,10 @@ impl ReviewPullRequestScreen {
     /// Fold one file's findings into the aggregate.
     pub fn record_scan_result(&mut self, findings: Vec<ReviewFinding>) {
         self.findings.extend(findings);
+    }
+
+    pub fn record_scan_telemetry(&mut self, telemetry: ReviewScanTelemetry) {
+        self.scan_telemetry.push(telemetry);
     }
 
     /// A scan that failed twice gets its own Failed row and the pool moves
@@ -713,6 +724,17 @@ impl ReviewPullRequestScreen {
     }
 
     pub fn enter_done(&mut self) {
+        if !self.telemetry_reported && !self.scan_telemetry.is_empty() {
+            let label = review_telemetry_label(&self.scan_telemetry);
+            self.summary_rows.push(SummaryRow::with_status(
+                "AI scan usage",
+                label,
+                colors::MUTED,
+                None,
+            ));
+            persist_scan_telemetry(&self.scan_telemetry);
+            self.telemetry_reported = true;
+        }
         self.step = ReviewStep::Done;
     }
 
@@ -1531,6 +1553,13 @@ impl ReviewPullRequestScreen {
             chunks[2],
         );
     }
+}
+
+fn persist_scan_telemetry(scans: &[ReviewScanTelemetry]) {
+    #[cfg(not(test))]
+    crate::services::review_telemetry::persist_review_telemetry(scans);
+    #[cfg(test)]
+    let _ = scans;
 }
 
 /// Render a centered row of bordered buttons, each sized to exactly its own
@@ -2558,6 +2587,31 @@ mod tests {
         assert!(dump.contains("Posted 1 review comment"), "{dump}");
         assert!(dump.contains("Submitted"), "{dump}");
         assert!(dump.contains("Press any key"), "{dump}");
+    }
+
+    #[test]
+    fn done_report_includes_aggregate_scan_telemetry_once() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.record_scan_telemetry(ReviewScanTelemetry {
+            scan: "app:a.rs".to_string(),
+            prompt_bytes: 1200,
+            tokens_in: Some(40_000),
+            tokens_out: Some(8_000),
+            duration_ms: 250,
+            findings: 1,
+        });
+        screen.enter_done();
+        screen.enter_done();
+        let rows = screen
+            .summary_rows
+            .iter()
+            .filter(|row| row.command == "AI scan usage")
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status.as_ref().unwrap().label,
+            "~48k tokens across 1 call"
+        );
     }
 
     #[test]

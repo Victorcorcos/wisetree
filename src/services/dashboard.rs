@@ -27,6 +27,9 @@ use crate::services::bugkill::{
     parse_porcelain_v2, AttemptChanges, BugHypothesis, BugkillVerdict, JudgeResult,
     ParsedInvestigation, INVESTIGATION_FILE,
 };
+use crate::services::review_telemetry::{
+    opencode_usage_for_title, review_scan_title, ReviewScanTelemetry,
+};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// `gh api graphql` may include the network round-trip — give it more headroom
@@ -862,6 +865,14 @@ pub struct ReviewFinding {
     /// Exact replacement code for the targeted line(s), when the fix is
     /// expressible as one — becomes a GitHub ```suggestion block.
     pub suggestion: Option<String>,
+}
+
+/// One paid Review model call, including telemetry even when its output could
+/// not be parsed or the subprocess failed.
+#[derive(Debug)]
+pub struct ReviewScanAttempt {
+    pub result: Result<Vec<ReviewFinding>>,
+    pub telemetry: ReviewScanTelemetry,
 }
 
 impl ReviewFinding {
@@ -2862,14 +2873,30 @@ impl DashboardService {
         file: &ReviewFile,
         feedback: Option<&str>,
         previous_finding: Option<&str>,
-    ) -> Result<Vec<ReviewFinding>> {
+    ) -> ReviewScanAttempt {
+        let started = Instant::now();
+        let scan = if feedback.is_some() {
+            format!("revision:{}", file.path)
+        } else if is_test_file(&file.path) {
+            format!("tester:{}", file.path)
+        } else {
+            format!("app:{}", file.path)
+        };
         let cwd = PathBuf::from(worktree_path);
         let model = self.config.ai.review.model.trim().to_string();
         if model.is_empty() {
-            return Err(WisetreeError::other("ai.review model is not configured."));
+            return review_scan_attempt(
+                scan,
+                0,
+                started,
+                None,
+                Err(WisetreeError::other("ai.review model is not configured.")),
+            );
         }
         let tables_path = materialize_review_tables().await;
         let prompt = build_review_scan_prompt(file, &tables_path, feedback, previous_finding);
+        let prompt_bytes = prompt.len();
+        let title = review_scan_title();
         let mut run_args: Vec<String> = vec![
             "run".to_string(),
             prompt,
@@ -2877,24 +2904,33 @@ impl DashboardService {
             model,
             "--agent".to_string(),
             "plan".to_string(),
+            "--title".to_string(),
+            title.clone(),
         ];
         run_args.extend(run_variant_args(&self.config.ai.review.thinking));
         let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let output = time::timeout(
+        let result = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
             run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
         )
         .await
-        .map_err(|_| WisetreeError::other("opencode review scan timed out after 240s"))?
-        .map_err(WisetreeError::other)?;
-
-        parse_review_findings(
-            &output,
-            &file.path,
-            &file.commentable_lines,
-            &file.annotated_diff,
-        )
-        .ok_or_else(|| WisetreeError::other("could not parse findings from the review AI output."))
+        {
+            Err(_) => Err(WisetreeError::other(
+                "opencode review scan timed out after 240s",
+            )),
+            Ok(Err(err)) => Err(WisetreeError::other(err)),
+            Ok(Ok(output)) => parse_review_findings(
+                &output,
+                &file.path,
+                &file.commentable_lines,
+                &file.annotated_diff,
+            )
+            .ok_or_else(|| {
+                WisetreeError::other("could not parse findings from the review AI output.")
+            }),
+        };
+        let usage = opencode_usage_for_title(title).await;
+        review_scan_attempt(scan, prompt_bytes, started, usage, result)
     }
 
     /// Scan the WHOLE diff once for missing test coverage with a single
@@ -2907,13 +2943,22 @@ impl DashboardService {
         &self,
         worktree_path: &str,
         files: &[ReviewFile],
-    ) -> Result<Vec<ReviewFinding>> {
+    ) -> ReviewScanAttempt {
+        let started = Instant::now();
         let cwd = PathBuf::from(worktree_path);
         let model = self.config.ai.review.model.trim().to_string();
         if model.is_empty() {
-            return Err(WisetreeError::other("ai.review model is not configured."));
+            return review_scan_attempt(
+                "coverage".to_string(),
+                0,
+                started,
+                None,
+                Err(WisetreeError::other("ai.review model is not configured.")),
+            );
         }
         let prompt = build_review_coverage_prompt(files);
+        let prompt_bytes = prompt.len();
+        let title = review_scan_title();
         let mut run_args: Vec<String> = vec![
             "run".to_string(),
             prompt,
@@ -2921,20 +2966,27 @@ impl DashboardService {
             model,
             "--agent".to_string(),
             "plan".to_string(),
+            "--title".to_string(),
+            title.clone(),
         ];
         run_args.extend(run_variant_args(&self.config.ai.review.thinking));
         let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let output = time::timeout(
+        let result = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
             run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
         )
         .await
-        .map_err(|_| WisetreeError::other("opencode coverage scan timed out after 240s"))?
-        .map_err(WisetreeError::other)?;
-
-        parse_coverage_findings(&output, files).ok_or_else(|| {
-            WisetreeError::other("could not parse findings from the coverage AI output.")
-        })
+        {
+            Err(_) => Err(WisetreeError::other(
+                "opencode coverage scan timed out after 240s",
+            )),
+            Ok(Err(err)) => Err(WisetreeError::other(err)),
+            Ok(Ok(output)) => parse_coverage_findings(&output, files).ok_or_else(|| {
+                WisetreeError::other("could not parse findings from the coverage AI output.")
+            }),
+        };
+        let usage = opencode_usage_for_title(title).await;
+        review_scan_attempt("coverage".to_string(), prompt_bytes, started, usage, result)
     }
 
     /// Post one approved finding to the PR — inline when it carries a
@@ -6018,6 +6070,28 @@ fn normalize_suggestion(suggestion: Option<&str>) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn review_scan_attempt(
+    scan: String,
+    prompt_bytes: usize,
+    started: Instant,
+    usage: Option<(u64, u64)>,
+    result: Result<Vec<ReviewFinding>>,
+) -> ReviewScanAttempt {
+    let findings = result.as_ref().map_or(0, Vec::len);
+    let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    ReviewScanAttempt {
+        result,
+        telemetry: ReviewScanTelemetry {
+            scan,
+            prompt_bytes,
+            tokens_in: usage.map(|value| value.0),
+            tokens_out: usage.map(|value| value.1),
+            duration_ms,
+            findings,
+        },
+    }
 }
 
 /// Write the curated reference tables next to the temp dir so the scan AI

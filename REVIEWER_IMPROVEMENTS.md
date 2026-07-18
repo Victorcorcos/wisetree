@@ -110,6 +110,8 @@ go/no-go decision.
 **Touches.** `scan_review_*` result plumbing, Done report row, small state
 file.
 
+**Status:** ✅ implemented — commit 4c5751a. as specified.
+
 ## #3 — Cheap retry: reformat instead of re-scan
 
 **Attacks waste #4. Goes before #4 because the merged scan raises the blast

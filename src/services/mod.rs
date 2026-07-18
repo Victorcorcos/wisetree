@@ -7,6 +7,7 @@ pub mod dashboard;
 pub mod opencode_models;
 pub mod opencode_turn;
 pub mod presets;
+pub mod review_telemetry;
 pub mod shell_integration;
 pub mod update;
 
@@ -28,14 +29,15 @@ pub use dashboard::{
     DashboardService, DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome,
     EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
     MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewComment, ReviewFile,
-    ReviewFinding, ReviewPreparation, ReviewSeverity, ReviewSkippedFile, ReviewStatus,
-    ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdatePullRequestOutcome,
-    AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
+    ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewSeverity, ReviewSkippedFile,
+    ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
+    UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };
 pub use opencode_models::{
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,
 };
 pub use opencode_turn::{OpencodeTurn, OpencodeTurnWatcher};
+pub use review_telemetry::ReviewScanTelemetry;
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,

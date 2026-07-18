@@ -42,8 +42,8 @@ use crate::services::{
     DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
     FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
     OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
-    ReviewPreparation, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase,
-    UpdateProgress, UpdateSource,
+    ReviewPreparation, ReviewScanTelemetry, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -198,11 +198,13 @@ enum AppEvent {
         /// True when this was already the one retry after unparseable output.
         retried: bool,
         result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
     },
     /// An "Other" revision of the current finding returned.
     ReviewPrRevised {
         index: usize,
         result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
     },
     /// One approved finding was posted (or failed to post) on the PR.
     ReviewPrPosted {
@@ -2776,6 +2778,7 @@ impl App {
         file_index: usize,
         retried: bool,
         result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         // Guard against a late arrival after the user cancelled or the scan
@@ -2786,6 +2789,9 @@ impl App {
             .is_some_and(|s| s.scan_phase_active());
         if !active {
             return;
+        }
+        if let (Some(screen), Some(telemetry)) = (self.review_pr.as_mut(), telemetry) {
+            screen.record_scan_telemetry(telemetry);
         }
         match result {
             Ok(findings) => {
@@ -2824,11 +2830,15 @@ impl App {
         &mut self,
         index: usize,
         result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let _ = tx;
         if !self.review_at_index(index) {
             return;
+        }
+        if let (Some(screen), Some(telemetry)) = (self.review_pr.as_mut(), telemetry) {
+            screen.record_scan_telemetry(telemetry);
         }
         // A revision must always return to the Decision screen — with the
         // revised comment when the model obeyed, otherwise with the previous
@@ -5047,10 +5057,13 @@ impl App {
                 file_index,
                 retried,
                 result,
-            } => self.apply_review_pr_scanned(file_index, retried, result, tx),
-            AppEvent::ReviewPrRevised { index, result } => {
-                self.apply_review_pr_revised(index, result, tx)
-            }
+                telemetry,
+            } => self.apply_review_pr_scanned(file_index, retried, result, telemetry, tx),
+            AppEvent::ReviewPrRevised {
+                index,
+                result,
+                telemetry,
+            } => self.apply_review_pr_revised(index, result, telemetry, tx),
             AppEvent::ReviewPrPosted { index, result } => {
                 self.apply_review_pr_posted(index, result, tx)
             }
@@ -7513,19 +7526,21 @@ fn kick_off_scan_review_file(
             file_index,
             retried,
             result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service
+        let attempt = service
             .scan_review_file(&req.worktree_path, &req.file, None, None)
-            .await
-            .map_err(|err| user_friendly_message(&err));
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index,
             retried,
             result,
+            telemetry: Some(attempt.telemetry),
         });
     });
 }
@@ -7542,19 +7557,21 @@ fn kick_off_scan_review_coverage(
             file_index: COVERAGE_SCAN_INDEX,
             retried,
             result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service
+        let attempt = service
             .scan_review_coverage(&req.worktree_path, &req.files)
-            .await
-            .map_err(|err| user_friendly_message(&err));
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index: COVERAGE_SCAN_INDEX,
             retried,
             result,
+            telemetry: Some(attempt.telemetry),
         });
     });
 }
@@ -7570,21 +7587,26 @@ fn kick_off_revise_review_finding(
         let _ = tx.send(AppEvent::ReviewPrRevised {
             index,
             result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service
+        let attempt = service
             .scan_review_file(
                 &req.worktree_path,
                 &req.file,
                 Some(&req.feedback),
                 Some(&req.previous_finding),
             )
-            .await
-            .map_err(|err| user_friendly_message(&err));
-        let _ = tx.send(AppEvent::ReviewPrRevised { index, result });
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrRevised {
+            index,
+            result,
+            telemetry: Some(attempt.telemetry),
+        });
     });
 }
 

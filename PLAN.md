@@ -50,18 +50,18 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] Each app, tester, and coverage call records scan identity, prompt bytes, input/output token usage, duration, and parsed finding count.
-- [ ] The Done report includes one concise aggregate usage row with call count and available token totals.
-- [ ] Only a bounded number of recent review runs is persisted under `~/.wisetree/`, using camelCase serialization and best-effort I/O.
-- [ ] Tests cover usage parsing, aggregation/formatting, retention bounds, and the Done-report row.
-- [ ] The local opencode usage source is exercised against fixtures matching the discovered session/step token shape.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #2 Status line.
+- [x] Each app, tester, and coverage call records scan identity, prompt bytes, input/output token usage, duration, and parsed finding count.
+- [x] The Done report includes one concise aggregate usage row with call count and available token totals.
+- [x] Only a bounded number of recent review runs is persisted under `~/.wisetree/`, using camelCase serialization and best-effort I/O.
+- [x] Tests cover usage parsing, aggregation/formatting, retention bounds, and the Done-report row.
+- [x] The local opencode usage source is exercised against fixtures matching the discovered session/step token shape.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #2 Status line.
 
 **Edge cases**:
 
-- [ ] Missing, locked, changed-schema, or unreadable opencode state records `tokens: unavailable` while retaining prompt bytes, duration, and findings.
-- [ ] Failed and retried calls remain measurable as distinct paid calls without double-counting findings from discarded output.
-- [ ] Telemetry persistence failure never fails or delays the review workflow.
+- [x] Missing, locked, changed-schema, or unreadable opencode state records `tokens: unavailable` while retaining prompt bytes, duration, and findings.
+- [x] Failed and retried calls remain measurable as distinct paid calls without double-counting findings from discarded output.
+- [x] Telemetry persistence failure never fails or delays the review workflow.
 
 ---
 
@@ -269,7 +269,7 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 | Section | Name | Status |
 |---------|------|--------|
 | 1 | Cache-align prompt templates | ✅ Done |
-| 2 | Per-scan token telemetry | ⬚ Pending |
+| 2 | Per-scan token telemetry | ✅ Done |
 | 3 | Cheap retry through reformatting | ⬚ Pending |
 | 4 | Adaptive merged scan | ⬚ Pending |
 | 5 | Pre-digest shared repository context | ⬚ Pending |
