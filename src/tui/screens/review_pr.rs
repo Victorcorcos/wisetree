@@ -229,8 +229,13 @@ pub struct ReviewPullRequestScreen {
     /// Small diffs combine application review and coverage in the sentinel
     /// call; large diffs retain per-file application scans plus coverage.
     scan_mode: ReviewScanMode,
-    /// Index of the next file not yet handed to a scan task.
+    /// File indices in dispatch order: tester scans first, then split-mode
+    /// application scans. `next_scan` indexes this list.
+    scan_order: Vec<usize>,
     next_scan: usize,
+    tester_scans_total: usize,
+    tester_scans_done: usize,
+    tester_findings: Vec<ReviewFinding>,
     /// Whether this run includes the whole-diff test-coverage pass — only
     /// when at least one changed application (non-test) file survived the
     /// filter, since a tests-only diff has no coverage to judge.
@@ -284,7 +289,11 @@ impl ReviewPullRequestScreen {
             files: Vec::new(),
             context: ReviewContext::default(),
             scan_mode: ReviewScanMode::Split,
+            scan_order: Vec::new(),
             next_scan: 0,
+            tester_scans_total: 0,
+            tester_scans_done: 0,
+            tester_findings: Vec::new(),
             has_coverage_scan: false,
             coverage_dispatched: false,
             in_flight: Vec::new(),
@@ -393,7 +402,15 @@ impl ReviewPullRequestScreen {
         self.owner = owner;
         self.repo = repo;
         self.head_sha = sha;
+        self.rebuild_scan_order();
         self.next_scan = 0;
+        self.tester_scans_total = self
+            .files
+            .iter()
+            .filter(|file| is_test_file(&file.path))
+            .count();
+        self.tester_scans_done = 0;
+        self.tester_findings.clear();
         self.has_coverage_scan = self.files.iter().any(|f| !is_test_file(&f.path));
         self.coverage_dispatched = false;
         self.in_flight.clear();
@@ -406,6 +423,7 @@ impl ReviewPullRequestScreen {
 
     pub fn set_scan_mode(&mut self, scan_mode: ReviewScanMode) {
         self.scan_mode = scan_mode;
+        self.rebuild_scan_order();
     }
 
     pub fn set_review_context(&mut self, context: ReviewContext) {
@@ -447,22 +465,20 @@ impl ReviewPullRequestScreen {
     /// Hand out the next file to scan, tracking it as in-flight. `None`
     /// once every file has been dispatched.
     pub fn take_next_scan_file(&mut self) -> Option<(usize, ReviewFile)> {
-        while let Some(file) = self.files.get(self.next_scan).cloned() {
-            let index = self.next_scan;
-            self.next_scan += 1;
-            if self.scan_mode == ReviewScanMode::Merged && !is_test_file(&file.path) {
-                continue;
-            }
-            self.in_flight.push(file.path.clone());
-            return Some((index, file));
-        }
-        None
+        let index = *self.scan_order.get(self.next_scan)?;
+        let file = self.files.get(index)?.clone();
+        self.next_scan += 1;
+        self.in_flight.push(file.path.clone());
+        Some((index, file))
     }
 
     /// Hand out the whole-diff coverage scan, tracking it as in-flight.
     /// `None` when this run has no coverage pass or it already went out.
     pub fn take_coverage_scan(&mut self) -> Option<Vec<ReviewFile>> {
-        if !self.has_coverage_scan || self.coverage_dispatched {
+        if !self.has_coverage_scan
+            || self.coverage_dispatched
+            || self.tester_scans_done < self.tester_scans_total
+        {
             return None;
         }
         self.coverage_dispatched = true;
@@ -480,6 +496,14 @@ impl ReviewPullRequestScreen {
     /// update the progress message and the in-flight panel.
     pub fn note_scan_done(&mut self, file_index: usize) {
         self.scans_done += 1;
+        if file_index != COVERAGE_SCAN_INDEX
+            && self
+                .files
+                .get(file_index)
+                .is_some_and(|file| is_test_file(&file.path))
+        {
+            self.tester_scans_done += 1;
+        }
         let label = if file_index == COVERAGE_SCAN_INDEX {
             Some(self.sentinel_scan_label())
         } else {
@@ -500,15 +524,40 @@ impl ReviewPullRequestScreen {
     }
 
     fn scan_units_total(&self) -> usize {
-        let file_scans = match self.scan_mode {
-            ReviewScanMode::Merged => self
-                .files
-                .iter()
-                .filter(|file| is_test_file(&file.path))
-                .count(),
-            ReviewScanMode::Split => self.files.len(),
-        };
-        file_scans + usize::from(self.has_coverage_scan)
+        self.scan_order.len() + usize::from(self.has_coverage_scan)
+    }
+
+    fn rebuild_scan_order(&mut self) {
+        self.scan_order = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| is_test_file(&file.path))
+            .map(|(index, _)| index)
+            .chain(
+                self.files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, file)| {
+                        self.scan_mode == ReviewScanMode::Split && !is_test_file(&file.path)
+                    })
+                    .map(|(index, _)| index),
+            )
+            .collect();
+    }
+
+    pub fn record_tester_findings(&mut self, file_index: usize, findings: &[ReviewFinding]) {
+        if self
+            .files
+            .get(file_index)
+            .is_some_and(|file| is_test_file(&file.path))
+        {
+            self.tester_findings.extend_from_slice(findings);
+        }
+    }
+
+    pub fn tester_findings(&self) -> Vec<ReviewFinding> {
+        self.tester_findings.clone()
     }
 
     fn sentinel_scan_label(&self) -> &'static str {
@@ -2158,11 +2207,44 @@ mod tests {
         assert_eq!(index, 1);
         assert_eq!(tester.path, "tests/a_test.rs");
         assert!(screen.take_next_scan_file().is_none());
-        assert_eq!(screen.take_coverage_scan().unwrap().len(), 3);
+        assert!(screen.take_coverage_scan().is_none());
         screen.note_scan_done(index);
         assert!(screen.scans_pending());
+        assert_eq!(screen.take_coverage_scan().unwrap().len(), 3);
         screen.note_scan_done(COVERAGE_SCAN_INDEX);
         assert!(!screen.scans_pending());
+    }
+
+    #[test]
+    fn split_pool_prioritizes_testers_and_gates_coverage_until_they_settle() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![
+                file("src/a.rs"),
+                file("tests/a_test.rs"),
+                file("tests/b_test.rs"),
+                file("src/b.rs"),
+            ],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        let indices = (0..4)
+            .map(|_| screen.take_next_scan_file().unwrap().0)
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![1, 2, 0, 3]);
+        assert!(screen.take_coverage_scan().is_none());
+
+        let weak = finding("tests/a_test.rs", Some(3), ReviewSeverity::Medium);
+        screen.record_tester_findings(1, std::slice::from_ref(&weak));
+        screen.record_tester_findings(0, &[finding("src/a.rs", Some(2), ReviewSeverity::Low)]);
+        screen.note_scan_done(1);
+        assert!(screen.take_coverage_scan().is_none());
+        // The second tester settling without findings models a terminal
+        // failed scan: it still releases the coverage gate.
+        screen.note_scan_done(2);
+        assert_eq!(screen.tester_findings(), vec![weak]);
+        assert_eq!(screen.take_coverage_scan().unwrap().len(), 4);
     }
 
     #[test]

@@ -21,6 +21,8 @@ Judge only the behavior introduced or modified by the numbered `+` lines of the 
 - each meaningful branch and boundary (empty, nil, zero, duplicate, max-size, out-of-range)
 - the exact broken scenario, when the diff fixes a bug (regression test)
 
+The harness may provide findings from the test-quality specialists. A scenario whose only protection is a flagged test remains at risk: verify that test's assertion yourself before counting it as coverage, and raise the one missing-coverage finding when the assertion does not actually protect the behavior. The feed is evidence for this coverage judgment only; do not repeat the tester's test-code finding.
+
 Raise each missing scenario as its own specific finding, anchored to the application file (and line) whose behavior is untested — never one vague "add more tests". When several scenarios of the same function are untested, you may group them into one finding on that function; never spread the same recommendation across multiple findings or files.
 
 ## Quality rules
@@ -67,6 +69,12 @@ Rules: `CATEGORY`, `SEVERITY`, `FILE`, `LINE`, `START_LINE`, and `TITLE` are sin
 
 ```
 REPO_CONTEXT
+```
+
+- Test-quality findings from completed tester scans (advisory evidence; empty when none):
+
+```
+TEST_QUALITY_FINDINGS
 ```
 
 - The PR's changed files, one `### FILE: <path>` section per file. Every line that exists in the new version of a file is prefixed with its new-side line number; removed lines have no number:

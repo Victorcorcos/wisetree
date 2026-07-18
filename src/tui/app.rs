@@ -2617,6 +2617,7 @@ impl App {
         };
         let mode = screen.scan_mode();
         let context = screen.review_context();
+        let tester_findings = screen.tester_findings();
         kick_off_scan_review_coverage(
             self.git_root.clone(),
             self.current_dashboard_config(),
@@ -2625,6 +2626,7 @@ impl App {
                 files,
                 mode,
                 context,
+                tester_findings,
                 retry: ReviewScanRetry::Initial,
                 raw_output: None,
             },
@@ -2650,6 +2652,7 @@ impl App {
         if file_index == COVERAGE_SCAN_INDEX {
             let files = screen.all_files();
             let mode = screen.scan_mode();
+            let tester_findings = screen.tester_findings();
             kick_off_scan_review_coverage(
                 self.git_root.clone(),
                 self.current_dashboard_config(),
@@ -2658,6 +2661,7 @@ impl App {
                     files,
                     mode,
                     context,
+                    tester_findings,
                     retry,
                     raw_output,
                 },
@@ -2823,6 +2827,7 @@ impl App {
         match result {
             Ok(findings) => {
                 if let Some(screen) = self.review_pr.as_mut() {
+                    screen.record_tester_findings(file_index, &findings);
                     // Deterministic dedup: findings the PR already carries
                     // as a wisetree comment never re-enter the walkthrough,
                     // regardless of whether the model honored the
@@ -7517,6 +7522,7 @@ struct ReviewCoverageScanRequest {
     files: Vec<ReviewFile>,
     mode: ReviewScanMode,
     context: ReviewContext,
+    tester_findings: Vec<ReviewFinding>,
     retry: ReviewScanRetry,
     raw_output: Option<String>,
 }
@@ -7655,12 +7661,22 @@ fn kick_off_scan_review_coverage(
             ReviewScanRetry::Initial | ReviewScanRetry::Full => match req.mode {
                 ReviewScanMode::Merged => {
                     service
-                        .scan_review_merged(&req.worktree_path, &req.files, &req.context)
+                        .scan_review_merged(
+                            &req.worktree_path,
+                            &req.files,
+                            &req.context,
+                            &req.tester_findings,
+                        )
                         .await
                 }
                 ReviewScanMode::Split => {
                     service
-                        .scan_review_coverage(&req.worktree_path, &req.files, &req.context)
+                        .scan_review_coverage(
+                            &req.worktree_path,
+                            &req.files,
+                            &req.context,
+                            &req.tester_findings,
+                        )
                         .await
                 }
             },

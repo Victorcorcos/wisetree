@@ -106,6 +106,8 @@ const REVIEW_REPO_CONTEXT_MAX_BYTES: usize = 6 * 1024;
 const REVIEW_DIRECTORY_INVENTORY_MAX_BYTES: usize = 2 * 1024;
 /// Full new-side files at or below this cap are attached to scan inputs.
 const REVIEW_FILE_INLINE_MAX_BYTES: usize = 16 * 1024;
+/// Compact tester evidence passed to the sole coverage-owning scan.
+const REVIEW_TESTER_FINDINGS_MAX_BYTES: usize = 2 * 1024;
 /// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
 /// embedded PTY (the user watches it and can Esc out), so only the judge —
 /// which classifies one short comment — and the local git operations
@@ -3018,6 +3020,7 @@ impl DashboardService {
         worktree_path: &str,
         files: &[ReviewFile],
         context: &ReviewContext,
+        tester_findings: &[ReviewFinding],
     ) -> ReviewScanAttempt {
         let started = Instant::now();
         let cwd = PathBuf::from(worktree_path);
@@ -3032,7 +3035,7 @@ impl DashboardService {
                 None,
             );
         }
-        let prompt = build_review_coverage_prompt(files, context);
+        let prompt = build_review_coverage_prompt(files, context, tester_findings);
         let prompt_bytes = prompt.len();
         let title = review_scan_title();
         let mut run_args: Vec<String> = vec![
@@ -3088,6 +3091,7 @@ impl DashboardService {
         worktree_path: &str,
         files: &[ReviewFile],
         context: &ReviewContext,
+        tester_findings: &[ReviewFinding],
     ) -> ReviewScanAttempt {
         let started = Instant::now();
         let cwd = PathBuf::from(worktree_path);
@@ -3103,7 +3107,7 @@ impl DashboardService {
             );
         }
         let tables_path = materialize_review_tables().await;
-        let prompt = build_review_merged_prompt(files, context, &tables_path);
+        let prompt = build_review_merged_prompt(files, context, tester_findings, &tables_path);
         let prompt_bytes = prompt.len();
         let title = review_scan_title();
         let mut run_args: Vec<String> = vec![
@@ -6705,24 +6709,44 @@ fn build_review_scan_prompt(
 /// combined — coverage is a cross-file judgment no per-file scan can make.
 /// Substitution order mirrors [`build_review_scan_prompt`]: the (largest,
 /// user-controlled) diff goes last.
-fn build_review_coverage_prompt(files: &[ReviewFile], context: &ReviewContext) -> String {
+fn build_review_coverage_prompt(
+    files: &[ReviewFile],
+    context: &ReviewContext,
+    tester_findings: &[ReviewFinding],
+) -> String {
     const COVERAGE_PROMPT: &str = include_str!("../../prompts/reviewer_coverage.md");
-    build_review_whole_diff_prompt(COVERAGE_PROMPT, files, context, None, false)
+    build_review_whole_diff_prompt(
+        COVERAGE_PROMPT,
+        files,
+        context,
+        tester_findings,
+        None,
+        false,
+    )
 }
 
 fn build_review_merged_prompt(
     files: &[ReviewFile],
     context: &ReviewContext,
+    tester_findings: &[ReviewFinding],
     tables_path: &str,
 ) -> String {
     const MERGED_PROMPT: &str = include_str!("../../prompts/reviewer.md");
-    build_review_whole_diff_prompt(MERGED_PROMPT, files, context, Some(tables_path), true)
+    build_review_whole_diff_prompt(
+        MERGED_PROMPT,
+        files,
+        context,
+        tester_findings,
+        Some(tables_path),
+        true,
+    )
 }
 
 fn build_review_whole_diff_prompt(
     template: &str,
     files: &[ReviewFile],
     context: &ReviewContext,
+    tester_findings: &[ReviewFinding],
     tables_path: Option<&str>,
     include_full_content: bool,
 ) -> String {
@@ -6765,15 +6789,58 @@ fn build_review_whole_diff_prompt(
         }
     }
     let context = context.rendered();
+    let tester_findings = format_test_quality_findings(tester_findings);
+    let tester_findings = if tester_findings.is_empty() {
+        "(none)"
+    } else {
+        &tester_findings
+    };
     substitute_review_prompt(
         template,
         &[
             ("TABLES_PATH", tables_path.unwrap_or("")),
             ("REPO_CONTEXT", &context),
+            ("TEST_QUALITY_FINDINGS", tester_findings),
             ("EXISTING_COMMENTS", &existing),
             ("FULL_DIFF", &diff),
         ],
     )
+}
+
+pub(crate) fn format_test_quality_findings(findings: &[ReviewFinding]) -> String {
+    let mut rendered = String::new();
+    for finding in findings {
+        let anchor = finding.line.map_or_else(
+            || finding.file.clone(),
+            |line| format!("{}:{line}", finding.file),
+        );
+        let title = compact_review_text(&finding.title, 100);
+        let explanation = compact_review_text(&finding.explanation, 220);
+        let detail = if explanation.is_empty() {
+            title
+        } else {
+            format!("{title}: {explanation}")
+        };
+        let line = format!("- {anchor} — {detail}\n");
+        if rendered.len() + line.len() > REVIEW_TESTER_FINDINGS_MAX_BYTES {
+            break;
+        }
+        rendered.push_str(&line);
+    }
+    rendered.truncate(rendered.trim_end().len());
+    rendered
+}
+
+fn compact_review_text(value: &str, max_bytes: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() <= max_bytes {
+        return compact;
+    }
+    let mut end = max_bytes;
+    while !compact.is_char_boundary(end) {
+        end -= 1;
+    }
+    compact[..end].trim_end().to_string()
 }
 
 fn review_file_content_for_prompt(file: &ReviewFile) -> String {
@@ -8331,7 +8398,18 @@ new file mode 100644
             convention_docs: "coverage convention".to_string(),
             directory_inventory: "coverage inventory".to_string(),
         };
-        let prompt = build_review_coverage_prompt(&[app, test], &context);
+        let tester_findings = vec![ReviewFinding {
+            category: "Test".to_string(),
+            severity: ReviewSeverity::Medium,
+            file: "tests/lib_test.rs".to_string(),
+            start_line: None,
+            line: Some(9),
+            title: "Assertion is too weak".to_string(),
+            explanation: "Only checks truthiness.\nThe wrong value stays green.".to_string(),
+            suggestion: None,
+        }];
+        let files = [app, test];
+        let prompt = build_review_coverage_prompt(&files, &context, &tester_findings);
         assert!(prompt.starts_with("You are the test-coverage specialist"));
         assert!(prompt.contains("### FILE: src/lib.rs"));
         assert!(prompt.contains("     1 +let x = 1;"));
@@ -8343,6 +8421,13 @@ new file mode 100644
         assert!(prompt.contains("coverage inventory"));
         assert!(prompt.contains("never your ability to read the real files"));
         assert!(!prompt.contains("coverage body must stay out"));
+        assert!(prompt.contains(
+            "- tests/lib_test.rs:9 — Assertion is too weak: Only checks truthiness. The wrong value stays green."
+        ));
+        assert!(prompt.contains("verify that test's assertion yourself"));
+        assert!(!prompt.contains("TEST_QUALITY_FINDINGS"));
+        let empty_feed = build_review_coverage_prompt(&files, &context, &[]);
+        assert!(empty_feed.contains("```\n(none)\n```"));
         let contract = prompt.find("## Output contract").unwrap();
         let inputs = prompt.find("## Inputs (provided by the harness)").unwrap();
         assert!(contract < inputs, "static contract must precede inputs");
@@ -8390,7 +8475,18 @@ new file mode 100644
             convention_docs: "merged convention".to_string(),
             directory_inventory: "merged inventory".to_string(),
         };
-        let prompt = build_review_merged_prompt(&[app, test], &context, "/tmp/tables.md");
+        let tester_findings = vec![ReviewFinding {
+            category: "Test".to_string(),
+            severity: ReviewSeverity::Low,
+            file: "tests/lib_test.rs".to_string(),
+            start_line: None,
+            line: None,
+            title: "Over-mocked flow".to_string(),
+            explanation: "Mocks the unit under test.".to_string(),
+            suggestion: None,
+        }];
+        let prompt =
+            build_review_merged_prompt(&[app, test], &context, &tester_findings, "/tmp/tables.md");
         assert!(prompt.contains(
             "CATEGORY: <Code Smell | Security | Performance | Test Quality | Convention>"
         ));
@@ -8406,7 +8502,37 @@ new file mode 100644
         assert!(prompt.contains("fn merged_body() {}"));
         assert!(prompt.contains("read `tests/lib_test.rs` before emitting"));
         assert!(prompt.contains("MUST read that real full file"));
+        assert!(
+            prompt.contains("- tests/lib_test.rs — Over-mocked flow: Mocks the unit under test.")
+        );
+        assert!(prompt.contains("verify that test's assertion yourself"));
+        assert!(!prompt.contains("TEST_QUALITY_FINDINGS"));
         assert!(prompt.find("## Output contract").unwrap() < prompt.find("## Inputs").unwrap());
+    }
+
+    #[test]
+    fn test_quality_findings_feed_is_single_line_bounded_and_empty_safe() {
+        assert!(format_test_quality_findings(&[]).is_empty());
+        let findings = (0..30)
+            .map(|index| ReviewFinding {
+                category: "Test".to_string(),
+                severity: ReviewSeverity::Medium,
+                file: format!("tests/case_{index}_test.rs"),
+                start_line: None,
+                line: Some(8),
+                title: "Weak\n assertion".repeat(10),
+                explanation: "Only checks that the result is not null. ".repeat(20),
+                suggestion: None,
+            })
+            .collect::<Vec<_>>();
+        let rendered = format_test_quality_findings(&findings);
+        assert!(rendered.len() <= REVIEW_TESTER_FINDINGS_MAX_BYTES);
+        assert!(rendered.starts_with("- tests/case_0_test.rs:8 — Weak assertion"));
+        assert!(rendered.lines().all(|line| line.starts_with("- tests/")));
+        assert!(
+            rendered.lines().count() < findings.len(),
+            "the cap must apply"
+        );
     }
 
     #[test]

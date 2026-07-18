@@ -161,18 +161,18 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] Tester scans are dispatched before or alongside split app scans, while the merged/coverage sentinel cannot dispatch until every tester scan reaches a terminal state.
-- [ ] Tester findings are formatted into bounded one-line evidence entries and passed only to the sole coverage owner.
-- [ ] Merged and coverage prompts instruct the model to verify flagged weak tests before counting them as coverage.
-- [ ] Tester and split-app prompts remain forbidden from creating missing-coverage findings.
-- [ ] Tests cover ordering/gating, out-of-order completions, tester failures, empty feeds, feed formatting, and exactly-one coverage ownership.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #7 Status line.
+- [x] Tester scans are dispatched before or alongside split app scans, while the merged/coverage sentinel cannot dispatch until every tester scan reaches a terminal state.
+- [x] Tester findings are formatted into bounded one-line evidence entries and passed only to the sole coverage owner.
+- [x] Merged and coverage prompts instruct the model to verify flagged weak tests before counting them as coverage.
+- [x] Tester and split-app prompts remain forbidden from creating missing-coverage findings.
+- [x] Tests cover ordering/gating, out-of-order completions, tester failures, empty feeds, feed formatting, and exactly-one coverage ownership.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #7 Status line.
 
 **Edge cases**:
 
-- [ ] A failed tester scan still settles the gate and remaining valid tester findings are forwarded.
-- [ ] PRs with no changed test files dispatch the coverage owner without an unnecessary wait.
-- [ ] Duplicate tester findings do not create duplicate coverage owners or direct coverage comments.
+- [x] A failed tester scan still settles the gate and remaining valid tester findings are forwarded.
+- [x] PRs with no changed test files dispatch the coverage owner without an unnecessary wait.
+- [x] Duplicate tester findings do not create duplicate coverage owners or direct coverage comments.
 
 ---
 
@@ -271,10 +271,10 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 | 1 | Cache-align prompt templates | ✅ Done |
 | 2 | Per-scan token telemetry | ✅ Done |
 | 3 | Cheap retry through reformatting | ✅ Done |
-| 4 | Adaptive merged scan | ⬚ Pending |
-| 5 | Pre-digest shared repository context | ⬚ Pending |
-| 6 | Inline capped full-file content | ⬚ Pending |
-| 7 | Feed test-quality findings to coverage | ⬚ Pending |
+| 4 | Adaptive merged scan | ✅ Done |
+| 5 | Pre-digest shared repository context | ✅ Done |
+| 6 | Inline capped full-file content | ✅ Done |
+| 7 | Feed test-quality findings to coverage | ✅ Done |
 | 8 | Slim test diffs to scenario skeletons | ⬚ Pending |
 | 9 | Compact existing-comment keys | ⬚ Pending |
 | 10 | Expand deterministic skip rules | ⬚ Pending |

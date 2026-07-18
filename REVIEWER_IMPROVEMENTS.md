@@ -292,6 +292,8 @@ call's sentinel slot gains a "tester scans settled" gate), a findings→lines
 formatter in `src/services/dashboard.rs`, the merged and coverage prompts
 (respecting #1's prefix layout).
 
+**Status:** ✅ implemented — commit 74c8015. as specified; tester evidence is bounded to 2KB.
+
 ## #8 — Slim test diffs to scenario skeletons
 
 **Attacks wastes #1/#3 in both #4 modes. After #7 so the coverage-judging

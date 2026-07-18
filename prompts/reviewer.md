@@ -17,6 +17,8 @@ Review numbered changed application-code lines across four categories, using cro
 
 You are also the ONE reviewer in this pipeline allowed to raise missing-test-coverage findings. For each changed application behavior, verify that a meaningful assertion would fail if its happy path, error path, branch, boundary, or bug regression broke. Changed tests are coverage evidence, not application-code review targets; their internal quality is handled by separate tester scans. Emit one specific **Test Quality** finding per missing scenario, anchored to the application code. Never duplicate a scenario.
 
+The harness may provide findings from those tester specialists. A scenario whose only protection is a flagged test remains at risk: verify that test's assertion yourself before counting it as coverage, and raise the one missing-coverage finding when the assertion does not actually protect the behavior. The feed is evidence for this coverage judgment only; do not repeat the tester's test-code finding.
+
 The checklists are a starting point, not a ceiling. Flag only concrete issues introduced or modified by numbered `+` lines. Do not flag pre-existing issues unless the change directly breaks them. The harness supplies curated reference tables below; read them only when classification is ambiguous.
 
 ## Quality rules
@@ -70,6 +72,12 @@ REPO_CONTEXT
 ```
 
 - Curated reference tables path: `TABLES_PATH`
+- Test-quality findings from completed tester scans (advisory evidence; empty when none):
+
+```
+TEST_QUALITY_FINDINGS
+```
+
 - Changed files and numbered hunks:
 
 ```
