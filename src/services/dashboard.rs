@@ -6121,8 +6121,9 @@ pub(crate) fn is_test_file(path: &str) -> bool {
 }
 
 /// Render the per-file scan (or revision) prompt: `prompts/reviewer_tester.md`
-/// for test files (test-quality lens), `prompts/reviewer.md` for everything
-/// else. Fixed tokens are substituted first and the user-controlled blocks
+/// for test files (test-quality lens), `prompts/reviewer_application.md` for
+/// application code (every file [`is_test_file`] doesn't classify as a test).
+/// Fixed tokens are substituted first and the user-controlled blocks
 /// last so an earlier placeholder can't be clobbered by a value containing a
 /// later token. `feedback` / `previous_finding` are only present on an
 /// "Other" revision of a single finding.
@@ -6132,7 +6133,7 @@ fn build_review_scan_prompt(
     feedback: Option<&str>,
     previous_finding: Option<&str>,
 ) -> String {
-    const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer.md");
+    const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer_application.md");
     const TESTER_PROMPT: &str = include_str!("../../prompts/reviewer_tester.md");
     let template = if is_test_file(&file.path) {
         TESTER_PROMPT
