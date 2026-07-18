@@ -873,6 +873,9 @@ pub struct ReviewFinding {
 pub struct ReviewScanAttempt {
     pub result: Result<Vec<ReviewFinding>>,
     pub telemetry: ReviewScanTelemetry,
+    /// Present only when opencode returned text that failed the parser. The
+    /// retry path can repair this text without paying to inspect the diff.
+    pub raw_output: Option<String>,
 }
 
 impl ReviewFinding {
@@ -2891,6 +2894,7 @@ impl DashboardService {
                 started,
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
+                None,
             );
         }
         let tables_path = materialize_review_tables().await;
@@ -2909,28 +2913,36 @@ impl DashboardService {
         ];
         run_args.extend(run_variant_args(&self.config.ai.review.thinking));
         let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let result = match time::timeout(
+        let (result, raw_output) = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
             run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
         )
         .await
         {
-            Err(_) => Err(WisetreeError::other(
-                "opencode review scan timed out after 240s",
-            )),
-            Ok(Err(err)) => Err(WisetreeError::other(err)),
-            Ok(Ok(output)) => parse_review_findings(
+            Err(_) => (
+                Err(WisetreeError::other(
+                    "opencode review scan timed out after 240s",
+                )),
+                None,
+            ),
+            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
+            Ok(Ok(output)) => match parse_review_findings(
                 &output,
                 &file.path,
                 &file.commentable_lines,
                 &file.annotated_diff,
-            )
-            .ok_or_else(|| {
-                WisetreeError::other("could not parse findings from the review AI output.")
-            }),
+            ) {
+                Some(findings) => (Ok(findings), None),
+                None => (
+                    Err(WisetreeError::other(
+                        "could not parse findings from the review AI output.",
+                    )),
+                    Some(output),
+                ),
+            },
         };
         let usage = opencode_usage_for_title(title).await;
-        review_scan_attempt(scan, prompt_bytes, started, usage, result)
+        review_scan_attempt(scan, prompt_bytes, started, usage, result, raw_output)
     }
 
     /// Scan the WHOLE diff once for missing test coverage with a single
@@ -2954,6 +2966,7 @@ impl DashboardService {
                 started,
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
+                None,
             );
         }
         let prompt = build_review_coverage_prompt(files);
@@ -2971,22 +2984,144 @@ impl DashboardService {
         ];
         run_args.extend(run_variant_args(&self.config.ai.review.thinking));
         let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let result = match time::timeout(
+        let (result, raw_output) = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
             run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
         )
         .await
         {
-            Err(_) => Err(WisetreeError::other(
-                "opencode coverage scan timed out after 240s",
-            )),
-            Ok(Err(err)) => Err(WisetreeError::other(err)),
-            Ok(Ok(output)) => parse_coverage_findings(&output, files).ok_or_else(|| {
-                WisetreeError::other("could not parse findings from the coverage AI output.")
-            }),
+            Err(_) => (
+                Err(WisetreeError::other(
+                    "opencode coverage scan timed out after 240s",
+                )),
+                None,
+            ),
+            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
+            Ok(Ok(output)) => match parse_coverage_findings(&output, files) {
+                Some(findings) => (Ok(findings), None),
+                None => (
+                    Err(WisetreeError::other(
+                        "could not parse findings from the coverage AI output.",
+                    )),
+                    Some(output),
+                ),
+            },
         };
         let usage = opencode_usage_for_title(title).await;
-        review_scan_attempt("coverage".to_string(), prompt_bytes, started, usage, result)
+        review_scan_attempt(
+            "coverage".to_string(),
+            prompt_bytes,
+            started,
+            usage,
+            result,
+            raw_output,
+        )
+    }
+
+    /// Repair a malformed per-file result without sending the diff again.
+    pub async fn reformat_review_file_output(
+        &self,
+        worktree_path: &str,
+        file: &ReviewFile,
+        previous_output: &str,
+    ) -> ReviewScanAttempt {
+        let prompt = build_review_reformat_prompt(false, previous_output);
+        self.run_review_reformat(
+            worktree_path,
+            format!("reformat:{}", file.path),
+            prompt,
+            |output| {
+                parse_review_findings(
+                    output,
+                    &file.path,
+                    &file.commentable_lines,
+                    &file.annotated_diff,
+                )
+            },
+        )
+        .await
+    }
+
+    /// Repair a malformed whole-diff coverage result without sending the
+    /// diff again.
+    pub async fn reformat_review_coverage_output(
+        &self,
+        worktree_path: &str,
+        files: &[ReviewFile],
+        previous_output: &str,
+    ) -> ReviewScanAttempt {
+        let prompt = build_review_reformat_prompt(true, previous_output);
+        self.run_review_reformat(
+            worktree_path,
+            "reformat:coverage".to_string(),
+            prompt,
+            |output| parse_coverage_findings(output, files),
+        )
+        .await
+    }
+
+    async fn run_review_reformat(
+        &self,
+        worktree_path: &str,
+        scan: String,
+        prompt: String,
+        parse: impl FnOnce(&str) -> Option<Vec<ReviewFinding>>,
+    ) -> ReviewScanAttempt {
+        let started = Instant::now();
+        let prompt_bytes = prompt.len();
+        let model = self.config.ai.review.model.trim().to_string();
+        if model.is_empty() {
+            return review_scan_attempt(
+                scan,
+                prompt_bytes,
+                started,
+                None,
+                Err(WisetreeError::other("ai.review model is not configured.")),
+                None,
+            );
+        }
+        let title = review_scan_title();
+        let mut run_args = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+            "--title".to_string(),
+            title.clone(),
+        ];
+        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
+        let (result, raw_output) = match time::timeout(
+            REVIEW_SCAN_TIMEOUT,
+            run_command(
+                &self.opencode_binary,
+                &run_args_ref,
+                Some(Path::new(worktree_path)),
+            ),
+        )
+        .await
+        {
+            Err(_) => (
+                Err(WisetreeError::other(
+                    "opencode review reformat timed out after 240s",
+                )),
+                None,
+            ),
+            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
+            Ok(Ok(output)) => match parse(&output) {
+                Some(findings) => (Ok(findings), None),
+                None => (
+                    Err(WisetreeError::other(
+                        "could not parse findings from the reformatted review output.",
+                    )),
+                    Some(output),
+                ),
+            },
+        };
+        let usage = opencode_usage_for_title(title).await;
+        review_scan_attempt(scan, prompt_bytes, started, usage, result, raw_output)
     }
 
     /// Post one approved finding to the PR — inline when it carries a
@@ -6078,11 +6213,13 @@ fn review_scan_attempt(
     started: Instant,
     usage: Option<(u64, u64)>,
     result: Result<Vec<ReviewFinding>>,
+    raw_output: Option<String>,
 ) -> ReviewScanAttempt {
     let findings = result.as_ref().map_or(0, Vec::len);
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     ReviewScanAttempt {
         result,
+        raw_output,
         telemetry: ReviewScanTelemetry {
             scan,
             prompt_bytes,
@@ -6192,6 +6329,34 @@ pub(crate) fn is_test_file(path: &str) -> bool {
         || stem.ends_with(".test")
         || stem.ends_with("_spec")
         || stem.ends_with(".spec")
+}
+
+fn build_review_reformat_prompt(coverage: bool, previous_output: &str) -> String {
+    const REFORMAT_PROMPT: &str = include_str!("../../prompts/reviewer_reformat.md");
+    const FILE_PROMPT: &str = include_str!("../../prompts/reviewer_application.md");
+    const COVERAGE_PROMPT: &str = include_str!("../../prompts/reviewer_coverage.md");
+    let source = if coverage {
+        COVERAGE_PROMPT
+    } else {
+        FILE_PROMPT
+    };
+    let contract = review_output_contract(source);
+    substitute_review_prompt(
+        REFORMAT_PROMPT,
+        &[
+            ("OUTPUT_CONTRACT", contract),
+            ("PREVIOUS_OUTPUT", previous_output),
+        ],
+    )
+}
+
+fn review_output_contract(prompt: &str) -> &str {
+    let start = prompt
+        .find("## Output contract")
+        .expect("embedded reviewer prompt has an output contract");
+    let tail = &prompt[start..];
+    let end = tail.find("\n## Inputs").unwrap_or(tail.len());
+    tail[..end].trim_end()
 }
 
 /// Render the per-file scan (or revision) prompt: `prompts/reviewer_tester.md`
@@ -7513,6 +7678,23 @@ new file mode 100644
         );
         assert!(literal.contains("keep FILE_DIFF and EXISTING_COMMENTS literal"));
         assert!(literal.contains("keep USER_FEEDBACK literal"));
+    }
+
+    #[test]
+    fn build_review_reformat_prompt_contains_only_contract_and_previous_output() {
+        let previous = "malformed OUTPUT_CONTRACT response";
+        let file = build_review_reformat_prompt(false, previous);
+        assert!(file.contains("===WISETREE-REVIEW-BEGIN==="));
+        assert!(file.contains("CATEGORY: <Code Smell | Security"));
+        assert!(!file.contains("FULL_DIFF"));
+        assert!(file.contains(previous));
+        assert!(file.find("## Inputs").unwrap() < file.find(previous).unwrap());
+
+        let coverage = build_review_reformat_prompt(true, "bad coverage output");
+        assert!(coverage.contains("CATEGORY: Test Quality\nSEVERITY:"));
+        assert!(coverage.contains("FILE: <path of the application file"));
+        assert!(coverage.contains("bad coverage output"));
+        assert!(!coverage.contains("FILE_DIFF"));
     }
 
     #[test]

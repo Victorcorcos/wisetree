@@ -195,10 +195,10 @@ enum AppEvent {
     ReviewPrScanned {
         /// File index the scan belongs to — guards against a stale result.
         file_index: usize,
-        /// True when this was already the one retry after unparseable output.
-        retried: bool,
+        retry: ReviewScanRetry,
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
+        raw_output: Option<String>,
     },
     /// An "Other" revision of the current finding returned.
     ReviewPrRevised {
@@ -2602,7 +2602,8 @@ impl App {
                     worktree_path,
                     file,
                     file_index,
-                    retried: false,
+                    retry: ReviewScanRetry::Initial,
+                    raw_output: None,
                 },
                 tx.clone(),
             );
@@ -2617,7 +2618,8 @@ impl App {
             ReviewCoverageScanRequest {
                 worktree_path,
                 files,
-                retried: false,
+                retry: ReviewScanRetry::Initial,
+                raw_output: None,
             },
             tx.clone(),
         );
@@ -2626,7 +2628,13 @@ impl App {
 
     /// Re-kick one scan after unparseable output — its slot in the pool
     /// stays occupied, so no extra scan starts.
-    fn retry_review_scan(&mut self, file_index: usize, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn retry_review_scan(
+        &mut self,
+        file_index: usize,
+        retry: ReviewScanRetry,
+        raw_output: Option<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
@@ -2639,7 +2647,8 @@ impl App {
                 ReviewCoverageScanRequest {
                     worktree_path,
                     files,
-                    retried: true,
+                    retry,
+                    raw_output,
                 },
                 tx.clone(),
             );
@@ -2655,7 +2664,8 @@ impl App {
                 worktree_path,
                 file,
                 file_index,
-                retried: true,
+                retry,
+                raw_output,
             },
             tx.clone(),
         );
@@ -2776,9 +2786,10 @@ impl App {
     fn apply_review_pr_scanned(
         &mut self,
         file_index: usize,
-        retried: bool,
+        retry: ReviewScanRetry,
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
+        raw_output: Option<String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         // Guard against a late arrival after the user cancelled or the scan
@@ -2810,11 +2821,14 @@ impl App {
                     self.settle_review_scans();
                 }
             }
-            // One retry per file for unparseable output; a second failure
-            // records a Failed row and frees the slot — one bad file never
-            // aborts the whole review.
-            Err(_) if !retried => self.retry_review_scan(file_index, tx),
             Err(message) => {
+                if let Some(next) = next_review_retry(retry, raw_output.is_some()) {
+                    let raw_output = (next == ReviewScanRetry::Reformat)
+                        .then_some(raw_output)
+                        .flatten();
+                    self.retry_review_scan(file_index, next, raw_output, tx);
+                    return;
+                }
                 if let Some(screen) = self.review_pr.as_mut() {
                     screen.record_scan_failure(file_index, truncate_error(&message));
                     screen.note_scan_done(file_index);
@@ -5055,10 +5069,11 @@ impl App {
             AppEvent::ReviewPrPrepared(result) => self.apply_review_pr_prepared(result, tx),
             AppEvent::ReviewPrScanned {
                 file_index,
-                retried,
+                retry,
                 result,
                 telemetry,
-            } => self.apply_review_pr_scanned(file_index, retried, result, telemetry, tx),
+                raw_output,
+            } => self.apply_review_pr_scanned(file_index, retry, result, telemetry, raw_output, tx),
             AppEvent::ReviewPrRevised {
                 index,
                 result,
@@ -7451,6 +7466,21 @@ fn kick_off_push_fix(
 /// hammering the provider.
 const REVIEW_SCAN_CONCURRENCY: usize = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewScanRetry {
+    Initial,
+    Reformat,
+    Full,
+}
+
+fn next_review_retry(retry: ReviewScanRetry, has_raw_output: bool) -> Option<ReviewScanRetry> {
+    match retry {
+        ReviewScanRetry::Initial if has_raw_output => Some(ReviewScanRetry::Reformat),
+        ReviewScanRetry::Initial | ReviewScanRetry::Reformat => Some(ReviewScanRetry::Full),
+        ReviewScanRetry::Full => None,
+    }
+}
+
 /// Inputs for one captured per-file scan call. `file_index` identifies the
 /// file the result belongs to (scans run in parallel); `retried` marks the
 /// one retry allowed after unparseable output.
@@ -7458,7 +7488,8 @@ struct ReviewScanRequest {
     worktree_path: String,
     file: ReviewFile,
     file_index: usize,
-    retried: bool,
+    retry: ReviewScanRetry,
+    raw_output: Option<String>,
 }
 
 /// Inputs for the single whole-diff coverage scan. Its result comes back
@@ -7467,7 +7498,8 @@ struct ReviewScanRequest {
 struct ReviewCoverageScanRequest {
     worktree_path: String,
     files: Vec<ReviewFile>,
-    retried: bool,
+    retry: ReviewScanRetry,
+    raw_output: Option<String>,
 }
 
 /// Inputs for an "Other" revision of a single finding.
@@ -7520,27 +7552,42 @@ fn kick_off_scan_review_file(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let file_index = req.file_index;
-    let retried = req.retried;
+    let retry = req.retry;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index,
-            retried,
+            retry,
             result: Err("Could not resolve git root.".to_string()),
             telemetry: None,
+            raw_output: None,
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let attempt = service
-            .scan_review_file(&req.worktree_path, &req.file, None, None)
-            .await;
+        let attempt = match retry {
+            ReviewScanRetry::Reformat => {
+                service
+                    .reformat_review_file_output(
+                        &req.worktree_path,
+                        &req.file,
+                        req.raw_output.as_deref().unwrap_or_default(),
+                    )
+                    .await
+            }
+            ReviewScanRetry::Initial | ReviewScanRetry::Full => {
+                service
+                    .scan_review_file(&req.worktree_path, &req.file, None, None)
+                    .await
+            }
+        };
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index,
-            retried,
+            retry,
             result,
             telemetry: Some(attempt.telemetry),
+            raw_output: attempt.raw_output,
         });
     });
 }
@@ -7551,27 +7598,42 @@ fn kick_off_scan_review_coverage(
     req: ReviewCoverageScanRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    let retried = req.retried;
+    let retry = req.retry;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index: COVERAGE_SCAN_INDEX,
-            retried,
+            retry,
             result: Err("Could not resolve git root.".to_string()),
             telemetry: None,
+            raw_output: None,
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let attempt = service
-            .scan_review_coverage(&req.worktree_path, &req.files)
-            .await;
+        let attempt = match retry {
+            ReviewScanRetry::Reformat => {
+                service
+                    .reformat_review_coverage_output(
+                        &req.worktree_path,
+                        &req.files,
+                        req.raw_output.as_deref().unwrap_or_default(),
+                    )
+                    .await
+            }
+            ReviewScanRetry::Initial | ReviewScanRetry::Full => {
+                service
+                    .scan_review_coverage(&req.worktree_path, &req.files)
+                    .await
+            }
+        };
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index: COVERAGE_SCAN_INDEX,
-            retried,
+            retry,
             result,
             telemetry: Some(attempt.telemetry),
+            raw_output: attempt.raw_output,
         });
     });
 }
@@ -8470,6 +8532,25 @@ mod tests {
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
+    }
+
+    #[test]
+    fn review_retry_routes_parse_failures_through_reformat_then_full_scan() {
+        assert_eq!(
+            next_review_retry(ReviewScanRetry::Initial, true),
+            Some(ReviewScanRetry::Reformat)
+        );
+        assert_eq!(
+            next_review_retry(ReviewScanRetry::Reformat, true),
+            Some(ReviewScanRetry::Full)
+        );
+        assert_eq!(next_review_retry(ReviewScanRetry::Full, true), None);
+        // A spawn/timeout failure has no raw text to reformat, so preserve the
+        // former behavior: go straight to the one full retry.
+        assert_eq!(
+            next_review_retry(ReviewScanRetry::Initial, false),
+            Some(ReviewScanRetry::Full)
+        );
     }
 
     fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> NotificationsConfig {

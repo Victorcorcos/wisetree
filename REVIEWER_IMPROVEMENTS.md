@@ -133,6 +133,8 @@ last resort.
 **Touches.** retry path in `src/tui/app.rs`, `scan_review_file` /
 `scan_review_coverage`, new tiny `prompts/reviewer_reformat.md`.
 
+**Status:** ✅ implemented — commit 476b8eb. as specified.
+
 ## #4 — Adaptive merged scan (the centerpiece)
 
 **Attacks wastes #1 and #2 at the root. Depends on #1 (the new prompt is

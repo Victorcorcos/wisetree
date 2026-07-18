@@ -73,17 +73,17 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] A parse failure retains the raw model output and dispatches a reformat call containing only the contract and malformed output.
-- [ ] Valid reformatted output returns through the normal parser, validation, dedup, telemetry, and scan-pool paths.
-- [ ] A failed reformat triggers exactly one full re-scan; only failure of that fallback produces the final Failed row.
-- [ ] Tests cover file and coverage scans for reformat success, reformat failure followed by full-scan success, and terminal failure.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #3 Status line.
+- [x] A parse failure retains the raw model output and dispatches a reformat call containing only the contract and malformed output.
+- [x] Valid reformatted output returns through the normal parser, validation, dedup, telemetry, and scan-pool paths.
+- [x] A failed reformat triggers exactly one full re-scan; only failure of that fallback produces the final Failed row.
+- [x] Tests cover file and coverage scans for reformat success, reformat failure followed by full-scan success, and terminal failure.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #3 Status line.
 
 **Edge cases**:
 
-- [ ] A clean `NO-FINDINGS` block recovered by reformatting is treated as a successful empty scan.
-- [ ] Late retry events after cancellation or scan settlement remain ignored.
-- [ ] Reformatting cannot gain write permissions or require repository/diff context.
+- [x] A clean `NO-FINDINGS` block recovered by reformatting is treated as a successful empty scan.
+- [x] Late retry events after cancellation or scan settlement remain ignored.
+- [x] Reformatting cannot gain write permissions or require repository/diff context.
 
 ---
 
@@ -270,7 +270,7 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 |---------|------|--------|
 | 1 | Cache-align prompt templates | ✅ Done |
 | 2 | Per-scan token telemetry | ✅ Done |
-| 3 | Cheap retry through reformatting | ⬚ Pending |
+| 3 | Cheap retry through reformatting | ✅ Done |
 | 4 | Adaptive merged scan | ⬚ Pending |
 | 5 | Pre-digest shared repository context | ⬚ Pending |
 | 6 | Inline capped full-file content | ⬚ Pending |
