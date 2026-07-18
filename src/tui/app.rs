@@ -2914,15 +2914,13 @@ impl App {
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             BugkillAction::Confirmed => {
-                if let Some(screen) = self.bugkill_pr.as_mut() {
-                    screen.show_describe();
-                }
-            }
-            BugkillAction::DescriptionSubmitted(description) => {
+                // Preflight first: when a resumable BUG_INVESTIGATION.md
+                // exists, the Resume prompt already carries the description —
+                // asking for it again would be wasted effort. DescribeBug is
+                // only shown for the start-fresh paths.
                 let Some(screen) = self.bugkill_pr.as_mut() else {
                     return;
                 };
-                screen.set_bug_description(description);
                 let worktree_path = screen.request().worktree_path.clone();
                 screen.start_working("Preparing...", false);
                 kick_off_bugkill_preflight(
@@ -2931,6 +2929,13 @@ impl App {
                     worktree_path,
                     tx.clone(),
                 );
+            }
+            BugkillAction::DescriptionSubmitted(description) => {
+                let Some(screen) = self.bugkill_pr.as_mut() else {
+                    return;
+                };
+                screen.set_bug_description(description);
+                self.start_bugkill_investigation(false, tx);
             }
             BugkillAction::DiscardLeftovers => {
                 let Some(screen) = self.bugkill_pr.as_mut() else {
@@ -2960,7 +2965,13 @@ impl App {
                     }
                 }
             }
-            BugkillAction::StartFresh => self.start_bugkill_investigation(false, tx),
+            BugkillAction::StartFresh => {
+                // Fresh run over an existing (or unparseable) investigation
+                // file — the description still has to be collected.
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.show_describe();
+                }
+            }
             BugkillAction::ForceInvestigationDone => self.force_bugkill_investigation_done(tx),
             BugkillAction::AttemptFix => self.start_bugkill_attempt(None, tx),
             BugkillAction::AbortFix => {
@@ -3227,7 +3238,7 @@ impl App {
                     };
                     screen.set_base_ref(preflight.base_ref);
                     match preflight.resume {
-                        BugkillResumeState::Absent => self.start_bugkill_investigation(false, tx),
+                        BugkillResumeState::Absent => screen.show_describe(),
                         BugkillResumeState::Unparseable => screen.show_overwrite_prompt(),
                         BugkillResumeState::Parsed {
                             investigation,

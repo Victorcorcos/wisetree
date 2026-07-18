@@ -4,6 +4,8 @@
 //! - `Confirm`     : bordered explanation panel (the 5-step pipeline) +
 //!   resolved-config footer + `ConfirmationModal` (**Cancel** default).
 //! - `DescribeBug` : multiline input page (Enter = submit, Ctrl+J = newline).
+//!   Shown after the preflight, and only when there is nothing to resume
+//!   (no parseable `BUG_INVESTIGATION.md`, or Start fresh / Overwrite).
 //! - `Working`     : quiet spinner covering every captured / deterministic
 //!   phase (preflight, snapshots, commit, revert, judge).
 //! - `Investigating`: the embedded opencode **TUI** (AI Activity panel,
@@ -111,16 +113,17 @@ pub enum BugkillAction {
     Continue,
     /// Back to the dashboard (Esc/Cancel on any abandonable step).
     Cancelled,
-    /// Confirm panel accepted — show the bug-description page.
+    /// Confirm panel accepted — the `App` runs the preflight.
     Confirmed,
-    /// Bug description submitted — the `App` runs the preflight.
+    /// Bug description submitted — the `App` starts the investigation.
     DescriptionSubmitted(String),
     /// Leftover-attempt prompt: discard the debris, then re-run preflight.
     DiscardLeftovers,
     /// ResumePrompt: load the parsed investigation and skip the AI call.
     Resume,
-    /// ResumePrompt: Start fresh / Overwrite — run the investigation
-    /// (the file is overwritten on the next render).
+    /// ResumePrompt: Start fresh / Overwrite — collect a bug description,
+    /// then run the investigation (the file is overwritten on the next
+    /// render).
     StartFresh,
     /// Select: attempt the highlighted eligible row.
     AttemptFix,
@@ -349,6 +352,7 @@ impl BugkillPullRequestScreen {
         self.step = BugkillStep::Working;
         self.phase_message = message.into();
         self.working_locked = locked;
+        self.confirm = None;
         self.input = None;
         self.pty = None;
     }
@@ -1285,14 +1289,17 @@ impl BugkillPullRequestScreen {
         self.render_button_row(frame, chunks[2], variant.labels(), self.resume_focus);
     }
 
-    /// A centered row of native buttons, focused one highlighted.
+    /// A centered row of native buttons, focused one highlighted. Width =
+    /// label + 2 borders + 2 padding cells each side; the label is passed
+    /// bare — `button_paragraph` centers, so any manual padding would just
+    /// push the text off-center.
     fn render_button_row(&self, frame: &mut Frame, area: Rect, labels: &[&str], focus: usize) {
         let mut constraints: Vec<Constraint> = vec![Constraint::Min(0)];
         for (i, label) in labels.iter().enumerate() {
             if i > 0 {
                 constraints.push(Constraint::Length(2));
             }
-            constraints.push(Constraint::Length(label.chars().count() as u16 + 4));
+            constraints.push(Constraint::Length(label.chars().count() as u16 + 6));
         }
         constraints.push(Constraint::Min(0));
         let cols = Layout::default()
@@ -1301,15 +1308,12 @@ impl BugkillPullRequestScreen {
             .split(area);
         for (i, label) in labels.iter().enumerate() {
             let rect = cols[1 + i * 2];
-            let color = if *label == "Cancel" {
-                colors::ERROR
-            } else {
-                colors::INFO
+            let color = match *label {
+                "Cancel" => colors::ERROR,
+                "Resume" => colors::GREEN,
+                _ => colors::INFO,
             };
-            frame.render_widget(
-                button_paragraph(&format!("  {label}  "), color, focus == i),
-                rect,
-            );
+            frame.render_widget(button_paragraph(label, color, focus == i), rect);
         }
     }
 
