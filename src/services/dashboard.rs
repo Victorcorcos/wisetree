@@ -3319,12 +3319,14 @@ impl DashboardService {
     ) -> Result<crate::services::bugkill::PorcelainStatus> {
         // `--untracked-files=all` lists files inside untracked directories
         // individually, so the per-path snapshot/commit/cleanup always works
-        // on real files, never on a `dir/` placeholder.
+        // on real files, never on a `dir/` placeholder. `-z` keeps paths
+        // unquoted (NUL-terminated records) so exotic filenames survive as
+        // valid pathspecs — see `parse_porcelain_v2`.
         let output = time::timeout(
             BUGKILL_GIT_TIMEOUT,
             run_command(
                 &self.git_binary,
-                &["status", "--porcelain=v2", "--untracked-files=all"],
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
                 Some(cwd),
             ),
         )

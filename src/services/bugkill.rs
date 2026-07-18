@@ -489,25 +489,32 @@ pub struct PorcelainStatus {
     pub untracked: Vec<String>,
 }
 
-/// Parse `git status --porcelain=v2` output (non-NUL mode). Ignored (`! `)
-/// and header (`# `) lines are skipped.
+/// Parse `git status --porcelain=v2 -z` output (NUL-terminated records).
+/// `-z` mode is required: without it git C-quotes paths containing `"`,
+/// `\`, control bytes, or (under `core.quotePath`) non-ASCII, and the
+/// quoted string is not a valid pathspec for the later per-path `git add`
+/// / `git checkout` calls. Ignored (`! `) and header (`# `) records are
+/// skipped.
 pub fn parse_porcelain_v2(output: &str) -> PorcelainStatus {
     let mut status = PorcelainStatus::default();
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("? ") {
+    let mut records = output.split('\0');
+    while let Some(record) = records.next() {
+        if let Some(rest) = record.strip_prefix("? ") {
             status.untracked.push(rest.to_string());
-        } else if line.starts_with("1 ") {
-            if let Some(path) = line.splitn(9, ' ').nth(8) {
+        } else if record.starts_with("1 ") {
+            if let Some(path) = record.splitn(9, ' ').nth(8) {
                 status.tracked.push(path.to_string());
             }
-        } else if line.starts_with("2 ") {
-            // Rename/copy: `<path>\t<origPath>` — the current path comes first.
-            if let Some(paths) = line.splitn(10, ' ').nth(9) {
-                let path = paths.split('\t').next().unwrap_or(paths);
+        } else if record.starts_with("2 ") {
+            // Rename/copy: the current path ends this record; in `-z` mode
+            // the origPath follows as its own NUL-terminated field — consume
+            // it so it is not mistaken for the next record.
+            if let Some(path) = record.splitn(10, ' ').nth(9) {
                 status.tracked.push(path.to_string());
             }
-        } else if line.starts_with("u ") {
-            if let Some(path) = line.splitn(11, ' ').nth(10) {
+            records.next();
+        } else if record.starts_with("u ") {
+            if let Some(path) = record.splitn(11, ' ').nth(10) {
                 status.tracked.push(path.to_string());
             }
         }
@@ -898,18 +905,32 @@ SOLUTION: s";
     #[test]
     fn porcelain_v2_splits_tracked_and_untracked() {
         let output = "\
-# branch.oid abc
-1 .M N... 100644 100644 100644 abc def src/lib.rs
-2 R. N... 100644 100644 100644 abc def R100 new name.rs\told name.rs
-u UU N... 100644 100644 100644 100644 abc def ghi conflicted.rs
-? notes with spaces.txt
-! ignored.log";
+# branch.oid abc\0\
+1 .M N... 100644 100644 100644 abc def src/lib.rs\0\
+2 R. N... 100644 100644 100644 abc def R100 new name.rs\0old name.rs\0\
+u UU N... 100644 100644 100644 100644 abc def ghi conflicted.rs\0\
+? notes with spaces.txt\0\
+! ignored.log\0";
         let status = parse_porcelain_v2(output);
         assert_eq!(
             status.tracked,
             ["src/lib.rs", "new name.rs", "conflicted.rs"]
         );
         assert_eq!(status.untracked, ["notes with spaces.txt"]);
+    }
+
+    #[test]
+    fn porcelain_v2_keeps_exotic_paths_verbatim() {
+        // In `-z` mode git never quotes paths, so a name full of quotes and
+        // backslashes must come through byte-for-byte (the bug that broke
+        // Bugkill's attempt commit: a C-quoted path used as a pathspec).
+        let output = "? {stdin_data: \"\", unsetenv_others: false}.jpg\0";
+        let status = parse_porcelain_v2(output);
+        assert_eq!(
+            status.untracked,
+            ["{stdin_data: \"\", unsetenv_others: false}.jpg"]
+        );
+        assert!(status.tracked.is_empty());
     }
 
     // ── attempt change-set ──────────────────────────────────────────────
