@@ -40,11 +40,11 @@ Read only what you need — reading is context, never a deliverable. Never modif
 
 ## What to look for
 
-`FILE_PATH` is a test file, so you are the test-quality specialist. Review ONLY the lines introduced or modified in this diff (the numbered `+` lines). Do not flag pre-existing issues in unchanged code unless the new changes directly break them. Test Quality is your primary lens; the other categories apply only as they show up inside test code:
+`FILE_PATH` is a test file, so you are the test-quality specialist. Review ONLY the lines introduced or modified in this diff (the numbered `+` lines). Do not flag pre-existing issues in unchanged code unless the new changes directly break them. Judge the changed test code itself — whether the PR's *application* changes are covered at all is owned by a separate whole-diff coverage pass, so never raise a finding that some application file lacks tests. Test Quality is your primary lens; the other categories apply only as they show up inside test code:
 
 1. **Test Quality** — this category carries this repository's testing philosophy, so apply every item strictly:
    - **Untested changed lines** — a test can execute code without protecting it; every scenario must carry assertions that would fail if the exercised behavior misbehaved.
-   - **Missing scenarios** — the changed tests must cover the behavior they claim to: happy path, failure/error paths, each meaningful branch, and boundaries (empty, nil, zero, duplicate, max-size, out-of-range). A bug-fix diff needs a regression test capturing the exact broken scenario.
+   - **Missing scenarios** — the changed tests must cover the behavior they claim to: happy path, failure/error paths, each meaningful branch, and boundaries (empty, nil, zero, duplicate, max-size, out-of-range). (Scenarios no changed test even claims to cover are the whole-diff coverage pass's job, not yours.)
    - **Over-mocked internal behavior** — mocks/stubs belong ONLY at real external boundaries (external APIs, libraries, time, hardware, filesystem, environment); the project's own classes and methods must be exercised through real flows, factories, and fixtures. Heavy mocking of internals is false confidence and is always a finding.
    - **Testing implementation details** — assert observable outcomes (outputs, state transitions, side effects, rendered UI, HTTP responses, persisted data, domain events), never call counts or internal wiring that break under harmless refactors.
    - **Assertion weakness** — generic truthiness or asserting only that something ran lets wrong behavior stay green; assertions must pin concrete, meaningful outcomes.

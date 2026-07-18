@@ -36,14 +36,14 @@ use crate::services::{
     build_review_summary, check_for_updates_all_sources, compute_attempt_changes,
     default_dashboard_warning, detect_shell_integration, fetch_free_opencode_models,
     fetch_opencode_model_variants, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, split_duplicate_findings, AiStatus,
-    AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
-    BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
-    DashboardService, DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome,
-    EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    JudgeResult, MultiSourceUpdateResult, OpencodeModel, OpencodeTurn, OpencodeTurnWatcher,
-    PrState, ReviewFile, ReviewFinding, ReviewPreparation, Shell, ShellIntegrationStatus,
-    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    parse_pull_request_md, resolve_dashboard_columns, AiStatus, AttemptChanges, BugHypothesis,
+    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
+    CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
+    DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
+    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
+    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
+    ReviewPreparation, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase,
+    UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -64,7 +64,9 @@ use crate::tui::screens::enrich_pr::{EnrichAction, EnrichPullRequestScreen, Enri
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
-use crate::tui::screens::review_pr::{ReviewAction, ReviewPullRequestScreen, ReviewRowOutcome};
+use crate::tui::screens::review_pr::{
+    ReviewAction, ReviewPullRequestScreen, ReviewRowOutcome, COVERAGE_SCAN_INDEX,
+};
 use crate::tui::screens::settings::{
     CopyDirection, SettingsAction, SettingsScreen, SettingsStep, UpgradeOutcome,
 };
@@ -2583,23 +2585,36 @@ impl App {
         self.settle_review_scans();
     }
 
-    /// Hand the next un-dispatched file to a scan task. `false` once every
-    /// file has been dispatched.
+    /// Hand the next un-dispatched scan to a task: the files first, then the
+    /// whole-diff coverage pass. `false` once everything has been dispatched.
     fn dispatch_next_review_scan(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) -> bool {
         let Some(screen) = self.review_pr.as_mut() else {
             return false;
         };
-        let Some((file_index, file)) = screen.take_next_scan_file() else {
+        let worktree_path = screen.request().worktree_path.clone();
+        if let Some((file_index, file)) = screen.take_next_scan_file() {
+            kick_off_scan_review_file(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                ReviewScanRequest {
+                    worktree_path,
+                    file,
+                    file_index,
+                    retried: false,
+                },
+                tx.clone(),
+            );
+            return true;
+        }
+        let Some(files) = screen.take_coverage_scan() else {
             return false;
         };
-        let worktree_path = screen.request().worktree_path.clone();
-        kick_off_scan_review_file(
+        kick_off_scan_review_coverage(
             self.git_root.clone(),
             self.current_dashboard_config(),
-            ReviewScanRequest {
+            ReviewCoverageScanRequest {
                 worktree_path,
-                file,
-                file_index,
+                files,
                 retried: false,
             },
             tx.clone(),
@@ -2607,16 +2622,30 @@ impl App {
         true
     }
 
-    /// Re-kick one file after unparseable output — its slot in the pool
+    /// Re-kick one scan after unparseable output — its slot in the pool
     /// stays occupied, so no extra scan starts.
     fn retry_review_scan(&mut self, file_index: usize, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
+        let worktree_path = screen.request().worktree_path.clone();
+        if file_index == COVERAGE_SCAN_INDEX {
+            let files = screen.all_files();
+            kick_off_scan_review_coverage(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                ReviewCoverageScanRequest {
+                    worktree_path,
+                    files,
+                    retried: true,
+                },
+                tx.clone(),
+            );
+            return;
+        }
         let Some(file) = screen.file_at(file_index) else {
             return;
         };
-        let worktree_path = screen.request().worktree_path.clone();
         kick_off_scan_review_file(
             self.git_root.clone(),
             self.current_dashboard_config(),
@@ -2765,10 +2794,8 @@ impl App {
                     // as a wisetree comment never re-enter the walkthrough,
                     // regardless of whether the model honored the
                     // existing-comments instruction.
-                    let (fresh, duplicates) = match screen.file_at(file_index) {
-                        Some(file) => split_duplicate_findings(findings, &file.existing_keys),
-                        None => (findings, Vec::new()),
-                    };
+                    let (fresh, duplicates) =
+                        screen.split_existing_duplicates(file_index, findings);
                     screen.record_duplicate_findings(&duplicates);
                     screen.record_scan_result(fresh);
                     screen.note_scan_done(file_index);
@@ -7421,6 +7448,15 @@ struct ReviewScanRequest {
     retried: bool,
 }
 
+/// Inputs for the single whole-diff coverage scan. Its result comes back
+/// through the same `ReviewPrScanned` event under [`COVERAGE_SCAN_INDEX`],
+/// so it shares the pool's completion/retry/failure plumbing.
+struct ReviewCoverageScanRequest {
+    worktree_path: String,
+    files: Vec<ReviewFile>,
+    retried: bool,
+}
+
 /// Inputs for an "Other" revision of a single finding.
 struct ReviewReviseRequest {
     worktree_path: String,
@@ -7488,6 +7524,35 @@ fn kick_off_scan_review_file(
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index,
+            retried,
+            result,
+        });
+    });
+}
+
+fn kick_off_scan_review_coverage(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: ReviewCoverageScanRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let retried = req.retried;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrScanned {
+            file_index: COVERAGE_SCAN_INDEX,
+            retried,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .scan_review_coverage(&req.worktree_path, &req.files)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrScanned {
+            file_index: COVERAGE_SCAN_INDEX,
             retried,
             result,
         });

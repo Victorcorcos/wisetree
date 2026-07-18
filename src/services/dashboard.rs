@@ -92,6 +92,9 @@ const GH_TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// diff, and the existing-comments dedup context.
 const REVIEW_DIFF_MAX_BYTES: usize = 60_000;
 const REVIEW_COMMENTS_MAX_BYTES: usize = 12_000;
+/// Byte cap for the whole-diff coverage prompt, which concatenates every
+/// file's (already individually capped) annotated diff into one call.
+const REVIEW_COVERAGE_DIFF_MAX_BYTES: usize = 120_000;
 /// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
 /// embedded PTY (the user watches it and can Esc out), so only the judge —
 /// which classifies one short comment — and the local git operations
@@ -2892,6 +2895,46 @@ impl DashboardService {
             &file.annotated_diff,
         )
         .ok_or_else(|| WisetreeError::other("could not parse findings from the review AI output."))
+    }
+
+    /// Scan the WHOLE diff once for missing test coverage with a single
+    /// captured opencode call. Coverage is deliberately owned by this one
+    /// pass: whether an application change is tested depends on the test
+    /// side of the diff (and the repo's existing tests), which no per-file
+    /// scan can see — and letting each parallel scan judge it made them
+    /// re-raise the same "add tests" recommendation as duplicate comments.
+    pub async fn scan_review_coverage(
+        &self,
+        worktree_path: &str,
+        files: &[ReviewFile],
+    ) -> Result<Vec<ReviewFinding>> {
+        let cwd = PathBuf::from(worktree_path);
+        let model = self.config.ai.review.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other("ai.review model is not configured."));
+        }
+        let prompt = build_review_coverage_prompt(files);
+        let mut run_args: Vec<String> = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+        ];
+        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
+        let output = time::timeout(
+            REVIEW_SCAN_TIMEOUT,
+            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("opencode coverage scan timed out after 240s"))?
+        .map_err(WisetreeError::other)?;
+
+        parse_coverage_findings(&output, files).ok_or_else(|| {
+            WisetreeError::other("could not parse findings from the coverage AI output.")
+        })
     }
 
     /// Post one approved finding to the PR — inline when it carries a
@@ -6113,6 +6156,98 @@ fn build_review_scan_prompt(
         )
 }
 
+/// Render the whole-diff coverage prompt (`prompts/reviewer_coverage.md`):
+/// one `### FILE:` section per changed file, application code and tests
+/// alike, so the single coverage pass sees everything the per-file scans see
+/// combined — coverage is a cross-file judgment no per-file scan can make.
+/// Substitution order mirrors [`build_review_scan_prompt`]: the (largest,
+/// user-controlled) diff goes last.
+fn build_review_coverage_prompt(files: &[ReviewFile]) -> String {
+    const COVERAGE_PROMPT: &str = include_str!("../../prompts/reviewer_coverage.md");
+    let mut diff = String::new();
+    for file in files {
+        diff.push_str(&format!("### FILE: {}\n", file.path));
+        diff.push_str(&truncate_for_prompt(
+            &file.annotated_diff,
+            REVIEW_DIFF_MAX_BYTES,
+        ));
+        diff.push_str("\n\n");
+    }
+    let mut comments = String::new();
+    for file in files {
+        if !file.existing_comments.trim().is_empty() {
+            comments.push_str(&format!(
+                "### FILE: {}\n{}\n\n",
+                file.path, file.existing_comments
+            ));
+        }
+    }
+    let existing = if comments.trim().is_empty() {
+        "(none)".to_string()
+    } else {
+        truncate_for_prompt(&comments, REVIEW_COMMENTS_MAX_BYTES)
+    };
+    COVERAGE_PROMPT
+        .replace("EXISTING_COMMENTS", &existing)
+        .replace(
+            "FULL_DIFF",
+            &truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES),
+        )
+}
+
+/// Parse the coverage pass's findings block. Same block format as
+/// [`parse_review_findings`] plus a `FILE:` header per finding, since the one
+/// coverage call spans every changed file. The named file must be one of the
+/// scanned [`ReviewFile`]s — a finding pointing anywhere else can't be posted
+/// on the PR and is dropped. Line anchors are validated against that file's
+/// commentable lines, and the category is pinned to Test Quality whatever the
+/// model wrote.
+pub(crate) fn parse_coverage_findings(
+    output: &str,
+    files: &[ReviewFile],
+) -> Option<Vec<ReviewFinding>> {
+    const BEGIN: &str = "===WISETREE-REVIEW-BEGIN===";
+    const END: &str = "===WISETREE-REVIEW-END===";
+    let after_begin = &output[output.find(BEGIN)? + BEGIN.len()..];
+    let block = &after_begin[..after_begin.find(END)?];
+
+    let mut findings = Vec::new();
+    for chunk in block.split("---FINDING---").skip(1) {
+        let chunk = chunk.split("---END-FINDING---").next().unwrap_or(chunk);
+        let Some(file) = coverage_chunk_file(chunk, files) else {
+            continue;
+        };
+        if let Some(mut finding) = parse_review_finding_chunk(
+            chunk,
+            &file.path,
+            &file.commentable_lines,
+            &file.annotated_diff,
+        ) {
+            finding.category = normalize_review_category("Test Quality");
+            findings.push(finding);
+        }
+    }
+    Some(findings)
+}
+
+/// Resolve one coverage chunk's `FILE:` header against the scanned files,
+/// tolerating a `./` prefix. Read with the same header-zone rule as the other
+/// fields: only above the first `---…---` section marker, so an explanation
+/// quoting `FILE:` never leaks in.
+fn coverage_chunk_file<'a>(chunk: &str, files: &'a [ReviewFile]) -> Option<&'a ReviewFile> {
+    for line in chunk.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() > 6 && trimmed.starts_with("---") && trimmed.ends_with("---") {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("FILE:") {
+            let path = rest.trim().trim_start_matches("./");
+            return files.iter().find(|f| f.path == path);
+        }
+    }
+    None
+}
+
 /// Parse the single machine-readable findings block the scan AI emits.
 /// Tolerant of surrounding transcript noise: locates the BEGIN/END markers
 /// anywhere in `output`. Returns `None` when no block is present (the model
@@ -7364,11 +7499,111 @@ new file mode 100644
         assert!(source_prompt.starts_with("You are reviewing the changed lines of ONE file"));
         assert!(test_prompt.starts_with("You are reviewing the changed lines of ONE test file"));
         assert!(test_prompt.contains("test-quality specialist"));
+        // Coverage is owned by the whole-diff pass — both per-file profiles
+        // must carry the hand-off so parallel scans stop duplicating "add
+        // tests" recommendations.
+        assert!(source_prompt.contains("Out of scope for this scan: **test coverage**"));
+        assert!(test_prompt.contains("whole-diff coverage pass"));
         // Both profiles share the same machine-parsed output contract.
         for prompt in [&source_prompt, &test_prompt] {
             assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
             assert!(prompt.contains("---END-FINDING---"));
         }
+    }
+
+    #[test]
+    fn build_review_coverage_prompt_sections_every_file() {
+        let app = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "     1 +let x = 1;".to_string(),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: "@bob (line 1): please test this".to_string(),
+            existing_keys: Vec::new(),
+        };
+        let test = ReviewFile {
+            path: "tests/lib_test.rs".to_string(),
+            annotated_diff: "     9 +assert!(x);".to_string(),
+            commentable_lines: BTreeSet::from([9]),
+            existing_comments: String::new(),
+            ..app.clone()
+        };
+        let prompt = build_review_coverage_prompt(&[app, test]);
+        assert!(prompt.starts_with("You are the test-coverage specialist"));
+        assert!(prompt.contains("### FILE: src/lib.rs"));
+        assert!(prompt.contains("     1 +let x = 1;"));
+        assert!(prompt.contains("### FILE: tests/lib_test.rs"));
+        assert!(prompt.contains("     9 +assert!(x);"));
+        assert!(prompt.contains("@bob (line 1): please test this"));
+        assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
+    }
+
+    #[test]
+    fn parse_coverage_findings_maps_files_and_validates_anchors() {
+        let files = vec![
+            ReviewFile {
+                path: "src/a.rs".to_string(),
+                annotated_diff: "     2 +fn run() {}".to_string(),
+                commentable_lines: BTreeSet::from([2]),
+                existing_comments: String::new(),
+                existing_keys: Vec::new(),
+            },
+            ReviewFile {
+                path: "src/b.rs".to_string(),
+                annotated_diff: "     5 +fn stop() {}".to_string(),
+                commentable_lines: BTreeSet::from([5]),
+                existing_comments: String::new(),
+                existing_keys: Vec::new(),
+            },
+        ];
+        let output = "\
+===WISETREE-REVIEW-BEGIN===
+---FINDING---
+CATEGORY: Security
+SEVERITY: High
+FILE: ./src/a.rs
+LINE: 2
+START_LINE:
+TITLE: run() error path untested
+---EXPLANATION---
+No test fails when run() misbehaves.
+---END-FINDING---
+---FINDING---
+CATEGORY: Test Quality
+SEVERITY: Medium
+FILE: src/b.rs
+LINE: 99
+START_LINE:
+TITLE: stop() untested
+---EXPLANATION---
+No test covers stop().
+---END-FINDING---
+---FINDING---
+CATEGORY: Test Quality
+SEVERITY: Low
+FILE: docs/readme.md
+LINE: 1
+START_LINE:
+TITLE: not a changed file
+---EXPLANATION---
+Should be dropped.
+---END-FINDING---
+===WISETREE-REVIEW-END===";
+        let findings = parse_coverage_findings(output, &files).unwrap();
+        assert_eq!(findings.len(), 2, "the unknown file's finding is dropped");
+        // `./` prefix tolerated; the stray CATEGORY is pinned to Test.
+        assert_eq!(findings[0].file, "src/a.rs");
+        assert_eq!(findings[0].line, Some(2));
+        assert_eq!(findings[0].category, "Test");
+        // An anchor outside b.rs's commentable lines downgrades to file-level.
+        assert_eq!(findings[1].file, "src/b.rs");
+        assert_eq!(findings[1].line, None);
+    }
+
+    #[test]
+    fn parse_coverage_findings_accepts_a_clean_scan() {
+        let out = "chatter\n===WISETREE-REVIEW-BEGIN===\nNO-FINDINGS\n===WISETREE-REVIEW-END===";
+        assert_eq!(parse_coverage_findings(out, &[]), Some(Vec::new()));
+        assert_eq!(parse_coverage_findings("no block at all", &[]), None);
     }
 
     // ── Fix pipeline: verdict parsing ──────────────────────────────────

@@ -1,7 +1,8 @@
 //! "Review Pull Request" screen. Scans the PR's changed files with one
 //! captured AI call per file — a small pool of files in parallel, test files
-//! with a dedicated test-quality prompt — then walks the findings one at a
-//! time and posts the approved ones as PR comments. State machine:
+//! with a dedicated test-quality prompt, plus one whole-diff pass that alone
+//! owns test-coverage findings — then walks the findings one at a time and
+//! posts the approved ones as PR comments. State machine:
 //!
 //! - `Confirm`   : explanation panel + `ConfirmationModal` (Yes/No, **No**
 //!   default). Enter on Yes returns `ReviewAction::Confirmed`.
@@ -45,7 +46,8 @@ use ratatui::Frame;
 use crate::config::schema::AiModelConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{
-    split_run_duplicate_findings, ReviewFile, ReviewFinding, ReviewSeverity, ReviewSkippedFile,
+    is_test_file, split_duplicate_findings, split_run_duplicate_findings, ReviewFile,
+    ReviewFinding, ReviewSeverity, ReviewSkippedFile,
 };
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
@@ -54,6 +56,13 @@ use crate::tui::widgets::{
     ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, Status, StatusIndicator,
     SummaryRow,
 };
+
+/// Sentinel `file_index` for the whole-diff test-coverage scan — it occupies
+/// one pool slot like a file scan but isn't any single file.
+pub const COVERAGE_SCAN_INDEX: usize = usize::MAX;
+
+/// Label for the coverage scan in the in-flight panel and report rows.
+const COVERAGE_SCAN_LABEL: &str = "test coverage";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewStep {
@@ -216,6 +225,12 @@ pub struct ReviewPullRequestScreen {
     files: Vec<ReviewFile>,
     /// Index of the next file not yet handed to a scan task.
     next_scan: usize,
+    /// Whether this run includes the whole-diff test-coverage pass — only
+    /// when at least one changed application (non-test) file survived the
+    /// filter, since a tests-only diff has no coverage to judge.
+    has_coverage_scan: bool,
+    /// The coverage pass has been handed to a scan task.
+    coverage_dispatched: bool,
     /// Paths currently being scanned in parallel — the Working panel's
     /// content while the scan phase runs.
     in_flight: Vec<String>,
@@ -260,6 +275,8 @@ impl ReviewPullRequestScreen {
             head_sha: String::new(),
             files: Vec::new(),
             next_scan: 0,
+            has_coverage_scan: false,
+            coverage_dispatched: false,
             in_flight: Vec::new(),
             scans_done: 0,
             findings: Vec::new(),
@@ -365,6 +382,8 @@ impl ReviewPullRequestScreen {
         self.repo = repo;
         self.head_sha = sha;
         self.next_scan = 0;
+        self.has_coverage_scan = self.files.iter().any(|f| !is_test_file(&f.path));
+        self.coverage_dispatched = false;
         self.in_flight.clear();
         self.scans_done = 0;
         self.findings.clear();
@@ -380,8 +399,13 @@ impl ReviewPullRequestScreen {
     }
 
     fn refresh_scan_message(&mut self) {
+        let coverage = if self.has_coverage_scan {
+            " + test coverage"
+        } else {
+            ""
+        };
         self.phase_message = format!(
-            "Scanning {} changed files ({} done)...",
+            "Scanning {} changed files{coverage} ({} done)...",
             self.files.len(),
             self.scans_done
         );
@@ -397,21 +421,75 @@ impl ReviewPullRequestScreen {
         Some((index, file))
     }
 
-    /// One file's scan reached a terminal state (result recorded or failed
-    /// twice): update the progress message and the in-flight panel.
+    /// Hand out the whole-diff coverage scan, tracking it as in-flight.
+    /// `None` when this run has no coverage pass or it already went out.
+    pub fn take_coverage_scan(&mut self) -> Option<Vec<ReviewFile>> {
+        if !self.has_coverage_scan || self.coverage_dispatched {
+            return None;
+        }
+        self.coverage_dispatched = true;
+        self.in_flight.push(COVERAGE_SCAN_LABEL.to_string());
+        Some(self.files.clone())
+    }
+
+    /// The full file list — re-kicking the coverage scan after a bad reply
+    /// needs it again (its take-slot was consumed on dispatch).
+    pub fn all_files(&self) -> Vec<ReviewFile> {
+        self.files.clone()
+    }
+
+    /// One scan reached a terminal state (result recorded or failed twice):
+    /// update the progress message and the in-flight panel.
     pub fn note_scan_done(&mut self, file_index: usize) {
         self.scans_done += 1;
-        if let Some(path) = self.files.get(file_index).map(|f| f.path.as_str()) {
-            if let Some(pos) = self.in_flight.iter().position(|p| p == path) {
+        let label = if file_index == COVERAGE_SCAN_INDEX {
+            Some(COVERAGE_SCAN_LABEL)
+        } else {
+            self.files.get(file_index).map(|f| f.path.as_str())
+        };
+        if let Some(label) = label {
+            if let Some(pos) = self.in_flight.iter().position(|p| p == label) {
                 self.in_flight.remove(pos);
             }
         }
         self.refresh_scan_message();
     }
 
-    /// True while some scan hasn't reached its terminal state yet.
+    /// True while some scan (a file's or the coverage pass) hasn't reached
+    /// its terminal state yet.
     pub fn scans_pending(&self) -> bool {
-        self.scans_done < self.files.len()
+        self.scans_done < self.files.len() + usize::from(self.has_coverage_scan)
+    }
+
+    /// Deterministic dedup of one scan's findings against the wisetree
+    /// comments already on the PR. A per-file scan checks its own file's
+    /// keys; the coverage scan's findings span files, so each is checked
+    /// against the keys of the file it targets.
+    pub fn split_existing_duplicates(
+        &self,
+        file_index: usize,
+        findings: Vec<ReviewFinding>,
+    ) -> (Vec<ReviewFinding>, Vec<ReviewFinding>) {
+        if file_index != COVERAGE_SCAN_INDEX {
+            return match self.files.get(file_index) {
+                Some(file) => split_duplicate_findings(findings, &file.existing_keys),
+                None => (findings, Vec::new()),
+            };
+        }
+        let mut fresh = Vec::new();
+        let mut duplicates = Vec::new();
+        for finding in findings {
+            let keys = self
+                .files
+                .iter()
+                .find(|f| f.path == finding.file)
+                .map(|f| f.existing_keys.as_slice())
+                .unwrap_or(&[]);
+            let (f, d) = split_duplicate_findings(vec![finding], keys);
+            fresh.extend(f);
+            duplicates.extend(d);
+        }
+        (fresh, duplicates)
     }
 
     /// Files the deterministic filter excluded before any AI call: one
@@ -461,14 +539,18 @@ impl ReviewPullRequestScreen {
         self.findings.extend(findings);
     }
 
-    /// A file whose scan failed twice gets its own Failed row and the pool
-    /// moves on — one bad file never aborts the whole review.
+    /// A scan that failed twice gets its own Failed row and the pool moves
+    /// on — one bad file (or the coverage pass) never aborts the whole
+    /// review.
     pub fn record_scan_failure(&mut self, file_index: usize, message: String) {
-        let path = self
-            .files
-            .get(file_index)
-            .map(|f| f.path.clone())
-            .unwrap_or_default();
+        let path = if file_index == COVERAGE_SCAN_INDEX {
+            COVERAGE_SCAN_LABEL.to_string()
+        } else {
+            self.files
+                .get(file_index)
+                .map(|f| f.path.clone())
+                .unwrap_or_default()
+        };
         self.summary_rows.push(SummaryRow::with_status(
             format!("scan {path}"),
             "Failed",
@@ -1682,7 +1764,7 @@ fn build_detail_lines(request: &ReviewPullRequestRequest) -> Vec<Line<'static>> 
 const REVIEW_STEPS: [&str; 7] = [
     "Sync the branch + fetch the PR diff and its existing comments",
     "Lockfiles, minified/generated files and snapshots are skipped (no AI cost)",
-    "AI scans the remaining files in parallel (test files get a dedicated prompt)",
+    "AI scans files in parallel; one whole-diff pass alone judges test coverage",
     "You choose Post / Edit / Other / Skip per finding (Edit is AI-free)",
     "Approved findings are posted as inline PR comments (with suggestions)",
     "A review summary is assembled from the posted comments (no AI)",
@@ -1944,7 +2026,9 @@ mod tests {
 
         screen.begin_scan_phase();
         assert!(screen.scan_phase_active());
-        assert!(screen.phase_message.contains("2 changed files (0 done)"));
+        assert!(screen
+            .phase_message
+            .contains("2 changed files + test coverage (0 done)"));
         let (first, file_a) = screen.take_next_scan_file().unwrap();
         let (second, file_b) = screen.take_next_scan_file().unwrap();
         assert_eq!((first, second), (0, 1));
@@ -1953,6 +2037,11 @@ mod tests {
             ("a.rs", "b.rs")
         );
         assert!(screen.take_next_scan_file().is_none());
+        // App files changed, so the whole-diff coverage pass fills the last
+        // pool slot — exactly once.
+        let coverage_files = screen.take_coverage_scan().unwrap();
+        assert_eq!(coverage_files.len(), 2);
+        assert!(screen.take_coverage_scan().is_none());
 
         // Results arrive out of order — the second file finishes first.
         screen.record_scan_result(vec![finding("b.rs", Some(3), ReviewSeverity::Critical)]);
@@ -1961,6 +2050,9 @@ mod tests {
         assert!(screen.scans_pending());
         screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::Low)]);
         screen.note_scan_done(0);
+        assert!(screen.scans_pending(), "the coverage pass is still out");
+        screen.record_scan_result(Vec::new());
+        screen.note_scan_done(COVERAGE_SCAN_INDEX);
         assert!(!screen.scans_pending());
 
         // Aggregation sorts Critical first, and the walkthrough starts at 0.
@@ -2033,11 +2125,16 @@ mod tests {
         screen.begin_scan_phase();
         screen.take_next_scan_file();
         screen.take_next_scan_file();
+        screen.take_coverage_scan();
         let dump = render_dump(&mut screen, 80, 10);
-        assert!(dump.contains("Scanning 2 changed files (0 done)"), "{dump}");
+        assert!(
+            dump.contains("Scanning 2 changed files + test coverage (0 done)"),
+            "{dump}"
+        );
         assert!(dump.contains("Reviewing"), "{dump}");
         assert!(dump.contains("src/lib/deep.rs"), "{dump}");
         assert!(dump.contains("src/other.rs"), "{dump}");
+        assert!(dump.contains("test coverage"), "{dump}");
     }
 
     #[test]
@@ -2057,6 +2154,61 @@ mod tests {
         let row = &screen.summary_rows[0];
         assert_eq!(row.status.as_ref().unwrap().label, "Failed");
         assert!(row.command.contains("a.rs"));
+    }
+
+    #[test]
+    fn tests_only_diff_runs_no_coverage_pass() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![file("tests/a_test.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        screen.begin_scan_phase();
+        assert!(screen.phase_message.contains("1 changed files (0 done)"));
+        screen.take_next_scan_file();
+        assert!(screen.take_coverage_scan().is_none());
+        screen.record_scan_result(Vec::new());
+        screen.note_scan_done(0);
+        assert!(!screen.scans_pending());
+    }
+
+    #[test]
+    fn coverage_scan_failure_row_names_the_pass() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+        screen.take_next_scan_file();
+        screen.take_coverage_scan();
+        screen.record_scan_failure(COVERAGE_SCAN_INDEX, "model returned garbage".to_string());
+        screen.note_scan_done(COVERAGE_SCAN_INDEX);
+        assert!(screen.scans_pending(), "a.rs is still out");
+        let row = &screen.summary_rows[0];
+        assert_eq!(row.status.as_ref().unwrap().label, "Failed");
+        assert!(row.command.contains("test coverage"));
+    }
+
+    #[test]
+    fn split_existing_duplicates_checks_each_coverage_finding_against_its_file() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        let mut a = file("a.rs");
+        a.existing_keys = vec![crate::services::dashboard::ExistingFindingKey {
+            line: Some(2),
+            title: "hardcoded api key".to_string(),
+        }];
+        screen.set_files(vec![a, file("b.rs")], "o".into(), "r".into(), "sha".into());
+        let (fresh, duplicates) = screen.split_existing_duplicates(
+            COVERAGE_SCAN_INDEX,
+            vec![
+                finding("a.rs", Some(2), ReviewSeverity::High), // already on the PR
+                finding("b.rs", Some(2), ReviewSeverity::High), // b.rs has no keys
+            ],
+        );
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].file, "b.rs");
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].file, "a.rs");
     }
 
     #[test]
