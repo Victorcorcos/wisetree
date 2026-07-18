@@ -28,10 +28,10 @@ pub use dashboard::{
     CommentGroup, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow,
     DashboardService, DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome,
     EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewComment, ReviewFile,
-    ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewScanMode, ReviewSeverity,
-    ReviewSkippedFile, ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase,
-    UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
+    MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewComment, ReviewContext,
+    ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewScanMode,
+    ReviewSeverity, ReviewSkippedFile, ReviewStatus, ReviewerSummary, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
     PR_REFRESH_PERIOD_MS,
 };
 pub use opencode_models::{

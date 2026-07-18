@@ -118,16 +118,16 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] Preparation builds a shared review context containing section-aware capped convention docs and bounded directory file inventories.
-- [ ] Merged, split-app, tester, and split-coverage prompt builders receive the same relevant context without violating cache-aligned layout.
-- [ ] Prompts narrow default exploratory reads but explicitly retain targeted full-file, sibling, test, and convention-file access when evidence is ambiguous.
-- [ ] Tests cover document priority/capping, line-safe truncation, directory inventory construction, missing files/directories, and prompt injection.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #5 Status line.
+- [x] Preparation builds a shared review context containing section-aware capped convention docs and bounded directory file inventories.
+- [x] Merged, split-app, tester, and split-coverage prompt builders receive the same relevant context without violating cache-aligned layout.
+- [x] Prompts narrow default exploratory reads but explicitly retain targeted full-file, sibling, test, and convention-file access when evidence is ambiguous.
+- [x] Tests cover document priority/capping, line-safe truncation, directory inventory construction, missing files/directories, and prompt injection.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #5 Status line.
 
 **Edge cases**:
 
-- [ ] Missing, unreadable, non-UTF-8, or oversized convention files degrade to the available digest rather than failing preparation.
-- [ ] Inventories remain bounded for very large directories and do not traverse outside the worktree.
+- [x] Missing, unreadable, non-UTF-8, or oversized convention files degrade to the available digest rather than failing preparation.
+- [x] Inventories remain bounded for very large directories and do not traverse outside the worktree.
 
 ---
 

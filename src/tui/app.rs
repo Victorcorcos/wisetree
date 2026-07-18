@@ -41,9 +41,9 @@ use crate::services::{
     CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
     DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
     FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
-    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
-    ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, Shell, ShellIntegrationStatus,
-    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewContext, ReviewFile,
+    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, Shell,
+    ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -2530,6 +2530,7 @@ impl App {
                 let request = ReviewReviseRequest {
                     worktree_path: screen.request().worktree_path.clone(),
                     file,
+                    context: screen.review_context(),
                     previous_finding: finding.rendered_for_revision(),
                     feedback,
                     index: screen.current_index(),
@@ -2594,6 +2595,7 @@ impl App {
             return false;
         };
         let worktree_path = screen.request().worktree_path.clone();
+        let context = screen.review_context();
         if let Some((file_index, file)) = screen.take_next_scan_file() {
             kick_off_scan_review_file(
                 self.git_root.clone(),
@@ -2601,6 +2603,7 @@ impl App {
                 ReviewScanRequest {
                     worktree_path,
                     file,
+                    context,
                     file_index,
                     retry: ReviewScanRetry::Initial,
                     raw_output: None,
@@ -2613,6 +2616,7 @@ impl App {
             return false;
         };
         let mode = screen.scan_mode();
+        let context = screen.review_context();
         kick_off_scan_review_coverage(
             self.git_root.clone(),
             self.current_dashboard_config(),
@@ -2620,6 +2624,7 @@ impl App {
                 worktree_path,
                 files,
                 mode,
+                context,
                 retry: ReviewScanRetry::Initial,
                 raw_output: None,
             },
@@ -2641,6 +2646,7 @@ impl App {
             return;
         };
         let worktree_path = screen.request().worktree_path.clone();
+        let context = screen.review_context();
         if file_index == COVERAGE_SCAN_INDEX {
             let files = screen.all_files();
             let mode = screen.scan_mode();
@@ -2651,6 +2657,7 @@ impl App {
                     worktree_path,
                     files,
                     mode,
+                    context,
                     retry,
                     raw_output,
                 },
@@ -2667,6 +2674,7 @@ impl App {
             ReviewScanRequest {
                 worktree_path,
                 file,
+                context,
                 file_index,
                 retry,
                 raw_output,
@@ -2734,6 +2742,7 @@ impl App {
                 ReviewPreparation::Ready {
                     files,
                     scan_mode,
+                    context,
                     skipped,
                     owner,
                     repo,
@@ -2741,6 +2750,7 @@ impl App {
                 } => {
                     if let Some(screen) = self.review_pr.as_mut() {
                         screen.set_scan_mode(scan_mode);
+                        screen.set_review_context(context);
                         screen.set_files(files, owner, repo, head_sha);
                         screen.record_skipped_files(&skipped);
                     }
@@ -7493,6 +7503,7 @@ fn next_review_retry(retry: ReviewScanRetry, has_raw_output: bool) -> Option<Rev
 struct ReviewScanRequest {
     worktree_path: String,
     file: ReviewFile,
+    context: ReviewContext,
     file_index: usize,
     retry: ReviewScanRetry,
     raw_output: Option<String>,
@@ -7505,6 +7516,7 @@ struct ReviewCoverageScanRequest {
     worktree_path: String,
     files: Vec<ReviewFile>,
     mode: ReviewScanMode,
+    context: ReviewContext,
     retry: ReviewScanRetry,
     raw_output: Option<String>,
 }
@@ -7513,6 +7525,7 @@ struct ReviewCoverageScanRequest {
 struct ReviewReviseRequest {
     worktree_path: String,
     file: ReviewFile,
+    context: ReviewContext,
     previous_finding: String,
     feedback: String,
     index: usize,
@@ -7584,7 +7597,7 @@ fn kick_off_scan_review_file(
             }
             ReviewScanRetry::Initial | ReviewScanRetry::Full => {
                 service
-                    .scan_review_file(&req.worktree_path, &req.file, None, None)
+                    .scan_review_file(&req.worktree_path, &req.file, &req.context, None, None)
                     .await
             }
         };
@@ -7642,12 +7655,12 @@ fn kick_off_scan_review_coverage(
             ReviewScanRetry::Initial | ReviewScanRetry::Full => match req.mode {
                 ReviewScanMode::Merged => {
                     service
-                        .scan_review_merged(&req.worktree_path, &req.files)
+                        .scan_review_merged(&req.worktree_path, &req.files, &req.context)
                         .await
                 }
                 ReviewScanMode::Split => {
                     service
-                        .scan_review_coverage(&req.worktree_path, &req.files)
+                        .scan_review_coverage(&req.worktree_path, &req.files, &req.context)
                         .await
                 }
             },
@@ -7684,6 +7697,7 @@ fn kick_off_revise_review_finding(
             .scan_review_file(
                 &req.worktree_path,
                 &req.file,
+                &req.context,
                 Some(&req.feedback),
                 Some(&req.previous_finding),
             )

@@ -2,7 +2,7 @@ You are reviewing a pull request for an automated pipeline. You see every change
 
 ## Context you may gather
 
-You run inside the pull request's worktree with read access. When the diff is insufficient, you MAY read full changed files, relevant tests (including unchanged tests), 1-3 targeted sibling files, and root `README.md`, `AGENTS.md`, or `CLAUDE.md`. Read only what a specific judgment requires. Never modify anything.
+The harness supplies a repository-context digest below with root conventions and changed-directory file names. Use that digest first. You run inside the pull request's worktree with read access, and when the digest plus diff leave a specific judgment ambiguous, you MAY still read full changed files, relevant tests (including unchanged tests), 1-3 targeted sibling files, and root `README.md`, `AGENTS.md`, or `CLAUDE.md`. The digest replaces default exploratory reads, never your ability to read the real files. Read only what that specific judgment requires. Never modify anything.
 
 ## What to look for
 
@@ -60,6 +60,12 @@ TITLE: <one short line naming the issue>
 Rules: `CATEGORY`, `SEVERITY`, `FILE`, `LINE`, `START_LINE`, and `TITLE` are single lines in exactly that order. An unknown `FILE` drops the finding; invalid anchors become file-level. Omit `---SUGGESTION---` for broad refactors, deletions, and all missing-test findings. Never print anything outside the block.
 
 ## Inputs (provided by the harness)
+
+- Repository context prepared once for this review:
+
+```
+REPO_CONTEXT
+```
 
 - Curated reference tables path: `TABLES_PATH`
 - Changed files and numbered hunks:

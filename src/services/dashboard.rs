@@ -100,6 +100,10 @@ const REVIEW_COMMENTS_MAX_BYTES: usize = 12_000;
 const REVIEW_COVERAGE_DIFF_MAX_BYTES: usize = 120_000;
 /// Maximum combined annotated-diff size for one focused merged review call.
 pub(crate) const REVIEW_MERGED_FOCUS_BYTES: usize = 28_000;
+/// Shared repository conventions are read once per review and supplied to
+/// every scan. The directory inventory has its own small bound.
+const REVIEW_REPO_CONTEXT_MAX_BYTES: usize = 6 * 1024;
+const REVIEW_DIRECTORY_INVENTORY_MAX_BYTES: usize = 2 * 1024;
 /// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
 /// embedded PTY (the user watches it and can Esc out), so only the judge —
 /// which classifies one short comment — and the local git operations
@@ -769,6 +773,7 @@ pub enum ReviewPreparation {
     Ready {
         files: Vec<ReviewFile>,
         scan_mode: ReviewScanMode,
+        context: ReviewContext,
         /// Changed files nobody reviews by hand (lockfiles, minified
         /// bundles, snapshots, …), filtered out deterministically before
         /// any AI call. Reported on the final table with their reason.
@@ -794,6 +799,30 @@ pub enum ReviewPreparation {
 pub enum ReviewScanMode {
     Merged,
     Split,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewContext {
+    pub convention_docs: String,
+    pub directory_inventory: String,
+}
+
+impl ReviewContext {
+    fn rendered(&self) -> String {
+        let docs = if self.convention_docs.trim().is_empty() {
+            "(no root convention documents found)"
+        } else {
+            &self.convention_docs
+        };
+        let inventory = if self.directory_inventory.trim().is_empty() {
+            "(no changed-directory inventory available)"
+        } else {
+            &self.directory_inventory
+        };
+        format!(
+            "### Root convention documents\n{docs}\n\n### Changed-directory inventory\n{inventory}"
+        )
+    }
 }
 
 fn review_scan_mode(files: &[ReviewFile]) -> ReviewScanMode {
@@ -2830,9 +2859,11 @@ impl DashboardService {
             }
         }
 
+        let context = build_review_context(&cwd, &files).await;
         Ok(ReviewPreparation::Ready {
             scan_mode: review_scan_mode(&files),
             files,
+            context,
             skipped,
             owner,
             repo,
@@ -2896,6 +2927,7 @@ impl DashboardService {
         &self,
         worktree_path: &str,
         file: &ReviewFile,
+        context: &ReviewContext,
         feedback: Option<&str>,
         previous_finding: Option<&str>,
     ) -> ReviewScanAttempt {
@@ -2920,7 +2952,8 @@ impl DashboardService {
             );
         }
         let tables_path = materialize_review_tables().await;
-        let prompt = build_review_scan_prompt(file, &tables_path, feedback, previous_finding);
+        let prompt =
+            build_review_scan_prompt(file, context, &tables_path, feedback, previous_finding);
         let prompt_bytes = prompt.len();
         let title = review_scan_title();
         let mut run_args: Vec<String> = vec![
@@ -2977,6 +3010,7 @@ impl DashboardService {
         &self,
         worktree_path: &str,
         files: &[ReviewFile],
+        context: &ReviewContext,
     ) -> ReviewScanAttempt {
         let started = Instant::now();
         let cwd = PathBuf::from(worktree_path);
@@ -2991,7 +3025,7 @@ impl DashboardService {
                 None,
             );
         }
-        let prompt = build_review_coverage_prompt(files);
+        let prompt = build_review_coverage_prompt(files, context);
         let prompt_bytes = prompt.len();
         let title = review_scan_title();
         let mut run_args: Vec<String> = vec![
@@ -3046,6 +3080,7 @@ impl DashboardService {
         &self,
         worktree_path: &str,
         files: &[ReviewFile],
+        context: &ReviewContext,
     ) -> ReviewScanAttempt {
         let started = Instant::now();
         let cwd = PathBuf::from(worktree_path);
@@ -3061,7 +3096,7 @@ impl DashboardService {
             );
         }
         let tables_path = materialize_review_tables().await;
-        let prompt = build_review_merged_prompt(files, &tables_path);
+        let prompt = build_review_merged_prompt(files, context, &tables_path);
         let prompt_bytes = prompt.len();
         let title = review_scan_title();
         let mut run_args: Vec<String> = vec![
@@ -6317,6 +6352,120 @@ fn normalize_suggestion(suggestion: Option<&str>) -> String {
         .join(" ")
 }
 
+async fn build_review_context(cwd: &Path, files: &[ReviewFile]) -> ReviewContext {
+    let mut documents = Vec::new();
+    for name in ["CLAUDE.md", "AGENTS.md", "README.md"] {
+        if let Ok(content) = tokio::fs::read_to_string(cwd.join(name)).await {
+            documents.push((name, content));
+        }
+    }
+    ReviewContext {
+        convention_docs: render_review_documents(&documents, REVIEW_REPO_CONTEXT_MAX_BYTES),
+        directory_inventory: build_review_directory_inventory(
+            cwd,
+            files,
+            REVIEW_DIRECTORY_INVENTORY_MAX_BYTES,
+        )
+        .await,
+    }
+}
+
+fn render_review_documents(documents: &[(&str, String)], max_bytes: usize) -> String {
+    let mut rendered = String::new();
+    for (name, content) in documents {
+        let separator = if rendered.is_empty() { "" } else { "\n\n" };
+        let header = format!("#### {name}\n");
+        if rendered.len() + separator.len() + header.len() >= max_bytes {
+            break;
+        }
+        let remaining = max_bytes - rendered.len() - separator.len() - header.len();
+        let body = truncate_markdown_sections(content, remaining);
+        if body.is_empty() {
+            continue;
+        }
+        rendered.push_str(separator);
+        rendered.push_str(&header);
+        rendered.push_str(&body);
+    }
+    rendered
+}
+
+/// Keep complete leading Markdown sections when possible, then fall back to
+/// complete lines for an oversized first section. Never split UTF-8 or a
+/// source line in the middle.
+fn truncate_markdown_sections(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.trim_end().to_string();
+    }
+    let mut rendered = String::new();
+    let mut last_section_end = 0;
+    for line in content.split_inclusive('\n') {
+        if line.trim_start().starts_with('#') && !rendered.is_empty() {
+            last_section_end = rendered.len();
+        }
+        if rendered.len() + line.len() > max_bytes {
+            break;
+        }
+        rendered.push_str(line);
+    }
+    if last_section_end > 0 {
+        rendered.truncate(last_section_end);
+    }
+    rendered.truncate(rendered.trim_end().len());
+    rendered
+}
+
+async fn build_review_directory_inventory(
+    cwd: &Path,
+    files: &[ReviewFile],
+    max_bytes: usize,
+) -> String {
+    let mut directories = BTreeSet::new();
+    for file in files {
+        let path = Path::new(&file.path);
+        if path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            continue;
+        }
+        directories.insert(path.parent().unwrap_or(Path::new("")).to_path_buf());
+    }
+
+    let mut rendered = String::new();
+    for directory in directories {
+        let mut entries = Vec::new();
+        let Ok(mut read_dir) = tokio::fs::read_dir(cwd.join(&directory)).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            entries.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        entries.sort();
+        let display = if directory.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            directory.to_string_lossy().into_owned()
+        };
+        let header = format!("#### {display}\n");
+        if rendered.len() + header.len() > max_bytes {
+            break;
+        }
+        rendered.push_str(&header);
+        for entry in entries {
+            let line = format!("- {entry}\n");
+            if rendered.len() + line.len() > max_bytes {
+                break;
+            }
+            rendered.push_str(&line);
+        }
+    }
+    rendered.truncate(rendered.trim_end().len());
+    rendered
+}
+
 fn review_scan_attempt(
     scan: String,
     prompt_bytes: usize,
@@ -6486,6 +6635,7 @@ fn review_output_contract(prompt: &str) -> &str {
 /// "Other" revision of a single finding.
 fn build_review_scan_prompt(
     file: &ReviewFile,
+    context: &ReviewContext,
     tables_path: &str,
     feedback: Option<&str>,
     previous_finding: Option<&str>,
@@ -6503,6 +6653,7 @@ fn build_review_scan_prompt(
         truncate_for_prompt(&file.existing_comments, REVIEW_COMMENTS_MAX_BYTES)
     };
     let diff = truncate_for_prompt(&file.annotated_diff, REVIEW_DIFF_MAX_BYTES);
+    let context = context.rendered();
     substitute_review_prompt(
         template,
         &[
@@ -6510,6 +6661,7 @@ fn build_review_scan_prompt(
             ("FILE_PATH", &file.path),
             ("USER_FEEDBACK", feedback.unwrap_or("(none)")),
             ("PREVIOUS_FINDING", previous_finding.unwrap_or("(none)")),
+            ("REPO_CONTEXT", &context),
             ("EXISTING_COMMENTS", &existing),
             ("FILE_DIFF", &diff),
         ],
@@ -6522,19 +6674,24 @@ fn build_review_scan_prompt(
 /// combined — coverage is a cross-file judgment no per-file scan can make.
 /// Substitution order mirrors [`build_review_scan_prompt`]: the (largest,
 /// user-controlled) diff goes last.
-fn build_review_coverage_prompt(files: &[ReviewFile]) -> String {
+fn build_review_coverage_prompt(files: &[ReviewFile], context: &ReviewContext) -> String {
     const COVERAGE_PROMPT: &str = include_str!("../../prompts/reviewer_coverage.md");
-    build_review_whole_diff_prompt(COVERAGE_PROMPT, files, None)
+    build_review_whole_diff_prompt(COVERAGE_PROMPT, files, context, None)
 }
 
-fn build_review_merged_prompt(files: &[ReviewFile], tables_path: &str) -> String {
+fn build_review_merged_prompt(
+    files: &[ReviewFile],
+    context: &ReviewContext,
+    tables_path: &str,
+) -> String {
     const MERGED_PROMPT: &str = include_str!("../../prompts/reviewer.md");
-    build_review_whole_diff_prompt(MERGED_PROMPT, files, Some(tables_path))
+    build_review_whole_diff_prompt(MERGED_PROMPT, files, context, Some(tables_path))
 }
 
 fn build_review_whole_diff_prompt(
     template: &str,
     files: &[ReviewFile],
+    context: &ReviewContext,
     tables_path: Option<&str>,
 ) -> String {
     let mut diff = String::new();
@@ -6561,10 +6718,12 @@ fn build_review_whole_diff_prompt(
         truncate_for_prompt(&comments, REVIEW_COMMENTS_MAX_BYTES)
     };
     let diff = truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES);
+    let context = context.rendered();
     substitute_review_prompt(
         template,
         &[
             ("TABLES_PATH", tables_path.unwrap_or("")),
+            ("REPO_CONTEXT", &context),
             ("EXISTING_COMMENTS", &existing),
             ("FULL_DIFF", &diff),
         ],
@@ -7794,11 +7953,17 @@ new file mode 100644
             existing_comments: "@alice (line 1): rename this".to_string(),
             existing_keys: Vec::new(),
         };
-        let prompt = build_review_scan_prompt(&file, "/tmp/tables.md", None, None);
+        let context = ReviewContext {
+            convention_docs: "#### AGENTS.md\nUse surgical changes.".to_string(),
+            directory_inventory: "#### src\n- lib.rs\n- main.rs".to_string(),
+        };
+        let prompt = build_review_scan_prompt(&file, &context, "/tmp/tables.md", None, None);
         assert!(prompt.contains("src/lib.rs"));
         assert!(prompt.contains("     1 +let x = 1;"));
         assert!(prompt.contains("@alice (line 1): rename this"));
         assert!(prompt.contains("/tmp/tables.md"));
+        assert!(prompt.contains("Use surgical changes."));
+        assert!(prompt.contains("- main.rs"));
         // No unsubstituted tokens survive.
         for token in [
             "FILE_PATH",
@@ -7807,6 +7972,7 @@ new file mode 100644
             "TABLES_PATH",
             "USER_FEEDBACK",
             "PREVIOUS_FINDING",
+            "REPO_CONTEXT",
         ] {
             assert!(!prompt.contains(token), "{token} leaked into the prompt");
         }
@@ -7816,11 +7982,18 @@ new file mode 100644
         assert!(inputs < prompt.find("src/lib.rs").unwrap());
         assert!(inputs < prompt.find("     1 +let x = 1;").unwrap());
         // The revision pass threads feedback + the previous finding through.
-        let revised = build_review_scan_prompt(&file, "/tmp/t.md", Some("too harsh"), Some("prev"));
+        let revised = build_review_scan_prompt(
+            &file,
+            &ReviewContext::default(),
+            "/tmp/t.md",
+            Some("too harsh"),
+            Some("prev"),
+        );
         assert!(revised.contains("too harsh"));
         assert!(revised.contains("prev"));
         let literal = build_review_scan_prompt(
             &file,
+            &ReviewContext::default(),
             "/tmp/t.md",
             Some("keep FILE_DIFF and EXISTING_COMMENTS literal"),
             Some("keep USER_FEEDBACK literal"),
@@ -7930,6 +8103,55 @@ new file mode 100644
     }
 
     #[test]
+    fn review_documents_keep_priority_and_truncate_at_section_boundaries() {
+        let documents = vec![
+            (
+                "CLAUDE.md",
+                "# First\nalpha\n# Second\nbeta beta beta\n".to_string(),
+            ),
+            ("AGENTS.md", "agents rules".to_string()),
+            ("README.md", "readme notes".to_string()),
+        ];
+        let rendered = render_review_documents(&documents, 45);
+        assert!(rendered.starts_with("#### CLAUDE.md\n# First\nalpha"));
+        assert!(!rendered.contains("# Second"));
+        assert!(!rendered.contains("agents rules"));
+        assert!(rendered.len() <= 45);
+        assert!(!rendered.ends_with("bet"), "must not split a source line");
+    }
+
+    #[tokio::test]
+    async fn review_context_builds_bounded_directory_inventory_and_skips_bad_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Keep it simple.\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), [0xff, 0xfe]).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
+        let file = |path: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: String::new(),
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let context = build_review_context(
+            dir.path(),
+            &[
+                file("src/a.rs"),
+                file("missing/no.rs"),
+                file("../outside.rs"),
+            ],
+        )
+        .await;
+        assert!(context.convention_docs.contains("#### AGENTS.md"));
+        assert!(context.convention_docs.contains("Keep it simple."));
+        assert!(!context.convention_docs.contains("README.md"));
+        assert_eq!(context.directory_inventory, "#### src\n- a.rs\n- b.rs");
+        assert!(context.directory_inventory.len() <= REVIEW_DIRECTORY_INVENTORY_MAX_BYTES);
+    }
+
+    #[test]
     fn build_review_scan_prompt_picks_the_profile_by_file_kind() {
         let source = ReviewFile {
             path: "src/lib.rs".to_string(),
@@ -7942,8 +8164,12 @@ new file mode 100644
             path: "tests/lib_test.rs".to_string(),
             ..source.clone()
         };
-        let source_prompt = build_review_scan_prompt(&source, "/tmp/t.md", None, None);
-        let test_prompt = build_review_scan_prompt(&test, "/tmp/t.md", None, None);
+        let context = ReviewContext {
+            convention_docs: "shared convention".to_string(),
+            directory_inventory: "shared inventory".to_string(),
+        };
+        let source_prompt = build_review_scan_prompt(&source, &context, "/tmp/t.md", None, None);
+        let test_prompt = build_review_scan_prompt(&test, &context, "/tmp/t.md", None, None);
         assert!(source_prompt.starts_with("You are reviewing the changed lines of ONE file"));
         assert!(test_prompt.starts_with("You are reviewing the changed lines of ONE test file"));
         assert!(test_prompt.contains("test-quality specialist"));
@@ -7956,6 +8182,9 @@ new file mode 100644
         for prompt in [&source_prompt, &test_prompt] {
             assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
             assert!(prompt.contains("---END-FINDING---"));
+            assert!(prompt.contains("shared convention"));
+            assert!(prompt.contains("shared inventory"));
+            assert!(prompt.contains("never your ability to read the real files"));
         }
     }
 
@@ -7975,7 +8204,11 @@ new file mode 100644
             existing_comments: String::new(),
             ..app.clone()
         };
-        let prompt = build_review_coverage_prompt(&[app, test]);
+        let context = ReviewContext {
+            convention_docs: "coverage convention".to_string(),
+            directory_inventory: "coverage inventory".to_string(),
+        };
+        let prompt = build_review_coverage_prompt(&[app, test], &context);
         assert!(prompt.starts_with("You are the test-coverage specialist"));
         assert!(prompt.contains("### FILE: src/lib.rs"));
         assert!(prompt.contains("     1 +let x = 1;"));
@@ -7983,6 +8216,9 @@ new file mode 100644
         assert!(prompt.contains("     9 +assert!(x);"));
         assert!(prompt.contains("@bob (line 1): please test this"));
         assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
+        assert!(prompt.contains("coverage convention"));
+        assert!(prompt.contains("coverage inventory"));
+        assert!(prompt.contains("never your ability to read the real files"));
         let contract = prompt.find("## Output contract").unwrap();
         let inputs = prompt.find("## Inputs (provided by the harness)").unwrap();
         assert!(contract < inputs, "static contract must precede inputs");
@@ -8023,7 +8259,11 @@ new file mode 100644
             commentable_lines: BTreeSet::from([9]),
             ..app.clone()
         };
-        let prompt = build_review_merged_prompt(&[app, test], "/tmp/tables.md");
+        let context = ReviewContext {
+            convention_docs: "merged convention".to_string(),
+            directory_inventory: "merged inventory".to_string(),
+        };
+        let prompt = build_review_merged_prompt(&[app, test], &context, "/tmp/tables.md");
         assert!(prompt.contains(
             "CATEGORY: <Code Smell | Security | Performance | Test Quality | Convention>"
         ));
@@ -8032,6 +8272,9 @@ new file mode 100644
         assert!(prompt.contains("### FILE: tests/lib_test.rs"));
         assert!(prompt.contains("/tmp/tables.md"));
         assert!(!prompt.contains("TABLES_PATH"));
+        assert!(prompt.contains("merged convention"));
+        assert!(prompt.contains("merged inventory"));
+        assert!(prompt.contains("never your ability to read the real files"));
         assert!(prompt.find("## Output contract").unwrap() < prompt.find("## Inputs").unwrap());
     }
 

@@ -216,6 +216,8 @@ optional reads judges conventions blind).
 **Touches.** `prepare_review`, a shared `ReviewContext` handed to every scan,
 all scan prompts (respecting #1's prefix layout).
 
+**Status:** ✅ implemented — commit b486917. as specified; convention docs are capped at 6KB and the directory inventory at 2KB.
+
 ## #6 — Inline full files under a size cap (precision upgrade)
 
 **Attacks precision deficit #5 — the strongest remaining way the skill can

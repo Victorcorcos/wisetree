@@ -46,8 +46,8 @@ use ratatui::Frame;
 use crate::config::schema::AiModelConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{
-    is_test_file, split_duplicate_findings, split_run_duplicate_findings, ReviewFile,
-    ReviewFinding, ReviewScanMode, ReviewSeverity, ReviewSkippedFile,
+    is_test_file, split_duplicate_findings, split_run_duplicate_findings, ReviewContext,
+    ReviewFile, ReviewFinding, ReviewScanMode, ReviewSeverity, ReviewSkippedFile,
 };
 use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
@@ -225,6 +225,7 @@ pub struct ReviewPullRequestScreen {
     /// The changed files to scan, in diff order. Empty until preparation.
     /// Kept whole so an "Other" revision can re-render the file's prompt.
     files: Vec<ReviewFile>,
+    context: ReviewContext,
     /// Small diffs combine application review and coverage in the sentinel
     /// call; large diffs retain per-file application scans plus coverage.
     scan_mode: ReviewScanMode,
@@ -281,6 +282,7 @@ impl ReviewPullRequestScreen {
             repo: String::new(),
             head_sha: String::new(),
             files: Vec::new(),
+            context: ReviewContext::default(),
             scan_mode: ReviewScanMode::Split,
             next_scan: 0,
             has_coverage_scan: false,
@@ -404,6 +406,14 @@ impl ReviewPullRequestScreen {
 
     pub fn set_scan_mode(&mut self, scan_mode: ReviewScanMode) {
         self.scan_mode = scan_mode;
+    }
+
+    pub fn set_review_context(&mut self, context: ReviewContext) {
+        self.context = context;
+    }
+
+    pub fn review_context(&self) -> ReviewContext {
+        self.context.clone()
     }
 
     pub fn scan_mode(&self) -> ReviewScanMode {
