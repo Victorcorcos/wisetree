@@ -108,6 +108,7 @@ const REVIEW_DIRECTORY_INVENTORY_MAX_BYTES: usize = 2 * 1024;
 const REVIEW_FILE_INLINE_MAX_BYTES: usize = 16 * 1024;
 /// Compact tester evidence passed to the sole coverage-owning scan.
 const REVIEW_TESTER_FINDINGS_MAX_BYTES: usize = 2 * 1024;
+const REVIEW_TEST_FILE_INVENTORY_MAX_BYTES: usize = 2 * 1024;
 /// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
 /// embedded PTY (the user watches it and can Esc out), so only the judge —
 /// which classifies one short comment — and the local git operations
@@ -6753,10 +6754,12 @@ fn build_review_whole_diff_prompt(
     let mut diff = String::new();
     for file in files {
         diff.push_str(&format!("### FILE: {}\n", file.path));
-        diff.push_str(&truncate_for_prompt(
-            &file.annotated_diff,
-            REVIEW_DIFF_MAX_BYTES,
-        ));
+        let annotated = if is_test_file(&file.path) {
+            review_test_skeleton(file)
+        } else {
+            file.annotated_diff.clone()
+        };
+        diff.push_str(&truncate_for_prompt(&annotated, REVIEW_DIFF_MAX_BYTES));
         diff.push_str("\n\n");
     }
     let mut comments = String::new();
@@ -6779,6 +6782,9 @@ fn build_review_whole_diff_prompt(
         if diff.len() + heading.len() <= REVIEW_COVERAGE_DIFF_MAX_BYTES {
             diff.push_str(heading);
             for file in files {
+                if is_test_file(&file.path) {
+                    continue;
+                }
                 let content = review_file_content_for_prompt(file);
                 let block = format!("\n#### FILE: {}\n{content}\n", file.path);
                 if diff.len() + block.len() > REVIEW_COVERAGE_DIFF_MAX_BYTES {
@@ -6788,6 +6794,7 @@ fn build_review_whole_diff_prompt(
             }
         }
     }
+    let test_file_inventory = review_test_file_inventory(files, &context.directory_inventory);
     let context = context.rendered();
     let tester_findings = format_test_quality_findings(tester_findings);
     let tester_findings = if tester_findings.is_empty() {
@@ -6801,10 +6808,115 @@ fn build_review_whole_diff_prompt(
             ("TABLES_PATH", tables_path.unwrap_or("")),
             ("REPO_CONTEXT", &context),
             ("TEST_QUALITY_FINDINGS", tester_findings),
+            ("TEST_FILE_INVENTORY", &test_file_inventory),
             ("EXISTING_COMMENTS", &existing),
             ("FULL_DIFF", &diff),
         ],
     )
+}
+
+fn review_test_skeleton(file: &ReviewFile) -> String {
+    let mut skeleton = String::new();
+    let mut rust_test_attribute = false;
+    for line in file.annotated_diff.lines() {
+        let Some(diff_line) = line.get(7..) else {
+            continue;
+        };
+        let Some(kind) = diff_line.chars().next() else {
+            continue;
+        };
+        if kind == '-' {
+            continue;
+        }
+        let code = diff_line.get(1..).unwrap_or_default().trim_start();
+        let is_attribute = code.starts_with("#[") && code.contains("test");
+        let is_test_function =
+            rust_test_attribute && (code.starts_with("fn ") || code.starts_with("async fn "));
+        let keep = is_attribute
+            || is_test_function
+            || is_test_scenario_declaration(code)
+            || is_test_assertion_line(code);
+        if keep {
+            skeleton.push_str(line);
+            skeleton.push('\n');
+        }
+        rust_test_attribute = is_attribute;
+    }
+    if skeleton.is_empty() {
+        file.annotated_diff.clone()
+    } else {
+        skeleton.trim_end().to_string()
+    }
+}
+
+fn is_test_scenario_declaration(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    lower.starts_with("describe(")
+        || lower.starts_with("describe ")
+        || lower.starts_with("context(")
+        || lower.starts_with("context ")
+        || lower.starts_with("it(")
+        || lower.starts_with("it ")
+        || lower.starts_with("test(")
+        || lower.starts_with("test ")
+        || lower.starts_with("def test_")
+        || lower.starts_with("async def test_")
+        || lower.starts_with("class test")
+}
+
+fn is_test_assertion_line(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    lower.contains("assert")
+        || lower.starts_with("debug_assert")
+        || lower.starts_with("refute")
+        || lower.contains("expect(")
+        || lower.contains("expect (")
+        || lower.contains("expect {")
+        || lower.contains("is_expected")
+        || lower.starts_with("with pytest.raises")
+        || lower.contains(".should")
+        || lower.contains(".must_")
+        || lower.starts_with(".to")
+        || lower.starts_with(".not_to")
+        || lower.starts_with(".rejects")
+        || lower.starts_with(".resolves")
+}
+
+fn review_test_file_inventory(files: &[ReviewFile], directory_inventory: &str) -> String {
+    let mut paths = files
+        .iter()
+        .filter(|file| is_test_file(&file.path))
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut directory = String::new();
+    for line in directory_inventory.lines() {
+        if let Some(value) = line.strip_prefix("#### ") {
+            directory = value.trim().to_string();
+        } else if let Some(name) = line.strip_prefix("- ") {
+            let path = if directory == "." || directory.is_empty() {
+                name.trim().to_string()
+            } else {
+                format!("{}/{}", directory.trim_end_matches('/'), name.trim())
+            };
+            if is_test_file(&path) {
+                paths.insert(path);
+            }
+        }
+    }
+    let mut rendered = String::new();
+    for path in paths {
+        let line = format!("- {path}\n");
+        if rendered.len() + line.len() > REVIEW_TEST_FILE_INVENTORY_MAX_BYTES {
+            break;
+        }
+        rendered.push_str(&line);
+    }
+    if rendered.is_empty() {
+        "(none found in changed-directory inventory; use a targeted read when needed)".to_string()
+    } else {
+        rendered.truncate(rendered.trim_end().len());
+        rendered
+    }
 }
 
 pub(crate) fn format_test_quality_findings(findings: &[ReviewFinding]) -> String {
@@ -8347,6 +8459,8 @@ new file mode 100644
         };
         let test = ReviewFile {
             path: "tests/lib_test.rs".to_string(),
+            annotated_diff: "     8 +let fixture = expensive_setup();\n     9 +assert!(x);"
+                .to_string(),
             full_content: Some("fn test_body() {}".to_string()),
             ..source.clone()
         };
@@ -8375,6 +8489,7 @@ new file mode 100644
         }
         assert!(source_prompt.contains("fn source_body() {}"));
         assert!(test_prompt.contains("fn test_body() {}"));
+        assert!(test_prompt.contains("let fixture = expensive_setup();"));
     }
 
     #[test]
@@ -8389,14 +8504,15 @@ new file mode 100644
         };
         let test = ReviewFile {
             path: "tests/lib_test.rs".to_string(),
-            annotated_diff: "     9 +assert!(x);".to_string(),
+            annotated_diff: "     8 +let fixture = expensive_setup();\n     9 +assert!(x);"
+                .to_string(),
             commentable_lines: BTreeSet::from([9]),
             existing_comments: String::new(),
             ..app.clone()
         };
         let context = ReviewContext {
             convention_docs: "coverage convention".to_string(),
-            directory_inventory: "coverage inventory".to_string(),
+            directory_inventory: "#### src\n- lib.rs\n- lib_test.rs".to_string(),
         };
         let tester_findings = vec![ReviewFinding {
             category: "Test".to_string(),
@@ -8415,10 +8531,10 @@ new file mode 100644
         assert!(prompt.contains("     1 +let x = 1;"));
         assert!(prompt.contains("### FILE: tests/lib_test.rs"));
         assert!(prompt.contains("     9 +assert!(x);"));
+        assert!(!prompt.contains("let fixture = expensive_setup();"));
         assert!(prompt.contains("@bob (line 1): please test this"));
         assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
         assert!(prompt.contains("coverage convention"));
-        assert!(prompt.contains("coverage inventory"));
         assert!(prompt.contains("never your ability to read the real files"));
         assert!(!prompt.contains("coverage body must stay out"));
         assert!(prompt.contains(
@@ -8426,6 +8542,8 @@ new file mode 100644
         ));
         assert!(prompt.contains("verify that test's assertion yourself"));
         assert!(!prompt.contains("TEST_QUALITY_FINDINGS"));
+        assert!(prompt.contains("- src/lib_test.rs\n- tests/lib_test.rs"));
+        assert!(!prompt.contains("TEST_FILE_INVENTORY"));
         let empty_feed = build_review_coverage_prompt(&files, &context, &[]);
         assert!(empty_feed.contains("```\n(none)\n```"));
         let contract = prompt.find("## Output contract").unwrap();
@@ -8466,8 +8584,9 @@ new file mode 100644
         };
         let test = ReviewFile {
             path: "tests/lib_test.rs".to_string(),
-            annotated_diff: "     9 +assert!(x);".to_string(),
-            full_content: None,
+            annotated_diff: "     8 +let fixture = expensive_setup();\n     9 +assert!(x);"
+                .to_string(),
+            full_content: Some("fn test_body() { expensive_setup(); }".to_string()),
             commentable_lines: BTreeSet::from([9]),
             ..app.clone()
         };
@@ -8493,6 +8612,7 @@ new file mode 100644
         assert!(prompt.contains("**Test Quality** finding"));
         assert!(prompt.contains("### FILE: src/lib.rs"));
         assert!(prompt.contains("### FILE: tests/lib_test.rs"));
+        assert!(!prompt.contains("let fixture = expensive_setup();"));
         assert!(prompt.contains("/tmp/tables.md"));
         assert!(!prompt.contains("TABLES_PATH"));
         assert!(prompt.contains("merged convention"));
@@ -8500,13 +8620,15 @@ new file mode 100644
         assert!(prompt.contains("never your ability to read the real files"));
         assert!(prompt.contains("### FULL CURRENT FILE CONTENT APPENDIX"));
         assert!(prompt.contains("fn merged_body() {}"));
-        assert!(prompt.contains("read `tests/lib_test.rs` before emitting"));
+        assert!(!prompt.contains("fn test_body() { expensive_setup(); }"));
         assert!(prompt.contains("MUST read that real full file"));
         assert!(
             prompt.contains("- tests/lib_test.rs — Over-mocked flow: Mocks the unit under test.")
         );
         assert!(prompt.contains("verify that test's assertion yourself"));
         assert!(!prompt.contains("TEST_QUALITY_FINDINGS"));
+        assert!(prompt.contains("- tests/lib_test.rs"));
+        assert!(!prompt.contains("TEST_FILE_INVENTORY"));
         assert!(prompt.find("## Output contract").unwrap() < prompt.find("## Inputs").unwrap());
     }
 
@@ -8532,6 +8654,88 @@ new file mode 100644
         assert!(
             rendered.lines().count() < findings.len(),
             "the cap must apply"
+        );
+    }
+
+    #[test]
+    fn test_skeletons_keep_scenarios_and_assertions_across_languages() {
+        let cases = [
+            (
+                "tests/unit_test.rs",
+                "     1 +#[test]\n     2 +fn rejects_empty() {\n     3 +    let value = setup();\n     4 +    assert_eq!(value, 1);\n     5 +}",
+                "fn rejects_empty()",
+                "assert_eq!",
+                "let value = setup()",
+            ),
+            (
+                "spec/unit_spec.rb",
+                "    10 +context \"when empty\" do\n    11 +  let(:value) { build(:x) }\n    12 +  it \"rejects it\" do\n    13 +    expect(result).to eq(:error)\n    14 +  end",
+                "context \"when empty\"",
+                "expect(result)",
+                "let(:value)",
+            ),
+            (
+                "tests/test_unit.py",
+                "    20 +def test_rejects_empty():\n    21 +    value = setup()\n    22 +    assert value == 1",
+                "def test_rejects_empty",
+                "assert value == 1",
+                "value = setup()",
+            ),
+            (
+                "src/unit.test.ts",
+                "    30 +it(\"rejects empty\", () => {\n    31 +  const value = setup();\n    32 +  expect(value)\n    33 +    .toEqual(1);\n    34 +});",
+                "it(\"rejects empty\"",
+                ".toEqual(1)",
+                "const value = setup()",
+            ),
+        ];
+        for (path, diff, scenario, assertion, setup) in cases {
+            let file = ReviewFile {
+                path: path.to_string(),
+                annotated_diff: diff.to_string(),
+                full_content: None,
+                commentable_lines: BTreeSet::new(),
+                existing_comments: String::new(),
+                existing_keys: Vec::new(),
+            };
+            let skeleton = review_test_skeleton(&file);
+            assert!(skeleton.contains(scenario), "{path}: {skeleton}");
+            assert!(skeleton.contains(assertion), "{path}: {skeleton}");
+            assert!(!skeleton.contains(setup), "{path}: {skeleton}");
+        }
+    }
+
+    #[test]
+    fn unknown_test_syntax_falls_back_and_inventory_includes_nearby_tests() {
+        let file = ReviewFile {
+            path: "tests/custom_test.dsl".to_string(),
+            annotated_diff: "     1 +verify result equals success\n     2 +using fixture account"
+                .to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        assert_eq!(review_test_skeleton(&file), file.annotated_diff);
+        let app = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            ..file.clone()
+        };
+        let context = ReviewContext {
+            convention_docs: String::new(),
+            directory_inventory: "#### src\n- helper.rs\n- lib.rs\n- lib_test.rs".to_string(),
+        };
+        let rendered =
+            review_test_file_inventory(&[app.clone(), file.clone()], &context.directory_inventory);
+        assert_eq!(rendered, "- src/lib_test.rs\n- tests/custom_test.dsl");
+        let many = (0..300)
+            .map(|index| ReviewFile {
+                path: format!("tests/case_{index}_test.rs"),
+                ..file.clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            review_test_file_inventory(&many, "").len() <= REVIEW_TEST_FILE_INVENTORY_MAX_BYTES
         );
     }
 

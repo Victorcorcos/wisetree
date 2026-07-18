@@ -324,6 +324,8 @@ unaffected — it never used the slimmed copy.
 Rust test-skeleton extractor (per-language line heuristics, same spirit as
 `is_test_file`).
 
+**Status:** ✅ implemented — commit 7b1cb6b. as specified; unknown test syntax falls back to the full diff and the test-path inventory is capped at 2KB.
+
 ## #9 — Send existing-comment *keys*, not bodies
 
 **Independent trim; ordered here because it edits the same prompt-input code

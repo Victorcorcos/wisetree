@@ -12,6 +12,8 @@ Read a full changed file, relevant test, or root convention file only for that s
 
 This coverage-only profile does not duplicate full file bodies in its input. Your permission to read any real changed or test file remains unchanged whenever the numbered hunks and repository context leave coverage ambiguous.
 
+Test-file sections in the changed-files input are slim scenario skeletons: scenario declarations and assertions retain their authoritative line numbers while setup and fixture bodies are omitted. When a skeleton is ambiguous, you MAY read the real full test file; the nearby test-file inventory identifies the most targeted read. Tester specialists still receive the unchanged full test diffs.
+
 ## What to look for
 
 Judge only the behavior introduced or modified by the numbered `+` lines of the **application-code** files. The changed test files are your evidence of what is covered, not review targets — their internal quality (naming, mocking, structure) is another reviewer's job. For each changed behavior, decide whether some test — changed in this diff or already in the repo — would FAIL if that behavior misbehaved. Executing a line is not covering it; only an assertion that pins the outcome counts. A behavior is a coverage gap when no such test exists for:
@@ -77,7 +79,13 @@ REPO_CONTEXT
 TEST_QUALITY_FINDINGS
 ```
 
-- The PR's changed files, one `### FILE: <path>` section per file. Every line that exists in the new version of a file is prefixed with its new-side line number; removed lines have no number:
+- Changed and nearby test-file paths from the prepared inventory:
+
+```
+TEST_FILE_INVENTORY
+```
+
+- The PR's changed application files as numbered hunks and changed test files as numbered scenario/assertion skeletons, one `### FILE: <path>` section per file:
 
 ```
 FULL_DIFF

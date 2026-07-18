@@ -6,6 +6,8 @@ The harness supplies a repository-context digest below with root conventions and
 
 A full-content appendix also supplies current files while they fit the bounded prompt budget. When a file is absent from that appendix or says its full content was not inlined, you MUST read that real full file before emitting any structural finding such as long method, god class, divergent change, shotgun surgery, or step-down violation. The numbered hunks remain authoritative for finding anchors.
 
+Test-file sections in the changed-files input are slim scenario skeletons: scenario declarations and assertions retain their authoritative line numbers while setup and fixture bodies are omitted. When a skeleton is ambiguous, you MAY read the real full test file; the nearby test-file inventory identifies the most targeted read. Tester specialists still receive the unchanged full test diffs.
+
 ## What to look for
 
 Review numbered changed application-code lines across four categories, using cross-file evidence when relevant:
@@ -78,7 +80,13 @@ REPO_CONTEXT
 TEST_QUALITY_FINDINGS
 ```
 
-- Changed files and numbered hunks:
+- Changed and nearby test-file paths from the prepared inventory:
+
+```
+TEST_FILE_INVENTORY
+```
+
+- Changed application files with numbered hunks, and changed test files with numbered scenario/assertion skeletons:
 
 ```
 FULL_DIFF

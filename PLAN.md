@@ -184,16 +184,16 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] A conservative multi-language extractor retains recognized scenario/test declarations and assertion lines from annotated test diffs.
-- [ ] Merged and split-coverage prompt builders use test skeletons plus nearby test-path inventory; tester prompts still receive full annotated test diffs.
-- [ ] Coverage prompts explicitly retain permission to read the full test file when the skeleton is ambiguous.
-- [ ] Tests cover representative Rust, Ruby, Python, and JavaScript/TypeScript test shapes, line numbers, unknown syntax fallback, and profile separation.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #8 Status line.
+- [x] A conservative multi-language extractor retains recognized scenario/test declarations and assertion lines from annotated test diffs.
+- [x] Merged and split-coverage prompt builders use test skeletons plus nearby test-path inventory; tester prompts still receive full annotated test diffs.
+- [x] Coverage prompts explicitly retain permission to read the full test file when the skeleton is ambiguous.
+- [x] Tests cover representative Rust, Ruby, Python, and JavaScript/TypeScript test shapes, line numbers, unknown syntax fallback, and profile separation.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #8 Status line.
 
 **Edge cases**:
 
-- [ ] Unrecognized test frameworks degrade conservatively without silently removing all coverage evidence.
-- [ ] Multiline assertions and nested scenario names retain enough context or trigger the full-file read allowance.
+- [x] Unrecognized test frameworks degrade conservatively without silently removing all coverage evidence.
+- [x] Multiline assertions and nested scenario names retain enough context or trigger the full-file read allowance.
 
 ---
 
@@ -275,7 +275,7 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 | 5 | Pre-digest shared repository context | ✅ Done |
 | 6 | Inline capped full-file content | ✅ Done |
 | 7 | Feed test-quality findings to coverage | ✅ Done |
-| 8 | Slim test diffs to scenario skeletons | ⬚ Pending |
+| 8 | Slim test diffs to scenario skeletons | ✅ Done |
 | 9 | Compact existing-comment keys | ⬚ Pending |
 | 10 | Expand deterministic skip rules | ⬚ Pending |
 | 11 | Focus the “Other” revision call | ⬚ Pending |
