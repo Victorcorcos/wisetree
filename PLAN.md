@@ -205,16 +205,16 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] Existing Wisetree comments render as one compact line containing anchor and normalized title; human comments contribute only a bounded first line.
-- [ ] Deterministic `ExistingFindingKey` extraction and `split_duplicate_findings` behavior remain unchanged.
-- [ ] Per-file and multi-file prompts consume the compact representation and no longer include full comment bodies by default.
-- [ ] Tests cover Wisetree comments, human comments, missing anchors, multiline/long bodies, and unchanged deterministic dedup.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #9 Status line.
+- [x] Existing Wisetree comments render as one compact line containing anchor and normalized title; human comments contribute only a bounded first line.
+- [x] Deterministic `ExistingFindingKey` extraction and `split_duplicate_findings` behavior remain unchanged.
+- [x] Per-file and multi-file prompts consume the compact representation and no longer include full comment bodies by default.
+- [x] Tests cover Wisetree comments, human comments, missing anchors, multiline/long bodies, and unchanged deterministic dedup.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #9 Status line.
 
 **Edge cases**:
 
-- [ ] Blank or heading-only human comments do not create misleading keys.
-- [ ] Multiple comments with the same first line remain harmless because model context is advisory and Rust dedup is authoritative.
+- [x] Blank or heading-only human comments do not create misleading keys.
+- [x] Multiple comments with the same first line remain harmless because model context is advisory and Rust dedup is authoritative.
 
 ---
 

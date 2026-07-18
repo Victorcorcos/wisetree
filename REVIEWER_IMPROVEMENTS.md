@@ -348,6 +348,8 @@ dedup and the walkthrough's Skip button already absorb.
 **Touches.** prompt builders, `ReviewFile::existing_comments` construction in
 `prepare_review`.
 
+**Status:** ✅ implemented — commit 85744ce. as specified.
+
 ## #10 — Skip more files deterministically
 
 **Independent, zero-AI. Late only because its savings are smaller than

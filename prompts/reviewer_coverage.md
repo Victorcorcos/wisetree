@@ -91,7 +91,7 @@ TEST_FILE_INVENTORY
 FULL_DIFF
 ```
 
-- Review comments already posted on the PR, grouped per file (do NOT re-raise anything these already cover; empty when none):
+- Compact keys for review comments already posted on the PR, grouped per file (do NOT re-raise anything these already cover; empty when none):
 
 ```
 EXISTING_COMMENTS

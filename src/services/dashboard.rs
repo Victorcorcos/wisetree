@@ -95,6 +95,7 @@ const GH_TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// diff, and the existing-comments dedup context.
 const REVIEW_DIFF_MAX_BYTES: usize = 60_000;
 const REVIEW_COMMENTS_MAX_BYTES: usize = 12_000;
+const REVIEW_COMMENT_KEY_MAX_BYTES: usize = 160;
 /// Byte cap for the whole-diff coverage prompt, which concatenates every
 /// file's (already individually capped) annotated diff into one call.
 const REVIEW_COVERAGE_DIFF_MAX_BYTES: usize = 120_000;
@@ -754,8 +755,8 @@ pub struct ReviewFile {
     /// New-side line numbers GitHub accepts inline comments on (additions +
     /// context lines present in the diff).
     pub commentable_lines: BTreeSet<u64>,
-    /// Review comments already posted on this file, rendered as
-    /// `@author (line N): body` blocks — dedup context for the scan call.
+    /// Review comments already posted on this file, rendered as compact
+    /// `- line N: title` advisory keys for the scan call.
     /// Empty when the PR has none.
     pub existing_comments: String,
     /// Structured dedup keys of the wisetree-format comments already on
@@ -6198,8 +6199,9 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
 }
 
 /// Per-file context extracted from the PR's existing inline comments: the
-/// rendered block the scan prompt shows the AI, plus the structured keys of
-/// the wisetree-format ones that back the deterministic duplicate filter.
+/// compact advisory keys the scan prompt shows the AI, plus the structured
+/// keys of the wisetree-format ones that back the deterministic duplicate
+/// filter.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ExistingComments {
     pub(crate) rendered: String,
@@ -6207,9 +6209,9 @@ pub(crate) struct ExistingComments {
 }
 
 /// Group the PR's existing inline review comments per file path, rendered as
-/// `@author (line N): body` blocks. Input is the REST
-/// `pulls/{n}/comments` JSON array; anything unparsable yields no context
-/// (the scan just runs without dedup awareness).
+/// compact line/title keys. Input is the REST `pulls/{n}/comments` JSON array;
+/// anything unparsable yields no context (the scan just runs without dedup
+/// awareness).
 pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, ExistingComments> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         return HashMap::new();
@@ -6227,20 +6229,23 @@ pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, Exis
         if body.trim().is_empty() {
             continue;
         }
-        let author = item
-            .pointer("/user/login")
-            .and_then(|v| v.as_str())
-            .unwrap_or("reviewer");
         let line = item
             .get("line")
             .and_then(|v| v.as_u64())
             .or_else(|| item.get("original_line").and_then(|v| v.as_u64()));
-        let anchor = line.map(|l| format!(" (line {l})")).unwrap_or_default();
-        rendered
-            .entry(path.to_string())
-            .or_default()
-            .push(format!("@{author}{anchor}: {}", body.trim()));
-        if let Some(title) = wisetree_finding_title(body) {
+        let wisetree_title = wisetree_finding_title(body);
+        let advisory = wisetree_title
+            .as_deref()
+            .map(|title| compact_review_text(title, REVIEW_COMMENT_KEY_MAX_BYTES))
+            .or_else(|| human_comment_first_line(body));
+        if let Some(advisory) = advisory.filter(|value| !value.is_empty()) {
+            let anchor = line.map_or("file".to_string(), |line| format!("line {line}"));
+            rendered
+                .entry(path.to_string())
+                .or_default()
+                .push(format!("- {anchor}: {advisory}"));
+        }
+        if let Some(title) = wisetree_title {
             keys.entry(path.to_string())
                 .or_default()
                 .push(ExistingFindingKey { line, title });
@@ -6253,12 +6258,21 @@ pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, Exis
             (
                 path,
                 ExistingComments {
-                    rendered: comments.join("\n\n"),
+                    rendered: comments.join("\n"),
                     keys,
                 },
             )
         })
         .collect()
+}
+
+fn human_comment_first_line(body: &str) -> Option<String> {
+    let first = body.trim().lines().next()?.trim();
+    if first.trim_matches('#').trim().is_empty() {
+        return None;
+    }
+    let compact = compact_review_text(first, REVIEW_COMMENT_KEY_MAX_BYTES);
+    (!compact.is_empty()).then_some(compact)
 }
 
 /// The normalized title of a wisetree-format review comment, or `None` for a
@@ -7947,23 +7961,36 @@ new file mode 100644
 
     #[test]
     fn parse_existing_review_comments_groups_by_path() {
-        let json = r#"[
-            {"path": "a.rs", "line": 7, "body": "prefer a constant", "user": {"login": "alice"}},
-            {"path": "a.rs", "original_line": 9, "body": "typo", "user": {"login": "bob"}},
-            {"path": "b.rs", "body": "structure question", "user": {"login": "alice"}},
-            {"path": "c.rs", "body": "   ", "user": {"login": "alice"}}
-        ]"#;
-        let by_path = parse_existing_review_comments(json);
+        let long = "x".repeat(REVIEW_COMMENT_KEY_MAX_BYTES + 40);
+        let json = serde_json::json!([
+            {"path": "a.rs", "line": 7, "body": "prefer a constant\nbecause this value repeats"},
+            {"path": "a.rs", "line": 8, "body": "prefer a constant\nindependent detail"},
+            {"path": "a.rs", "original_line": 9, "body": long},
+            {"path": "b.rs", "body": "structure question\nwith more detail"},
+            {"path": "c.rs", "body": "   "},
+            {"path": "d.rs", "line": 4, "body": "###\nheading without a title"}
+        ])
+        .to_string();
+        let by_path = parse_existing_review_comments(&json);
         let a = by_path.get("a.rs").unwrap();
-        assert!(a.rendered.contains("@alice (line 7): prefer a constant"));
-        assert!(a.rendered.contains("@bob (line 9): typo"));
-        assert!(by_path
-            .get("b.rs")
-            .unwrap()
+        assert!(a.rendered.contains("- line 7: prefer a constant"));
+        assert!(a.rendered.contains("- line 8: prefer a constant"));
+        assert!(!a.rendered.contains("because this value repeats"));
+        let long_line = a
             .rendered
-            .contains("@alice: structure"));
-        // Blank bodies contribute nothing.
+            .lines()
+            .find(|line| line.starts_with("- line 9:"));
+        assert_eq!(
+            long_line.unwrap().len(),
+            "- line 9: ".len() + REVIEW_COMMENT_KEY_MAX_BYTES
+        );
+        assert_eq!(
+            by_path.get("b.rs").unwrap().rendered,
+            "- file: structure question"
+        );
+        // Blank and heading-only bodies contribute nothing.
         assert!(!by_path.contains_key("c.rs"));
+        assert!(!by_path.contains_key("d.rs"));
         // Garbage input degrades to "no context", never an error.
         assert!(parse_existing_review_comments("not json").is_empty());
         // Human comments never produce dedup keys.
@@ -7998,6 +8025,15 @@ new file mode 100644
                 title: "hardcoded api key".to_string(),
             }]
         );
+        assert_eq!(
+            by_path.get("a.rs").unwrap().rendered,
+            "- line 7: hardcoded api key\n- line 9: please rename this"
+        );
+        assert!(!by_path
+            .get("a.rs")
+            .unwrap()
+            .rendered
+            .contains("Secrets leak"));
     }
 
     #[test]
@@ -8187,7 +8223,7 @@ new file mode 100644
             annotated_diff: "@@ -1 +1 @@\n     1 +let x = 1;".to_string(),
             full_content: Some("fn complete() { let x = 1; }".to_string()),
             commentable_lines: BTreeSet::from([1]),
-            existing_comments: "@alice (line 1): rename this".to_string(),
+            existing_comments: "- line 1: rename this".to_string(),
             existing_keys: Vec::new(),
         };
         let context = ReviewContext {
@@ -8197,7 +8233,7 @@ new file mode 100644
         let prompt = build_review_scan_prompt(&file, &context, "/tmp/tables.md", None, None);
         assert!(prompt.contains("src/lib.rs"));
         assert!(prompt.contains("     1 +let x = 1;"));
-        assert!(prompt.contains("@alice (line 1): rename this"));
+        assert!(prompt.contains("- line 1: rename this"));
         assert!(prompt.contains("/tmp/tables.md"));
         assert!(prompt.contains("Use surgical changes."));
         assert!(prompt.contains("- main.rs"));
@@ -8499,7 +8535,7 @@ new file mode 100644
             annotated_diff: "     1 +let x = 1;".to_string(),
             full_content: Some("coverage body must stay out".to_string()),
             commentable_lines: BTreeSet::from([1]),
-            existing_comments: "@bob (line 1): please test this".to_string(),
+            existing_comments: "- line 1: please test this".to_string(),
             existing_keys: Vec::new(),
         };
         let test = ReviewFile {
@@ -8532,7 +8568,7 @@ new file mode 100644
         assert!(prompt.contains("### FILE: tests/lib_test.rs"));
         assert!(prompt.contains("     9 +assert!(x);"));
         assert!(!prompt.contains("let fixture = expensive_setup();"));
-        assert!(prompt.contains("@bob (line 1): please test this"));
+        assert!(prompt.contains("- line 1: please test this"));
         assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
         assert!(prompt.contains("coverage convention"));
         assert!(prompt.contains("never your ability to read the real files"));

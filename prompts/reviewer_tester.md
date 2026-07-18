@@ -102,7 +102,7 @@ FILE_CONTENT
 FILE_DIFF
 ```
 
-- Review comments already posted on this file (do NOT re-raise anything these already cover; empty when none):
+- Compact keys for review comments already posted on this file (do NOT re-raise anything these already cover; empty when none):
 
 ```
 EXISTING_COMMENTS
