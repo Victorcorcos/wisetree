@@ -11,6 +11,8 @@ The harness supplies a repository-context digest below with root conventions and
 
 Read a sibling, test, or root convention file only for that specific ambiguity. The digest replaces default exploratory reads, never your ability to read the real files. Reading is context, never a deliverable. Never modify anything.
 
+The harness also supplies the full current file when it fits the inline budget. When the full-content input says it was not inlined, you MUST read the real full file before emitting any structural finding such as long method, god class, divergent change, shotgun surgery, or step-down violation. The numbered diff remains authoritative for finding anchors.
+
 ## What to look for
 
 Review ONLY the lines introduced or modified in this diff (the numbered `+` lines). Do not flag pre-existing issues in unchanged code unless the new changes directly break them. Judge four categories:
@@ -78,6 +80,12 @@ REPO_CONTEXT
 
 - File under review: `FILE_PATH`
 - Curated reference tables path: `TABLES_PATH`
+- Full current file content when within the inline budget:
+
+```
+FILE_CONTENT
+```
+
 - This file's diff hunks. Every line that exists in the new version of the file is prefixed with its new-side line number; removed lines have no number:
 
 ```

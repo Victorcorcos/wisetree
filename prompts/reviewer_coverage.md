@@ -10,6 +10,8 @@ The harness supplies a repository-context digest below with root conventions and
 
 Read a full changed file, relevant test, or root convention file only for that specific ambiguity. The digest replaces default exploratory reads, never your ability to read the real files. Reading is context, never a deliverable. Never modify anything.
 
+This coverage-only profile does not duplicate full file bodies in its input. Your permission to read any real changed or test file remains unchanged whenever the numbered hunks and repository context leave coverage ambiguous.
+
 ## What to look for
 
 Judge only the behavior introduced or modified by the numbered `+` lines of the **application-code** files. The changed test files are your evidence of what is covered, not review targets — their internal quality (naming, mocking, structure) is another reviewer's job. For each changed behavior, decide whether some test — changed in this diff or already in the repo — would FAIL if that behavior misbehaved. Executing a line is not covering it; only an assertion that pins the outcome counts. A behavior is a coverage gap when no such test exists for:

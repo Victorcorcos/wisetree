@@ -2002,6 +2002,7 @@ mod tests {
             annotated_diff:
                 "@@ -1,2 +1,3 @@\n     1  fn main() {\n     2 +    let x = 1;\n     3  }"
                     .to_string(),
+            full_content: None,
             commentable_lines: BTreeSet::from([1, 2, 3]),
             existing_comments: String::new(),
             existing_keys: Vec::new(),

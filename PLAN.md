@@ -139,17 +139,17 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] A named per-file cap inside the specified range controls whether full content is attached to `ReviewFile`.
-- [ ] Merged, split-app, and tester prompts include capped full content alongside authoritative numbered hunks.
-- [ ] Files over the cap include no body and every applicable prompt carries the mandatory structural-read trigger while retaining normal read access.
-- [ ] Merged/split routing continues to count annotated hunks only, not the inlined body.
-- [ ] Tests cover below-cap, exact-cap, over-cap, unreadable/binary content, and prompt behavior in each profile.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #6 Status line.
+- [x] A named per-file cap inside the specified range controls whether full content is attached to `ReviewFile`.
+- [x] Merged, split-app, and tester prompts include capped full content alongside authoritative numbered hunks.
+- [x] Files over the cap include no body and every applicable prompt carries the mandatory structural-read trigger while retaining normal read access.
+- [x] Merged/split routing continues to count annotated hunks only, not the inlined body.
+- [x] Tests cover below-cap, exact-cap, over-cap, unreadable/binary content, and prompt behavior in each profile.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #6 Status line.
 
 **Edge cases**:
 
-- [ ] Deleted or unavailable new-side files do not fail preparation.
-- [ ] Non-UTF-8 content is not inlined and follows the conservative read-on-demand path.
+- [x] Deleted or unavailable new-side files do not fail preparation.
+- [x] Non-UTF-8 content is not inlined and follows the conservative read-on-demand path.
 
 ---
 

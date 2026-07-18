@@ -104,6 +104,8 @@ pub(crate) const REVIEW_MERGED_FOCUS_BYTES: usize = 28_000;
 /// every scan. The directory inventory has its own small bound.
 const REVIEW_REPO_CONTEXT_MAX_BYTES: usize = 6 * 1024;
 const REVIEW_DIRECTORY_INVENTORY_MAX_BYTES: usize = 2 * 1024;
+/// Full new-side files at or below this cap are attached to scan inputs.
+const REVIEW_FILE_INLINE_MAX_BYTES: usize = 16 * 1024;
 /// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
 /// embedded PTY (the user watches it and can Esc out), so only the judge —
 /// which classifies one short comment — and the local git operations
@@ -742,6 +744,10 @@ pub struct ReviewFile {
     /// This file's hunks with every new-side line prefixed by its line
     /// number, so the AI cites anchors the harness can verify.
     pub annotated_diff: String,
+    /// Full new-side UTF-8 content when it fits the bounded inline budget.
+    /// `None` keeps the real-file read path available for large, binary,
+    /// deleted, or unreadable files.
+    pub full_content: Option<String>,
     /// New-side line numbers GitHub accepts inline comments on (additions +
     /// context lines present in the diff).
     pub commentable_lines: BTreeSet<u64>,
@@ -2840,6 +2846,7 @@ impl DashboardService {
         // any AI call — they still reach the screen so the final report can
         // show each one with its reason.
         let (mut files, skipped) = partition_reviewable_files(parsed);
+        attach_review_file_contents(&cwd, &mut files).await;
 
         // Existing review comments, grouped per file — dedup context only,
         // so a fetch failure just means the AI scans without it.
@@ -6091,6 +6098,7 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
                 files.push(ReviewFile {
                     path: p,
                     annotated_diff: std::mem::take(annotated).trim_end().to_string(),
+                    full_content: None,
                     commentable_lines: std::mem::take(commentable),
                     existing_comments: String::new(),
                     existing_keys: Vec::new(),
@@ -6367,6 +6375,27 @@ async fn build_review_context(cwd: &Path, files: &[ReviewFile]) -> ReviewContext
             REVIEW_DIRECTORY_INVENTORY_MAX_BYTES,
         )
         .await,
+    }
+}
+
+async fn attach_review_file_contents(cwd: &Path, files: &mut [ReviewFile]) {
+    for file in files {
+        let path = Path::new(&file.path);
+        if path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(cwd.join(path)).await else {
+            continue;
+        };
+        if bytes.len() > REVIEW_FILE_INLINE_MAX_BYTES {
+            continue;
+        }
+        file.full_content = String::from_utf8(bytes).ok();
     }
 }
 
@@ -6653,6 +6682,7 @@ fn build_review_scan_prompt(
         truncate_for_prompt(&file.existing_comments, REVIEW_COMMENTS_MAX_BYTES)
     };
     let diff = truncate_for_prompt(&file.annotated_diff, REVIEW_DIFF_MAX_BYTES);
+    let full_content = review_file_content_for_prompt(file);
     let context = context.rendered();
     substitute_review_prompt(
         template,
@@ -6663,6 +6693,7 @@ fn build_review_scan_prompt(
             ("PREVIOUS_FINDING", previous_finding.unwrap_or("(none)")),
             ("REPO_CONTEXT", &context),
             ("EXISTING_COMMENTS", &existing),
+            ("FILE_CONTENT", &full_content),
             ("FILE_DIFF", &diff),
         ],
     )
@@ -6676,7 +6707,7 @@ fn build_review_scan_prompt(
 /// user-controlled) diff goes last.
 fn build_review_coverage_prompt(files: &[ReviewFile], context: &ReviewContext) -> String {
     const COVERAGE_PROMPT: &str = include_str!("../../prompts/reviewer_coverage.md");
-    build_review_whole_diff_prompt(COVERAGE_PROMPT, files, context, None)
+    build_review_whole_diff_prompt(COVERAGE_PROMPT, files, context, None, false)
 }
 
 fn build_review_merged_prompt(
@@ -6685,7 +6716,7 @@ fn build_review_merged_prompt(
     tables_path: &str,
 ) -> String {
     const MERGED_PROMPT: &str = include_str!("../../prompts/reviewer.md");
-    build_review_whole_diff_prompt(MERGED_PROMPT, files, context, Some(tables_path))
+    build_review_whole_diff_prompt(MERGED_PROMPT, files, context, Some(tables_path), true)
 }
 
 fn build_review_whole_diff_prompt(
@@ -6693,6 +6724,7 @@ fn build_review_whole_diff_prompt(
     files: &[ReviewFile],
     context: &ReviewContext,
     tables_path: Option<&str>,
+    include_full_content: bool,
 ) -> String {
     let mut diff = String::new();
     for file in files {
@@ -6717,7 +6749,21 @@ fn build_review_whole_diff_prompt(
     } else {
         truncate_for_prompt(&comments, REVIEW_COMMENTS_MAX_BYTES)
     };
-    let diff = truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES);
+    let mut diff = truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES);
+    if include_full_content {
+        let heading = "\n\n### FULL CURRENT FILE CONTENT APPENDIX\n";
+        if diff.len() + heading.len() <= REVIEW_COVERAGE_DIFF_MAX_BYTES {
+            diff.push_str(heading);
+            for file in files {
+                let content = review_file_content_for_prompt(file);
+                let block = format!("\n#### FILE: {}\n{content}\n", file.path);
+                if diff.len() + block.len() > REVIEW_COVERAGE_DIFF_MAX_BYTES {
+                    break;
+                }
+                diff.push_str(&block);
+            }
+        }
+    }
     let context = context.rendered();
     substitute_review_prompt(
         template,
@@ -6728,6 +6774,17 @@ fn build_review_whole_diff_prompt(
             ("FULL_DIFF", &diff),
         ],
     )
+}
+
+fn review_file_content_for_prompt(file: &ReviewFile) -> String {
+    match file.full_content.as_deref() {
+        Some("") => "(empty file)".to_string(),
+        Some(content) => content.to_string(),
+        None => format!(
+            "(not inlined — read `{}` before emitting any structural finding)",
+            file.path
+        ),
+    }
 }
 
 /// Substitute template tokens in one pass so inserted user/repository text is
@@ -7949,6 +8006,7 @@ new file mode 100644
         let file = ReviewFile {
             path: "src/lib.rs".to_string(),
             annotated_diff: "@@ -1 +1 @@\n     1 +let x = 1;".to_string(),
+            full_content: Some("fn complete() { let x = 1; }".to_string()),
             commentable_lines: BTreeSet::from([1]),
             existing_comments: "@alice (line 1): rename this".to_string(),
             existing_keys: Vec::new(),
@@ -7964,6 +8022,8 @@ new file mode 100644
         assert!(prompt.contains("/tmp/tables.md"));
         assert!(prompt.contains("Use surgical changes."));
         assert!(prompt.contains("- main.rs"));
+        assert!(prompt.contains("fn complete() { let x = 1; }"));
+        assert!(prompt.contains("MUST read the real full file"));
         // No unsubstituted tokens survive.
         for token in [
             "FILE_PATH",
@@ -7973,6 +8033,7 @@ new file mode 100644
             "USER_FEEDBACK",
             "PREVIOUS_FINDING",
             "REPO_CONTEXT",
+            "FILE_CONTENT",
         ] {
             assert!(!prompt.contains(token), "{token} leaked into the prompt");
         }
@@ -8000,6 +8061,18 @@ new file mode 100644
         );
         assert!(literal.contains("keep FILE_DIFF and EXISTING_COMMENTS literal"));
         assert!(literal.contains("keep USER_FEEDBACK literal"));
+        let not_inlined = ReviewFile {
+            full_content: None,
+            ..file
+        };
+        let prompt = build_review_scan_prompt(
+            &not_inlined,
+            &ReviewContext::default(),
+            "/tmp/t.md",
+            None,
+            None,
+        );
+        assert!(prompt.contains("read `src/lib.rs` before emitting any structural finding"));
     }
 
     #[test]
@@ -8059,6 +8132,7 @@ new file mode 100644
         let file = |path: &str| ReviewFile {
             path: path.to_string(),
             annotated_diff: String::new(),
+            full_content: None,
             commentable_lines: BTreeSet::new(),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
@@ -8131,6 +8205,7 @@ new file mode 100644
         let file = |path: &str| ReviewFile {
             path: path.to_string(),
             annotated_diff: String::new(),
+            full_content: None,
             commentable_lines: BTreeSet::new(),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
@@ -8151,17 +8226,61 @@ new file mode 100644
         assert!(context.directory_inventory.len() <= REVIEW_DIRECTORY_INVENTORY_MAX_BYTES);
     }
 
+    #[tokio::test]
+    async fn review_file_content_inlining_handles_cap_and_unavailable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.rs"), "fn small() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("exact.rs"),
+            "x".repeat(REVIEW_FILE_INLINE_MAX_BYTES),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("large.rs"),
+            "x".repeat(REVIEW_FILE_INLINE_MAX_BYTES + 1),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("binary.rs"), [0xff, 0xfe]).unwrap();
+        let file = |path: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: String::new(),
+            full_content: None,
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let mut files = vec![
+            file("small.rs"),
+            file("exact.rs"),
+            file("large.rs"),
+            file("binary.rs"),
+            file("missing.rs"),
+            file("../outside.rs"),
+        ];
+        attach_review_file_contents(dir.path(), &mut files).await;
+        assert_eq!(files[0].full_content.as_deref(), Some("fn small() {}\n"));
+        assert_eq!(
+            files[1].full_content.as_ref().map(String::len),
+            Some(REVIEW_FILE_INLINE_MAX_BYTES)
+        );
+        for file in &files[2..] {
+            assert!(file.full_content.is_none(), "{} must not inline", file.path);
+        }
+    }
+
     #[test]
     fn build_review_scan_prompt_picks_the_profile_by_file_kind() {
         let source = ReviewFile {
             path: "src/lib.rs".to_string(),
             annotated_diff: "     1 +let x = 1;".to_string(),
+            full_content: Some("fn source_body() {}".to_string()),
             commentable_lines: BTreeSet::from([1]),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
         };
         let test = ReviewFile {
             path: "tests/lib_test.rs".to_string(),
+            full_content: Some("fn test_body() {}".to_string()),
             ..source.clone()
         };
         let context = ReviewContext {
@@ -8185,7 +8304,10 @@ new file mode 100644
             assert!(prompt.contains("shared convention"));
             assert!(prompt.contains("shared inventory"));
             assert!(prompt.contains("never your ability to read the real files"));
+            assert!(prompt.contains("MUST read the real full file"));
         }
+        assert!(source_prompt.contains("fn source_body() {}"));
+        assert!(test_prompt.contains("fn test_body() {}"));
     }
 
     #[test]
@@ -8193,6 +8315,7 @@ new file mode 100644
         let app = ReviewFile {
             path: "src/lib.rs".to_string(),
             annotated_diff: "     1 +let x = 1;".to_string(),
+            full_content: Some("coverage body must stay out".to_string()),
             commentable_lines: BTreeSet::from([1]),
             existing_comments: "@bob (line 1): please test this".to_string(),
             existing_keys: Vec::new(),
@@ -8219,6 +8342,7 @@ new file mode 100644
         assert!(prompt.contains("coverage convention"));
         assert!(prompt.contains("coverage inventory"));
         assert!(prompt.contains("never your ability to read the real files"));
+        assert!(!prompt.contains("coverage body must stay out"));
         let contract = prompt.find("## Output contract").unwrap();
         let inputs = prompt.find("## Inputs (provided by the harness)").unwrap();
         assert!(contract < inputs, "static contract must precede inputs");
@@ -8230,6 +8354,7 @@ new file mode 100644
         let file = |bytes: usize| ReviewFile {
             path: "src/lib.rs".to_string(),
             annotated_diff: "x".repeat(bytes),
+            full_content: Some("y".repeat(REVIEW_FILE_INLINE_MAX_BYTES)),
             commentable_lines: BTreeSet::new(),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
@@ -8249,6 +8374,7 @@ new file mode 100644
         let app = ReviewFile {
             path: "src/lib.rs".to_string(),
             annotated_diff: "     1 +let x = 1;".to_string(),
+            full_content: Some("fn merged_body() {}".to_string()),
             commentable_lines: BTreeSet::from([1]),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
@@ -8256,6 +8382,7 @@ new file mode 100644
         let test = ReviewFile {
             path: "tests/lib_test.rs".to_string(),
             annotated_diff: "     9 +assert!(x);".to_string(),
+            full_content: None,
             commentable_lines: BTreeSet::from([9]),
             ..app.clone()
         };
@@ -8275,6 +8402,10 @@ new file mode 100644
         assert!(prompt.contains("merged convention"));
         assert!(prompt.contains("merged inventory"));
         assert!(prompt.contains("never your ability to read the real files"));
+        assert!(prompt.contains("### FULL CURRENT FILE CONTENT APPENDIX"));
+        assert!(prompt.contains("fn merged_body() {}"));
+        assert!(prompt.contains("read `tests/lib_test.rs` before emitting"));
+        assert!(prompt.contains("MUST read that real full file"));
         assert!(prompt.find("## Output contract").unwrap() < prompt.find("## Inputs").unwrap());
     }
 
@@ -8284,6 +8415,7 @@ new file mode 100644
             ReviewFile {
                 path: "src/a.rs".to_string(),
                 annotated_diff: "     2 +fn run() {}".to_string(),
+                full_content: None,
                 commentable_lines: BTreeSet::from([2]),
                 existing_comments: String::new(),
                 existing_keys: Vec::new(),
@@ -8291,6 +8423,7 @@ new file mode 100644
             ReviewFile {
                 path: "src/b.rs".to_string(),
                 annotated_diff: "     5 +fn stop() {}".to_string(),
+                full_content: None,
                 commentable_lines: BTreeSet::from([5]),
                 existing_comments: String::new(),
                 existing_keys: Vec::new(),
@@ -8352,6 +8485,7 @@ Should be dropped.
         let files = vec![ReviewFile {
             path: "src/a.rs".to_string(),
             annotated_diff: "     2 +fn run() {}".to_string(),
+            full_content: None,
             commentable_lines: BTreeSet::from([2]),
             existing_comments: String::new(),
             existing_keys: Vec::new(),

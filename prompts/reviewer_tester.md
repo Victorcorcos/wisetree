@@ -11,6 +11,8 @@ The harness supplies a repository-context digest below with root conventions and
 
 Read a source, sibling test, or root convention file only for that specific ambiguity. The digest replaces default exploratory reads, never your ability to read the real files. Reading is context, never a deliverable. Never modify anything.
 
+The harness also supplies the full current test file when it fits the inline budget. When the full-content input says it was not inlined, you MUST read the real full file before emitting any structural finding such as duplicated setup, long test body, deep nesting, divergent change, or inconsistent structure. The numbered diff remains authoritative for finding anchors.
+
 ## What to look for
 
 `FILE_PATH` is a test file, so you are the test-quality specialist. Review ONLY the lines introduced or modified in this diff (the numbered `+` lines). Do not flag pre-existing issues in unchanged code unless the new changes directly break them. Judge the changed test code itself — whether the PR's *application* changes are covered at all is owned by a separate whole-diff coverage pass, so never raise a finding that some application file lacks tests. Test Quality is your primary lens; the other categories apply only as they show up inside test code:
@@ -88,6 +90,12 @@ REPO_CONTEXT
 
 - File under review: `FILE_PATH`
 - Curated reference tables path: `TABLES_PATH`
+- Full current test-file content when within the inline budget:
+
+```
+FILE_CONTENT
+```
+
 - This file's diff hunks. Every line that exists in the new version of the file is prefixed with its new-side line number; removed lines have no number:
 
 ```

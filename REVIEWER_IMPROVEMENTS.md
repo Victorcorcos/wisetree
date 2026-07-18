@@ -251,6 +251,8 @@ skill instead of hoping the model exercises its read allowance.
 **Touches.** `ReviewFile` (full-content field, capped), `prepare_review`,
 prompt builders, all scan prompts.
 
+**Status:** ✅ implemented — commit 16cb6fb. as specified; full UTF-8 files are inlined up to 16KB, with a bounded merged appendix that never displaces numbered hunks.
+
 ## #7 — Feed test-quality findings into the coverage judgment (cross-call knowledge sharing)
 
 **Attacks precision deficit #6 — the one advantage of the skill's single

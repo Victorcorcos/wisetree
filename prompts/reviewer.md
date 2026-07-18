@@ -4,6 +4,8 @@ You are reviewing a pull request for an automated pipeline. You see every change
 
 The harness supplies a repository-context digest below with root conventions and changed-directory file names. Use that digest first. You run inside the pull request's worktree with read access, and when the digest plus diff leave a specific judgment ambiguous, you MAY still read full changed files, relevant tests (including unchanged tests), 1-3 targeted sibling files, and root `README.md`, `AGENTS.md`, or `CLAUDE.md`. The digest replaces default exploratory reads, never your ability to read the real files. Read only what that specific judgment requires. Never modify anything.
 
+A full-content appendix also supplies current files while they fit the bounded prompt budget. When a file is absent from that appendix or says its full content was not inlined, you MUST read that real full file before emitting any structural finding such as long method, god class, divergent change, shotgun surgery, or step-down violation. The numbered hunks remain authoritative for finding anchors.
+
 ## What to look for
 
 Review numbered changed application-code lines across four categories, using cross-file evidence when relevant:
