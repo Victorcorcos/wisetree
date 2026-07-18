@@ -6145,16 +6145,18 @@ fn build_review_scan_prompt(
     } else {
         truncate_for_prompt(&file.existing_comments, REVIEW_COMMENTS_MAX_BYTES)
     };
-    template
-        .replace("TABLES_PATH", tables_path)
-        .replace("FILE_PATH", &file.path)
-        .replace("USER_FEEDBACK", feedback.unwrap_or("(none)"))
-        .replace("PREVIOUS_FINDING", previous_finding.unwrap_or("(none)"))
-        .replace("EXISTING_COMMENTS", &existing)
-        .replace(
-            "FILE_DIFF",
-            &truncate_for_prompt(&file.annotated_diff, REVIEW_DIFF_MAX_BYTES),
-        )
+    let diff = truncate_for_prompt(&file.annotated_diff, REVIEW_DIFF_MAX_BYTES);
+    substitute_review_prompt(
+        template,
+        &[
+            ("TABLES_PATH", tables_path),
+            ("FILE_PATH", &file.path),
+            ("USER_FEEDBACK", feedback.unwrap_or("(none)")),
+            ("PREVIOUS_FINDING", previous_finding.unwrap_or("(none)")),
+            ("EXISTING_COMMENTS", &existing),
+            ("FILE_DIFF", &diff),
+        ],
+    )
 }
 
 /// Render the whole-diff coverage prompt (`prompts/reviewer_coverage.md`):
@@ -6188,12 +6190,32 @@ fn build_review_coverage_prompt(files: &[ReviewFile]) -> String {
     } else {
         truncate_for_prompt(&comments, REVIEW_COMMENTS_MAX_BYTES)
     };
-    COVERAGE_PROMPT
-        .replace("EXISTING_COMMENTS", &existing)
-        .replace(
-            "FULL_DIFF",
-            &truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES),
-        )
+    let diff = truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES);
+    substitute_review_prompt(
+        COVERAGE_PROMPT,
+        &[("EXISTING_COMMENTS", &existing), ("FULL_DIFF", &diff)],
+    )
+}
+
+/// Substitute template tokens in one pass so inserted user/repository text is
+/// never scanned again for a different token name.
+fn substitute_review_prompt(template: &str, substitutions: &[(&str, &str)]) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+    while !rest.is_empty() {
+        let next = substitutions
+            .iter()
+            .filter_map(|(token, value)| rest.find(token).map(|at| (at, *token, *value)))
+            .min_by_key(|(at, _, _)| *at);
+        let Some((at, token, value)) = next else {
+            rendered.push_str(rest);
+            break;
+        };
+        rendered.push_str(&rest[..at]);
+        rendered.push_str(value);
+        rest = &rest[at + token.len()..];
+    }
+    rendered
 }
 
 /// Parse the coverage pass's findings block. Same block format as
@@ -7400,10 +7422,23 @@ new file mode 100644
         ] {
             assert!(!prompt.contains(token), "{token} leaked into the prompt");
         }
+        let contract = prompt.find("## Output contract").unwrap();
+        let inputs = prompt.find("## Inputs (provided by the harness)").unwrap();
+        assert!(contract < inputs, "static contract must precede inputs");
+        assert!(inputs < prompt.find("src/lib.rs").unwrap());
+        assert!(inputs < prompt.find("     1 +let x = 1;").unwrap());
         // The revision pass threads feedback + the previous finding through.
         let revised = build_review_scan_prompt(&file, "/tmp/t.md", Some("too harsh"), Some("prev"));
         assert!(revised.contains("too harsh"));
         assert!(revised.contains("prev"));
+        let literal = build_review_scan_prompt(
+            &file,
+            "/tmp/t.md",
+            Some("keep FILE_DIFF and EXISTING_COMMENTS literal"),
+            Some("keep USER_FEEDBACK literal"),
+        );
+        assert!(literal.contains("keep FILE_DIFF and EXISTING_COMMENTS literal"));
+        assert!(literal.contains("keep USER_FEEDBACK literal"));
     }
 
     #[test]
@@ -7536,6 +7571,10 @@ new file mode 100644
         assert!(prompt.contains("     9 +assert!(x);"));
         assert!(prompt.contains("@bob (line 1): please test this"));
         assert!(prompt.contains("===WISETREE-REVIEW-BEGIN==="));
+        let contract = prompt.find("## Output contract").unwrap();
+        let inputs = prompt.find("## Inputs (provided by the harness)").unwrap();
+        assert!(contract < inputs, "static contract must precede inputs");
+        assert!(inputs < prompt.find("### FILE: src/lib.rs").unwrap());
     }
 
     #[test]

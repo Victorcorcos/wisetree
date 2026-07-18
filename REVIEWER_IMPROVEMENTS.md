@@ -84,6 +84,8 @@ at cached-input price (~10% of normal on Anthropic).
 `prompts/reviewer_coverage.md`, `build_review_scan_prompt` /
 `build_review_coverage_prompt` in `src/services/dashboard.rs`.
 
+**Status:** ✅ implemented — commit 0525d02. as specified.
+
 ## #2 — Per-scan token telemetry
 
 **Enabler. Goes before the structural change (#4) so its savings are
