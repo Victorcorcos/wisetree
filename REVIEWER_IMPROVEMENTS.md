@@ -183,6 +183,8 @@ the knob is deterministic and central.
 `src/tui/screens/review_pr.rs` (the merged call takes the coverage scan's
 sentinel-slot pattern), parser generalization in `src/services/dashboard.rs`.
 
+**Status:** ✅ implemented — commit 7ee79fc. as specified; the focus budget is 28KB.
+
 ## #5 — Pre-digest shared repo context in Rust
 
 **Attacks waste #3. After #4 so the digest is designed once for the final

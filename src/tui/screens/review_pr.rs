@@ -47,7 +47,7 @@ use crate::config::schema::AiModelConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{
     is_test_file, split_duplicate_findings, split_run_duplicate_findings, ReviewFile,
-    ReviewFinding, ReviewSeverity, ReviewSkippedFile,
+    ReviewFinding, ReviewScanMode, ReviewSeverity, ReviewSkippedFile,
 };
 use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
@@ -64,6 +64,7 @@ pub const COVERAGE_SCAN_INDEX: usize = usize::MAX;
 
 /// Label for the coverage scan in the in-flight panel and report rows.
 const COVERAGE_SCAN_LABEL: &str = "test coverage";
+const MERGED_SCAN_LABEL: &str = "merged review";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewStep {
@@ -224,6 +225,9 @@ pub struct ReviewPullRequestScreen {
     /// The changed files to scan, in diff order. Empty until preparation.
     /// Kept whole so an "Other" revision can re-render the file's prompt.
     files: Vec<ReviewFile>,
+    /// Small diffs combine application review and coverage in the sentinel
+    /// call; large diffs retain per-file application scans plus coverage.
+    scan_mode: ReviewScanMode,
     /// Index of the next file not yet handed to a scan task.
     next_scan: usize,
     /// Whether this run includes the whole-diff test-coverage pass — only
@@ -277,6 +281,7 @@ impl ReviewPullRequestScreen {
             repo: String::new(),
             head_sha: String::new(),
             files: Vec::new(),
+            scan_mode: ReviewScanMode::Split,
             next_scan: 0,
             has_coverage_scan: false,
             coverage_dispatched: false,
@@ -397,6 +402,14 @@ impl ReviewPullRequestScreen {
         self.telemetry_reported = false;
     }
 
+    pub fn set_scan_mode(&mut self, scan_mode: ReviewScanMode) {
+        self.scan_mode = scan_mode;
+    }
+
+    pub fn scan_mode(&self) -> ReviewScanMode {
+        self.scan_mode
+    }
+
     /// Working step for the parallel scan phase: the spinner message tracks
     /// completed files and the panel below lists the files being scanned.
     pub fn begin_scan_phase(&mut self) {
@@ -406,13 +419,16 @@ impl ReviewPullRequestScreen {
     }
 
     fn refresh_scan_message(&mut self) {
-        let coverage = if self.has_coverage_scan {
-            " + test coverage"
+        let combined = if self.has_coverage_scan {
+            match self.scan_mode {
+                ReviewScanMode::Merged => " + merged review",
+                ReviewScanMode::Split => " + test coverage",
+            }
         } else {
             ""
         };
         self.phase_message = format!(
-            "Scanning {} changed files{coverage} ({} done)...",
+            "Scanning {} changed files{combined} ({} done)...",
             self.files.len(),
             self.scans_done
         );
@@ -421,11 +437,16 @@ impl ReviewPullRequestScreen {
     /// Hand out the next file to scan, tracking it as in-flight. `None`
     /// once every file has been dispatched.
     pub fn take_next_scan_file(&mut self) -> Option<(usize, ReviewFile)> {
-        let file = self.files.get(self.next_scan)?.clone();
-        let index = self.next_scan;
-        self.next_scan += 1;
-        self.in_flight.push(file.path.clone());
-        Some((index, file))
+        while let Some(file) = self.files.get(self.next_scan).cloned() {
+            let index = self.next_scan;
+            self.next_scan += 1;
+            if self.scan_mode == ReviewScanMode::Merged && !is_test_file(&file.path) {
+                continue;
+            }
+            self.in_flight.push(file.path.clone());
+            return Some((index, file));
+        }
+        None
     }
 
     /// Hand out the whole-diff coverage scan, tracking it as in-flight.
@@ -435,7 +456,7 @@ impl ReviewPullRequestScreen {
             return None;
         }
         self.coverage_dispatched = true;
-        self.in_flight.push(COVERAGE_SCAN_LABEL.to_string());
+        self.in_flight.push(self.sentinel_scan_label().to_string());
         Some(self.files.clone())
     }
 
@@ -450,7 +471,7 @@ impl ReviewPullRequestScreen {
     pub fn note_scan_done(&mut self, file_index: usize) {
         self.scans_done += 1;
         let label = if file_index == COVERAGE_SCAN_INDEX {
-            Some(COVERAGE_SCAN_LABEL)
+            Some(self.sentinel_scan_label())
         } else {
             self.files.get(file_index).map(|f| f.path.as_str())
         };
@@ -465,7 +486,26 @@ impl ReviewPullRequestScreen {
     /// True while some scan (a file's or the coverage pass) hasn't reached
     /// its terminal state yet.
     pub fn scans_pending(&self) -> bool {
-        self.scans_done < self.files.len() + usize::from(self.has_coverage_scan)
+        self.scans_done < self.scan_units_total()
+    }
+
+    fn scan_units_total(&self) -> usize {
+        let file_scans = match self.scan_mode {
+            ReviewScanMode::Merged => self
+                .files
+                .iter()
+                .filter(|file| is_test_file(&file.path))
+                .count(),
+            ReviewScanMode::Split => self.files.len(),
+        };
+        file_scans + usize::from(self.has_coverage_scan)
+    }
+
+    fn sentinel_scan_label(&self) -> &'static str {
+        match self.scan_mode {
+            ReviewScanMode::Merged => MERGED_SCAN_LABEL,
+            ReviewScanMode::Split => COVERAGE_SCAN_LABEL,
+        }
     }
 
     /// Deterministic dedup of one scan's findings against the wisetree
@@ -555,7 +595,7 @@ impl ReviewPullRequestScreen {
     /// review.
     pub fn record_scan_failure(&mut self, file_index: usize, message: String) {
         let path = if file_index == COVERAGE_SCAN_INDEX {
-            COVERAGE_SCAN_LABEL.to_string()
+            self.sentinel_scan_label().to_string()
         } else {
             self.files
                 .get(file_index)
@@ -2089,6 +2129,45 @@ mod tests {
         assert!(!screen.scan_phase_active());
         assert_eq!(screen.findings_len(), 2);
         assert_eq!(screen.current_finding().unwrap().file, "b.rs");
+    }
+
+    #[test]
+    fn merged_scan_pool_dispatches_testers_and_one_combined_scan() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_scan_mode(ReviewScanMode::Merged);
+        screen.set_files(
+            vec![file("src/a.rs"), file("tests/a_test.rs"), file("src/b.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        screen.begin_scan_phase();
+        assert!(screen.phase_message.contains("+ merged review"));
+        let (index, tester) = screen.take_next_scan_file().unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(tester.path, "tests/a_test.rs");
+        assert!(screen.take_next_scan_file().is_none());
+        assert_eq!(screen.take_coverage_scan().unwrap().len(), 3);
+        screen.note_scan_done(index);
+        assert!(screen.scans_pending());
+        screen.note_scan_done(COVERAGE_SCAN_INDEX);
+        assert!(!screen.scans_pending());
+    }
+
+    #[test]
+    fn merged_tests_only_diff_has_no_combined_coverage_owner() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_scan_mode(ReviewScanMode::Merged);
+        screen.set_files(
+            vec![file("tests/a_test.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        let (index, _) = screen.take_next_scan_file().unwrap();
+        assert!(screen.take_coverage_scan().is_none());
+        screen.note_scan_done(index);
+        assert!(!screen.scans_pending());
     }
 
     #[test]

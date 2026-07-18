@@ -42,8 +42,8 @@ use crate::services::{
     DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
     FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
     OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
-    ReviewPreparation, ReviewScanTelemetry, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdateSource,
+    ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, Shell, ShellIntegrationStatus,
+    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -2612,12 +2612,14 @@ impl App {
         let Some(files) = screen.take_coverage_scan() else {
             return false;
         };
+        let mode = screen.scan_mode();
         kick_off_scan_review_coverage(
             self.git_root.clone(),
             self.current_dashboard_config(),
             ReviewCoverageScanRequest {
                 worktree_path,
                 files,
+                mode,
                 retry: ReviewScanRetry::Initial,
                 raw_output: None,
             },
@@ -2641,12 +2643,14 @@ impl App {
         let worktree_path = screen.request().worktree_path.clone();
         if file_index == COVERAGE_SCAN_INDEX {
             let files = screen.all_files();
+            let mode = screen.scan_mode();
             kick_off_scan_review_coverage(
                 self.git_root.clone(),
                 self.current_dashboard_config(),
                 ReviewCoverageScanRequest {
                     worktree_path,
                     files,
+                    mode,
                     retry,
                     raw_output,
                 },
@@ -2729,12 +2733,14 @@ impl App {
             Ok(prep) => match *prep {
                 ReviewPreparation::Ready {
                     files,
+                    scan_mode,
                     skipped,
                     owner,
                     repo,
                     head_sha,
                 } => {
                     if let Some(screen) = self.review_pr.as_mut() {
+                        screen.set_scan_mode(scan_mode);
                         screen.set_files(files, owner, repo, head_sha);
                         screen.record_skipped_files(&skipped);
                     }
@@ -7498,6 +7504,7 @@ struct ReviewScanRequest {
 struct ReviewCoverageScanRequest {
     worktree_path: String,
     files: Vec<ReviewFile>,
+    mode: ReviewScanMode,
     retry: ReviewScanRetry,
     raw_output: Option<String>,
 }
@@ -7612,20 +7619,38 @@ fn kick_off_scan_review_coverage(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let attempt = match retry {
-            ReviewScanRetry::Reformat => {
-                service
-                    .reformat_review_coverage_output(
-                        &req.worktree_path,
-                        &req.files,
-                        req.raw_output.as_deref().unwrap_or_default(),
-                    )
-                    .await
-            }
-            ReviewScanRetry::Initial | ReviewScanRetry::Full => {
-                service
-                    .scan_review_coverage(&req.worktree_path, &req.files)
-                    .await
-            }
+            ReviewScanRetry::Reformat => match req.mode {
+                ReviewScanMode::Merged => {
+                    service
+                        .reformat_review_merged_output(
+                            &req.worktree_path,
+                            &req.files,
+                            req.raw_output.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                }
+                ReviewScanMode::Split => {
+                    service
+                        .reformat_review_coverage_output(
+                            &req.worktree_path,
+                            &req.files,
+                            req.raw_output.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                }
+            },
+            ReviewScanRetry::Initial | ReviewScanRetry::Full => match req.mode {
+                ReviewScanMode::Merged => {
+                    service
+                        .scan_review_merged(&req.worktree_path, &req.files)
+                        .await
+                }
+                ReviewScanMode::Split => {
+                    service
+                        .scan_review_coverage(&req.worktree_path, &req.files)
+                        .await
+                }
+            },
         };
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {

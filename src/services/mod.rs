@@ -29,9 +29,10 @@ pub use dashboard::{
     DashboardService, DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome,
     EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
     MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewComment, ReviewFile,
-    ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewSeverity, ReviewSkippedFile,
-    ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
-    UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
+    ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewScanMode, ReviewSeverity,
+    ReviewSkippedFile, ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase,
+    UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
+    PR_REFRESH_PERIOD_MS,
 };
 pub use opencode_models::{
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,

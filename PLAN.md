@@ -95,18 +95,18 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] A named focus-budget constant inside the specified 25–30 KB range deterministically selects merged or split mode from total annotated-diff bytes.
-- [ ] Merged mode runs tester scans plus exactly one sentinel-style merged call that judges app categories and missing coverage across all changed files.
-- [ ] Split mode retains per-app/per-test file scans plus exactly one coverage pass.
-- [ ] The generalized multi-file parser accepts all five categories in merged mode while coverage parsing remains category-pinned in split mode.
-- [ ] Tests cover boundary routing, tests-only PRs, sentinel accounting/retry/failure, file mapping/anchor validation, prompt profile content, and single coverage ownership in both modes.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #4 Status line.
+- [x] A named focus-budget constant inside the specified 25–30 KB range deterministically selects merged or split mode from total annotated-diff bytes.
+- [x] Merged mode runs tester scans plus exactly one sentinel-style merged call that judges app categories and missing coverage across all changed files.
+- [x] Split mode retains per-app/per-test file scans plus exactly one coverage pass.
+- [x] The generalized multi-file parser accepts all five categories in merged mode while coverage parsing remains category-pinned in split mode.
+- [x] Tests cover boundary routing, tests-only PRs, sentinel accounting/retry/failure, file mapping/anchor validation, prompt profile content, and single coverage ownership in both modes.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #4 Status line.
 
 **Edge cases**:
 
-- [ ] A diff exactly equal to the focus budget uses merged mode; one byte over uses split mode.
-- [ ] Tests-only changes do not create a coverage owner beyond tester scans.
-- [ ] Empty or fully skipped diffs retain the existing no-changes behavior.
+- [x] A diff exactly equal to the focus budget uses merged mode; one byte over uses split mode.
+- [x] Tests-only changes do not create a coverage owner beyond tester scans.
+- [x] Empty or fully skipped diffs retain the existing no-changes behavior.
 
 ---
 

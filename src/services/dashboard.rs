@@ -98,6 +98,8 @@ const REVIEW_COMMENTS_MAX_BYTES: usize = 12_000;
 /// Byte cap for the whole-diff coverage prompt, which concatenates every
 /// file's (already individually capped) annotated diff into one call.
 const REVIEW_COVERAGE_DIFF_MAX_BYTES: usize = 120_000;
+/// Maximum combined annotated-diff size for one focused merged review call.
+pub(crate) const REVIEW_MERGED_FOCUS_BYTES: usize = 28_000;
 /// Timeouts for the "Bugkill" pipeline. The investigation runs live in the
 /// embedded PTY (the user watches it and can Esc out), so only the judge —
 /// which classifies one short comment — and the local git operations
@@ -766,6 +768,7 @@ pub struct ExistingFindingKey {
 pub enum ReviewPreparation {
     Ready {
         files: Vec<ReviewFile>,
+        scan_mode: ReviewScanMode,
         /// Changed files nobody reviews by hand (lockfiles, minified
         /// bundles, snapshots, …), filtered out deterministically before
         /// any AI call. Reported on the final table with their reason.
@@ -785,6 +788,24 @@ pub enum ReviewPreparation {
     AiUnavailable,
     /// `git pull --ff-only` or the PR lookup failed. stderr included.
     SyncFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewScanMode {
+    Merged,
+    Split,
+}
+
+fn review_scan_mode(files: &[ReviewFile]) -> ReviewScanMode {
+    let diff_bytes = files
+        .iter()
+        .map(|file| file.annotated_diff.len())
+        .sum::<usize>();
+    if diff_bytes <= REVIEW_MERGED_FOCUS_BYTES {
+        ReviewScanMode::Merged
+    } else {
+        ReviewScanMode::Split
+    }
 }
 
 /// One changed file excluded from the review before any AI call, with the
@@ -2810,6 +2831,7 @@ impl DashboardService {
         }
 
         Ok(ReviewPreparation::Ready {
+            scan_mode: review_scan_mode(&files),
             files,
             skipped,
             owner,
@@ -3018,6 +3040,76 @@ impl DashboardService {
         )
     }
 
+    /// Scan a focused whole diff once for application findings and missing
+    /// test coverage. This is the sole coverage owner in merged mode.
+    pub async fn scan_review_merged(
+        &self,
+        worktree_path: &str,
+        files: &[ReviewFile],
+    ) -> ReviewScanAttempt {
+        let started = Instant::now();
+        let cwd = PathBuf::from(worktree_path);
+        let model = self.config.ai.review.model.trim().to_string();
+        if model.is_empty() {
+            return review_scan_attempt(
+                "merged".to_string(),
+                0,
+                started,
+                None,
+                Err(WisetreeError::other("ai.review model is not configured.")),
+                None,
+            );
+        }
+        let tables_path = materialize_review_tables().await;
+        let prompt = build_review_merged_prompt(files, &tables_path);
+        let prompt_bytes = prompt.len();
+        let title = review_scan_title();
+        let mut run_args: Vec<String> = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+            "--title".to_string(),
+            title.clone(),
+        ];
+        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
+        let (result, raw_output) = match time::timeout(
+            REVIEW_SCAN_TIMEOUT,
+            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
+        )
+        .await
+        {
+            Err(_) => (
+                Err(WisetreeError::other(
+                    "opencode merged review scan timed out after 240s",
+                )),
+                None,
+            ),
+            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
+            Ok(Ok(output)) => match parse_merged_findings(&output, files) {
+                Some(findings) => (Ok(findings), None),
+                None => (
+                    Err(WisetreeError::other(
+                        "could not parse findings from the merged review AI output.",
+                    )),
+                    Some(output),
+                ),
+            },
+        };
+        let usage = opencode_usage_for_title(title).await;
+        review_scan_attempt(
+            "merged".to_string(),
+            prompt_bytes,
+            started,
+            usage,
+            result,
+            raw_output,
+        )
+    }
+
     /// Repair a malformed per-file result without sending the diff again.
     pub async fn reformat_review_file_output(
         &self,
@@ -3025,7 +3117,7 @@ impl DashboardService {
         file: &ReviewFile,
         previous_output: &str,
     ) -> ReviewScanAttempt {
-        let prompt = build_review_reformat_prompt(false, previous_output);
+        let prompt = build_review_reformat_prompt(ReviewReformatProfile::File, previous_output);
         self.run_review_reformat(
             worktree_path,
             format!("reformat:{}", file.path),
@@ -3050,12 +3142,30 @@ impl DashboardService {
         files: &[ReviewFile],
         previous_output: &str,
     ) -> ReviewScanAttempt {
-        let prompt = build_review_reformat_prompt(true, previous_output);
+        let prompt = build_review_reformat_prompt(ReviewReformatProfile::Coverage, previous_output);
         self.run_review_reformat(
             worktree_path,
             "reformat:coverage".to_string(),
             prompt,
             |output| parse_coverage_findings(output, files),
+        )
+        .await
+    }
+
+    /// Repair a malformed merged whole-diff result without sending the diff
+    /// again.
+    pub async fn reformat_review_merged_output(
+        &self,
+        worktree_path: &str,
+        files: &[ReviewFile],
+        previous_output: &str,
+    ) -> ReviewScanAttempt {
+        let prompt = build_review_reformat_prompt(ReviewReformatProfile::Merged, previous_output);
+        self.run_review_reformat(
+            worktree_path,
+            "reformat:merged".to_string(),
+            prompt,
+            |output| parse_merged_findings(output, files),
         )
         .await
     }
@@ -6331,14 +6441,22 @@ pub(crate) fn is_test_file(path: &str) -> bool {
         || stem.ends_with(".spec")
 }
 
-fn build_review_reformat_prompt(coverage: bool, previous_output: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewReformatProfile {
+    File,
+    Coverage,
+    Merged,
+}
+
+fn build_review_reformat_prompt(profile: ReviewReformatProfile, previous_output: &str) -> String {
     const REFORMAT_PROMPT: &str = include_str!("../../prompts/reviewer_reformat.md");
     const FILE_PROMPT: &str = include_str!("../../prompts/reviewer_application.md");
     const COVERAGE_PROMPT: &str = include_str!("../../prompts/reviewer_coverage.md");
-    let source = if coverage {
-        COVERAGE_PROMPT
-    } else {
-        FILE_PROMPT
+    const MERGED_PROMPT: &str = include_str!("../../prompts/reviewer.md");
+    let source = match profile {
+        ReviewReformatProfile::File => FILE_PROMPT,
+        ReviewReformatProfile::Coverage => COVERAGE_PROMPT,
+        ReviewReformatProfile::Merged => MERGED_PROMPT,
     };
     let contract = review_output_contract(source);
     substitute_review_prompt(
@@ -6406,6 +6524,19 @@ fn build_review_scan_prompt(
 /// user-controlled) diff goes last.
 fn build_review_coverage_prompt(files: &[ReviewFile]) -> String {
     const COVERAGE_PROMPT: &str = include_str!("../../prompts/reviewer_coverage.md");
+    build_review_whole_diff_prompt(COVERAGE_PROMPT, files, None)
+}
+
+fn build_review_merged_prompt(files: &[ReviewFile], tables_path: &str) -> String {
+    const MERGED_PROMPT: &str = include_str!("../../prompts/reviewer.md");
+    build_review_whole_diff_prompt(MERGED_PROMPT, files, Some(tables_path))
+}
+
+fn build_review_whole_diff_prompt(
+    template: &str,
+    files: &[ReviewFile],
+    tables_path: Option<&str>,
+) -> String {
     let mut diff = String::new();
     for file in files {
         diff.push_str(&format!("### FILE: {}\n", file.path));
@@ -6431,8 +6562,12 @@ fn build_review_coverage_prompt(files: &[ReviewFile]) -> String {
     };
     let diff = truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES);
     substitute_review_prompt(
-        COVERAGE_PROMPT,
-        &[("EXISTING_COMMENTS", &existing), ("FULL_DIFF", &diff)],
+        template,
+        &[
+            ("TABLES_PATH", tables_path.unwrap_or("")),
+            ("EXISTING_COMMENTS", &existing),
+            ("FULL_DIFF", &diff),
+        ],
     )
 }
 
@@ -6468,6 +6603,18 @@ pub(crate) fn parse_coverage_findings(
     output: &str,
     files: &[ReviewFile],
 ) -> Option<Vec<ReviewFinding>> {
+    parse_multi_file_findings(output, files, Some("Test Quality"))
+}
+
+fn parse_merged_findings(output: &str, files: &[ReviewFile]) -> Option<Vec<ReviewFinding>> {
+    parse_multi_file_findings(output, files, None)
+}
+
+fn parse_multi_file_findings(
+    output: &str,
+    files: &[ReviewFile],
+    forced_category: Option<&str>,
+) -> Option<Vec<ReviewFinding>> {
     const BEGIN: &str = "===WISETREE-REVIEW-BEGIN===";
     const END: &str = "===WISETREE-REVIEW-END===";
     let after_begin = &output[output.find(BEGIN)? + BEGIN.len()..];
@@ -6476,7 +6623,7 @@ pub(crate) fn parse_coverage_findings(
     let mut findings = Vec::new();
     for chunk in block.split("---FINDING---").skip(1) {
         let chunk = chunk.split("---END-FINDING---").next().unwrap_or(chunk);
-        let Some(file) = coverage_chunk_file(chunk, files) else {
+        let Some(file) = multi_file_chunk_file(chunk, files) else {
             continue;
         };
         if let Some(mut finding) = parse_review_finding_chunk(
@@ -6485,7 +6632,9 @@ pub(crate) fn parse_coverage_findings(
             &file.commentable_lines,
             &file.annotated_diff,
         ) {
-            finding.category = normalize_review_category("Test Quality");
+            if let Some(category) = forced_category {
+                finding.category = normalize_review_category(category);
+            }
             findings.push(finding);
         }
     }
@@ -6496,7 +6645,7 @@ pub(crate) fn parse_coverage_findings(
 /// tolerating a `./` prefix. Read with the same header-zone rule as the other
 /// fields: only above the first `---…---` section marker, so an explanation
 /// quoting `FILE:` never leaks in.
-fn coverage_chunk_file<'a>(chunk: &str, files: &'a [ReviewFile]) -> Option<&'a ReviewFile> {
+fn multi_file_chunk_file<'a>(chunk: &str, files: &'a [ReviewFile]) -> Option<&'a ReviewFile> {
     for line in chunk.lines() {
         let trimmed = line.trim();
         if trimmed.len() > 6 && trimmed.starts_with("---") && trimmed.ends_with("---") {
@@ -7683,18 +7832,25 @@ new file mode 100644
     #[test]
     fn build_review_reformat_prompt_contains_only_contract_and_previous_output() {
         let previous = "malformed OUTPUT_CONTRACT response";
-        let file = build_review_reformat_prompt(false, previous);
+        let file = build_review_reformat_prompt(ReviewReformatProfile::File, previous);
         assert!(file.contains("===WISETREE-REVIEW-BEGIN==="));
         assert!(file.contains("CATEGORY: <Code Smell | Security"));
         assert!(!file.contains("FULL_DIFF"));
         assert!(file.contains(previous));
         assert!(file.find("## Inputs").unwrap() < file.find(previous).unwrap());
 
-        let coverage = build_review_reformat_prompt(true, "bad coverage output");
+        let coverage =
+            build_review_reformat_prompt(ReviewReformatProfile::Coverage, "bad coverage output");
         assert!(coverage.contains("CATEGORY: Test Quality\nSEVERITY:"));
         assert!(coverage.contains("FILE: <path of the application file"));
         assert!(coverage.contains("bad coverage output"));
         assert!(!coverage.contains("FILE_DIFF"));
+
+        let merged =
+            build_review_reformat_prompt(ReviewReformatProfile::Merged, "bad merged output");
+        assert!(merged.contains("CATEGORY: <Code Smell | Security"));
+        assert!(merged.contains("FILE: <one exact path from a `### FILE:` section>"));
+        assert!(merged.contains("bad merged output"));
     }
 
     #[test]
@@ -7834,6 +7990,52 @@ new file mode 100644
     }
 
     #[test]
+    fn review_scan_mode_uses_the_annotated_diff_budget_boundary() {
+        let file = |bytes: usize| ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "x".repeat(bytes),
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        assert_eq!(
+            review_scan_mode(&[file(REVIEW_MERGED_FOCUS_BYTES)]),
+            ReviewScanMode::Merged
+        );
+        assert_eq!(
+            review_scan_mode(&[file(REVIEW_MERGED_FOCUS_BYTES + 1)]),
+            ReviewScanMode::Split
+        );
+    }
+
+    #[test]
+    fn build_review_merged_prompt_keeps_all_categories_and_sections_every_file() {
+        let app = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "     1 +let x = 1;".to_string(),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let test = ReviewFile {
+            path: "tests/lib_test.rs".to_string(),
+            annotated_diff: "     9 +assert!(x);".to_string(),
+            commentable_lines: BTreeSet::from([9]),
+            ..app.clone()
+        };
+        let prompt = build_review_merged_prompt(&[app, test], "/tmp/tables.md");
+        assert!(prompt.contains(
+            "CATEGORY: <Code Smell | Security | Performance | Test Quality | Convention>"
+        ));
+        assert!(prompt.contains("**Test Quality** finding"));
+        assert!(prompt.contains("### FILE: src/lib.rs"));
+        assert!(prompt.contains("### FILE: tests/lib_test.rs"));
+        assert!(prompt.contains("/tmp/tables.md"));
+        assert!(!prompt.contains("TABLES_PATH"));
+        assert!(prompt.find("## Output contract").unwrap() < prompt.find("## Inputs").unwrap());
+    }
+
+    #[test]
     fn parse_coverage_findings_maps_files_and_validates_anchors() {
         let files = vec![
             ReviewFile {
@@ -7900,6 +8102,34 @@ Should be dropped.
         let out = "chatter\n===WISETREE-REVIEW-BEGIN===\nNO-FINDINGS\n===WISETREE-REVIEW-END===";
         assert_eq!(parse_coverage_findings(out, &[]), Some(Vec::new()));
         assert_eq!(parse_coverage_findings("no block at all", &[]), None);
+    }
+
+    #[test]
+    fn parse_merged_findings_preserves_all_finding_categories() {
+        let files = vec![ReviewFile {
+            path: "src/a.rs".to_string(),
+            annotated_diff: "     2 +fn run() {}".to_string(),
+            commentable_lines: BTreeSet::from([2]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        }];
+        let output = "\
+===WISETREE-REVIEW-BEGIN===
+---FINDING---
+CATEGORY: Security
+SEVERITY: High
+FILE: src/a.rs
+LINE: 2
+START_LINE:
+TITLE: unsafe behavior
+---EXPLANATION---
+This changed line is unsafe.
+---END-FINDING---
+===WISETREE-REVIEW-END===";
+        let findings = parse_merged_findings(output, &files).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, "Security");
+        assert_eq!(findings[0].file, "src/a.rs");
     }
 
     // ── Fix pipeline: verdict parsing ──────────────────────────────────
