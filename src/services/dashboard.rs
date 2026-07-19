@@ -6155,7 +6155,7 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
                 && (pure_rename
                     || metadata.rename_or_copy
                     || visible_binary_skip
-                    || (!metadata.binary && !commentable.is_empty()))
+                    || (!metadata.binary && metadata.saw_hunk))
             {
                 files.push(ReviewFile {
                     path: p,
@@ -6358,8 +6358,12 @@ pub(crate) fn parse_existing_review_comments(json: &str) -> HashMap<String, Exis
 }
 
 fn human_comment_first_line(body: &str) -> Option<String> {
-    let first = body.trim().lines().next()?.trim();
-    if first.trim_matches('#').trim().is_empty() {
+    let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next()?;
+    let heading_tail = first.trim_start_matches('#');
+    let is_markdown_heading = heading_tail.len() < first.len()
+        && (heading_tail.is_empty() || heading_tail.starts_with(char::is_whitespace));
+    if heading_tail.trim().is_empty() || (is_markdown_heading && lines.next().is_none()) {
         return None;
     }
     let compact = compact_review_text(first, REVIEW_COMMENT_KEY_MAX_BYTES);
@@ -6471,16 +6475,25 @@ fn normalize_suggestion(suggestion: Option<&str>) -> String {
 }
 
 async fn build_review_context(cwd: &Path, files: &[ReviewFile]) -> ReviewContext {
+    let Ok(root) = tokio::fs::canonicalize(cwd).await else {
+        return ReviewContext::default();
+    };
     let mut documents = Vec::new();
     for name in ["CLAUDE.md", "AGENTS.md", "README.md"] {
-        if let Ok(content) = tokio::fs::read_to_string(cwd.join(name)).await {
+        let Ok(path) = tokio::fs::canonicalize(root.join(name)).await else {
+            continue;
+        };
+        if !path.starts_with(&root) {
+            continue;
+        }
+        if let Ok(content) = tokio::fs::read_to_string(path).await {
             documents.push((name, content));
         }
     }
     ReviewContext {
         convention_docs: render_review_documents(&documents, REVIEW_REPO_CONTEXT_MAX_BYTES),
         directory_inventory: build_review_directory_inventory(
-            cwd,
+            &root,
             files,
             REVIEW_DIRECTORY_INVENTORY_MAX_BYTES,
         )
@@ -6489,6 +6502,9 @@ async fn build_review_context(cwd: &Path, files: &[ReviewFile]) -> ReviewContext
 }
 
 async fn attach_review_file_contents(cwd: &Path, files: &mut [ReviewFile]) {
+    let Ok(root) = tokio::fs::canonicalize(cwd).await else {
+        return;
+    };
     for file in files {
         let path = Path::new(&file.path);
         if path.components().any(|component| {
@@ -6499,7 +6515,19 @@ async fn attach_review_file_contents(cwd: &Path, files: &mut [ReviewFile]) {
         }) {
             continue;
         }
-        let Ok(bytes) = tokio::fs::read(cwd.join(path)).await else {
+        let Ok(path) = tokio::fs::canonicalize(root.join(path)).await else {
+            continue;
+        };
+        if !path.starts_with(&root) {
+            continue;
+        }
+        let Ok(metadata) = tokio::fs::metadata(&path).await else {
+            continue;
+        };
+        if metadata.len() > REVIEW_FILE_INLINE_MAX_BYTES as u64 {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(path).await else {
             continue;
         };
         if bytes.len() > REVIEW_FILE_INLINE_MAX_BYTES {
@@ -6576,7 +6604,13 @@ async fn build_review_directory_inventory(
     let mut rendered = String::new();
     for directory in directories {
         let mut entries = Vec::new();
-        let Ok(mut read_dir) = tokio::fs::read_dir(cwd.join(&directory)).await else {
+        let Ok(path) = tokio::fs::canonicalize(cwd.join(&directory)).await else {
+            continue;
+        };
+        if !path.starts_with(cwd) {
+            continue;
+        }
+        let Ok(mut read_dir) = tokio::fs::read_dir(path).await else {
             continue;
         };
         while let Ok(Some(entry)) = read_dir.next_entry().await {
@@ -7092,20 +7126,26 @@ fn review_test_skeleton(file: &ReviewFile) -> String {
     let mut skeleton = String::new();
     let mut rust_test_attribute = false;
     for line in file.annotated_diff.lines() {
+        if line.starts_with("@@") {
+            rust_test_attribute = false;
+            continue;
+        }
         let Some(diff_line) = line.get(7..) else {
             continue;
         };
         let Some(kind) = diff_line.chars().next() else {
             continue;
         };
-        if kind == '-' {
+        if !matches!(kind, '+' | '-' | ' ') {
             continue;
         }
         let code = diff_line.get(1..).unwrap_or_default().trim_start();
         let is_attribute = code.starts_with("#[") && code.contains("test");
+        let is_any_attribute = code.starts_with("#[");
         let is_test_function =
             rust_test_attribute && (code.starts_with("fn ") || code.starts_with("async fn "));
         let keep = is_attribute
+            || (rust_test_attribute && is_any_attribute)
             || is_test_function
             || is_test_scenario_declaration(code)
             || is_test_assertion_line(code);
@@ -7113,7 +7153,11 @@ fn review_test_skeleton(file: &ReviewFile) -> String {
             skeleton.push_str(line);
             skeleton.push('\n');
         }
-        rust_test_attribute = is_attribute;
+        if is_attribute {
+            rust_test_attribute = true;
+        } else if is_test_function || (!is_any_attribute && !code.is_empty()) {
+            rust_test_attribute = false;
+        }
     }
     if skeleton.is_empty() {
         file.annotated_diff.clone()
@@ -7990,6 +8034,35 @@ Binary files a/gone.pdf and /dev/null differ
     }
 
     #[test]
+    fn deletion_only_hunks_reach_the_skip_classifier_or_reviewer() {
+        let diff = "\
+diff --git a/src/comment.rs b/src/comment.rs
+index 111..222 100644
+--- a/src/comment.rs
++++ b/src/comment.rs
+@@ -1 +0,0 @@
+-// obsolete note
+diff --git a/src/code.rs b/src/code.rs
+index 333..444 100644
+--- a/src/code.rs
++++ b/src/code.rs
+@@ -1 +0,0 @@
+-fn removed_behavior() {}
+";
+        let (reviewable, skipped) = partition_reviewable_files(parse_review_diff(diff));
+        assert_eq!(reviewable.len(), 1);
+        assert_eq!(reviewable[0].path, "src/code.rs");
+        assert!(reviewable[0].commentable_lines.is_empty());
+        assert_eq!(
+            skipped,
+            vec![ReviewSkippedFile {
+                path: "src/comment.rs".to_string(),
+                reason: "comments/blank lines only",
+            }]
+        );
+    }
+
+    #[test]
     fn rename_near_misses_remain_reviewable() {
         let diff = "\
 diff --git a/src/old.rs b/src/new.rs
@@ -8291,7 +8364,8 @@ copy to src/copied_again.rs
             {"path": "a.rs", "original_line": 9, "body": long},
             {"path": "b.rs", "body": "structure question\nwith more detail"},
             {"path": "c.rs", "body": "   "},
-            {"path": "d.rs", "line": 4, "body": "###\nheading without a title"}
+            {"path": "d.rs", "line": 4, "body": "###\nheading without a title"},
+            {"path": "e.rs", "line": 5, "body": "### Heading with no body"}
         ])
         .to_string();
         let by_path = parse_existing_review_comments(&json);
@@ -8314,6 +8388,7 @@ copy to src/copied_again.rs
         // Blank and heading-only bodies contribute nothing.
         assert!(!by_path.contains_key("c.rs"));
         assert!(!by_path.contains_key("d.rs"));
+        assert!(!by_path.contains_key("e.rs"));
         // Garbage input degrades to "no context", never an error.
         assert!(parse_existing_review_comments("not json").is_empty());
         // Human comments never produce dedup keys.
@@ -8965,6 +9040,35 @@ copy to src/copied_again.rs
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_context_and_inlining_do_not_follow_paths_outside_the_worktree() {
+        use std::os::unix::fs::symlink;
+
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("secret.rs"),
+            "const SECRET: &str = \"hidden\";",
+        )
+        .unwrap();
+        symlink(outside.path(), worktree.path().join("linked")).unwrap();
+
+        let mut files = vec![ReviewFile {
+            path: "linked/secret.rs".to_string(),
+            annotated_diff: "     1 +changed".to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        }];
+        let context = build_review_context(worktree.path(), &files).await;
+        assert!(context.directory_inventory.is_empty());
+
+        attach_review_file_contents(worktree.path(), &mut files).await;
+        assert!(files[0].full_content.is_none());
+    }
+
     #[test]
     fn build_review_scan_prompt_picks_the_profile_by_file_kind() {
         let source = ReviewFile {
@@ -9221,6 +9325,35 @@ copy to src/copied_again.rs
             assert!(skeleton.contains(assertion), "{path}: {skeleton}");
             assert!(!skeleton.contains(setup), "{path}: {skeleton}");
         }
+    }
+
+    #[test]
+    fn test_skeletons_keep_removed_evidence_and_rust_test_modifiers() {
+        let file = ReviewFile {
+            path: "tests/unit_test.rs".to_string(),
+            annotated_diff: concat!(
+                "       -#[test]\n",
+                "       -fn old_scenario() {\n",
+                "       -    assert!(old_result);\n",
+                "       -}\n",
+                "     1 +#[tokio::test]\n",
+                "     2 +#[should_panic]\n",
+                "     3 +async fn new_scenario() {\n",
+                "     4 +    assert!(new_result);\n",
+                "     5 +}"
+            )
+            .to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let skeleton = review_test_skeleton(&file);
+        assert!(skeleton.contains("fn old_scenario()"), "{skeleton}");
+        assert!(skeleton.contains("assert!(old_result)"), "{skeleton}");
+        assert!(skeleton.contains("#[should_panic]"), "{skeleton}");
+        assert!(skeleton.contains("async fn new_scenario()"), "{skeleton}");
+        assert!(skeleton.contains("assert!(new_result)"), "{skeleton}");
     }
 
     #[test]

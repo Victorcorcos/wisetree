@@ -8600,6 +8600,172 @@ mod tests {
         );
     }
 
+    fn review_scan_test_app(mode: ReviewScanMode, paths: &[&str]) -> App {
+        let request = ReviewPullRequestRequest {
+            number: 42,
+            title: "Review retries".to_string(),
+            url: "https://example.test/pull/42".to_string(),
+            branch: "review-retries".to_string(),
+            worktree_path: "/tmp/review-retries".to_string(),
+        };
+        let ai = crate::config::schema::AiModelConfig {
+            model: "opencode/test".to_string(),
+            thinking: "max".to_string(),
+        };
+        let files = paths
+            .iter()
+            .map(|path| ReviewFile {
+                path: (*path).to_string(),
+                annotated_diff: "@@ -1 +1 @@\n     1 +changed".to_string(),
+                full_content: None,
+                commentable_lines: std::collections::BTreeSet::from([1]),
+                existing_comments: String::new(),
+                existing_keys: Vec::new(),
+            })
+            .collect();
+        let mut screen = ReviewPullRequestScreen::new(request, ai);
+        screen.set_scan_mode(mode);
+        screen.set_files(files, "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+
+        let mut app = App::new(AppMode::Dashboard, false);
+        app.screen = Screen::ReviewPullRequest;
+        app.review_pr = Some(screen);
+        app
+    }
+
+    fn review_test_telemetry(scan: &str) -> ReviewScanTelemetry {
+        ReviewScanTelemetry {
+            scan: scan.to_string(),
+            prompt_bytes: 100,
+            tokens_in: Some(10),
+            tokens_out: Some(2),
+            duration_ms: 5,
+            findings: 0,
+        }
+    }
+
+    #[test]
+    fn review_file_reformat_success_settles_the_scan() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["tests/unit_test.rs"]);
+        app.review_pr.as_mut().unwrap().take_next_scan_file();
+        let tx = app_event_tx();
+        app.apply_review_pr_scanned(
+            0,
+            ReviewScanRetry::Initial,
+            Err("malformed".to_string()),
+            None,
+            Some("bad output".to_string()),
+            &tx,
+        );
+        assert!(app.review_pr.as_ref().unwrap().scan_phase_active());
+        app.apply_review_pr_scanned(
+            0,
+            ReviewScanRetry::Reformat,
+            Ok(Vec::new()),
+            None,
+            None,
+            &tx,
+        );
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+        app.apply_review_pr_scanned(
+            0,
+            ReviewScanRetry::Full,
+            Ok(Vec::new()),
+            Some(ReviewScanTelemetry {
+                scan: "late:test".to_string(),
+                prompt_bytes: 1,
+                tokens_in: Some(1),
+                tokens_out: Some(1),
+                duration_ms: 1,
+                findings: 0,
+            }),
+            None,
+            &tx,
+        );
+        assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 0);
+    }
+
+    #[test]
+    fn review_coverage_reformat_failure_falls_back_to_one_full_scan() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.take_next_scan_file();
+        screen.take_coverage_scan();
+        let tx = app_event_tx();
+        app.apply_review_pr_scanned(0, ReviewScanRetry::Initial, Ok(Vec::new()), None, None, &tx);
+        app.apply_review_pr_scanned(
+            COVERAGE_SCAN_INDEX,
+            ReviewScanRetry::Initial,
+            Err("malformed".to_string()),
+            Some(review_test_telemetry("coverage")),
+            Some("bad output".to_string()),
+            &tx,
+        );
+        app.apply_review_pr_scanned(
+            COVERAGE_SCAN_INDEX,
+            ReviewScanRetry::Reformat,
+            Err("still malformed".to_string()),
+            Some(review_test_telemetry("reformat:coverage")),
+            Some("still bad".to_string()),
+            &tx,
+        );
+        app.apply_review_pr_scanned(
+            COVERAGE_SCAN_INDEX,
+            ReviewScanRetry::Full,
+            Ok(Vec::new()),
+            Some(review_test_telemetry("coverage")),
+            None,
+            &tx,
+        );
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+        assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 3);
+    }
+
+    #[test]
+    fn review_retry_terminal_failures_settle_file_and_merged_scans() {
+        for (mode, path, index) in [
+            (ReviewScanMode::Split, "tests/unit_test.rs", 0),
+            (ReviewScanMode::Merged, "src/lib.rs", COVERAGE_SCAN_INDEX),
+        ] {
+            let mut app = review_scan_test_app(mode, &[path]);
+            let screen = app.review_pr.as_mut().unwrap();
+            if index == COVERAGE_SCAN_INDEX {
+                screen.take_coverage_scan();
+            } else {
+                screen.take_next_scan_file();
+            }
+            let tx = app_event_tx();
+            for (retry, raw_output) in [
+                (ReviewScanRetry::Initial, Some("bad output".to_string())),
+                (
+                    ReviewScanRetry::Reformat,
+                    Some("still malformed".to_string()),
+                ),
+                (ReviewScanRetry::Full, None),
+            ] {
+                app.apply_review_pr_scanned(
+                    index,
+                    retry,
+                    Err("malformed".to_string()),
+                    None,
+                    raw_output,
+                    &tx,
+                );
+            }
+            assert_eq!(
+                app.review_pr.as_ref().unwrap().step(),
+                crate::tui::screens::review_pr::ReviewStep::Done
+            );
+        }
+    }
+
     fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> NotificationsConfig {
         NotificationsConfig {
             ai_status_ok,

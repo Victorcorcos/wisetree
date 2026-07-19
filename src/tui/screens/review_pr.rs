@@ -649,6 +649,11 @@ impl ReviewPullRequestScreen {
         self.scan_telemetry.push(telemetry);
     }
 
+    #[cfg(test)]
+    pub fn scan_telemetry_len(&self) -> usize {
+        self.scan_telemetry.len()
+    }
+
     /// A scan that failed twice gets its own Failed row and the pool moves
     /// on — one bad file (or the coverage pass) never aborts the whole
     /// review.
@@ -1656,7 +1661,12 @@ impl ReviewPullRequestScreen {
 
 fn persist_scan_telemetry(scans: &[ReviewScanTelemetry]) {
     #[cfg(not(test))]
-    crate::services::review_telemetry::persist_review_telemetry(scans);
+    {
+        let scans = scans.to_vec();
+        tokio::task::spawn_blocking(move || {
+            crate::services::review_telemetry::persist_review_telemetry(&scans);
+        });
+    }
     #[cfg(test)]
     let _ = scans;
 }
@@ -2388,6 +2398,21 @@ mod tests {
         let row = &screen.summary_rows[0];
         assert_eq!(row.status.as_ref().unwrap().label, "Failed");
         assert!(row.command.contains("test coverage"));
+    }
+
+    #[test]
+    fn merged_scan_failure_row_names_the_combined_pass() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_scan_mode(ReviewScanMode::Merged);
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+        screen.take_coverage_scan();
+        screen.record_scan_failure(COVERAGE_SCAN_INDEX, "model returned garbage".to_string());
+        screen.note_scan_done(COVERAGE_SCAN_INDEX);
+        assert!(!screen.scans_pending());
+        let row = &screen.summary_rows[0];
+        assert_eq!(row.status.as_ref().unwrap().label, "Failed");
+        assert!(row.command.contains("merged review"));
     }
 
     #[test]
