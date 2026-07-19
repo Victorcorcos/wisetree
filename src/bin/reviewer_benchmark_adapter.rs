@@ -348,8 +348,17 @@ async fn run_review_pipeline(
     fixture: &Path,
 ) -> Result<(Vec<Finding>, ReviewTokenUsage)> {
     let mut config = DashboardConfig::default();
-    config.ai.review.model = args.model.clone();
-    config.ai.review.thinking = args.thinking.clone();
+    // Controlled benchmark mode pins every production Review profile to the
+    // same model/effort as the canonical skill so the comparison isolates
+    // orchestration rather than model mix.
+    for profile in [
+        &mut config.ai.review.strong,
+        &mut config.ai.review.balanced,
+        &mut config.ai.review.utility,
+    ] {
+        profile.model = args.model.clone();
+        profile.thinking = args.thinking.clone();
+    }
     let service = DashboardService::new(fixture.to_path_buf(), config);
     let outcome = service
         .benchmark_review_diff(

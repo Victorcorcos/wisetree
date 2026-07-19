@@ -44,7 +44,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::config::schema::AiModelConfig;
+use crate::config::schema::AiReviewConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{
     review_coverage_groups, review_file_groups, split_duplicate_findings,
@@ -216,8 +216,8 @@ pub enum ReviewAction {
 
 pub struct ReviewPullRequestScreen {
     request: ReviewPullRequestRequest,
-    /// Resolved `ai.review` config, shown on the confirm panel's AI table.
-    ai: AiModelConfig,
+    /// Resolved `ai.review` profiles, shown on the confirm panel's AI table.
+    ai: AiReviewConfig,
     confirm: Option<ConfirmationModal>,
     phase_message: String,
     /// True only during the per-file scan phase, so the Working view shows
@@ -286,7 +286,7 @@ pub struct ReviewPullRequestScreen {
 }
 
 impl ReviewPullRequestScreen {
-    pub fn new(request: ReviewPullRequestRequest, ai: AiModelConfig) -> Self {
+    pub fn new(request: ReviewPullRequestRequest, ai: AiReviewConfig) -> Self {
         Self {
             confirm: Some(build_confirm(&request)),
             request,
@@ -837,7 +837,7 @@ impl ReviewPullRequestScreen {
         !self.findings.is_empty()
     }
 
-    pub fn begin_verification(&mut self) -> Vec<(usize, ReviewFile, ReviewFinding)> {
+    pub fn begin_verification(&mut self) -> Vec<(usize, ReviewFile, ReviewFinding, bool)> {
         self.verification_results = self.findings.iter().cloned().map(Some).collect();
         let mut candidates = Vec::new();
         for (index, finding) in self.findings.iter().enumerate() {
@@ -846,7 +846,12 @@ impl ReviewPullRequestScreen {
             }
             if let Some(file) = self.files.iter().find(|file| file.path == finding.file) {
                 self.verification_outstanding.insert(index);
-                candidates.push((index, file.clone(), finding.clone()));
+                candidates.push((
+                    index,
+                    file.clone(),
+                    finding.clone(),
+                    self.finding_requires_strong_verification(finding),
+                ));
             }
         }
         if !candidates.is_empty() {
@@ -861,6 +866,22 @@ impl ReviewPullRequestScreen {
             || finding.category.eq_ignore_ascii_case("security")
             || finding.line.is_none()
             || finding.suggestion.is_some()
+            || self
+                .audit_finding_titles
+                .contains(&finding.title.to_ascii_lowercase())
+            || self.scan_groups.iter().any(|(_, group)| {
+                !group.relationship_summary.is_empty()
+                    && group
+                        .relationship_summary
+                        .contains(&format!("`{}`", finding.file))
+            })
+    }
+
+    fn finding_requires_strong_verification(&self, finding: &ReviewFinding) -> bool {
+        matches!(
+            finding.severity,
+            ReviewSeverity::Critical | ReviewSeverity::High
+        ) || finding.category.eq_ignore_ascii_case("security")
             || self
                 .audit_finding_titles
                 .contains(&finding.title.to_ascii_lowercase())
@@ -1445,12 +1466,26 @@ impl ReviewPullRequestScreen {
             .title_color(colors::NAVY)
             .block(build_detail_lines(&self.request))
             .steps(&REVIEW_STEPS)
-            .ai_roles(vec![AiRoleRow::new(
-                "review",
-                colors::NAVY,
-                self.ai.model.clone(),
-                self.ai.thinking.clone(),
-            )])
+            .ai_roles(vec![
+                AiRoleRow::new(
+                    "strong",
+                    colors::NAVY,
+                    self.ai.strong.model.clone(),
+                    self.ai.strong.thinking.clone(),
+                ),
+                AiRoleRow::new(
+                    "balanced",
+                    colors::NAVY,
+                    self.ai.balanced.model.clone(),
+                    self.ai.balanced.thinking.clone(),
+                ),
+                AiRoleRow::new(
+                    "utility",
+                    colors::NAVY,
+                    self.ai.utility.model.clone(),
+                    self.ai.utility.thinking.clone(),
+                ),
+            ])
             .modal(self.confirm.as_ref())
             .render(frame, area);
     }
@@ -2264,6 +2299,7 @@ fn sanitize_row(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::AiModelConfig;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -2279,10 +2315,15 @@ mod tests {
         }
     }
 
-    fn test_ai() -> AiModelConfig {
-        AiModelConfig {
+    fn test_ai() -> AiReviewConfig {
+        let model = AiModelConfig {
             model: "opencode/review-scan".to_string(),
             thinking: "max".to_string(),
+        };
+        AiReviewConfig {
+            strong: model.clone(),
+            balanced: model.clone(),
+            utility: model,
         }
     }
 
@@ -2361,7 +2402,9 @@ mod tests {
         assert!(dump.contains("#42"), "{dump}");
         assert!(dump.contains("Add retry logic"), "{dump}");
         assert!(dump.contains("Will run:"), "{dump}");
-        assert!(dump.contains("review"), "{dump}");
+        assert!(dump.contains("strong"), "{dump}");
+        assert!(dump.contains("balanced"), "{dump}");
+        assert!(dump.contains("utility"), "{dump}");
         assert!(dump.contains("opencode/review-scan"), "{dump}");
     }
 
@@ -2586,6 +2629,12 @@ mod tests {
             2,
             "low-severity prose should bypass verifier"
         );
+        let routed_profiles = candidates
+            .iter()
+            .map(|(_, _, finding, strong)| (finding.title.as_str(), *strong))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(routed_profiles.get("High impact bug"), Some(&true));
+        assert_eq!(routed_profiles.get("Direct replacement"), Some(&false));
         let rejected = candidates[0].0;
         screen.record_verification(
             rejected,
@@ -3190,6 +3239,9 @@ mod tests {
             scan: "app:a.rs".to_string(),
             scan_role: "application".to_string(),
             retry_role: "initial".to_string(),
+            model_profile: "balanced".to_string(),
+            model: "openai/gpt-5.6-terra".to_string(),
+            thinking: "medium".to_string(),
             prompt_bytes: 1200,
             usage: crate::services::review_telemetry::ReviewTokenUsage {
                 uncached_input: Some(40_000),

@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, MissedTickBehavior};
 
-use crate::config::schema::{normalize_dashboard_columns, DashboardConfig};
+use crate::config::schema::{normalize_dashboard_columns, AiModelConfig, DashboardConfig};
 use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
 use crate::files::{strip_ansi, ActivityKind};
@@ -806,9 +806,9 @@ pub enum ReviewPreparation {
     NoChanges,
     /// `gh` CLI is missing.
     GhUnavailable,
-    /// `ai.review.model` is blank — no model configured to scan the diff.
+    /// Both Review discovery-profile models are blank, so the diff cannot be scanned.
     AiNotConfigured,
-    /// `ai.review.model` set but `opencode` is not on PATH.
+    /// A Review discovery profile is configured but `opencode` is not on PATH.
     AiUnavailable,
     /// `git pull --ff-only` or the PR lookup failed. stderr included.
     SyncFailed(String),
@@ -824,6 +824,30 @@ pub enum ReviewScanMode {
 pub(crate) enum ReviewGroupProfile {
     Application,
     Tester,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReviewModelProfile {
+    Strong,
+    Balanced,
+    Utility,
+}
+
+impl ReviewModelProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Strong => "strong",
+            Self::Balanced => "balanced",
+            Self::Utility => "utility",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReviewModelSelection {
+    profile: ReviewModelProfile,
+    model: String,
+    thinking: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1019,6 +1043,54 @@ fn review_profile_groups(
             relationship_summary: group.cross_group_summary,
         })
         .collect()
+}
+
+fn review_group_model_profile(group: &ReviewFileGroup) -> ReviewModelProfile {
+    match group.profile {
+        ReviewGroupProfile::Tester => ReviewModelProfile::Balanced,
+        ReviewGroupProfile::Application if review_group_requires_strong_model(group) => {
+            ReviewModelProfile::Strong
+        }
+        ReviewGroupProfile::Application => ReviewModelProfile::Balanced,
+    }
+}
+
+fn review_group_requires_strong_model(group: &ReviewFileGroup) -> bool {
+    group.files.len() > 1
+        || !group.relationship_summary.trim().is_empty()
+        || group.files.iter().any(review_file_requires_strong_model)
+}
+
+fn review_file_requires_strong_model(file: &ReviewFile) -> bool {
+    let path = file.path.replace('\\', "/").to_ascii_lowercase();
+    let risky_path = [
+        "auth",
+        "permission",
+        "security",
+        "crypto",
+        "migration",
+        "schema",
+        "config",
+    ]
+    .iter()
+    .any(|token| path.split(['/', '_', '-', '.']).any(|part| part == *token));
+    if risky_path || file.annotated_diff.len() > REVIEW_MERGED_FOCUS_BYTES / 2 {
+        return true;
+    }
+    let diff = file.annotated_diff.to_ascii_lowercase();
+    [
+        "unsafe ",
+        "async ",
+        "await",
+        "spawn(",
+        "transaction",
+        "authorize",
+        "permission",
+        "password",
+        "secret",
+    ]
+    .iter()
+    .any(|signal| diff.contains(signal))
 }
 
 /// One changed file excluded from the review before any AI call, with the
@@ -2951,11 +3023,24 @@ impl DashboardService {
 
     // ── "Review Pull Request" pipeline ─────────────────────────────────
     //
-    // AI is called in exactly one place: the captured per-file scan (plus
-    // its "Other" revision variant). Everything else — PR lookup, diff
-    // fetch + per-file split, line-number validation, comment posting, the
-    // review-summary template, and the final `gh pr review` submission —
-    // is deterministic code below.
+    // Model selection is deterministic: focused scans/revisions use the
+    // balanced profile, cross-file/high-consequence work uses strong, and
+    // mechanical response repair uses utility. PR lookup, diff preparation,
+    // routing, validation, deduplication, posting, and summary submission do
+    // not call AI.
+
+    fn review_model_selection(&self, profile: ReviewModelProfile) -> ReviewModelSelection {
+        let config: &AiModelConfig = match profile {
+            ReviewModelProfile::Strong => &self.config.ai.review.strong,
+            ReviewModelProfile::Balanced => &self.config.ai.review.balanced,
+            ReviewModelProfile::Utility => &self.config.ai.review.utility,
+        };
+        ReviewModelSelection {
+            profile,
+            model: config.model.trim().to_string(),
+            thinking: config.thinking.clone(),
+        }
+    }
 
     /// Deterministic Review preparation: gates (gh / model / opencode),
     /// branch sync, PR lookup (owner/repo/head sha), `gh pr diff` split per
@@ -2968,7 +3053,7 @@ impl DashboardService {
         if !self.gh_available {
             return Ok(ReviewPreparation::GhUnavailable);
         }
-        if self.config.ai.review.model.trim().is_empty() {
+        if !self.config.ai.review.has_discovery_models() {
             return Ok(ReviewPreparation::AiNotConfigured);
         }
         if !binary_available(&self.opencode_binary) {
@@ -3148,8 +3233,15 @@ impl DashboardService {
             format!("app:{}", file.path)
         };
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.review.model.trim().to_string();
-        if model.is_empty() {
+        let profile = if review_file_is_test(file) {
+            ReviewModelProfile::Balanced
+        } else if review_file_requires_strong_model(file) {
+            ReviewModelProfile::Strong
+        } else {
+            ReviewModelProfile::Balanced
+        };
+        let selection = self.review_model_selection(profile);
+        if selection.model.is_empty() {
             return review_scan_attempt(
                 scan,
                 0,
@@ -3157,11 +3249,12 @@ impl DashboardService {
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
                 None,
+                &selection,
             );
         }
         let tables_path = materialize_review_tables().await;
         let prompt = build_review_scan_prompt(file, context, &tables_path);
-        self.execute_review_file_prompt(cwd, file, scan, started, prompt, model)
+        self.execute_review_file_prompt(cwd, file, scan, started, prompt, selection)
             .await
     }
 
@@ -3186,8 +3279,8 @@ impl DashboardService {
                 .join(",")
         );
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.review.model.trim().to_string();
-        if model.is_empty() {
+        let selection = self.review_model_selection(review_group_model_profile(group));
+        if selection.model.is_empty() {
             return review_scan_attempt(
                 scan,
                 0,
@@ -3195,6 +3288,7 @@ impl DashboardService {
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
                 None,
+                &selection,
             );
         }
         let tables_path = materialize_review_tables().await;
@@ -3211,13 +3305,13 @@ impl DashboardService {
             "run".to_string(),
             prompt,
             "-m".to_string(),
-            model,
+            selection.model.clone(),
             "--agent".to_string(),
             "plan".to_string(),
             "--title".to_string(),
             title.clone(),
         ];
-        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        run_args.extend(run_variant_args(&selection.thinking));
         let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
         let (result, raw_output) = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
@@ -3243,7 +3337,15 @@ impl DashboardService {
             },
         };
         let usage = opencode_usage_for_title(title).await;
-        review_scan_attempt(scan, prompt_bytes, started, usage, result, raw_output)
+        review_scan_attempt(
+            scan,
+            prompt_bytes,
+            started,
+            usage,
+            result,
+            raw_output,
+            &selection,
+        )
     }
 
     /// Revise one existing finding with the dedicated focused prompt. This
@@ -3260,8 +3362,17 @@ impl DashboardService {
         let started = Instant::now();
         let scan = format!("revision:{}", file.path);
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.review.model.trim().to_string();
-        if model.is_empty() {
+        let high_risk = matches!(
+            finding.severity,
+            ReviewSeverity::Critical | ReviewSeverity::High
+        ) || finding.category.eq_ignore_ascii_case("security");
+        let profile = if mode == ReviewRevisionMode::Expanded || high_risk {
+            ReviewModelProfile::Strong
+        } else {
+            ReviewModelProfile::Balanced
+        };
+        let selection = self.review_model_selection(profile);
+        if selection.model.is_empty() {
             return review_scan_attempt(
                 scan,
                 0,
@@ -3269,10 +3380,11 @@ impl DashboardService {
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
                 None,
+                &selection,
             );
         }
         let prompt = build_review_revision_prompt(file, finding, feedback, mode);
-        self.execute_review_file_prompt(cwd, file, scan, started, prompt, model)
+        self.execute_review_file_prompt(cwd, file, scan, started, prompt, selection)
             .await
     }
 
@@ -3282,20 +3394,27 @@ impl DashboardService {
         file: &ReviewFile,
         finding: &ReviewFinding,
         context: &ReviewContext,
+        strong: bool,
     ) -> ReviewVerificationAttempt {
         let started = Instant::now();
         let scan = format!("verify:{}:{}", file.path, finding.line.unwrap_or_default());
         let suggestion_validation = validate_review_suggestion_isolated(file, finding).await;
         let prompt = build_review_verifier_prompt(file, finding, context, &suggestion_validation);
         let prompt_bytes = prompt.len();
-        let model = self.config.ai.review.model.trim().to_string();
-        if model.is_empty() {
+        let profile = if strong {
+            ReviewModelProfile::Strong
+        } else {
+            ReviewModelProfile::Balanced
+        };
+        let selection = self.review_model_selection(profile);
+        if selection.model.is_empty() {
             return review_verification_attempt(
                 scan,
                 prompt_bytes,
                 started,
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
+                &selection,
             );
         }
         let title = review_scan_title();
@@ -3303,13 +3422,13 @@ impl DashboardService {
             "run".to_string(),
             prompt,
             "-m".to_string(),
-            model,
+            selection.model.clone(),
             "--agent".to_string(),
             "plan".to_string(),
             "--title".to_string(),
             title.clone(),
         ];
-        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        run_args.extend(run_variant_args(&selection.thinking));
         let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
         let result = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
@@ -3327,7 +3446,7 @@ impl DashboardService {
                 .ok_or_else(|| WisetreeError::other("could not parse the review verifier output")),
         };
         let usage = opencode_usage_for_title(title).await;
-        review_verification_attempt(scan, prompt_bytes, started, usage, result)
+        review_verification_attempt(scan, prompt_bytes, started, usage, result, &selection)
     }
 
     async fn execute_review_file_prompt(
@@ -3337,7 +3456,7 @@ impl DashboardService {
         scan: String,
         started: Instant,
         prompt: String,
-        model: String,
+        selection: ReviewModelSelection,
     ) -> ReviewScanAttempt {
         let prompt_bytes = prompt.len();
         let title = review_scan_title();
@@ -3345,13 +3464,13 @@ impl DashboardService {
             "run".to_string(),
             prompt,
             "-m".to_string(),
-            model,
+            selection.model.clone(),
             "--agent".to_string(),
             "plan".to_string(),
             "--title".to_string(),
             title.clone(),
         ];
-        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        run_args.extend(run_variant_args(&selection.thinking));
         let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
         let (result, raw_output) = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
@@ -3382,7 +3501,15 @@ impl DashboardService {
             },
         };
         let usage = opencode_usage_for_title(title).await;
-        review_scan_attempt(scan, prompt_bytes, started, usage, result, raw_output)
+        review_scan_attempt(
+            scan,
+            prompt_bytes,
+            started,
+            usage,
+            result,
+            raw_output,
+            &selection,
+        )
     }
 
     /// Scan the WHOLE diff once for missing test coverage with a single
@@ -3400,8 +3527,8 @@ impl DashboardService {
     ) -> ReviewScanAttempt {
         let started = Instant::now();
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.review.model.trim().to_string();
-        if model.is_empty() {
+        let selection = self.review_model_selection(ReviewModelProfile::Strong);
+        if selection.model.is_empty() {
             return review_scan_attempt(
                 "coverage".to_string(),
                 0,
@@ -3409,6 +3536,7 @@ impl DashboardService {
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
                 None,
+                &selection,
             );
         }
         let prompt = build_review_coverage_prompt(files, context, tester_findings);
@@ -3418,13 +3546,13 @@ impl DashboardService {
             "run".to_string(),
             prompt,
             "-m".to_string(),
-            model,
+            selection.model.clone(),
             "--agent".to_string(),
             "plan".to_string(),
             "--title".to_string(),
             title.clone(),
         ];
-        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        run_args.extend(run_variant_args(&selection.thinking));
         let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
         let (result, raw_output) = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
@@ -3457,6 +3585,7 @@ impl DashboardService {
             usage,
             result,
             raw_output,
+            &selection,
         )
     }
 
@@ -3471,8 +3600,8 @@ impl DashboardService {
     ) -> ReviewScanAttempt {
         let started = Instant::now();
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.review.model.trim().to_string();
-        if model.is_empty() {
+        let selection = self.review_model_selection(ReviewModelProfile::Strong);
+        if selection.model.is_empty() {
             return review_scan_attempt(
                 "merged".to_string(),
                 0,
@@ -3480,6 +3609,7 @@ impl DashboardService {
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
                 None,
+                &selection,
             );
         }
         let tables_path = materialize_review_tables().await;
@@ -3490,13 +3620,13 @@ impl DashboardService {
             "run".to_string(),
             prompt,
             "-m".to_string(),
-            model,
+            selection.model.clone(),
             "--agent".to_string(),
             "plan".to_string(),
             "--title".to_string(),
             title.clone(),
         ];
-        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        run_args.extend(run_variant_args(&selection.thinking));
         let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
         let (result, raw_output) = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
@@ -3529,6 +3659,7 @@ impl DashboardService {
             usage,
             result,
             raw_output,
+            &selection,
         )
     }
 
@@ -3550,8 +3681,8 @@ impl DashboardService {
             existing_findings,
         );
         let prompt_bytes = prompt.len();
-        let model = self.config.ai.review.model.trim().to_string();
-        if model.is_empty() {
+        let selection = self.review_model_selection(ReviewModelProfile::Strong);
+        if selection.model.is_empty() {
             return review_scan_attempt(
                 "gap-audit".to_string(),
                 prompt_bytes,
@@ -3559,6 +3690,7 @@ impl DashboardService {
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
                 None,
+                &selection,
             );
         }
         let title = review_scan_title();
@@ -3566,13 +3698,13 @@ impl DashboardService {
             "run".to_string(),
             prompt,
             "-m".to_string(),
-            model,
+            selection.model.clone(),
             "--agent".to_string(),
             "plan".to_string(),
             "--title".to_string(),
             title.clone(),
         ];
-        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        run_args.extend(run_variant_args(&selection.thinking));
         let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
         let (result, raw_output) = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
@@ -3609,6 +3741,7 @@ impl DashboardService {
             usage,
             result,
             raw_output,
+            &selection,
         )
     }
 
@@ -3712,8 +3845,20 @@ impl DashboardService {
             let Some(file) = files.iter().find(|file| file.path == finding.file) else {
                 continue;
             };
+            let cross_group = groups.iter().any(|group| {
+                !group.relationship_summary.is_empty()
+                    && group
+                        .relationship_summary
+                        .contains(&format!("`{}`", finding.file))
+            });
+            let strong = matches!(
+                finding.severity,
+                ReviewSeverity::Critical | ReviewSeverity::High
+            ) || finding.category.eq_ignore_ascii_case("security")
+                || audit_titles.contains(&finding.title.to_ascii_lowercase())
+                || cross_group;
             let attempt = self
-                .verify_review_finding(worktree_path, file, &finding, &context)
+                .verify_review_finding(worktree_path, file, &finding, &context, strong)
                 .await;
             accumulate_review_usage(&mut usage, &attempt.telemetry.usage);
             match attempt.result {
@@ -3888,8 +4033,8 @@ impl DashboardService {
     ) -> ReviewScanAttempt {
         let started = Instant::now();
         let prompt_bytes = prompt.len();
-        let model = self.config.ai.review.model.trim().to_string();
-        if model.is_empty() {
+        let selection = self.review_model_selection(ReviewModelProfile::Utility);
+        if selection.model.is_empty() {
             return review_scan_attempt(
                 scan,
                 prompt_bytes,
@@ -3897,6 +4042,7 @@ impl DashboardService {
                 None,
                 Err(WisetreeError::other("ai.review model is not configured.")),
                 None,
+                &selection,
             );
         }
         let title = review_scan_title();
@@ -3904,13 +4050,13 @@ impl DashboardService {
             "run".to_string(),
             prompt,
             "-m".to_string(),
-            model,
+            selection.model.clone(),
             "--agent".to_string(),
             "plan".to_string(),
             "--title".to_string(),
             title.clone(),
         ];
-        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        run_args.extend(run_variant_args(&selection.thinking));
         let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
         let (result, raw_output) = match time::timeout(
             REVIEW_SCAN_TIMEOUT,
@@ -3940,7 +4086,15 @@ impl DashboardService {
             },
         };
         let usage = opencode_usage_for_title(title).await;
-        review_scan_attempt(scan, prompt_bytes, started, usage, result, raw_output)
+        review_scan_attempt(
+            scan,
+            prompt_bytes,
+            started,
+            usage,
+            result,
+            raw_output,
+            &selection,
+        )
     }
 
     /// Post one approved finding to the PR — inline when it carries a
@@ -7347,6 +7501,7 @@ fn review_scan_attempt(
     usage: Option<ReviewTokenUsage>,
     result: Result<Vec<ReviewFinding>>,
     raw_output: Option<String>,
+    selection: &ReviewModelSelection,
 ) -> ReviewScanAttempt {
     let findings = result.as_ref().map_or(0, Vec::len);
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -7365,6 +7520,9 @@ fn review_scan_attempt(
             scan,
             scan_role,
             retry_role: retry_role.to_string(),
+            model_profile: selection.profile.label().to_string(),
+            model: selection.model.clone(),
+            thinking: selection.thinking.clone(),
             prompt_bytes,
             usage: usage.unwrap_or_default(),
             duration_ms,
@@ -7410,6 +7568,7 @@ fn review_verification_attempt(
     started: Instant,
     usage: Option<ReviewTokenUsage>,
     result: Result<ReviewVerification>,
+    selection: &ReviewModelSelection,
 ) -> ReviewVerificationAttempt {
     let findings = usize::from(matches!(
         &result,
@@ -7422,6 +7581,9 @@ fn review_verification_attempt(
             scan,
             scan_role: "verification".to_string(),
             retry_role: "initial".to_string(),
+            model_profile: selection.profile.label().to_string(),
+            model: selection.model.clone(),
+            thinking: selection.thinking.clone(),
             prompt_bytes,
             usage: usage.unwrap_or_default(),
             duration_ms,
@@ -11022,6 +11184,66 @@ copy to src/copied_again.rs
         assert!(merged
             .iter()
             .all(|group| group.profile == ReviewGroupProfile::Tester));
+    }
+
+    #[test]
+    fn review_model_routing_escalates_only_complex_or_risky_discovery() {
+        let file = |path: &str, diff: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: diff.to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let group = |profile, files: Vec<ReviewFile>, relationship_summary: &str| ReviewFileGroup {
+            profile,
+            files,
+            relationship_summary: relationship_summary.to_string(),
+        };
+
+        let focused_app = group(
+            ReviewGroupProfile::Application,
+            vec![file("src/format.rs", "     1 +let label = format_name();")],
+            "",
+        );
+        assert_eq!(
+            review_group_model_profile(&focused_app),
+            ReviewModelProfile::Balanced
+        );
+
+        let test_group = group(
+            ReviewGroupProfile::Tester,
+            vec![file("tests/auth_test.rs", "     1 +assert!(allowed);")],
+            "",
+        );
+        assert_eq!(
+            review_group_model_profile(&test_group),
+            ReviewModelProfile::Balanced
+        );
+
+        let risky_app = group(
+            ReviewGroupProfile::Application,
+            vec![file("src/auth/session.rs", "     1 +validate(user);")],
+            "",
+        );
+        assert_eq!(
+            review_group_model_profile(&risky_app),
+            ReviewModelProfile::Strong
+        );
+
+        let cross_file_app = group(
+            ReviewGroupProfile::Application,
+            vec![
+                file("src/caller.rs", "     1 +call();"),
+                file("src/callee.rs", "     1 +fn call() {}"),
+            ],
+            "`src/caller.rs` directly calls `src/callee.rs`",
+        );
+        assert_eq!(
+            review_group_model_profile(&cross_file_app),
+            ReviewModelProfile::Strong
+        );
     }
 
     #[test]

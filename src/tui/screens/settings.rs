@@ -21,8 +21,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::config::schema::{
-    AiBugkillConfig, AiConfig, AiFixConfig, AiModelConfig, DashboardConfig, LinkStrategy,
-    NotificationsConfig, WorktreeConfig,
+    AiBugkillConfig, AiConfig, AiFixConfig, AiModelConfig, AiReviewConfig, DashboardConfig,
+    LinkStrategy, NotificationsConfig, WorktreeConfig,
 };
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
@@ -1146,7 +1146,11 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
             plan: clean(&ai.fix.plan),
             apply: clean(&ai.fix.apply),
         },
-        review: clean(&ai.review),
+        review: AiReviewConfig {
+            strong: clean(&ai.review.strong),
+            balanced: clean(&ai.review.balanced),
+            utility: clean(&ai.review.utility),
+        },
         update: clean(&ai.update),
         bugkill: AiBugkillConfig {
             investigate: clean(&ai.bugkill.investigate),
@@ -1163,7 +1167,9 @@ pub enum AiSlot {
     Enrich,
     FixPlan,
     FixApply,
-    Review,
+    ReviewStrong,
+    ReviewBalanced,
+    ReviewUtility,
     Update,
     BugkillInvestigate,
     BugkillFix,
@@ -1171,11 +1177,13 @@ pub enum AiSlot {
 }
 
 impl AiSlot {
-    pub const ALL: [AiSlot; 8] = [
+    pub const ALL: [AiSlot; 10] = [
         AiSlot::Enrich,
         AiSlot::FixPlan,
         AiSlot::FixApply,
-        AiSlot::Review,
+        AiSlot::ReviewStrong,
+        AiSlot::ReviewBalanced,
+        AiSlot::ReviewUtility,
         AiSlot::Update,
         AiSlot::BugkillInvestigate,
         AiSlot::BugkillFix,
@@ -1187,7 +1195,9 @@ impl AiSlot {
             AiSlot::Enrich => "enrich",
             AiSlot::FixPlan => "fix_plan",
             AiSlot::FixApply => "fix_apply",
-            AiSlot::Review => "review",
+            AiSlot::ReviewStrong => "review_strong",
+            AiSlot::ReviewBalanced => "review_balanced",
+            AiSlot::ReviewUtility => "review_utility",
             AiSlot::Update => "update",
             AiSlot::BugkillInvestigate => "bugkill_investigate",
             AiSlot::BugkillFix => "bugkill_fix",
@@ -1200,10 +1210,14 @@ impl AiSlot {
             AiSlot::Enrich => "Drafts the PR title + description (Enrich)",
             AiSlot::FixPlan => "Plans review-comment fixes — pick a stronger model (Fix · plan)",
             AiSlot::FixApply => "Applies the approved fix live (Fix · apply)",
-            AiSlot::Review => {
-                "Scans each changed file and drafts review comments — pick a stronger model \
-                 (Review)"
+            AiSlot::ReviewStrong => {
+                "Cross-file discovery, coverage, audits, and high-risk verification (Review · \
+                 strong)"
             }
+            AiSlot::ReviewBalanced => {
+                "Focused application/test scans and revisions (Review · balanced)"
+            }
+            AiSlot::ReviewUtility => "Repairs malformed structured output only (Review · utility)",
             AiSlot::Update => "Resolves merge conflicts (Update Pull Request / branch)",
             AiSlot::BugkillInvestigate => {
                 "Investigates the bug and ranks root causes — pick a stronger model \
@@ -1221,7 +1235,9 @@ impl AiSlot {
             AiSlot::Enrich => &ai.enrich,
             AiSlot::FixPlan => &ai.fix.plan,
             AiSlot::FixApply => &ai.fix.apply,
-            AiSlot::Review => &ai.review,
+            AiSlot::ReviewStrong => &ai.review.strong,
+            AiSlot::ReviewBalanced => &ai.review.balanced,
+            AiSlot::ReviewUtility => &ai.review.utility,
             AiSlot::Update => &ai.update,
             AiSlot::BugkillInvestigate => &ai.bugkill.investigate,
             AiSlot::BugkillFix => &ai.bugkill.fix,
@@ -1234,7 +1250,9 @@ impl AiSlot {
             AiSlot::Enrich => &mut ai.enrich,
             AiSlot::FixPlan => &mut ai.fix.plan,
             AiSlot::FixApply => &mut ai.fix.apply,
-            AiSlot::Review => &mut ai.review,
+            AiSlot::ReviewStrong => &mut ai.review.strong,
+            AiSlot::ReviewBalanced => &mut ai.review.balanced,
+            AiSlot::ReviewUtility => &mut ai.review.utility,
             AiSlot::Update => &mut ai.update,
             AiSlot::BugkillInvestigate => &mut ai.bugkill.investigate,
             AiSlot::BugkillFix => &mut ai.bugkill.fix,
@@ -1243,14 +1261,16 @@ impl AiSlot {
     }
 }
 
-/// The eight leaf models in slot order — used by the dashboard `ai` summary and
+/// The ten leaf models in slot order — used by the dashboard `ai` summary and
 /// the AI Settings editor.
-fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 8] {
+fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 10] {
     [
         &ai.enrich,
         &ai.fix.plan,
         &ai.fix.apply,
-        &ai.review,
+        &ai.review.strong,
+        &ai.review.balanced,
+        &ai.review.utility,
         &ai.update,
         &ai.bugkill.investigate,
         &ai.bugkill.fix,
@@ -6215,7 +6235,7 @@ mod tests {
                 assert_eq!(cfg.ai.fix.plan.model, "openai/gpt-5.5");
                 assert_eq!(cfg.ai.fix.plan.thinking, "minimal");
                 // Untouched slots keep their per-command default.
-                assert_eq!(cfg.ai.enrich.model, "opencode-go/deepseek-v4-flash");
+                assert_eq!(cfg.ai.enrich.model, "opencode/deepseek-v4-flash-free");
             }
             other => panic!("expected SaveDashboard, got {other:?}"),
         }
@@ -6224,17 +6244,17 @@ mod tests {
     #[test]
     fn apply_ai_selection_targets_focused_slot() {
         let mut screen = ai_settings_screen(vec![]);
-        focus_ai_slot(&mut screen, 3); // update
+        focus_ai_slot(&mut screen, 6); // update
         screen.apply_ai_selection(
             "anthropic/claude-sonnet-4-5".to_string(),
             "high".to_string(),
         );
         let editor = screen.ai_settings_editor.as_ref().unwrap();
-        let slot = AiSlot::ALL[3].get(&editor.ai);
+        let slot = AiSlot::ALL[6].get(&editor.ai);
         assert_eq!(slot.model, "anthropic/claude-sonnet-4-5");
         assert_eq!(slot.thinking, "high");
-        assert_eq!(editor.statuses[3], DashboardRectStatus::Modified);
-        assert_eq!(editor.selection, AiSettingsSelection::Rect(3));
+        assert_eq!(editor.statuses[6], DashboardRectStatus::Modified);
+        assert_eq!(editor.selection, AiSettingsSelection::Rect(6));
     }
 
     #[test]

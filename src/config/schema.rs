@@ -132,54 +132,69 @@ pub struct AiModelConfig {
     pub thinking: String,
 }
 
-// Out-of-the-box defaults per AI command. These point at opencode's free /
-// cheap router models so AI-assisted flows work without the user wiring up
-// their own keys: `enrich` and `fix.plan` get a roomier reasoning budget
-// (`max`), while the heavier-traffic `fix.apply` / `update` run at the model's
-// default effort. Used both for `*Config::default()` and as the per-command
-// fallback when a slot is absent from the persisted config.
+// Out-of-the-box defaults per AI command. Each role is explicit so changing
+// one workflow cannot silently change another. Used both for
+// `*Config::default()` and as the per-command fallback when a slot is absent
+// from the persisted config.
 fn default_enrich_ai() -> AiModelConfig {
     AiModelConfig {
-        model: "opencode-go/deepseek-v4-flash".to_string(),
+        model: "opencode/deepseek-v4-flash-free".to_string(),
         thinking: "max".to_string(),
     }
 }
 fn default_fix_plan_ai() -> AiModelConfig {
     AiModelConfig {
-        model: "opencode-go/glm-5.2".to_string(),
-        thinking: "max".to_string(),
+        model: "openai/gpt-5.6-sol".to_string(),
+        thinking: "medium".to_string(),
     }
 }
 fn default_fix_apply_ai() -> AiModelConfig {
     AiModelConfig {
-        model: "opencode-go/kimi-k2.7-code".to_string(),
-        thinking: String::new(),
+        model: "openai/gpt-5.6-terra".to_string(),
+        thinking: "medium".to_string(),
     }
 }
 fn default_update_ai() -> AiModelConfig {
     AiModelConfig {
-        model: "opencode-go/kimi-k2.7-code".to_string(),
-        thinking: String::new(),
+        model: "openai/gpt-5.6-terra".to_string(),
+        thinking: "medium".to_string(),
     }
 }
-// Review scans one file's diff per captured call and must reason across
-// code smells / security / performance / tests — same strong model as
-// `fix.plan`.
-fn default_review_ai() -> AiModelConfig {
-    default_fix_plan_ai()
+fn default_review_strong_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "openai/gpt-5.6-sol".to_string(),
+        thinking: "medium".to_string(),
+    }
 }
-// Bugkill defaults mirror the Fix pipeline's split: `investigate` reasons
-// deeply over the whole codebase (same strong model as `fix.plan`), while
-// `fix` edits live and `judge` classifies a short comment (same fast model
-// as `fix.apply`).
+fn default_review_balanced_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "openai/gpt-5.6-terra".to_string(),
+        thinking: "medium".to_string(),
+    }
+}
+fn default_review_utility_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "openai/gpt-5.6-luna".to_string(),
+        thinking: "low".to_string(),
+    }
+}
 fn default_bugkill_investigate_ai() -> AiModelConfig {
-    default_fix_plan_ai()
+    AiModelConfig {
+        model: "openai/gpt-5.6-sol".to_string(),
+        thinking: "medium".to_string(),
+    }
 }
 fn default_bugkill_fix_ai() -> AiModelConfig {
-    default_fix_apply_ai()
+    AiModelConfig {
+        model: "openai/gpt-5.6-terra".to_string(),
+        thinking: "high".to_string(),
+    }
 }
 fn default_bugkill_judge_ai() -> AiModelConfig {
-    default_fix_apply_ai()
+    AiModelConfig {
+        model: "openai/gpt-5.6-terra".to_string(),
+        thinking: "medium".to_string(),
+    }
 }
 
 /// Per-step models for the two-phase "Fix Pull Request" pipeline. `plan` judges
@@ -200,6 +215,80 @@ impl Default for AiFixConfig {
         Self {
             plan: default_fix_plan_ai(),
             apply: default_fix_apply_ai(),
+        }
+    }
+}
+
+/// Capability profiles used by the Review pipeline. Deterministic routing
+/// selects `strong` for cross-file/high-consequence reasoning, `balanced` for
+/// focused discovery and revision, and `utility` for mechanical output repair.
+///
+/// The custom deserializer accepts the former `{ model, thinking }` Review
+/// leaf and seeds all three profiles with it, preserving explicit user choices
+/// made before profiles existed. Serialization always emits this nested shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct AiReviewConfig {
+    pub strong: AiModelConfig,
+    pub balanced: AiModelConfig,
+    pub utility: AiModelConfig,
+}
+
+impl AiReviewConfig {
+    fn from_legacy(model: AiModelConfig) -> Self {
+        Self {
+            strong: model.clone(),
+            balanced: model.clone(),
+            utility: model,
+        }
+    }
+
+    pub fn has_discovery_models(&self) -> bool {
+        [&self.strong, &self.balanced]
+            .iter()
+            .all(|profile| !profile.model.trim().is_empty())
+    }
+}
+
+impl Default for AiReviewConfig {
+    fn default() -> Self {
+        Self {
+            strong: default_review_strong_ai(),
+            balanced: default_review_balanced_ai(),
+            utility: default_review_utility_ai(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AiReviewConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Profiles {
+            #[serde(default = "default_review_strong_ai")]
+            strong: AiModelConfig,
+            #[serde(default = "default_review_balanced_ai")]
+            balanced: AiModelConfig,
+            #[serde(default = "default_review_utility_ai")]
+            utility: AiModelConfig,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Profiles(Profiles),
+            Legacy(AiModelConfig),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Profiles(profiles) => Ok(Self {
+                strong: profiles.strong,
+                balanced: profiles.balanced,
+                utility: profiles.utility,
+            }),
+            Wire::Legacy(model) => Ok(Self::from_legacy(model)),
         }
     }
 }
@@ -237,22 +326,34 @@ impl Default for AiBugkillConfig {
 ///
 /// ```json
 /// "ai": {
-///   "enrich": { "model": "opencode-go/deepseek-v4-flash", "thinking": "max" },
+///   "enrich": { "model": "opencode/deepseek-v4-flash-free", "thinking": "max" },
 ///   "fix": {
-///     "plan":  { "model": "opencode-go/glm-5.2", "thinking": "max" },
-///     "apply": { "model": "opencode-go/kimi-k2.7-code", "thinking": "default" }
+///     "plan":  { "model": "openai/gpt-5.6-sol", "thinking": "medium" },
+///     "apply": { "model": "openai/gpt-5.6-terra", "thinking": "medium" }
 ///   },
-///   "update": { "model": "opencode-go/kimi-k2.7-code", "thinking": "default" }
+///   "review": {
+///     "strong": { "model": "openai/gpt-5.6-sol", "thinking": "medium" },
+///     "balanced": { "model": "openai/gpt-5.6-terra", "thinking": "medium" },
+///     "utility": { "model": "openai/gpt-5.6-luna", "thinking": "low" }
+///   },
+///   "update": { "model": "openai/gpt-5.6-terra", "thinking": "medium" },
+///   "bugkill": {
+///     "investigate": { "model": "openai/gpt-5.6-sol", "thinking": "medium" },
+///     "fix": { "model": "openai/gpt-5.6-terra", "thinking": "high" },
+///     "judge": { "model": "openai/gpt-5.6-terra", "thinking": "medium" }
+///   }
 /// }
 /// ```
 ///
 /// `enrich` drives the "Enrich Pull Request" draft; `fix.plan` / `fix.apply`
-/// drive the two Fix phases; `update` drives the AI merge-conflict resolution
-/// shared by "Update Pull Request" and "Update branch (locally)".
+/// drive the two Fix phases; Review routes its analysis between three
+/// capability profiles; `update` drives the AI merge-conflict resolution
+/// shared by "Update Pull Request" and "Update branch (locally)"; and
+/// `bugkill` owns its investigate/fix/judge phases.
 ///
-/// An absent slot falls back to its built-in default (free/cheap opencode
-/// router models — see `default_*_ai`), so AI flows work out of the box and a
-/// fresh AI Settings page is pre-filled. Configs written before per-command
+/// An absent slot falls back to its built-in default (see `default_*_ai`), so
+/// AI flows work out of the box and a fresh AI Settings page is pre-filled.
+/// Configs written before per-command
 /// models existed used a single flat `{ "model": ..., "thinking": ... }`; those
 /// are migrated transparently on load by seeding every command with that one
 /// value (which takes precedence over the per-command defaults — see the custom
@@ -261,8 +362,8 @@ impl Default for AiBugkillConfig {
 pub struct AiConfig {
     pub enrich: AiModelConfig,
     pub fix: AiFixConfig,
-    /// Drives the "Review Pull Request" per-file diff scan.
-    pub review: AiModelConfig,
+    /// Capability profiles used by the "Review Pull Request" pipeline.
+    pub review: AiReviewConfig,
     pub update: AiModelConfig,
     pub bugkill: AiBugkillConfig,
 }
@@ -272,7 +373,7 @@ impl Default for AiConfig {
         Self {
             enrich: default_enrich_ai(),
             fix: AiFixConfig::default(),
-            review: default_review_ai(),
+            review: AiReviewConfig::default(),
             update: default_update_ai(),
             bugkill: AiBugkillConfig::default(),
         }
@@ -301,7 +402,7 @@ impl<'de> Deserialize<'de> for AiConfig {
             #[serde(default)]
             fix: Option<AiFixConfig>,
             #[serde(default)]
-            review: Option<AiModelConfig>,
+            review: Option<AiReviewConfig>,
             #[serde(default)]
             update: Option<AiModelConfig>,
             #[serde(default)]
@@ -334,10 +435,10 @@ impl<'de> Deserialize<'de> for AiConfig {
                 },
                 None => AiFixConfig::default(),
             }),
-            review: raw
-                .review
-                .or_else(|| legacy.clone())
-                .unwrap_or_else(default_review_ai),
+            review: raw.review.unwrap_or_else(|| match &legacy {
+                Some(model) => AiReviewConfig::from_legacy(model.clone()),
+                None => AiReviewConfig::default(),
+            }),
             update: raw
                 .update
                 .or_else(|| legacy.clone())
@@ -369,9 +470,10 @@ pub struct DashboardConfig {
     #[serde(rename = "columns", default = "default_columns")]
     pub columns: Vec<String>,
 
-    /// Per-command AI model + thinking strength for opencode-assisted flows
-    /// (enrich, fix plan/apply, update conflict resolution). When a command's
-    /// `model` is empty, that AI step is disabled and the user acts manually.
+    /// Per-command AI model + thinking strength for opencode-assisted flows.
+    /// Review owns three capability profiles and routes calls between them
+    /// deterministically; the other commands use one profile per AI step.
+    /// When a step's `model` is empty, that AI step is disabled.
     #[serde(rename = "ai", default)]
     pub ai: AiConfig,
 
@@ -575,7 +677,7 @@ pub struct AppState {
 
 #[cfg(test)]
 mod ai_config_tests {
-    use super::{AiConfig, DashboardConfig};
+    use super::{AiConfig, AiReviewConfig, DashboardConfig};
 
     #[test]
     fn legacy_flat_ai_seeds_every_command() {
@@ -587,7 +689,9 @@ mod ai_config_tests {
             &ai.enrich,
             &ai.fix.plan,
             &ai.fix.apply,
-            &ai.review,
+            &ai.review.strong,
+            &ai.review.balanced,
+            &ai.review.utility,
             &ai.update,
             &ai.bugkill.investigate,
             &ai.bugkill.fix,
@@ -619,24 +723,41 @@ mod ai_config_tests {
     }
 
     #[test]
+    fn legacy_review_leaf_seeds_every_review_profile() {
+        let json = r#"{
+            "review": { "model": "legacy/reviewer", "thinking": "high" }
+        }"#;
+        let ai: AiConfig = serde_json::from_str(json).expect("legacy review leaf parses");
+        for profile in [&ai.review.strong, &ai.review.balanced, &ai.review.utility] {
+            assert_eq!(profile.model, "legacy/reviewer");
+            assert_eq!(profile.thinking, "high");
+        }
+    }
+
+    #[test]
     fn empty_ai_object_uses_per_command_defaults() {
         let ai: AiConfig = serde_json::from_str("{}").expect("empty ai parses");
         assert_eq!(ai, AiConfig::default());
-        assert_eq!(ai.enrich.model, "opencode-go/deepseek-v4-flash");
+        assert_eq!(ai.enrich.model, "opencode/deepseek-v4-flash-free");
         assert_eq!(ai.enrich.thinking, "max");
-        assert_eq!(ai.fix.plan.model, "opencode-go/glm-5.2");
-        assert_eq!(ai.fix.plan.thinking, "max");
-        assert_eq!(ai.fix.apply.model, "opencode-go/kimi-k2.7-code");
-        assert_eq!(ai.fix.apply.thinking, "");
-        assert_eq!(ai.update.model, "opencode-go/kimi-k2.7-code");
-        assert_eq!(ai.update.thinking, "");
-        // Bugkill defaults mirror the Fix pipeline's plan/apply split.
-        assert_eq!(ai.bugkill.investigate.model, "opencode-go/glm-5.2");
-        assert_eq!(ai.bugkill.investigate.thinking, "max");
-        assert_eq!(ai.bugkill.fix.model, "opencode-go/kimi-k2.7-code");
-        assert_eq!(ai.bugkill.fix.thinking, "");
-        assert_eq!(ai.bugkill.judge.model, "opencode-go/kimi-k2.7-code");
-        assert_eq!(ai.bugkill.judge.thinking, "");
+        assert_eq!(ai.fix.plan.model, "openai/gpt-5.6-sol");
+        assert_eq!(ai.fix.plan.thinking, "medium");
+        assert_eq!(ai.fix.apply.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.fix.apply.thinking, "medium");
+        assert_eq!(ai.review.strong.model, "openai/gpt-5.6-sol");
+        assert_eq!(ai.review.strong.thinking, "medium");
+        assert_eq!(ai.review.balanced.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.review.balanced.thinking, "medium");
+        assert_eq!(ai.review.utility.model, "openai/gpt-5.6-luna");
+        assert_eq!(ai.review.utility.thinking, "low");
+        assert_eq!(ai.update.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.update.thinking, "medium");
+        assert_eq!(ai.bugkill.investigate.model, "openai/gpt-5.6-sol");
+        assert_eq!(ai.bugkill.investigate.thinking, "medium");
+        assert_eq!(ai.bugkill.fix.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.bugkill.fix.thinking, "high");
+        assert_eq!(ai.bugkill.judge.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.bugkill.judge.thinking, "medium");
     }
 
     #[test]
@@ -645,8 +766,11 @@ mod ai_config_tests {
         let json = r#"{ "enrich": { "model": "x", "thinking": "low" } }"#;
         let ai: AiConfig = serde_json::from_str(json).unwrap();
         assert_eq!(ai.enrich.model, "x");
-        assert_eq!(ai.fix.plan.model, "opencode-go/glm-5.2");
-        assert_eq!(ai.update.model, "opencode-go/kimi-k2.7-code");
+        assert_eq!(ai.fix.plan.model, "openai/gpt-5.6-sol");
+        assert_eq!(ai.fix.plan.thinking, "medium");
+        assert_eq!(ai.review, AiReviewConfig::default());
+        assert_eq!(ai.update.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.update.thinking, "medium");
     }
 
     #[test]
@@ -659,7 +783,9 @@ mod ai_config_tests {
             &ai.enrich,
             &ai.fix.plan,
             &ai.fix.apply,
-            &ai.review,
+            &ai.review.strong,
+            &ai.review.balanced,
+            &ai.review.utility,
             &ai.update,
             &ai.bugkill.investigate,
             &ai.bugkill.fix,
@@ -691,10 +817,10 @@ mod ai_config_tests {
         let ai: AiConfig = serde_json::from_str(json).unwrap();
         assert_eq!(ai.bugkill.judge.model, "tiny/judge");
         assert_eq!(ai.bugkill.judge.thinking, "low");
-        assert_eq!(ai.bugkill.investigate.model, "opencode-go/glm-5.2");
-        assert_eq!(ai.bugkill.investigate.thinking, "max");
-        assert_eq!(ai.bugkill.fix.model, "opencode-go/kimi-k2.7-code");
-        assert_eq!(ai.bugkill.fix.thinking, "");
+        assert_eq!(ai.bugkill.investigate.model, "openai/gpt-5.6-sol");
+        assert_eq!(ai.bugkill.investigate.thinking, "medium");
+        assert_eq!(ai.bugkill.fix.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.bugkill.fix.thinking, "high");
     }
 
     #[test]
@@ -715,6 +841,13 @@ mod ai_config_tests {
     fn dashboard_config_default_ai_uses_per_command_defaults() {
         let dash = DashboardConfig::default();
         assert_eq!(dash.ai, AiConfig::default());
-        assert_eq!(dash.ai.fix.plan.model, "opencode-go/glm-5.2");
+        assert_eq!(dash.ai.fix.plan.model, "openai/gpt-5.6-sol");
+        assert_eq!(dash.ai.fix.plan.thinking, "medium");
+        assert_eq!(dash.ai.review.strong.model, "openai/gpt-5.6-sol");
+        assert_eq!(dash.ai.review.strong.thinking, "medium");
+        assert_eq!(dash.ai.review.balanced.model, "openai/gpt-5.6-terra");
+        assert_eq!(dash.ai.review.balanced.thinking, "medium");
+        assert_eq!(dash.ai.review.utility.model, "openai/gpt-5.6-luna");
+        assert_eq!(dash.ai.review.utility.thinking, "low");
     }
 }

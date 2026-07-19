@@ -2742,7 +2742,7 @@ impl App {
                 return;
             }
             let config = self.current_dashboard_config();
-            for (index, file, finding) in candidates {
+            for (index, file, finding, strong) in candidates {
                 kick_off_verify_review_finding(
                     self.git_root.clone(),
                     config.clone(),
@@ -2752,6 +2752,7 @@ impl App {
                         finding,
                         context: context.clone(),
                         index,
+                        strong,
                     },
                     tx.clone(),
                 );
@@ -2834,8 +2835,8 @@ impl App {
                 ),
                 ReviewPreparation::AiNotConfigured => self.fail_review(
                     ToastVariant::Warning,
-                    "Set the `ai.review` model (Settings → Dashboard → ai) so the AI can scan \
-                     the diff."
+                    "Set both Review discovery profiles (`strong` and `balanced`) in Settings → \
+                     Dashboard → ai so the AI can scan the diff."
                         .to_string(),
                     tx,
                 ),
@@ -7682,6 +7683,7 @@ struct ReviewVerifyRequest {
     finding: ReviewFinding,
     context: ReviewContext,
     index: usize,
+    strong: bool,
 }
 
 struct ReviewGapAuditRequest {
@@ -7908,7 +7910,13 @@ fn kick_off_verify_review_finding(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let attempt = service
-            .verify_review_finding(&req.worktree_path, &req.file, &req.finding, &req.context)
+            .verify_review_finding(
+                &req.worktree_path,
+                &req.file,
+                &req.finding,
+                &req.context,
+                req.strong,
+            )
             .await;
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrVerified {
@@ -8841,9 +8849,14 @@ mod tests {
             branch: "review-retries".to_string(),
             worktree_path: "/tmp/review-retries".to_string(),
         };
-        let ai = crate::config::schema::AiModelConfig {
+        let model = crate::config::schema::AiModelConfig {
             model: "opencode/test".to_string(),
             thinking: "max".to_string(),
+        };
+        let ai = crate::config::schema::AiReviewConfig {
+            strong: model.clone(),
+            balanced: model.clone(),
+            utility: model,
         };
         let files = paths
             .iter()
@@ -8872,6 +8885,9 @@ mod tests {
             scan: scan.to_string(),
             scan_role: "test".to_string(),
             retry_role: "initial".to_string(),
+            model_profile: "balanced".to_string(),
+            model: "openai/gpt-5.6-terra".to_string(),
+            thinking: "medium".to_string(),
             prompt_bytes: 100,
             usage: crate::services::ReviewTokenUsage {
                 uncached_input: Some(10),
@@ -8920,6 +8936,9 @@ mod tests {
                 scan: "late:test".to_string(),
                 scan_role: "test".to_string(),
                 retry_role: "full-rescan".to_string(),
+                model_profile: "balanced".to_string(),
+                model: "openai/gpt-5.6-terra".to_string(),
+                thinking: "medium".to_string(),
                 prompt_bytes: 1,
                 usage: crate::services::ReviewTokenUsage {
                     uncached_input: Some(1),

@@ -43,6 +43,12 @@ pub struct ReviewScanTelemetry {
     pub scan: String,
     pub scan_role: String,
     pub retry_role: String,
+    #[serde(default)]
+    pub model_profile: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub thinking: String,
     pub prompt_bytes: usize,
     pub usage: ReviewTokenUsage,
     pub duration_ms: u64,
@@ -274,6 +280,9 @@ mod tests {
             scan: "app:src/lib.rs".to_string(),
             scan_role: "application".to_string(),
             retry_role: "initial".to_string(),
+            model_profile: "balanced".to_string(),
+            model: "openai/gpt-5.6-terra".to_string(),
+            thinking: "medium".to_string(),
             prompt_bytes: 1200,
             usage: ReviewTokenUsage {
                 uncached_input: tokens.map(|usage| usage.0),
@@ -345,6 +354,26 @@ mod tests {
         assert!(json.contains("promptBytes"));
         assert!(json.contains("uncachedInput"));
         assert!(json.contains("scanRole"));
+        assert!(json.contains("modelProfile"));
+        assert!(json.contains("openai/gpt-5.6-terra"));
+        assert!(json.contains("thinking"));
         assert!(json.contains("logicalTotal"));
+    }
+
+    #[test]
+    fn old_scan_telemetry_without_model_route_still_deserializes() {
+        let json = r#"{
+            "scan":"coverage",
+            "scanRole":"coverage",
+            "retryRole":"initial",
+            "promptBytes":1200,
+            "usage":{},
+            "durationMs":25,
+            "findings":1
+        }"#;
+        let telemetry: ReviewScanTelemetry = serde_json::from_str(json).unwrap();
+        assert!(telemetry.model_profile.is_empty());
+        assert!(telemetry.model.is_empty());
+        assert!(telemetry.thinking.is_empty());
     }
 }
