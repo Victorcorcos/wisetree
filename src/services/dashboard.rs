@@ -96,6 +96,9 @@ const GH_TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(3);
 const REVIEW_DIFF_MAX_BYTES: usize = 60_000;
 const REVIEW_COMMENTS_MAX_BYTES: usize = 12_000;
 const REVIEW_COMMENT_KEY_MAX_BYTES: usize = 160;
+/// Annotated-diff byte threshold above which an explicit test fixture is
+/// treated as data rather than reviewable source.
+const REVIEW_FIXTURE_DIFF_MAX_BYTES: usize = 24_000;
 /// Byte cap for the whole-diff coverage prompt, which concatenates every
 /// file's (already individually capped) annotated diff into one call.
 const REVIEW_COVERAGE_DIFF_MAX_BYTES: usize = 120_000;
@@ -6082,25 +6085,44 @@ fn parse_review_pr_json(body: &str) -> Option<(String, String, String, String)> 
 /// Every line present in the new version of a file gets its new-side line
 /// number inlined (removed lines stay unnumbered), and those numbers double
 /// as the commentable-lines set the AI's anchors are validated against.
-/// Binary and deleted files are skipped — there is nothing to comment on.
+/// Deleted files and opaque binaries are skipped — there is no new-side text
+/// to comment on. Pure renames and known skipped binary-adjacent assets retain
+/// lightweight metadata so the Done report can show why no scan ran.
 pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
+    #[derive(Default)]
+    struct Metadata {
+        binary: bool,
+        deleted: bool,
+        similarity_100: bool,
+        rename_or_copy: bool,
+        saw_hunk: bool,
+    }
+
     let mut files: Vec<ReviewFile> = Vec::new();
     let mut path: Option<String> = None;
     let mut annotated = String::new();
     let mut commentable: BTreeSet<u64> = BTreeSet::new();
     let mut new_line: u64 = 0;
     let mut in_hunk = false;
-    let mut skip = false;
+    let mut metadata = Metadata::default();
 
     fn flush(
         files: &mut Vec<ReviewFile>,
         path: &mut Option<String>,
         annotated: &mut String,
         commentable: &mut BTreeSet<u64>,
-        skip: bool,
+        metadata: &Metadata,
     ) {
         if let Some(p) = path.take() {
-            if !skip && !commentable.is_empty() {
+            let pure_rename =
+                metadata.similarity_100 && metadata.rename_or_copy && !metadata.saw_hunk;
+            let visible_binary_skip = metadata.binary && review_skip_reason(&p).is_some();
+            if !metadata.deleted
+                && (pure_rename
+                    || metadata.rename_or_copy
+                    || visible_binary_skip
+                    || (!metadata.binary && !commentable.is_empty()))
+            {
                 files.push(ReviewFile {
                     path: p,
                     annotated_diff: std::mem::take(annotated).trim_end().to_string(),
@@ -6122,20 +6144,45 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
                 &mut path,
                 &mut annotated,
                 &mut commentable,
-                skip,
+                &metadata,
             );
+            path = review_diff_destination(line);
             in_hunk = false;
-            skip = false;
+            metadata = Metadata::default();
             continue;
         }
         if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
-            skip = true;
+            metadata.binary = true;
+            annotated.push_str(line);
+            annotated.push('\n');
+            continue;
+        }
+        if line == "similarity index 100%" {
+            metadata.similarity_100 = true;
+            annotated.push_str(line);
+            annotated.push('\n');
+            continue;
+        }
+        if let Some(to) = line
+            .strip_prefix("rename to ")
+            .or_else(|| line.strip_prefix("copy to "))
+        {
+            metadata.rename_or_copy = true;
+            path = Some(to.trim_matches('"').to_string());
+            annotated.push_str(line);
+            annotated.push('\n');
+            continue;
+        }
+        if line.starts_with("rename from ") || line.starts_with("copy from ") {
+            metadata.rename_or_copy = true;
+            annotated.push_str(line);
+            annotated.push('\n');
             continue;
         }
         if let Some(rest) = line.strip_prefix("+++ ") {
             if rest.trim() == "/dev/null" {
                 // Deleted file — no new side to comment on.
-                skip = true;
+                metadata.deleted = true;
             } else {
                 path = Some(
                     rest.trim()
@@ -6159,12 +6206,13 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
             if let Some(start) = start {
                 new_line = start;
                 in_hunk = true;
+                metadata.saw_hunk = true;
                 annotated.push_str(line);
                 annotated.push('\n');
             }
             continue;
         }
-        if !in_hunk || skip {
+        if !in_hunk || metadata.binary || metadata.deleted {
             continue;
         }
         match line.chars().next() {
@@ -6193,9 +6241,18 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
         &mut path,
         &mut annotated,
         &mut commentable,
-        skip,
+        &metadata,
     );
     files
+}
+
+fn review_diff_destination(header: &str) -> Option<String> {
+    let header = header.strip_prefix("diff --git ")?;
+    if let Some((_, destination)) = header.rsplit_once(" b/") {
+        return Some(destination.to_string());
+    }
+    let start = header.rfind("\"b/")? + 3;
+    Some(header[start..].trim_end_matches('"').to_string())
 }
 
 /// Per-file context extracted from the PR's existing inline comments: the
@@ -6553,8 +6610,8 @@ async fn materialize_review_tables() -> String {
 
 /// Deterministic pre-filter: files nobody reviews by hand are excluded
 /// before any AI call — each skipped file would otherwise cost a full
-/// scan (prompt + diff) for feedback no author wants. Path-based only, so
-/// the decision is reproducible and visible on the final report.
+/// scan (prompt + diff) for feedback no author wants. The cheap classifiers
+/// are deterministic, reproducible, and visible on the final report.
 pub(crate) fn review_skip_reason(path: &str) -> Option<&'static str> {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
     let mut parts = lower.rsplit('/');
@@ -6592,10 +6649,116 @@ pub(crate) fn review_skip_reason(path: &str) -> Option<&'static str> {
     if name.ends_with(".map") {
         return Some("source map");
     }
+    if name.ends_with(".svg") || name.ends_with(".pdf") {
+        return Some("binary-adjacent asset");
+    }
     if name.contains(".generated.") || name.ends_with(".pb.go") || name.ends_with("_pb2.py") {
         return Some("generated code");
     }
     None
+}
+
+fn review_file_skip_reason(file: &ReviewFile) -> Option<&'static str> {
+    review_skip_reason(&file.path)
+        .or_else(|| is_pure_review_rename(file).then_some("pure rename/move"))
+        .or_else(|| {
+            review_diff_is_comment_or_blank_only(file).then_some("comments/blank lines only")
+        })
+        .or_else(|| is_oversized_review_fixture(file).then_some("oversized test fixture"))
+}
+
+fn is_pure_review_rename(file: &ReviewFile) -> bool {
+    file.commentable_lines.is_empty()
+        && file
+            .annotated_diff
+            .lines()
+            .any(|line| line == "similarity index 100%")
+        && file
+            .annotated_diff
+            .lines()
+            .any(|line| line.starts_with("rename from ") || line.starts_with("rename to "))
+}
+
+fn is_oversized_review_fixture(file: &ReviewFile) -> bool {
+    if file.annotated_diff.len() <= REVIEW_FIXTURE_DIFF_MAX_BYTES {
+        return false;
+    }
+    let lower = file.path.replace('\\', "/").to_ascii_lowercase();
+    let mut parts = lower.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_some()
+            && matches!(part, "fixture" | "fixtures" | "testdata" | "test_data")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn review_diff_is_comment_or_blank_only(file: &ReviewFile) -> bool {
+    let extension = Path::new(&file.path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let mut changed = false;
+    for content in file.annotated_diff.lines().filter_map(review_changed_line) {
+        changed = true;
+        if !review_line_is_blank_or_comment(extension.as_deref(), content) {
+            return false;
+        }
+    }
+    changed
+}
+
+fn review_changed_line(line: &str) -> Option<&str> {
+    if let Some(content) = line.strip_prefix("       -") {
+        return Some(content);
+    }
+    let trimmed = line.trim_start();
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    trimmed[digits..].strip_prefix(' ')?.strip_prefix('+')
+}
+
+fn review_line_is_blank_or_comment(extension: Option<&str>, content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Some(extension) = extension else {
+        return false;
+    };
+    match extension {
+        "rs" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "cs" | "java" | "js" | "jsx" | "ts"
+        | "tsx" | "go" | "swift" | "kt" | "kts" | "dart" | "scala" => {
+            let doc_comment = trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                || trimmed.starts_with("/**")
+                || trimmed.starts_with("/*!");
+            (!doc_comment && trimmed.starts_with("//"))
+                || (!doc_comment
+                    && trimmed.starts_with("/*")
+                    && trimmed.ends_with("*/")
+                    && !trimmed[2..trimmed.len() - 2].contains("*/"))
+        }
+        "py" | "rb" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" | "pl" | "pm" | "r"
+        | "ex" | "exs" => {
+            let lower = trimmed.to_ascii_lowercase();
+            trimmed.starts_with('#')
+                && !trimmed.starts_with("#!")
+                && !lower.contains("coding:")
+                && !lower.contains("coding=")
+                && !lower.starts_with("# frozen_string_literal:")
+        }
+        "sql" | "lua" | "hs" => trimmed.starts_with("--"),
+        "css" | "scss" | "less" => trimmed.starts_with("/*") && trimmed.ends_with("*/"),
+        "html" | "htm" | "xml" | "vue" | "svelte" => {
+            trimmed.starts_with("<!--") && trimmed.ends_with("-->")
+        }
+        _ => false,
+    }
 }
 
 /// Split the parsed diff into the files worth an AI scan and the ones the
@@ -6606,7 +6769,7 @@ pub(crate) fn partition_reviewable_files(
     let mut reviewable = Vec::new();
     let mut skipped = Vec::new();
     for file in files {
-        match review_skip_reason(&file.path) {
+        match review_file_skip_reason(&file) {
             Some(reason) => skipped.push(ReviewSkippedFile {
                 path: file.path,
                 reason,
@@ -7695,6 +7858,70 @@ new file mode 100644
     }
 
     #[test]
+    fn parse_review_diff_keeps_visible_pure_renames_and_binary_adjacent_assets() {
+        let diff = "\
+diff --git a/src/old.rs b/src/new.rs
+similarity index 100%
+rename from src/old.rs
+rename to src/new.rs
+diff --git a/docs/manual.pdf b/docs/manual.pdf
+Binary files a/docs/manual.pdf and b/docs/manual.pdf differ
+diff --git a/gone.pdf b/gone.pdf
+deleted file mode 100644
+--- a/gone.pdf
++++ /dev/null
+Binary files a/gone.pdf and /dev/null differ
+";
+        let files = parse_review_diff(diff);
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(files[0].path, "src/new.rs");
+        assert_eq!(files[1].path, "docs/manual.pdf");
+        let (reviewable, skipped) = partition_reviewable_files(files);
+        assert!(reviewable.is_empty());
+        assert_eq!(
+            skipped,
+            vec![
+                ReviewSkippedFile {
+                    path: "src/new.rs".to_string(),
+                    reason: "pure rename/move",
+                },
+                ReviewSkippedFile {
+                    path: "docs/manual.pdf".to_string(),
+                    reason: "binary-adjacent asset",
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_near_misses_remain_reviewable() {
+        let diff = "\
+diff --git a/src/old.rs b/src/new.rs
+similarity index 90%
+rename from src/old.rs
+rename to src/new.rs
+--- a/src/old.rs
++++ b/src/new.rs
+@@ -1 +1 @@
+-fn old() {}
++fn changed() {}
+diff --git a/src/copied.rs b/src/copied_again.rs
+similarity index 100%
+copy from src/copied.rs
+copy to src/copied_again.rs
+";
+        let (reviewable, skipped) = partition_reviewable_files(parse_review_diff(diff));
+        assert!(skipped.is_empty());
+        assert_eq!(
+            reviewable
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/new.rs", "src/copied_again.rs"]
+        );
+    }
+
+    #[test]
     fn parse_review_findings_reads_multiple_findings() {
         let out = "chatter\n===WISETREE-REVIEW-BEGIN===\n\
             ---FINDING---\n\
@@ -8322,6 +8549,8 @@ new file mode 100644
             ("gradle/deps.lockfile", "lockfile"),
             ("dist/app.min.js", "minified asset"),
             ("dist/app.js.map", "source map"),
+            ("assets/logo.svg", "binary-adjacent asset"),
+            ("docs/manual.pdf", "binary-adjacent asset"),
             ("src/__snapshots__/app.tsx.snap", "test snapshot"),
             ("components/Button.snap", "test snapshot"),
             ("vendor/lib/util.rb", "vendored code"),
@@ -8362,6 +8591,101 @@ new file mode 100644
                 path: "Cargo.lock".to_string(),
                 reason: "lockfile",
             }]
+        );
+    }
+
+    #[test]
+    fn comment_and_blank_only_diffs_are_skipped_conservatively() {
+        let file = |path: &str, annotated_diff: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: annotated_diff.to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        for candidate in [
+            file("src/lib.rs", "@@ -1 +1 @@\n       -// old\n     1 +// new"),
+            file(
+                "src/app.ts",
+                "@@ -1 +1,2 @@\n       -/* old */\n     1 +/* new */\n     2 +",
+            ),
+            file(
+                "config/settings.py",
+                "@@ -1 +1 @@\n       -# old\n     1 +# new",
+            ),
+            file("notes.unknown", "@@ -1 +1 @@\n       -   \n     1 +"),
+        ] {
+            assert_eq!(
+                review_file_skip_reason(&candidate),
+                Some("comments/blank lines only"),
+                "{}",
+                candidate.path
+            );
+        }
+
+        for candidate in [
+            file(
+                "src/lib.rs",
+                "@@ -1 +1 @@\n       -// old\n     1 +let live = true;",
+            ),
+            file(
+                "src/lib.rs",
+                "@@ -1 +1 @@\n       -/// old\n     1 +/// ```rust",
+            ),
+            file(
+                "script.sh",
+                "@@ -1 +1 @@\n       -# old\n     1 +#!/bin/bash",
+            ),
+            file(
+                "src/app.ts",
+                "@@ -1 +1,3 @@\n       -/* old */\n     1 +/* start\n     2 + * body\n     3 + */",
+            ),
+            file("notes.unknown", "@@ -1 +1 @@\n       -# old\n     1 +# new"),
+        ] {
+            assert_eq!(
+                review_file_skip_reason(&candidate),
+                None,
+                "{}",
+                candidate.path
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_fixtures_are_removed_before_scan_mode_routing() {
+        let file = |path: &str, bytes: usize| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: "x".repeat(bytes),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let fixture = file("tests/fixtures/payload.json", REVIEW_MERGED_FOCUS_BYTES + 1);
+        let app = file("src/lib.rs", 100);
+        assert_eq!(
+            review_scan_mode(&[fixture.clone(), app.clone()]),
+            ReviewScanMode::Split
+        );
+
+        let (reviewable, skipped) = partition_reviewable_files(vec![fixture, app]);
+        assert_eq!(review_scan_mode(&reviewable), ReviewScanMode::Merged);
+        assert_eq!(skipped[0].reason, "oversized test fixture");
+
+        let (at_cap, _) = partition_reviewable_files(vec![file(
+            "tests/fixtures/small.json",
+            REVIEW_FIXTURE_DIFF_MAX_BYTES,
+        )]);
+        assert_eq!(at_cap.len(), 1, "the threshold itself remains reviewable");
+        let (ambiguous, _) = partition_reviewable_files(vec![file(
+            "examples/large.json",
+            REVIEW_FIXTURE_DIFF_MAX_BYTES + 1,
+        )]);
+        assert_eq!(
+            ambiguous.len(),
+            1,
+            "ambiguous fixture paths remain reviewable"
         );
     }
 

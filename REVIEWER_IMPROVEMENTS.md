@@ -374,6 +374,8 @@ its reason — auditable, never silent.
 
 **Touches.** `review_skip_reason`, `partition_reviewable_files`.
 
+**Status:** ✅ implemented — commit e40988c. as specified.
+
 ## #11 — Trim the "Other" revision call
 
 **Independent; last of the trims because revisions are the rarest call (the

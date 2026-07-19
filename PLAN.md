@@ -226,18 +226,18 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] Pure 100%-similarity renames/moves are represented as visible skipped entries rather than scans or silent omissions.
-- [ ] Comment/blank-only diffs are skipped only when every changed line is conservatively recognized for that language.
-- [ ] `.svg`, `.pdf`, and oversized fixture changes receive explicit deterministic skip reasons.
-- [ ] Skipped bytes are excluded before merged/split mode routing.
-- [ ] Tests cover every new skip class plus near-miss cases that must still be reviewed.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #10 Status line.
+- [x] Pure 100%-similarity renames/moves are represented as visible skipped entries rather than scans or silent omissions.
+- [x] Comment/blank-only diffs are skipped only when every changed line is conservatively recognized for that language.
+- [x] `.svg`, `.pdf`, and oversized fixture changes receive explicit deterministic skip reasons.
+- [x] Skipped bytes are excluded before merged/split mode routing.
+- [x] Tests cover every new skip class plus near-miss cases that must still be reviewed.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #10 Status line.
 
 **Edge cases**:
 
-- [ ] Renames with edits, low similarity, or ambiguous diff metadata are scanned.
-- [ ] Mixed comment/code changes, unknown languages, doc comments with executable examples, and ambiguous fixtures are scanned.
-- [ ] Binary/deleted files retain existing safe handling without duplicate report rows.
+- [x] Renames with edits, low similarity, or ambiguous diff metadata are scanned.
+- [x] Mixed comment/code changes, unknown languages, doc comments with executable examples, and ambiguous fixtures are scanned.
+- [x] Binary/deleted files retain existing safe handling without duplicate report rows.
 
 ---
 
