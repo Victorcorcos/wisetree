@@ -44,10 +44,6 @@ These checklists are a starting point, not a ceiling — flag any real issue you
 - **Respect conventions**: proposed fixes must match the project's own test style.
 - Finding nothing is a valid, expected outcome. Do not invent issues to fill the report.
 
-## Revision mode
-
-When the provided user feedback is non-empty, you are revising ONE finding the user is actively reviewing. Treat their feedback as the authority: re-emit exactly one finding block that revises the previous finding accordingly (same file, same concern unless they redirect you). Never emit `NO-FINDINGS` in revision mode.
-
 ## Output contract — emit EXACTLY one block, nothing else
 
 Print a single block delimited by the exact marker lines below. Do not wrap it in code fences. Do not print prose before or after the block. The harness parses this block in Rust and branches on it deterministically, so the marker lines and section headers must be byte-for-byte exact.
@@ -106,16 +102,4 @@ FILE_DIFF
 
 ```
 EXISTING_COMMENTS
-```
-
-- The user's freeform feedback on your previous finding (empty on the first pass — only present when the user asked you to revise):
-
-```
-USER_FEEDBACK
-```
-
-- Your previously proposed finding (empty on the first pass):
-
-```
-PREVIOUS_FINDING
 ```

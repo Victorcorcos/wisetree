@@ -402,6 +402,8 @@ touching anything else.
 **Touches.** new `prompts/reviewer_revise.md`,
 `kick_off_revise_review_finding` path.
 
+**Status:** ✅ implemented — commit 3bcd22a. as specified.
+
 ## #12 — Batch split-mode app scans (conditional — implement only if telemetry justifies it)
 
 **A refinement of #4's split mode. Formerly a headline strategy; #4 subsumes

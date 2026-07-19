@@ -358,8 +358,8 @@ impl ReviewPullRequestScreen {
     pub fn current_finding(&self) -> Option<ReviewFinding> {
         self.findings.get(self.current).cloned()
     }
-    /// The scanned file a finding belongs to — an "Other" revision re-renders
-    /// this file's prompt with the user's feedback threaded in.
+    /// The scanned file a finding belongs to — an "Other" revision derives
+    /// its focused hunk and optional inlined content from this snapshot.
     pub fn file_for(&self, finding: &ReviewFinding) -> Option<ReviewFile> {
         self.files.iter().find(|f| f.path == finding.file).cloned()
     }
@@ -2655,6 +2655,20 @@ mod tests {
             screen.current_finding().unwrap().title,
             "Use a secrets manager"
         );
+    }
+
+    #[test]
+    fn failed_revision_returns_to_the_existing_finding() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "s".into());
+        let original = finding("a.rs", Some(2), ReviewSeverity::High);
+        screen.record_scan_result(vec![original.clone()]);
+        screen.finish_scanning();
+        screen.enter_decision();
+        screen.start_revising();
+        screen.reshow_decision();
+        assert_eq!(screen.step(), ReviewStep::Decision);
+        assert_eq!(screen.current_finding(), Some(original));
     }
 
     #[test]

@@ -2933,22 +2933,15 @@ impl DashboardService {
     /// opencode call and parse its findings. Test files get the dedicated
     /// test-quality prompt profile; everything else the source profile. The
     /// AI only reads and emits structured text — `--agent plan` disables
-    /// every write tool. When
-    /// `feedback` is set the user chose "Other" on a finding: the previous
-    /// finding + their feedback are threaded back in so the model revises
-    /// exactly one finding rather than re-scanning.
+    /// every write tool.
     pub async fn scan_review_file(
         &self,
         worktree_path: &str,
         file: &ReviewFile,
         context: &ReviewContext,
-        feedback: Option<&str>,
-        previous_finding: Option<&str>,
     ) -> ReviewScanAttempt {
         let started = Instant::now();
-        let scan = if feedback.is_some() {
-            format!("revision:{}", file.path)
-        } else if is_test_file(&file.path) {
+        let scan = if is_test_file(&file.path) {
             format!("tester:{}", file.path)
         } else {
             format!("app:{}", file.path)
@@ -2966,8 +2959,49 @@ impl DashboardService {
             );
         }
         let tables_path = materialize_review_tables().await;
-        let prompt =
-            build_review_scan_prompt(file, context, &tables_path, feedback, previous_finding);
+        let prompt = build_review_scan_prompt(file, context, &tables_path);
+        self.execute_review_file_prompt(cwd, file, scan, started, prompt, model)
+            .await
+    }
+
+    /// Revise one existing finding with the dedicated focused prompt. This
+    /// keeps the walkthrough's "Other" call independent of merged/split scan
+    /// routing and never asks the model to judge unrelated hunks again.
+    pub async fn revise_review_finding(
+        &self,
+        worktree_path: &str,
+        file: &ReviewFile,
+        finding: &ReviewFinding,
+        feedback: &str,
+    ) -> ReviewScanAttempt {
+        let started = Instant::now();
+        let scan = format!("revision:{}", file.path);
+        let cwd = PathBuf::from(worktree_path);
+        let model = self.config.ai.review.model.trim().to_string();
+        if model.is_empty() {
+            return review_scan_attempt(
+                scan,
+                0,
+                started,
+                None,
+                Err(WisetreeError::other("ai.review model is not configured.")),
+                None,
+            );
+        }
+        let prompt = build_review_revision_prompt(file, finding, feedback);
+        self.execute_review_file_prompt(cwd, file, scan, started, prompt, model)
+            .await
+    }
+
+    async fn execute_review_file_prompt(
+        &self,
+        cwd: PathBuf,
+        file: &ReviewFile,
+        scan: String,
+        started: Instant,
+        prompt: String,
+        model: String,
+    ) -> ReviewScanAttempt {
         let prompt_bytes = prompt.len();
         let title = review_scan_title();
         let mut run_args: Vec<String> = vec![
@@ -6837,19 +6871,13 @@ fn review_output_contract(prompt: &str) -> &str {
     tail[..end].trim_end()
 }
 
-/// Render the per-file scan (or revision) prompt: `prompts/reviewer_tester.md`
-/// for test files (test-quality lens), `prompts/reviewer_application.md` for
+/// Render the per-file scan prompt: `prompts/reviewer_tester.md` for test
+/// files (test-quality lens), `prompts/reviewer_application.md` for
 /// application code (every file [`is_test_file`] doesn't classify as a test).
-/// Fixed tokens are substituted first and the user-controlled blocks
-/// last so an earlier placeholder can't be clobbered by a value containing a
-/// later token. `feedback` / `previous_finding` are only present on an
-/// "Other" revision of a single finding.
 fn build_review_scan_prompt(
     file: &ReviewFile,
     context: &ReviewContext,
     tables_path: &str,
-    feedback: Option<&str>,
-    previous_finding: Option<&str>,
 ) -> String {
     const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer_application.md");
     const TESTER_PROMPT: &str = include_str!("../../prompts/reviewer_tester.md");
@@ -6871,14 +6899,82 @@ fn build_review_scan_prompt(
         &[
             ("TABLES_PATH", tables_path),
             ("FILE_PATH", &file.path),
-            ("USER_FEEDBACK", feedback.unwrap_or("(none)")),
-            ("PREVIOUS_FINDING", previous_finding.unwrap_or("(none)")),
             ("REPO_CONTEXT", &context),
             ("EXISTING_COMMENTS", &existing),
             ("FILE_CONTENT", &full_content),
             ("FILE_DIFF", &diff),
         ],
     )
+}
+
+fn build_review_revision_prompt(
+    file: &ReviewFile,
+    finding: &ReviewFinding,
+    feedback: &str,
+) -> String {
+    const REVISION_PROMPT: &str = include_str!("../../prompts/reviewer_revise.md");
+    const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer_application.md");
+    let contract = review_output_contract(SOURCE_PROMPT);
+    let full_content = review_file_content_for_prompt(file);
+    let focused_diff = focused_review_diff(file, finding.line);
+    let previous_finding = finding.rendered_for_revision();
+    substitute_review_prompt(
+        REVISION_PROMPT,
+        &[
+            ("OUTPUT_CONTRACT", contract),
+            ("FILE_PATH", &file.path),
+            ("FILE_CONTENT", &full_content),
+            ("FOCUSED_DIFF", &focused_diff),
+            ("PREVIOUS_FINDING", &previous_finding),
+            ("USER_FEEDBACK", feedback),
+        ],
+    )
+}
+
+fn focused_review_diff(file: &ReviewFile, anchor: Option<u64>) -> String {
+    const CONTEXT_LINES: usize = 20;
+    let Some(anchor) = anchor else {
+        return "(file-level finding — no anchor hunk; read the file if more context is needed)"
+            .to_string();
+    };
+    let lines = file.annotated_diff.lines().collect::<Vec<_>>();
+    let Some(target) = lines
+        .iter()
+        .position(|line| annotated_review_line_number(line) == Some(anchor))
+    else {
+        return format!(
+            "(anchor line {anchor} was not present in the retained diff; read the file if needed)"
+        );
+    };
+    let hunk_start = (0..=target)
+        .rev()
+        .find(|index| lines[*index].starts_with("@@"))
+        .unwrap_or(0);
+    let hunk_end = lines[target + 1..]
+        .iter()
+        .position(|line| line.starts_with("@@"))
+        .map_or(lines.len(), |offset| target + 1 + offset);
+    let hunk_content_start = if lines[hunk_start].starts_with("@@") {
+        hunk_start + 1
+    } else {
+        hunk_start
+    };
+    let context_start = target.saturating_sub(CONTEXT_LINES).max(hunk_content_start);
+    let context_end = (target + CONTEXT_LINES + 1).min(hunk_end);
+    let mut focused = String::new();
+    if lines[hunk_start].starts_with("@@") {
+        focused.push_str(lines[hunk_start]);
+        focused.push('\n');
+    }
+    focused.push_str(&lines[context_start..context_end].join("\n"));
+    focused.trim_end().to_string()
+}
+
+fn annotated_review_line_number(line: &str) -> Option<u64> {
+    if line.starts_with("@@") || line.starts_with("       -") {
+        return None;
+    }
+    line.trim_start().split_once(' ')?.0.parse().ok()
 }
 
 /// Render the whole-diff coverage prompt (`prompts/reviewer_coverage.md`):
@@ -8457,7 +8553,7 @@ copy to src/copied_again.rs
             convention_docs: "#### AGENTS.md\nUse surgical changes.".to_string(),
             directory_inventory: "#### src\n- lib.rs\n- main.rs".to_string(),
         };
-        let prompt = build_review_scan_prompt(&file, &context, "/tmp/tables.md", None, None);
+        let prompt = build_review_scan_prompt(&file, &context, "/tmp/tables.md");
         assert!(prompt.contains("src/lib.rs"));
         assert!(prompt.contains("     1 +let x = 1;"));
         assert!(prompt.contains("- line 1: rename this"));
@@ -8472,8 +8568,6 @@ copy to src/copied_again.rs
             "FILE_DIFF",
             "EXISTING_COMMENTS",
             "TABLES_PATH",
-            "USER_FEEDBACK",
-            "PREVIOUS_FINDING",
             "REPO_CONTEXT",
             "FILE_CONTENT",
         ] {
@@ -8484,37 +8578,101 @@ copy to src/copied_again.rs
         assert!(contract < inputs, "static contract must precede inputs");
         assert!(inputs < prompt.find("src/lib.rs").unwrap());
         assert!(inputs < prompt.find("     1 +let x = 1;").unwrap());
-        // The revision pass threads feedback + the previous finding through.
-        let revised = build_review_scan_prompt(
-            &file,
-            &ReviewContext::default(),
-            "/tmp/t.md",
-            Some("too harsh"),
-            Some("prev"),
-        );
-        assert!(revised.contains("too harsh"));
-        assert!(revised.contains("prev"));
-        let literal = build_review_scan_prompt(
-            &file,
-            &ReviewContext::default(),
-            "/tmp/t.md",
-            Some("keep FILE_DIFF and EXISTING_COMMENTS literal"),
-            Some("keep USER_FEEDBACK literal"),
-        );
-        assert!(literal.contains("keep FILE_DIFF and EXISTING_COMMENTS literal"));
-        assert!(literal.contains("keep USER_FEEDBACK literal"));
+        assert!(!prompt.contains("## Revision mode"));
         let not_inlined = ReviewFile {
             full_content: None,
             ..file
         };
-        let prompt = build_review_scan_prompt(
-            &not_inlined,
-            &ReviewContext::default(),
-            "/tmp/t.md",
-            None,
-            None,
-        );
+        let prompt = build_review_scan_prompt(&not_inlined, &ReviewContext::default(), "/tmp/t.md");
         assert!(prompt.contains("read `src/lib.rs` before emitting any structural finding"));
+    }
+
+    #[test]
+    fn build_review_revision_prompt_is_focused_and_contract_exact() {
+        let first_hunk = (1..=70)
+            .map(|line| format!("{line:>6} +value_{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: format!(
+                "@@ -1,70 +1,70 @@\n{first_hunk}\n@@ -200 +200 @@\n   200 +unrelated_hunk"
+            ),
+            full_content: Some("fn complete_file() {}".to_string()),
+            commentable_lines: (1..=70).chain(std::iter::once(200)).collect(),
+            existing_comments: "- line 35: already raised".to_string(),
+            existing_keys: Vec::new(),
+        };
+        let finding = ReviewFinding {
+            category: "Performance".to_string(),
+            severity: ReviewSeverity::Medium,
+            file: file.path.clone(),
+            start_line: Some(34),
+            line: Some(35),
+            title: "Repeated lookup".to_string(),
+            explanation: "The lookup repeats.".to_string(),
+            suggestion: Some("cached".to_string()),
+        };
+        let prompt = build_review_revision_prompt(
+            &file,
+            &finding,
+            "Soften this and keep FOCUSED_DIFF plus OUTPUT_CONTRACT literal",
+        );
+
+        assert!(prompt.starts_with("You are revising ONE pull-request finding"));
+        assert!(prompt.contains("fn complete_file() {}"));
+        assert!(prompt.contains("Title: Repeated lookup"));
+        assert!(prompt.contains("Soften this and keep FOCUSED_DIFF plus OUTPUT_CONTRACT literal"));
+        assert!(prompt.contains("Anchor: lines 34-35"));
+        assert!(prompt.contains("@@ -1,70 +1,70 @@"));
+        assert!(prompt.contains("    15 +value_15"));
+        assert!(prompt.contains("    55 +value_55"));
+        assert!(!prompt.contains("    14 +value_14"));
+        assert!(!prompt.contains("    56 +value_56"));
+        assert!(!prompt.contains("unrelated_hunk"));
+        assert!(!prompt.contains("already raised"));
+        assert!(!prompt.contains("Repository context prepared once"));
+        assert_eq!(
+            review_output_contract(&prompt),
+            review_output_contract(include_str!("../../prompts/reviewer_application.md"))
+        );
+        assert!(prompt.find("## Output contract").unwrap() < prompt.find("## Inputs").unwrap());
+        for token in [
+            "FILE_PATH",
+            "FILE_CONTENT",
+            "PREVIOUS_FINDING",
+            "USER_FEEDBACK",
+        ] {
+            assert!(!prompt.contains(token), "{token} leaked into the prompt");
+        }
+    }
+
+    #[test]
+    fn focused_review_diff_handles_file_level_and_missing_inline_context() {
+        let file = ReviewFile {
+            path: "large.rs".to_string(),
+            annotated_diff: "@@ -10 +10 @@\n    10 +changed".to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([10]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        assert!(focused_review_diff(&file, None).contains("file-level finding"));
+        assert!(focused_review_diff(&file, Some(10)).contains("    10 +changed"));
+        assert!(focused_review_diff(&file, Some(99)).contains("was not present"));
+        let finding = ReviewFinding {
+            category: "Code Smell".to_string(),
+            severity: ReviewSeverity::Low,
+            file: file.path.clone(),
+            start_line: None,
+            line: None,
+            title: "Broad concern".to_string(),
+            explanation: "Needs context.".to_string(),
+            suggestion: None,
+        };
+        let prompt = build_review_revision_prompt(&file, &finding, "clarify");
+        assert!(prompt.contains("read `large.rs` before emitting any structural finding"));
+        assert!(prompt.contains("file-level finding"));
     }
 
     #[test]
@@ -8828,8 +8986,8 @@ copy to src/copied_again.rs
             convention_docs: "shared convention".to_string(),
             directory_inventory: "shared inventory".to_string(),
         };
-        let source_prompt = build_review_scan_prompt(&source, &context, "/tmp/t.md", None, None);
-        let test_prompt = build_review_scan_prompt(&test, &context, "/tmp/t.md", None, None);
+        let source_prompt = build_review_scan_prompt(&source, &context, "/tmp/t.md");
+        let test_prompt = build_review_scan_prompt(&test, &context, "/tmp/t.md");
         assert!(source_prompt.starts_with("You are reviewing the changed lines of ONE file"));
         assert!(test_prompt.starts_with("You are reviewing the changed lines of ONE test file"));
         assert!(test_prompt.contains("test-quality specialist"));

@@ -2521,8 +2521,8 @@ impl App {
                 let Some(finding) = screen.current_finding() else {
                     return;
                 };
-                // The scanned file is re-rendered into the prompt so the
-                // revision judges the same diff the original scan saw.
+                // The dedicated revision prompt receives only focused context
+                // around this finding, independent of merged/split routing.
                 let Some(file) = screen.file_for(&finding) else {
                     screen.reshow_decision();
                     return;
@@ -2530,8 +2530,7 @@ impl App {
                 let request = ReviewReviseRequest {
                     worktree_path: screen.request().worktree_path.clone(),
                     file,
-                    context: screen.review_context(),
-                    previous_finding: finding.rendered_for_revision(),
+                    finding,
                     feedback,
                     index: screen.current_index(),
                 };
@@ -7531,8 +7530,7 @@ struct ReviewCoverageScanRequest {
 struct ReviewReviseRequest {
     worktree_path: String,
     file: ReviewFile,
-    context: ReviewContext,
-    previous_finding: String,
+    finding: ReviewFinding,
     feedback: String,
     index: usize,
 }
@@ -7603,7 +7601,7 @@ fn kick_off_scan_review_file(
             }
             ReviewScanRetry::Initial | ReviewScanRetry::Full => {
                 service
-                    .scan_review_file(&req.worktree_path, &req.file, &req.context, None, None)
+                    .scan_review_file(&req.worktree_path, &req.file, &req.context)
                     .await
             }
         };
@@ -7710,13 +7708,7 @@ fn kick_off_revise_review_finding(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let attempt = service
-            .scan_review_file(
-                &req.worktree_path,
-                &req.file,
-                &req.context,
-                Some(&req.feedback),
-                Some(&req.previous_finding),
-            )
+            .revise_review_finding(&req.worktree_path, &req.file, &req.finding, &req.feedback)
             .await;
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrRevised {

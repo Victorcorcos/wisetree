@@ -249,18 +249,18 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 
 **Acceptance criteria**:
 
-- [ ] The revision path no longer renders either per-file scan profile or a whole diff.
-- [ ] The dedicated prompt receives the exact output contract, previous finding, user feedback, target path, and the anchored hunk with at most ±20 surrounding lines.
-- [ ] When #6 supplied capped full content it remains available to the revision; repository read access is explicitly retained.
-- [ ] Revision parsing, anchor validation, no-op stripping, walkthrough replacement, and failure fallback remain deterministic and unchanged.
-- [ ] Tests cover single-line/range/file-level anchors, hunk boundaries, full-content presence/absence, placeholder substitution, and revision failure returning to the existing finding.
-- [ ] The full format/lint/test gate passes and the improvement is committed alone with its #11 Status line.
+- [x] The revision path no longer renders either per-file scan profile or a whole diff.
+- [x] The dedicated prompt receives the exact output contract, previous finding, user feedback, target path, and the anchored hunk with at most ±20 surrounding lines.
+- [x] When #6 supplied capped full content it remains available to the revision; repository read access is explicitly retained.
+- [x] Revision parsing, anchor validation, no-op stripping, walkthrough replacement, and failure fallback remain deterministic and unchanged.
+- [x] Tests cover single-line/range/file-level anchors, hunk boundaries, full-content presence/absence, placeholder substitution, and revision failure returning to the existing finding.
+- [x] The full format/lint/test gate passes and the improvement is committed alone with its #11 Status line.
 
 **Edge cases**:
 
-- [ ] Missing or invalid anchors use a conservative local context without including unrelated hunks.
-- [ ] Feedback containing prompt marker text cannot corrupt the static output contract or substitution order.
-- [ ] A revision never introduces extra findings or changes the coverage-owner count.
+- [x] Missing or invalid anchors use a conservative local context without including unrelated hunks.
+- [x] Feedback containing prompt marker text cannot corrupt the static output contract or substitution order.
+- [x] A revision never introduces extra findings or changes the coverage-owner count.
 
 ---
 
@@ -276,8 +276,8 @@ The scope is epic-sized and should be split. The specification's eleven sequenti
 | 6 | Inline capped full-file content | ✅ Done |
 | 7 | Feed test-quality findings to coverage | ✅ Done |
 | 8 | Slim test diffs to scenario skeletons | ✅ Done |
-| 9 | Compact existing-comment keys | ⬚ Pending |
-| 10 | Expand deterministic skip rules | ⬚ Pending |
-| 11 | Focus the “Other” revision call | ⬚ Pending |
+| 9 | Compact existing-comment keys | ✅ Done |
+| 10 | Expand deterministic skip rules | ✅ Done |
+| 11 | Focus the “Other” revision call | ✅ Done |
 
 Improvement #12 is excluded from this plan. Its go/no-go decision requires production telemetry that cannot be established in this implementation session.
