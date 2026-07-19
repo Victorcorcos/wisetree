@@ -3529,12 +3529,15 @@ impl DashboardService {
     /// Build the spawn parameters for one live implement run. `sections`
     /// holds only the section block(s) this run must build — one section on
     /// a Ralph Loop, all pending sections otherwise — so no tokens are spent
-    /// re-reading the rest of the plan.
+    /// re-reading the rest of the plan; `outline` is the one-line-per-section
+    /// roadmap (names + statuses, never bodies) that keeps the run in its
+    /// lane.
     pub fn prepare_develop_implement(
         &self,
         worktree_path: &str,
         task_description: &str,
         sections: &str,
+        outline: &str,
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.develop.implement;
         let model = slot.model.trim().to_string();
@@ -3547,7 +3550,7 @@ impl DashboardService {
             return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let cwd = PathBuf::from(worktree_path);
-        let prompt = build_develop_implement_prompt(task_description, sections);
+        let prompt = build_develop_implement_prompt(task_description, sections, outline);
         // The opencode TUI takes no `--variant`; it honors reasoning effort
         // solely via the persisted `model.json`, so seed it before spawning.
         seed_opencode_tui_variant(&model, &slot.thinking);
@@ -5814,13 +5817,21 @@ fn build_develop_plan_prompt(
 
 /// Render `prompts/develop_implement.md` for one live implement run. Only
 /// the section block(s) the run must build go in — never the whole plan
-/// file (token-efficiency invariant).
-fn build_develop_implement_prompt(task_description: &str, sections: &str) -> String {
+/// file (token-efficiency invariant) — plus the compact outline so the run
+/// knows what belongs to other sections.
+fn build_develop_implement_prompt(task_description: &str, sections: &str, outline: &str) -> String {
     const PROMPT: &str = include_str!("../../prompts/develop_implement.md");
     PROMPT
         .replace(
             "TASK_DESCRIPTION",
             &truncate_bugkill_field(task_description, DEVELOP_TASK_MAX_BYTES),
+        )
+        // `PLAN_OUTLINE` before `SECTIONS`: the outline placeholder contains
+        // the word SECTIONS nowhere, but replacing the more specific token
+        // first keeps the templating order-independent regardless.
+        .replace(
+            "PLAN_OUTLINE",
+            &truncate_bugkill_field(outline, DEVELOP_FEEDBACK_MAX_BYTES),
         )
         .replace(
             "SECTIONS",

@@ -8,6 +8,12 @@ You are implementing part of an approved development plan in the current working
 TASK_DESCRIPTION
 ```
 
+- The plan outline — one line per section so you know where your work sits. `done` = already implemented (its code is in the worktree), `THIS RUN` = yours now, `later` = owned by a future run:
+
+```
+PLAN_OUTLINE
+```
+
 - The section(s) YOU must implement now:
 
 ```
@@ -20,7 +26,7 @@ SECTIONS
 2. Implement the smallest change that satisfies every acceptance criterion. Follow the surrounding conventions (naming, style, imports, error handling).
 3. Cover the edge cases the section lists.
 4. Write or update tests for the behavior each section introduces, and run them. If they fail, diagnose and fix before stopping.
-5. No unrelated refactors, no "while I'm here" fixes, no work from sections not listed above.
+5. No unrelated refactors, no "while I'm here" fixes, no work from sections not listed above. Anything marked `later` in the outline belongs to a future run — leave it alone even if the code looks incomplete without it; a `done` section's behavior may be relied on but not reworked.
 
 ## Forbidden
 

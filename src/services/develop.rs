@@ -430,6 +430,30 @@ pub fn render_sections_for_prompt(sections: &[&PlanSection]) -> String {
     out.trim_end().to_string()
 }
 
+/// The whole-plan roadmap embedded in every implement prompt: one line per
+/// section (number, name, status), never the bodies — ~a dozen tokens each.
+/// Gives a run the overview it needs to stay in its lane: `done` work is
+/// already in the code, `THIS RUN` is its job, `later` belongs to a future
+/// run and must be left alone. `current` is the Ralph Loop target (`None` =
+/// a single run building every pending section).
+pub fn render_plan_outline(plan: &DevelopPlan, current: Option<usize>) -> String {
+    let mut out = String::new();
+    for (idx, section) in plan.sections.iter().enumerate() {
+        let status = if section.done {
+            "done"
+        } else if current.map_or(true, |c| c == idx) {
+            "THIS RUN"
+        } else {
+            "later"
+        };
+        out.push_str(&format!(
+            "{}. {} — {status}\n",
+            section.number, section.name
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +694,27 @@ body";
         assert_eq!(reparsed.complexity, plan.complexity);
         assert_eq!(reparsed.sections.len(), plan.sections.len());
         assert_eq!(reparsed.sections[0].name, "Data model");
+    }
+
+    #[test]
+    fn plan_outline_marks_done_this_run_and_later() {
+        let mut plan = plan();
+        plan.mark_done(0);
+        // Ralph Loop: section 2 is the target; section 3 stays "later".
+        let outline = render_plan_outline(&plan, Some(1));
+        assert_eq!(
+            outline,
+            "1. Data model — done\n2. Exporter — THIS RUN\n3. CLI flag — later"
+        );
+        // Single run: every pending section is "THIS RUN".
+        let outline = render_plan_outline(&plan, None);
+        assert_eq!(
+            outline,
+            "1. Data model — done\n2. Exporter — THIS RUN\n3. CLI flag — THIS RUN"
+        );
+        // The outline never leaks section bodies.
+        assert!(!outline.contains("Goal"));
+        assert!(!outline.contains("criterion"));
     }
 
     #[test]

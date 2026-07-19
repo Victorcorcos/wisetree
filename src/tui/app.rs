@@ -3799,16 +3799,20 @@ impl App {
         };
         let section = screen.ralph().then_some(next);
         let sections_block = screen.sections_for_run(section);
+        let outline = screen.outline_for_run(section);
         let worktree_path = screen.request().worktree_path.clone();
         let description = screen.task_description().to_string();
         screen.start_working("Preparing the implementation...");
         kick_off_develop_prepare_implement(
             self.git_root.clone(),
             self.current_dashboard_config(),
-            worktree_path,
-            description,
-            sections_block,
-            section,
+            DevelopPrepareImplementRequest {
+                worktree_path,
+                task_description: description,
+                sections: sections_block,
+                outline,
+                section,
+            },
             tx.clone(),
         );
     }
@@ -8475,15 +8479,23 @@ fn kick_off_develop_prepare_plan(
     });
 }
 
-fn kick_off_develop_prepare_implement(
-    git_root: Option<String>,
-    config: DashboardConfig,
+/// Inputs for one implement run: the target section's block(s) plus the
+/// compact whole-plan outline that keeps the run in its lane.
+struct DevelopPrepareImplementRequest {
     worktree_path: String,
     task_description: String,
     sections: String,
+    outline: String,
     section: Option<usize>,
+}
+
+fn kick_off_develop_prepare_implement(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: DevelopPrepareImplementRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let section = req.section;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::DevelopImplementReady {
             section,
@@ -8494,7 +8506,12 @@ fn kick_off_develop_prepare_implement(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let result = service
-            .prepare_develop_implement(&worktree_path, &task_description, &sections)
+            .prepare_develop_implement(
+                &req.worktree_path,
+                &req.task_description,
+                &req.sections,
+                &req.outline,
+            )
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopImplementReady { section, result });

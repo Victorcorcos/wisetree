@@ -42,7 +42,9 @@ use ratatui::Frame;
 
 use crate::config::schema::AiDevelopConfig;
 use crate::messages::colors;
-use crate::services::develop::{render_plan_md, render_sections_for_prompt, DevelopPlan};
+use crate::services::develop::{
+    render_plan_md, render_plan_outline, render_sections_for_prompt, DevelopPlan,
+};
 use crate::tui::screens::dashboard::DevelopRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
@@ -265,6 +267,14 @@ impl DevelopPullRequestScreen {
             None => plan.sections.iter().filter(|s| !s.done).collect(),
         };
         render_sections_for_prompt(&sections)
+    }
+    /// The compact roadmap for the next implement run: every section's
+    /// number, name, and status (done / THIS RUN / later) — never bodies.
+    pub fn outline_for_run(&self, section: Option<usize>) -> String {
+        self.plan
+            .as_ref()
+            .map(|plan| render_plan_outline(plan, section))
+            .unwrap_or_default()
     }
     /// Expanded steps want the whole bottom region; Working / ResumePrompt
     /// render in a sized panel.
@@ -2263,10 +2273,13 @@ mod tests {
             dump.contains("Implementing section 1/2 — Data model..."),
             "{dump}"
         );
-        // The run's prompt block holds only its section.
+        // The run's prompt block holds only its section; the outline names
+        // every section (no bodies) with its status.
         let block = s.sections_for_run(Some(0));
         assert!(block.contains("### Section 1 — Data model"), "{block}");
         assert!(!block.contains("CLI flag"), "{block}");
+        let outline = s.outline_for_run(Some(0));
+        assert_eq!(outline, "1. Data model — THIS RUN\n2. CLI flag — later");
         s.mark_run_done();
         assert!(s.plan().unwrap().sections[0].done);
         assert_eq!(s.next_pending(), Some(1));
