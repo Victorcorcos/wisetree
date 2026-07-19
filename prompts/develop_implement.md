@@ -20,13 +20,26 @@ PLAN_OUTLINE
 SECTIONS
 ```
 
+- The check the harness runs after you stop (your work must make it pass):
+
+```
+CHECK_COMMAND
+```
+
+- The output of that check from your previous attempt, if it just failed (empty on a first attempt). Fix exactly what it reports:
+
+```
+CHECK_FAILURE
+```
+
 ## What to do
 
 1. Read the files each section names in full — context outside the changed lines matters.
 2. Implement the smallest change that satisfies every acceptance criterion. Follow the surrounding conventions (naming, style, imports, error handling).
 3. Cover the edge cases the section lists.
 4. Write or update tests for the behavior each section introduces, and run them. If they fail, diagnose and fix before stopping.
-5. No unrelated refactors, no "while I'm here" fixes, no work from sections not listed above. Anything marked `later` in the outline belongs to a future run — leave it alone even if the code looks incomplete without it; a `done` section's behavior may be relied on but not reworked.
+5. Before stopping, make sure the check command above passes for your work — that is the gate the harness enforces. When a previous check failure is shown, your job this run is to resolve exactly those failures.
+6. No unrelated refactors, no "while I'm here" fixes, no work from sections not listed above. Anything marked `later` in the outline belongs to a future run — leave it alone even if the code looks incomplete without it; a `done` section's behavior may be relied on but not reworked.
 
 ## Forbidden
 

@@ -112,6 +112,17 @@ const BUGKILL_FIELD_MAX_BYTES: usize = 8_000;
 const DEVELOP_TASK_MAX_BYTES: usize = 16_000;
 const DEVELOP_FEEDBACK_MAX_BYTES: usize = 8_000;
 const DEVELOP_PLAN_MAX_BYTES: usize = 48_000;
+/// How long the post-section check command may run before it is killed and
+/// reported as a failure. A full test suite is slower than a git op, so this
+/// gets a generous leash.
+const DEVELOP_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Bytes of the check command's combined output kept (the tail) for the UI
+/// and the corrective prompt — the failing assertions are near the end.
+const DEVELOP_CHECK_OUTPUT_MAX_BYTES: usize = 12_000;
+/// The harness-owned plan file, always excluded from a section commit — like
+/// Bugkill's `BUG_INVESTIGATION.md`, it is output for the human, not part of
+/// the delivered change.
+const DEVELOP_PLAN_FILE: &str = "PLAN.md";
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -1036,6 +1047,15 @@ pub enum DevelopPreflightOutcome {
     AiNotConfigured,
     /// `opencode` is not on PATH.
     AiUnavailable,
+}
+
+/// Result of running the configured post-section check command (Ralph-canon
+/// backpressure). `Failed` carries the captured output tail so the UI can
+/// show it and the corrective run can embed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevelopCheckOutcome {
+    Passed,
+    Failed { output: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3538,6 +3558,7 @@ impl DashboardService {
         task_description: &str,
         sections: &str,
         outline: &str,
+        check_failure: Option<&str>,
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.develop.implement;
         let model = slot.model.trim().to_string();
@@ -3550,7 +3571,13 @@ impl DashboardService {
             return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let cwd = PathBuf::from(worktree_path);
-        let prompt = build_develop_implement_prompt(task_description, sections, outline);
+        let prompt = build_develop_implement_prompt(
+            task_description,
+            sections,
+            outline,
+            self.config.develop.check_command.trim(),
+            check_failure,
+        );
         // The opencode TUI takes no `--variant`; it honors reasoning effort
         // solely via the persisted `model.json`, so seed it before spawning.
         seed_opencode_tui_variant(&model, &slot.thinking);
@@ -3566,6 +3593,90 @@ impl DashboardService {
             opencode_args,
             cwd,
         })
+    }
+
+    /// Run the configured check command (Ralph-canon backpressure) in the
+    /// worktree, deterministically — no AI. The command is run through the
+    /// user's login shell so their PATH / toolchain shims resolve exactly as
+    /// in a real terminal; stdout and stderr are merged (test runners split
+    /// across both) and the tail is kept. A non-zero exit or a timeout is a
+    /// `Failed`; the caller decides what to do with it (never the harness
+    /// silently). Assumes a non-blank command — the pipeline skips the check
+    /// entirely when `develop.checkCommand` is empty, so this is never called
+    /// with nothing to run.
+    pub async fn develop_run_check(&self, worktree_path: &str) -> DevelopCheckOutcome {
+        let command = self.config.develop.check_command.trim().to_string();
+        let cwd = PathBuf::from(worktree_path);
+        let (shell, args) = login_shell_check_command(&command);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = time::timeout(
+            DEVELOP_CHECK_TIMEOUT,
+            run_command_combined(&shell, &arg_refs, Some(&cwd)),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => DevelopCheckOutcome::Passed,
+            Ok(Err(output)) => DevelopCheckOutcome::Failed {
+                output: clip_output_tail(&output, DEVELOP_CHECK_OUTPUT_MAX_BYTES),
+            },
+            Err(_) => DevelopCheckOutcome::Failed {
+                output: format!("`{command}` timed out after 10 minutes."),
+            },
+        }
+    }
+
+    /// Commit one finished section — the harness, never the AI — as a
+    /// Ralph-canon checkpoint. Stages everything **except** the harness-owned
+    /// `PLAN.md` (`git add -A -- . ':(exclude)PLAN.md'`), then commits with
+    /// `subject` (build it with [`develop_commit_subject`]). Returns the new
+    /// sha, or `Ok(None)` when there was nothing to commit (the run made no
+    /// change, or touched only `PLAN.md`) so the caller records no checkpoint
+    /// rather than erroring.
+    pub async fn develop_commit_section(
+        &self,
+        worktree_path: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
+        let cwd = PathBuf::from(worktree_path);
+        // Stage all tracked + untracked changes but the plan file. The
+        // pathspec `:(exclude)PLAN.md` drops it wherever it sits.
+        let exclude_plan = format!(":(exclude){DEVELOP_PLAN_FILE}");
+        self.develop_git(&cwd, &["add", "-A", "--", ".", &exclude_plan])
+            .await
+            .map_err(WisetreeError::other)?;
+        // Nothing staged (empty diff, or only PLAN.md changed) → no commit.
+        if self
+            .develop_git(&cwd, &["diff", "--cached", "--quiet"])
+            .await
+            .is_ok()
+        {
+            return Ok(None);
+        }
+        self.develop_git(&cwd, &["commit", "-m", subject])
+            .await
+            .map_err(|err| {
+                WisetreeError::other(if err.trim().is_empty() {
+                    "git commit failed after staging the section.".to_string()
+                } else {
+                    err
+                })
+            })?;
+        let sha = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+        Ok(Some(sha.trim().to_string()))
+    }
+
+    /// Run one git command inside `cwd` under the Develop check timeout,
+    /// mirroring [`Self::bugkill_git`].
+    async fn develop_git(&self, cwd: &Path, args: &[&str]) -> std::result::Result<String, String> {
+        let subcommand = args.first().copied().unwrap_or("command");
+        time::timeout(
+            BUGKILL_GIT_TIMEOUT,
+            run_command(&self.git_binary, args, Some(cwd)),
+        )
+        .await
+        .unwrap_or_else(|_| Err(format!("git {subcommand} timed out")))
     }
 
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
@@ -5818,9 +5929,23 @@ fn build_develop_plan_prompt(
 /// Render `prompts/develop_implement.md` for one live implement run. Only
 /// the section block(s) the run must build go in — never the whole plan
 /// file (token-efficiency invariant) — plus the compact outline so the run
-/// knows what belongs to other sections.
-fn build_develop_implement_prompt(task_description: &str, sections: &str, outline: &str) -> String {
+/// knows what belongs to other sections. `check_command` is the check the
+/// harness runs after the run (blank = none); `check_failure` is the
+/// captured output from the previous run's failed check on a corrective
+/// retry (empty on a first attempt).
+fn build_develop_implement_prompt(
+    task_description: &str,
+    sections: &str,
+    outline: &str,
+    check_command: &str,
+    check_failure: Option<&str>,
+) -> String {
     const PROMPT: &str = include_str!("../../prompts/develop_implement.md");
+    let check_command = if check_command.is_empty() {
+        "(no automated check configured — rely on the acceptance criteria)".to_string()
+    } else {
+        check_command.to_string()
+    };
     PROMPT
         .replace(
             "TASK_DESCRIPTION",
@@ -5834,9 +5959,103 @@ fn build_develop_implement_prompt(task_description: &str, sections: &str, outlin
             &truncate_bugkill_field(outline, DEVELOP_FEEDBACK_MAX_BYTES),
         )
         .replace(
+            "CHECK_COMMAND",
+            &truncate_bugkill_field(&check_command, DEVELOP_FEEDBACK_MAX_BYTES),
+        )
+        .replace(
+            "CHECK_FAILURE",
+            &truncate_bugkill_field(check_failure.unwrap_or(""), DEVELOP_PLAN_MAX_BYTES),
+        )
+        .replace(
             "SECTIONS",
             &truncate_bugkill_field(sections, DEVELOP_PLAN_MAX_BYTES),
         )
+}
+
+/// Build a section-commit subject. Ralph mode passes the section's
+/// `Some((number, name))` → `develop: section N — <name>`; single-run mode
+/// passes `None` → `develop: implement plan`. The name's first line is
+/// clipped to 60 chars so the subject stays one tidy line.
+pub fn develop_commit_subject(section: Option<(usize, &str)>) -> String {
+    match section {
+        Some((number, name)) => {
+            let first = name.lines().next().unwrap_or("").trim();
+            let clipped: String = if first.chars().count() <= 60 {
+                first.to_string()
+            } else {
+                let head: String = first.chars().take(60).collect();
+                format!("{head}…")
+            };
+            format!("develop: section {number} — {clipped}")
+        }
+        None => "develop: implement plan".to_string(),
+    }
+}
+
+/// Keep the last `max_bytes` of `text` on a char boundary, prefixing `…`
+/// when clipped. Used for the check-command output tail (failures cluster at
+/// the end of a test run).
+fn clip_output_tail(text: &str, max_bytes: usize) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.len() <= max_bytes {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len() - max_bytes;
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &trimmed[start..])
+}
+
+/// Build the `(shell, args)` that run `command` through the user's login
+/// shell so their PATH / toolchain shims resolve as in a real terminal.
+/// Mirrors `files::service`'s post-create runner: `-l` for shells that
+/// support it, then `-c <command>`. No `-i` — there is no PTY.
+fn login_shell_check_command(command: &str) -> (PathBuf, Vec<String>) {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sh")
+        .trim_start_matches('-');
+    let mut args = Vec::new();
+    if matches!(
+        shell_name,
+        "bash" | "zsh" | "fish" | "ksh" | "ksh93" | "mksh" | "tcsh" | "csh"
+    ) {
+        args.push("-l".to_string());
+    }
+    args.push("-c".to_string());
+    args.push(command.to_string());
+    (PathBuf::from(shell), args)
+}
+
+/// Like [`run_command_once`] but merges stdout+stderr and returns `Ok(())`
+/// on a zero exit or `Err(combined_output)` otherwise — the shape the check
+/// runner needs (a test runner writes results to both streams, and success
+/// carries no message).
+async fn run_command_combined(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> std::result::Result<(), String> {
+    let mut cmd = Command::new(binary);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let output = cmd.output().await.map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        Err(combined)
+    }
 }
 
 /// Hash every untracked file (excluding `BUG_INVESTIGATION.md`) so a later
@@ -10013,5 +10232,134 @@ so the intent reads clearly.
     fn pr_url_from_output_finds_last_url_line() {
         let out = "Warning: 3 uncommitted changes\nhttps://github.com/o/r/pull/9";
         assert_eq!(pr_url_from_output(out), "https://github.com/o/r/pull/9");
+    }
+
+    // ── Develop: check command + section commit ─────────────────────────
+
+    /// A config whose only non-default is the Develop check command.
+    fn develop_config(check_command: &str) -> DashboardConfig {
+        let mut config = DashboardConfig::default();
+        config.develop.check_command = check_command.to_string();
+        config
+    }
+
+    /// A committed git repo with identity set, ready for section commits.
+    fn develop_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("work");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        std::fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        (tmp, repo)
+    }
+
+    #[tokio::test]
+    async fn develop_run_check_passes_and_captures_failures() {
+        let (_tmp, repo) = develop_repo();
+        let repo_str = repo.to_str().unwrap();
+
+        let ok = DashboardService::new(repo.clone(), develop_config("exit 0"));
+        assert_eq!(
+            ok.develop_run_check(repo_str).await,
+            DevelopCheckOutcome::Passed
+        );
+
+        // A failing check surfaces its combined stdout+stderr tail.
+        let bad = DashboardService::new(
+            repo.clone(),
+            develop_config("echo boom-out; echo boom-err 1>&2; exit 1"),
+        );
+        match bad.develop_run_check(repo_str).await {
+            DevelopCheckOutcome::Failed { output } => {
+                assert!(output.contains("boom-out"), "{output}");
+                assert!(output.contains("boom-err"), "{output}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_commits_everything_but_plan_md() {
+        let (_tmp, repo) = develop_repo();
+        let repo_str = repo.to_str().unwrap();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default());
+
+        // A source change plus a harness-owned PLAN.md write.
+        std::fs::write(repo.join("src.txt"), "impl").unwrap();
+        std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
+
+        let sha = service
+            .develop_commit_section(repo_str, &develop_commit_subject(Some((2, "Exporter"))))
+            .await
+            .expect("commit ok")
+            .expect("a commit was made");
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%s"]),
+            "develop: section 2 — Exporter"
+        );
+        // src.txt is committed; PLAN.md stays uncommitted (still dirty).
+        assert!(git(&repo, &["ls-files", "src.txt"]).contains("src.txt"));
+        assert!(git(&repo, &["ls-files", "PLAN.md"]).is_empty());
+        assert!(git(&repo, &["status", "--porcelain"]).contains("PLAN.md"));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_no_op_when_only_plan_changed() {
+        let (_tmp, repo) = develop_repo();
+        let repo_str = repo.to_str().unwrap();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default());
+
+        // Only the harness-owned plan file changed → nothing to checkpoint.
+        std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
+        let sha = service
+            .develop_commit_section(repo_str, &develop_commit_subject(Some((1, "Data model"))))
+            .await
+            .expect("commit ok");
+        assert_eq!(sha, None);
+        // No new commit was created.
+        assert_eq!(git(&repo, &["log", "-1", "--format=%s"]), "seed");
+    }
+
+    #[test]
+    fn develop_commit_subject_ralph_and_single_run() {
+        assert_eq!(
+            develop_commit_subject(Some((3, "CLI flag"))),
+            "develop: section 3 — CLI flag"
+        );
+        assert_eq!(develop_commit_subject(None), "develop: implement plan");
+        // Long names are clipped to keep the subject one tidy line.
+        let long = "x".repeat(80);
+        let subject = develop_commit_subject(Some((1, &long)));
+        assert!(subject.ends_with('…'), "{subject}");
+    }
+
+    #[test]
+    fn implement_prompt_templates_check_command_and_failure() {
+        let with_check = build_develop_implement_prompt(
+            "task",
+            "### Section 1 — A",
+            "1. A — THIS RUN",
+            "cargo test --all",
+            Some("assertion failed: left == right"),
+        );
+        assert!(with_check.contains("cargo test --all"), "{with_check}");
+        assert!(
+            with_check.contains("assertion failed: left == right"),
+            "{with_check}"
+        );
+
+        // No check configured → a clear placeholder, no empty CHECK_COMMAND.
+        let no_check = build_develop_implement_prompt("task", "s", "o", "", None);
+        assert!(
+            no_check.contains("no automated check configured"),
+            "{no_check}"
+        );
+        assert!(!no_check.contains("CHECK_COMMAND"), "{no_check}");
+        assert!(!no_check.contains("CHECK_FAILURE"), "{no_check}");
     }
 }

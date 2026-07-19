@@ -22,19 +22,19 @@ pub use bugkill::{
     ParsedInvestigation,
 };
 pub use dashboard::{
-    build_review_summary, default_dashboard_warning, is_behind, parse_pull_request_md,
-    resolve_base_ref, resolve_dashboard_columns, split_duplicate_findings, BugkillPreflight,
-    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillUnverdicted, CheckStatus,
-    CommentGroup, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow,
-    DashboardService, DashboardUpdate, DashboardWatch, DevelopPreflight, DevelopPreflightOutcome,
-    DevelopResumeState, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest,
-    FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, MergeStatus, PrState,
-    PullRequest, PullRequestDetails, ReviewComment, ReviewFile, ReviewFinding, ReviewPreparation,
-    ReviewSeverity, ReviewSkippedFile, ReviewStatus, ReviewerSummary, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
-    PR_REFRESH_PERIOD_MS,
+    build_review_summary, default_dashboard_warning, develop_commit_subject, is_behind,
+    parse_pull_request_md, resolve_base_ref, resolve_dashboard_columns, split_duplicate_findings,
+    BugkillPreflight, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
+    BugkillUnverdicted, CheckStatus, CommentGroup, CommitSummary, DashboardNotice,
+    DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
+    DevelopCheckOutcome, DevelopPreflight, DevelopPreflightOutcome, DevelopResumeState,
+    EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
+    FixPlan, FixPreparation, FixVerdict, MergeStatus, PrState, PullRequest, PullRequestDetails,
+    ReviewComment, ReviewFile, ReviewFinding, ReviewPreparation, ReviewSeverity, ReviewSkippedFile,
+    ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
+    UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };
-pub use develop::{parse_plan_transcript, DevelopPlan, PlanSection};
+pub use develop::{parse_plan_transcript, summarize_transcript, DevelopPlan, PlanSection};
 pub use opencode_models::{
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,
 };

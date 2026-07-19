@@ -228,6 +228,7 @@ fn dashboard_config_round_trips_json() {
             columns: vec!["status".into(), "branch".into(), "pull_request".into()],
             ai: Default::default(),
             ai_status: Default::default(),
+            develop: Default::default(),
             legacy_notifications: None,
         },
         notifications: NotificationsConfig {

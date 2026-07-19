@@ -40,6 +40,11 @@ pub struct DevelopPlan {
     /// Fibonacci-style complexity estimate in points.
     pub complexity: u8,
     pub sections: Vec<PlanSection>,
+    /// Cross-run learnings ledger — the Ralph-canon `fix_plan.md` discovery
+    /// log. Each implement run's closing summary is appended here by the
+    /// harness (never by the AI), so later runs and the human see what each
+    /// section reported. Rendered as `## Section Notes`; omitted when empty.
+    pub notes: Vec<String>,
 }
 
 impl DevelopPlan {
@@ -59,6 +64,18 @@ impl DevelopPlan {
             section.done = true;
             section.body = section.body.replace("- [ ]", "- [x]");
         }
+    }
+
+    /// Append one run's closing summary to the notes ledger under `label`
+    /// (e.g. `Section 2` in Ralph mode, `All sections` for a single run), so
+    /// the log reads as a per-run history. Blank summaries are dropped
+    /// (nothing worth recording).
+    pub fn push_note(&mut self, label: &str, summary: &str) {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return;
+        }
+        self.notes.push(format!("{label}: {summary}"));
     }
 }
 
@@ -118,6 +135,7 @@ pub fn parse_plan_transcript(transcript: &str) -> Option<DevelopPlan> {
         task_description,
         complexity,
         sections,
+        notes: Vec::new(),
     })
 }
 
@@ -207,6 +225,7 @@ fn checkbox_lines(field: &str) -> String {
 const TASK_HEADING: &str = "## Task Description";
 const SECTIONS_HEADING: &str = "## Implementation Sections";
 const TRACKER_HEADING: &str = "## Progress Tracker";
+const NOTES_HEADING: &str = "## Section Notes";
 const DONE_SUFFIX: &str = " ✅";
 
 /// Render the whole `PLAN.md` from the in-memory model. The harness rewrites
@@ -239,6 +258,12 @@ pub fn render_plan_md(plan: &DevelopPlan) -> String {
             "| {} | {} | {status} |\n",
             section.number, section.name
         ));
+    }
+    if !plan.notes.is_empty() {
+        out.push_str(&format!("\n{NOTES_HEADING}\n\n"));
+        for note in &plan.notes {
+            out.push_str(&format!("- {note}\n"));
+        }
     }
     out
 }
@@ -311,10 +336,26 @@ pub fn parse_plan_md(content: &str) -> Option<DevelopPlan> {
     if sections.is_empty() {
         return None;
     }
+
+    // Section Notes: an optional `## Section Notes` list after the tracker.
+    // Every `- ` bullet under it is one note; a missing heading = no notes.
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(notes_idx) = lines[tracker_idx..]
+        .iter()
+        .position(|l| l.trim() == NOTES_HEADING)
+    {
+        for line in &lines[tracker_idx + notes_idx + 1..] {
+            if let Some(note) = line.trim().strip_prefix("- ") {
+                notes.push(note.trim().to_string());
+            }
+        }
+    }
+
     Some(DevelopPlan {
         task_description,
         complexity,
         sections,
+        notes,
     })
 }
 
@@ -454,6 +495,36 @@ pub fn render_plan_outline(plan: &DevelopPlan, current: Option<usize>) -> String
     out.trim_end().to_string()
 }
 
+// ── Section-notes summarizer ────────────────────────────────────────────
+
+/// Max chars kept from an implement run's closing summary before it lands
+/// in the notes ledger. Keeps `## Section Notes` a scannable one-liner list.
+const NOTE_MAX_CHARS: usize = 200;
+
+/// Distill an implement run's transcript into the one-line summary the
+/// prompt asks for at the end ("state in one short line what you
+/// implemented"). Takes the last non-empty line — that closing line is the
+/// run's own report — collapses internal whitespace, strips a leading
+/// markdown bullet/quote marker, and clips to [`NOTE_MAX_CHARS`]. Returns
+/// `None` when the transcript holds nothing usable, so the caller records
+/// no note rather than an empty one. Zero AI tokens: this is the run's
+/// existing output, not a fresh call.
+pub fn summarize_transcript(transcript: &str) -> Option<String> {
+    let last = transcript.lines().rev().find(|l| !l.trim().is_empty())?;
+    let collapsed = last.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = collapsed
+        .trim_start_matches(['-', '*', '>', '#', ' '])
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.chars().count() <= NOTE_MAX_CHARS {
+        return Some(cleaned.to_string());
+    }
+    let head: String = cleaned.chars().take(NOTE_MAX_CHARS).collect();
+    Some(format!("{head}…"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +551,7 @@ mod tests {
                 section(2, "Exporter", false),
                 section(3, "CLI flag", false),
             ],
+            notes: Vec::new(),
         }
     }
 
@@ -612,6 +684,65 @@ CRITERIA: - c";
         let rendered = render_plan_md(&plan);
         let parsed = parse_plan_md(&rendered).expect("round-trip parses");
         assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn section_notes_render_and_round_trip() {
+        let mut plan = plan();
+        plan.push_note("Section 1", "Added the record type; 3 tests green.");
+        plan.push_note("Section 2", "Wired --csv; reused existing writer.");
+        let rendered = render_plan_md(&plan);
+        assert!(rendered.contains("## Section Notes"), "{rendered}");
+        assert!(
+            rendered.contains("- Section 1: Added the record type; 3 tests green."),
+            "{rendered}"
+        );
+        let parsed = parse_plan_md(&rendered).expect("round-trip parses");
+        assert_eq!(parsed, plan);
+        assert_eq!(parsed.notes.len(), 2);
+    }
+
+    #[test]
+    fn empty_notes_omit_the_heading() {
+        let rendered = render_plan_md(&plan());
+        assert!(!rendered.contains("## Section Notes"), "{rendered}");
+        assert!(parse_plan_md(&rendered).unwrap().notes.is_empty());
+    }
+
+    #[test]
+    fn push_note_prefixes_label_and_drops_blank_summaries() {
+        let mut plan = plan();
+        plan.push_note("Section 2", "  did the thing  ");
+        plan.push_note("Section 3", "   ");
+        plan.push_note("All sections", "one-shot run");
+        assert_eq!(
+            plan.notes,
+            vec![
+                "Section 2: did the thing".to_string(),
+                "All sections: one-shot run".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn summarize_transcript_takes_the_last_meaningful_line() {
+        let transcript = "\
+Reading files...
+Editing src/model.rs
+- Implemented the CSV record type and its serializer; all tests pass.
+";
+        assert_eq!(
+            summarize_transcript(transcript).as_deref(),
+            Some("Implemented the CSV record type and its serializer; all tests pass.")
+        );
+        // Whitespace-only / empty transcripts yield nothing to record.
+        assert_eq!(summarize_transcript("   \n\n"), None);
+        assert_eq!(summarize_transcript(""), None);
+        // Internal whitespace is collapsed and long lines are clipped.
+        let long = format!("done: {}", "x".repeat(400));
+        let summary = summarize_transcript(&long).unwrap();
+        assert!(summary.ends_with('…'));
+        assert!(summary.chars().count() <= NOTE_MAX_CHARS + 1);
     }
 
     #[test]

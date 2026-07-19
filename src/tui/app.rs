@@ -34,12 +34,13 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     build_review_summary, check_for_updates_all_sources, compute_attempt_changes,
-    default_dashboard_warning, detect_shell_integration, fetch_free_opencode_models,
-    fetch_opencode_model_variants, fetch_opencode_models, install_shell_integration,
-    parse_plan_transcript, parse_pull_request_md, resolve_dashboard_columns, AiStatus,
-    AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
-    BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
-    DashboardService, DashboardUpdate, DashboardWatch, DevelopPreflightOutcome, DevelopResumeState,
+    default_dashboard_warning, detect_shell_integration, develop_commit_subject,
+    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
+    install_shell_integration, parse_plan_transcript, parse_pull_request_md,
+    resolve_dashboard_columns, summarize_transcript, AiStatus, AttemptChanges, BugHypothesis,
+    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
+    CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
+    DashboardWatch, DevelopCheckOutcome, DevelopPreflightOutcome, DevelopResumeState,
     EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
     FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult, OpencodeModel,
     OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding, ReviewPreparation,
@@ -270,6 +271,11 @@ enum AppEvent {
     },
     /// Rewriting `PLAN.md` failed (best-effort warning).
     DevelopFileWriteFailed(String),
+    /// The post-section check command finished (Ralph-canon backpressure).
+    DevelopChecked(DevelopCheckOutcome),
+    /// A section checkpoint commit finished. `Ok(Some(sha))` when a commit
+    /// landed, `Ok(None)` when there was nothing to commit.
+    DevelopCommitted(Result<Option<String>, String>),
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
@@ -792,7 +798,14 @@ impl App {
                     match develop_exited {
                         Some((true, DevelopStep::Planning)) => self.on_develop_plan_pty_exited(&tx),
                         Some((true, DevelopStep::Implementing)) => {
-                            self.on_develop_implement_done(&tx)
+                            // opencode exited on its own — read whatever
+                            // transcript the watcher captured for the note.
+                            let transcript = self
+                                .develop_watch
+                                .as_mut()
+                                .and_then(OpencodeTurnWatcher::transcript_now)
+                                .unwrap_or_default();
+                            self.on_develop_implement_done(transcript, &tx)
                         }
                         Some((false, DevelopStep::Planning | DevelopStep::Implementing)) => {
                             if let Some(turn) = self
@@ -3676,8 +3689,12 @@ impl App {
     ) {
         // Lands on the Confirm step immediately; the preflight only runs
         // once the user has confirmed.
-        let ai = self.current_dashboard_config().ai.develop.clone();
-        self.develop_pr = Some(DevelopPullRequestScreen::new(request, ai));
+        let config = self.current_dashboard_config();
+        let ai = config.ai.develop.clone();
+        let check_command = config.develop.check_command.trim().to_string();
+        let mut screen = DevelopPullRequestScreen::new(request, ai);
+        screen.set_check_command((!check_command.is_empty()).then_some(check_command));
+        self.develop_pr = Some(screen);
         self.screen = Screen::DevelopPullRequest;
     }
 
@@ -3749,7 +3766,18 @@ impl App {
                 // `revision()` — replan with that context.
                 self.start_develop_planning(false, tx);
             }
-            DevelopAction::ImplementFinished => self.on_develop_implement_done(tx),
+            DevelopAction::ImplementFinished => {
+                // The user confirmed from the PTY; pull the transcript from
+                // the watcher so the run's summary is still recorded.
+                let transcript = self
+                    .develop_watch
+                    .as_mut()
+                    .and_then(OpencodeTurnWatcher::transcript_now)
+                    .unwrap_or_default();
+                self.on_develop_implement_done(transcript, tx);
+            }
+            DevelopAction::CheckFixWithAi => self.start_develop_implement_run(tx),
+            DevelopAction::CheckMarkDone => self.finalize_develop_section(tx),
             DevelopAction::Done => {
                 self.develop_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
@@ -3800,6 +3828,9 @@ impl App {
         let section = screen.ralph().then_some(next);
         let sections_block = screen.sections_for_run(section);
         let outline = screen.outline_for_run(section);
+        // On a check-fix retry the failing output is still stashed on the
+        // screen; a fresh section run has none.
+        let check_failure = screen.check_failure();
         let worktree_path = screen.request().worktree_path.clone();
         let description = screen.task_description().to_string();
         screen.start_working("Preparing the implementation...");
@@ -3812,6 +3843,7 @@ impl App {
                 sections: sections_block,
                 outline,
                 section,
+                check_failure,
             },
             tx.clone(),
         );
@@ -3826,10 +3858,10 @@ impl App {
             (Some(DevelopStep::Planning), OpencodeTurn::Finished { transcript }) => {
                 self.finish_develop_plan(transcript, tx)
             }
-            // The implement transcript is irrelevant — completion is the
-            // signal; the change is already in the worktree.
-            (Some(DevelopStep::Implementing), OpencodeTurn::Finished { .. }) => {
-                self.on_develop_implement_done(tx)
+            // The implement transcript's closing line becomes the section
+            // note (Ralph-canon learnings ledger) — capture it here.
+            (Some(DevelopStep::Implementing), OpencodeTurn::Finished { transcript }) => {
+                self.on_develop_implement_done(transcript, tx)
             }
             (_, OpencodeTurn::Failed { message }) => {
                 self.develop_watch = None;
@@ -3911,16 +3943,107 @@ impl App {
     }
 
     /// One implement run finished (turn completed, opencode exited, or the
-    /// user confirmed): mark its section(s) ✅ in Rust, rewrite `PLAN.md`,
-    /// then either open the next Ralph Loop run or end the pipeline.
-    fn on_develop_implement_done(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+    /// user confirmed). Capture the run's closing summary for the notes
+    /// ledger, then either run the configured check (Ralph-canon
+    /// backpressure) or finalize the section directly when no check is set.
+    fn on_develop_implement_done(
+        &mut self,
+        transcript: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
         self.develop_watch = None;
         let Some(screen) = self.develop_pr.as_mut() else {
             return;
         };
         screen.kill_pty();
-        screen.mark_run_done();
+        screen.record_run_summary(summarize_transcript(&transcript));
+        if screen.has_check() {
+            let worktree_path = screen.request().worktree_path.clone();
+            screen.start_verifying();
+            kick_off_develop_check(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                worktree_path,
+                tx.clone(),
+            );
+        } else {
+            self.finalize_develop_section(tx);
+        }
+    }
+
+    /// The check finished: pass on failure (CheckFailed prompt) or finalize
+    /// the section on success. A result arriving after the user already
+    /// paused (screen gone, or no longer Verifying) is ignored.
+    fn apply_develop_checked(
+        &mut self,
+        outcome: DevelopCheckOutcome,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        if screen.step() != DevelopStep::Verifying {
+            return;
+        }
+        match outcome {
+            DevelopCheckOutcome::Passed => self.finalize_develop_section(tx),
+            DevelopCheckOutcome::Failed { output } => screen.show_check_failed(output),
+        }
+    }
+
+    /// Accept the current section (check passed or the user overrode it):
+    /// push its note + mark it ✅, rewrite `PLAN.md`, then commit the
+    /// checkpoint (if the toggle is on) or advance straight to the next run.
+    fn finalize_develop_section(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        let commit = screen.commit_sections();
+        let target = screen.finish_section();
         self.rewrite_develop_file(tx);
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        if commit {
+            let subject =
+                develop_commit_subject(target.as_ref().map(|(n, name)| (*n, name.as_str())));
+            let worktree_path = screen.request().worktree_path.clone();
+            screen.start_working("Committing the section...");
+            kick_off_develop_commit(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                worktree_path,
+                subject,
+                tx.clone(),
+            );
+        } else {
+            self.start_develop_implement_run(tx);
+        }
+    }
+
+    /// A section commit finished: count it (Done-page summary) and advance
+    /// to the next run. A commit failure is a non-fatal toast — the section
+    /// is already marked done and its edits remain in the worktree.
+    fn apply_develop_committed(
+        &mut self,
+        result: Result<Option<String>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.develop_pr.is_none() {
+            return;
+        }
+        match result {
+            Ok(Some(_sha)) => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.record_commit();
+                }
+            }
+            Ok(None) => {}
+            Err(message) => self.show_toast(
+                ToastVariant::Warning,
+                format!("Section commit failed: {}", truncate_error(&message)),
+            ),
+        }
         self.start_develop_implement_run(tx);
     }
 
@@ -5573,6 +5696,8 @@ impl App {
                 ToastVariant::Warning,
                 format!("Could not write PLAN.md: {}", truncate_error(&err)),
             ),
+            AppEvent::DevelopChecked(outcome) => self.apply_develop_checked(outcome, tx),
+            AppEvent::DevelopCommitted(result) => self.apply_develop_committed(result, tx),
             AppEvent::BugkillFileWriteFailed(err) => self.show_toast(
                 ToastVariant::Warning,
                 format!("Could not write BUG_INVESTIGATION.md: {err}"),
@@ -8479,14 +8604,16 @@ fn kick_off_develop_prepare_plan(
     });
 }
 
-/// Inputs for one implement run: the target section's block(s) plus the
-/// compact whole-plan outline that keeps the run in its lane.
+/// Inputs for one implement run: the target section's block(s), the compact
+/// whole-plan outline that keeps the run in its lane, and the previous
+/// check-failure output on a corrective retry.
 struct DevelopPrepareImplementRequest {
     worktree_path: String,
     task_description: String,
     sections: String,
     outline: String,
     section: Option<usize>,
+    check_failure: Option<String>,
 }
 
 fn kick_off_develop_prepare_implement(
@@ -8511,10 +8638,58 @@ fn kick_off_develop_prepare_implement(
                 &req.task_description,
                 &req.sections,
                 &req.outline,
+                req.check_failure.as_deref(),
             )
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopImplementReady { section, result });
+    });
+}
+
+/// Run the configured post-section check (Ralph-canon backpressure). A
+/// missing git root reports a `Failed` so the UI shows the CheckFailed
+/// prompt rather than silently passing.
+fn kick_off_develop_check(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopChecked(DevelopCheckOutcome::Failed {
+            output: "Could not resolve git root.".to_string(),
+        }));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let outcome = service.develop_run_check(&worktree_path).await;
+        let _ = tx.send(AppEvent::DevelopChecked(outcome));
+    });
+}
+
+/// Commit one finished section as a checkpoint (opt-in). A missing git root
+/// reports the error; the pipeline treats a commit failure as non-fatal.
+fn kick_off_develop_commit(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    subject: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopCommitted(Err(
+            "Could not resolve git root.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .develop_commit_section(&worktree_path, &subject)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::DevelopCommitted(result));
     });
 }
 
@@ -10184,6 +10359,7 @@ mod tests {
                     columns: vec!["branch".into(), "status".into()],
                     ai: Default::default(),
                     ai_status: Default::default(),
+                    develop: Default::default(),
                     legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
@@ -10196,6 +10372,7 @@ mod tests {
                     columns: vec!["branch".into()],
                     ai: Default::default(),
                     ai_status: Default::default(),
+                    develop: Default::default(),
                     legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
@@ -10224,6 +10401,7 @@ mod tests {
                 ],
                 ai: Default::default(),
                 ai_status: Default::default(),
+                develop: Default::default(),
                 legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
@@ -10257,6 +10435,7 @@ mod tests {
                     columns: vec!["branch".into()],
                     ai: Default::default(),
                     ai_status: Default::default(),
+                    develop: Default::default(),
                     legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
@@ -10279,6 +10458,7 @@ mod tests {
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 ai: Default::default(),
                 ai_status: Default::default(),
+                develop: Default::default(),
                 legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
@@ -10310,6 +10490,7 @@ mod tests {
                     columns: vec!["branch".into(), "status".into()],
                     ai: Default::default(),
                     ai_status: Default::default(),
+                    develop: Default::default(),
                     legacy_notifications: None,
                 },
                 terminal_command: "global-terminal".into(),

@@ -427,6 +427,11 @@ pub struct DashboardConfig {
     #[serde(rename = "aiStatus", default)]
     pub ai_status: AiStatusConfig,
 
+    /// Project-level knobs for the "Develop" PR command (currently the
+    /// post-section check command). Defaults to all-empty (check disabled).
+    #[serde(rename = "develop", default)]
+    pub develop: DevelopSettings,
+
     /// Deprecated location for the notification toggles. Read only for
     /// backward compatibility with configs written before notifications moved
     /// to the top-level [`WorktreeConfig::notifications`] field; folded up by
@@ -449,9 +454,21 @@ impl Default for DashboardConfig {
             columns: default_columns(),
             ai: AiConfig::default(),
             ai_status: AiStatusConfig::default(),
+            develop: DevelopSettings::default(),
             legacy_notifications: None,
         }
     }
+}
+
+/// Project-level "Develop" PR command settings. `check_command` is the shell
+/// command the harness runs after each implement section as Ralph-canon
+/// backpressure (e.g. `cargo test`); empty disables the check entirely, so
+/// out of the box Develop behaves exactly as before this feature landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DevelopSettings {
+    #[serde(rename = "checkCommand", default)]
+    pub check_command: String,
 }
 
 impl DashboardConfig {
@@ -787,5 +804,39 @@ mod ai_config_tests {
         let dash = DashboardConfig::default();
         assert_eq!(dash.ai, AiConfig::default());
         assert_eq!(dash.ai.fix.plan.model, "opencode-go/glm-5.2");
+    }
+
+    #[test]
+    fn develop_settings_default_disable_the_check() {
+        let dash = DashboardConfig::default();
+        assert_eq!(dash.develop.check_command, "");
+    }
+
+    #[test]
+    fn develop_check_command_parses_and_round_trips() {
+        use super::DashboardConfig;
+        let json = r#"{ "develop": { "checkCommand": "cargo test --all" } }"#;
+        let dash: DashboardConfig = serde_json::from_str(json).expect("parses");
+        assert_eq!(dash.develop.check_command, "cargo test --all");
+        let reparsed: DashboardConfig =
+            serde_json::from_str(&serde_json::to_string(&dash).unwrap()).unwrap();
+        assert_eq!(reparsed.develop.check_command, "cargo test --all");
+    }
+
+    #[test]
+    fn dashboard_config_without_develop_block_still_parses() {
+        use super::DashboardConfig;
+        // Configs written before the develop block existed must load and get
+        // the disabled default.
+        let json = r#"{ "refreshIntervalMs": 5000 }"#;
+        let dash: DashboardConfig = serde_json::from_str(json).expect("parses");
+        assert_eq!(dash.develop.check_command, "");
+    }
+
+    #[test]
+    fn unknown_develop_key_is_rejected() {
+        use super::DashboardConfig;
+        let json = r#"{ "develop": { "checkCommand": "x", "bogus": true } }"#;
+        assert!(serde_json::from_str::<DashboardConfig>(json).is_err());
     }
 }

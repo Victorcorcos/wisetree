@@ -74,6 +74,11 @@ pub enum DevelopStep {
     PlanReview,
     Feedback,
     Implementing,
+    /// Quiet spinner while the harness runs the configured check command
+    /// after an implement run (Ralph-canon backpressure).
+    Verifying,
+    /// The check failed: its output tail + Fix with AI / Mark done / Pause.
+    CheckFailed,
     Done,
 }
 
@@ -131,9 +136,15 @@ pub enum DevelopAction {
     /// PlanReview → Feedback submitted: revise the plan with this input.
     PlanRejected(String),
     /// `Implementing` finished (turn completed, opencode exited, or the
-    /// user confirmed) — the App marks the run's section(s) ✅ and either
-    /// spawns the next Ralph Loop run or ends the pipeline.
+    /// user confirmed) — the App captures the run's summary and either runs
+    /// the check (backpressure) or finishes the section directly.
     ImplementFinished,
+    /// CheckFailed: re-run the same still-pending section with the failure
+    /// output embedded, so the AI fixes exactly what the check reported.
+    CheckFixWithAi,
+    /// CheckFailed: accept the section despite the failing check — mark it
+    /// done and move on (the user overrides the gate).
+    CheckMarkDone,
     /// Done page: a key was pressed; return to the dashboard + refresh.
     Done,
 }
@@ -150,6 +161,25 @@ pub struct DevelopPullRequestScreen {
     /// The Ralph Loop toggle on the Confirm page: one fresh opencode run
     /// per section (☒) vs a single run for the whole plan (☐).
     ralph: bool,
+    /// The Commit-sections toggle on the Confirm page: when ☒ the harness
+    /// commits each finished section as a Ralph-canon checkpoint (default ☐).
+    commit_sections: bool,
+    /// Which Confirm-page toggle Up/Down focus sits on (0 = Ralph Loop,
+    /// 1 = Commit sections); Space flips the focused one.
+    toggle_focus: usize,
+    /// Resolved `develop.checkCommand` (project config), shown on the confirm
+    /// panel and used to decide whether a run is followed by Verifying.
+    /// `None` when unconfigured (check disabled).
+    check_command: Option<String>,
+    // ── check backpressure ─────────────────────────────────────────────
+    /// The failing check's captured output on the CheckFailed page, and
+    /// threaded into the corrective run's prompt.
+    check_failure: Option<String>,
+    check_failed_focus: usize,
+    check_scroll: u16,
+    check_failed_button_rects: Cell<[Rect; 3]>,
+    /// How many sections were committed (Done-page summary).
+    commit_count: usize,
     // ── task description / feedback input ──────────────────────────────
     input: Option<InputPrompt>,
     describe_warning: bool,
@@ -179,6 +209,10 @@ pub struct DevelopPullRequestScreen {
     /// The section index the current implement run builds; `None` while a
     /// single (non-Ralph) run builds every pending section.
     current_section: Option<usize>,
+    /// The current run's closing summary, captured from the transcript when
+    /// the run finishes and pushed to the notes ledger when the section is
+    /// finalized (survives the Verifying / CheckFailed detour).
+    pending_summary: Option<String>,
     step_before_error: Option<DevelopStep>,
     pub tick: usize,
 }
@@ -193,6 +227,14 @@ impl DevelopPullRequestScreen {
             error: None,
             phase_message: String::new(),
             ralph: true,
+            commit_sections: false,
+            toggle_focus: 0,
+            check_command: None,
+            check_failure: None,
+            check_failed_focus: 0,
+            check_scroll: 0,
+            check_failed_button_rects: Cell::new([Rect::default(); 3]),
+            commit_count: 0,
             input: None,
             describe_warning: false,
             task_description: String::new(),
@@ -211,6 +253,7 @@ impl DevelopPullRequestScreen {
             finalize_confirm: None,
             plan_corrective: false,
             current_section: None,
+            pending_summary: None,
             step_before_error: None,
             tick: 0,
         }
@@ -226,6 +269,29 @@ impl DevelopPullRequestScreen {
     }
     pub fn ralph(&self) -> bool {
         self.ralph
+    }
+    pub fn commit_sections(&self) -> bool {
+        self.commit_sections
+    }
+    /// The section the current/last run targeted (`None` in single-run
+    /// mode). The App re-spawns this same section on a check-fix retry.
+    pub fn current_section(&self) -> Option<usize> {
+        self.current_section
+    }
+    /// Whether a check command is configured — the App only runs Verifying
+    /// (and can reach CheckFailed) when this is true.
+    pub fn has_check(&self) -> bool {
+        self.check_command.is_some()
+    }
+    /// The failing check output threaded into the next corrective run
+    /// (`None` unless CheckFailed → Fix with AI was chosen).
+    pub fn check_failure(&self) -> Option<String> {
+        self.check_failure.clone()
+    }
+    /// The App resolves `develop.checkCommand` and hands it here on entry;
+    /// a blank command stays `None` so the check is disabled.
+    pub fn set_check_command(&mut self, command: Option<String>) {
+        self.check_command = command.filter(|c| !c.trim().is_empty());
     }
     pub fn task_description(&self) -> &str {
         &self.task_description
@@ -276,15 +342,18 @@ impl DevelopPullRequestScreen {
             .map(|plan| render_plan_outline(plan, section))
             .unwrap_or_default()
     }
-    /// Expanded steps want the whole bottom region; Working / ResumePrompt
-    /// render in a sized panel.
+    /// Expanded steps want the whole bottom region; the compact spinner
+    /// steps (Working / Verifying) and ResumePrompt render in a sized panel.
     pub fn wants_full_panel(&self) -> bool {
-        !matches!(self.step, DevelopStep::Working | DevelopStep::ResumePrompt)
+        !matches!(
+            self.step,
+            DevelopStep::Working | DevelopStep::Verifying | DevelopStep::ResumePrompt
+        )
     }
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
-            DevelopStep::Working => 3,
+            DevelopStep::Working | DevelopStep::Verifying => 3,
             DevelopStep::ResumePrompt => 8,
             _ => 22,
         }
@@ -440,23 +509,73 @@ impl DevelopPullRequestScreen {
         self.finalize_confirm = None;
     }
 
-    /// The current implement run finished: mark its section(s) ✅ in the
-    /// model (checkboxes included — all in Rust, no AI involved).
-    pub fn mark_run_done(&mut self) {
-        let Some(plan) = self.plan.as_mut() else {
-            return;
-        };
-        match self.current_section {
-            Some(idx) => plan.mark_done(idx),
-            None => {
-                for idx in 0..plan.sections.len() {
-                    if !plan.sections[idx].done {
-                        plan.mark_done(idx);
+    /// Stash the run's closing summary (distilled from the transcript by the
+    /// App) so it lands in the notes ledger when the section is finalized —
+    /// surviving the Verifying / CheckFailed detour in between.
+    pub fn record_run_summary(&mut self, summary: Option<String>) {
+        self.pending_summary = summary;
+    }
+
+    /// Enter the quiet Verifying spinner while the harness runs the check.
+    pub fn start_verifying(&mut self) {
+        let command = self.check_command.clone().unwrap_or_default();
+        self.phase_message = format!("Running the check — `{command}`...");
+        self.pty = None;
+        self.step = DevelopStep::Verifying;
+    }
+
+    /// The check failed: show its output tail + the recovery buttons. `Fix
+    /// with AI` is focused by default (the constructive path).
+    pub fn show_check_failed(&mut self, output: String) {
+        self.check_failure = Some(output);
+        self.check_failed_focus = 0;
+        self.check_scroll = 0;
+        self.step = DevelopStep::CheckFailed;
+    }
+
+    /// The section is accepted (check passed, or the user overrode it):
+    /// append its note under a Ralph/single-run label, mark the section(s)
+    /// ✅ in the model, and clear the run's transient state. Returns the
+    /// commit target — `Some((number, name))` in Ralph mode, `None` for a
+    /// single run — so the App can build the commit subject.
+    pub fn finish_section(&mut self) -> Option<(usize, String)> {
+        let summary = self.pending_summary.take().unwrap_or_default();
+        let target = self.commit_target();
+        if let Some(plan) = self.plan.as_mut() {
+            let label = match self.current_section {
+                Some(idx) => format!("Section {}", plan.sections[idx].number),
+                None => "All sections".to_string(),
+            };
+            plan.push_note(&label, &summary);
+            match self.current_section {
+                Some(idx) => plan.mark_done(idx),
+                None => {
+                    for idx in 0..plan.sections.len() {
+                        if !plan.sections[idx].done {
+                            plan.mark_done(idx);
+                        }
                     }
                 }
             }
         }
         self.current_section = None;
+        self.check_failure = None;
+        target
+    }
+
+    /// The commit subject target for the run just finished: the section's
+    /// `(number, name)` in Ralph mode, `None` for a single whole-plan run.
+    fn commit_target(&self) -> Option<(usize, String)> {
+        let plan = self.plan.as_ref()?;
+        let idx = self.current_section?;
+        plan.sections
+            .get(idx)
+            .map(|section| (section.number, section.name.clone()))
+    }
+
+    /// Record that a section commit landed (Done-page summary count).
+    pub fn record_commit(&mut self) {
+        self.commit_count += 1;
     }
 
     /// Spawn opencode inside the embedded PTY. A spawn failure surfaces as
@@ -527,6 +646,10 @@ impl DevelopPullRequestScreen {
                 self.review_scroll = self.review_scroll.saturating_sub(lines);
                 true
             }
+            DevelopStep::CheckFailed => {
+                self.check_scroll = self.check_scroll.saturating_sub(lines);
+                true
+            }
             _ => false,
         }
     }
@@ -541,6 +664,10 @@ impl DevelopPullRequestScreen {
             }
             DevelopStep::PlanReview => {
                 self.review_scroll = self.review_scroll.saturating_add(lines);
+                true
+            }
+            DevelopStep::CheckFailed => {
+                self.check_scroll = self.check_scroll.saturating_add(lines);
                 true
             }
             _ => false,
@@ -563,7 +690,43 @@ impl DevelopPullRequestScreen {
             DevelopStep::PlanReview => self.handle_review_key(key),
             DevelopStep::Feedback => self.handle_feedback_key(key),
             DevelopStep::Implementing => self.handle_implementing_key(key),
+            // Verifying is a quiet phase the harness drives; only Esc (pause)
+            // is honored so a stray key can't abandon a running check.
+            DevelopStep::Verifying => match key.code {
+                KeyCode::Esc => DevelopAction::Cancelled,
+                _ => DevelopAction::Continue,
+            },
+            DevelopStep::CheckFailed => self.handle_check_failed_key(key),
             DevelopStep::Done => DevelopAction::Done,
+        }
+    }
+
+    fn handle_check_failed_key(&mut self, key: KeyEvent) -> DevelopAction {
+        match key.code {
+            KeyCode::Left | KeyCode::BackTab => {
+                self.check_failed_focus = (self.check_failed_focus + 2) % 3;
+                DevelopAction::Continue
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                self.check_failed_focus = (self.check_failed_focus + 1) % 3;
+                DevelopAction::Continue
+            }
+            KeyCode::PageUp => {
+                self.check_scroll = self.check_scroll.saturating_sub(5);
+                DevelopAction::Continue
+            }
+            KeyCode::PageDown => {
+                self.check_scroll = self.check_scroll.saturating_add(5);
+                DevelopAction::Continue
+            }
+            KeyCode::Enter => match self.check_failed_focus {
+                0 => DevelopAction::CheckFixWithAi,
+                1 => DevelopAction::CheckMarkDone,
+                _ => DevelopAction::Cancelled,
+            },
+            // Esc pauses (progress preserved) — never a silent mark-done.
+            KeyCode::Esc => DevelopAction::Cancelled,
+            _ => DevelopAction::Continue,
         }
     }
 
@@ -583,11 +746,23 @@ impl DevelopPullRequestScreen {
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) -> DevelopAction {
-        // Space is the Ralph Loop toggle — intercepted before the modal
-        // (which only reacts to y/n/arrows/Enter/Esc).
-        if matches!(key.code, KeyCode::Char(' ')) {
-            self.ralph = !self.ralph;
-            return DevelopAction::Continue;
+        // Up/Down move focus between the two toggles; Space flips the
+        // focused one. Both are intercepted before the modal (which only
+        // reacts to Left/Right/y/n/Enter/Esc), so they never conflict.
+        match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                self.toggle_focus = 1 - self.toggle_focus;
+                return DevelopAction::Continue;
+            }
+            KeyCode::Char(' ') => {
+                if self.toggle_focus == 0 {
+                    self.ralph = !self.ralph;
+                } else {
+                    self.commit_sections = !self.commit_sections;
+                }
+                return DevelopAction::Continue;
+            }
+            _ => {}
         }
         let Some(dialog) = self.confirm.as_mut() else {
             return DevelopAction::Cancelled;
@@ -880,6 +1055,19 @@ impl DevelopPullRequestScreen {
                 }
                 DevelopAction::Continue
             }
+            DevelopStep::CheckFailed => {
+                let [fix, mark, pause] = self.check_failed_button_rects.get();
+                if contains_position(fix, position) {
+                    return DevelopAction::CheckFixWithAi;
+                }
+                if contains_position(mark, position) {
+                    return DevelopAction::CheckMarkDone;
+                }
+                if contains_position(pause, position) {
+                    return DevelopAction::Cancelled;
+                }
+                DevelopAction::Continue
+            }
             _ => DevelopAction::Continue,
         }
     }
@@ -919,6 +1107,12 @@ impl DevelopPullRequestScreen {
             DevelopStep::PlanReview => self.render_plan_review(frame, area),
             DevelopStep::Feedback => self.render_feedback(frame, area),
             DevelopStep::Implementing => self.render_implementing(frame, area),
+            DevelopStep::Verifying => {
+                StatusIndicator::new(Status::Loading, self.phase_message.clone())
+                    .with_tick(self.tick)
+                    .render(frame, area)
+            }
+            DevelopStep::CheckFailed => self.render_check_failed(frame, area),
             DevelopStep::Done => self.render_done(frame, area),
         }
     }
@@ -928,6 +1122,13 @@ impl DevelopPullRequestScreen {
             "each section gets its own fresh opencode run"
         } else {
             "one single opencode run implements the whole plan"
+        };
+        let check_note = if self.check_command.is_some() {
+            "wisetree runs the configured check after each section; a failure lets you fix \
+             it with AI, accept it, or pause."
+        } else {
+            "wisetree marks each finished section ✅ in `PLAN.md`; edits stay uncommitted for \
+             your review."
         };
         let steps = [
             "You describe the feature or task.".to_string(),
@@ -939,43 +1140,71 @@ impl DevelopPullRequestScreen {
                 "The implement AI builds every section in an embedded opencode terminal — \
                  {ralph_note}."
             ),
-            "wisetree marks each finished section ✅ in `PLAN.md`; edits stay uncommitted for \
-             your review."
-                .to_string(),
+            check_note.to_string(),
         ];
         PrConfirmView::new("Develop a feature on this worktree?")
             .title_color(colors::ORANGE)
             .block(self.confirm_detail_lines())
             .steps(&steps)
-            .block(self.ralph_toggle_lines())
+            .block(self.toggle_lines())
             .ai_roles(self.confirm_ai_roles())
             .modal(self.confirm.as_ref())
             .render(frame, area);
     }
 
-    /// The purple Ralph Loop toggle row shown on the Confirm page.
-    fn ralph_toggle_lines(&self) -> Vec<Line<'static>> {
-        let checkbox = if self.ralph { "☒" } else { "☐" };
-        vec![Line::from(vec![
+    /// The two focusable Confirm-page toggles (Ralph Loop + Commit sections),
+    /// each with a ▸ focus marker on the active row. ↑/↓ moves focus, Space
+    /// flips the focused toggle.
+    fn toggle_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![self.toggle_line(
+            0,
+            self.ralph,
+            "Ralph Loop",
+            "a fresh opencode terminal per section: cheaper (small context each run) and more \
+             reliable.",
+        )];
+        lines.push(self.toggle_line(
+            1,
+            self.commit_sections,
+            "Commit sections",
+            "commit each finished section as a checkpoint (develop: section N — …); off leaves \
+             everything uncommitted.",
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("↑ ↓ ".to_string(), Style::default().fg(colors::BRAND)),
+            Span::styled("Move".to_string(), muted_dim()),
+            Span::styled("   ".to_string(), muted_dim()),
+            Span::styled("Space ".to_string(), Style::default().fg(colors::BRAND)),
+            Span::styled("Toggle".to_string(), muted_dim()),
+        ]));
+        lines
+    }
+
+    fn toggle_line(&self, index: usize, on: bool, label: &str, description: &str) -> Line<'static> {
+        let focused = self.toggle_focus == index;
+        let marker = if focused { "▸ " } else { "  " };
+        let checkbox = if on { "☒" } else { "☐" };
+        Line::from(vec![
+            Span::styled(marker.to_string(), Style::default().fg(colors::ORANGE)),
             Span::styled(
-                format!("{checkbox} Ralph Loop"),
+                format!("{checkbox} {label}"),
                 Style::default()
                     .fg(colors::BRAND)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  — a fresh opencode terminal per section: cheaper (small context each run) \
-                 and more reliable. "
-                    .to_string(),
-                Style::default().fg(colors::GRAY_LIGHT),
+                format!("  — {description}"),
+                Style::default().fg(if focused {
+                    colors::GRAY_LIGHT
+                } else {
+                    colors::GRAY_DARK
+                }),
             ),
-            Span::styled("Space".to_string(), Style::default().fg(colors::BRAND)),
-            Span::styled(" toggles".to_string(), muted_dim()),
-        ])]
+        ])
     }
 
     /// Labeled detail rows for the confirm panel: an optional `PR` row, then
-    /// Branch + Worktree.
+    /// Branch + Worktree + Check.
     fn confirm_detail_lines(&self) -> Vec<Line<'static>> {
         let mut rows: Vec<Line<'static>> = Vec::new();
         if let Some(number) = self.request.number {
@@ -1009,6 +1238,17 @@ impl DevelopPullRequestScreen {
                 self.request.worktree_path.clone(),
                 Style::default().fg(colors::EMPHASIS),
             ),
+            None,
+        ));
+        rows.push(labeled_line(
+            "Check",
+            match self.check_command.as_deref() {
+                Some(command) => code_span(command.to_string()),
+                None => Span::styled(
+                    "(none configured — set dashboard.develop.checkCommand)".to_string(),
+                    muted_dim(),
+                ),
+            },
             None,
         ));
         rows
@@ -1724,6 +1964,112 @@ impl DevelopPullRequestScreen {
         }
     }
 
+    /// The CheckFailed page — Bugkill-style: title, context subtitle, the
+    /// failing check's output in a scrollable panel, then the three recovery
+    /// buttons (Fix with AI / Mark done anyway / Pause).
+    fn render_check_failed(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // title
+                Constraint::Length(1), // subtitle
+                Constraint::Length(1), // blank
+                Constraint::Min(4),    // output panel
+                Constraint::Length(1), // blank
+                Constraint::Length(3), // buttons
+                Constraint::Length(1), // hint
+            ])
+            .split(area);
+
+        let section_label = match self
+            .current_section
+            .and_then(|idx| self.plan.as_ref().and_then(|plan| plan.sections.get(idx)))
+        {
+            Some(section) => format!("section {} — {}", section.number, section.name),
+            None => "the plan".to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "🧪 Check failed — the section did not pass".to_string(),
+                Style::default()
+                    .fg(colors::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("After implementing {section_label}, "),
+                    Style::default().fg(colors::GRAY_DARK),
+                ),
+                match self.check_command.as_deref() {
+                    Some(command) => code_span(command.to_string()),
+                    None => Span::styled("the check".to_string(), muted_dim()),
+                },
+                Span::styled(" reported failures.".to_string(), muted_dim()),
+            ])),
+            chunks[1],
+        );
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for raw in self.check_failure.as_deref().unwrap_or("").lines() {
+            lines.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(colors::GRAY_LIGHT),
+            )));
+        }
+        render_text_panel(frame, chunks[3], lines, self.check_scroll);
+
+        let labels = ["Fix with AI", "Mark done anyway", "Pause"];
+        let colors_by = [colors::INFO, colors::WARNING, colors::ERROR];
+        let widths: Vec<u16> = labels
+            .iter()
+            .map(|l| l.chars().count() as u16 + 4)
+            .collect();
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(widths[0]),
+                Constraint::Length(2),
+                Constraint::Length(widths[1]),
+                Constraint::Length(2),
+                Constraint::Length(widths[2]),
+                Constraint::Min(0),
+            ])
+            .split(chunks[5]);
+        let rects = [cols[1], cols[3], cols[5]];
+        for (i, label) in labels.iter().enumerate() {
+            frame.render_widget(
+                button_paragraph(
+                    &format!("  {label}  "),
+                    colors_by[i],
+                    self.check_failed_focus == i,
+                ),
+                rects[i],
+            );
+        }
+        self.check_failed_button_rects.set(rects);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("← → ".to_string(), Style::default().fg(colors::INFO)),
+                Span::styled("Switch".to_string(), muted_dim()),
+                Span::styled("  ·  ".to_string(), muted_dim()),
+                Span::styled("↵ ".to_string(), Style::default().fg(colors::SUCCESS)),
+                Span::styled("Choose".to_string(), muted_dim()),
+                Span::styled("  ·  ".to_string(), muted_dim()),
+                Span::styled("PgUp PgDn ".to_string(), Style::default().fg(colors::INFO)),
+                Span::styled("Scroll output".to_string(), muted_dim()),
+                Span::styled("  ·  ".to_string(), muted_dim()),
+                Span::styled("Esc ".to_string(), Style::default().fg(colors::WARNING)),
+                Span::styled("Pause".to_string(), muted_dim()),
+            ])),
+            chunks[6],
+        );
+    }
+
     fn render_done(&self, frame: &mut Frame, area: Rect) {
         let sections = self
             .plan
@@ -1772,16 +2118,28 @@ impl DevelopPullRequestScreen {
     }
 
     fn closing_lines(&self) -> Vec<Line<'static>> {
-        vec![
-            Line::from(vec![
-                Span::styled("Plan        ".to_string(), muted_dim()),
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Plan        ".to_string(), muted_dim()),
+            Span::styled(
+                "PLAN.md kept at the worktree root — the tracker shows every section ✅"
+                    .to_string(),
+                Style::default().fg(colors::WHITE),
+            ),
+        ])];
+        // Changes line: either committed as checkpoints, or left for review.
+        if self.commit_count > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("Commits     ".to_string(), muted_dim()),
                 Span::styled(
-                    "PLAN.md kept at the worktree root — the tracker shows every section ✅"
-                        .to_string(),
-                    Style::default().fg(colors::WHITE),
+                    format!(
+                        "{} section checkpoint(s) committed on {} (develop: section …).",
+                        self.commit_count, self.request.branch
+                    ),
+                    Style::default().fg(colors::SUCCESS),
                 ),
-            ]),
-            Line::from(vec![
+            ]));
+        } else {
+            lines.push(Line::from(vec![
                 Span::styled("Changes     ".to_string(), muted_dim()),
                 Span::styled(
                     format!(
@@ -1791,18 +2149,37 @@ impl DevelopPullRequestScreen {
                     ),
                     Style::default().fg(colors::SUCCESS),
                 ),
-            ]),
-            Line::from(vec![
-                Span::styled("Base ref    ".to_string(), muted_dim()),
-                match self.base_ref.clone() {
-                    Some(base_ref) => code_span(base_ref),
-                    None => Span::styled(
-                        "(none resolved)".to_string(),
-                        Style::default().fg(colors::EMPHASIS),
-                    ),
-                },
-            ]),
-        ]
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("Base ref    ".to_string(), muted_dim()),
+            match self.base_ref.clone() {
+                Some(base_ref) => code_span(base_ref),
+                None => Span::styled(
+                    "(none resolved)".to_string(),
+                    Style::default().fg(colors::EMPHASIS),
+                ),
+            },
+        ]));
+        // Section Notes — the Ralph-canon learnings ledger, if any.
+        if let Some(plan) = self.plan.as_ref() {
+            if !plan.notes.is_empty() {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "Section Notes".to_string(),
+                    Style::default()
+                        .fg(colors::INFO)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for note in &plan.notes {
+                    lines.push(Line::from(vec![
+                        Span::styled("  • ".to_string(), muted_dim()),
+                        Span::styled(note.clone(), Style::default().fg(colors::GRAY_LIGHT)),
+                    ]));
+                }
+            }
+        }
+        lines
     }
 }
 
@@ -1991,6 +2368,7 @@ mod tests {
             task_description: "Add CSV export".to_string(),
             complexity: 5,
             sections: vec![section(1, "Data model"), section(2, "CLI flag")],
+            notes: Vec::new(),
         }
     }
 
@@ -2030,19 +2408,46 @@ mod tests {
     }
 
     #[test]
-    fn space_toggles_the_ralph_loop_checkbox() {
+    fn space_toggles_the_focused_confirm_toggle() {
         let mut s = screen();
-        let dump = render_dump(&mut s, 110, 34);
+        // Both toggles render; Ralph on (☒) + Commit off (☐) by default.
+        let dump = render_dump(&mut s, 110, 36);
         assert!(dump.contains("☒ Ralph Loop"), "{dump}");
+        assert!(dump.contains("☐ Commit sections"), "{dump}");
+        assert!(s.ralph());
+        assert!(!s.commit_sections());
+
+        // Focus starts on Ralph → Space flips it.
         assert_eq!(
             s.handle_key(key(KeyCode::Char(' '))),
             DevelopAction::Continue
         );
         assert!(!s.ralph());
-        let dump = render_dump(&mut s, 110, 34);
-        assert!(dump.contains("☐ Ralph Loop"), "{dump}");
+        assert!(render_dump(&mut s, 110, 36).contains("☐ Ralph Loop"));
+
+        // Down moves focus to Commit sections → Space flips that one, Ralph
+        // is untouched.
+        assert_eq!(s.handle_key(key(KeyCode::Down)), DevelopAction::Continue);
         s.handle_key(key(KeyCode::Char(' ')));
-        assert!(s.ralph());
+        assert!(s.commit_sections());
+        assert!(!s.ralph());
+        assert!(render_dump(&mut s, 110, 36).contains("☒ Commit sections"));
+    }
+
+    #[test]
+    fn confirm_shows_the_check_row() {
+        // No check configured → the row says so.
+        let mut s = screen();
+        assert!(render_dump(&mut s, 120, 36).contains("(none configured"));
+        // Configured → the command shows as a code chip.
+        let mut s = screen();
+        s.set_check_command(Some("cargo test --all".to_string()));
+        assert!(s.has_check());
+        assert!(render_dump(&mut s, 120, 36).contains("cargo test --all"));
+        // A blank command stays disabled.
+        let mut s = screen();
+        s.set_check_command(Some("   ".to_string()));
+        assert!(!s.has_check());
     }
 
     #[test]
@@ -2280,7 +2685,7 @@ mod tests {
         assert!(!block.contains("CLI flag"), "{block}");
         let outline = s.outline_for_run(Some(0));
         assert_eq!(outline, "1. Data model — THIS RUN\n2. CLI flag — later");
-        s.mark_run_done();
+        s.finish_section();
         assert!(s.plan().unwrap().sections[0].done);
         assert_eq!(s.next_pending(), Some(1));
         // The rendered file reflects the ✅ (round-trips through the parser).
@@ -2302,7 +2707,7 @@ mod tests {
         let block = s.sections_for_run(None);
         assert!(block.contains("### Section 1 — Data model"), "{block}");
         assert!(block.contains("### Section 2 — CLI flag"), "{block}");
-        s.mark_run_done();
+        s.finish_section();
         assert_eq!(s.next_pending(), None);
     }
 
@@ -2321,7 +2726,7 @@ mod tests {
         assert!(dump.contains("Ralph Loop ☒"), "{dump}");
         // After the first run, the sidebar advances with the model: the
         // finished section keeps its name, now behind a ✅.
-        s.mark_run_done();
+        s.finish_section();
         s.begin_implement_run(Some(1));
         let dump = render_dump(&mut s, 120, 30);
         assert!(dump.contains("1/2 sections implemented"), "{dump}");
@@ -2369,6 +2774,74 @@ mod tests {
         assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
     }
 
+    // ── Verifying + CheckFailed ─────────────────────────────────────────
+
+    #[test]
+    fn verifying_shows_the_check_and_only_esc_pauses() {
+        let mut s = screen_on_review();
+        s.set_check_command(Some("cargo test".to_string()));
+        s.begin_implement_run(Some(0));
+        s.start_verifying();
+        assert_eq!(s.step(), DevelopStep::Verifying);
+        let dump = render_dump(&mut s, 110, 20);
+        assert!(dump.contains("Running the check"), "{dump}");
+        assert!(dump.contains("cargo test"), "{dump}");
+        // Stray keys are ignored; only Esc pauses.
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Continue);
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
+    }
+
+    #[test]
+    fn check_failed_shows_output_and_offers_three_paths() {
+        let mut s = screen_on_review();
+        s.set_check_command(Some("cargo test".to_string()));
+        s.begin_implement_run(Some(0));
+        s.show_check_failed("assertion `left == right` failed\n  left: 1\n  right: 2".to_string());
+        assert_eq!(s.step(), DevelopStep::CheckFailed);
+        let dump = render_dump(&mut s, 110, 26);
+        assert!(dump.contains("Check failed"), "{dump}");
+        assert!(dump.contains("section 1 — Data model"), "{dump}");
+        assert!(dump.contains("assertion"), "{dump}");
+        assert!(dump.contains("Fix with AI"), "{dump}");
+        assert!(dump.contains("Mark done anyway"), "{dump}");
+        assert!(dump.contains("Pause"), "{dump}");
+
+        // Fix with AI is focused first; Enter fires it.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            DevelopAction::CheckFixWithAi
+        );
+        // The failure is threaded into the next run's prompt.
+        assert!(s.check_failure().unwrap().contains("assertion"));
+        // Right → Mark done anyway; Right again → Pause.
+        s.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            DevelopAction::CheckMarkDone
+        );
+        s.handle_key(key(KeyCode::Right));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Cancelled);
+        // Esc also pauses.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
+    }
+
+    #[test]
+    fn finish_section_records_a_note_and_clears_the_failure() {
+        let mut s = screen_on_review();
+        s.begin_implement_run(Some(0));
+        s.record_run_summary(Some("Added the CSV record type; tests green.".to_string()));
+        s.show_check_failed("boom".to_string());
+        // Accepting the section pushes the note and clears the failure.
+        let target = s.finish_section();
+        assert_eq!(target, Some((1, "Data model".to_string())));
+        assert!(s.check_failure().is_none());
+        let notes = &s.plan().unwrap().notes;
+        assert_eq!(
+            notes,
+            &vec!["Section 1: Added the CSV record type; tests green.".to_string()]
+        );
+    }
+
     // ── Done ────────────────────────────────────────────────────────────
 
     #[test]
@@ -2376,7 +2849,7 @@ mod tests {
         let mut s = screen_on_review();
         s.set_base_ref(Some("origin/main".to_string()));
         s.begin_implement_run(None);
-        s.mark_run_done();
+        s.finish_section();
         s.enter_done();
         assert_eq!(s.step(), DevelopStep::Done);
         let dump = render_dump(&mut s, 110, 30);
@@ -2388,5 +2861,27 @@ mod tests {
         );
         assert!(dump.contains("origin/main"), "{dump}");
         assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Done);
+    }
+
+    #[test]
+    fn done_shows_notes_and_commit_count_when_present() {
+        let mut s = screen_on_review();
+        // Two Ralph runs, each leaving a note and a commit.
+        s.begin_implement_run(Some(0));
+        s.record_run_summary(Some("built the model".to_string()));
+        s.finish_section();
+        s.record_commit();
+        s.begin_implement_run(Some(1));
+        s.record_run_summary(Some("wired the CLI flag".to_string()));
+        s.finish_section();
+        s.record_commit();
+        s.enter_done();
+        let dump = render_dump(&mut s, 110, 30);
+        assert!(dump.contains("Section Notes"), "{dump}");
+        assert!(dump.contains("Section 1: built the model"), "{dump}");
+        assert!(dump.contains("Section 2: wired the CLI flag"), "{dump}");
+        assert!(dump.contains("2 section checkpoint(s) committed"), "{dump}");
+        // The uncommitted-changes line is replaced by the commit summary.
+        assert!(!dump.contains("left uncommitted"), "{dump}");
     }
 }
