@@ -27,6 +27,7 @@ use crate::services::bugkill::{
     parse_porcelain_v2, AttemptChanges, BugHypothesis, BugkillVerdict, JudgeResult,
     ParsedInvestigation, INVESTIGATION_FILE,
 };
+use crate::services::develop::{parse_plan_md, DevelopPlan, PLAN_FILE};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// `gh api graphql` may include the network round-trip — give it more headroom
@@ -105,6 +106,12 @@ const BUGKILL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// prompt argv never approaches OS limits.
 const BUGKILL_DESCRIPTION_MAX_BYTES: usize = 16_000;
 const BUGKILL_FIELD_MAX_BYTES: usize = 8_000;
+/// Byte caps applied to Develop prompt inputs before templating. The
+/// previous-plan block embedded on a revision can hold a whole plan, so it
+/// gets a roomier cap than the freeform fields.
+const DEVELOP_TASK_MAX_BYTES: usize = 16_000;
+const DEVELOP_FEEDBACK_MAX_BYTES: usize = 8_000;
+const DEVELOP_PLAN_MAX_BYTES: usize = 48_000;
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -997,6 +1004,38 @@ pub enum BugkillPreflightOutcome {
     LeftoverAttempt {
         tracked: Vec<String>,
     },
+}
+
+/// What the Develop preflight found on disk about a previous run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevelopResumeState {
+    /// No `PLAN.md` — collect a task description.
+    Absent,
+    /// The file exists but is not in Develop's format — Overwrite/Cancel.
+    Unparseable,
+    /// A parseable plan. With pending sections the UI offers Resume; a fully
+    /// implemented plan only offers Start fresh.
+    Parsed(DevelopPlan),
+}
+
+/// Everything the deterministic Develop pre-flight gathered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevelopPreflight {
+    /// First reachable ref from `BASE_REF_PRIORITY` (prompt context only,
+    /// rendered as `(none resolved)` when absent).
+    pub base_ref: Option<String>,
+    pub resume: DevelopResumeState,
+}
+
+/// Outcome of [`DashboardService::develop_preflight`]. The non-`Ready`
+/// variants map straight to a toast in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevelopPreflightOutcome {
+    Ready(Box<DevelopPreflight>),
+    /// `ai.develop.plan.model` is blank.
+    AiNotConfigured,
+    /// `opencode` is not on PATH.
+    AiUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3400,6 +3439,132 @@ impl DashboardService {
         })
     }
 
+    // ── "Develop" pipeline ─────────────────────────────────────────────
+    //
+    // AI is called in exactly two places: plan (once per revision, live TUI
+    // watched by the turn watcher) and implement (one run per section on a
+    // Ralph Loop, or a single run for the whole plan). Everything else —
+    // gates, PLAN.md rendering/parsing, progress tracking, the approval
+    // loop — is deterministic Rust. The AI never reads or writes PLAN.md.
+
+    /// Deterministic Develop pre-flight: model + opencode gates, base-ref
+    /// resolution, and detection of a resumable `PLAN.md`.
+    pub async fn develop_preflight(&self, worktree_path: &str) -> Result<DevelopPreflightOutcome> {
+        if self.config.ai.develop.plan.model.trim().is_empty() {
+            return Ok(DevelopPreflightOutcome::AiNotConfigured);
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Ok(DevelopPreflightOutcome::AiUnavailable);
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let resume = match tokio::fs::read_to_string(cwd.join(PLAN_FILE)).await.ok() {
+            None => DevelopResumeState::Absent,
+            Some(content) => match parse_plan_md(&content) {
+                None => DevelopResumeState::Unparseable,
+                Some(plan) => DevelopResumeState::Parsed(plan),
+            },
+        };
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await;
+        Ok(DevelopPreflightOutcome::Ready(Box::new(DevelopPreflight {
+            base_ref,
+            resume,
+        })))
+    }
+
+    /// Build the spawn parameters for one live planning run: the full
+    /// opencode **TUI** pinned to the read-only Plan agent, embedded in the
+    /// AI Activity panel. The TUI never exits on its own — the App detects
+    /// completion through an `OpencodeTurnWatcher` and reads the transcript
+    /// from opencode's database. `previous_plan` + `feedback` are set on a
+    /// revision after the user rejects the plan; `corrective` appends the
+    /// stricter-contract suffix used on the single retry after a parse
+    /// failure.
+    pub fn prepare_develop_plan(
+        &self,
+        worktree_path: &str,
+        task_description: &str,
+        base_ref: Option<&str>,
+        previous_plan: Option<&str>,
+        feedback: Option<&str>,
+        corrective: bool,
+    ) -> Result<FixApplyHandoff> {
+        let slot = &self.config.ai.develop.plan;
+        let model = slot.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other(
+                "ai.develop.plan model is not configured.",
+            ));
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Err(WisetreeError::other("opencode CLI is not on PATH."));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let mut prompt =
+            build_develop_plan_prompt(task_description, base_ref, previous_plan, feedback);
+        if corrective {
+            prompt = format!(
+                "{prompt}\n\nYour previous output could not be parsed. Reply with ONLY the \
+                 delimited blocks, exactly as specified."
+            );
+        }
+        // The opencode TUI takes no `--variant`; it honors reasoning effort
+        // solely via the persisted `model.json`, so seed it before spawning.
+        seed_opencode_tui_variant(&model, &slot.thinking);
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+            cwd.to_string_lossy().to_string(),
+        ];
+        Ok(FixApplyHandoff {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+        })
+    }
+
+    /// Build the spawn parameters for one live implement run. `sections`
+    /// holds only the section block(s) this run must build — one section on
+    /// a Ralph Loop, all pending sections otherwise — so no tokens are spent
+    /// re-reading the rest of the plan.
+    pub fn prepare_develop_implement(
+        &self,
+        worktree_path: &str,
+        task_description: &str,
+        sections: &str,
+    ) -> Result<FixApplyHandoff> {
+        let slot = &self.config.ai.develop.implement;
+        let model = slot.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other(
+                "ai.develop.implement model is not configured.",
+            ));
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Err(WisetreeError::other("opencode CLI is not on PATH."));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let prompt = build_develop_implement_prompt(task_description, sections);
+        // The opencode TUI takes no `--variant`; it honors reasoning effort
+        // solely via the persisted `model.json`, so seed it before spawning.
+        seed_opencode_tui_variant(&model, &slot.thinking);
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            cwd.to_string_lossy().to_string(),
+        ];
+        Ok(FixApplyHandoff {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+        })
+    }
+
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
     /// for every worktree in parallel, then layer cached PR data on top. No
     /// network calls — safe to emit immediately so the UI can render before
@@ -5618,6 +5783,48 @@ fn build_bug_judge_prompt(row: &BugHypothesis, user_text: &str) -> String {
         .replace(
             "USER_FEEDBACK",
             &truncate_bugkill_field(user_text, BUGKILL_FIELD_MAX_BYTES),
+        )
+}
+
+/// Render `prompts/develop_plan.md` for one live planning run.
+/// `previous_plan` is the compact contract-format rendering of the plan
+/// being revised; both revision slots are empty on a first run.
+fn build_develop_plan_prompt(
+    task_description: &str,
+    base_ref: Option<&str>,
+    previous_plan: Option<&str>,
+    feedback: Option<&str>,
+) -> String {
+    const PROMPT: &str = include_str!("../../prompts/develop_plan.md");
+    PROMPT
+        .replace(
+            "TASK_DESCRIPTION",
+            &truncate_bugkill_field(task_description, DEVELOP_TASK_MAX_BYTES),
+        )
+        .replace("BASE_REF", base_ref.unwrap_or("(none resolved)"))
+        .replace(
+            "PREVIOUS_PLAN",
+            &truncate_bugkill_field(previous_plan.unwrap_or(""), DEVELOP_PLAN_MAX_BYTES),
+        )
+        .replace(
+            "USER_FEEDBACK",
+            &truncate_bugkill_field(feedback.unwrap_or(""), DEVELOP_FEEDBACK_MAX_BYTES),
+        )
+}
+
+/// Render `prompts/develop_implement.md` for one live implement run. Only
+/// the section block(s) the run must build go in — never the whole plan
+/// file (token-efficiency invariant).
+fn build_develop_implement_prompt(task_description: &str, sections: &str) -> String {
+    const PROMPT: &str = include_str!("../../prompts/develop_implement.md");
+    PROMPT
+        .replace(
+            "TASK_DESCRIPTION",
+            &truncate_bugkill_field(task_description, DEVELOP_TASK_MAX_BYTES),
+        )
+        .replace(
+            "SECTIONS",
+            &truncate_bugkill_field(sections, DEVELOP_PLAN_MAX_BYTES),
         )
 }
 

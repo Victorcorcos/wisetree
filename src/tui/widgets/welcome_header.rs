@@ -49,6 +49,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::FixPullRequest => Some("Fix Pull Request"),
             Screen::ReviewPullRequest => Some("Review Pull Request"),
             Screen::BugkillPullRequest => Some("Bugkill Pull Request"),
+            Screen::DevelopPullRequest => Some("Develop Pull Request"),
             Screen::UpdateBranch => Some("Update Branch"),
             Screen::Settings => Some("Settings"),
             Screen::Setup => Some("Setup"),

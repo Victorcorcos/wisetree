@@ -36,14 +36,14 @@ use crate::services::{
     build_review_summary, check_for_updates_all_sources, compute_attempt_changes,
     default_dashboard_warning, detect_shell_integration, fetch_free_opencode_models,
     fetch_opencode_model_variants, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, AiStatus, AttemptChanges, BugHypothesis,
-    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
-    CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
-    DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
-    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
-    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
-    ReviewPreparation, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase,
-    UpdateProgress, UpdateSource,
+    parse_plan_transcript, parse_pull_request_md, resolve_dashboard_columns, AiStatus,
+    AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
+    BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
+    DashboardService, DashboardUpdate, DashboardWatch, DevelopPreflightOutcome, DevelopResumeState,
+    EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
+    FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult, OpencodeModel,
+    OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding, ReviewPreparation,
+    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -54,12 +54,13 @@ use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BugkillRequest, BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
-    EnrichPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
+    DevelopRequest, EnrichPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
     ReviewPullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
 };
+use crate::tui::screens::develop_pr::{DevelopAction, DevelopPullRequestScreen, DevelopStep};
 use crate::tui::screens::enrich_pr::{EnrichAction, EnrichPullRequestScreen, EnrichStep};
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
@@ -252,6 +253,23 @@ enum AppEvent {
     BugkillRolledBack(Result<(), String>),
     /// Rewriting `BUG_INVESTIGATION.md` failed (best-effort warning).
     BugkillFileWriteFailed(String),
+    /// "Develop": deterministic preflight finished (gates, base ref, resume
+    /// detection).
+    DevelopPrepared(Result<Box<DevelopPreflightOutcome>, String>),
+    /// Spawn params for one live planning run are ready (or a gate failed).
+    /// `corrective` marks the single retry after a parse failure.
+    DevelopPlanReady {
+        corrective: bool,
+        result: Result<Box<FixApplyHandoff>, String>,
+    },
+    /// Spawn params for one live implement run are ready. `section` is the
+    /// Ralph Loop target (`None` = one run for every pending section).
+    DevelopImplementReady {
+        section: Option<usize>,
+        result: Result<Box<FixApplyHandoff>, String>,
+    },
+    /// Rewriting `PLAN.md` failed (best-effort warning).
+    DevelopFileWriteFailed(String),
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
@@ -424,10 +442,15 @@ pub struct App {
     fix_pr: Option<FixPullRequestScreen>,
     review_pr: Option<ReviewPullRequestScreen>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
+    develop_pr: Option<DevelopPullRequestScreen>,
     /// Watches opencode's database for the embedded investigation TUI's
     /// turn to complete — the TUI never exits on its own, so this is what
     /// advances the `Investigating` step. `Some` only while investigating.
     bugkill_investigation: Option<OpencodeTurnWatcher>,
+    /// Same idea for the Develop screen's Planning + Implementing TUIs —
+    /// advances the plan into review, and (on a Ralph Loop) closes one
+    /// section's run and opens the next. `Some` only while one is live.
+    develop_watch: Option<OpencodeTurnWatcher>,
     /// Same idea for the Enrich screen's drafting TUI — advances straight
     /// to Review once opencode finishes writing `pull_request.md`. `Some`
     /// only while the `Enriching` step is active.
@@ -550,7 +573,9 @@ impl App {
             fix_pr: None,
             review_pr: None,
             bugkill_pr: None,
+            develop_pr: None,
             bugkill_investigation: None,
+            develop_watch: None,
             enrich_draft: None,
             update_conflict: None,
             update_branch: None,
@@ -754,6 +779,32 @@ impl App {
                         }
                         _ => {}
                     }
+                    // Same for the Develop TUIs. Both live steps are watched
+                    // through opencode's database: a completed Planning turn
+                    // carries the plan transcript; a completed Implementing
+                    // turn marks the section(s) ✅ and (on a Ralph Loop)
+                    // opens the next run. An early PTY exit falls back to
+                    // the same handlers.
+                    let develop_exited = self
+                        .develop_pr
+                        .as_mut()
+                        .map(|screen| (screen.tick_pty(None), screen.step()));
+                    match develop_exited {
+                        Some((true, DevelopStep::Planning)) => self.on_develop_plan_pty_exited(&tx),
+                        Some((true, DevelopStep::Implementing)) => {
+                            self.on_develop_implement_done(&tx)
+                        }
+                        Some((false, DevelopStep::Planning | DevelopStep::Implementing)) => {
+                            if let Some(turn) = self
+                                .develop_watch
+                                .as_mut()
+                                .and_then(OpencodeTurnWatcher::poll)
+                            {
+                                self.on_develop_turn(turn, &tx);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Event::Resize(width, height) => {
                     // `Viewport::Fixed` (see `terminal::app_viewport`) does
@@ -781,6 +832,7 @@ impl App {
         self.enrich_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.update_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.bugkill_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.develop_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -1108,6 +1160,29 @@ impl App {
                     bugkill_pr.render(frame, panel);
                 }
             }
+            Screen::DevelopPullRequest => {
+                // Expanded steps (Confirm, DescribeTask, PlanReview, the
+                // live Planning/Implementing PTYs, Done…) want the whole
+                // bottom region; the compact Working / ResumePrompt steps
+                // stay sized.
+                let expand = self
+                    .develop_pr
+                    .as_ref()
+                    .is_some_and(|s| s.wants_full_panel());
+                let panel = if expand {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .develop_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
+                if let Some(develop_pr) = self.develop_pr.as_mut() {
+                    develop_pr.tick = self.tick;
+                    develop_pr.render(frame, panel);
+                }
+            }
             Screen::UpdateBranch => {
                 let h = self
                     .update_branch
@@ -1229,6 +1304,17 @@ impl App {
             self.apply_bugkill_action(action, tx);
             return;
         }
+        // Develop consumes pastes atomically too (multi-line task
+        // descriptions and plan feedback).
+        if matches!(self.screen, Screen::DevelopPullRequest) {
+            let action = self
+                .develop_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(DevelopAction::Continue);
+            self.apply_develop_action(action, tx);
+            return;
+        }
         for ch in text.chars() {
             if ch.is_control() {
                 continue;
@@ -1287,6 +1373,14 @@ impl App {
                     };
                 }
             }
+            Screen::DevelopPullRequest => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
             _ => {}
         }
     }
@@ -1311,6 +1405,10 @@ impl App {
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             Screen::BugkillPullRequest => self
                 .bugkill_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            Screen::DevelopPullRequest => self
+                .develop_pr
                 .as_mut()
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             _ => false,
@@ -1443,6 +1541,7 @@ impl App {
             Screen::FixPullRequest => self.handle_fix_pr_key(key, tx),
             Screen::ReviewPullRequest => self.handle_review_pr_key(key, tx),
             Screen::BugkillPullRequest => self.handle_bugkill_key(key, tx),
+            Screen::DevelopPullRequest => self.handle_develop_key(key, tx),
             Screen::UpdateBranch => {
                 if let Some(screen) = self.update_branch.as_mut() {
                     screen.handle_key(key);
@@ -1859,6 +1958,14 @@ impl App {
                     .map(|screen| screen.handle_mouse_click(position))
                     .unwrap_or(BugkillAction::Continue);
                 self.apply_bugkill_action(action, tx);
+            }
+            Screen::DevelopPullRequest => {
+                let action = self
+                    .develop_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(DevelopAction::Continue);
+                self.apply_develop_action(action, tx);
             }
             Screen::UpdateBranch => {}
             Screen::AiModelPicker => {
@@ -3560,6 +3667,382 @@ impl App {
         }
     }
 
+    // ── "Develop" orchestration ─────────────────────────────────────────
+
+    fn start_develop_flow(
+        &mut self,
+        request: DevelopRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // Lands on the Confirm step immediately; the preflight only runs
+        // once the user has confirmed.
+        let ai = self.current_dashboard_config().ai.develop.clone();
+        self.develop_pr = Some(DevelopPullRequestScreen::new(request, ai));
+        self.screen = Screen::DevelopPullRequest;
+    }
+
+    fn handle_develop_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.develop_pr.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+        self.apply_develop_action(action, tx);
+    }
+
+    /// Single handler for `DevelopAction`s from keyboard or mouse. Drives
+    /// the screen transitions and kicks off each async stage; the approval
+    /// loop, progress tracking, and every file write stay in Rust.
+    fn apply_develop_action(
+        &mut self,
+        action: DevelopAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match action {
+            DevelopAction::Continue => {}
+            DevelopAction::Cancelled => {
+                let worktree_path = self
+                    .develop_pr
+                    .take()
+                    .map(|s| s.request().worktree_path.clone());
+                self.develop_watch = None;
+                self.back_to_dashboard_action_menu(worktree_path, tx);
+            }
+            DevelopAction::Confirmed => {
+                let Some(screen) = self.develop_pr.as_mut() else {
+                    return;
+                };
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_working("Preparing...");
+                kick_off_develop_preflight(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    tx.clone(),
+                );
+            }
+            DevelopAction::TaskSubmitted(description) => {
+                let Some(screen) = self.develop_pr.as_mut() else {
+                    return;
+                };
+                screen.set_task_description(description);
+                self.start_develop_planning(false, tx);
+            }
+            DevelopAction::Resume => {
+                let Some(screen) = self.develop_pr.as_mut() else {
+                    return;
+                };
+                // Adopt the parsed plan and go straight to implementing the
+                // pending sections — the plan was already approved when it
+                // was first written.
+                screen.apply_resume();
+                self.start_develop_implement_run(tx);
+            }
+            DevelopAction::StartFresh => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.show_describe();
+                }
+            }
+            DevelopAction::ForcePlanDone => self.force_develop_plan_done(tx),
+            DevelopAction::PlanApproved => self.start_develop_implement_run(tx),
+            DevelopAction::PlanRejected(_) => {
+                // The screen already stashed the rejected plan + feedback in
+                // `revision()` — replan with that context.
+                self.start_develop_planning(false, tx);
+            }
+            DevelopAction::ImplementFinished => self.on_develop_implement_done(tx),
+            DevelopAction::Done => {
+                self.develop_pr = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+        }
+    }
+
+    /// Kick off one live planning run: build the opencode TUI spawn params,
+    /// then show it in the embedded PTY. On a revision the screen carries
+    /// the rejected plan + feedback; `corrective` is only set on the
+    /// automatic retry after an unparseable transcript.
+    fn start_develop_planning(&mut self, corrective: bool, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.develop_watch = None;
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        let worktree_path = screen.request().worktree_path.clone();
+        let description = screen.task_description().to_string();
+        let base_ref = screen.base_ref().map(str::to_string);
+        let revision = screen.revision();
+        screen.start_working("Preparing the plan...");
+        kick_off_develop_prepare_plan(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            DevelopPreparePlanRequest {
+                worktree_path,
+                task_description: description,
+                base_ref,
+                revision,
+                corrective,
+            },
+            tx.clone(),
+        );
+    }
+
+    /// Kick off the next implement run: one section on a Ralph Loop, or
+    /// every pending section in a single run. With nothing pending, the
+    /// pipeline is already complete.
+    fn start_develop_implement_run(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.develop_watch = None;
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        let Some(next) = screen.next_pending() else {
+            screen.enter_done();
+            return;
+        };
+        let section = screen.ralph().then_some(next);
+        let sections_block = screen.sections_for_run(section);
+        let worktree_path = screen.request().worktree_path.clone();
+        let description = screen.task_description().to_string();
+        screen.start_working("Preparing the implementation...");
+        kick_off_develop_prepare_implement(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            worktree_path,
+            description,
+            sections_block,
+            section,
+            tx.clone(),
+        );
+    }
+
+    /// The turn watcher fired (or a PTY exit fell back here) — dispatch on
+    /// the live step.
+    fn on_develop_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let step = self.develop_pr.as_ref().map(|s| s.step());
+        match (step, turn) {
+            (_, OpencodeTurn::Working) => {}
+            (Some(DevelopStep::Planning), OpencodeTurn::Finished { transcript }) => {
+                self.finish_develop_plan(transcript, tx)
+            }
+            // The implement transcript is irrelevant — completion is the
+            // signal; the change is already in the worktree.
+            (Some(DevelopStep::Implementing), OpencodeTurn::Finished { .. }) => {
+                self.on_develop_implement_done(tx)
+            }
+            (_, OpencodeTurn::Failed { message }) => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(format!("opencode reported an error: {message}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The plan transcript is in: tear the TUI down and parse the sections.
+    /// An unparseable transcript earns one corrective retry (stricter
+    /// prompt); a second failure surfaces the tail.
+    fn finish_develop_plan(&mut self, transcript: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.develop_watch = None;
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        let corrective = screen.plan_corrective();
+        screen.kill_pty();
+        match parse_plan_transcript(&transcript) {
+            Some(plan) => {
+                screen.set_plan(plan);
+                self.rewrite_develop_file(tx);
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.enter_plan_review();
+                }
+            }
+            None if !corrective => self.start_develop_planning(true, tx),
+            None => screen.set_error(format!(
+                "could not parse the plan from the planning output. Raw tail:\n{}",
+                crate::services::transcript_tail(&transcript)
+            )),
+        }
+    }
+
+    /// The planning TUI exited before the watcher saw a completed turn (the
+    /// user quit opencode, or it crashed). Check the database once —
+    /// otherwise error.
+    fn on_develop_plan_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = self
+            .develop_watch
+            .as_mut()
+            .map(OpencodeTurnWatcher::check_now)
+            .unwrap_or(OpencodeTurn::Working);
+        match turn {
+            OpencodeTurn::Working => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error("opencode exited before the plan was finished.".to_string());
+                }
+            }
+            turn => self.on_develop_turn(turn, tx),
+        }
+    }
+
+    /// Enter → "Continue now" confirmed during Planning: re-check once; if
+    /// the turn still looks unfinished, try whatever transcript exists — if
+    /// the contract parser accepts it the detection was simply blind,
+    /// otherwise keep waiting and say so.
+    fn force_develop_plan_done(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(watcher) = self.develop_watch.as_mut() else {
+            return;
+        };
+        match watcher.check_now() {
+            OpencodeTurn::Working => {
+                let transcript = watcher.transcript_now().unwrap_or_default();
+                if parse_plan_transcript(&transcript).is_some() {
+                    self.finish_develop_plan(transcript, tx);
+                } else if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.note_planning_waiting();
+                }
+            }
+            turn => self.on_develop_turn(turn, tx),
+        }
+    }
+
+    /// One implement run finished (turn completed, opencode exited, or the
+    /// user confirmed): mark its section(s) ✅ in Rust, rewrite `PLAN.md`,
+    /// then either open the next Ralph Loop run or end the pipeline.
+    fn on_develop_implement_done(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.develop_watch = None;
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        screen.kill_pty();
+        screen.mark_run_done();
+        self.rewrite_develop_file(tx);
+        self.start_develop_implement_run(tx);
+    }
+
+    /// Surface a terminal preflight failure as a toast and return to the
+    /// dashboard, dropping the Develop screen.
+    fn fail_develop(
+        &mut self,
+        variant: ToastVariant,
+        message: impl Into<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.show_toast(variant, message.into());
+        self.develop_pr = None;
+        self.enter_screen(Screen::Dashboard, tx);
+    }
+
+    /// Re-render `PLAN.md` from the in-memory model and write it to the
+    /// worktree root (called after every mutation — the AI never touches
+    /// the file).
+    fn rewrite_develop_file(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.develop_pr.as_ref() else {
+            return;
+        };
+        let Some(content) = screen.render_plan() else {
+            return;
+        };
+        let path = PathBuf::from(&screen.request().worktree_path)
+            .join(crate::services::develop::PLAN_FILE);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = tokio::fs::write(&path, content).await {
+                let _ = tx.send(AppEvent::DevelopFileWriteFailed(err.to_string()));
+            }
+        });
+    }
+
+    fn apply_develop_prepared(
+        &mut self,
+        result: Result<Box<DevelopPreflightOutcome>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.develop_pr.is_none() {
+            return;
+        }
+        match result {
+            Err(message) => self.fail_develop(
+                ToastVariant::Error,
+                format!("Develop preparation failed: {}", truncate_error(&message)),
+                tx,
+            ),
+            Ok(outcome) => match *outcome {
+                DevelopPreflightOutcome::AiNotConfigured => self.fail_develop(
+                    ToastVariant::Warning,
+                    "ai.develop.plan model is not configured.",
+                    tx,
+                ),
+                DevelopPreflightOutcome::AiUnavailable => self.fail_develop(
+                    ToastVariant::Error,
+                    "`opencode` CLI is not on PATH — install it from https://opencode.ai then \
+                     retry.",
+                    tx,
+                ),
+                DevelopPreflightOutcome::Ready(preflight) => {
+                    let Some(screen) = self.develop_pr.as_mut() else {
+                        return;
+                    };
+                    screen.set_base_ref(preflight.base_ref);
+                    match preflight.resume {
+                        DevelopResumeState::Absent => screen.show_describe(),
+                        DevelopResumeState::Unparseable => screen.show_overwrite_prompt(),
+                        DevelopResumeState::Parsed(plan) => screen.show_resume_prompt(plan),
+                    }
+                }
+            },
+        }
+    }
+
+    /// Spawn params ready → show the AI Activity panel and launch the
+    /// opencode TUI. The watcher is created **before** the spawn so its
+    /// start timestamp precedes the session row the TUI creates.
+    fn apply_develop_plan_ready(
+        &mut self,
+        corrective: bool,
+        result: Result<Box<FixApplyHandoff>, String>,
+    ) {
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(handoff) => {
+                self.develop_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                screen.start_planning(corrective);
+                screen.spawn_opencode_pty(
+                    handoff.opencode_binary,
+                    handoff.opencode_args,
+                    handoff.cwd,
+                    Vec::new(),
+                );
+            }
+            Err(message) => screen.set_error(message),
+        }
+    }
+
+    fn apply_develop_implement_ready(
+        &mut self,
+        section: Option<usize>,
+        result: Result<Box<FixApplyHandoff>, String>,
+    ) {
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(handoff) => {
+                self.develop_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                screen.begin_implement_run(section);
+                screen.spawn_opencode_pty(
+                    handoff.opencode_binary,
+                    handoff.opencode_args,
+                    handoff.cwd,
+                    Vec::new(),
+                );
+            }
+            Err(message) => screen.set_error(message),
+        }
+    }
+
     /// Surface a terminal failure and return to the dashboard, dropping the
     /// fix screen. Shared by every non-recoverable prepare-stage outcome.
     fn fail_fix(
@@ -3940,6 +4423,9 @@ impl App {
             }
             DashboardAction::Bugkill(request) => {
                 self.start_bugkill_flow(*request, tx);
+            }
+            DashboardAction::Develop(request) => {
+                self.start_develop_flow(*request, tx);
             }
             DashboardAction::PushPullRequest(request) => {
                 self.start_push_pr_flow(*request, tx);
@@ -5072,6 +5558,17 @@ impl App {
                 self.apply_bugkill_judged(user_text, result, tx)
             }
             AppEvent::BugkillRolledBack(result) => self.apply_bugkill_rolled_back(result, tx),
+            AppEvent::DevelopPrepared(result) => self.apply_develop_prepared(result, tx),
+            AppEvent::DevelopPlanReady { corrective, result } => {
+                self.apply_develop_plan_ready(corrective, result)
+            }
+            AppEvent::DevelopImplementReady { section, result } => {
+                self.apply_develop_implement_ready(section, result)
+            }
+            AppEvent::DevelopFileWriteFailed(err) => self.show_toast(
+                ToastVariant::Warning,
+                format!("Could not write PLAN.md: {}", truncate_error(&err)),
+            ),
             AppEvent::BugkillFileWriteFailed(err) => self.show_toast(
                 ToastVariant::Warning,
                 format!("Could not write BUG_INVESTIGATION.md: {err}"),
@@ -5902,6 +6399,13 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::DevelopPullRequest => {
+                // Only reachable through `start_develop_flow`, which seeds
+                // `develop_pr` before flipping the screen.
+                if self.develop_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
             Screen::UpdateBranch => {
                 // Only reachable through `start_update_branch_flow`,
                 // which seeds `update_branch` before flipping the
@@ -5946,6 +6450,7 @@ impl App {
         self.enrich_pr = None;
         self.fix_pr = None;
         self.bugkill_pr = None;
+        self.develop_pr = None;
         self.update_branch = None;
         self.ai_model_picker = None;
         self.mouse_selection = None;
@@ -7897,6 +8402,102 @@ fn kick_off_bugkill_rollback(
             .await
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::BugkillRolledBack(result));
+    });
+}
+
+/// Inputs for one planning run: the freeform task plus the optional
+/// revision context (the rejected plan's contract block + the feedback).
+struct DevelopPreparePlanRequest {
+    worktree_path: String,
+    task_description: String,
+    base_ref: Option<String>,
+    revision: Option<(String, String)>,
+    corrective: bool,
+}
+
+fn kick_off_develop_preflight(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopPrepared(Err(
+            "Could not resolve git root.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .develop_preflight(&worktree_path)
+            .await
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::DevelopPrepared(result));
+    });
+}
+
+fn kick_off_develop_prepare_plan(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: DevelopPreparePlanRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let corrective = req.corrective;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopPlanReady {
+            corrective,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    // A task despite the call being synchronous: the opencode-on-PATH gate
+    // inside spawns `opencode --version`, which must not block the UI.
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let (previous_plan, feedback) = match &req.revision {
+            Some((plan, feedback)) => (Some(plan.as_str()), Some(feedback.as_str())),
+            None => (None, None),
+        };
+        let result = service
+            .prepare_develop_plan(
+                &req.worktree_path,
+                &req.task_description,
+                req.base_ref.as_deref(),
+                previous_plan,
+                feedback,
+                corrective,
+            )
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::DevelopPlanReady { corrective, result });
+    });
+}
+
+fn kick_off_develop_prepare_implement(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    task_description: String,
+    sections: String,
+    section: Option<usize>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopImplementReady {
+            section,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .prepare_develop_implement(&worktree_path, &task_description, &sections)
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::DevelopImplementReady { section, result });
     });
 }
 

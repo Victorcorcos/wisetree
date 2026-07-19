@@ -181,6 +181,21 @@ fn default_bugkill_fix_ai() -> AiModelConfig {
 fn default_bugkill_judge_ai() -> AiModelConfig {
     default_fix_apply_ai()
 }
+// Develop splits engineer/bricklayer across the GPT-5.6 pair: `plan` designs
+// the implementation with the stronger reasoning model at high effort,
+// `implement` lays the bricks section by section at medium effort.
+fn default_develop_plan_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "openai/gpt-5.6-sol".to_string(),
+        thinking: "high".to_string(),
+    }
+}
+fn default_develop_implement_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "openai/gpt-5.6-terra".to_string(),
+        thinking: "medium".to_string(),
+    }
+}
 
 /// Per-step models for the two-phase "Fix Pull Request" pipeline. `plan` judges
 /// and plans each review comment with a non-interactive `opencode run` (so it
@@ -230,6 +245,28 @@ impl Default for AiBugkillConfig {
     }
 }
 
+/// Per-role models for the "Develop" pipeline. `plan` investigates the
+/// codebase and decomposes the described task into `PLAN.md` sections with a
+/// strong reasoning model; `implement` realizes the approved plan live in the
+/// embedded opencode TUI, one section (Ralph Loop) or all sections at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiDevelopConfig {
+    #[serde(default = "default_develop_plan_ai")]
+    pub plan: AiModelConfig,
+    #[serde(default = "default_develop_implement_ai")]
+    pub implement: AiModelConfig,
+}
+
+impl Default for AiDevelopConfig {
+    fn default() -> Self {
+        Self {
+            plan: default_develop_plan_ai(),
+            implement: default_develop_implement_ai(),
+        }
+    }
+}
+
 /// Per-command AI model + thinking strength for the opencode-assisted flows.
 /// Each command (or sub-step) selects its own model so a planning step can use
 /// a stronger model than, say, the PR-drafting step. Persisted as a nested
@@ -265,6 +302,8 @@ pub struct AiConfig {
     pub review: AiModelConfig,
     pub update: AiModelConfig,
     pub bugkill: AiBugkillConfig,
+    /// Drives the "Develop" plan → implement pipeline.
+    pub develop: AiDevelopConfig,
 }
 
 impl Default for AiConfig {
@@ -275,6 +314,7 @@ impl Default for AiConfig {
             review: default_review_ai(),
             update: default_update_ai(),
             bugkill: AiBugkillConfig::default(),
+            develop: AiDevelopConfig::default(),
         }
     }
 }
@@ -306,6 +346,8 @@ impl<'de> Deserialize<'de> for AiConfig {
             update: Option<AiModelConfig>,
             #[serde(default)]
             bugkill: Option<AiBugkillConfig>,
+            #[serde(default)]
+            develop: Option<AiDevelopConfig>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -349,6 +391,13 @@ impl<'de> Deserialize<'de> for AiConfig {
                     judge: l.clone(),
                 },
                 None => AiBugkillConfig::default(),
+            }),
+            develop: raw.develop.unwrap_or_else(|| match &legacy {
+                Some(l) => AiDevelopConfig {
+                    plan: l.clone(),
+                    implement: l.clone(),
+                },
+                None => AiDevelopConfig::default(),
             }),
         })
     }
@@ -592,6 +641,8 @@ mod ai_config_tests {
             &ai.bugkill.investigate,
             &ai.bugkill.fix,
             &ai.bugkill.judge,
+            &ai.develop.plan,
+            &ai.develop.implement,
         ] {
             assert_eq!(leaf.model, "opencode/deepseek-v4-flash-free");
             assert_eq!(leaf.thinking, "max");
@@ -637,6 +688,11 @@ mod ai_config_tests {
         assert_eq!(ai.bugkill.fix.thinking, "");
         assert_eq!(ai.bugkill.judge.model, "opencode-go/kimi-k2.7-code");
         assert_eq!(ai.bugkill.judge.thinking, "");
+        // Develop defaults use the GPT-5.6 engineer/bricklayer pair.
+        assert_eq!(ai.develop.plan.model, "openai/gpt-5.6-sol");
+        assert_eq!(ai.develop.plan.thinking, "high");
+        assert_eq!(ai.develop.implement.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.develop.implement.thinking, "medium");
     }
 
     #[test]
@@ -664,6 +720,8 @@ mod ai_config_tests {
             &ai.bugkill.investigate,
             &ai.bugkill.fix,
             &ai.bugkill.judge,
+            &ai.develop.plan,
+            &ai.develop.implement,
         ] {
             assert_eq!(leaf.model, "legacy/model");
             assert_eq!(leaf.thinking, "low");
@@ -681,6 +739,18 @@ mod ai_config_tests {
     fn unknown_bugkill_key_is_rejected() {
         let json = r#"{ "bugkill": { "investigate": { "model": "x" }, "bogus": {} } }"#;
         assert!(serde_json::from_str::<AiConfig>(json).is_err());
+    }
+
+    #[test]
+    fn partial_develop_slot_falls_back_per_slot() {
+        // Only `develop.plan` configured → implement falls back to its own
+        // default, never to plan's value.
+        let json = r#"{ "develop": { "plan": { "model": "custom/planner", "thinking": "max" } } }"#;
+        let ai: AiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(ai.develop.plan.model, "custom/planner");
+        assert_eq!(ai.develop.plan.thinking, "max");
+        assert_eq!(ai.develop.implement.model, "openai/gpt-5.6-terra");
+        assert_eq!(ai.develop.implement.thinking, "medium");
     }
 
     #[test]
@@ -707,6 +777,7 @@ mod ai_config_tests {
         assert!(serialized.contains("\"fix\""));
         assert!(serialized.contains("\"update\""));
         assert!(serialized.contains("\"bugkill\""));
+        assert!(serialized.contains("\"develop\""));
         let reparsed: AiConfig = serde_json::from_str(&serialized).unwrap();
         assert_eq!(ai, reparsed);
     }

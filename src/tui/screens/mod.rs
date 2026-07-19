@@ -7,6 +7,7 @@ pub mod cache;
 pub mod create;
 pub mod dashboard;
 pub mod delete;
+pub mod develop_pr;
 pub mod enrich_pr;
 pub mod error;
 pub mod fix_pr;
