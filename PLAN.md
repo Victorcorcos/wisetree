@@ -1,21 +1,32 @@
 ## Task Description
 
-Implement improvements #1 through #11 from `REVIEWER_IMPROVEMENTS.md`, then harden and validate Wisetree's Review Pull Request pipeline through approved Sections 12–19. The additional work closes deterministic recall gaps, guarantees complete coverage evidence, improves deduplication and test-context fidelity, batches large reviews efficiently, makes finding revisions adaptive, removes duplicated prompt evidence, and adds a repeatable benchmark against the canonical `reviewer` skill.
+Implement improvements #1 through #11 from `REVIEWER_IMPROVEMENTS.md`, harden the Review Pull Request pipeline through completed Sections 12–19, then execute the planned accuracy-and-efficiency program in Sections 20–29. The new program must make Review discover real code flaws more accurately than the canonical `reviewer` skill with statistically defensible evidence while preserving Review's deterministic workflow and making it a clear end-to-end logical-token winner.
 
-Sections 1–11 map one-to-one to the original numbered improvements and commits. Sections 12–19 map one-to-one to the approved follow-up implementation order. Before starting a section, re-read its acceptance criteria; after implementation, update this plan and run the section's focused tests before moving forward. Run the complete format/lint/test gate after the final section.
+Sections 1–11 map one-to-one to the original numbered improvements and commits. Sections 12–19 map one-to-one to the completed follow-up implementation order. Sections 20–29 are new, sequential sessions: first eliminate known recall and token-multiplication gaps, then improve evidence selection and cross-file reasoning, then add selective verification and a global omission audit, and finally prove superiority with leakage-free live evaluation. Before starting a section, re-read its acceptance criteria; after implementation, update this plan and run the section's focused tests before moving forward. Run the complete format/lint/test gate after the final section.
 
 The following invariants apply to every section:
 
 - Walkthrough, posting, summary, report, anchor validation, no-op stripping, and both dedup layers remain deterministic Rust.
-- Exactly one scan per run may raise missing-test-coverage findings.
+- Exactly one review role may raise missing-test-coverage findings; budget partitioning may create several disjoint calls owned by that role, but no changed behavior may be judged twice.
 - Digests and inline content never remove the model's permission to read real repository files.
 - All five categories, both per-file profiles, the merged profile, and the reference-tables tier remain available.
 - The machine-parsed marker block, finding chunk delimiters, and header order remain byte-for-byte compatible.
 - The existing untracked `prompt.md` is user-owned and must not be modified or committed.
 
-**Complexity**: 20 points
+Additional invariants for Sections 20–29:
 
-The scope is epic-sized and is split into nineteen sequential, independently verifiable sections. Later sections may rely only on completed earlier sections.
+- Every changed application behavior, including whole-file deletion, is assigned to exactly one primary discovery group; no deterministic skip may make a potentially actionable security, behavior, convention, or test regression invisible.
+- Related evidence is supplied once to its owning group wherever possible. Repeated full test suites, full files, or repository instructions across coverage groups require a measured justification.
+- Relationship discovery, evidence extraction, routing, token accounting, validation, and posting remain deterministic Rust; models judge code, not pipeline bookkeeping.
+- Accuracy improvements must not move ordinary walkthrough, posting, summary, or reporting work back into model turns.
+- Provider prompt caching is reported as a cost dimension, not counted as a logical-token reduction.
+- Benchmark adapters never receive labels, expected findings, adjudication notes, or hidden holdout metadata.
+- Review and the skill run with the same model, thinking level, repository state, tool permissions, timeout policy, and repetition set.
+- No document or user-facing message may claim superiority until Section 29's preregistered accuracy and token thresholds pass on the held-out live corpus.
+
+**Complexity**: 34 points
+
+The scope is epic-sized and is split into twenty-nine sequential, independently verifiable sections. Later sections may rely only on completed earlier sections.
 
 ---
 
@@ -439,6 +450,246 @@ The scope is epic-sized and is split into nineteen sequential, independently ver
 
 ---
 
+#### Section 20 — Eliminate deterministic review blind spots
+
+**Goal**: Ensure potentially actionable changes reach discovery instead of being discarded before any model can judge them.
+
+**Files**: `src/services/dashboard.rs`, reviewer prompt templates as needed, focused parser/routing tests, benchmark cases, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] Whole-file text deletions remain represented with the old path, complete removed-line evidence within a bound, and file-level-comment support when no right-side anchor exists.
+- [x] Deleted application, policy/configuration, and test files participate in application and coverage judgments instead of becoming `NoChanges` or disappearing from the final report.
+- [x] Lockfiles, generated code, vendored code, snapshots, minified assets, and oversized fixtures are no longer unconditionally treated as judgment-free; each class is either conservatively reviewed, routed to a cheap specialized check, or skipped only after a deterministic proof that the change cannot carry an actionable concern.
+- [x] Test classification covers common unit, integration, end-to-end, behavior-specification, and framework patterns including `e2e/`, `integration/`, `features/`, `*.cy.*`, and `.feature`, with project-configured patterns taking precedence.
+- [x] Ambiguous file classifications degrade to review rather than skip, while every retained skip remains visible with its reason.
+- [x] Tests cover whole-file deletion of authorization code, whole-test deletion, dependency/lockfile changes, generated/security-sensitive near misses, nonstandard test layouts, and truly judgment-free binary changes.
+
+**Edge cases**:
+
+- [x] Deleted binary files remain visible but do not fabricate text evidence.
+- [x] A pure rename, a rename plus deletion, and delete-and-recreate at the same path remain distinguishable.
+- [x] File-level deletion findings never attempt an invalid GitHub suggestion block.
+
+---
+
+#### Section 21 — Establish an end-to-end logical-token budget
+
+**Goal**: Make token efficiency a measured product constraint before adding accuracy calls, and eliminate known evidence multiplication in split mode.
+
+**Files**: `src/services/dashboard.rs`, `src/services/review_telemetry.rs`, `src/tui/app.rs`, `src/tui/screens/review_pr.rs`, reviewer prompts, benchmark capture schema/evaluator, tests, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] Telemetry records uncached input, cache read, cache write, output, reasoning, logical total, cost, scan role, retry role, and end-to-end review totals without collapsing dimensions.
+- [x] Cached tokens remain part of logical-token totals; cache savings are reported separately as cost/latency information.
+- [x] Split coverage groups receive only tests related to their application behaviors plus a compact global test manifest; the entire changed test set is not repeated in every group.
+- [x] Bounded full-file evidence, changed-test evidence, convention context, and tester findings each have a deterministic ownership/dedup key so prompt construction can prove when the same bytes are resent.
+- [x] Prompt-building tests expose per-role and per-evidence-kind byte totals and fail when an unapproved repeated-evidence budget is exceeded.
+- [x] The ordinary Post/Edit/Skip walkthrough, posting, summary, and final report remain zero-model-turn operations.
+- [ ] Initial live measurements establish token baselines by PR shape: small merged, medium merged, large split, test-heavy, finding-heavy, clean, and revision-heavy.
+
+**Edge cases**:
+
+- [x] Missing or partial provider telemetry makes the comparison unavailable rather than treating dimensions as zero.
+- [x] Retries and expanded revisions are counted as paid calls even when their results are discarded.
+- [x] One test legitimately related to several application groups uses a compact shared assertion digest or targeted read instead of repeated full-file payloads.
+
+---
+
+#### Section 22 — Extract behavior- and symbol-level evidence
+
+**Goal**: Give each reviewer the complete relevant implementation context for changed behavior without paying for unrelated portions of large files.
+
+**Files**: a focused reviewer-evidence module under `src/services/`, `src/services/dashboard.rs`, reviewer prompts, language fixtures/tests, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] Each changed hunk maps, when deterministically possible, to its complete enclosing function/method, class/type/module boundary, and changed symbol identity.
+- [x] Evidence includes directly referenced local types, constants, error variants, and bounded caller/callee context when those relationships are required to judge the change.
+- [x] Removed behavior is preserved alongside the current symbol so regression and deleted-guard analysis remains possible.
+- [x] Supported languages use existing lightweight parsers or minimal proven extraction; no broad parsing framework is introduced without measured necessity.
+- [x] When extraction is unavailable or ambiguous, the scan must read the real full changed file before completing that file's discovery judgment, not only after it has already noticed a structural finding.
+- [x] Small files continue using one authoritative numbered full-file representation; changed current lines are never duplicated in separate hunks.
+- [x] Tests cover nested functions/classes, multiple hunks in one symbol, macros/decorators/attributes, overloads, partial syntax, non-UTF-8 files, and extraction fallback.
+
+**Edge cases**:
+
+- [x] A change between symbols receives bounded module context without being arbitrarily assigned to the wrong function.
+- [x] Generated or templated languages fall back safely without silently clipping relevant code.
+- [x] Symbol evidence preserves authoritative new-side anchors and old-side deletion context.
+
+---
+
+#### Section 23 — Build relationship-aware review groups
+
+**Goal**: Replace directory-only batching with deterministic groups that expose the cross-file relationships where real defects occur.
+
+**Files**: reviewer-evidence/routing modules, `src/services/dashboard.rs`, `src/tui/app.rs`, `src/tui/screens/review_pr.rs`, reviewer prompts, tests, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] The review graph connects changed files and symbols through imports, module references, direct calls, shared types/constants, configuration consumers, schema/model consumers, rename history, and implementation-to-test relationships.
+- [x] Primary application groups prefer strong dependency relationships over directory proximity while remaining within the measured focus budget.
+- [x] Cross-layer changes such as schema → model → service → controller and configuration → worker/consumer are visible together when their relationship is relevant.
+- [x] Every changed application behavior belongs to exactly one primary discovery group; overlapping context is bounded evidence, not duplicate ownership.
+- [x] Oversized connected components split deterministically with explicit cross-group edge summaries so no relationship disappears at the boundary.
+- [x] Tester groups and coverage ownership remain separate and cannot create duplicate missing-coverage findings.
+- [x] Tests cover same-directory unrelated files, cross-directory related files, cyclic dependencies, fan-in/fan-out, partial migrations, renames, and deterministic ordering.
+
+**Edge cases**:
+
+- [x] Dynamic or unresolved imports remain visible as uncertain edges rather than false certainty.
+- [x] A disconnected one-file PR behaves like the existing focused path.
+- [x] Very high-degree shared utility files do not pull the entire PR into one unbounded group.
+
+---
+
+#### Section 24 — Make relevant-test inspection mandatory and complete
+
+**Goal**: Ensure coverage decisions use the actual assertions protecting each changed behavior while avoiding repeated test payloads.
+
+**Files**: reviewer-evidence/routing modules, `src/services/dashboard.rs`, merged/coverage/tester prompts, tests, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] Every changed application behavior has an explicit coverage-ledger entry naming its related changed and unchanged tests, or recording that no relevant test was found.
+- [x] Test discovery uses naming, imports/references, framework configuration, repository conventions, and the relationship graph rather than only the changed file's directory.
+- [x] The coverage owner receives concrete scenario names and complete meaningful assertions that would fail when the changed behavior regresses.
+- [x] When deterministic evidence cannot establish whether an existing test protects the behavior, the coverage owner must perform a targeted real-file read before emitting or suppressing the finding.
+- [x] Tester findings about weak assertions, excessive internal mocking, flakiness, and implementation-detail tests are connected to the exact behavior they fail to protect.
+- [x] Each related test body is supplied to one owning specialist; other consumers receive bounded assertion digests or targeted-read references.
+- [x] Tests cover separate test roots, parameterized tests, generated cases, shared examples, integration/e2e suites, weak assertions, unchanged regression tests, and no-test repositories.
+
+**Edge cases**:
+
+- [x] One test protecting several behaviors records each relationship without duplicating its full body.
+- [x] A test named like the implementation but asserting unrelated behavior does not count as coverage.
+- [x] Deleted tests update the ledger as lost protection rather than ordinary absent evidence.
+
+---
+
+#### Section 25 — Selectively verify discovered findings and fixes
+
+**Goal**: Increase precision and proposed-fix correctness with a bounded adversarial verification call only where its value justifies its tokens.
+
+**Files**: a verifier prompt, `src/services/dashboard.rs`, `src/tui/app.rs`, `src/tui/screens/review_pr.rs`, telemetry, parser/state-machine tests, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] Verification is mandatory for Critical/High, Security, file-level, invalid-anchor, cross-group, and suggestion-bearing findings; straightforward lower-severity prose findings may bypass it under an explicit deterministic policy.
+- [x] The verifier receives exactly one candidate concern, its local behavior/symbol evidence, applicable relationship/test/convention evidence, and proposed replacement—never the whole PR by default.
+- [x] The verifier emits exactly `CONFIRMED`, `REJECTED_FALSE_POSITIVE`, or `REVISE` with structured reasoning and, for `REVISE`, one corrected finding.
+- [x] Rejected candidates never reach the walkthrough; revised candidates pass normal anchor, dedup, no-op, and suggestion validation.
+- [x] Direct suggestions are checked against the targeted replacement range and, when safely available, parsed/formatted or applied in an isolated temporary patch followed by the smallest relevant compile/test check.
+- [x] Verification tokens are recorded separately and remain within the end-to-end budget established in Section 21.
+- [x] Tests cover correct findings, plausible false positives, stale assumptions, invalid fixes, deletion suggestions, broad refactors, verifier parse failures, and retry limits.
+
+**Edge cases**:
+
+- [x] Verification failure keeps the candidate explicitly unverified rather than silently confirming it; the user sees the status or the finding is conservatively withheld according to policy.
+- [x] Isolated suggestion validation never mutates the user's worktree or posts to GitHub.
+- [x] Two findings sharing an anchor remain independently verified when their concerns differ.
+
+---
+
+#### Section 26 — Add a compact global omission audit
+
+**Goal**: Recover cross-group recall after focused discovery by auditing the complete behavior/relationship ledger without resending full diffs.
+
+**Files**: a global-gap-audit prompt, reviewer-evidence data structures, `src/services/dashboard.rs`, `src/tui/app.rs`, `src/tui/screens/review_pr.rs`, telemetry/tests, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] The audit receives the complete changed-file/symbol/behavior manifest, important cross-group edges, coverage-ledger status, deterministic skip decisions, and compact summaries of already discovered findings.
+- [x] Its only discovery responsibility is omissions caused by decomposition: partial migrations, missing consumers, cross-directory inconsistencies, duplicated behavior, shotgun surgery, configuration/schema mismatches, and behaviors absent from the finding/coverage ledger.
+- [x] The audit first identifies a concrete missing relationship and requests only the targeted evidence needed to confirm it; it does not receive every full file or test by default.
+- [x] New audit findings pass the same verifier and deterministic validation pipeline as primary findings.
+- [x] Existing findings are never rephrased into duplicates, and the audit cannot become a second general missing-coverage owner.
+- [x] Clean and single-group PRs use a smaller manifest-only audit or skip it under a measured deterministic policy.
+- [x] Tests cover omissions spanning two and several groups, clean PRs, duplicate suppression, targeted expansion, failed audit calls, and token-budget enforcement.
+
+**Edge cases**:
+
+- [x] A relationship edge summarized under the context cap remains addressable by stable identifier.
+- [x] Audit failure never discards findings already discovered and verified.
+- [x] Tests-only PRs do not create an unnecessary application gap audit.
+
+---
+
+#### Section 27 — Implement real leakage-free benchmark adapters
+
+**Goal**: Execute Review and the canonical `reviewer` skill end-to-end under identical read-only conditions instead of comparing hand-authored captures.
+
+**Files**: benchmark adapters/scripts under `benchmarks/reviewer/`, evaluator/capture schema, read-only harness fixtures, documentation, tests, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] Repository-owned executable adapters exist for both Review and `/Users/victorcorcos/Desktop/repositories/skills/skills/reviewer/SKILL.md` and implement the same capture protocol.
+- [x] The runner produces a redacted review-input corpus containing no expected findings, labels, adjudication notes, severity hints, or hidden metadata before invoking either adapter.
+- [x] Both adapters use the same model, thinking level, repository snapshot, tool permissions, context files, timeouts, and repetition identifiers.
+- [x] Adapters exercise discovery, finding revision/suggestion production when applicable, and deterministic end-to-end workflow tokens without posting comments, submitting reviews, or modifying source fixtures.
+- [x] Every model and tool turn contributes to logical-token totals; missing dimensions remain unavailable.
+- [x] Capture provenance includes workflow commit, skill hash, model/provider identifier, thinking level, corpus hash, environment version, and timestamps.
+- [x] Tests prove label redaction, read-only enforcement, adapter parity, side-effect rejection, missing-credential behavior, and complete repetition coverage.
+
+**Edge cases**:
+
+- [x] The installed and repository skill copies must hash-match or the benchmark stops with an explicit mismatch.
+- [x] Adapter crashes preserve prior repetitions but make the comparison incomplete rather than selectively dropping bad runs.
+- [x] Tool reads and context expansion are included in usage instead of only counting the initial prompt.
+
+---
+
+#### Section 28 — Build a representative blinded accuracy corpus
+
+**Goal**: Measure real defect discovery and fix quality across production-like PRs without overfitting to a tiny synthetic checklist.
+
+**Files**: versioned public corpus metadata, private/held-out corpus integration, adjudication tooling/docs, evaluator, benchmark tests, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] The evaluation contains at least 100 cases, targeting 200, spanning small/medium/large, clean/defective, test-heavy, finding-heavy, split-mode, and revision-heavy PR shapes.
+- [x] Cases cover all five categories plus whole-file deletions, cross-directory/cross-layer defects, authorization/security regressions, partial migrations, large-file structural flaws, unconventional test layouts, weak/missing tests, dependency changes, and false-positive traps.
+- [x] Ground truth combines real historical reviewed defects with controlled seeded mutations whose intended behavior and minimal correct fix are independently documented.
+- [x] A private held-out subset is inaccessible to implementation prompts and routine development; public fixtures test evaluator mechanics only.
+- [ ] At least two blind adjudicators classify semantic correctness, severity, duplicate equivalence, and proposed-fix quality, with disagreements resolved and agreement reported.
+- [x] Suggestion quality is measured by isolated application plus formatter/parser/build/test outcomes where applicable, not exact-string equality alone.
+- [x] Metrics include precision, recall, F1, severity-weighted recall, Critical/High recall, false positives per PR, cross-file recall, test-gap recall, anchor validity, suggestion correctness/applicability, and end-to-end logical tokens by PR shape.
+
+**Edge cases**:
+
+- [x] Convention cases include the repository evidence needed to make the expected convention objectively inferable.
+- [x] Multiple valid fixes are accepted through semantic/application adjudication rather than one golden string.
+- [x] Clean cases are large enough and varied enough to expose systematic over-reporting.
+
+---
+
+#### Section 29 — Prove and continuously guard joint superiority
+
+**Goal**: Permit the claim that Review is more accurate and more token-efficient only after preregistered, statistically defensible live results pass together.
+
+**Files**: benchmark evaluator/reporting, CI/nightly workflows as appropriate, benchmark documentation, user-facing Review documentation, `REVIEWER_IMPROVEMENTS.md`, `PLAN.md`
+
+**Acceptance criteria**:
+
+- [x] Before running the held-out comparison, preregister thresholds and analysis: Review F1 at least `+0.05`, recall at least `+0.08`, precision no worse than `-0.01`, Critical/High recall non-inferior and preferably at least `95%`, suggestion success at least `+0.05`, and median end-to-end logical tokens at least `25%` lower than the skill.
+- [x] Both workflows run at least ten paired repetitions per case on the same model/thinking/environment, preserving every stochastic result.
+- [x] Paired confidence intervals or an appropriate paired bootstrap demonstrate the accuracy and token improvements at 95% confidence instead of relying on point estimates.
+- [x] Token superiority is reported by PR-shape bucket as well as overall; no major bucket may show Review materially more expensive without an explicit failed gate.
+- [x] Accuracy reports separate discovery from delivery mechanics so anchor/dedup success cannot masquerade as flaw-detection success.
+- [ ] A human-reviewed evidence packet confirms that matched findings identify the intended defects and proposed fixes genuinely solve them.
+- [x] Only after every accuracy and token gate passes are superiority statements added to documentation or UI; otherwise reports name the failed dimensions and the claim remains disabled.
+- [x] Deterministic evaluator/fixture checks run in normal CI, while credentialed stochastic comparisons run on an explicitly controlled schedule and alert on material regression.
+
+**Edge cases**:
+
+- [x] Provider/model upgrades create a new baseline rather than being compared across incompatible environments.
+- [x] Missing telemetry, incomplete repetitions, adjudicator disagreement above the allowed threshold, or holdout leakage automatically invalidates the claim.
+- [x] A later regression below any preregistered threshold removes or marks the superiority claim stale until revalidated.
+
+---
+
 ## Progress Tracker
 
 | Section | Name | Status |
@@ -462,5 +713,15 @@ The scope is epic-sized and is split into nineteen sequential, independently ver
 | 17 | Escalate revisions adaptively and support deletion suggestions | ✅ Done |
 | 18 | Eliminate duplicated full-file and diff evidence | ✅ Done |
 | 19 | Benchmark token efficiency and review accuracy | ✅ Done |
+| 20 | Eliminate deterministic review blind spots | ✅ Done |
+| 21 | Establish an end-to-end logical-token budget | 🟡 Live baseline pending |
+| 22 | Extract behavior- and symbol-level evidence | ✅ Done |
+| 23 | Build relationship-aware review groups | ✅ Done |
+| 24 | Make relevant-test inspection mandatory and complete | ✅ Done |
+| 25 | Selectively verify discovered findings and fixes | ✅ Done |
+| 26 | Add a compact global omission audit | ✅ Done |
+| 27 | Implement real leakage-free benchmark adapters | ✅ Done |
+| 28 | Build a representative blinded accuracy corpus | 🟡 Blind adjudication pending |
+| 29 | Prove and continuously guard joint superiority | 🟡 Private live proof pending |
 
-Sections 12–19 are pre-approved by the developer and may execute sequentially without additional approval gates, while retaining a focused test gate and progress update after each section.
+Sections 1–20 and 22–27 are implemented. Section 21's code awaits live token baselines; Section 28 awaits two-person blind adjudication; and Section 29 awaits the preregistered private live comparison plus its resolved human evidence packet. Section 29 remains the sole authority for declaring that Review is jointly more accurate and more token-efficient than the canonical skill; the claim is currently disabled.

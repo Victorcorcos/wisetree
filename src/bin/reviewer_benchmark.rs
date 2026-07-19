@@ -9,6 +9,8 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Corpus {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
     cases: Vec<Case>,
 }
 
@@ -17,6 +19,8 @@ struct Corpus {
 struct Case {
     id: String,
     tags: Vec<String>,
+    #[serde(default = "default_shape")]
+    shape: String,
     review_input: ReviewInput,
     valid_anchors: HashMap<String, BTreeSet<u64>>,
     expected: Vec<ExpectedFinding>,
@@ -35,6 +39,12 @@ struct ExpectedFinding {
     file: String,
     line: Option<u64>,
     suggestion: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    equivalence_group: Option<String>,
+    #[serde(default)]
+    accepted_fix_patterns: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -44,7 +54,26 @@ struct Capture {
     model: Option<String>,
     thinking: Option<String>,
     side_effects: bool,
+    #[serde(default)]
+    complete: Option<bool>,
+    #[serde(default)]
+    provenance: Option<Provenance>,
     runs: Vec<Run>,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Provenance {
+    workflow_commit: String,
+    workflow_tree_hash: String,
+    skill_hash: String,
+    source_corpus_hash: String,
+    review_input_hash: String,
+    provider_model: String,
+    thinking: String,
+    tool_permissions: String,
+    timeout_seconds: u64,
+    environment_version: String,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +89,8 @@ struct Run {
 #[serde(rename_all = "camelCase")]
 struct CapturedFinding {
     category: String,
+    #[serde(default)]
+    severity: Option<String>,
     file: String,
     line: Option<u64>,
     title: String,
@@ -86,6 +117,15 @@ struct Score {
     anchors_total: usize,
     suggestions_applicable: usize,
     suggestions_total: usize,
+    severity_hit: f64,
+    severity_total: f64,
+    critical_high_hit: usize,
+    critical_high_total: usize,
+    cross_file_hit: usize,
+    cross_file_total: usize,
+    test_gap_hit: usize,
+    test_gap_total: usize,
+    prs: usize,
 }
 
 #[derive(Default)]
@@ -130,6 +170,7 @@ fn main() -> Result<()> {
     if repetition_ids(&pipeline) != repetition_ids(&skill) {
         bail!("captures must contain the same repetition IDs");
     }
+    validate_provenance_parity(&pipeline, &skill)?;
 
     println!("Reviewer benchmark (deterministic evaluator)");
     println!(
@@ -150,20 +191,40 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T> 
 }
 
 fn validate_corpus(corpus: &Corpus) -> Result<()> {
-    let required = [
-        "code-smell",
-        "security",
-        "performance",
-        "test-quality",
-        "convention",
-        "deletion-only",
-        "rename",
-        "svg-security",
-        "cross-file",
-        "multiline-assertion",
-        "false-positive-trap",
-        "suggestion-quality",
-    ];
+    let required: &[&str] = if corpus.schema_version >= 2 {
+        &[
+            "code-smell",
+            "security",
+            "performance",
+            "test-quality",
+            "convention",
+            "whole-file-deletion",
+            "cross-layer",
+            "authorization-security",
+            "partial-migration",
+            "large-file-structure",
+            "unconventional-layout",
+            "weak-missing-tests",
+            "dependency-change",
+            "false-positive-trap",
+            "finding-heavy",
+        ]
+    } else {
+        &[
+            "code-smell",
+            "security",
+            "performance",
+            "test-quality",
+            "convention",
+            "deletion-only",
+            "rename",
+            "svg-security",
+            "cross-file",
+            "multiline-assertion",
+            "false-positive-trap",
+            "suggestion-quality",
+        ]
+    };
     let tags = corpus
         .cases
         .iter()
@@ -182,7 +243,18 @@ fn validate_corpus(corpus: &Corpus) -> Result<()> {
     Ok(())
 }
 
+fn default_schema_version() -> u32 {
+    1
+}
+
+fn default_shape() -> String {
+    "fixture".to_owned()
+}
+
 fn validate_capture(corpus: &Corpus, capture: &Capture) -> Result<()> {
+    if capture.complete == Some(false) {
+        bail!("capture `{}` is incomplete", capture.name);
+    }
     if capture.side_effects {
         bail!(
             "capture `{}` reports side effects; refusing to score it",
@@ -232,6 +304,17 @@ fn validate_capture(corpus: &Corpus, capture: &Capture) -> Result<()> {
     Ok(())
 }
 
+fn validate_provenance_parity(left: &Capture, right: &Capture) -> Result<()> {
+    match (&left.provenance, &right.provenance) {
+        (None, None) => Ok(()),
+        (Some(left), Some(right)) if left == right => Ok(()),
+        (Some(_), Some(_)) => bail!(
+            "live captures must use identical workflow, skill, corpus, model, permissions, timeout, and environment provenance"
+        ),
+        _ => bail!("live captures must both include complete provenance"),
+    }
+}
+
 fn repetition_ids(capture: &Capture) -> BTreeSet<u32> {
     capture.runs.iter().map(|run| run.repetition).collect()
 }
@@ -244,6 +327,8 @@ fn evaluate_and_print(corpus: &Corpus, capture: &Capture) -> Result<()> {
         .collect::<HashMap<_, _>>();
     let mut score = Score::default();
     let mut tokens = TokenAggregate::default();
+    let mut scores_by_shape = HashMap::<&str, Score>::new();
+    let mut tokens_by_shape = HashMap::<&str, TokenAggregate>::new();
     let mut repetitions = BTreeSet::new();
     for run in &capture.runs {
         let case = cases
@@ -252,6 +337,11 @@ fn evaluate_and_print(corpus: &Corpus, capture: &Capture) -> Result<()> {
         repetitions.insert(run.repetition);
         score_run(case, run, &mut score);
         tokens.add(run.repetition, &run.tokens);
+        score_run(case, run, scores_by_shape.entry(&case.shape).or_default());
+        tokens_by_shape
+            .entry(&case.shape)
+            .or_default()
+            .add(run.repetition, &run.tokens);
     }
 
     let precision = ratio(
@@ -273,7 +363,12 @@ fn evaluate_and_print(corpus: &Corpus, capture: &Capture) -> Result<()> {
         repetitions.len()
     );
     println!(
-        "accuracy: precision={precision:.3} recall={recall:.3} f1={f1:.3} anchorValidity={:.3} suggestionApplicability={:.3}",
+        "accuracy: precision={precision:.3} recall={recall:.3} f1={f1:.3} severityWeightedRecall={:.3} criticalHighRecall={:.3} crossFileRecall={:.3} testGapRecall={:.3} falsePositivesPerPr={:.3} anchorValidity={:.3} suggestionCorrectness={:.3}",
+        float_ratio(score.severity_hit, score.severity_total),
+        ratio(score.critical_high_hit, score.critical_high_total),
+        ratio(score.cross_file_hit, score.cross_file_total),
+        ratio(score.test_gap_hit, score.test_gap_total),
+        ratio(score.false_positive, score.prs),
         ratio(score.anchors_valid, score.anchors_total),
         ratio(score.suggestions_applicable, score.suggestions_total)
     );
@@ -282,10 +377,34 @@ fn evaluate_and_print(corpus: &Corpus, capture: &Capture) -> Result<()> {
         score.true_positive, score.false_positive, score.false_negative
     );
     tokens.print();
+    let mut shapes = scores_by_shape.keys().copied().collect::<Vec<_>>();
+    shapes.sort_unstable();
+    for shape in shapes {
+        let bucket = &scores_by_shape[shape];
+        let precision = ratio(
+            bucket.true_positive,
+            bucket.true_positive + bucket.false_positive,
+        );
+        let recall = ratio(
+            bucket.true_positive,
+            bucket.true_positive + bucket.false_negative,
+        );
+        let f1 = if precision + recall == 0.0 {
+            0.0
+        } else {
+            2.0 * precision * recall / (precision + recall)
+        };
+        println!(
+            "shape.{shape}: precision={precision:.3} recall={recall:.3} f1={f1:.3} falsePositivesPerPr={:.3}",
+            ratio(bucket.false_positive, bucket.prs)
+        );
+        tokens_by_shape[shape].print_with_prefix(&format!("shape.{shape}."));
+    }
     Ok(())
 }
 
 fn score_run(case: &Case, run: &Run, score: &mut Score) {
+    score.prs += 1;
     let mut matched = vec![false; case.expected.len()];
     for finding in &run.findings {
         score.anchors_total += 1;
@@ -305,24 +424,80 @@ fn score_run(case: &Case, run: &Run, score: &mut Score) {
                 !matched[index]
                     && expected.category == finding.category
                     && expected.file == finding.file
-                    && expected.line == finding.line
+                    && (expected.line.is_none() || expected.line == finding.line)
             });
         if let Some(index) = candidate {
             matched[index] = true;
             score.true_positive += 1;
             let expected = &case.expected[index];
-            if let Some(suggestion) = &expected.suggestion {
+            if expected.suggestion.is_some() || !expected.accepted_fix_patterns.is_empty() {
                 score.suggestions_total += 1;
-                if finding.suggestion.as_deref() == Some(suggestion.as_str()) {
+                if suggestion_correct(expected, finding.suggestion.as_deref()) {
                     score.suggestions_applicable += 1;
                 }
             }
-            let _ = (&expected.id, &finding.title);
+            let _ = (
+                &expected.id,
+                &expected.equivalence_group,
+                &finding.title,
+                &finding.severity,
+            );
         } else {
             score.false_positive += 1;
         }
     }
+    for (expected, matched) in case.expected.iter().zip(&matched) {
+        let weight = severity_weight(expected.severity.as_deref());
+        score.severity_total += weight;
+        if *matched {
+            score.severity_hit += weight;
+        }
+        if matches!(expected.severity.as_deref(), Some("Critical" | "High")) {
+            score.critical_high_total += 1;
+            score.critical_high_hit += usize::from(*matched);
+        }
+        if case.tags.iter().any(|tag| {
+            matches!(
+                tag.as_str(),
+                "cross-file" | "cross-layer" | "cross-directory" | "partial-migration"
+            )
+        }) {
+            score.cross_file_total += 1;
+            score.cross_file_hit += usize::from(*matched);
+        }
+        if expected.category == "Test Quality" {
+            score.test_gap_total += 1;
+            score.test_gap_hit += usize::from(*matched);
+        }
+    }
     score.false_negative += matched.iter().filter(|matched| !**matched).count();
+}
+
+fn suggestion_correct(expected: &ExpectedFinding, actual: Option<&str>) -> bool {
+    let Some(actual) = actual else {
+        return false;
+    };
+    if expected
+        .suggestion
+        .as_deref()
+        .is_some_and(|suggestion| suggestion == actual)
+    {
+        return true;
+    }
+    !expected.accepted_fix_patterns.is_empty()
+        && expected
+            .accepted_fix_patterns
+            .iter()
+            .all(|pattern| actual.contains(pattern))
+}
+
+fn severity_weight(severity: Option<&str>) -> f64 {
+    match severity {
+        Some("Critical") => 8.0,
+        Some("High") => 4.0,
+        Some("Medium") => 2.0,
+        _ => 1.0,
+    }
 }
 
 fn ratio(numerator: usize, denominator: usize) -> f64 {
@@ -330,6 +505,14 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
         1.0
     } else {
         numerator as f64 / denominator as f64
+    }
+}
+
+fn float_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator == 0.0 {
+        1.0
+    } else {
+        numerator / denominator
     }
 }
 
@@ -348,11 +531,15 @@ impl TokenAggregate {
     }
 
     fn print(&self) {
-        self.uncached_input.print("uncachedInput");
-        self.cache_read.print("cacheRead");
-        self.cache_write.print("cacheWrite");
-        self.output.print("output");
-        self.reasoning.print("reasoning");
+        self.print_with_prefix("");
+    }
+
+    fn print_with_prefix(&self, prefix: &str) {
+        self.uncached_input.print(&format!("{prefix}uncachedInput"));
+        self.cache_read.print(&format!("{prefix}cacheRead"));
+        self.cache_write.print(&format!("{prefix}cacheWrite"));
+        self.output.print(&format!("{prefix}output"));
+        self.reasoning.print(&format!("{prefix}reasoning"));
         if self.uncached_input.missing
             + self.cache_read.missing
             + self.cache_write.missing
@@ -365,9 +552,9 @@ impl TokenAggregate {
                 + self.cache_write.total
                 + self.output.total
                 + self.reasoning.total;
-            println!("tokens.logicalTotal={logical}");
+            println!("tokens.{prefix}logicalTotal={logical}");
         } else {
-            println!("tokens.logicalTotal=unavailable");
+            println!("tokens.{prefix}logicalTotal=unavailable");
         }
         let logical_repetitions = self.logical_by_repetition.values().collect::<Vec<_>>();
         if logical_repetitions.iter().all(|value| value.missing == 0) {
@@ -376,14 +563,20 @@ impl TokenAggregate {
                 .map(|value| value.total)
                 .collect::<Vec<_>>();
             totals.sort_unstable();
-            println!("tokens.medianLogicalPerRepetition={:.1}", median(&totals));
+            println!(
+                "tokens.{prefix}medianLogicalPerRepetition={:.1}",
+                median(&totals)
+            );
         } else {
-            println!("tokens.medianLogicalPerRepetition=unavailable");
+            println!("tokens.{prefix}medianLogicalPerRepetition=unavailable");
         }
         if self.cost_usd.missing == 0 {
-            println!("costUsd={:.6}", self.cost_usd.total);
+            println!("{prefix}costUsd={:.6}", self.cost_usd.total);
         } else {
-            println!("costUsd=unavailable ({} run(s))", self.cost_usd.missing);
+            println!(
+                "{prefix}costUsd=unavailable ({} run(s))",
+                self.cost_usd.missing
+            );
         }
     }
 }
@@ -430,5 +623,67 @@ impl CostDimension {
             Some(value) => self.total += value,
             None => self.missing += 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn corpus() -> Corpus {
+        Corpus {
+            schema_version: 1,
+            cases: vec![Case {
+                id: "case".into(),
+                tags: Vec::new(),
+                shape: "fixture".into(),
+                review_input: ReviewInput {
+                    diff: "diff".into(),
+                },
+                valid_anchors: HashMap::new(),
+                expected: Vec::new(),
+            }],
+        }
+    }
+
+    fn capture(side_effects: bool, complete: Option<bool>) -> Capture {
+        Capture {
+            name: "capture".into(),
+            model: Some("provider/model".into()),
+            thinking: Some("high".into()),
+            side_effects,
+            complete,
+            provenance: None,
+            runs: vec![Run {
+                case_id: "case".into(),
+                repetition: 1,
+                findings: Vec::new(),
+                tokens: TokenUsage::default(),
+            }],
+        }
+    }
+
+    #[test]
+    fn rejects_side_effecting_and_incomplete_captures() {
+        assert!(validate_capture(&corpus(), &capture(true, Some(true))).is_err());
+        assert!(validate_capture(&corpus(), &capture(false, Some(false))).is_err());
+        assert!(validate_capture(&corpus(), &capture(false, Some(true))).is_ok());
+    }
+
+    #[test]
+    fn live_provenance_must_match_exactly() {
+        let json = r#"{
+          "workflowCommit":"abc","workflowTreeHash":"tree","skillHash":"skill","sourceCorpusHash":"source",
+          "reviewInputHash":"input","providerModel":"provider/model","thinking":"high",
+          "toolPermissions":"read-only","timeoutSeconds":240,"environmentVersion":"env"
+        }"#;
+        let provenance: Provenance = serde_json::from_str(json).unwrap();
+        let mut left = capture(false, Some(true));
+        left.provenance = Some(provenance);
+        let mut right = capture(false, Some(true));
+        right.provenance = Some(serde_json::from_str(json).unwrap());
+        assert!(validate_provenance_parity(&left, &right).is_ok());
+        right.provenance.as_mut().unwrap().timeout_seconds = 241;
+        assert!(validate_provenance_parity(&left, &right).is_err());
     }
 }

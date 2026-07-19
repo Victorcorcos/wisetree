@@ -8,6 +8,9 @@ pub mod opencode_models;
 pub mod opencode_turn;
 pub mod presets;
 pub mod review_telemetry;
+pub(crate) mod reviewer_evidence;
+pub(crate) mod reviewer_routing;
+pub(crate) mod reviewer_tests;
 pub mod shell_integration;
 pub mod update;
 
@@ -28,17 +31,19 @@ pub use dashboard::{
     CommentGroup, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow,
     DashboardService, DashboardUpdate, DashboardWatch, EnrichPreparation, EnrichSubmitOutcome,
     EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewComment, ReviewContext,
-    ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewScanMode,
-    ReviewSeverity, ReviewSkippedFile, ReviewStatus, ReviewerSummary, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
-    PR_REFRESH_PERIOD_MS,
+    MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewBenchmarkOutcome, ReviewComment,
+    ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewScanMode,
+    ReviewSeverity, ReviewSkippedFile, ReviewStatus, ReviewVerification, ReviewVerificationAttempt,
+    ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdatePullRequestOutcome,
+    AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };
 pub use opencode_models::{
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,
 };
 pub use opencode_turn::{OpencodeTurn, OpencodeTurnWatcher};
-pub use review_telemetry::ReviewScanTelemetry;
+pub use review_telemetry::{
+    opencode_usage_for_title, review_scan_title, ReviewScanTelemetry, ReviewTokenUsage,
+};
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,

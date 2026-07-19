@@ -1,11 +1,12 @@
 //! Live dashboard polling service.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use globset::{Glob, GlobSetBuilder};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,12 @@ use crate::services::bugkill::{
     ParsedInvestigation, INVESTIGATION_FILE,
 };
 use crate::services::review_telemetry::{
-    opencode_usage_for_title, review_scan_title, ReviewScanTelemetry,
+    opencode_usage_for_title, review_scan_title, ReviewScanTelemetry, ReviewTokenUsage,
+};
+use crate::services::reviewer_evidence::extract_symbol_evidence;
+use crate::services::reviewer_routing::{relationship_groups, ReviewRouteFile};
+use crate::services::reviewer_tests::{
+    build_coverage_ledger, ReviewCoverageInput, ReviewCoverageLedger,
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
@@ -98,7 +104,6 @@ const REVIEW_COMMENTS_MAX_BYTES: usize = 12_000;
 const REVIEW_COMMENT_KEY_MAX_BYTES: usize = 160;
 /// Annotated-diff byte threshold above which an explicit test fixture is
 /// treated as data rather than reviewable source.
-const REVIEW_FIXTURE_DIFF_MAX_BYTES: usize = 24_000;
 /// Byte cap for the whole-diff coverage prompt, which concatenates every
 /// file's (already individually capped) annotated diff into one call.
 const REVIEW_COVERAGE_DIFF_MAX_BYTES: usize = 120_000;
@@ -110,6 +115,7 @@ const REVIEW_REPO_CONTEXT_MAX_BYTES: usize = 6 * 1024;
 const REVIEW_DIRECTORY_INVENTORY_MAX_BYTES: usize = 2 * 1024;
 /// Full new-side files at or below this cap are attached to scan inputs.
 const REVIEW_FILE_INLINE_MAX_BYTES: usize = 16 * 1024;
+const REVIEW_SYMBOL_SOURCE_MAX_BYTES: usize = 1024 * 1024;
 /// Compact tester evidence passed to the sole coverage-owning scan.
 const REVIEW_TESTER_FINDINGS_MAX_BYTES: usize = 2 * 1024;
 const REVIEW_TEST_FILE_INVENTORY_MAX_BYTES: usize = 2 * 1024;
@@ -824,6 +830,7 @@ pub(crate) enum ReviewGroupProfile {
 pub(crate) struct ReviewFileGroup {
     pub(crate) profile: ReviewGroupProfile,
     pub(crate) files: Vec<ReviewFile>,
+    pub(crate) relationship_summary: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -853,6 +860,7 @@ pub struct ReviewContext {
     pub convention_docs: String,
     pub directory_inventory: String,
     pub changed_file_manifest: String,
+    pub(crate) coverage_ledger: ReviewCoverageLedger,
 }
 
 impl ReviewContext {
@@ -892,7 +900,10 @@ fn review_scan_mode(files: &[ReviewFile]) -> ReviewScanMode {
 
 /// Partition split-mode coverage work without ever dropping a changed
 /// application file behind the whole-prompt cap. Application files appear in
-/// exactly one group; changed tests are repeated as evidence for each group.
+/// exactly one group. Changed tests are supplied in full only to the first
+/// application group they are deterministically related to; every group still
+/// sees the compact global manifest and may target-read a listed test. This
+/// prevents a test-heavy PR from multiplying the same payload by every group.
 /// An application file over the focus budget is kept alone and its prompt
 /// carries the normal truncation/read marker.
 pub(crate) fn review_coverage_groups(
@@ -901,7 +912,7 @@ pub(crate) fn review_coverage_groups(
 ) -> Vec<Vec<ReviewFile>> {
     let applications = files
         .iter()
-        .filter(|file| !is_test_file(&file.path))
+        .filter(|file| !review_file_is_test(file))
         .collect::<Vec<_>>();
     if applications.is_empty() {
         return Vec::new();
@@ -910,34 +921,57 @@ pub(crate) fn review_coverage_groups(
         return vec![files.to_vec()];
     }
 
-    let tests = files
-        .iter()
-        .filter(|file| is_test_file(&file.path))
-        .cloned()
-        .collect::<Vec<_>>();
     let mut groups = Vec::new();
     let mut current = Vec::new();
     let mut current_bytes = 0usize;
     for file in applications {
         let bytes = file.annotated_diff.len();
         if !current.is_empty() && current_bytes.saturating_add(bytes) > REVIEW_MERGED_FOCUS_BYTES {
-            current.extend(tests.iter().cloned());
             groups.push(std::mem::take(&mut current));
             current_bytes = 0;
         }
         current.push(file.clone());
         current_bytes = current_bytes.saturating_add(bytes);
         if bytes > REVIEW_MERGED_FOCUS_BYTES {
-            current.extend(tests.iter().cloned());
             groups.push(std::mem::take(&mut current));
             current_bytes = 0;
         }
     }
     if !current.is_empty() {
-        current.extend(tests);
         groups.push(current);
     }
+    let tests = files
+        .iter()
+        .filter(|file| review_file_is_test(file))
+        .cloned()
+        .collect::<Vec<_>>();
+    for test in tests {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group
+                .iter()
+                .any(|application| review_test_relates_to_application(&test, application))
+        }) {
+            group.push(test);
+        }
+    }
     groups
+}
+
+fn review_test_relates_to_application(test: &ReviewFile, application: &ReviewFile) -> bool {
+    let app_path = application.path.replace('\\', "/").to_ascii_lowercase();
+    let test_path = test.path.replace('\\', "/").to_ascii_lowercase();
+    let stem = Path::new(&app_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if !matches!(stem, "" | "lib" | "main" | "mod" | "index")
+        && (test_path.contains(stem) || test.annotated_diff.to_ascii_lowercase().contains(stem))
+    {
+        return true;
+    }
+    let app_parent = Path::new(&app_path).parent().and_then(Path::to_str);
+    let test_parent = Path::new(&test_path).parent().and_then(Path::to_str);
+    app_parent == test_parent && app_parent.is_some()
 }
 
 /// Build deterministic focus-budget groups for the ordinary application and
@@ -963,54 +997,28 @@ fn review_profile_groups(
     profile: ReviewGroupProfile,
 ) -> Vec<ReviewFileGroup> {
     let matches_profile =
-        |file: &&ReviewFile| is_test_file(&file.path) == (profile == ReviewGroupProfile::Tester);
-    let mut directories = Vec::<String>::new();
-    let mut by_directory = HashMap::<String, Vec<&ReviewFile>>::new();
-    for file in files.iter().filter(matches_profile) {
-        let directory = Path::new(&file.path)
-            .parent()
-            .and_then(Path::to_str)
-            .unwrap_or_default()
-            .to_string();
-        if !by_directory.contains_key(&directory) {
-            directories.push(directory.clone());
-        }
-        by_directory.entry(directory).or_default().push(file);
-    }
-
-    let mut groups = Vec::new();
-    for directory in directories {
-        let mut current = Vec::new();
-        let mut current_bytes = 0usize;
-        for file in by_directory.remove(&directory).unwrap_or_default() {
-            let bytes = file.annotated_diff.len();
-            if !current.is_empty()
-                && current_bytes.saturating_add(bytes) > REVIEW_MERGED_FOCUS_BYTES
-            {
-                groups.push(ReviewFileGroup {
-                    profile,
-                    files: std::mem::take(&mut current),
-                });
-                current_bytes = 0;
-            }
-            current.push(file.clone());
-            current_bytes = current_bytes.saturating_add(bytes);
-            if bytes > REVIEW_MERGED_FOCUS_BYTES {
-                groups.push(ReviewFileGroup {
-                    profile,
-                    files: std::mem::take(&mut current),
-                });
-                current_bytes = 0;
-            }
-        }
-        if !current.is_empty() {
-            groups.push(ReviewFileGroup {
-                profile,
-                files: current,
-            });
-        }
-    }
-    groups
+        |file: &&ReviewFile| review_file_is_test(file) == (profile == ReviewGroupProfile::Tester);
+    let selected = files.iter().filter(matches_profile).collect::<Vec<_>>();
+    let route_files = selected
+        .iter()
+        .map(|file| ReviewRouteFile {
+            path: &file.path,
+            evidence: file.full_content.as_deref().unwrap_or(&file.annotated_diff),
+            bytes: file.annotated_diff.len(),
+        })
+        .collect::<Vec<_>>();
+    relationship_groups(&route_files, REVIEW_MERGED_FOCUS_BYTES)
+        .into_iter()
+        .map(|group| ReviewFileGroup {
+            profile,
+            files: group
+                .indices
+                .into_iter()
+                .map(|index| selected[index].clone())
+                .collect(),
+            relationship_summary: group.cross_group_summary,
+        })
+        .collect()
 }
 
 /// One changed file excluded from the review before any AI call, with the
@@ -1102,6 +1110,33 @@ pub struct ReviewScanAttempt {
     /// Present only when opencode returned text that failed the parser. The
     /// retry path can repair this text without paying to inspect the diff.
     pub raw_output: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ReviewVerificationAttempt {
+    pub result: Result<ReviewVerification>,
+    pub telemetry: ReviewScanTelemetry,
+}
+
+/// Read-only result of running the production Review discovery pipeline for a benchmark case.
+#[derive(Debug)]
+pub struct ReviewBenchmarkOutcome {
+    pub findings: Vec<ReviewFinding>,
+    pub usage: ReviewTokenUsage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewVerification {
+    Confirmed {
+        reason: String,
+    },
+    RejectedFalsePositive {
+        reason: String,
+    },
+    Revise {
+        reason: String,
+        finding: ReviewFinding,
+    },
 }
 
 impl ReviewFinding {
@@ -3012,9 +3047,12 @@ impl DashboardService {
         if parsed.is_empty() {
             return Ok(ReviewPreparation::NoChanges);
         }
-        // Lockfiles, minified bundles, snapshots, … are excluded here, before
-        // any AI call — they still reach the screen so the final report can
-        // show each one with its reason.
+        let mut parsed = parsed;
+        apply_project_test_patterns(&cwd, &mut parsed).await;
+        // Only changes that deterministically carry no reviewable text are
+        // excluded. Text lockfiles, generated sources, snapshots, vendored
+        // code, and fixtures remain visible because they can still introduce
+        // dependency, security, behavior, or convention regressions.
         let (mut files, skipped) = partition_reviewable_files(parsed);
         attach_review_file_contents(&cwd, &mut files).await;
 
@@ -3104,7 +3142,7 @@ impl DashboardService {
         context: &ReviewContext,
     ) -> ReviewScanAttempt {
         let started = Instant::now();
-        let scan = if is_test_file(&file.path) {
+        let scan = if review_file_is_test(file) {
             format!("tester:{}", file.path)
         } else {
             format!("app:{}", file.path)
@@ -3160,7 +3198,13 @@ impl DashboardService {
             );
         }
         let tables_path = materialize_review_tables().await;
-        let prompt = build_review_group_prompt(&group.files, group.profile, context, &tables_path);
+        let prompt = build_review_group_prompt_with_relationships(
+            &group.files,
+            group.profile,
+            context,
+            &tables_path,
+            &group.relationship_summary,
+        );
         let prompt_bytes = prompt.len();
         let title = review_scan_title();
         let mut run_args = vec![
@@ -3230,6 +3274,60 @@ impl DashboardService {
         let prompt = build_review_revision_prompt(file, finding, feedback, mode);
         self.execute_review_file_prompt(cwd, file, scan, started, prompt, model)
             .await
+    }
+
+    pub(crate) async fn verify_review_finding(
+        &self,
+        worktree_path: &str,
+        file: &ReviewFile,
+        finding: &ReviewFinding,
+        context: &ReviewContext,
+    ) -> ReviewVerificationAttempt {
+        let started = Instant::now();
+        let scan = format!("verify:{}:{}", file.path, finding.line.unwrap_or_default());
+        let suggestion_validation = validate_review_suggestion_isolated(file, finding).await;
+        let prompt = build_review_verifier_prompt(file, finding, context, &suggestion_validation);
+        let prompt_bytes = prompt.len();
+        let model = self.config.ai.review.model.trim().to_string();
+        if model.is_empty() {
+            return review_verification_attempt(
+                scan,
+                prompt_bytes,
+                started,
+                None,
+                Err(WisetreeError::other("ai.review model is not configured.")),
+            );
+        }
+        let title = review_scan_title();
+        let mut run_args = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+            "--title".to_string(),
+            title.clone(),
+        ];
+        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = match time::timeout(
+            REVIEW_SCAN_TIMEOUT,
+            run_command(
+                &self.opencode_binary,
+                &run_args_ref,
+                Some(Path::new(worktree_path)),
+            ),
+        )
+        .await
+        {
+            Err(_) => Err(WisetreeError::other("review verifier timed out after 240s")),
+            Ok(Err(err)) => Err(WisetreeError::other(err)),
+            Ok(Ok(output)) => parse_review_verification(&output, file)
+                .ok_or_else(|| WisetreeError::other("could not parse the review verifier output")),
+        };
+        let usage = opencode_usage_for_title(title).await;
+        review_verification_attempt(scan, prompt_bytes, started, usage, result)
     }
 
     async fn execute_review_file_prompt(
@@ -3432,6 +3530,277 @@ impl DashboardService {
             result,
             raw_output,
         )
+    }
+
+    pub(crate) async fn scan_review_gap_audit(
+        &self,
+        worktree_path: &str,
+        files: &[ReviewFile],
+        context: &ReviewContext,
+        relationship_edges: &str,
+        skipped: &[ReviewSkippedFile],
+        existing_findings: &[ReviewFinding],
+    ) -> ReviewScanAttempt {
+        let started = Instant::now();
+        let prompt = build_review_gap_audit_prompt(
+            files,
+            context,
+            relationship_edges,
+            skipped,
+            existing_findings,
+        );
+        let prompt_bytes = prompt.len();
+        let model = self.config.ai.review.model.trim().to_string();
+        if model.is_empty() {
+            return review_scan_attempt(
+                "gap-audit".to_string(),
+                prompt_bytes,
+                started,
+                None,
+                Err(WisetreeError::other("ai.review model is not configured.")),
+                None,
+            );
+        }
+        let title = review_scan_title();
+        let mut run_args = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+            "--title".to_string(),
+            title.clone(),
+        ];
+        run_args.extend(run_variant_args(&self.config.ai.review.thinking));
+        let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let (result, raw_output) = match time::timeout(
+            REVIEW_SCAN_TIMEOUT,
+            run_command(
+                &self.opencode_binary,
+                &run_args_ref,
+                Some(Path::new(worktree_path)),
+            ),
+        )
+        .await
+        {
+            Err(_) => (
+                Err(WisetreeError::other(
+                    "global gap audit timed out after 240s",
+                )),
+                None,
+            ),
+            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
+            Ok(Ok(output)) => match parse_gap_audit_findings(&output, files) {
+                Some(findings) => (Ok(findings), None),
+                None => (
+                    Err(WisetreeError::other(
+                        "could not parse global gap audit output",
+                    )),
+                    Some(output),
+                ),
+            },
+        };
+        let usage = opencode_usage_for_title(title).await;
+        review_scan_attempt(
+            "gap-audit".to_string(),
+            prompt_bytes,
+            started,
+            usage,
+            result,
+            raw_output,
+        )
+    }
+
+    /// Run the production Review discovery, retry, omission-audit, and
+    /// selective-verification pipeline against an already captured diff.
+    /// This entry point exists for the read-only benchmark adapter; it never
+    /// posts comments, submits a review, or invokes `git`/`gh`.
+    pub async fn benchmark_review_diff(
+        &self,
+        worktree_path: &str,
+        diff: &str,
+    ) -> Result<ReviewBenchmarkOutcome> {
+        let mut files = parse_review_diff(diff);
+        let (mut files, _) = partition_reviewable_files(std::mem::take(&mut files));
+        if files.is_empty() {
+            return Ok(ReviewBenchmarkOutcome {
+                findings: Vec::new(),
+                usage: ReviewTokenUsage::default(),
+            });
+        }
+        attach_review_file_contents(Path::new(worktree_path), &mut files).await;
+        let context = build_review_context(Path::new(worktree_path), &files).await;
+        let mode = review_scan_mode(&files);
+        let groups = review_file_groups(&files, mode);
+        let coverage_groups = review_coverage_groups(&files, mode);
+        let mut usage = None;
+        let mut findings = Vec::new();
+        let mut tester_findings = Vec::new();
+
+        for group in &groups {
+            let group_findings = self
+                .benchmark_scan_group_with_retries(worktree_path, group, &context, &mut usage)
+                .await?;
+            if group.profile == ReviewGroupProfile::Tester {
+                tester_findings.extend(group_findings.clone());
+            }
+            findings.extend(group_findings);
+        }
+
+        for coverage_files in &coverage_groups {
+            let coverage_findings = self
+                .benchmark_scan_coverage_with_retries(
+                    worktree_path,
+                    coverage_files,
+                    &context,
+                    &tester_findings,
+                    mode,
+                    &mut usage,
+                )
+                .await?;
+            findings.extend(coverage_findings);
+        }
+
+        let mut audit_titles = BTreeSet::new();
+        if mode == ReviewScanMode::Split && coverage_groups.len() > 1 {
+            let relationships = groups
+                .iter()
+                .filter_map(|group| {
+                    (!group.relationship_summary.is_empty())
+                        .then_some(group.relationship_summary.as_str())
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let attempt = self
+                .scan_review_gap_audit(
+                    worktree_path,
+                    &files,
+                    &context,
+                    &relationships,
+                    &[],
+                    &findings,
+                )
+                .await;
+            accumulate_review_usage(&mut usage, &attempt.telemetry.usage);
+            if let Ok(audit) = attempt.result {
+                audit_titles.extend(
+                    audit
+                        .iter()
+                        .map(|finding| finding.title.to_ascii_lowercase()),
+                );
+                findings.extend(audit);
+            }
+        }
+
+        let (mut findings, _) = split_run_duplicate_findings(findings);
+        let mut verified = Vec::with_capacity(findings.len());
+        for finding in findings.drain(..) {
+            let requires_verification = matches!(
+                finding.severity,
+                ReviewSeverity::Critical | ReviewSeverity::High
+            ) || finding.category.eq_ignore_ascii_case("security")
+                || finding.line.is_none()
+                || finding.suggestion.is_some()
+                || audit_titles.contains(&finding.title.to_ascii_lowercase());
+            if !requires_verification {
+                verified.push(finding);
+                continue;
+            }
+            let Some(file) = files.iter().find(|file| file.path == finding.file) else {
+                continue;
+            };
+            let attempt = self
+                .verify_review_finding(worktree_path, file, &finding, &context)
+                .await;
+            accumulate_review_usage(&mut usage, &attempt.telemetry.usage);
+            match attempt.result {
+                Ok(ReviewVerification::Confirmed { .. }) => verified.push(finding),
+                Ok(ReviewVerification::RejectedFalsePositive { .. }) | Err(_) => {}
+                Ok(ReviewVerification::Revise {
+                    finding: revised, ..
+                }) => verified.push(revised),
+            }
+        }
+        let (findings, _) = split_run_duplicate_findings(verified);
+        Ok(ReviewBenchmarkOutcome {
+            findings,
+            usage: usage.unwrap_or_default(),
+        })
+    }
+
+    async fn benchmark_scan_group_with_retries(
+        &self,
+        worktree_path: &str,
+        group: &ReviewFileGroup,
+        context: &ReviewContext,
+        usage: &mut Option<ReviewTokenUsage>,
+    ) -> Result<Vec<ReviewFinding>> {
+        let first = self.scan_review_group(worktree_path, group, context).await;
+        accumulate_review_usage(usage, &first.telemetry.usage);
+        let raw = first.raw_output.clone();
+        if let Ok(findings) = first.result {
+            return Ok(findings);
+        }
+        if let Some(raw) = raw {
+            let reformatted = self
+                .reformat_review_group_output(worktree_path, group, &raw)
+                .await;
+            accumulate_review_usage(usage, &reformatted.telemetry.usage);
+            if let Ok(findings) = reformatted.result {
+                return Ok(findings);
+            }
+        }
+        let full = self.scan_review_group(worktree_path, group, context).await;
+        accumulate_review_usage(usage, &full.telemetry.usage);
+        full.result
+    }
+
+    async fn benchmark_scan_coverage_with_retries(
+        &self,
+        worktree_path: &str,
+        files: &[ReviewFile],
+        context: &ReviewContext,
+        tester_findings: &[ReviewFinding],
+        mode: ReviewScanMode,
+        usage: &mut Option<ReviewTokenUsage>,
+    ) -> Result<Vec<ReviewFinding>> {
+        let first = if mode == ReviewScanMode::Merged {
+            self.scan_review_merged(worktree_path, files, context, tester_findings)
+                .await
+        } else {
+            self.scan_review_coverage(worktree_path, files, context, tester_findings)
+                .await
+        };
+        accumulate_review_usage(usage, &first.telemetry.usage);
+        let raw = first.raw_output.clone();
+        if let Ok(findings) = first.result {
+            return Ok(findings);
+        }
+        if let Some(raw) = raw {
+            let reformatted = if mode == ReviewScanMode::Merged {
+                self.reformat_review_merged_output(worktree_path, files, &raw)
+                    .await
+            } else {
+                self.reformat_review_coverage_output(worktree_path, files, &raw)
+                    .await
+            };
+            accumulate_review_usage(usage, &reformatted.telemetry.usage);
+            if let Ok(findings) = reformatted.result {
+                return Ok(findings);
+            }
+        }
+        let full = if mode == ReviewScanMode::Merged {
+            self.scan_review_merged(worktree_path, files, context, tester_findings)
+                .await
+        } else {
+            self.scan_review_coverage(worktree_path, files, context, tester_findings)
+                .await
+        };
+        accumulate_review_usage(usage, &full.telemetry.usage);
+        full.result
     }
 
     /// Repair a malformed per-file result without sending the diff again.
@@ -6374,9 +6743,10 @@ fn parse_review_pr_json(body: &str) -> Option<(String, String, String, String)> 
 /// Every line present in the new version of a file gets its new-side line
 /// number inlined (removed lines stay unnumbered), and those numbers double
 /// as the commentable-lines set the AI's anchors are validated against.
-/// Deleted files are skipped — there is no new-side text to comment on. Pure
-/// renames and SVG/PDF binary metadata remain visible so placement/security
-/// review or an explicit deterministic skip can happen downstream.
+/// Whole-file deletions remain visible with their removed text and use
+/// file-level findings because they have no right-side anchor. Binary metadata
+/// also remains visible so the deterministic classifier can report why no
+/// textual judgment was possible.
 pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
     #[derive(Default)]
     struct Metadata {
@@ -6405,23 +6775,29 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
         if let Some(p) = path.take() {
             let pure_rename =
                 metadata.similarity_100 && metadata.rename_or_copy && !metadata.saw_hunk;
-            let visible_binary = metadata.binary
-                && Path::new(&p)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        extension.eq_ignore_ascii_case("svg")
-                            || extension.eq_ignore_ascii_case("pdf")
-                    });
-            if !metadata.deleted
-                && (pure_rename
-                    || metadata.rename_or_copy
-                    || visible_binary
-                    || (!metadata.binary && metadata.saw_hunk))
+            if metadata.deleted
+                || pure_rename
+                || metadata.rename_or_copy
+                || metadata.binary
+                || metadata.saw_hunk
             {
+                let change = if metadata.deleted && metadata.binary {
+                    "### CHANGE: deleted binary file\n"
+                } else if metadata.deleted {
+                    "### CHANGE: deleted text file (old-side evidence; file-level findings only)\n"
+                } else if metadata.binary {
+                    "### CHANGE: binary file (no textual evidence)\n"
+                } else if pure_rename {
+                    "### CHANGE: pure rename\n"
+                } else if metadata.rename_or_copy {
+                    "### CHANGE: rename/copy with content changes\n"
+                } else {
+                    ""
+                };
+                let evidence = std::mem::take(annotated).trim_end().to_string();
                 files.push(ReviewFile {
                     path: p,
-                    annotated_diff: std::mem::take(annotated).trim_end().to_string(),
+                    annotated_diff: format!("{change}{evidence}").trim_end().to_string(),
                     full_content: None,
                     commentable_lines: std::mem::take(commentable),
                     existing_comments: String::new(),
@@ -6459,6 +6835,10 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
             annotated.push('\n');
             continue;
         }
+        if line.starts_with("deleted file mode ") {
+            metadata.deleted = true;
+            continue;
+        }
         if let Some(to) = line
             .strip_prefix("rename to ")
             .or_else(|| line.strip_prefix("copy to "))
@@ -6477,7 +6857,6 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
         }
         if let Some(rest) = line.strip_prefix("+++ ") {
             if rest.trim() == "/dev/null" {
-                // Deleted file — no new side to comment on.
                 metadata.deleted = true;
             } else {
                 path = Some(
@@ -6508,11 +6887,11 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
             }
             continue;
         }
-        if !in_hunk || metadata.binary || metadata.deleted {
+        if !in_hunk || metadata.binary {
             continue;
         }
         match line.chars().next() {
-            Some('+') => {
+            Some('+') if !metadata.deleted => {
                 annotated.push_str(&format!("{new_line:>6} {line}\n"));
                 commentable.insert(new_line);
                 new_line += 1;
@@ -6524,12 +6903,13 @@ pub(crate) fn parse_review_diff(diff: &str) -> Vec<ReviewFile> {
                 // "\ No newline at end of file" — metadata, not content.
                 annotated.push_str(&format!("       {line}\n"));
             }
-            _ => {
+            _ if !metadata.deleted => {
                 // Context line — part of the new side, commentable on RIGHT.
                 annotated.push_str(&format!("{new_line:>6} {line}\n"));
                 commentable.insert(new_line);
                 new_line += 1;
             }
+            _ => {}
         }
     }
     flush(
@@ -6759,6 +7139,33 @@ async fn build_review_context(cwd: &Path, files: &[ReviewFile]) -> ReviewContext
             documents.push((name, content));
         }
     }
+    let coverage_inputs = files
+        .iter()
+        .map(|file| {
+            let evidence = file.full_content.as_deref().unwrap_or(&file.annotated_diff);
+            let symbols = file.full_content.as_deref().map_or_else(
+                || {
+                    file.annotated_diff
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("#### SYMBOL: "))
+                        .filter_map(|line| line.split_once(" (lines ").map(|(name, _)| name))
+                        .map(str::to_string)
+                        .collect()
+                },
+                |content| {
+                    extract_symbol_evidence(&file.path, content, &file.annotated_diff).symbols
+                },
+            );
+            ReviewCoverageInput {
+                path: file.path.clone(),
+                evidence: evidence.to_string(),
+                is_test: review_file_is_test(file),
+                deleted: review_file_is_deleted(file),
+                symbols,
+            }
+        })
+        .collect();
+    let coverage_ledger = build_coverage_ledger(root.clone(), coverage_inputs).await;
     ReviewContext {
         convention_docs: render_review_documents(&documents, REVIEW_REPO_CONTEXT_MAX_BYTES),
         directory_inventory: build_review_directory_inventory(
@@ -6770,7 +7177,7 @@ async fn build_review_context(cwd: &Path, files: &[ReviewFile]) -> ReviewContext
         changed_file_manifest: files
             .iter()
             .map(|file| {
-                let kind = if is_test_file(&file.path) {
+                let kind = if review_file_is_test(file) {
                     "test"
                 } else {
                     "application"
@@ -6779,6 +7186,7 @@ async fn build_review_context(cwd: &Path, files: &[ReviewFile]) -> ReviewContext
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        coverage_ledger,
     }
 }
 
@@ -6805,16 +7213,28 @@ async fn attach_review_file_contents(cwd: &Path, files: &mut [ReviewFile]) {
         let Ok(metadata) = tokio::fs::metadata(&path).await else {
             continue;
         };
-        if metadata.len() > REVIEW_FILE_INLINE_MAX_BYTES as u64 {
+        if metadata.len() > REVIEW_SYMBOL_SOURCE_MAX_BYTES as u64 {
+            file.annotated_diff.push_str(
+                "\n\nEVIDENCE-FALLBACK: file exceeds the deterministic extraction bound; read the real full file before completing this file's discovery judgment.",
+            );
             continue;
         }
         let Ok(bytes) = tokio::fs::read(path).await else {
             continue;
         };
-        if bytes.len() > REVIEW_FILE_INLINE_MAX_BYTES {
+        let Ok(content) = String::from_utf8(bytes) else {
+            file.annotated_diff.push_str(
+                "\n\nEVIDENCE-FALLBACK: current file is not UTF-8; inspect the real file with an appropriate repository tool before completing this file's discovery judgment.",
+            );
             continue;
+        };
+        if content.len() <= REVIEW_FILE_INLINE_MAX_BYTES {
+            file.full_content = Some(content);
+        } else {
+            let evidence = extract_symbol_evidence(&file.path, &content, &file.annotated_diff);
+            file.annotated_diff
+                .push_str(&format!("\n\n{}", evidence.rendered));
         }
-        file.full_content = String::from_utf8(bytes).ok();
     }
 }
 
@@ -6924,20 +7344,86 @@ fn review_scan_attempt(
     scan: String,
     prompt_bytes: usize,
     started: Instant,
-    usage: Option<(u64, u64)>,
+    usage: Option<ReviewTokenUsage>,
     result: Result<Vec<ReviewFinding>>,
     raw_output: Option<String>,
 ) -> ReviewScanAttempt {
     let findings = result.as_ref().map_or(0, Vec::len);
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    let scan_role = scan.split(':').next().unwrap_or("unknown").to_string();
+    let retry_role = if scan.starts_with("reformat:") {
+        "reformat"
+    } else if scan.starts_with("revision:") {
+        "revision"
+    } else {
+        "initial"
+    };
     ReviewScanAttempt {
         result,
         raw_output,
         telemetry: ReviewScanTelemetry {
             scan,
+            scan_role,
+            retry_role: retry_role.to_string(),
             prompt_bytes,
-            tokens_in: usage.map(|value| value.0),
-            tokens_out: usage.map(|value| value.1),
+            usage: usage.unwrap_or_default(),
+            duration_ms,
+            findings,
+        },
+    }
+}
+
+fn accumulate_review_usage(total: &mut Option<ReviewTokenUsage>, next: &ReviewTokenUsage) {
+    let Some(current) = total.as_mut() else {
+        *total = Some(next.clone());
+        return;
+    };
+    current.uncached_input = current
+        .uncached_input
+        .zip(next.uncached_input)
+        .map(|(left, right)| left.saturating_add(right));
+    current.cache_read = current
+        .cache_read
+        .zip(next.cache_read)
+        .map(|(left, right)| left.saturating_add(right));
+    current.cache_write = current
+        .cache_write
+        .zip(next.cache_write)
+        .map(|(left, right)| left.saturating_add(right));
+    current.output = current
+        .output
+        .zip(next.output)
+        .map(|(left, right)| left.saturating_add(right));
+    current.reasoning = current
+        .reasoning
+        .zip(next.reasoning)
+        .map(|(left, right)| left.saturating_add(right));
+    current.cost_usd = current
+        .cost_usd
+        .zip(next.cost_usd)
+        .map(|(left, right)| left + right);
+}
+
+fn review_verification_attempt(
+    scan: String,
+    prompt_bytes: usize,
+    started: Instant,
+    usage: Option<ReviewTokenUsage>,
+    result: Result<ReviewVerification>,
+) -> ReviewVerificationAttempt {
+    let findings = usize::from(matches!(
+        &result,
+        Ok(ReviewVerification::Confirmed { .. } | ReviewVerification::Revise { .. })
+    ));
+    let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    ReviewVerificationAttempt {
+        result,
+        telemetry: ReviewScanTelemetry {
+            scan,
+            scan_role: "verification".to_string(),
+            retry_role: "initial".to_string(),
+            prompt_bytes,
+            usage: usage.unwrap_or_default(),
             duration_ms,
             findings,
         },
@@ -6957,10 +7443,10 @@ async fn materialize_review_tables() -> String {
     path.to_string_lossy().to_string()
 }
 
-/// Deterministic pre-filter: files nobody reviews by hand are excluded
-/// before any AI call — each skipped file would otherwise cost a full
-/// scan (prompt + diff) for feedback no author wants. The cheap classifiers
-/// are deterministic, reproducible, and visible on the final report.
+/// Legacy path classifier retained for diagnostics and benchmark fixtures.
+/// These classes are not sufficient proof that a textual change is harmless,
+/// so [`review_file_skip_reason`] does not use them as unconditional skips.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn review_skip_reason(path: &str) -> Option<&'static str> {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
     let mut parts = lower.rsplit('/');
@@ -7008,25 +7494,61 @@ pub(crate) fn review_skip_reason(path: &str) -> Option<&'static str> {
 }
 
 fn review_file_skip_reason(file: &ReviewFile) -> Option<&'static str> {
-    review_skip_reason(&file.path)
-        .or_else(|| review_diff_is_blank_only(file).then_some("blank lines only"))
-        .or_else(|| is_oversized_review_fixture(file).then_some("oversized test fixture"))
+    if review_file_is_binary(file) {
+        return Some("binary file without reviewable text");
+    }
+    review_diff_is_blank_only(file).then_some("blank lines only")
 }
 
-fn is_oversized_review_fixture(file: &ReviewFile) -> bool {
-    if file.annotated_diff.len() <= REVIEW_FIXTURE_DIFF_MAX_BYTES {
-        return false;
+fn review_file_is_deleted(file: &ReviewFile) -> bool {
+    file.annotated_diff.starts_with("### CHANGE: deleted ")
+}
+
+fn review_file_is_binary(file: &ReviewFile) -> bool {
+    file.annotated_diff.starts_with("### CHANGE: binary file")
+        || file
+            .annotated_diff
+            .starts_with("### CHANGE: deleted binary file")
+}
+
+const PROJECT_TEST_PATTERNS_FILE: &str = ".wisetree-review-tests";
+const PROJECT_TEST_PATTERNS_MAX_BYTES: usize = 16 * 1024;
+const PROJECT_TEST_CLASSIFICATION: &str = "### CLASSIFICATION: test file (project pattern)\n";
+
+async fn apply_project_test_patterns(cwd: &Path, files: &mut [ReviewFile]) {
+    let path = cwd.join(PROJECT_TEST_PATTERNS_FILE);
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return;
+    };
+    if bytes.len() > PROJECT_TEST_PATTERNS_MAX_BYTES {
+        return;
     }
-    let lower = file.path.replace('\\', "/").to_ascii_lowercase();
-    let mut parts = lower.split('/').peekable();
-    while let Some(part) = parts.next() {
-        if parts.peek().is_some()
-            && matches!(part, "fixture" | "fixtures" | "testdata" | "test_data")
-        {
-            return true;
+    let Ok(text) = String::from_utf8(bytes) else {
+        return;
+    };
+    let patterns = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let mut builder = GlobSetBuilder::new();
+    let mut count = 0usize;
+    for pattern in patterns {
+        if let Ok(glob) = Glob::new(pattern) {
+            builder.add(glob);
+            count += 1;
         }
     }
-    false
+    if count == 0 {
+        return;
+    }
+    let Ok(patterns) = builder.build() else {
+        return;
+    };
+    for file in files {
+        if patterns.is_match(&file.path) && !review_file_is_test(file) {
+            file.annotated_diff = format!("{PROJECT_TEST_CLASSIFICATION}{}", file.annotated_diff);
+        }
+    }
 }
 
 fn review_diff_is_blank_only(file: &ReviewFile) -> bool {
@@ -7080,7 +7602,26 @@ pub(crate) fn is_test_file(path: &str) -> bool {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
     let mut parts = lower.rsplit('/');
     let name = parts.next().unwrap_or_default();
-    if parts.any(|dir| matches!(dir, "test" | "tests" | "spec" | "specs" | "__tests__")) {
+    if parts.any(|dir| {
+        matches!(
+            dir,
+            "test"
+                | "tests"
+                | "spec"
+                | "specs"
+                | "__tests__"
+                | "e2e"
+                | "integration"
+                | "integrations"
+                | "feature"
+                | "features"
+                | "acceptance"
+                | "cypress"
+        )
+    }) {
+        return true;
+    }
+    if name.ends_with(".feature") {
         return true;
     }
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
@@ -7090,6 +7631,11 @@ pub(crate) fn is_test_file(path: &str) -> bool {
         || stem.ends_with(".test")
         || stem.ends_with("_spec")
         || stem.ends_with(".spec")
+        || stem.ends_with(".cy")
+}
+
+pub(crate) fn review_file_is_test(file: &ReviewFile) -> bool {
+    file.annotated_diff.starts_with(PROJECT_TEST_CLASSIFICATION) || is_test_file(&file.path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7136,7 +7682,7 @@ fn build_review_scan_prompt(
     context: &ReviewContext,
     tables_path: &str,
 ) -> String {
-    let profile = if is_test_file(&file.path) {
+    let profile = if review_file_is_test(file) {
         ReviewGroupProfile::Tester
     } else {
         ReviewGroupProfile::Application
@@ -7149,6 +7695,16 @@ fn build_review_group_prompt(
     profile: ReviewGroupProfile,
     context: &ReviewContext,
     tables_path: &str,
+) -> String {
+    build_review_group_prompt_with_relationships(files, profile, context, tables_path, "")
+}
+
+fn build_review_group_prompt_with_relationships(
+    files: &[ReviewFile],
+    profile: ReviewGroupProfile,
+    context: &ReviewContext,
+    tables_path: &str,
+    relationship_summary: &str,
 ) -> String {
     const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer_application.md");
     const TESTER_PROMPT: &str = include_str!("../../prompts/reviewer_tester.md");
@@ -7175,16 +7731,27 @@ fn build_review_group_prompt(
     let diff = files
         .iter()
         .map(|file| {
+            let evidence = review_file_evidence(file, false);
+            let evidence_id = review_evidence_id("changed-file", &file.path, &evidence);
             format!(
-                "### FILE: {}\n{}",
+                "### FILE: {}\nEVIDENCE-ID: {evidence_id}\n{}",
                 file.path,
-                truncate_for_prompt(&review_file_evidence(file, false), REVIEW_DIFF_MAX_BYTES)
+                truncate_for_prompt(&evidence, REVIEW_DIFF_MAX_BYTES)
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
     let full_content = "(included once in the authoritative numbered file evidence below)";
     let context = context.rendered();
+    let context_id = review_evidence_id("repository-context", "shared", &context);
+    let relationships = if relationship_summary.trim().is_empty() {
+        "(no cross-group relationships)"
+    } else {
+        relationship_summary
+    };
+    let context = format!(
+        "EVIDENCE-ID: {context_id}\n{context}\n\n### Cross-group relationship edges\n{relationships}"
+    );
     substitute_review_prompt(
         template,
         &[
@@ -7243,6 +7810,162 @@ fn build_review_revision_prompt(
             ("USER_FEEDBACK", feedback),
         ],
     )
+}
+
+fn build_review_verifier_prompt(
+    file: &ReviewFile,
+    finding: &ReviewFinding,
+    context: &ReviewContext,
+    suggestion_validation: &str,
+) -> String {
+    const VERIFIER_PROMPT: &str = include_str!("../../prompts/reviewer_verify.md");
+    let local_evidence = truncate_for_prompt(&review_file_evidence(file, false), 24 * 1024);
+    let paths = BTreeSet::from([file.path.as_str()]);
+    let coverage = context.coverage_ledger.render_for_paths(&paths, &[]);
+    let related = truncate_for_prompt(
+        &format!(
+            "### Conventions\n{}\n\n### Directory inventory\n{}\n\n### Coverage relationship\n{}",
+            context.convention_docs, context.directory_inventory, coverage
+        ),
+        12 * 1024,
+    );
+    substitute_review_prompt(
+        VERIFIER_PROMPT,
+        &[
+            ("CANDIDATE_FINDING", &finding.rendered_for_revision()),
+            ("LOCAL_EVIDENCE", &local_evidence),
+            ("RELATED_EVIDENCE", &related),
+            ("SUGGESTION_VALIDATION", suggestion_validation),
+        ],
+    )
+}
+
+async fn validate_review_suggestion_isolated(file: &ReviewFile, finding: &ReviewFinding) -> String {
+    let deterministic = deterministic_suggestion_validation(file, finding);
+    if !deterministic.starts_with("VALID-RANGE:") {
+        return deterministic;
+    }
+    let (Some(content), Some(suggestion), Some(end)) = (
+        file.full_content.as_deref(),
+        finding.suggestion.as_deref(),
+        finding.line,
+    ) else {
+        return deterministic;
+    };
+    let start = finding.start_line.unwrap_or(end);
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    if start == 0 || end < start || end as usize > lines.len() {
+        return "INVALID: replacement range falls outside the inlined current file.".to_string();
+    }
+    lines.splice(
+        start as usize - 1..end as usize,
+        suggestion.lines().map(str::to_string),
+    );
+    let candidate = format!("{}\n", lines.join("\n"));
+    let digest = blake3::hash(format!("{}\0{start}\0{end}\0{suggestion}", file.path).as_bytes());
+    let directory =
+        std::env::temp_dir().join(format!("wisetree-review-verify-{}", &digest.to_hex()[..16]));
+    if tokio::fs::create_dir(&directory).await.is_err() {
+        return format!("{deterministic} Isolated parser/formatter check unavailable.");
+    }
+    let name = Path::new(&file.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("candidate.txt");
+    let candidate_path = directory.join(name);
+    let check = if tokio::fs::write(&candidate_path, candidate).await.is_err() {
+        "isolated write failed".to_string()
+    } else {
+        let extension = candidate_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let candidate_arg = candidate_path.to_string_lossy().to_string();
+        match extension {
+            "rs" => match run_command(
+                Path::new("rustfmt"),
+                &["--check", &candidate_arg],
+                Some(&directory),
+            )
+            .await
+            {
+                Ok(_) => "isolated rustfmt parse/format check passed".to_string(),
+                Err(error) => format!("isolated rustfmt check failed: {}", clip(&error, 240)),
+            },
+            "py" => match run_command(
+                Path::new("python3"),
+                &["-m", "py_compile", &candidate_arg],
+                Some(&directory),
+            )
+            .await
+            {
+                Ok(_) => "isolated Python parser check passed".to_string(),
+                Err(error) => format!("isolated Python parser check failed: {}", clip(&error, 240)),
+            },
+            _ => "no safe local parser/formatter registered for this extension".to_string(),
+        }
+    };
+    let _ = tokio::fs::remove_dir_all(&directory).await;
+    format!("{deterministic} {check}.")
+}
+
+fn deterministic_suggestion_validation(file: &ReviewFile, finding: &ReviewFinding) -> String {
+    let Some(suggestion) = finding.suggestion.as_deref() else {
+        return "No direct suggestion; prose concern only.".to_string();
+    };
+    let Some(end) = finding.line else {
+        return "INVALID: a file-level finding cannot carry an applicable GitHub suggestion."
+            .to_string();
+    };
+    let start = finding.start_line.unwrap_or(end);
+    let Some(current) = diff_lines_text(&file.annotated_diff, start, end) else {
+        return "INVALID: the targeted replacement range is not fully present in authoritative new-side evidence."
+            .to_string();
+    };
+    if code_lines_equal(&current, suggestion) {
+        return "INVALID: the replacement is a no-op.".to_string();
+    }
+    if suggestion.is_empty() {
+        return format!("VALID-RANGE: direct deletion of authoritative lines {start}-{end}.");
+    }
+    let delimiters = review_delimiter_balance(suggestion);
+    if delimiters != 0 {
+        return format!(
+            "NEEDS-REVISION: replacement range {start}-{end} has unbalanced delimiters ({delimiters})."
+        );
+    }
+    format!(
+        "VALID-RANGE: replacement differs from authoritative lines {start}-{end} and has balanced delimiters; verifier must still judge semantics."
+    )
+}
+
+fn parse_review_verification(output: &str, file: &ReviewFile) -> Option<ReviewVerification> {
+    const BEGIN: &str = "===WISETREE-VERIFY-BEGIN===";
+    const END: &str = "===WISETREE-VERIFY-END===";
+    let after = &output[output.find(BEGIN)? + BEGIN.len()..];
+    let block = &after[..after.find(END)?];
+    let field = |name: &str| {
+        block
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&format!("{name}:")).map(str::trim))
+    };
+    let reason = field("REASON").unwrap_or_default().to_string();
+    match field("VERDICT")? {
+        "CONFIRMED" => Some(ReviewVerification::Confirmed { reason }),
+        "REJECTED_FALSE_POSITIVE" => Some(ReviewVerification::RejectedFalsePositive { reason }),
+        "REVISE" => {
+            let chunk = block.split("---FINDING---").nth(1)?;
+            let chunk = chunk.split("---END-FINDING---").next().unwrap_or(chunk);
+            let finding = parse_review_finding_chunk(
+                chunk,
+                &file.path,
+                &file.commentable_lines,
+                &file.annotated_diff,
+            )?;
+            Some(ReviewVerification::Revise { reason, finding })
+        }
+        _ => None,
+    }
 }
 
 fn focused_review_diff(file: &ReviewFile, anchor: Option<u64>) -> String {
@@ -7331,11 +8054,22 @@ fn build_review_whole_diff_prompt(
 ) -> String {
     let mut diff = String::new();
     for file in files {
-        diff.push_str(&format!("### FILE: {}\n", file.path));
-        diff.push_str(&truncate_for_prompt(
-            &review_file_evidence(file, is_test_file(&file.path)),
-            REVIEW_DIFF_MAX_BYTES,
+        let evidence = if review_file_is_test(file) {
+            review_coverage_test_evidence(file)
+        } else {
+            review_file_evidence(file, false)
+        };
+        let kind = if review_file_is_test(file) {
+            "changed-test-digest"
+        } else {
+            "coverage-application"
+        };
+        let evidence_id = review_evidence_id(kind, &file.path, &evidence);
+        diff.push_str(&format!(
+            "### FILE: {}\nEVIDENCE-ID: {evidence_id}\n",
+            file.path
         ));
+        diff.push_str(&truncate_for_prompt(&evidence, REVIEW_DIFF_MAX_BYTES));
         diff.push_str("\n\n");
     }
     let mut comments = String::new();
@@ -7354,24 +8088,221 @@ fn build_review_whole_diff_prompt(
     };
     let diff = truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES);
     let test_file_inventory = review_test_file_inventory(files, &context.directory_inventory);
+    let application_paths = files
+        .iter()
+        .filter(|file| !review_file_is_test(file))
+        .map(|file| file.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let tester_links = tester_findings
+        .iter()
+        .map(|finding| (finding.file.clone(), finding.title.clone()))
+        .collect::<Vec<_>>();
+    let coverage_ledger = context
+        .coverage_ledger
+        .render_for_paths(&application_paths, &tester_links);
     let context = context.rendered();
+    let context_id = review_evidence_id("repository-context", "shared", &context);
+    let context = format!("EVIDENCE-ID: {context_id}\n{context}");
     let tester_findings = format_test_quality_findings(tester_findings, files);
     let tester_findings = if tester_findings.is_empty() {
-        "(none)"
+        "(none)".to_string()
     } else {
-        &tester_findings
+        let id = review_evidence_id("tester-findings", "shared", &tester_findings);
+        format!("EVIDENCE-ID: {id}\n{tester_findings}")
     };
     substitute_review_prompt(
         template,
         &[
             ("TABLES_PATH", tables_path.unwrap_or("")),
             ("REPO_CONTEXT", &context),
-            ("TEST_QUALITY_FINDINGS", tester_findings),
+            ("TEST_QUALITY_FINDINGS", &tester_findings),
+            ("COVERAGE_LEDGER", &coverage_ledger),
             ("TEST_FILE_INVENTORY", &test_file_inventory),
             ("EXISTING_COMMENTS", &existing),
             ("FULL_DIFF", &diff),
         ],
     )
+}
+
+fn build_review_gap_audit_prompt(
+    files: &[ReviewFile],
+    context: &ReviewContext,
+    relationship_edges: &str,
+    skipped: &[ReviewSkippedFile],
+    existing_findings: &[ReviewFinding],
+) -> String {
+    const GAP_AUDIT_PROMPT: &str = include_str!("../../prompts/reviewer_gap_audit.md");
+    let application_paths = files
+        .iter()
+        .filter(|file| !review_file_is_test(file))
+        .map(|file| file.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let coverage = context
+        .coverage_ledger
+        .render_for_paths(&application_paths, &[]);
+    let manifest = format!(
+        "{}\n\n### Changed behavior IDs\n{}",
+        context.changed_file_manifest, coverage
+    );
+    let skips = if skipped.is_empty() {
+        "(none)".to_string()
+    } else {
+        skipped
+            .iter()
+            .map(|file| format!("- `{}` — {}", file.path, file.reason))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let findings = if existing_findings.is_empty() {
+        "(none)".to_string()
+    } else {
+        existing_findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "- {} [{}] {}",
+                    finding.descriptor(),
+                    finding.category,
+                    compact_review_text(&finding.title, 120)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    substitute_review_prompt(
+        GAP_AUDIT_PROMPT,
+        &[
+            (
+                "GLOBAL_MANIFEST",
+                &truncate_for_prompt(&manifest, 24 * 1024),
+            ),
+            (
+                "RELATIONSHIP_EDGES",
+                if relationship_edges.trim().is_empty() {
+                    "(none)"
+                } else {
+                    relationship_edges
+                },
+            ),
+            (
+                "COVERAGE_LEDGER",
+                &truncate_for_prompt(&coverage, 16 * 1024),
+            ),
+            ("SKIP_DECISIONS", &skips),
+            (
+                "EXISTING_FINDINGS",
+                &truncate_for_prompt(&findings, 8 * 1024),
+            ),
+        ],
+    )
+}
+
+fn parse_gap_audit_findings(output: &str, files: &[ReviewFile]) -> Option<Vec<ReviewFinding>> {
+    Some(
+        parse_multi_file_findings(output, files, None)?
+            .into_iter()
+            .filter(|finding| {
+                !finding.category.eq_ignore_ascii_case("test quality")
+                    && !finding.category.eq_ignore_ascii_case("test")
+            })
+            .collect(),
+    )
+}
+
+fn review_evidence_id(kind: &str, owner: &str, evidence: &str) -> String {
+    let digest = blake3::hash(format!("{kind}\0{owner}\0{evidence}").as_bytes());
+    format!("{kind}:{}", &digest.to_hex()[..16])
+}
+
+fn review_coverage_test_evidence(file: &ReviewFile) -> String {
+    if review_file_is_deleted(file) {
+        return review_file_evidence(file, true);
+    }
+    format!(
+        "### CHANGED TEST ASSERTION DIGEST (read `{}` for unresolved coverage questions)\n{}",
+        file.path,
+        review_test_skeleton(file)
+    )
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReviewPromptEvidenceStats {
+    bytes_by_role: BTreeMap<String, usize>,
+    bytes_by_kind: BTreeMap<String, usize>,
+    repeated_bytes_by_kind: BTreeMap<String, usize>,
+}
+
+#[derive(Default)]
+struct ReviewEvidenceLedger {
+    seen: HashSet<String>,
+    stats: ReviewPromptEvidenceStats,
+}
+
+impl ReviewEvidenceLedger {
+    fn record(&mut self, role: &str, kind: &str, owner: &str, evidence: &str) {
+        *self
+            .stats
+            .bytes_by_role
+            .entry(role.to_string())
+            .or_default() += evidence.len();
+        *self
+            .stats
+            .bytes_by_kind
+            .entry(kind.to_string())
+            .or_default() += evidence.len();
+        let key = review_evidence_id(kind, owner, evidence);
+        if !self.seen.insert(key) {
+            *self
+                .stats
+                .repeated_bytes_by_kind
+                .entry(kind.to_string())
+                .or_default() += evidence.len();
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn review_prompt_evidence_stats(
+    files: &[ReviewFile],
+    mode: ReviewScanMode,
+    context: &ReviewContext,
+    tester_findings: &[ReviewFinding],
+) -> ReviewPromptEvidenceStats {
+    let mut ledger = ReviewEvidenceLedger::default();
+    let context = context.rendered();
+    for group in review_file_groups(files, mode) {
+        let role = match group.profile {
+            ReviewGroupProfile::Application => "application",
+            ReviewGroupProfile::Tester => "tester",
+        };
+        ledger.record(role, "repository-context", "shared", &context);
+        for file in &group.files {
+            let evidence = review_file_evidence(file, false);
+            ledger.record(role, "changed-file", &file.path, &evidence);
+        }
+    }
+    let tester_findings = format_test_quality_findings(tester_findings, files);
+    for (index, group) in review_coverage_groups(files, mode).iter().enumerate() {
+        let role = if mode == ReviewScanMode::Merged {
+            "merged".to_string()
+        } else {
+            format!("coverage-{index}")
+        };
+        ledger.record(&role, "repository-context", "shared", &context);
+        if !tester_findings.is_empty() {
+            ledger.record(&role, "tester-findings", "shared", &tester_findings);
+        }
+        for file in group {
+            if review_file_is_test(file) {
+                let evidence = review_coverage_test_evidence(file);
+                ledger.record(&role, "changed-test-digest", &file.path, &evidence);
+            } else {
+                let evidence = review_file_evidence(file, false);
+                ledger.record(&role, "coverage-application", &file.path, &evidence);
+            }
+        }
+    }
+    ledger.stats
 }
 
 fn review_test_skeleton(file: &ReviewFile) -> String {
@@ -7498,7 +8429,7 @@ fn is_test_assertion_line(code: &str) -> bool {
 fn review_test_file_inventory(files: &[ReviewFile], directory_inventory: &str) -> String {
     let mut paths = files
         .iter()
-        .filter(|file| is_test_file(&file.path))
+        .filter(|file| review_file_is_test(file))
         .map(|file| file.path.clone())
         .collect::<BTreeSet<_>>();
     let mut directory = String::new();
@@ -7598,17 +8529,36 @@ fn compact_review_text(value: &str, max_bytes: usize) -> String {
 }
 
 fn review_file_evidence(file: &ReviewFile, slim_unavailable_test: bool) -> String {
+    if review_file_is_deleted(file) {
+        return format!(
+            "### DELETED FILE (complete retained old-side evidence; no right-side anchors)\n{}\n\n\
+             (the path no longer exists; judge removed behavior from this evidence and use file-level findings)",
+            file.annotated_diff
+        );
+    }
     let Some(content) = file.full_content.as_deref() else {
-        let diff = if slim_unavailable_test && is_test_file(&file.path) {
+        let diff = if slim_unavailable_test && review_file_is_test(file) {
             review_test_skeleton(file)
         } else {
             file.annotated_diff.clone()
         };
-        return format!(
-            "### NUMBERED DIFF HUNKS (authoritative anchors)\n{diff}\n\n\
-             (current file was not inlined — read `{}` before any structural finding)",
-            file.path
-        );
+        let guidance = if diff.contains("EVIDENCE-FALLBACK:") {
+            format!(
+                "extraction was unavailable or ambiguous — MUST read `{}` before completing this file's discovery judgment",
+                file.path
+            )
+        } else if diff.contains("### ENCLOSING SYMBOL EVIDENCE") {
+            format!(
+                "complete enclosing symbols were extracted; read `{}` only for a specific unresolved relationship",
+                file.path
+            )
+        } else {
+            format!(
+                "current file was not inlined — MUST read `{}` before completing this file's discovery judgment",
+                file.path
+            )
+        };
+        return format!("### NUMBERED DIFF HUNKS (authoritative anchors)\n{diff}\n\n({guidance})");
     };
 
     let changed = file
@@ -7620,6 +8570,10 @@ fn review_file_evidence(file: &ReviewFile, slim_unavailable_test: bool) -> Strin
     let mut rendered = String::from(
         "### NUMBERED CURRENT FILE (`+` marks changed lines; numbers are authoritative anchors)\n",
     );
+    let symbols = extract_symbol_evidence(&file.path, content, &file.annotated_diff).symbols;
+    if !symbols.is_empty() {
+        rendered.push_str(&format!("Changed symbols: {}\n", symbols.join(", ")));
+    }
     if content.is_empty() {
         rendered.push_str("(empty current file)\n");
     } else {
@@ -7838,15 +8792,17 @@ fn parse_review_finding_chunk(
     // #6 of the token-saving plan: a SUGGESTION that reproduces the current
     // lines verbatim is a no-op the author could "apply" for nothing — a
     // known model failure. Strip the block and keep the finding as prose.
-    let suggestion = suggestion.filter(|body| {
-        let Some(end) = line else {
-            return true; // file-level: no lines to compare against
-        };
-        match diff_lines_text(annotated_diff, start_line.unwrap_or(end), end) {
-            Some(current) => !code_lines_equal(body, &current),
-            None => true,
-        }
-    });
+    let suggestion = suggestion
+        .filter(|_| !(line.is_none() && annotated_diff.starts_with("### CHANGE: deleted ")))
+        .filter(|body| {
+            let Some(end) = line else {
+                return true; // file-level: no lines to compare against
+            };
+            match diff_lines_text(annotated_diff, start_line.unwrap_or(end), end) {
+                Some(current) => !code_lines_equal(body, &current),
+                None => true,
+            }
+        });
 
     Some(ReviewFinding {
         category: normalize_review_category(&header("CATEGORY").unwrap_or_default()),
@@ -8354,9 +9310,9 @@ new file mode 100644
     #[test]
     fn parse_review_diff_splits_files_and_numbers_new_side_lines() {
         let files = parse_review_diff(SAMPLE_DIFF);
-        // Deleted + binary files are skipped: only the modified and the new
-        // file survive.
-        assert_eq!(files.len(), 2, "{files:?}");
+        // Text deletions remain reviewable; binary metadata stays visible for
+        // the deterministic no-text classifier.
+        assert_eq!(files.len(), 4, "{files:?}");
 
         let lib = &files[0];
         assert_eq!(lib.path, "src/lib.rs");
@@ -8372,7 +9328,20 @@ new file mode 100644
         assert!(lib.annotated_diff.contains("    12 +let c = 3;"));
         assert!(lib.annotated_diff.contains("       -let b = 2;"));
 
-        let new = &files[1];
+        let deleted = &files[1];
+        assert_eq!(deleted.path, "gone.rs");
+        assert!(deleted
+            .annotated_diff
+            .contains("### CHANGE: deleted text file"));
+        assert!(deleted.annotated_diff.contains("       -old"));
+        assert!(deleted.annotated_diff.contains("       -lines"));
+        assert!(deleted.commentable_lines.is_empty());
+
+        let binary = &files[2];
+        assert_eq!(binary.path, "logo.png");
+        assert!(review_file_is_binary(binary));
+
+        let new = &files[3];
         assert_eq!(new.path, "new.rs");
         assert_eq!(new.commentable_lines, BTreeSet::from([1, 2]));
     }
@@ -8381,7 +9350,24 @@ new file mode 100644
     fn parse_review_diff_returns_empty_for_no_text_changes() {
         assert!(parse_review_diff("").is_empty());
         let binary_only = "diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n";
-        assert!(parse_review_diff(binary_only).is_empty());
+        let files = parse_review_diff(binary_only);
+        assert_eq!(files.len(), 1);
+        let (reviewable, skipped) = partition_reviewable_files(files);
+        assert!(reviewable.is_empty());
+        assert_eq!(skipped[0].reason, "binary file without reviewable text");
+    }
+
+    #[tokio::test]
+    async fn benchmark_review_diff_returns_without_model_calls_for_empty_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let service =
+            DashboardService::new(directory.path().to_path_buf(), DashboardConfig::default());
+        let outcome = service
+            .benchmark_review_diff(directory.path().to_str().unwrap(), "")
+            .await
+            .unwrap();
+        assert!(outcome.findings.is_empty());
+        assert_eq!(outcome.usage, ReviewTokenUsage::default());
     }
 
     #[test]
@@ -8402,24 +9388,35 @@ deleted file mode 100644
 Binary files a/gone.pdf and /dev/null differ
 ";
         let files = parse_review_diff(diff);
-        assert_eq!(files.len(), 3, "{files:?}");
+        assert_eq!(files.len(), 4, "{files:?}");
         assert_eq!(files[0].path, "src/new.rs");
         assert_eq!(files[1].path, "assets/icon.svg");
         assert_eq!(files[2].path, "docs/manual.pdf");
+        assert_eq!(files[3].path, "gone.pdf");
         let (reviewable, skipped) = partition_reviewable_files(files);
         assert_eq!(
             reviewable
                 .iter()
                 .map(|file| file.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["src/new.rs", "assets/icon.svg"]
+            vec!["src/new.rs"]
         );
         assert_eq!(
             skipped,
-            vec![ReviewSkippedFile {
-                path: "docs/manual.pdf".to_string(),
-                reason: "binary-adjacent asset",
-            }]
+            vec![
+                ReviewSkippedFile {
+                    path: "assets/icon.svg".to_string(),
+                    reason: "binary file without reviewable text",
+                },
+                ReviewSkippedFile {
+                    path: "docs/manual.pdf".to_string(),
+                    reason: "binary file without reviewable text",
+                },
+                ReviewSkippedFile {
+                    path: "gone.pdf".to_string(),
+                    reason: "binary file without reviewable text",
+                },
+            ]
         );
     }
 
@@ -8451,6 +9448,46 @@ index 333..444 100644
             .iter()
             .all(|file| file.commentable_lines.is_empty()));
         assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn whole_file_authorization_and_test_deletions_remain_reviewable() {
+        let diff = "\
+diff --git a/src/policy.rs b/src/policy.rs
+deleted file mode 100644
+--- a/src/policy.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-pub fn authorize(user: &User) -> bool {
+-    user.is_admin()
+diff --git a/features/admin_access.feature b/features/admin_access.feature
+deleted file mode 100644
+--- a/features/admin_access.feature
++++ /dev/null
+@@ -1,2 +0,0 @@
+-Feature: admin access
+-  Scenario: rejects normal users
+";
+        let (files, skipped) = partition_reviewable_files(parse_review_diff(diff));
+        assert!(skipped.is_empty());
+        assert_eq!(files.len(), 2);
+        assert!(review_file_is_deleted(&files[0]));
+        assert!(!review_file_is_test(&files[0]));
+        assert!(review_file_is_deleted(&files[1]));
+        assert!(review_file_is_test(&files[1]));
+        assert!(review_file_evidence(&files[0], false).contains("user.is_admin"));
+
+        let output = "===WISETREE-REVIEW-BEGIN===\n---FINDING---\nCATEGORY: Security\nSEVERITY: High\nFILE: src/policy.rs\nLINE:\nSTART_LINE:\nTITLE: Authorization policy was removed\n---EXPLANATION---\nDeleting this policy removes the access check.\n---SUGGESTION---\nrestore it\n---END-FINDING---\n===WISETREE-REVIEW-END===";
+        let findings = parse_review_findings(
+            output,
+            &files[0].path,
+            &files[0].commentable_lines,
+            &files[0].annotated_diff,
+        )
+        .unwrap();
+        assert!(findings[0].line.is_none());
+        assert!(findings[0].suggestion.is_none());
+        assert!(!findings[0].comment_body().contains("```suggestion"));
     }
 
     #[test]
@@ -9038,6 +10075,7 @@ copy to src/copied_again.rs
             convention_docs: "#### AGENTS.md\nUse surgical changes.".to_string(),
             directory_inventory: "#### src\n- lib.rs\n- main.rs".to_string(),
             changed_file_manifest: "- src/lib.rs (application)".to_string(),
+            coverage_ledger: ReviewCoverageLedger::default(),
         };
         let prompt = build_review_scan_prompt(&file, &context, "/tmp/tables.md");
         assert!(prompt.contains("src/lib.rs"));
@@ -9070,7 +10108,8 @@ copy to src/copied_again.rs
             ..file
         };
         let prompt = build_review_scan_prompt(&not_inlined, &ReviewContext::default(), "/tmp/t.md");
-        assert!(prompt.contains("read `src/lib.rs` before any structural finding"));
+        assert!(prompt
+            .contains("MUST read `src/lib.rs` before completing this file's discovery judgment"));
     }
 
     #[test]
@@ -9130,7 +10169,8 @@ copy to src/copied_again.rs
         };
         let evidence = review_file_evidence(&unavailable, false);
         assert!(evidence.contains("NUMBERED DIFF HUNKS"));
-        assert!(evidence.contains("read `src/empty.rs` before any structural finding"));
+        assert!(evidence
+            .contains("MUST read `src/empty.rs` before completing this file's discovery judgment"));
     }
 
     #[test]
@@ -9292,6 +10332,140 @@ copy to src/copied_again.rs
     }
 
     #[test]
+    fn verifier_prompt_is_candidate_local_and_parser_handles_all_verdicts() {
+        let file = ReviewFile {
+            path: "src/auth.rs".to_string(),
+            annotated_diff: "@@ -1 +1 @@\n     1 +authorize(user);".to_string(),
+            full_content: Some("authorize(user);\n".to_string()),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let finding = ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: file.path.clone(),
+            start_line: None,
+            line: Some(1),
+            title: "Authorization is bypassed".to_string(),
+            explanation: "The new call trusts an unchecked user.".to_string(),
+            suggestion: Some("authorize_checked(user);".to_string()),
+        };
+        let prompt =
+            build_review_verifier_prompt(&file, &finding, &ReviewContext::default(), "VALID-RANGE");
+        assert!(prompt.contains("Authorization is bypassed"));
+        assert!(prompt.contains("authorize(user)"));
+        assert!(prompt.contains("VALID-RANGE"));
+        assert!(!prompt.contains("FULL_DIFF"));
+
+        let confirmed = "===WISETREE-VERIFY-BEGIN===\nVERDICT: CONFIRMED\nREASON: Evidence supports it.\n===WISETREE-VERIFY-END===";
+        assert!(matches!(
+            parse_review_verification(confirmed, &file),
+            Some(ReviewVerification::Confirmed { .. })
+        ));
+        let rejected = "===WISETREE-VERIFY-BEGIN===\nVERDICT: REJECTED_FALSE_POSITIVE\nREASON: Existing guard applies.\n===WISETREE-VERIFY-END===";
+        assert!(matches!(
+            parse_review_verification(rejected, &file),
+            Some(ReviewVerification::RejectedFalsePositive { .. })
+        ));
+        let revised = "===WISETREE-VERIFY-BEGIN===\nVERDICT: REVISE\nREASON: Correct concern, wrong fix.\n---FINDING---\nCATEGORY: Security\nSEVERITY: Medium\nFILE: src/auth.rs\nLINE: 1\nSTART_LINE:\nTITLE: Validate the user before authorization\n---EXPLANATION---\nUse the checked principal.\n---SUGGESTION---\nauthorize_checked(user);\n---END-FINDING---\n===WISETREE-VERIFY-END===";
+        assert!(matches!(
+            parse_review_verification(revised, &file),
+            Some(ReviewVerification::Revise {
+                finding: ReviewFinding {
+                    severity: ReviewSeverity::Medium,
+                    line: Some(1),
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(parse_review_verification("VERDICT: CONFIRMED", &file).is_none());
+    }
+
+    #[tokio::test]
+    async fn suggestion_validation_isolated_from_the_worktree_and_checks_ranges() {
+        let file = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "@@ -1 +1 @@\n     1 +fn value() -> i32 { 1 }".to_string(),
+            full_content: Some("fn value() -> i32 { 1 }\n".to_string()),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let finding = ReviewFinding {
+            category: "Code Smell".to_string(),
+            severity: ReviewSeverity::Medium,
+            file: file.path.clone(),
+            start_line: None,
+            line: Some(1),
+            title: "Return the configured value".to_string(),
+            explanation: String::new(),
+            suggestion: Some("fn value() -> i32 { 2 }".to_string()),
+        };
+        let before = file.full_content.clone();
+        let validation = validate_review_suggestion_isolated(&file, &finding).await;
+        assert!(validation.contains("VALID-RANGE"), "{validation}");
+        assert_eq!(
+            file.full_content, before,
+            "validation must not mutate source"
+        );
+
+        let mut invalid = finding;
+        invalid.line = None;
+        assert!(deterministic_suggestion_validation(&file, &invalid).starts_with("INVALID"));
+    }
+
+    #[test]
+    fn gap_audit_prompt_is_compact_and_cannot_become_coverage_owner() {
+        let file = ReviewFile {
+            path: "src/auth.rs".to_string(),
+            annotated_diff: "@@ -1 +1 @@\n     1 +authorize(user);".to_string(),
+            full_content: Some("authorize(user);\n".to_string()),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let existing = ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: file.path.clone(),
+            start_line: None,
+            line: Some(1),
+            title: "Existing authorization finding".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        };
+        let prompt = build_review_gap_audit_prompt(
+            std::slice::from_ref(&file),
+            &ReviewContext {
+                changed_file_manifest: "- src/auth.rs (application)".to_string(),
+                ..ReviewContext::default()
+            },
+            "- edge:abc: `src/auth.rs` ↔ `api.rs` (reference)",
+            &[ReviewSkippedFile {
+                path: "logo.png".to_string(),
+                reason: "binary file without reviewable text",
+            }],
+            &[existing],
+        );
+        assert!(prompt.contains("edge:abc"));
+        assert!(prompt.contains("Existing authorization finding"));
+        assert!(prompt.contains("logo.png"));
+        assert!(prompt.contains("`Test Quality` is forbidden"));
+        assert!(
+            !prompt.contains("authorize(user);"),
+            "audit must not resend full code"
+        );
+        assert!(prompt.len() < 64 * 1024);
+
+        let output = "===WISETREE-REVIEW-BEGIN===\n---FINDING---\nCATEGORY: Convention\nSEVERITY: Medium\nFILE: src/auth.rs\nLINE: 1\nSTART_LINE:\nTITLE: Consumer rename was missed\n---EXPLANATION---\nedge:abc remains stale.\n---END-FINDING---\n---FINDING---\nCATEGORY: Test Quality\nSEVERITY: Low\nFILE: src/auth.rs\nLINE: 1\nSTART_LINE:\nTITLE: Add a test\n---EXPLANATION---\nForbidden coverage duplicate.\n---END-FINDING---\n===WISETREE-REVIEW-END===";
+        let findings = parse_gap_audit_findings(output, &[file]).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "Consumer rename was missed");
+    }
+
+    #[test]
     fn build_review_reformat_prompt_contains_only_contract_and_previous_output() {
         let previous = "malformed OUTPUT_CONTRACT response";
         let file = build_review_reformat_prompt(ReviewReformatProfile::File, previous);
@@ -9346,7 +10520,7 @@ copy to src/copied_again.rs
     }
 
     #[test]
-    fn partition_reviewable_files_splits_and_keeps_reasons() {
+    fn risky_text_classes_are_reviewed_instead_of_unconditionally_skipped() {
         let file = |path: &str| ReviewFile {
             path: path.to_string(),
             annotated_diff: String::new(),
@@ -9357,15 +10531,10 @@ copy to src/copied_again.rs
         };
         let (reviewable, skipped) =
             partition_reviewable_files(vec![file("src/lib.rs"), file("Cargo.lock")]);
-        assert_eq!(reviewable.len(), 1);
+        assert_eq!(reviewable.len(), 2);
         assert_eq!(reviewable[0].path, "src/lib.rs");
-        assert_eq!(
-            skipped,
-            vec![ReviewSkippedFile {
-                path: "Cargo.lock".to_string(),
-                reason: "lockfile",
-            }]
-        );
+        assert_eq!(reviewable[1].path, "Cargo.lock");
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -9422,7 +10591,7 @@ copy to src/copied_again.rs
     }
 
     #[test]
-    fn oversized_fixtures_are_removed_before_scan_mode_routing() {
+    fn oversized_fixtures_remain_visible_to_review_routing() {
         let file = |path: &str, bytes: usize| ReviewFile {
             path: path.to_string(),
             annotated_diff: "x".repeat(bytes),
@@ -9439,23 +10608,8 @@ copy to src/copied_again.rs
         );
 
         let (reviewable, skipped) = partition_reviewable_files(vec![fixture, app]);
-        assert_eq!(review_scan_mode(&reviewable), ReviewScanMode::Merged);
-        assert_eq!(skipped[0].reason, "oversized test fixture");
-
-        let (at_cap, _) = partition_reviewable_files(vec![file(
-            "tests/fixtures/small.json",
-            REVIEW_FIXTURE_DIFF_MAX_BYTES,
-        )]);
-        assert_eq!(at_cap.len(), 1, "the threshold itself remains reviewable");
-        let (ambiguous, _) = partition_reviewable_files(vec![file(
-            "examples/large.json",
-            REVIEW_FIXTURE_DIFF_MAX_BYTES + 1,
-        )]);
-        assert_eq!(
-            ambiguous.len(),
-            1,
-            "ambiguous fixture paths remain reviewable"
-        );
+        assert_eq!(review_scan_mode(&reviewable), ReviewScanMode::Split);
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -9470,6 +10624,10 @@ copy to src/copied_again.rs
             "src/app.spec.js",
             "tests/test_parser.py",
             "conftest.py",
+            "e2e/login.ts",
+            "integration/payment.rs",
+            "features/sign_in.feature",
+            "cypress/login.cy.ts",
         ] {
             assert!(is_test_file(path), "{path} should be a test file");
         }
@@ -9482,6 +10640,31 @@ copy to src/copied_again.rs
         ] {
             assert!(!is_test_file(path), "{path} should be a source file");
         }
+    }
+
+    #[tokio::test]
+    async fn project_test_patterns_take_precedence_over_path_heuristics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(PROJECT_TEST_PATTERNS_FILE),
+            "checks/**/*.contract.ts\n# ignored\n",
+        )
+        .unwrap();
+        let mut files = vec![ReviewFile {
+            path: "checks/api/user.contract.ts".to_string(),
+            annotated_diff: "     1 +expect(result).toEqual(ok)".to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        }];
+        assert!(!is_test_file(&files[0].path));
+        apply_project_test_patterns(dir.path(), &mut files).await;
+        assert!(review_file_is_test(&files[0]));
+        assert_eq!(
+            review_file_groups(&files, ReviewScanMode::Split)[0].profile,
+            ReviewGroupProfile::Tester
+        );
     }
 
     #[test]
@@ -9576,6 +10759,34 @@ copy to src/copied_again.rs
         }
     }
 
+    #[tokio::test]
+    async fn large_supported_files_receive_bounded_symbol_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let padding = "// padding\n".repeat(2_000);
+        let source = format!(
+            "{padding}\n#[allow(dead_code)]\npub async fn changed_handler() {{\n    let value = load();\n    validate(value);\n}}\n"
+        );
+        std::fs::write(dir.path().join("large.rs"), source).unwrap();
+        let mut files = vec![ReviewFile {
+            path: "large.rs".to_string(),
+            annotated_diff: "@@ -2002,5 +2002,5 @@\n  2002  #[allow(dead_code)]\n  2003  pub async fn changed_handler() {\n  2004 +    let value = load();\n  2005      validate(value);\n  2006  }"
+                .to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([2002, 2003, 2004, 2005, 2006]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        }];
+        attach_review_file_contents(dir.path(), &mut files).await;
+        assert!(files[0].full_content.is_none());
+        assert!(files[0]
+            .annotated_diff
+            .contains("### ENCLOSING SYMBOL EVIDENCE"));
+        assert!(files[0].annotated_diff.contains("changed_handler"));
+        assert!(!files[0].annotated_diff.contains("EVIDENCE-FALLBACK"));
+        let prompt_evidence = review_file_evidence(&files[0], false);
+        assert!(prompt_evidence.contains("complete enclosing symbols were extracted"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn review_context_and_inlining_do_not_follow_paths_outside_the_worktree() {
@@ -9627,6 +10838,7 @@ copy to src/copied_again.rs
             directory_inventory: "shared inventory".to_string(),
             changed_file_manifest: "- src/source.rs (application)\n- tests/source_test.rs (test)"
                 .to_string(),
+            coverage_ledger: ReviewCoverageLedger::default(),
         };
         let source_prompt = build_review_scan_prompt(&source, &context, "/tmp/t.md");
         let test_prompt = build_review_scan_prompt(&test, &context, "/tmp/t.md");
@@ -9676,6 +10888,7 @@ copy to src/copied_again.rs
             directory_inventory: "#### src\n- lib.rs\n- lib_test.rs".to_string(),
             changed_file_manifest: "- src/lib.rs (application)\n- tests/lib_test.rs (test)"
                 .to_string(),
+            coverage_ledger: ReviewCoverageLedger::default(),
         };
         let tester_findings = vec![ReviewFinding {
             category: "Test".to_string(),
@@ -9764,15 +10977,20 @@ copy to src/copied_again.rs
             vec!["src/a.rs", "src/b.rs", "src/oversized.rs", "src/tail.rs"]
         );
         assert_eq!(groups.len(), 4);
-        assert!(groups
-            .iter()
-            .all(|group| group.iter().any(|file| file.path == "tests/a_test.rs")));
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|group| group.iter().any(|file| file.path == "tests/a_test.rs"))
+                .count(),
+            1,
+            "related changed test evidence must have one owning coverage group"
+        );
         assert_eq!(groups[2][0].path, "src/oversized.rs");
         assert_eq!(groups[3][0].path, "src/tail.rs");
     }
 
     #[test]
-    fn file_groups_batch_by_profile_directory_and_focus_budget() {
+    fn file_groups_prioritize_relationships_over_directory_proximity() {
         let file = |path: &str, bytes: usize| ReviewFile {
             path: path.to_string(),
             annotated_diff: "x".repeat(bytes),
@@ -9790,19 +11008,65 @@ copy to src/copied_again.rs
             file("tests/oversized_test.rs", REVIEW_MERGED_FOCUS_BYTES + 1),
         ];
         let groups = review_file_groups(&files, ReviewScanMode::Split);
-        assert_eq!(groups.len(), 4);
+        assert_eq!(groups.len(), 6);
         assert_eq!(groups[0].profile, ReviewGroupProfile::Tester);
-        assert_eq!(groups[0].files.len(), 2);
-        assert_eq!(groups[1].files[0].path, "tests/oversized_test.rs");
-        assert_eq!(groups[1].files.len(), 1);
-        assert_eq!(groups[2].profile, ReviewGroupProfile::Application);
-        assert_eq!(groups[2].files.len(), 2, "exact boundary stays grouped");
-        assert_eq!(groups[3].files[0].path, "other/c.rs");
+        assert_eq!(groups[0].files[0].path, "tests/a_test.rs");
+        assert_eq!(groups[1].files[0].path, "tests/b_test.rs");
+        assert_eq!(groups[2].files[0].path, "tests/oversized_test.rs");
+        assert_eq!(groups[3].profile, ReviewGroupProfile::Application);
+        assert_eq!(groups[3].files[0].path, "src/a.rs");
+        assert_eq!(groups[4].files[0].path, "src/b.rs");
+        assert_eq!(groups[5].files[0].path, "other/c.rs");
 
         let merged = review_file_groups(&files, ReviewScanMode::Merged);
         assert!(merged
             .iter()
             .all(|group| group.profile == ReviewGroupProfile::Tester));
+    }
+
+    #[test]
+    fn prompt_evidence_stats_expose_roles_kinds_and_repetition() {
+        let file = |path: &str, body: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: format!("     1 +{body}"),
+            full_content: Some(body.to_string()),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let files = vec![
+            file("src/auth.rs", "fn authenticate() {}"),
+            file("src/billing.rs", "fn charge() {}"),
+            file("tests/auth_test.rs", "assert!(authenticate())"),
+        ];
+        let context = ReviewContext {
+            convention_docs: "rules".to_string(),
+            directory_inventory: "tests/auth_test.rs".to_string(),
+            changed_file_manifest: "all files".to_string(),
+            coverage_ledger: ReviewCoverageLedger::default(),
+        };
+        let stats = review_prompt_evidence_stats(&files, ReviewScanMode::Split, &context, &[]);
+        assert!(stats.bytes_by_role.contains_key("application"));
+        assert!(stats.bytes_by_role.contains_key("tester"));
+        assert!(stats.bytes_by_role.contains_key("coverage-0"));
+        assert!(stats.bytes_by_kind.contains_key("changed-file"));
+        assert!(stats.bytes_by_kind.contains_key("changed-test-digest"));
+        assert_eq!(
+            stats
+                .repeated_bytes_by_kind
+                .get("changed-test-digest")
+                .copied()
+                .unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            stats
+                .repeated_bytes_by_kind
+                .get("coverage-application")
+                .copied()
+                .unwrap_or_default(),
+            0
+        );
     }
 
     #[test]
@@ -9883,6 +11147,7 @@ copy to src/copied_again.rs
             directory_inventory: "merged inventory".to_string(),
             changed_file_manifest: "- src/lib.rs (application)\n- tests/lib_test.rs (test)"
                 .to_string(),
+            coverage_ledger: ReviewCoverageLedger::default(),
         };
         let tester_findings = vec![ReviewFinding {
             category: "Test".to_string(),
@@ -9902,7 +11167,11 @@ copy to src/copied_again.rs
         assert!(prompt.contains("**Test Quality** finding"));
         assert!(prompt.contains("### FILE: src/lib.rs"));
         assert!(prompt.contains("### FILE: tests/lib_test.rs"));
-        assert!(!prompt.contains("let fixture = expensive_setup();"));
+        assert_eq!(
+            prompt.matches("let fixture = expensive_setup();").count(),
+            1
+        );
+        assert!(prompt.contains("assert!(x);"));
         assert!(prompt.contains("/tmp/tables.md"));
         assert!(!prompt.contains("TABLES_PATH"));
         assert!(prompt.contains("merged convention"));
@@ -9910,7 +11179,7 @@ copy to src/copied_again.rs
         assert!(prompt.contains("never your ability to read the real files"));
         assert!(!prompt.contains("### FULL CURRENT FILE CONTENT APPENDIX"));
         assert!(prompt.contains("fn merged_body() {}"));
-        assert!(prompt.contains("fn test_body() { expensive_setup(); }"));
+        assert!(!prompt.contains("fn test_body() { expensive_setup(); }"));
         assert!(prompt.contains("Bounded files appear once"));
         assert!(
             prompt.contains("- tests/lib_test.rs — Over-mocked flow: Mocks the unit under test.")
@@ -10136,6 +11405,7 @@ copy to src/copied_again.rs
             convention_docs: String::new(),
             directory_inventory: "#### src\n- helper.rs\n- lib.rs\n- lib_test.rs".to_string(),
             changed_file_manifest: String::new(),
+            coverage_ledger: ReviewCoverageLedger::default(),
         };
         let rendered =
             review_test_file_inventory(&[app.clone(), file.clone()], &context.directory_inventory);

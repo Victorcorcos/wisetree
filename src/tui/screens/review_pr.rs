@@ -35,6 +35,7 @@
 //! choice here.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -48,7 +49,7 @@ use crate::messages::colors;
 use crate::services::dashboard::{
     review_coverage_groups, review_file_groups, split_duplicate_findings,
     split_run_duplicate_findings, ReviewContext, ReviewFile, ReviewFileGroup, ReviewFinding,
-    ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile,
+    ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile, ReviewVerification,
 };
 use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
@@ -254,6 +255,11 @@ pub struct ReviewPullRequestScreen {
     /// Findings aggregated across every scanned file, sorted by severity
     /// once scanning completes.
     findings: Vec<ReviewFinding>,
+    skipped_files: Vec<ReviewSkippedFile>,
+    gap_audit_started: bool,
+    audit_finding_titles: BTreeSet<String>,
+    verification_outstanding: BTreeSet<usize>,
+    verification_results: Vec<Option<ReviewFinding>>,
     /// Index of the finding currently on the Decision step.
     current: usize,
     /// Findings actually posted, in posting order — the summary's input.
@@ -303,6 +309,11 @@ impl ReviewPullRequestScreen {
             in_flight: Vec::new(),
             scans_done: 0,
             findings: Vec::new(),
+            skipped_files: Vec::new(),
+            gap_audit_started: false,
+            audit_finding_titles: BTreeSet::new(),
+            verification_outstanding: BTreeSet::new(),
+            verification_results: Vec::new(),
             current: 0,
             posted: Vec::new(),
             summary_body: String::new(),
@@ -643,6 +654,7 @@ impl ReviewPullRequestScreen {
     /// muted row each on the final report, reason in the status label —
     /// the user sees why a changed file never produced findings.
     pub fn record_skipped_files(&mut self, skipped: &[ReviewSkippedFile]) {
+        self.skipped_files.extend_from_slice(skipped);
         for file in skipped {
             self.summary_rows.push(SummaryRow::with_status(
                 format!("skip {}", file.path),
@@ -714,6 +726,92 @@ impl ReviewPullRequestScreen {
         ));
     }
 
+    pub fn should_run_gap_audit(&self) -> bool {
+        !self.gap_audit_started
+            && self.scan_mode == ReviewScanMode::Split
+            && self.coverage_groups.len() > 1
+            && self
+                .files
+                .iter()
+                .any(|file| !crate::services::dashboard::review_file_is_test(file))
+    }
+
+    pub fn begin_gap_audit(&mut self) {
+        self.gap_audit_started = true;
+        self.scanning = true;
+        self.phase_message = "Auditing cross-group omissions...".to_string();
+    }
+
+    pub fn gap_audit_inputs(
+        &self,
+    ) -> (
+        String,
+        Vec<ReviewFile>,
+        ReviewContext,
+        String,
+        Vec<ReviewSkippedFile>,
+        Vec<ReviewFinding>,
+    ) {
+        let edges = self
+            .scan_groups
+            .iter()
+            .filter_map(|(_, group)| {
+                (!group.relationship_summary.is_empty())
+                    .then_some(group.relationship_summary.as_str())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            self.request.worktree_path.clone(),
+            self.files.clone(),
+            self.context.clone(),
+            edges,
+            self.skipped_files.clone(),
+            self.findings.clone(),
+        )
+    }
+
+    pub fn record_gap_audit_result(&mut self, result: Result<Vec<ReviewFinding>, String>) {
+        self.scanning = false;
+        match result {
+            Ok(findings) => {
+                let existing = self
+                    .findings
+                    .iter()
+                    .map(|finding| {
+                        (
+                            finding.file.clone(),
+                            finding.line,
+                            finding.title.to_ascii_lowercase(),
+                        )
+                    })
+                    .collect::<BTreeSet<_>>();
+                for finding in findings {
+                    let key = (
+                        finding.file.clone(),
+                        finding.line,
+                        finding.title.to_ascii_lowercase(),
+                    );
+                    if existing.contains(&key) {
+                        self.record_run_duplicate_findings(std::slice::from_ref(&finding));
+                        continue;
+                    }
+                    self.audit_finding_titles
+                        .insert(finding.title.to_ascii_lowercase());
+                    self.findings.push(finding);
+                }
+            }
+            Err(message) => self.summary_rows.push(SummaryRow::with_status(
+                "global omission audit",
+                "Failed — primary findings kept",
+                colors::WARNING,
+                Some(message),
+            )),
+        }
+    }
+
     /// Scanning finished: sort the aggregate by severity (Critical first)
     /// and by diff order within a severity, so the walkthrough order is
     /// deterministic even though parallel scans finish in arbitrary order.
@@ -735,6 +833,99 @@ impl ReviewPullRequestScreen {
         let (kept, duplicates) = split_run_duplicate_findings(std::mem::take(&mut self.findings));
         self.findings = kept;
         self.record_run_duplicate_findings(&duplicates);
+        self.current = 0;
+        !self.findings.is_empty()
+    }
+
+    pub fn begin_verification(&mut self) -> Vec<(usize, ReviewFile, ReviewFinding)> {
+        self.verification_results = self.findings.iter().cloned().map(Some).collect();
+        let mut candidates = Vec::new();
+        for (index, finding) in self.findings.iter().enumerate() {
+            if !self.finding_requires_verification(finding) {
+                continue;
+            }
+            if let Some(file) = self.files.iter().find(|file| file.path == finding.file) {
+                self.verification_outstanding.insert(index);
+                candidates.push((index, file.clone(), finding.clone()));
+            }
+        }
+        if !candidates.is_empty() {
+            self.scanning = true;
+            self.phase_message = format!("Verifying {} high-risk findings...", candidates.len());
+        }
+        candidates
+    }
+
+    fn finding_requires_verification(&self, finding: &ReviewFinding) -> bool {
+        finding.severity.rank() <= ReviewSeverity::High.rank()
+            || finding.category.eq_ignore_ascii_case("security")
+            || finding.line.is_none()
+            || finding.suggestion.is_some()
+            || self
+                .audit_finding_titles
+                .contains(&finding.title.to_ascii_lowercase())
+            || self.scan_groups.iter().any(|(_, group)| {
+                !group.relationship_summary.is_empty()
+                    && group
+                        .relationship_summary
+                        .contains(&format!("`{}`", finding.file))
+            })
+    }
+
+    pub fn record_verification(
+        &mut self,
+        index: usize,
+        result: Result<ReviewVerification, String>,
+    ) {
+        if !self.verification_outstanding.remove(&index) {
+            return;
+        }
+        match result {
+            Ok(ReviewVerification::Confirmed { .. }) => {}
+            Ok(ReviewVerification::RejectedFalsePositive { reason }) => {
+                self.verification_results[index] = None;
+                self.summary_rows.push(SummaryRow::with_status(
+                    format!("verify {}", self.findings[index].descriptor()),
+                    "Rejected false positive",
+                    colors::MUTED,
+                    (!reason.is_empty()).then_some(reason),
+                ));
+            }
+            Ok(ReviewVerification::Revise { reason, finding }) => {
+                self.verification_results[index] = Some(finding);
+                self.summary_rows.push(SummaryRow::with_status(
+                    format!("verify {}", self.findings[index].descriptor()),
+                    "Revised",
+                    colors::EMPHASIS,
+                    (!reason.is_empty()).then_some(reason),
+                ));
+            }
+            Err(message) => {
+                self.verification_results[index] = None;
+                self.summary_rows.push(SummaryRow::with_status(
+                    format!("verify {}", self.findings[index].descriptor()),
+                    "Unverified — withheld",
+                    colors::WARNING,
+                    Some(message),
+                ));
+            }
+        }
+        self.phase_message = format!(
+            "Verifying high-risk findings ({} remaining)...",
+            self.verification_outstanding.len()
+        );
+    }
+
+    pub fn verification_pending(&self) -> bool {
+        !self.verification_outstanding.is_empty()
+    }
+
+    pub fn finish_verification(&mut self) -> bool {
+        self.scanning = false;
+        self.findings = std::mem::take(&mut self.verification_results)
+            .into_iter()
+            .flatten()
+            .collect();
         self.current = 0;
         !self.findings.is_empty()
     }
@@ -1941,7 +2132,7 @@ fn build_detail_lines(request: &ReviewPullRequestRequest) -> Vec<Line<'static>> 
 /// owns the numbering + styling.
 const REVIEW_STEPS: [&str; 7] = [
     "Sync the branch + fetch the PR diff and its existing comments",
-    "Lockfiles, minified/generated files and snapshots are skipped (no AI cost)",
+    "Only binary or blank-only changes are skipped; risky text changes stay reviewable",
     "AI scans files in parallel; one whole-diff pass alone judges test coverage",
     "You choose Post / Edit / Other / Skip per finding (Edit is AI-free)",
     "Approved findings are posted as inline PR comments (with suggestions)",
@@ -2284,20 +2475,17 @@ mod tests {
         let indices = (0..2)
             .map(|_| screen.take_next_scan_file().unwrap().0)
             .collect::<Vec<_>>();
-        assert_eq!(
-            indices,
-            vec![FILE_GROUP_SCAN_INDEX, FILE_GROUP_SCAN_INDEX - 1]
-        );
+        assert_eq!(indices, vec![1, 2]);
         assert!(screen.take_coverage_scan().is_none());
 
         let weak = finding("tests/a_test.rs", Some(3), ReviewSeverity::Medium);
+        let second_weak = finding("tests/b_test.rs", Some(2), ReviewSeverity::Low);
         screen.record_tester_findings(indices[0], std::slice::from_ref(&weak));
-        screen.record_tester_findings(
-            indices[1],
-            &[finding("src/a.rs", Some(2), ReviewSeverity::Low)],
-        );
+        screen.record_tester_findings(indices[1], std::slice::from_ref(&second_weak));
         screen.note_scan_done(indices[0]);
-        assert_eq!(screen.tester_findings(), vec![weak]);
+        assert_eq!(screen.tester_findings(), vec![weak, second_weak]);
+        assert!(screen.take_coverage_scan().is_none());
+        screen.note_scan_done(indices[1]);
         assert_eq!(screen.take_coverage_scan().unwrap().1.len(), 4);
     }
 
@@ -2376,6 +2564,124 @@ mod tests {
             .find(|r| r.status.as_ref().is_some_and(|s| s.label == "Duplicate"))
             .expect("a Duplicate row should be recorded");
         assert!(dup_row.command.contains("a.rs:9"));
+    }
+
+    #[test]
+    fn verification_policy_filters_high_risk_and_withholds_failures() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        let mut low_prose = finding_with("a.rs", Some(2), ReviewSeverity::Low, None);
+        low_prose.category = "Code Smell".to_string();
+        low_prose.title = "Minor naming issue".to_string();
+        let mut high = finding_with("a.rs", Some(2), ReviewSeverity::High, None);
+        high.title = "High impact bug".to_string();
+        let mut suggestion = finding_with("a.rs", Some(3), ReviewSeverity::Low, Some("fixed"));
+        suggestion.category = "Convention".to_string();
+        suggestion.title = "Direct replacement".to_string();
+        screen.record_scan_result(vec![low_prose.clone(), high, suggestion]);
+        assert!(screen.finish_scanning());
+        let candidates = screen.begin_verification();
+        assert_eq!(
+            candidates.len(),
+            2,
+            "low-severity prose should bypass verifier"
+        );
+        let rejected = candidates[0].0;
+        screen.record_verification(
+            rejected,
+            Ok(ReviewVerification::RejectedFalsePositive {
+                reason: "guard already applies".to_string(),
+            }),
+        );
+        let failed = candidates[1].0;
+        screen.record_verification(failed, Err("malformed verifier output".to_string()));
+        assert!(!screen.verification_pending());
+        assert!(screen.finish_verification());
+        assert_eq!(screen.findings, vec![low_prose]);
+        assert!(screen.summary_rows.iter().any(|row| row
+            .status
+            .as_ref()
+            .is_some_and(|status| status.label == "Unverified — withheld")));
+    }
+
+    #[test]
+    fn verifier_revision_replaces_candidate_without_colliding_shared_anchor() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        let mut first = finding_with("a.rs", Some(2), ReviewSeverity::High, None);
+        first.title = "First concern".to_string();
+        let mut second = finding_with("a.rs", Some(2), ReviewSeverity::High, None);
+        second.title = "Second concern".to_string();
+        screen.record_scan_result(vec![first, second.clone()]);
+        screen.finish_scanning();
+        let candidates = screen.begin_verification();
+        let mut revised = candidates[0].2.clone();
+        revised.title = "Corrected first concern".to_string();
+        screen.record_verification(
+            candidates[0].0,
+            Ok(ReviewVerification::Revise {
+                reason: "anchor retained".to_string(),
+                finding: revised.clone(),
+            }),
+        );
+        screen.record_verification(
+            candidates[1].0,
+            Ok(ReviewVerification::Confirmed {
+                reason: "independent concern".to_string(),
+            }),
+        );
+        screen.finish_verification();
+        assert_eq!(screen.findings.len(), 2);
+        assert!(screen.findings.contains(&revised));
+        assert!(screen.findings.contains(&second));
+    }
+
+    #[test]
+    fn gap_audit_runs_only_for_decomposed_application_reviews() {
+        let mut large = file("src/large.rs");
+        large.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_MERGED_FOCUS_BYTES);
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![large, file("src/tail.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        assert!(screen.should_run_gap_audit());
+        screen.begin_gap_audit();
+        assert!(!screen.should_run_gap_audit());
+        assert!(screen.scan_phase_active());
+
+        let mut tests_only = ReviewPullRequestScreen::new(request(), test_ai());
+        tests_only.set_files(
+            vec![file("tests/a_test.rs"), file("e2e/login.cy.ts")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        assert!(!tests_only.should_run_gap_audit());
+    }
+
+    #[test]
+    fn gap_audit_failure_keeps_primary_findings_and_duplicates_are_suppressed() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        let primary = finding_with("a.rs", Some(2), ReviewSeverity::Medium, None);
+        screen.record_scan_result(vec![primary.clone()]);
+        screen.record_gap_audit_result(Ok(vec![primary.clone()]));
+        assert_eq!(screen.findings, vec![primary.clone()]);
+        assert!(screen.summary_rows.iter().any(|row| row
+            .status
+            .as_ref()
+            .is_some_and(|status| status.label == "Duplicate")));
+
+        screen.record_gap_audit_result(Err("audit unavailable".to_string()));
+        assert_eq!(screen.findings, vec![primary]);
+        assert!(screen.summary_rows.iter().any(|row| {
+            row.status
+                .as_ref()
+                .is_some_and(|status| status.label == "Failed — primary findings kept")
+        }));
     }
 
     #[test]
@@ -2882,9 +3188,17 @@ mod tests {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.record_scan_telemetry(ReviewScanTelemetry {
             scan: "app:a.rs".to_string(),
+            scan_role: "application".to_string(),
+            retry_role: "initial".to_string(),
             prompt_bytes: 1200,
-            tokens_in: Some(40_000),
-            tokens_out: Some(8_000),
+            usage: crate::services::review_telemetry::ReviewTokenUsage {
+                uncached_input: Some(40_000),
+                cache_read: Some(0),
+                cache_write: Some(0),
+                output: Some(8_000),
+                reasoning: Some(0),
+                cost_usd: None,
+            },
             duration_ms: 250,
             findings: 1,
         });
@@ -2898,7 +3212,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].status.as_ref().unwrap().label,
-            "~48k tokens across 1 call"
+            "~48k logical tokens across 1 call"
         );
     }
 

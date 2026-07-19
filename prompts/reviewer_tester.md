@@ -11,7 +11,9 @@ The harness supplies a repository-context digest below with root conventions and
 
 Read a source, sibling test, or root convention file only for that specific ambiguity. The digest replaces default exploratory reads, never your ability to read the real files. Reading is context, never a deliverable. Never modify anything.
 
-When a current test file fits the inline budget, the harness supplies one authoritative numbered full-file view: `+` marks changed current lines, unchanged lines provide structure, and a compact removed-lines block preserves deleted test behavior. When evidence instead says the file was not inlined, you MUST read the real file before emitting any structural finding. New-side numbers remain authoritative anchors; removed lines are context only.
+When a current test file fits the inline budget, the harness supplies one authoritative numbered full-file view: `+` marks changed current lines, unchanged lines provide structure, and a compact removed-lines block preserves deleted test behavior. Large supported files carry complete enclosing-symbol evidence. When evidence carries `EVIDENCE-FALLBACK`, you MUST read the real file before completing that file's discovery judgment. New-side numbers remain authoritative anchors; removed lines are context only.
+
+A `DELETED FILE` section is authoritative old-side evidence. Judge lost or weakened protection from the removed test, emit a file-level finding with an empty `LINE`, and never emit a suggestion for a deleted file.
 
 ## What to look for
 

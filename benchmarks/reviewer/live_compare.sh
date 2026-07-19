@@ -1,29 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: bash benchmarks/reviewer/live_compare.sh <pipeline-adapter> <skill-adapter> <model> <thinking> <repetitions>" >&2
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+  echo "usage: bash benchmarks/reviewer/live_compare.sh <model> <thinking> <repetitions> [timeout-seconds]" >&2
   exit 2
 fi
 
-pipeline_adapter=$1
-skill_adapter=$2
-model=$3
-thinking=$4
-repetitions=$5
-corpus=benchmarks/reviewer/corpus.json
+model=$1
+thinking=$2
+repetitions=$3
+timeout_seconds=${4:-240}
+pipeline_adapter=benchmarks/reviewer/review_adapter.sh
+skill_adapter=benchmarks/reviewer/skill_adapter.sh
+corpus=${WISETREE_REVIEWER_HOLDOUT_CORPUS:-benchmarks/reviewer/corpus.public.json}
+
+if [[ -n "${WISETREE_REVIEWER_HOLDOUT_CORPUS:-}" ]]; then
+  if [[ -z "${WISETREE_REVIEWER_HOLDOUT_HASH:-}" ]]; then
+    echo "live benchmark unavailable: WISETREE_REVIEWER_HOLDOUT_HASH is required for a private holdout" >&2
+    exit 3
+  fi
+  cargo run --quiet --bin reviewer_corpus -- \
+    validate-private "$corpus" "$WISETREE_REVIEWER_HOLDOUT_HASH"
+fi
 
 if [[ ! -x "$pipeline_adapter" || ! -x "$skill_adapter" ]]; then
   echo "live benchmark unavailable: both adapter paths must be executable" >&2
   exit 3
 fi
-if [[ ! "$repetitions" =~ ^[1-9][0-9]*$ ]]; then
-  echo "live benchmark unavailable: repetitions must be a positive integer" >&2
+if [[ ! "$repetitions" =~ ^[1-9][0-9]*$ || ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  echo "live benchmark unavailable: repetitions and timeout must be positive integers" >&2
   exit 3
 fi
 
-capture_dir=$(mktemp -d)
-trap 'rm -rf "$capture_dir"' EXIT
+run_id=$(date -u +%Y%m%dT%H%M%SZ)
+capture_dir=${WISETREE_REVIEWER_CAPTURE_DIR:-"benchmarks/reviewer/captured/live-$run_id"}
+mkdir -p "$capture_dir"
 
 run_adapter() {
   local adapter=$1
@@ -33,6 +47,7 @@ run_adapter() {
     --model "$model" \
     --thinking "$thinking" \
     --repetitions "$repetitions" \
+    --timeout-seconds "$timeout_seconds" \
     --output "$output" \
     --read-only; then
     echo "live benchmark unavailable: adapter failed (check model credentials and telemetry)" >&2
@@ -47,3 +62,5 @@ cargo run --quiet --bin reviewer_benchmark -- \
   "$corpus" \
   "$capture_dir/pipeline.json" \
   "$capture_dir/skill.json"
+
+echo "live captures: $capture_dir"

@@ -43,8 +43,8 @@ use crate::services::{
     DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
     FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
     OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewContext, ReviewFile,
-    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, Shell,
-    ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification,
+    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -206,6 +206,15 @@ enum AppEvent {
         index: usize,
         mode: ReviewRevisionMode,
         feedback: String,
+        result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    },
+    ReviewPrVerified {
+        index: usize,
+        result: Result<ReviewVerification, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    },
+    ReviewPrGapAudited {
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
     },
@@ -2592,7 +2601,7 @@ impl App {
                 break;
             }
         }
-        self.settle_review_scans();
+        self.settle_review_scans(tx);
     }
 
     /// Hand the next un-dispatched scan to a task: the files first, then the
@@ -2698,15 +2707,55 @@ impl App {
     /// Close the scan phase once every file reached a terminal state: sort
     /// the findings and enter the walkthrough (or jump straight to Done on
     /// a clean review).
-    fn settle_review_scans(&mut self) {
+    fn settle_review_scans(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
         if screen.scans_pending() {
             return;
         }
+        if screen.should_run_gap_audit() {
+            screen.begin_gap_audit();
+            let (worktree_path, files, context, relationship_edges, skipped, findings) =
+                screen.gap_audit_inputs();
+            kick_off_review_gap_audit(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                ReviewGapAuditRequest {
+                    worktree_path,
+                    files,
+                    context,
+                    relationship_edges,
+                    skipped,
+                    findings,
+                },
+                tx.clone(),
+            );
+            return;
+        }
         if screen.finish_scanning() {
-            screen.enter_decision();
+            let worktree_path = screen.request().worktree_path.clone();
+            let context = screen.review_context();
+            let candidates = screen.begin_verification();
+            if candidates.is_empty() {
+                screen.enter_decision();
+                return;
+            }
+            let config = self.current_dashboard_config();
+            for (index, file, finding) in candidates {
+                kick_off_verify_review_finding(
+                    self.git_root.clone(),
+                    config.clone(),
+                    ReviewVerifyRequest {
+                        worktree_path: worktree_path.clone(),
+                        file,
+                        finding,
+                        context: context.clone(),
+                        index,
+                    },
+                    tx.clone(),
+                );
+            }
         } else {
             screen.enter_done();
         }
@@ -2816,7 +2865,7 @@ impl App {
         file_index: usize,
         retry: ReviewScanRetry,
         result: Result<Vec<ReviewFinding>, String>,
-        telemetry: Option<ReviewScanTelemetry>,
+        mut telemetry: Option<ReviewScanTelemetry>,
         raw_output: Option<String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
@@ -2828,6 +2877,14 @@ impl App {
             .is_some_and(|s| s.scan_phase_active());
         if !active {
             return;
+        }
+        if let Some(telemetry) = telemetry.as_mut() {
+            telemetry.retry_role = match retry {
+                ReviewScanRetry::Initial => "initial",
+                ReviewScanRetry::Reformat => "reformat",
+                ReviewScanRetry::Full => "full-rescan",
+            }
+            .to_string();
         }
         if let (Some(screen), Some(telemetry)) = (self.review_pr.as_mut(), telemetry) {
             screen.record_scan_telemetry(telemetry);
@@ -2847,7 +2904,7 @@ impl App {
                     screen.note_scan_done(file_index);
                 }
                 if !self.dispatch_next_review_scan(tx) {
-                    self.settle_review_scans();
+                    self.settle_review_scans(tx);
                 }
             }
             Err(message) => {
@@ -2863,7 +2920,7 @@ impl App {
                     screen.note_scan_done(file_index);
                 }
                 if !self.dispatch_next_review_scan(tx) {
-                    self.settle_review_scans();
+                    self.settle_review_scans(tx);
                 }
             }
         }
@@ -2935,6 +2992,45 @@ impl App {
                 self.show_toast(ToastVariant::Warning, message);
             }
         }
+    }
+
+    fn apply_review_pr_verified(
+        &mut self,
+        index: usize,
+        result: Result<ReviewVerification, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    ) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if let Some(telemetry) = telemetry {
+            screen.record_scan_telemetry(telemetry);
+        }
+        screen.record_verification(index, result);
+        if screen.verification_pending() {
+            return;
+        }
+        if screen.finish_verification() {
+            screen.enter_decision();
+        } else {
+            screen.enter_done();
+        }
+    }
+
+    fn apply_review_pr_gap_audited(
+        &mut self,
+        result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if let Some(telemetry) = telemetry {
+            screen.record_scan_telemetry(telemetry);
+        }
+        screen.record_gap_audit_result(result);
+        self.settle_review_scans(tx);
     }
 
     fn apply_review_pr_posted(
@@ -5134,6 +5230,14 @@ impl App {
                 result,
                 telemetry,
             } => self.apply_review_pr_revised(index, mode, feedback, result, telemetry, tx),
+            AppEvent::ReviewPrVerified {
+                index,
+                result,
+                telemetry,
+            } => self.apply_review_pr_verified(index, result, telemetry),
+            AppEvent::ReviewPrGapAudited { result, telemetry } => {
+                self.apply_review_pr_gap_audited(result, telemetry, tx)
+            }
             AppEvent::ReviewPrPosted { index, result } => {
                 self.apply_review_pr_posted(index, result, tx)
             }
@@ -7572,6 +7676,23 @@ struct ReviewReviseRequest {
     index: usize,
 }
 
+struct ReviewVerifyRequest {
+    worktree_path: String,
+    file: ReviewFile,
+    finding: ReviewFinding,
+    context: ReviewContext,
+    index: usize,
+}
+
+struct ReviewGapAuditRequest {
+    worktree_path: String,
+    files: Vec<ReviewFile>,
+    context: ReviewContext,
+    relationship_edges: String,
+    skipped: Vec<crate::services::ReviewSkippedFile>,
+    findings: Vec<ReviewFinding>,
+}
+
 /// Inputs for posting one approved finding on the PR.
 struct ReviewPostRequest {
     worktree_path: String,
@@ -7763,6 +7884,68 @@ fn kick_off_revise_review_finding(
             index,
             mode,
             feedback,
+            result,
+            telemetry: Some(attempt.telemetry),
+        });
+    });
+}
+
+fn kick_off_verify_review_finding(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: ReviewVerifyRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let index = req.index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrVerified {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let attempt = service
+            .verify_review_finding(&req.worktree_path, &req.file, &req.finding, &req.context)
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrVerified {
+            index,
+            result,
+            telemetry: Some(attempt.telemetry),
+        });
+    });
+}
+
+fn kick_off_review_gap_audit(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: ReviewGapAuditRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrGapAudited {
+            result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let attempt = service
+            .scan_review_gap_audit(
+                &req.worktree_path,
+                &req.files,
+                &req.context,
+                &req.relationship_edges,
+                &req.skipped,
+                &req.findings,
+            )
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrGapAudited {
             result,
             telemetry: Some(attempt.telemetry),
         });
@@ -8687,9 +8870,17 @@ mod tests {
     fn review_test_telemetry(scan: &str) -> ReviewScanTelemetry {
         ReviewScanTelemetry {
             scan: scan.to_string(),
+            scan_role: "test".to_string(),
+            retry_role: "initial".to_string(),
             prompt_bytes: 100,
-            tokens_in: Some(10),
-            tokens_out: Some(2),
+            usage: crate::services::ReviewTokenUsage {
+                uncached_input: Some(10),
+                cache_read: Some(0),
+                cache_write: Some(0),
+                output: Some(2),
+                reasoning: Some(0),
+                cost_usd: None,
+            },
             duration_ms: 5,
             findings: 0,
         }
@@ -8727,9 +8918,17 @@ mod tests {
             Ok(Vec::new()),
             Some(ReviewScanTelemetry {
                 scan: "late:test".to_string(),
+                scan_role: "test".to_string(),
+                retry_role: "full-rescan".to_string(),
                 prompt_bytes: 1,
-                tokens_in: Some(1),
-                tokens_out: Some(1),
+                usage: crate::services::ReviewTokenUsage {
+                    uncached_input: Some(1),
+                    cache_read: Some(0),
+                    cache_write: Some(0),
+                    output: Some(1),
+                    reasoning: Some(0),
+                    cost_usd: None,
+                },
                 duration_ms: 1,
                 findings: 0,
             }),
@@ -8743,7 +8942,7 @@ mod tests {
     fn review_multi_file_tester_group_retries_and_settles_once() {
         let mut app = review_scan_test_app(
             ReviewScanMode::Split,
-            &["tests/a_test.rs", "tests/b_test.rs"],
+            &["tests/user_test.rs", "tests/user_spec.rs"],
         );
         let group_index = app
             .review_pr

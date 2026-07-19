@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "lockedAt": "2026-07-19T00:00:00Z",
+  "analysis": "paired case-by-repetition bootstrap, 10000 resamples, deterministic seed 20260719, percentile 95% confidence intervals",
+  "baselineModel": "openai/gpt-5.6-terra",
+  "baselineThinking": "high",
+  "minimumRepetitions": 10,
+  "bootstrapResamples": 10000,
+  "bootstrapSeed": 20260719,
+  "confidenceLevel": 0.95,
+  "thresholds": {
+    "f1Delta": 0.05,
+    "recallDelta": 0.08,
+    "precisionDelta": -0.01,
+    "criticalHighRecall": 0.95,
+    "criticalHighRecallDelta": 0.0,
+    "suggestionSuccessDelta": 0.05,
+    "medianLogicalTokenReduction": 0.25,
+    "maximumShapeTokenRegression": 0.05,
+    "minimumSemanticAgreement": 0.80,
+    "minimumCohenKappa": 0.60
+  },
+  "confidenceGates": {
+    "f1DeltaLowerBound": 0.0,
+    "recallDeltaLowerBound": 0.0,
+    "logicalTokenReductionLowerBound": 0.0
+  },
+  "invalidation": [
+    "missing telemetry",
+    "incomplete or unpaired repetitions",
+    "provenance mismatch",
+    "holdout hash mismatch or repository-local holdout",
+    "adjudicator agreement below threshold",
+    "unresolved adjudication disagreement",
+    "provider, model, thinking, environment, corpus, skill, or workflow baseline change"
+  ]
+}
