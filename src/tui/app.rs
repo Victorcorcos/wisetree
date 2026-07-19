@@ -31,6 +31,7 @@ use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
+use crate::services::dashboard::{review_feedback_needs_expanded_context, ReviewRevisionMode};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     build_review_summary, check_for_updates_all_sources, compute_attempt_changes,
@@ -64,9 +65,9 @@ use crate::tui::screens::enrich_pr::{EnrichAction, EnrichPullRequestScreen, Enri
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
-use crate::tui::screens::review_pr::{
-    ReviewAction, ReviewPullRequestScreen, ReviewRowOutcome, COVERAGE_SCAN_INDEX,
-};
+#[cfg(test)]
+use crate::tui::screens::review_pr::COVERAGE_SCAN_INDEX;
+use crate::tui::screens::review_pr::{ReviewAction, ReviewPullRequestScreen, ReviewRowOutcome};
 use crate::tui::screens::settings::{
     CopyDirection, SettingsAction, SettingsScreen, SettingsStep, UpgradeOutcome,
 };
@@ -203,6 +204,8 @@ enum AppEvent {
     /// An "Other" revision of the current finding returned.
     ReviewPrRevised {
         index: usize,
+        mode: ReviewRevisionMode,
+        feedback: String,
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
     },
@@ -2531,6 +2534,11 @@ impl App {
                     worktree_path: screen.request().worktree_path.clone(),
                     file,
                     finding,
+                    mode: if review_feedback_needs_expanded_context(&feedback) {
+                        ReviewRevisionMode::Expanded
+                    } else {
+                        ReviewRevisionMode::Focused
+                    },
                     feedback,
                     index: screen.current_index(),
                 };
@@ -2595,13 +2603,13 @@ impl App {
         };
         let worktree_path = screen.request().worktree_path.clone();
         let context = screen.review_context();
-        if let Some((file_index, file)) = screen.take_next_scan_file() {
+        if let Some((file_index, group)) = screen.take_next_scan_file() {
             kick_off_scan_review_file(
                 self.git_root.clone(),
                 self.current_dashboard_config(),
                 ReviewScanRequest {
                     worktree_path,
-                    file,
+                    group,
                     context,
                     file_index,
                     retry: ReviewScanRetry::Initial,
@@ -2611,7 +2619,7 @@ impl App {
             );
             return true;
         }
-        let Some(files) = screen.take_coverage_scan() else {
+        let Some((scan_index, files)) = screen.take_coverage_scan() else {
             return false;
         };
         let mode = screen.scan_mode();
@@ -2623,6 +2631,7 @@ impl App {
             ReviewCoverageScanRequest {
                 worktree_path,
                 files,
+                scan_index,
                 mode,
                 context,
                 tester_findings,
@@ -2648,8 +2657,7 @@ impl App {
         };
         let worktree_path = screen.request().worktree_path.clone();
         let context = screen.review_context();
-        if file_index == COVERAGE_SCAN_INDEX {
-            let files = screen.all_files();
+        if let Some(files) = screen.coverage_group(file_index) {
             let mode = screen.scan_mode();
             let tester_findings = screen.tester_findings();
             kick_off_scan_review_coverage(
@@ -2658,6 +2666,7 @@ impl App {
                 ReviewCoverageScanRequest {
                     worktree_path,
                     files,
+                    scan_index: file_index,
                     mode,
                     context,
                     tester_findings,
@@ -2668,7 +2677,7 @@ impl App {
             );
             return;
         }
-        let Some(file) = screen.file_at(file_index) else {
+        let Some(group) = screen.scan_group(file_index) else {
             return;
         };
         kick_off_scan_review_file(
@@ -2676,7 +2685,7 @@ impl App {
             self.current_dashboard_config(),
             ReviewScanRequest {
                 worktree_path,
-                file,
+                group,
                 context,
                 file_index,
                 retry,
@@ -2863,11 +2872,12 @@ impl App {
     fn apply_review_pr_revised(
         &mut self,
         index: usize,
+        mode: ReviewRevisionMode,
+        feedback: String,
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        let _ = tx;
         if !self.review_at_index(index) {
             return;
         }
@@ -2890,6 +2900,29 @@ impl App {
                 }
             }
             other => {
+                if mode == ReviewRevisionMode::Focused {
+                    let request = self.review_pr.as_ref().and_then(|screen| {
+                        let finding = screen.current_finding()?;
+                        let file = screen.file_for(&finding)?;
+                        Some(ReviewReviseRequest {
+                            worktree_path: screen.request().worktree_path.clone(),
+                            file,
+                            finding,
+                            feedback: feedback.clone(),
+                            mode: ReviewRevisionMode::Expanded,
+                            index,
+                        })
+                    });
+                    if let Some(request) = request {
+                        kick_off_revise_review_finding(
+                            self.git_root.clone(),
+                            self.current_dashboard_config(),
+                            request,
+                            tx.clone(),
+                        );
+                        return;
+                    }
+                }
                 if let Some(screen) = self.review_pr.as_mut() {
                     screen.reshow_decision();
                 }
@@ -5096,9 +5129,11 @@ impl App {
             } => self.apply_review_pr_scanned(file_index, retry, result, telemetry, raw_output, tx),
             AppEvent::ReviewPrRevised {
                 index,
+                mode,
+                feedback,
                 result,
                 telemetry,
-            } => self.apply_review_pr_revised(index, result, telemetry, tx),
+            } => self.apply_review_pr_revised(index, mode, feedback, result, telemetry, tx),
             AppEvent::ReviewPrPosted { index, result } => {
                 self.apply_review_pr_posted(index, result, tx)
             }
@@ -7506,7 +7541,7 @@ fn next_review_retry(retry: ReviewScanRetry, has_raw_output: bool) -> Option<Rev
 /// one retry allowed after unparseable output.
 struct ReviewScanRequest {
     worktree_path: String,
-    file: ReviewFile,
+    group: crate::services::dashboard::ReviewFileGroup,
     context: ReviewContext,
     file_index: usize,
     retry: ReviewScanRetry,
@@ -7514,11 +7549,12 @@ struct ReviewScanRequest {
 }
 
 /// Inputs for the single whole-diff coverage scan. Its result comes back
-/// through the same `ReviewPrScanned` event under [`COVERAGE_SCAN_INDEX`],
+/// through the same `ReviewPrScanned` event under a synthetic group index,
 /// so it shares the pool's completion/retry/failure plumbing.
 struct ReviewCoverageScanRequest {
     worktree_path: String,
     files: Vec<ReviewFile>,
+    scan_index: usize,
     mode: ReviewScanMode,
     context: ReviewContext,
     tester_findings: Vec<ReviewFinding>,
@@ -7532,6 +7568,7 @@ struct ReviewReviseRequest {
     file: ReviewFile,
     finding: ReviewFinding,
     feedback: String,
+    mode: ReviewRevisionMode,
     index: usize,
 }
 
@@ -7592,16 +7629,16 @@ fn kick_off_scan_review_file(
         let attempt = match retry {
             ReviewScanRetry::Reformat => {
                 service
-                    .reformat_review_file_output(
+                    .reformat_review_group_output(
                         &req.worktree_path,
-                        &req.file,
+                        &req.group,
                         req.raw_output.as_deref().unwrap_or_default(),
                     )
                     .await
             }
             ReviewScanRetry::Initial | ReviewScanRetry::Full => {
                 service
-                    .scan_review_file(&req.worktree_path, &req.file, &req.context)
+                    .scan_review_group(&req.worktree_path, &req.group, &req.context)
                     .await
             }
         };
@@ -7623,9 +7660,10 @@ fn kick_off_scan_review_coverage(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let retry = req.retry;
+    let scan_index = req.scan_index;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrScanned {
-            file_index: COVERAGE_SCAN_INDEX,
+            file_index: scan_index,
             retry,
             result: Err("Could not resolve git root.".to_string()),
             telemetry: None,
@@ -7681,7 +7719,7 @@ fn kick_off_scan_review_coverage(
         };
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {
-            file_index: COVERAGE_SCAN_INDEX,
+            file_index: scan_index,
             retry,
             result,
             telemetry: Some(attempt.telemetry),
@@ -7697,9 +7735,13 @@ fn kick_off_revise_review_finding(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let index = req.index;
+    let mode = req.mode;
+    let feedback = req.feedback.clone();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrRevised {
             index,
+            mode,
+            feedback,
             result: Err("Could not resolve git root.".to_string()),
             telemetry: None,
         });
@@ -7708,11 +7750,19 @@ fn kick_off_revise_review_finding(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let attempt = service
-            .revise_review_finding(&req.worktree_path, &req.file, &req.finding, &req.feedback)
+            .revise_review_finding(
+                &req.worktree_path,
+                &req.file,
+                &req.finding,
+                &req.feedback,
+                req.mode,
+            )
             .await;
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrRevised {
             index,
+            mode,
+            feedback,
             result,
             telemetry: Some(attempt.telemetry),
         });
@@ -8687,6 +8737,78 @@ mod tests {
             &tx,
         );
         assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 0);
+    }
+
+    #[test]
+    fn review_multi_file_tester_group_retries_and_settles_once() {
+        let mut app = review_scan_test_app(
+            ReviewScanMode::Split,
+            &["tests/a_test.rs", "tests/b_test.rs"],
+        );
+        let group_index = app
+            .review_pr
+            .as_mut()
+            .unwrap()
+            .take_next_scan_file()
+            .unwrap()
+            .0;
+        let tx = app_event_tx();
+        app.apply_review_pr_scanned(
+            group_index,
+            ReviewScanRetry::Initial,
+            Err("malformed".to_string()),
+            None,
+            Some("bad output".to_string()),
+            &tx,
+        );
+        app.apply_review_pr_scanned(
+            group_index,
+            ReviewScanRetry::Reformat,
+            Ok(Vec::new()),
+            None,
+            None,
+            &tx,
+        );
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+    }
+
+    #[test]
+    fn failed_focused_revision_dispatches_one_expanded_retry() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![ReviewFinding {
+            category: "Code Smell".to_string(),
+            severity: crate::services::ReviewSeverity::Low,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Unclear branch".to_string(),
+            explanation: "The branch is hard to follow.".to_string(),
+            suggestion: None,
+        }]);
+        screen.finish_scanning();
+        screen.enter_decision();
+        screen.start_revising();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.apply_review_pr_revised(
+            0,
+            ReviewRevisionMode::Focused,
+            "use more context".to_string(),
+            Err("malformed".to_string()),
+            None,
+            &tx,
+        );
+        let event = rx.try_recv().expect("expanded retry event");
+        assert!(matches!(
+            event,
+            AppEvent::ReviewPrRevised {
+                mode: ReviewRevisionMode::Expanded,
+                ..
+            }
+        ));
     }
 
     #[test]

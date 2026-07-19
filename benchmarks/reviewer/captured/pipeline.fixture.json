@@ -1,0 +1,16 @@
+{
+  "name": "pull-request-command-fixture",
+  "model": "fixture/model",
+  "thinking": "fixture",
+  "sideEffects": false,
+  "runs": [
+    {"caseId":"code-smell-direct-fix","repetition":1,"findings":[{"category":"Code Smell","file":"src/parser.rs","line":12,"title":"Duplicate parsing","suggestion":"parse_once(input)?"}],"tokens":{"uncachedInput":900,"cacheRead":400,"cacheWrite":100,"output":90,"reasoning":120,"costUsd":null}},
+    {"caseId":"svg-script-injection","repetition":1,"findings":[{"category":"Security","file":"assets/icon.svg","line":4,"title":"Executable SVG script","suggestion":""}],"tokens":{"uncachedInput":700,"cacheRead":420,"cacheWrite":80,"output":85,"reasoning":110,"costUsd":null}},
+    {"caseId":"cross-file-unbounded-loop","repetition":1,"findings":[{"category":"Performance","file":"src/worker.rs","line":28,"title":"Unbounded worker loop","suggestion":null}],"tokens":{"uncachedInput":1100,"cacheRead":500,"cacheWrite":90,"output":75,"reasoning":180,"costUsd":null}},
+    {"caseId":"multiline-assertion-gap","repetition":1,"findings":[{"category":"Test Quality","file":"src/auth.rs","line":41,"title":"Error kind is not asserted","suggestion":null}],"tokens":{"uncachedInput":950,"cacheRead":480,"cacheWrite":70,"output":80,"reasoning":160,"costUsd":null}},
+    {"caseId":"rename-breaks-convention","repetition":1,"findings":[{"category":"Convention","file":"src/services/auth_handler.rs","line":null,"title":"Service naming convention broken","suggestion":null}],"tokens":{"uncachedInput":600,"cacheRead":450,"cacheWrite":60,"output":70,"reasoning":100,"costUsd":null}},
+    {"caseId":"deletion-removes-auth-check","repetition":1,"findings":[{"category":"Security","file":"src/policy.rs","line":33,"title":"Authorization check removed","suggestion":"authorize(user, action)?;\n    execute(action)?;"}],"tokens":{"uncachedInput":820,"cacheRead":440,"cacheWrite":70,"output":95,"reasoning":130,"costUsd":null}},
+    {"caseId":"safe-comment-and-constant","repetition":1,"findings":[],"tokens":{"uncachedInput":500,"cacheRead":400,"cacheWrite":50,"output":20,"reasoning":60,"costUsd":null}},
+    {"caseId":"missing-boundary-test","repetition":1,"findings":[{"category":"Test Quality","file":"src/pagination.rs","line":22,"title":"Maximum page size is untested","suggestion":null}],"tokens":{"uncachedInput":880,"cacheRead":460,"cacheWrite":70,"output":85,"reasoning":140,"costUsd":null}}
+  ]
+}
