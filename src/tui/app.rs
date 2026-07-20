@@ -11857,7 +11857,10 @@ mod tests {
                 &tx,
             );
 
-            assert_eq!(app.develop_pr.as_ref().unwrap().step(), DevelopStep::Planning);
+            assert_eq!(
+                app.develop_pr.as_ref().unwrap().step(),
+                DevelopStep::Planning
+            );
             assert!(rx.try_recv().is_err());
         });
     }
