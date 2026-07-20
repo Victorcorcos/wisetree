@@ -10635,6 +10635,36 @@ so the intent reads clearly.
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn develop_run_check_reports_timeout() {
+        let (_tmp, repo) = develop_repo();
+        let service = DashboardService::new(repo.clone(), develop_config("sleep 601"));
+
+        let outcome = service.develop_run_check(repo.to_str().unwrap()).await;
+
+        assert_eq!(
+            outcome,
+            DevelopCheckOutcome::Failed {
+                output: "`sleep 601` timed out after 10 minutes.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn clip_output_tail_keeps_only_the_configured_ascii_tail() {
+        assert_eq!(clip_output_tail("0123456789", 4), "…6789");
+    }
+
+    #[test]
+    fn clip_output_tail_preserves_utf8_when_limit_splits_a_character() {
+        let output = "prefix-αβγ";
+
+        let clipped = clip_output_tail(output, 5);
+
+        assert_eq!(clipped, "…βγ");
+        assert!(clipped.strip_prefix('…').unwrap().len() <= 5);
+    }
+
     #[tokio::test]
     async fn develop_commit_section_commits_everything_but_plan_md() {
         let (_tmp, repo) = develop_repo();
