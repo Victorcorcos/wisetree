@@ -162,7 +162,7 @@ pub struct DevelopPullRequestScreen {
     /// per section (☒) vs a single run for the whole plan (☐).
     ralph: bool,
     /// The Commit-sections toggle on the Confirm page: when ☒ the harness
-    /// commits each finished section as a Ralph-canon checkpoint (default ☐).
+    /// commits each finished section as a Ralph-canon checkpoint (default ☒).
     commit_sections: bool,
     /// Which Confirm-page toggle Up/Down focus sits on (0 = Ralph Loop,
     /// 1 = Commit sections); Space flips the focused one.
@@ -227,7 +227,7 @@ impl DevelopPullRequestScreen {
             error: None,
             phase_message: String::new(),
             ralph: true,
-            commit_sections: false,
+            commit_sections: true,
             toggle_focus: 0,
             check_command: None,
             check_failure: None,
@@ -2413,12 +2413,12 @@ mod tests {
     #[test]
     fn space_toggles_the_focused_confirm_toggle() {
         let mut s = screen();
-        // Both toggles render; Ralph on (☒) + Commit off (☐) by default.
+        // Both toggles render; Ralph on (☒) + Commit on (☒) by default.
         let dump = render_dump(&mut s, 110, 36);
         assert!(dump.contains("☒ Ralph Loop"), "{dump}");
-        assert!(dump.contains("☐ Commit sections"), "{dump}");
+        assert!(dump.contains("☒ Commit sections"), "{dump}");
         assert!(s.ralph());
-        assert!(!s.commit_sections());
+        assert!(s.commit_sections());
 
         // Focus starts on Ralph → Space flips it.
         assert_eq!(
@@ -2432,9 +2432,9 @@ mod tests {
         // is untouched.
         assert_eq!(s.handle_key(key(KeyCode::Down)), DevelopAction::Continue);
         s.handle_key(key(KeyCode::Char(' ')));
-        assert!(s.commit_sections());
+        assert!(!s.commit_sections());
         assert!(!s.ralph());
-        assert!(render_dump(&mut s, 110, 36).contains("☒ Commit sections"));
+        assert!(render_dump(&mut s, 110, 36).contains("☐ Commit sections"));
     }
 
     #[test]
