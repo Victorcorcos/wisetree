@@ -3661,11 +3661,11 @@ impl DashboardService {
             .await
             .map_err(WisetreeError::other)?;
         // Nothing staged (empty diff, or only PLAN.md changed) → no commit.
-        if self
-            .develop_git(&cwd, &["diff", "--cached", "--quiet"])
+        let staged = self
+            .develop_git(&cwd, &["diff", "--cached", "--name-only"])
             .await
-            .is_ok()
-        {
+            .map_err(WisetreeError::other)?;
+        if staged.trim().is_empty() {
             return Ok(None);
         }
         self.develop_git(&cwd, &["commit", "-m", subject])
@@ -10314,6 +10314,61 @@ so the intent reads clearly.
         (tmp, repo)
     }
 
+    /// A temp repo with an initial commit, ready for failure-path tests.
+    fn initialized_temp_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.name", "t"]);
+        git(repo, &["config", "user.email", "t@example.com"]);
+        std::fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "seed"]);
+        tmp
+    }
+
+    fn initialized_temp_repo_with_change() -> tempfile::TempDir {
+        let tmp = initialized_temp_repo();
+        std::fs::write(tmp.path().join("seed.txt"), "changed").unwrap();
+        tmp
+    }
+
+    /// Wrap the real git binary with a script that fails on a specific command.
+    fn dashboard_with_failing_git(
+        repo: &tempfile::TempDir,
+        trigger: &str,
+        stderr: &str,
+    ) -> DashboardService {
+        let parent = repo.path().parent().expect("tempdir parent");
+        let name = repo
+            .path()
+            .file_name()
+            .expect("tempdir name")
+            .to_string_lossy();
+        let wrapper = parent.join(format!("{name}-git"));
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+             \"{trigger}\"|\"{trigger} \"*)\n\
+             if [ -n \"{stderr}\" ]; then\n\
+             printf '%s\\n' \"{stderr}\" >&2\n\
+             fi\n\
+             exit 1\n\
+             ;;\n\
+             esac\n\
+             exec git \"$@\"\n"
+        );
+        std::fs::write(&wrapper, script).expect("write wrapper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod wrapper");
+        }
+        DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default())
+            .with_git_binary(wrapper)
+    }
+
     fn develop_dashboard_service() -> (DashboardService, tempfile::TempDir) {
         let worktree = tempfile::tempdir().expect("tempdir");
         let mut config = DashboardConfig::default();
@@ -10723,6 +10778,61 @@ so the intent reads clearly.
         assert_eq!(sha, None);
         // No new commit was created.
         assert_eq!(git(&repo, &["log", "-1", "--format=%s"]), "seed");
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_propagates_staging_failure() {
+        let repo = initialized_temp_repo();
+        let service = dashboard_with_failing_git(&repo, "add", "staging failed");
+
+        let error = service
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("staging failed"));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_propagates_cached_diff_failure() {
+        let repo = initialized_temp_repo();
+        let service = dashboard_with_failing_git(&repo, "diff --cached --name-only", "diff failed");
+
+        let error = service
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("diff failed"));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_uses_fallback_for_empty_commit_error() {
+        let repo = initialized_temp_repo_with_change();
+        let service = dashboard_with_failing_git(&repo, "commit", "");
+
+        let error = service
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "git commit failed after staging the section."
+        );
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_propagates_head_resolution_failure() {
+        let repo = initialized_temp_repo_with_change();
+        let service = dashboard_with_failing_git(&repo, "rev-parse HEAD", "HEAD resolution failed");
+
+        let error = service
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("HEAD resolution failed"));
     }
 
     #[test]
