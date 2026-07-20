@@ -915,13 +915,35 @@ Implement the feature.
     fn plan_contract_round_trips_through_the_transcript_parser() {
         // The compact revision payload must itself satisfy the contract the
         // plan AI is asked to emit, so a revision run starts from parity.
-        let plan = plan();
+        let mut plan = plan();
+        plan.mark_done(0);
+        plan.sections[1].body = "**Goal**: goal for Exporter\n**Acceptance criteria**:\n- [ ] criterion a"
+            .to_string();
         let contract = render_plan_contract(&plan);
         let reparsed = parse_plan_transcript(&contract).expect("contract parses");
         assert_eq!(reparsed.task_description, plan.task_description);
         assert_eq!(reparsed.complexity, plan.complexity);
         assert_eq!(reparsed.sections.len(), plan.sections.len());
-        assert_eq!(reparsed.sections[0].name, "Data model");
+        assert_eq!(
+            reparsed.sections[0].body,
+            concat!(
+                "**Goal**: goal for Data model\n",
+                "**Files**: src/Data model.rs\n",
+                "**Acceptance criteria**:\n",
+                "- [ ] criterion a\n",
+                "- [ ] criterion b\n",
+                "**Edge cases**:\n",
+                "- [ ] empty input"
+            )
+        );
+        assert_eq!(
+            reparsed.sections[1].body,
+            concat!(
+                "**Goal**: goal for Exporter\n",
+                "**Acceptance criteria**:\n",
+                "- [ ] criterion a"
+            )
+        );
     }
 
     #[test]
