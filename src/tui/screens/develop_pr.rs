@@ -2303,6 +2303,7 @@ mod tests {
     use crate::services::develop::{parse_plan_md, PlanSection};
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Position;
     use ratatui::Terminal;
 
     fn request() -> DevelopRequest {
@@ -2366,6 +2367,16 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn click_position(dump: &str, target: &str) -> Position {
+        for (y, line) in dump.lines().enumerate() {
+            if let Some(byte_start) = line.find(target) {
+                let x = line[..byte_start].chars().count() as u16;
+                return Position { x, y: y as u16 };
+            }
+        }
+        panic!("could not find {target:?} in render dump");
     }
 
     // ── Confirm + Ralph Loop toggle ─────────────────────────────────────
@@ -2890,5 +2901,86 @@ mod tests {
         assert!(dump.contains("2 section checkpoint(s) committed"), "{dump}");
         // The uncommitted-changes line is replaced by the commit summary.
         assert!(!dump.contains("left uncommitted"), "{dump}");
+    }
+
+    // ── Mouse-driven action coverage ────────────────────────────────────
+
+    #[test]
+    fn confirm_mouse_buttons_confirm_or_cancel_development() {
+        let mut s = screen();
+        let dump = render_dump(&mut s, 120, 36);
+        let confirm_pos = click_position(&dump, "Confirm");
+        assert_eq!(s.handle_mouse_click(confirm_pos), DevelopAction::Confirmed);
+
+        let mut s = screen();
+        let dump = render_dump(&mut s, 120, 36);
+        let cancel_pos = click_position(&dump, "Cancel");
+        assert_eq!(s.handle_mouse_click(cancel_pos), DevelopAction::Cancelled);
+    }
+
+    #[test]
+    fn plan_review_mouse_buttons_approve_or_open_feedback() {
+        let mut s = screen_on_review();
+        let dump = render_dump(&mut s, 110, 32);
+        let yes_pos = click_position(&dump, "Yes");
+        assert_eq!(s.handle_mouse_click(yes_pos), DevelopAction::PlanApproved);
+
+        let mut s = screen_on_review();
+        let dump = render_dump(&mut s, 110, 32);
+        let no_pos = click_position(&dump, "No");
+        assert_eq!(s.handle_mouse_click(no_pos), DevelopAction::Continue);
+        assert_eq!(s.step(), DevelopStep::Feedback);
+        assert!(s.input.is_some());
+    }
+
+    #[test]
+    fn implementing_finalize_modal_mouse_buttons_finish_or_dismiss() {
+        let mut s = screen_on_review();
+        s.begin_implement_run(Some(0));
+        s.finalize_confirm = Some(build_finalize_modal(true));
+        let dump = render_dump(&mut s, 110, 30);
+        let yes_pos = click_position(&dump, "Yes");
+        assert_eq!(
+            s.handle_mouse_click(yes_pos),
+            DevelopAction::ImplementFinished
+        );
+        assert!(s.ai_done);
+        assert!(s.finalize_confirm.is_none());
+
+        let mut s = screen_on_review();
+        s.begin_implement_run(Some(0));
+        s.finalize_confirm = Some(build_finalize_modal(true));
+        let dump = render_dump(&mut s, 110, 30);
+        let no_pos = click_position(&dump, "No");
+        assert_eq!(s.handle_mouse_click(no_pos), DevelopAction::Continue);
+        assert!(!s.ai_done);
+        assert!(s.finalize_confirm.is_none());
+    }
+
+    #[test]
+    fn check_failed_mouse_buttons_retry_or_cancel() {
+        let mut s = screen_on_review();
+        s.set_check_command(Some("cargo test".to_string()));
+        s.begin_implement_run(Some(0));
+        s.show_check_failed("assertion `left == right` failed".to_string());
+        let dump = render_dump(&mut s, 110, 26);
+        let fix_pos = click_position(&dump, "Fix with AI");
+        assert_eq!(s.handle_mouse_click(fix_pos), DevelopAction::CheckFixWithAi);
+
+        let mut s = screen_on_review();
+        s.set_check_command(Some("cargo test".to_string()));
+        s.begin_implement_run(Some(0));
+        s.show_check_failed("assertion `left == right` failed".to_string());
+        let dump = render_dump(&mut s, 110, 26);
+        let mark_pos = click_position(&dump, "Mark done anyway");
+        assert_eq!(s.handle_mouse_click(mark_pos), DevelopAction::CheckMarkDone);
+
+        let mut s = screen_on_review();
+        s.set_check_command(Some("cargo test".to_string()));
+        s.begin_implement_run(Some(0));
+        s.show_check_failed("assertion `left == right` failed".to_string());
+        let dump = render_dump(&mut s, 110, 26);
+        let pause_pos = click_position(&dump, "Pause");
+        assert_eq!(s.handle_mouse_click(pause_pos), DevelopAction::Cancelled);
     }
 }
