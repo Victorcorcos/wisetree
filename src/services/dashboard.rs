@@ -3477,6 +3477,15 @@ impl DashboardService {
             return Ok(DevelopPreflightOutcome::AiUnavailable);
         }
         let cwd = PathBuf::from(worktree_path);
+        let status = self
+            .develop_git(&cwd, &["status", "--porcelain", "--untracked-files=all"])
+            .await
+            .map_err(WisetreeError::other)?;
+        if !status.trim().is_empty() {
+            return Err(WisetreeError::other(
+                "Develop requires a clean worktree before starting.".to_string(),
+            ));
+        }
         let resume = match tokio::fs::read_to_string(cwd.join(PLAN_FILE)).await.ok() {
             None => DevelopResumeState::Absent,
             Some(content) => match parse_plan_md(&content) {
@@ -3638,6 +3647,10 @@ impl DashboardService {
         subject: &str,
     ) -> Result<Option<String>> {
         let cwd = PathBuf::from(worktree_path);
+        // Ensure a plan staged before this checkpoint cannot be committed.
+        self.develop_git(&cwd, &["reset", "--", DEVELOP_PLAN_FILE])
+            .await
+            .map_err(WisetreeError::other)?;
         // Stage all tracked + untracked changes but the plan file. The
         // pathspec `:(exclude)PLAN.md` drops it wherever it sits.
         let exclude_plan = format!(":(exclude){DEVELOP_PLAN_FILE}");
@@ -10361,5 +10374,30 @@ so the intent reads clearly.
         );
         assert!(!no_check.contains("CHECK_COMMAND"), "{no_check}");
         assert!(!no_check.contains("CHECK_FAILURE"), "{no_check}");
+    }
+
+    #[test]
+    fn renders_implementation_context_and_operational_constraints() {
+        let prompt = build_develop_implement_prompt(
+            "Implement task",
+            "Section 2 acceptance criteria",
+            "Section 1: done\nSection 2: THIS RUN\nSection 3: later",
+            "cargo test --all",
+            Some("previous check failure"),
+        );
+
+        assert!(prompt.contains("Implement task"));
+        assert!(prompt.contains("Section 1: done\nSection 2: THIS RUN\nSection 3: later"));
+        assert!(prompt.contains("Section 2 acceptance criteria"));
+        assert!(prompt.contains("cargo test --all"));
+        assert!(prompt.contains("previous check failure"));
+        assert!(prompt.contains("Write or update tests for the behavior each section introduces"));
+        assert!(prompt.contains("Anything marked `later` in the outline belongs to a future run"));
+        assert!(prompt.contains("Do NOT run `git add`"));
+        assert!(prompt.contains("do NOT run any `gh` command"));
+        assert!(prompt.contains("Do NOT create, read, or modify `PLAN.md`"));
+        assert!(prompt.contains(
+            "Stop and state in one short line what you implemented and whether the tests pass."
+        ));
     }
 }
