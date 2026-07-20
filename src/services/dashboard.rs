@@ -10899,16 +10899,33 @@ so the intent reads clearly.
     }
 
     #[test]
-    fn develop_commit_subject_ralph_and_single_run() {
+    fn develop_commit_subject_obeys_name_boundaries() {
+        let sixty = "a".repeat(60);
         assert_eq!(
-            develop_commit_subject(Some((3, "CLI flag"))),
-            "develop: section 3 — CLI flag"
+            develop_commit_subject(Some((2, &sixty))),
+            format!("develop: section 2 — {sixty}")
         );
-        assert_eq!(develop_commit_subject(None), "develop: implement plan");
-        // Long names are clipped to keep the subject one tidy line.
-        let long = "x".repeat(80);
-        let subject = develop_commit_subject(Some((1, &long)));
-        assert!(subject.ends_with('…'), "{subject}");
+
+        let sixty_one = "a".repeat(61);
+        assert_eq!(
+            develop_commit_subject(Some((2, &sixty_one))),
+            format!("develop: section 2 — {}…", "a".repeat(60))
+        );
+
+        let unicode = "界".repeat(61);
+        assert_eq!(
+            develop_commit_subject(Some((3, &unicode))),
+            format!("develop: section 3 — {}…", "界".repeat(60))
+        );
+
+        assert_eq!(
+            develop_commit_subject(Some((4, "  First line  \nSecond line"))),
+            "develop: section 4 — First line"
+        );
+        assert_eq!(
+            develop_commit_subject(Some((5, ""))),
+            "develop: section 5 — "
+        );
     }
 
     #[test]
