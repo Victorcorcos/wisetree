@@ -274,10 +274,11 @@ enum AppEvent {
         section: Option<usize>,
         result: Result<Box<FixApplyHandoff>, String>,
     },
-    /// Rewriting `PLAN.md` failed (best-effort warning).
-    DevelopFileWriteFailed {
+    /// Rewriting `PLAN.md` finished (best-effort warning on failure).
+    DevelopFileRewritten {
         operation_id: u64,
-        message: String,
+        revision: u64,
+        result: Result<(), String>,
     },
     /// The post-section check command finished (Ralph-canon backpressure).
     DevelopChecked {
@@ -347,6 +348,13 @@ struct UpdatePrSuccess {
 struct UpdatePrFailure {
     number: u64,
     message: String,
+}
+
+struct DevelopFileWrite {
+    operation_id: u64,
+    revision: u64,
+    path: PathBuf,
+    content: String,
 }
 
 #[derive(Debug, Default)]
@@ -465,6 +473,9 @@ pub struct App {
     develop_pr: Option<DevelopPullRequestScreen>,
     next_develop_operation_id: u64,
     active_develop_operation_id: Option<u64>,
+    next_develop_file_revision: u64,
+    develop_write_in_flight: bool,
+    pending_develop_write: Option<DevelopFileWrite>,
     /// Watches opencode's database for the embedded investigation TUI's
     /// turn to complete — the TUI never exits on its own, so this is what
     /// advances the `Investigating` step. `Some` only while investigating.
@@ -603,6 +614,9 @@ impl App {
             develop_pr: None,
             next_develop_operation_id: 0,
             active_develop_operation_id: None,
+            next_develop_file_revision: 0,
+            develop_write_in_flight: false,
+            pending_develop_write: None,
             bugkill_investigation: None,
             develop_watch: None,
             enrich_draft: None,
@@ -3727,6 +3741,11 @@ impl App {
             .and(self.active_develop_operation_id)
     }
 
+    fn next_develop_file_revision(&mut self) -> u64 {
+        self.next_develop_file_revision = self.next_develop_file_revision.wrapping_add(1);
+        self.next_develop_file_revision
+    }
+
     fn is_active_develop_operation(&self, operation_id: u64) -> bool {
         self.active_develop_operation_id() == Some(operation_id)
     }
@@ -4148,26 +4167,70 @@ impl App {
     /// worktree root (called after every mutation — the AI never touches
     /// the file).
     fn rewrite_develop_file(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
-        let Some(screen) = self.develop_pr.as_ref() else {
-            return;
-        };
-        let Some(content) = screen.render_plan() else {
-            return;
+        let (content, path) = {
+            let Some(screen) = self.develop_pr.as_ref() else {
+                return;
+            };
+            let Some(content) = screen.render_plan() else {
+                return;
+            };
+            let path = PathBuf::from(&screen.request().worktree_path)
+                .join(crate::services::develop::PLAN_FILE);
+            (content, path)
         };
         let Some(operation_id) = self.active_develop_operation_id() else {
             return;
         };
-        let path = PathBuf::from(&screen.request().worktree_path)
-            .join(crate::services::develop::PLAN_FILE);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            if let Err(err) = tokio::fs::write(&path, content).await {
-                let _ = tx.send(AppEvent::DevelopFileWriteFailed {
-                    operation_id,
-                    message: err.to_string(),
-                });
+        let write = DevelopFileWrite {
+            operation_id,
+            revision: self.next_develop_file_revision(),
+            path,
+            content,
+        };
+        if self.develop_write_in_flight {
+            // Keep only the newest snapshot while the current write finishes.
+            self.pending_develop_write = Some(write);
+            return;
+        }
+
+        self.start_develop_file_write(write, tx);
+    }
+
+    fn start_develop_file_write(
+        &mut self,
+        write: DevelopFileWrite,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.develop_write_in_flight = true;
+        kick_off_develop_file_write(write, tx.clone());
+    }
+
+    fn apply_develop_file_rewritten(
+        &mut self,
+        operation_id: u64,
+        revision: u64,
+        result: Result<(), String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.develop_write_in_flight = false;
+
+        if self.is_current_develop_revision(operation_id, revision) {
+            if let Err(error) = result {
+                self.show_toast(
+                    ToastVariant::Warning,
+                    format!("Could not write PLAN.md: {}", truncate_error(&error)),
+                );
             }
-        });
+        }
+
+        if let Some(write) = self.pending_develop_write.take() {
+            self.start_develop_file_write(write, tx);
+        }
+    }
+
+    fn is_current_develop_revision(&self, operation_id: u64, revision: u64) -> bool {
+        self.is_active_develop_operation(operation_id)
+            && self.next_develop_file_revision == revision
     }
 
     fn apply_develop_prepared(
@@ -5798,17 +5861,11 @@ impl App {
                 section,
                 result,
             } => self.apply_develop_implement_ready(operation_id, section, result),
-            AppEvent::DevelopFileWriteFailed {
+            AppEvent::DevelopFileRewritten {
                 operation_id,
-                message,
-            } => {
-                if self.is_active_develop_operation(operation_id) {
-                    self.show_toast(
-                        ToastVariant::Warning,
-                        format!("Could not write PLAN.md: {}", truncate_error(&message)),
-                    );
-                }
-            }
+                revision,
+                result,
+            } => self.apply_develop_file_rewritten(operation_id, revision, result, tx),
             AppEvent::DevelopChecked {
                 operation_id,
                 outcome,
@@ -8838,6 +8895,19 @@ fn kick_off_develop_commit(
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopCommitted {
             operation_id,
+            result,
+        });
+    });
+}
+
+fn kick_off_develop_file_write(write: DevelopFileWrite, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = tokio::fs::write(write.path, write.content)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = tx.send(AppEvent::DevelopFileRewritten {
+            operation_id: write.operation_id,
+            revision: write.revision,
             result,
         });
     });
