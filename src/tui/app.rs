@@ -12516,4 +12516,106 @@ mod tests {
             });
         });
     }
+
+    fn resolve_on_path(binary: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join(binary);
+            candidate.is_file().then_some(candidate)
+        })
+    }
+
+    #[test]
+    fn develop_plan_handoff_success_installs_watcher_before_spawning_pty() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let binary = resolve_on_path("true").expect("`true` binary should be on PATH");
+            let handoff = FixApplyHandoff {
+                opencode_binary: binary,
+                opencode_args: Vec::new(),
+                cwd: repo.clone(),
+            };
+
+            app.apply_develop_plan_ready(1, true, Ok(Box::new(handoff)));
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(app.develop_watch.is_some(), "watcher should be installed");
+            assert!(screen.has_pty(), "PTY should be spawned");
+            assert_eq!(screen.step(), DevelopStep::Planning);
+            assert!(
+                screen.plan_corrective(),
+                "screen should be in corrective planning state"
+            );
+        });
+    }
+
+    #[test]
+    fn develop_plan_handoff_failure_surfaces_error_without_starting_pty() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+
+            app.apply_develop_plan_ready(1, false, Err("planning handoff failed".to_string()));
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(
+                app.develop_watch.is_none(),
+                "watcher should not be installed"
+            );
+            assert!(!screen.has_pty(), "PTY should not be spawned");
+            assert_eq!(screen.error(), Some("planning handoff failed"));
+        });
+    }
+
+    #[test]
+    fn develop_implementation_handoff_success_selects_ralph_section_before_spawning_pty() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr.as_mut().unwrap().set_plan(develop_plan());
+            let binary = resolve_on_path("true").expect("`true` binary should be on PATH");
+            let handoff = FixApplyHandoff {
+                opencode_binary: binary,
+                opencode_args: Vec::new(),
+                cwd: repo.clone(),
+            };
+
+            app.apply_develop_implement_ready(1, Some(0), Ok(Box::new(handoff)));
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(app.develop_watch.is_some(), "watcher should be installed");
+            assert!(screen.has_pty(), "PTY should be spawned");
+            assert_eq!(screen.current_section(), Some(0));
+            assert_eq!(screen.step(), DevelopStep::Implementing);
+        });
+    }
+
+    #[test]
+    fn develop_implementation_handoff_failure_surfaces_error_without_starting_pty() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr.as_mut().unwrap().set_plan(develop_plan());
+
+            app.apply_develop_implement_ready(
+                1,
+                Some(0),
+                Err("implementation handoff failed".to_string()),
+            );
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(
+                app.develop_watch.is_none(),
+                "watcher should not be installed"
+            );
+            assert!(!screen.has_pty(), "PTY should not be spawned");
+            assert_eq!(screen.error(), Some("implementation handoff failed"));
+            assert_eq!(
+                screen.current_section(),
+                None,
+                "section should not be advanced"
+            );
+        });
+    }
 }
