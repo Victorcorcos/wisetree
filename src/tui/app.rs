@@ -5388,6 +5388,9 @@ impl App {
             behind: 0,
             base_ref: Some(base_ref),
             pr_base_ref: None,
+            // The local-conflict tail skips the confirm screen, so it cannot
+            // expose the autonomous toggle; keep the default behavior.
+            autonomous: true,
         };
         let ai = self.current_dashboard_config().ai.update.clone();
         let mut screen = UpdatePullRequestScreen::new_local_conflict(request, ai);
@@ -8388,7 +8391,12 @@ fn kick_off_update_pull_request(
         });
 
         let result = service
-            .update_pull_request_with_progress(&request.worktree_path, &base_ref, Some(progress_tx))
+            .update_pull_request_with_progress(
+                &request.worktree_path,
+                &base_ref,
+                request.autonomous,
+                Some(progress_tx),
+            )
             .await;
         // Drop the progress sender (the service already did, but be
         // explicit) and wait for the forwarder to drain before emitting

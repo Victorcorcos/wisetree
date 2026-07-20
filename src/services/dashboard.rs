@@ -2055,8 +2055,9 @@ impl DashboardService {
         &self,
         worktree_path: &str,
         base_ref: &str,
+        autonomous: bool,
     ) -> Result<UpdatePullRequestOutcome> {
-        self.update_pull_request_with_progress(worktree_path, base_ref, None)
+        self.update_pull_request_with_progress(worktree_path, base_ref, autonomous, None)
             .await
     }
 
@@ -2069,6 +2070,7 @@ impl DashboardService {
         &self,
         worktree_path: &str,
         base_ref: &str,
+        autonomous: bool,
         progress: Option<mpsc::UnboundedSender<UpdateProgress>>,
     ) -> Result<UpdatePullRequestOutcome> {
         let cwd = PathBuf::from(worktree_path);
@@ -2187,7 +2189,7 @@ impl DashboardService {
             // effort is seeded into opencode's `model.json` instead (see
             // `seed_opencode_tui_variant`).
             seed_opencode_tui_variant(&model, &self.config.ai.update.thinking);
-            let prompt = build_merge_prompt(base_ref, &conflicts);
+            let prompt = build_merge_prompt(base_ref, &conflicts, autonomous);
             let mut opencode_args: Vec<String> = vec![
                 "--prompt".to_string(),
                 prompt,
@@ -2334,7 +2336,9 @@ impl DashboardService {
         // The TUI takes no `--variant`; seed the reasoning effort into
         // opencode's `model.json` so it opens at the configured strength.
         seed_opencode_tui_variant(&model, &self.config.ai.update.thinking);
-        let prompt = build_merge_prompt(&base_ref, &conflicts);
+        // The local "Update branch" flow skips the confirm screen, so it
+        // cannot expose the autonomous toggle; default to autonomous mode.
+        let prompt = build_merge_prompt(&base_ref, &conflicts, true);
         let mut opencode_args: Vec<String> = vec![
             "--prompt".to_string(),
             prompt,
@@ -6308,7 +6312,7 @@ async fn conflicted_files(git_binary: &Path, cwd: &Path) -> Vec<String> {
 ///
 /// The prompt deliberately ships **without** YAML frontmatter so it stays a
 /// plain instruction body no matter which CLI harness executes it.
-fn build_merge_prompt(base_ref: &str, conflicts: &[String]) -> String {
+fn build_merge_prompt(base_ref: &str, conflicts: &[String], autonomous: bool) -> String {
     const MERGER_PROMPT: &str = include_str!("../../prompts/merger.md");
     let bulleted = if conflicts.is_empty() {
         "  (none reported — re-run `git diff --name-only --diff-filter=U`)".to_string()
@@ -6319,9 +6323,13 @@ fn build_merge_prompt(base_ref: &str, conflicts: &[String]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    MERGER_PROMPT
+    let mut prompt = MERGER_PROMPT
         .replace("MERGE_REF", base_ref)
-        .replace("CONFLICTED_FILES", &bulleted)
+        .replace("CONFLICTED_FILES", &bulleted);
+    if !autonomous {
+        prompt.push_str("\n\n## Clarification mode\n\nThe user has disabled autonomous mode. When a conflict hunk contains contradictory business rules, different assumptions, or incompatible security/policy checks (for example, one side requires `user.admin?` while the other requires `policy.update?`, or one side checks `age < 18` while the other checks `age < 21`), you MUST ask the user for clarification before resolving it. Present both conflicting options, explain the trade-off, and let the user pick one or provide a new version. Do not pick one side on your own in these cases.");
+    }
+    prompt
 }
 
 /// Fallback PR template used when the repo ships none of the well-known
@@ -13632,7 +13640,7 @@ so the intent reads clearly.
         // Regression guard: a leading `--- name: X ---` block would make
         // some CLIs treat the prompt as a skill manifest and package it
         // into a `.skill` archive instead of resolving conflicts.
-        let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()]);
+        let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()], true);
         assert!(
             !prompt.trim_start().starts_with("---"),
             "prompt must not start with YAML frontmatter, got:\n{prompt}"
@@ -13748,6 +13756,7 @@ so the intent reads clearly.
         let prompt = build_merge_prompt(
             "upstream/main",
             &["src/foo.rs".to_string(), "tests/snap.snap".to_string()],
+            true,
         );
         assert!(!prompt.contains("MERGE_REF"));
         assert!(
@@ -13761,13 +13770,47 @@ so the intent reads clearly.
 
     #[test]
     fn build_merge_prompt_forbids_unrelated_work_and_pipeline_git_ops() {
-        let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()]);
+        let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()], true);
         // The prompt must tell the AI to stay out of pipeline-managed git ops
         // and not to drift into unrelated cleanup — both are concrete failure
         // modes we've already observed in production.
         assert!(prompt.contains("git commit"));
         assert!(prompt.contains("git push"));
         assert!(prompt.to_lowercase().contains("stay focused on the merge"));
+    }
+
+    #[test]
+    fn build_merge_prompt_non_autonomous_adds_clarification_instruction() {
+        let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()], false);
+        assert!(
+            prompt.contains("Clarification mode"),
+            "non-autonomous prompt should mention clarification mode, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("ask the user for clarification"),
+            "non-autonomous prompt should instruct the AI to ask, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("user.admin?"),
+            "non-autonomous prompt should cite the admin example, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("age < 21"),
+            "non-autonomous prompt should cite the age example, got:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn build_merge_prompt_autonomous_omits_clarification_instruction() {
+        let prompt = build_merge_prompt("upstream/main", &["a.rs".to_string()], true);
+        assert!(
+            !prompt.contains("Clarification mode"),
+            "autonomous prompt must not mention clarification mode, got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("ask the user for clarification"),
+            "autonomous prompt must not instruct the AI to ask, got:\n{prompt}"
+        );
     }
 
     #[test]
