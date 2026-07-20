@@ -6274,6 +6274,89 @@ mod tests {
         }
     }
 
+    fn ai_settings_render_text(screen: &SettingsScreen) -> String {
+        let backend = TestBackend::new(120, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn assert_selected_slot_metadata(screen: &SettingsScreen, label: &str, description: &str) {
+        let text = ai_settings_render_text(screen);
+        assert!(
+            text.contains(label),
+            "expected label {label:?} in AI settings render:\n{text}"
+        );
+        assert!(
+            text.contains(description),
+            "expected description {description:?} in AI settings render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn develop_plan_slot_renders_and_saves_its_configuration() {
+        let mut screen = ai_settings_screen(vec![]);
+        let idx = AiSlot::ALL
+            .iter()
+            .position(|s| *s == AiSlot::DevelopPlan)
+            .unwrap();
+        focus_ai_slot(&mut screen, idx);
+
+        assert_selected_slot_metadata(
+            &screen,
+            "Develop · plan",
+            "Plans the described task into PLAN.md sections",
+        );
+
+        screen.apply_ai_selection("plan-model".to_string(), "high".to_string());
+        screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::Save;
+
+        match screen.handle_ai_settings(key(KeyCode::Enter)) {
+            SettingsAction::SaveDashboard(cfg) => {
+                assert_eq!(cfg.ai.develop.plan.model, "plan-model");
+                assert_eq!(cfg.ai.develop.plan.thinking, "high");
+                assert_ne!(cfg.ai.develop.implement.model, "plan-model");
+            }
+            other => panic!("expected SaveDashboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn develop_implement_slot_renders_and_saves_its_configuration() {
+        let mut screen = ai_settings_screen(vec![]);
+        let idx = AiSlot::ALL
+            .iter()
+            .position(|s| *s == AiSlot::DevelopImplement)
+            .unwrap();
+        focus_ai_slot(&mut screen, idx);
+
+        assert_selected_slot_metadata(
+            &screen,
+            "Develop · implement",
+            "Implements the approved plan section by section",
+        );
+
+        screen.apply_ai_selection("implement-model".to_string(), "medium".to_string());
+        screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::Save;
+
+        match screen.handle_ai_settings(key(KeyCode::Enter)) {
+            SettingsAction::SaveDashboard(cfg) => {
+                assert_eq!(cfg.ai.develop.implement.model, "implement-model");
+                assert_eq!(cfg.ai.develop.implement.thinking, "medium");
+                assert_ne!(cfg.ai.develop.plan.model, "implement-model");
+            }
+            other => panic!("expected SaveDashboard, got {other:?}"),
+        }
+    }
+
     #[test]
     fn apply_ai_selection_targets_focused_slot() {
         let mut screen = ai_settings_screen(vec![]);
