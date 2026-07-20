@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -6046,6 +6047,34 @@ fn login_shell_check_command(command: &str) -> (PathBuf, Vec<String>) {
     (PathBuf::from(shell), args)
 }
 
+async fn read_bounded_tail<R>(mut reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tail = Vec::new();
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+
+        if read >= max_bytes {
+            tail.clear();
+            tail.extend_from_slice(&chunk[read - max_bytes..read]);
+        } else {
+            let excess = tail.len().saturating_add(read).saturating_sub(max_bytes);
+            if excess > 0 {
+                tail.drain(..excess);
+            }
+            tail.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    Ok(tail)
+}
+
 /// Like [`run_command_once`] but merges stdout+stderr and returns `Ok(())`
 /// on a zero exit or `Err(combined_output)` otherwise — the shape the check
 /// runner needs (a test runner writes results to both streams, and success
@@ -6061,13 +6090,25 @@ async fn run_command_combined(
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    let output = cmd.output().await.map_err(|err| err.to_string())?;
-    if output.status.success() {
+    let mut child = cmd.spawn().map_err(|err| err.to_string())?;
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (status, stdout, stderr) = tokio::try_join!(
+        child.wait(),
+        read_bounded_tail(stdout, DEVELOP_CHECK_OUTPUT_MAX_BYTES),
+        read_bounded_tail(stderr, DEVELOP_CHECK_OUTPUT_MAX_BYTES),
+    )
+    .map_err(|err| err.to_string())?;
+
+    if status.success() {
         Ok(())
     } else {
-        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
-        Err(combined)
+        let mut combined = stdout;
+        combined.extend_from_slice(&stderr);
+        let start = combined
+            .len()
+            .saturating_sub(DEVELOP_CHECK_OUTPUT_MAX_BYTES);
+        Err(String::from_utf8_lossy(&combined[start..]).into_owned())
     }
 }
 
