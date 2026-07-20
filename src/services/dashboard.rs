@@ -3471,7 +3471,9 @@ impl DashboardService {
     /// Deterministic Develop pre-flight: model + opencode gates, base-ref
     /// resolution, and detection of a resumable `PLAN.md`.
     pub async fn develop_preflight(&self, worktree_path: &str) -> Result<DevelopPreflightOutcome> {
-        if self.config.ai.develop.plan.model.trim().is_empty() {
+        if self.config.ai.develop.plan.model.trim().is_empty()
+            || self.config.ai.develop.implement.model.trim().is_empty()
+        {
             return Ok(DevelopPreflightOutcome::AiNotConfigured);
         }
         if !binary_available(&self.opencode_binary) {
@@ -10505,6 +10507,21 @@ so the intent reads clearly.
         let (_tmp, repo) = develop_repo();
         let mut config = DashboardConfig::default();
         config.ai.develop.plan.model = " \t ".to_string();
+        let service = DashboardService::new(repo.clone(), config);
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DevelopPreflightOutcome::AiNotConfigured));
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_reports_ai_not_configured_for_blank_implementation_model() {
+        let (_tmp, repo) = develop_repo();
+        let mut config = DashboardConfig::default();
+        config.ai.develop.implement.model = " \t ".to_string();
         let service = DashboardService::new(repo.clone(), config);
 
         let outcome = service
