@@ -10338,13 +10338,20 @@ so the intent reads clearly.
 
         assert_eq!(handoff.opencode_binary, service.opencode_binary);
         assert_eq!(handoff.cwd, worktree.path());
-        assert_eq!(handoff.opencode_args[2..6], ["-m", "test-model", "--agent", "plan"]);
+        assert_eq!(
+            handoff.opencode_args[2..6],
+            ["-m", "test-model", "--agent", "plan"]
+        );
         assert!(handoff
             .opencode_args
             .get(1)
             .unwrap()
             .contains("Add dashboard filtering"));
-        assert!(handoff.opencode_args.get(1).unwrap().contains("origin/main"));
+        assert!(handoff
+            .opencode_args
+            .get(1)
+            .unwrap()
+            .contains("origin/main"));
         assert!(!handoff
             .opencode_args
             .get(1)
@@ -10389,7 +10396,10 @@ so the intent reads clearly.
             )
             .unwrap_err();
 
-        assert_eq!(error.to_string(), "ai.develop.plan model is not configured.");
+        assert_eq!(
+            error.to_string(),
+            "ai.develop.plan model is not configured."
+        );
     }
 
     #[test]
