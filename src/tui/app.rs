@@ -4191,6 +4191,18 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    fn on_develop_section_commit_result(
+        &mut self,
+        result: Result<Option<String>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(operation_id) = self.active_develop_operation_id else {
+            return;
+        };
+        self.apply_develop_committed(operation_id, result, tx);
+    }
+
     /// A section commit finished: count it (Done-page summary) and advance
     /// to the next run. A commit failure is a non-fatal toast — the section
     /// is already marked done and its edits remain in the worktree.
@@ -12106,6 +12118,95 @@ mod tests {
             assert!(!screen.plan().unwrap().sections[0].done);
             assert_eq!(screen.check_failure(), Some(output));
         });
+    }
+
+    // ── Develop section commit results ───────────────────────────────────
+
+    fn app_waiting_for_section_commit() -> (App, mpsc::UnboundedSender<AppEvent>) {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = develop_repo(&home);
+        let _ = home.keep();
+        let mut app = develop_app(&repo);
+        let screen = app.develop_pr.as_mut().expect("Develop screen");
+        screen.set_plan(single_section_plan());
+        screen.begin_implement_run(Some(0));
+        screen.finish_section();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        (app, tx)
+    }
+
+    fn single_section_plan() -> DevelopPlan {
+        DevelopPlan {
+            task_description: "Add CSV export".to_string(),
+            complexity: 3,
+            sections: vec![PlanSection {
+                number: 1,
+                name: "Data model".to_string(),
+                body: "Implement the data model.".to_string(),
+                done: false,
+            }],
+            notes: Vec::new(),
+        }
+    }
+
+    fn develop_committed_section_count(app: &App) -> usize {
+        app.develop_pr
+            .as_ref()
+            .expect("Develop screen")
+            .commit_count()
+    }
+
+    fn assert_develop_advanced_to_next_section(app: &App) {
+        let screen = app.develop_pr.as_ref().expect("Develop screen");
+        assert_eq!(
+            screen.step(),
+            DevelopStep::Done,
+            "workflow should have advanced"
+        );
+    }
+
+    fn develop_warning(app: &App) -> Option<&'static str> {
+        app.toast.current().map(|snapshot| {
+            let message = snapshot.message;
+            let stripped = message
+                .strip_prefix("Section commit failed: ")
+                .map(str::to_string)
+                .unwrap_or(message);
+            &*Box::leak(stripped.into_boxed_str())
+        })
+    }
+
+    #[test]
+    fn develop_section_commit_with_sha_counts_commit_and_advances() {
+        let (mut app, tx) = app_waiting_for_section_commit();
+
+        app.on_develop_section_commit_result(Ok(Some("abc123".to_string())), &tx);
+
+        assert_eq!(develop_committed_section_count(&app), 1);
+        assert_develop_advanced_to_next_section(&app);
+        assert_eq!(develop_warning(&app), None);
+    }
+
+    #[test]
+    fn develop_section_commit_without_changes_does_not_count_and_advances() {
+        let (mut app, tx) = app_waiting_for_section_commit();
+
+        app.on_develop_section_commit_result(Ok(None), &tx);
+
+        assert_eq!(develop_committed_section_count(&app), 0);
+        assert_develop_advanced_to_next_section(&app);
+        assert_eq!(develop_warning(&app), None);
+    }
+
+    #[test]
+    fn develop_section_commit_error_warns_without_counting_and_advances() {
+        let (mut app, tx) = app_waiting_for_section_commit();
+
+        app.on_develop_section_commit_result(Err("commit failed".to_string()), &tx);
+
+        assert_eq!(develop_committed_section_count(&app), 0);
+        assert_develop_advanced_to_next_section(&app);
+        assert_eq!(develop_warning(&app), Some("commit failed"));
     }
 
     // ── Develop preflight outcomes ─────────────────────────────────────
