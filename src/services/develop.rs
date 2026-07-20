@@ -552,6 +552,21 @@ pub fn summarize_transcript(transcript: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn summarize_transcript_keeps_summary_at_character_limit() {
+        let summary = "a".repeat(NOTE_MAX_CHARS);
+
+        assert_eq!(summarize_transcript(&summary), Some(summary));
+    }
+
+    #[test]
+    fn summarize_transcript_retains_exact_character_limit_before_ellipsis() {
+        let summary = "a".repeat(NOTE_MAX_CHARS + 1);
+        let expected = format!("{}…", "a".repeat(NOTE_MAX_CHARS));
+
+        assert_eq!(summarize_transcript(&summary), Some(expected));
+    }
+
     fn section(number: usize, name: &str, done: bool) -> PlanSection {
         PlanSection {
             number,
