@@ -6028,10 +6028,17 @@ fn clip_output_tail(text: &str, max_bytes: usize) -> String {
 /// Mirrors `files::service`'s post-create runner: `-l` for shells that
 /// support it, then `-c <command>`. No `-i` — there is no PTY.
 fn login_shell_check_command(command: &str) -> (PathBuf, Vec<String>) {
-    let shell = std::env::var("SHELL")
-        .ok()
+    let shell = std::env::var("SHELL").ok();
+    login_shell_check_command_for_shell(command, shell.as_deref())
+}
+
+fn login_shell_check_command_for_shell(
+    command: &str,
+    configured_shell: Option<&str>,
+) -> (PathBuf, Vec<String>) {
+    let shell = configured_shell
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".to_string());
+        .unwrap_or("/bin/sh");
     let shell_name = Path::new(&shell)
         .file_name()
         .and_then(|n| n.to_str())
@@ -7302,6 +7309,38 @@ pub fn resolve_dashboard_columns(
 mod tests {
     use super::*;
     use crate::services::develop::{render_plan_md, PlanSection};
+
+    #[test]
+    fn login_shell_check_uses_login_mode_for_supported_shell() {
+        let (shell, args) = login_shell_check_command_for_shell("cargo test", Some("/bin/zsh"));
+
+        assert_eq!(shell, PathBuf::from("/bin/zsh"));
+        assert_eq!(args, ["-l", "-c", "cargo test"]);
+    }
+
+    #[test]
+    fn login_shell_check_omits_login_mode_for_unsupported_shell() {
+        let (shell, args) = login_shell_check_command_for_shell("cargo test", Some("/usr/bin/nu"));
+
+        assert_eq!(shell, PathBuf::from("/usr/bin/nu"));
+        assert_eq!(args, ["-c", "cargo test"]);
+    }
+
+    #[test]
+    fn login_shell_check_falls_back_for_empty_shell() {
+        let (shell, args) = login_shell_check_command_for_shell("cargo test", Some(""));
+
+        assert_eq!(shell, PathBuf::from("/bin/sh"));
+        assert_eq!(args, ["-c", "cargo test"]);
+    }
+
+    #[test]
+    fn login_shell_check_falls_back_for_missing_shell() {
+        let (shell, args) = login_shell_check_command_for_shell("cargo test", None);
+
+        assert_eq!(shell, PathBuf::from("/bin/sh"));
+        assert_eq!(args, ["-c", "cargo test"]);
+    }
 
     #[test]
     fn develop_plan_prompt_renders_first_run_with_unresolved_base() {
