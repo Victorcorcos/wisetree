@@ -9953,6 +9953,74 @@ mod tests {
         }
     }
 
+    fn develop_app_implementing(
+        check_command: Option<&str>,
+    ) -> (
+        App,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = develop_repo(&home);
+        let _ = home.keep();
+        let mut app = develop_app(&repo);
+        if let Some(check_command) = check_command {
+            app.worktree_service
+                .as_mut()
+                .unwrap()
+                .config_service_mut()
+                .update(|config| {
+                    config.dashboard.develop.check_command = check_command.to_string();
+                });
+        }
+        let screen = app.develop_pr.as_mut().unwrap();
+        screen.set_plan(develop_plan());
+        screen.set_check_command(check_command.map(str::to_string));
+        screen.begin_implement_run(Some(0));
+        let (tx, rx) = mpsc::unbounded_channel();
+        (app, tx, rx)
+    }
+
+    fn develop_app_implementing_with_check(
+        check_command: &str,
+    ) -> (
+        App,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        develop_app_implementing(Some(check_command))
+    }
+
+    fn develop_app_implementing_without_check() -> (
+        App,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        develop_app_implementing(None)
+    }
+
+    async fn assert_develop_check_requested(
+        rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+        check_command: &str,
+    ) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("develop check event should arrive")
+            .expect("channel should stay open");
+        assert!(
+            matches!(event, AppEvent::DevelopChecked { .. }),
+            "expected DevelopChecked for `{check_command}`, got a different event"
+        );
+    }
+
+    async fn assert_no_develop_check_requested(rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("plan write or next implementation event should arrive")
+            .expect("channel should stay open");
+        assert!(!matches!(event, AppEvent::DevelopChecked { .. }));
+    }
+
     #[test]
     fn new_app_has_no_selected_path() {
         let app = App::new(AppMode::Menu, false);
@@ -11679,6 +11747,115 @@ mod tests {
                 );
                 assert_eq!(app.active_develop_operation_id, Some(1));
             });
+        });
+    }
+
+    #[test]
+    fn develop_implementation_completion_records_note_and_starts_configured_check() {
+        let (mut app, tx, mut rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done(
+                "Implemented the requested behavior.\nAdded regression coverage.".into(),
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(!screen.plan().unwrap().sections[0].done);
+            assert_eq!(screen.step(), DevelopStep::Verifying);
+            assert_develop_check_requested(&mut rx, "cargo test").await;
+
+            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert_eq!(
+                screen.plan().unwrap().notes,
+                vec!["Section 1: Added regression coverage."]
+            );
+        });
+    }
+
+    #[test]
+    fn develop_implementation_completion_without_check_finalizes_section_directly() {
+        let (mut app, tx, mut rx) = develop_app_implementing_without_check();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done(
+                "Implemented the requested behavior.\nAdded regression coverage.".into(),
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert_eq!(
+                screen.plan().unwrap().notes,
+                vec!["Section 1: Added regression coverage."]
+            );
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert_ne!(screen.step(), DevelopStep::Verifying);
+            assert_no_develop_check_requested(&mut rx).await;
+        });
+    }
+
+    #[test]
+    fn implementation_completion_records_summary_and_starts_configured_check() {
+        let (mut app, tx, mut rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_turn(
+                OpencodeTurn::Finished {
+                    transcript: "Implementation output\nCompleted the requested change.".into(),
+                },
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::Verifying);
+            assert_develop_check_requested(&mut rx, "cargo test").await;
+
+            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(
+                screen.plan().unwrap().notes,
+                vec!["Section 1: Completed the requested change."]
+            );
+        });
+    }
+
+    #[test]
+    fn implementation_completion_records_summary_and_finishes_without_check() {
+        let (mut app, tx, mut rx) = develop_app_implementing_without_check();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_turn(
+                OpencodeTurn::Finished {
+                    transcript: "Implementation output\nCompleted the requested change.".into(),
+                },
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(
+                screen.plan().unwrap().notes,
+                vec!["Section 1: Completed the requested change."]
+            );
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert_ne!(screen.step(), DevelopStep::Verifying);
+            assert_no_develop_check_requested(&mut rx).await;
         });
     }
 
