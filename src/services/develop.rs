@@ -230,6 +230,14 @@ const SECTIONS_HEADING: &str = "## Implementation Sections";
 const TRACKER_HEADING: &str = "## Progress Tracker";
 const NOTES_HEADING: &str = "## Section Notes";
 const DONE_SUFFIX: &str = " ✅";
+const ESCAPED_DONE_SUFFIX: &str = " ✅<!-- wisetree:section-name -->";
+
+fn render_section_name(name: &str) -> String {
+    match name.strip_suffix(DONE_SUFFIX) {
+        Some(name) => format!("{name}{ESCAPED_DONE_SUFFIX}"),
+        None => name.to_string(),
+    }
+}
 
 /// Render the whole `PLAN.md` from the in-memory model. The harness rewrites
 /// the file with this after **every** mutation — the file is output for the
@@ -243,9 +251,10 @@ pub fn render_plan_md(plan: &DevelopPlan) -> String {
     );
     for section in &plan.sections {
         let done = if section.done { DONE_SUFFIX } else { "" };
+        let name = render_section_name(&section.name);
         out.push_str(&format!(
             "\n#### Section {} — {}{done}\n{}\n\n---\n",
-            section.number, section.name, section.body
+            section.number, name, section.body
         ));
     }
     out.push_str(&format!(
@@ -318,6 +327,10 @@ pub fn parse_plan_md(content: &str) -> Option<DevelopPlan> {
             let (name, done) = match name_part.strip_suffix(DONE_SUFFIX) {
                 Some(name) => (name, true),
                 None => (name_part, false),
+            };
+            let name = match name.strip_suffix(ESCAPED_DONE_SUFFIX) {
+                Some(name) => format!("{name}{DONE_SUFFIX}"),
+                None => name.to_string(),
             };
             // Body: lines until the `---` separator (or the tracker heading).
             let mut end = cursor + 1;
@@ -687,6 +700,25 @@ CRITERIA: - c";
         let rendered = render_plan_md(&plan);
         let parsed = parse_plan_md(&rendered).expect("round-trip parses");
         assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn plan_round_trip_preserves_pending_name_ending_in_done_suffix() {
+        let mut plan = plan();
+        plan.sections[1].name = "Verification ✅".to_string();
+        let parsed = parse_plan_md(&render_plan_md(&plan)).expect("round-trip parses");
+        assert_eq!(parsed.sections[1].name, "Verification ✅");
+        assert!(!parsed.sections[1].done);
+    }
+
+    #[test]
+    fn plan_round_trip_preserves_completed_name_ending_in_done_suffix() {
+        let mut plan = plan();
+        plan.sections[1].name = "Verification ✅".to_string();
+        plan.sections[1].done = true;
+        let parsed = parse_plan_md(&render_plan_md(&plan)).expect("round-trip parses");
+        assert_eq!(parsed.sections[1].name, "Verification ✅");
+        assert!(parsed.sections[1].done);
     }
 
     #[test]
