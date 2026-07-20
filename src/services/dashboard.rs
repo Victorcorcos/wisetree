@@ -7299,6 +7299,7 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::develop::{render_plan_md, PlanSection};
 
     // ── Review pipeline: diff split + findings parsing ─────────────────
 
@@ -10309,6 +10310,116 @@ so the intent reads clearly.
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "seed"]);
         (tmp, repo)
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_reports_ai_not_configured_for_blank_planning_model() {
+        let (_tmp, repo) = develop_repo();
+        let mut config = DashboardConfig::default();
+        config.ai.develop.plan.model = " \t ".to_string();
+        let service = DashboardService::new(repo.clone(), config);
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DevelopPreflightOutcome::AiNotConfigured));
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_reports_ai_unavailable_when_opencode_is_missing() {
+        let (_tmp, repo) = develop_repo();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(repo.join("missing-opencode"));
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DevelopPreflightOutcome::AiUnavailable));
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_is_ready_with_an_absent_plan() {
+        let (_tmp, repo) = develop_repo();
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let expected_base_ref = Some("origin/main".to_string());
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let DevelopPreflightOutcome::Ready(preflight) = outcome else {
+            panic!("expected Develop preflight to be ready");
+        };
+        assert!(matches!(preflight.resume, DevelopResumeState::Absent));
+        assert_eq!(preflight.base_ref, expected_base_ref);
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_is_ready_with_an_unparseable_plan() {
+        let (_tmp, repo) = develop_repo();
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(repo.join(PLAN_FILE), "# Not a development plan").unwrap();
+        git(&repo, &["add", PLAN_FILE]);
+        git(&repo, &["commit", "-q", "-m", "add malformed plan"]);
+        let expected_base_ref = Some("origin/main".to_string());
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let DevelopPreflightOutcome::Ready(preflight) = outcome else {
+            panic!("expected Develop preflight to be ready");
+        };
+        assert!(matches!(preflight.resume, DevelopResumeState::Unparseable));
+        assert_eq!(preflight.base_ref, expected_base_ref);
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_is_ready_with_a_parsed_plan() {
+        let (_tmp, repo) = develop_repo();
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let expected_plan = DevelopPlan {
+            task_description: "Add Develop preflight coverage".to_string(),
+            complexity: 3,
+            sections: vec![PlanSection {
+                number: 1,
+                name: "Preflight tests".to_string(),
+                body: "**Goal**: Cover resume states\n**Acceptance criteria**:\n- [ ] Tests pass"
+                    .to_string(),
+                done: false,
+            }],
+            notes: vec!["Planning complete".to_string()],
+        };
+        std::fs::write(repo.join(PLAN_FILE), render_plan_md(&expected_plan)).unwrap();
+        git(&repo, &["add", PLAN_FILE]);
+        git(&repo, &["commit", "-q", "-m", "add valid plan"]);
+        let expected_base_ref = Some("origin/main".to_string());
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let DevelopPreflightOutcome::Ready(preflight) = outcome else {
+            panic!("expected Develop preflight to be ready");
+        };
+        let DevelopResumeState::Parsed(plan) = preflight.resume else {
+            panic!("expected a parsed Develop plan");
+        };
+        assert_eq!(plan, expected_plan);
+        assert_eq!(preflight.base_ref, expected_base_ref);
     }
 
     #[tokio::test]
