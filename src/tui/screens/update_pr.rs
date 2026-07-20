@@ -181,6 +181,11 @@ pub struct UpdatePullRequestScreen {
     commit_push_succeeded: bool,
     /// Summary rows shown on the done page (one row: overall commit+push result).
     commit_push_summary: Vec<SummaryRow>,
+    /// Autonomous mode toggle. `true` means the AI resolves conflicts on its
+    /// own; `false` means the AI must ask the user for clarification when the
+    /// merge contains contradictory assumptions, business rules, or
+    /// security/policy checks.
+    autonomous: bool,
 }
 
 impl UpdatePullRequestScreen {
@@ -194,6 +199,7 @@ impl UpdatePullRequestScreen {
         } else {
             (None, UpdateStep::Loading)
         };
+        let autonomous = request.autonomous;
         Self {
             request,
             ai,
@@ -220,6 +226,7 @@ impl UpdatePullRequestScreen {
             commit_push_done: false,
             commit_push_succeeded: false,
             commit_push_summary: Vec::new(),
+            autonomous,
         }
     }
 
@@ -257,6 +264,20 @@ impl UpdatePullRequestScreen {
 
     pub fn is_push_only(&self) -> bool {
         self.push_only
+    }
+
+    /// Whether the AI is allowed to resolve conflicts on its own (`true`)
+    /// or must ask the user for clarification when it detects contradictory
+    /// assumptions (`false`).
+    pub fn autonomous(&self) -> bool {
+        self.autonomous
+    }
+
+    /// Toggle the autonomous mode flag. Called when the user presses Spacebar
+    /// on the confirm screen.
+    pub fn toggle_autonomous(&mut self) {
+        self.autonomous = !self.autonomous;
+        self.request.autonomous = self.autonomous;
     }
 
     /// `true` when this screen is resolving conflicts for a local branch
@@ -923,6 +944,13 @@ impl UpdatePullRequestScreen {
             Some(d) => d,
             None => return UpdateAction::Cancelled,
         };
+        // Spacebar toggles the autonomous mode checkbox on the confirm screen.
+        // It is handled before the modal so it doesn't accidentally trigger a
+        // Yes/No selection.
+        if matches!(key.code, KeyCode::Char(' ')) && !self.push_only {
+            self.toggle_autonomous();
+            return UpdateAction::Continue;
+        }
         match dialog.handle_key(key) {
             ConfirmationOutcome::Confirmed => UpdateAction::Confirmed,
             ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
@@ -1086,16 +1114,52 @@ impl UpdatePullRequestScreen {
                 self.ai.thinking.clone(),
             )]
         };
-        PrConfirmView::new(format!(
+        let mut view = PrConfirmView::new(format!(
             "{title_verb} Pull Request #{}?",
             self.request.number
         ))
         .title_color(colors::WARNING)
         .block(build_detail_lines(&self.request))
         .steps(&build_steps(base_ref, self.push_only))
-        .ai_roles(ai_roles)
-        .modal(self.confirm.as_ref())
+        .ai_roles(ai_roles);
+        // Only the full update flow needs the autonomous mode toggle; push-only
+        // never merges, so the checkbox would be confusing there.
+        if !self.push_only {
+            view = view.block(vec![build_autonomous_line(self.autonomous)]);
+        }
+        view.modal(self.confirm.as_ref())
     }
+}
+
+fn build_autonomous_line(autonomous: bool) -> Line<'static> {
+    let marker = if autonomous { "☒" } else { "☐" };
+    let label = "Autonomous";
+    let hint = if autonomous {
+        "AI resolves conflicts on its own"
+    } else {
+        "AI asks when assumptions contradict"
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<12}"),
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("{marker} "),
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label.to_string(), Style::default().fg(colors::WHITE)),
+        Span::styled(
+            format!(" — {hint}"),
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        ),
+    ])
 }
 
 fn build_confirm(request: &UpdatePullRequestRequest, push_only: bool) -> ConfirmationModal {
@@ -2447,6 +2511,7 @@ mod tests {
             behind: 7,
             base_ref: None,
             pr_base_ref: Some("main".to_string()),
+            autonomous: true,
         }
     }
 
@@ -2995,8 +3060,9 @@ mod tests {
         let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
 
-        // Tall enough for details + Will-run steps + the ai.update table + modal.
-        let dumped = render_dump(&mut screen, 100, 34);
+        // Tall enough for details + Will-run steps + the ai.update table +
+        // autonomous checkbox + modal.
+        let dumped = render_dump(&mut screen, 100, 36);
 
         assert!(
             dumped.contains("Update Pull Request #21?"),
@@ -3010,6 +3076,19 @@ mod tests {
         assert!(
             dumped.contains("opencode/update-model"),
             "expected ai.update row in:\n{dumped}"
+        );
+        // The autonomous mode checkbox appears on the full update confirm page.
+        assert!(
+            dumped.contains("Autonomous"),
+            "expected autonomous checkbox label in:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("☒"),
+            "expected checked autonomous box in:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("AI resolves conflicts on its own"),
+            "expected autonomous hint in:\n{dumped}"
         );
     }
 
@@ -3042,6 +3121,57 @@ mod tests {
             !dumped.contains("git merge"),
             "push confirm must not mention merge:\n{dumped}"
         );
+        // The push-only flow never resolves conflicts, so the autonomous
+        // checkbox is hidden to avoid confusion.
+        assert!(
+            !dumped.contains("Autonomous"),
+            "push confirm must not show autonomous checkbox:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn spacebar_toggles_autonomous_checkbox() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
+        screen.set_base_ref("upstream/main".to_string());
+        assert!(screen.autonomous());
+
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(space), UpdateAction::Continue);
+        assert!(!screen.autonomous());
+        assert!(!screen.request().autonomous);
+
+        let dumped = render_dump(&mut screen, 100, 36);
+        assert!(
+            dumped.contains("☐"),
+            "expected unchecked box after toggling off:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("AI asks when assumptions contradict"),
+            "expected non-autonomous hint in:\n{dumped}"
+        );
+
+        assert_eq!(screen.handle_key(space), UpdateAction::Continue);
+        assert!(screen.autonomous());
+        assert!(screen.request().autonomous);
+
+        let dumped = render_dump(&mut screen, 100, 36);
+        assert!(
+            dumped.contains("☒"),
+            "expected checked box after toggling back on:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("AI resolves conflicts on its own"),
+            "expected autonomous hint in:\n{dumped}"
+        );
+    }
+
+    #[test]
+    fn spacebar_does_not_toggle_autonomous_in_push_only_mode() {
+        let mut screen = UpdatePullRequestScreen::new_push(sample_request(), test_ai());
+        assert!(screen.autonomous());
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(space), UpdateAction::Continue);
+        assert!(screen.autonomous());
     }
 
     #[test]
