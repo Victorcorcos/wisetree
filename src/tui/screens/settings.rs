@@ -4398,15 +4398,43 @@ impl SettingsScreen {
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
+        // Each slot needs a 3-row rectangle plus a 1-row hint. Keep the Save
+        // button and fixed header/footer rows visible by only rendering the
+        // slots that fit in the available height, scrolling to follow focus.
+        const SLOT_HEIGHT: u16 = 4;
+        const SAVE_HEIGHT: u16 = 3;
+        const FIXED_OVERHEAD: u16 = 1 + 1 + 1 + 1 + 1; // title, description, chips, chip hint, footer hint
+
+        let slot_viewport_height = area.height.saturating_sub(FIXED_OVERHEAD + SAVE_HEIGHT);
+        let visible_slots = usize::from(
+            slot_viewport_height
+                .checked_div(SLOT_HEIGHT)
+                .unwrap_or(0)
+                .max(1),
+        )
+        .min(AiSlot::ALL.len());
+
+        let focused_slot = match editor.selection {
+            AiSettingsSelection::Rect(i) => i,
+            AiSettingsSelection::FreeModels(_) => editor.last_rect,
+            AiSettingsSelection::Save => AiSlot::ALL.len() - 1,
+        }
+        .min(AiSlot::ALL.len() - 1);
+        let first_visible = focused_slot
+            .saturating_add(1)
+            .saturating_sub(visible_slots)
+            .min(AiSlot::ALL.len() - visible_slots);
+        let visible_range = first_visible..first_visible + visible_slots;
+
         let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
-        for _ in AiSlot::ALL.iter() {
+        for _ in visible_range.clone() {
             constraints.push(Constraint::Length(3));
             constraints.push(Constraint::Length(1));
         }
         constraints.push(Constraint::Length(1)); // chips line
         constraints.push(Constraint::Length(1)); // chip-action hint
         constraints.push(Constraint::Min(0));
-        constraints.push(Constraint::Length(3)); // Save
+        constraints.push(Constraint::Length(SAVE_HEIGHT)); // Save
         constraints.push(Constraint::Length(1)); // bottom hint
 
         let chunks = Layout::default()
@@ -4427,7 +4455,7 @@ impl SettingsScreen {
         );
 
         let mut cursor = 2usize;
-        for (i, _slot) in AiSlot::ALL.iter().enumerate() {
+        for i in visible_range.clone() {
             self.render_ai_settings_rectangle(frame, chunks[cursor], chunks[cursor + 1], editor, i);
             cursor += 2;
         }
@@ -6000,6 +6028,8 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
 mod tests {
     use super::*;
     use crate::config::schema::{AiStatusConfig, WorktreeConfig};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
@@ -6401,5 +6431,30 @@ mod tests {
             screen.ai_settings_editor.as_ref().unwrap().selection,
             AiSettingsSelection::Rect(2)
         );
+    }
+
+    #[test]
+    fn ai_settings_scrolls_to_keep_focused_slot_and_save_visible() {
+        let mut screen = ai_settings_screen(vec![]);
+        let develop_idx = AiSlot::ALL
+            .iter()
+            .position(|s| *s == AiSlot::DevelopImplement)
+            .unwrap();
+        focus_ai_slot(&mut screen, develop_idx);
+
+        let backend = TestBackend::new(80, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let dumped = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(dumped.contains("develop_implement"), "{dumped}");
+        assert!(dumped.contains("Save"), "{dumped}");
     }
 }
