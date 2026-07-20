@@ -836,6 +836,68 @@ body";
     }
 
     #[test]
+    fn resume_parser_rejects_malformed_plans() {
+        let malformed_plans = [
+            (
+                "malformed complexity",
+                r#"# Develop Plan
+## Task Description
+Implement the feature.
+**Complexity**: unknown points
+## Implementation Sections
+#### Section 1 — Implement
+Make the change.
+---
+## Progress Tracker
+"#,
+            ),
+            (
+                "invalid section number",
+                r#"# Develop Plan
+## Task Description
+Implement the feature.
+**Complexity**: 2 points
+## Implementation Sections
+#### Section one — Implement
+Make the change.
+---
+## Progress Tracker
+"#,
+            ),
+            (
+                "invalid section delimiter",
+                r#"# Develop Plan
+## Task Description
+Implement the feature.
+**Complexity**: 2 points
+## Implementation Sections
+#### Section 1 - Implement
+Make the change.
+---
+## Progress Tracker
+"#,
+            ),
+            (
+                "no implementation sections",
+                r#"# Develop Plan
+## Task Description
+Implement the feature.
+**Complexity**: 2 points
+## Implementation Sections
+## Progress Tracker
+"#,
+            ),
+        ];
+
+        for (case, contents) in malformed_plans {
+            assert!(
+                parse_plan_md(contents).is_none(),
+                "expected {case} to be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn parser_reads_done_state_from_the_header_suffix() {
         let mut plan = plan();
         plan.mark_done(1);
