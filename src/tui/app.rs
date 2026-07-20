@@ -4073,6 +4073,33 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    fn on_develop_plan_pty_exit_with_turn(
+        &mut self,
+        transcript: String,
+        turn: Result<OpencodeTurn, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match turn {
+            Ok(OpencodeTurn::Working) if parse_plan_transcript(&transcript).is_some() => {
+                self.finish_develop_plan(transcript, tx)
+            }
+            Ok(OpencodeTurn::Working) => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.note_planning_waiting();
+                }
+            }
+            Ok(turn) => self.on_develop_turn(turn, tx),
+            Err(message) => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(format!("opencode reported an error: {message}"));
+                }
+            }
+        }
+    }
+
     /// One implement run finished (turn completed, opencode exited, or the
     /// user confirmed). Capture the run's closing summary for the notes
     /// ledger, then either run the configured check (Ralph-canon
@@ -11793,6 +11820,95 @@ mod tests {
             }
             _other => panic!("expected DevelopPlanReady, got a different event"),
         }
+    }
+
+    #[test]
+    fn forced_plan_completion_accepts_parseable_working_transcript() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let transcript = valid_develop_plan_transcript();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.on_develop_plan_pty_exit_with_turn(transcript, Ok(OpencodeTurn::Working), &tx);
+
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::PlanReview
+                );
+                assert_plan_write_requested(&mut rx).await;
+            });
+        });
+    }
+
+    #[test]
+    fn forced_plan_completion_keeps_waiting_for_unparseable_working_transcript() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+
+            app.on_develop_plan_pty_exit_with_turn(
+                "partial, unparseable output".to_string(),
+                Ok(OpencodeTurn::Working),
+                &tx,
+            );
+
+            assert_eq!(app.develop_pr.as_ref().unwrap().step(), DevelopStep::Planning);
+            assert!(rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn forced_plan_completion_handles_finished_watcher_result_normally() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.on_develop_plan_pty_exit_with_turn(
+                    "partial output".to_string(),
+                    Ok(OpencodeTurn::Finished {
+                        transcript: valid_develop_plan_transcript(),
+                    }),
+                    &tx,
+                );
+
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::PlanReview
+                );
+                assert_plan_write_requested(&mut rx).await;
+            });
+        });
+    }
+
+    #[test]
+    fn forced_plan_completion_preserves_watcher_failures() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, _rx) = app_with_active_develop_flow(&repo);
+
+            app.on_develop_plan_pty_exit_with_turn(
+                String::new(),
+                Err("watcher failed".to_string()),
+                &tx,
+            );
+
+            assert!(app
+                .develop_pr
+                .as_ref()
+                .unwrap()
+                .error()
+                .is_some_and(|error| error.contains("watcher failed")));
+        });
     }
 
     #[test]
