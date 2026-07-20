@@ -108,6 +108,9 @@ pub fn parse_plan_transcript(transcript: &str) -> Option<DevelopPlan> {
             Some((is_task, lines)) => {
                 if trimmed == BLOCK_CLOSE {
                     if *is_task {
+                        if task.is_some() || !sections.is_empty() {
+                            return None;
+                        }
                         task = Some(parse_task_block(lines)?);
                     } else {
                         let mut section = parse_section_block(lines)?;
