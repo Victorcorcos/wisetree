@@ -10312,6 +10312,105 @@ so the intent reads clearly.
         (tmp, repo)
     }
 
+    fn develop_dashboard_service() -> (DashboardService, tempfile::TempDir) {
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let mut config = DashboardConfig::default();
+        config.ai.develop.plan.model = " test-model ".to_string();
+        let service = DashboardService::new(worktree.path().to_path_buf(), config)
+            .with_opencode_binary(PathBuf::from("git"));
+        (service, worktree)
+    }
+
+    #[test]
+    fn prepare_develop_plan_builds_plan_agent_handoff() {
+        let (service, worktree) = develop_dashboard_service();
+
+        let handoff = service
+            .prepare_develop_plan(
+                worktree.path().to_str().unwrap(),
+                "Add dashboard filtering",
+                Some("origin/main"),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(handoff.opencode_binary, service.opencode_binary);
+        assert_eq!(handoff.cwd, worktree.path());
+        assert_eq!(handoff.opencode_args[2..6], ["-m", "test-model", "--agent", "plan"]);
+        assert!(handoff
+            .opencode_args
+            .get(1)
+            .unwrap()
+            .contains("Add dashboard filtering"));
+        assert!(handoff.opencode_args.get(1).unwrap().contains("origin/main"));
+        assert!(!handoff
+            .opencode_args
+            .get(1)
+            .unwrap()
+            .contains("Your previous output could not be parsed"));
+    }
+
+    #[test]
+    fn prepare_develop_plan_appends_corrective_retry_instruction() {
+        let (service, worktree) = develop_dashboard_service();
+
+        let handoff = service
+            .prepare_develop_plan(
+                worktree.path().to_str().unwrap(),
+                "Add dashboard filtering",
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+
+        assert!(handoff.opencode_args.get(1).unwrap().ends_with(
+            "Your previous output could not be parsed. Reply with ONLY the \
+             delimited blocks, exactly as specified."
+        ));
+    }
+
+    #[test]
+    fn prepare_develop_plan_rejects_missing_model() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.plan.model = "   ".to_string();
+
+        let error = service
+            .prepare_develop_plan(
+                worktree.path().to_str().unwrap(),
+                "Add dashboard filtering",
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "ai.develop.plan model is not configured.");
+    }
+
+    #[test]
+    fn prepare_develop_plan_rejects_unavailable_opencode_binary() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.opencode_binary = worktree.path().join("missing-opencode");
+
+        let error = service
+            .prepare_develop_plan(
+                worktree.path().to_str().unwrap(),
+                "Add dashboard filtering",
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
+    }
+
     #[tokio::test]
     async fn develop_preflight_reports_ai_not_configured_for_blank_planning_model() {
         let (_tmp, repo) = develop_repo();
