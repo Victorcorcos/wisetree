@@ -6,12 +6,12 @@
 //!
 //! - `Confirm`   : explanation panel + `ConfirmationModal` (Yes/No, **No**
 //!   default). Enter on Yes returns `ReviewAction::Confirmed`.
-//! - `Working`   : a quiet spinner + step toast. Covers every captured /
-//!   deterministic phase the `App` drives: syncing + fetching the diff,
-//!   scanning the files (`Scanning N changed files (M done)…`), posting a
-//!   comment, revising a finding, and submitting the review summary. The
-//!   scan phase shows the files currently being scanned in a panel below
-//!   the spinner.
+//! - `Working`   : a quiet spinner + step toast for the captured/deterministic
+//!   phases the `App` drives (syncing + fetching the diff, posting a comment,
+//!   revising a finding, submitting the summary). The multi-pass scan instead
+//!   renders a live progress dashboard: a `Scan → Audit → Verify` stepper, a
+//!   per-stage progress bar, an "Under review" panel naming the files/passes
+//!   in flight, and a running per-severity findings tally.
 //! - `Decision`  : one finding at a time — category/severity badge, the exact
 //!   comment body that would be posted, then native **Post / Edit / Other /
 //!   Skip** buttons.
@@ -54,6 +54,7 @@ use crate::services::dashboard::{
 use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
+use crate::tui::widgets::spinner::spinner_frame;
 use crate::tui::widgets::{
     labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
     ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, Status, StatusIndicator,
@@ -70,8 +71,27 @@ fn coverage_scan_index(group_index: usize) -> usize {
 }
 
 /// Label for the coverage scan in the in-flight panel and report rows.
-const COVERAGE_SCAN_LABEL: &str = "test coverage";
+const COVERAGE_SCAN_LABEL: &str = "coverage";
 const MERGED_SCAN_LABEL: &str = "merged review";
+
+/// The three passes the Review pipeline runs, in order. Drives the progress
+/// stepper and the per-stage bar on the Working view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineStage {
+    Scan,
+    Audit,
+    Verify,
+}
+
+/// One stepper cell's state, mirroring the post-create command list icons
+/// (`✓` done, spinner active, `○` pending, `–` skipped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageState {
+    Done,
+    Active,
+    Pending,
+    Skipped,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewStep {
@@ -250,6 +270,16 @@ pub struct ReviewPullRequestScreen {
     /// Paths currently being scanned in parallel — the Working panel's
     /// content while the scan phase runs.
     in_flight: Vec<String>,
+    /// Which pipeline pass the Working view is currently showing (scan / audit
+    /// / verify), so the stepper and progress bar stay honest across phases.
+    stage: PipelineStage,
+    /// Whether the cross-group omission audit is expected to run this review,
+    /// captured when scanning begins so the stepper can show it as a real
+    /// upcoming stage (or as skipped) rather than guessing.
+    plan_audit: bool,
+    /// Total findings queued for high-risk verification, so the Verify bar can
+    /// show progress as `verification_outstanding` drains.
+    verification_total: usize,
     /// Files whose scan reached a terminal state (parsed or failed twice).
     scans_done: usize,
     /// Findings aggregated across every scanned file, sorted by severity
@@ -275,6 +305,9 @@ pub struct ReviewPullRequestScreen {
     summary_button_rects: Cell<[Rect; 3]>,
     /// Scroll offset for the (potentially long) comment preview / summary.
     decision_scroll: u16,
+    /// Max scroll offset from the last render, so scrolling can't overshoot
+    /// the bottom and leave the reverse direction feeling dead.
+    decision_max_scroll: Cell<u16>,
     other_input: Option<InputPrompt>,
     // ── results ─────────────────────────────────────────────────────────
     summary_rows: Vec<SummaryRow>,
@@ -307,6 +340,9 @@ impl ReviewPullRequestScreen {
             coverage_groups: Vec::new(),
             next_coverage_group: 0,
             in_flight: Vec::new(),
+            stage: PipelineStage::Scan,
+            plan_audit: false,
+            verification_total: 0,
             scans_done: 0,
             findings: Vec::new(),
             skipped_files: Vec::new(),
@@ -323,6 +359,7 @@ impl ReviewPullRequestScreen {
             summary_button: SummaryButton::Comment,
             summary_button_rects: Cell::new([Rect::default(); 3]),
             decision_scroll: 0,
+            decision_max_scroll: Cell::new(0),
             other_input: None,
             summary_rows: Vec::new(),
             scan_telemetry: Vec::new(),
@@ -458,6 +495,8 @@ impl ReviewPullRequestScreen {
     pub fn begin_scan_phase(&mut self) {
         self.step = ReviewStep::Working;
         self.scanning = true;
+        self.stage = PipelineStage::Scan;
+        self.plan_audit = self.should_run_gap_audit();
         self.refresh_scan_message();
     }
 
@@ -470,10 +509,10 @@ impl ReviewPullRequestScreen {
         } else {
             ""
         };
+        let files = self.files.len();
         self.phase_message = format!(
-            "Scanning {} changed files{combined} ({} done)...",
-            self.files.len(),
-            self.scans_done
+            "Reviewing {files} changed file{}{combined}",
+            if files == 1 { "" } else { "s" },
         );
     }
 
@@ -587,7 +626,7 @@ impl ReviewPullRequestScreen {
             MERGED_SCAN_LABEL.to_string()
         } else {
             format!(
-                "{COVERAGE_SCAN_LABEL} {}/{}",
+                "{COVERAGE_SCAN_LABEL} group {} of {}",
                 group_index + 1,
                 self.coverage_groups.len()
             )
@@ -739,7 +778,9 @@ impl ReviewPullRequestScreen {
     pub fn begin_gap_audit(&mut self) {
         self.gap_audit_started = true;
         self.scanning = true;
-        self.phase_message = "Auditing cross-group omissions...".to_string();
+        self.stage = PipelineStage::Audit;
+        self.phase_message =
+            "Cross-checking every group for issues a single pass might miss".to_string();
     }
 
     pub fn gap_audit_inputs(
@@ -856,7 +897,13 @@ impl ReviewPullRequestScreen {
         }
         if !candidates.is_empty() {
             self.scanning = true;
-            self.phase_message = format!("Verifying {} high-risk findings...", candidates.len());
+            self.stage = PipelineStage::Verify;
+            self.verification_total = candidates.len();
+            self.phase_message = format!(
+                "Double-checking {} high-risk finding{} before you review",
+                candidates.len(),
+                if candidates.len() == 1 { "" } else { "s" },
+            );
         }
         candidates
     }
@@ -905,7 +952,7 @@ impl ReviewPullRequestScreen {
             Ok(ReviewVerification::Confirmed { .. }) => {}
             Ok(ReviewVerification::RejectedFalsePositive { reason }) => {
                 self.verification_results[index] = None;
-                self.summary_rows.push(SummaryRow::with_status(
+                self.summary_rows.push(SummaryRow::with_note(
                     format!("verify {}", self.findings[index].descriptor()),
                     "Rejected false positive",
                     colors::MUTED,
@@ -914,7 +961,7 @@ impl ReviewPullRequestScreen {
             }
             Ok(ReviewVerification::Revise { reason, finding }) => {
                 self.verification_results[index] = Some(finding);
-                self.summary_rows.push(SummaryRow::with_status(
+                self.summary_rows.push(SummaryRow::with_note(
                     format!("verify {}", self.findings[index].descriptor()),
                     "Revised",
                     colors::EMPHASIS,
@@ -931,10 +978,7 @@ impl ReviewPullRequestScreen {
                 ));
             }
         }
-        self.phase_message = format!(
-            "Verifying high-risk findings ({} remaining)...",
-            self.verification_outstanding.len()
-        );
+        self.phase_message = "Double-checking high-risk findings".to_string();
     }
 
     pub fn verification_pending(&self) -> bool {
@@ -1096,10 +1140,24 @@ impl ReviewPullRequestScreen {
 
     // ── input ───────────────────────────────────────────────────────────
 
+    /// Scroll the comment/summary panel toward the top (smaller offset).
+    fn scroll_panel_up(&mut self, lines: u16) {
+        self.decision_scroll = self.decision_scroll.saturating_sub(lines);
+    }
+
+    /// Scroll toward the bottom, clamped to the last render's max offset so
+    /// the offset can't run past the end and make scrolling back feel dead.
+    fn scroll_panel_down(&mut self, lines: u16) {
+        self.decision_scroll = self
+            .decision_scroll
+            .saturating_add(lines)
+            .min(self.decision_max_scroll.get());
+    }
+
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
         match self.step {
             ReviewStep::Decision | ReviewStep::Summary => {
-                self.decision_scroll = self.decision_scroll.saturating_add(lines);
+                self.scroll_panel_up(lines);
                 true
             }
             _ => false,
@@ -1109,7 +1167,7 @@ impl ReviewPullRequestScreen {
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
         match self.step {
             ReviewStep::Decision | ReviewStep::Summary => {
-                self.decision_scroll = self.decision_scroll.saturating_sub(lines);
+                self.scroll_panel_down(lines);
                 true
             }
             _ => false,
@@ -1156,11 +1214,11 @@ impl ReviewPullRequestScreen {
                 ReviewAction::Continue
             }
             KeyCode::Up => {
-                self.decision_scroll = self.decision_scroll.saturating_add(1);
+                self.scroll_panel_up(1);
                 ReviewAction::Continue
             }
             KeyCode::Down => {
-                self.decision_scroll = self.decision_scroll.saturating_sub(1);
+                self.scroll_panel_down(1);
                 ReviewAction::Continue
             }
             KeyCode::Enter => match self.decision_button {
@@ -1300,11 +1358,11 @@ impl ReviewPullRequestScreen {
                 ReviewAction::Continue
             }
             KeyCode::Up => {
-                self.decision_scroll = self.decision_scroll.saturating_add(1);
+                self.scroll_panel_up(1);
                 ReviewAction::Continue
             }
             KeyCode::Down => {
-                self.decision_scroll = self.decision_scroll.saturating_sub(1);
+                self.scroll_panel_down(1);
                 ReviewAction::Continue
             }
             KeyCode::Enter => match self.summary_button {
@@ -1404,10 +1462,12 @@ impl ReviewPullRequestScreen {
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
-            // spinner (+ blank + 3-line file panel while scanning).
+            // Scanning shows the progress dashboard (spinner + stepper + bar +
+            // the "Under review" panel); every other Working phase is a quiet
+            // one-line spinner.
             ReviewStep::Working => {
                 if self.scanning {
-                    7
+                    12
                 } else {
                     3
                 }
@@ -1490,11 +1550,12 @@ impl ReviewPullRequestScreen {
             .render(frame, area);
     }
 
-    /// Working spinner. While scanning, the files currently under review are
-    /// shown in a panel below (same rounded-border, bold-title treatment as
-    /// the other PR-command panels).
+    /// Working spinner. While scanning, a live progress dashboard sits below
+    /// it: the pipeline stepper (Scan → Audit → Verify), a per-stage bar, the
+    /// files/passes currently under review, and a running findings tally —
+    /// so the user can see exactly what the AI is doing in the background.
     fn render_working(&self, frame: &mut Frame, area: Rect) {
-        if !self.scanning || area.height < 5 {
+        if !self.scanning || area.height < 7 {
             StatusIndicator::new(Status::Loading, self.phase_message.clone())
                 .with_tick(self.tick)
                 .render(frame, area);
@@ -1503,19 +1564,68 @@ impl ReviewPullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // spinner
+                Constraint::Length(1), // spinner headline
+                Constraint::Length(1), // pipeline stepper
+                Constraint::Length(1), // progress bar
                 Constraint::Length(1), // blank
-                Constraint::Min(3),    // file panel
+                Constraint::Min(3),    // "Under review" + findings panel
             ])
             .split(area);
         StatusIndicator::new(Status::Loading, self.phase_message.clone())
             .with_tick(self.tick)
             .render(frame, chunks[0]);
-        self.render_scan_panel(frame, chunks[2]);
+        self.render_pipeline_stepper(frame, chunks[1]);
+        self.render_progress_bar(frame, chunks[2]);
+        self.render_scan_panel(frame, chunks[4]);
+    }
+
+    /// The `Scan → Audit → Verify` stepper. Each cell reuses the post-create
+    /// command-list icon vocabulary: `✓` done, spinner active, `○` pending,
+    /// `–` skipped (an audit that this diff does not qualify for).
+    fn render_pipeline_stepper(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = Vec::new();
+        for (i, (name, state)) in self.pipeline_stages().into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("  →  ".to_string(), muted_dim()));
+            }
+            let (icon, icon_style) = match state {
+                StageState::Done => ("✓".to_string(), Style::default().fg(colors::SUCCESS)),
+                StageState::Active => (
+                    spinner_frame(self.tick).to_string(),
+                    Style::default().fg(colors::NAVY),
+                ),
+                StageState::Pending => ("○".to_string(), muted_dim()),
+                StageState::Skipped => ("–".to_string(), muted_dim()),
+            };
+            let label_style = match state {
+                StageState::Active => Style::default()
+                    .fg(colors::EMPHASIS)
+                    .add_modifier(Modifier::BOLD),
+                StageState::Done => Style::default().fg(colors::EMPHASIS),
+                _ => muted_dim(),
+            };
+            spans.push(Span::styled(icon, icon_style));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(name.to_string(), label_style));
+            if matches!(state, StageState::Skipped) {
+                spans.push(Span::styled(" (n/a)".to_string(), muted_dim()));
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The active stage's progress bar. Countable stages (scan / verify) show
+    /// a filled block bar with `done/total · pct%`; the single-call audit pass
+    /// shows an indeterminate sweep so the user still sees it is alive.
+    fn render_progress_bar(&self, frame: &mut Frame, area: Rect) {
+        let line = match self.stage_progress() {
+            Some((done, total)) => progress_bar_line(done, total, area.width),
+            None => indeterminate_bar_line(self.tick, area.width),
+        };
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_scan_panel(&self, frame: &mut Frame, area: Rect) {
-        let paths = self.in_flight.join("  ·  ");
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -1523,7 +1633,7 @@ impl ReviewPullRequestScreen {
             .title(Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
-                    "Reviewing",
+                    "Under review",
                     Style::default()
                         .fg(colors::NAVY)
                         .add_modifier(Modifier::BOLD),
@@ -1535,20 +1645,186 @@ impl ReviewPullRequestScreen {
         if inner.height == 0 || inner.width == 0 {
             return;
         }
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    sanitize_row(&paths),
-                    Style::default().fg(colors::EMPHASIS),
-                )),
-                Line::from(Span::styled(
-                    format!("{} finding(s) so far", self.findings.len()),
-                    muted_dim(),
-                )),
-            ])
-            .wrap(Wrap { trim: false }),
-            inner,
-        );
+        // Activity fills the top; the findings tally is pinned to the bottom
+        // row so it stays put as scans come and go.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        let activity = self.activity_lines(rows[0].height as usize, inner.width as usize);
+        frame.render_widget(Paragraph::new(activity), rows[0]);
+        frame.render_widget(Paragraph::new(self.findings_tally_line()), rows[1]);
+    }
+
+    /// The pipeline stages paired with each one's current state. `Audit` is a
+    /// real stage only when the diff qualifies for the cross-group omission
+    /// pass; otherwise it renders as skipped.
+    fn pipeline_stages(&self) -> [(&'static str, StageState); 3] {
+        let scan = match self.stage {
+            PipelineStage::Scan => StageState::Active,
+            _ => StageState::Done,
+        };
+        let audit = if !self.plan_audit {
+            StageState::Skipped
+        } else {
+            match self.stage {
+                PipelineStage::Scan => StageState::Pending,
+                PipelineStage::Audit => StageState::Active,
+                PipelineStage::Verify => StageState::Done,
+            }
+        };
+        let verify = match self.stage {
+            PipelineStage::Verify => StageState::Active,
+            _ => StageState::Pending,
+        };
+        [("Scan", scan), ("Audit", audit), ("Verify", verify)]
+    }
+
+    /// `(done, total)` for the active stage's bar, or `None` for the single
+    /// indeterminate audit call.
+    fn stage_progress(&self) -> Option<(usize, usize)> {
+        match self.stage {
+            PipelineStage::Scan => Some((self.scans_done, self.scan_units_total())),
+            PipelineStage::Audit => None,
+            PipelineStage::Verify => Some((
+                self.verification_total
+                    .saturating_sub(self.verification_outstanding.len()),
+                self.verification_total,
+            )),
+        }
+    }
+
+    /// Findings tallied per severity (Critical, High, Medium, Low).
+    fn severity_counts(&self) -> [usize; 4] {
+        let mut counts = [0usize; 4];
+        for finding in &self.findings {
+            counts[finding.severity.rank() as usize] += 1;
+        }
+        counts
+    }
+
+    /// The rows inside the "Under review" panel, capped at `max_rows`. During
+    /// the scan pass these name the files/passes in flight; the audit and
+    /// verify passes carry no per-file work, so they describe what is running.
+    fn activity_lines(&self, max_rows: usize, width: usize) -> Vec<Line<'static>> {
+        if max_rows == 0 {
+            return Vec::new();
+        }
+        match self.stage {
+            PipelineStage::Scan => {
+                if self.in_flight.is_empty() {
+                    return vec![Line::from(Span::styled(
+                        "  wrapping up the last scans…".to_string(),
+                        muted_dim(),
+                    ))];
+                }
+                let mut lines = Vec::new();
+                let overflow = self.in_flight.len() > max_rows;
+                let visible = if overflow {
+                    max_rows - 1
+                } else {
+                    self.in_flight.len()
+                };
+                for label in self.in_flight.iter().take(visible) {
+                    lines.push(self.activity_row(label, width));
+                }
+                if overflow {
+                    let more = self.in_flight.len() - visible;
+                    lines.push(Line::from(Span::styled(
+                        format!("  … +{more} more in parallel"),
+                        muted_dim(),
+                    )));
+                }
+                lines
+            }
+            PipelineStage::Audit => vec![self.activity_note(
+                "re-reading every changed file together to catch cross-file gaps",
+                width,
+            )],
+            PipelineStage::Verify => {
+                let n = self.verification_outstanding.len();
+                vec![self.activity_note(
+                    &format!(
+                        "independently re-checking {n} high-risk finding{} against the code",
+                        if n == 1 { "" } else { "s" },
+                    ),
+                    width,
+                )]
+            }
+        }
+    }
+
+    /// One in-flight scan row: spinner + a colored kind badge (app / tests /
+    /// coverage / review) + the file paths or coverage group under review.
+    fn activity_row(&self, label: &str, width: usize) -> Line<'static> {
+        const BADGE_W: usize = 8;
+        const PREFIX_W: usize = 2 + BADGE_W + 1; // "⠋ " + badge + " "
+        let (badge, detail) = split_activity_label(label);
+        let detail = truncate_to(&sanitize_row(&detail), width.saturating_sub(PREFIX_W));
+        Line::from(vec![
+            Span::styled(
+                spinner_frame(self.tick).to_string(),
+                Style::default().fg(colors::PRIMARY),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{badge:<BADGE_W$}"),
+                Style::default()
+                    .fg(activity_badge_color(badge))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(detail, Style::default().fg(colors::EMPHASIS)),
+        ])
+    }
+
+    /// A single descriptive row for the passes that do no per-file work.
+    fn activity_note(&self, text: &str, width: usize) -> Line<'static> {
+        let text = truncate_to(&sanitize_row(text), width.saturating_sub(2));
+        Line::from(vec![
+            Span::styled(
+                spinner_frame(self.tick).to_string(),
+                Style::default().fg(colors::PRIMARY),
+            ),
+            Span::raw(" "),
+            Span::styled(text, Style::default().fg(colors::EMPHASIS)),
+        ])
+    }
+
+    /// The running findings tally, broken down by severity with colored counts
+    /// instead of one opaque total.
+    fn findings_tally_line(&self) -> Line<'static> {
+        let counts = self.severity_counts();
+        let total: usize = counts.iter().sum();
+        let mut spans = vec![Span::styled(
+            "Findings  ".to_string(),
+            Style::default().fg(colors::EMPHASIS),
+        )];
+        if total == 0 {
+            spans.push(Span::styled("none surfaced yet".to_string(), muted_dim()));
+            return Line::from(spans);
+        }
+        let by_severity = [
+            (ReviewSeverity::Critical, counts[0]),
+            (ReviewSeverity::High, counts[1]),
+            (ReviewSeverity::Medium, counts[2]),
+            (ReviewSeverity::Low, counts[3]),
+        ];
+        for (severity, count) in by_severity {
+            let style = if count == 0 {
+                muted_dim()
+            } else {
+                Style::default()
+                    .fg(severity_color(severity))
+                    .add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(
+                format!("{} {count}  ", severity.emoji()),
+                style,
+            ));
+        }
+        spans.push(Span::styled(format!("· {total} total"), muted_dim()));
+        Line::from(spans)
     }
 
     fn render_decision(&self, frame: &mut Frame, area: Rect) {
@@ -1607,6 +1883,7 @@ impl ReviewPullRequestScreen {
         };
         frame.render_widget(block, chunks[1]);
         let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+        self.decision_max_scroll.set(max_scroll);
         let scroll = self.decision_scroll.min(max_scroll);
         frame.render_widget(
             Paragraph::new(lines)
@@ -1839,6 +2116,7 @@ impl ReviewPullRequestScreen {
             .collect();
         frame.render_widget(block, chunks[1]);
         let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+        self.decision_max_scroll.set(max_scroll);
         let scroll = self.decision_scroll.min(max_scroll);
         frame.render_widget(
             Paragraph::new(lines)
@@ -2296,6 +2574,104 @@ fn sanitize_row(s: &str) -> String {
     out
 }
 
+/// Bar cells the progress line ever draws — kept short so a wide terminal does
+/// not stretch it into a runway.
+const PROGRESS_BAR_MAX: usize = 32;
+
+/// A determinate progress bar: `████████░░░░  8/12 · 67%`.
+fn progress_bar_line(done: usize, total: usize, width: u16) -> Line<'static> {
+    if total == 0 {
+        return Line::from("");
+    }
+    let done = done.min(total);
+    let suffix = format!("  {done}/{total} · {}%", done * 100 / total);
+    let bar_w = (width as usize)
+        .saturating_sub(suffix.chars().count())
+        .min(PROGRESS_BAR_MAX);
+    let filled = (bar_w * done + total / 2) / total;
+    let filled = filled.min(bar_w);
+    Line::from(vec![
+        Span::styled("█".repeat(filled), Style::default().fg(colors::NAVY)),
+        Span::styled("░".repeat(bar_w - filled), muted_dim()),
+        Span::styled(suffix, Style::default().fg(colors::EMPHASIS)),
+    ])
+}
+
+/// An indeterminate bar: a filled window sweeps back and forth over a muted
+/// track, so a single long-running call still reads as alive.
+fn indeterminate_bar_line(tick: usize, width: u16) -> Line<'static> {
+    let bar_w = (width as usize).min(PROGRESS_BAR_MAX);
+    if bar_w == 0 {
+        return Line::from("");
+    }
+    let window = 6.min(bar_w);
+    let span = bar_w - window;
+    let start = if span == 0 {
+        0
+    } else {
+        let p = tick % (span * 2);
+        if p <= span {
+            p
+        } else {
+            span * 2 - p
+        }
+    };
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("░".repeat(start), muted_dim()));
+    }
+    spans.push(Span::styled(
+        "█".repeat(window),
+        Style::default().fg(colors::NAVY),
+    ));
+    let tail = bar_w - start - window;
+    if tail > 0 {
+        spans.push(Span::styled("░".repeat(tail), muted_dim()));
+    }
+    Line::from(spans)
+}
+
+/// Split an in-flight scan label into a short kind badge and its detail. The
+/// labels are produced by `scan_group_label` / `coverage_scan_label`, so the
+/// prefixes are ours to rely on.
+fn split_activity_label(label: &str) -> (&'static str, String) {
+    if let Some(rest) = label.strip_prefix("app: ") {
+        ("app", rest.to_string())
+    } else if let Some(rest) = label.strip_prefix("tests: ") {
+        ("tests", rest.to_string())
+    } else if let Some(rest) = label.strip_prefix(&format!("{COVERAGE_SCAN_LABEL} ")) {
+        ("coverage", rest.to_string())
+    } else if label == MERGED_SCAN_LABEL {
+        ("review", "whole diff + test coverage".to_string())
+    } else {
+        ("scan", label.to_string())
+    }
+}
+
+fn activity_badge_color(badge: &str) -> Color {
+    match badge {
+        "app" => colors::CYAN,
+        "tests" => colors::GREEN,
+        "coverage" => colors::ACCENT,
+        "review" => colors::NAVY,
+        _ => colors::EMPHASIS,
+    }
+}
+
+/// Truncate to `max` display columns (char count is a fair proxy for the ASCII
+/// paths and ASCII labels this renders), adding an ellipsis when it clips.
+fn truncate_to(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2441,7 +2817,7 @@ mod tests {
         assert!(screen.scan_phase_active());
         assert!(screen
             .phase_message
-            .contains("2 changed files + test coverage (0 done)"));
+            .contains("Reviewing 2 changed files + test coverage"));
         let (group_index, group) = screen.take_next_scan_file().unwrap();
         assert_eq!(group_index, FILE_GROUP_SCAN_INDEX);
         assert_eq!(
@@ -2464,7 +2840,8 @@ mod tests {
         screen.record_scan_result(vec![finding("b.rs", Some(3), ReviewSeverity::Critical)]);
         screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::Low)]);
         screen.note_scan_done(group_index);
-        assert!(screen.phase_message.contains("(1 done)"));
+        // The progress bar carries the count now: 1 of 2 scan units done.
+        assert!(render_dump(&mut screen, 80, 14).contains("1/2"));
         assert!(screen.scans_pending());
         screen.record_scan_result(Vec::new());
         screen.note_scan_done(COVERAGE_SCAN_INDEX);
@@ -2559,7 +2936,9 @@ mod tests {
         );
         screen.note_scan_done(second_group);
         assert!(!screen.scans_pending());
-        assert!(screen.summary_rows[0].command.contains("test coverage 1/2"));
+        assert!(screen.summary_rows[0]
+            .command
+            .contains("coverage group 1 of 2"));
         assert!(screen.coverage_group(second_group).is_some());
     }
 
@@ -2647,10 +3026,32 @@ mod tests {
         assert!(!screen.verification_pending());
         assert!(screen.finish_verification());
         assert_eq!(screen.findings, vec![low_prose]);
-        assert!(screen.summary_rows.iter().any(|row| row
-            .status
-            .as_ref()
-            .is_some_and(|status| status.label == "Unverified — withheld")));
+        let rejected_row = screen
+            .summary_rows
+            .iter()
+            .find(|row| {
+                row.status
+                    .as_ref()
+                    .is_some_and(|status| status.label == "Rejected false positive")
+            })
+            .expect("rejection is recorded on the summary");
+        assert!(
+            rejected_row.success,
+            "a rejected false positive is a correct verifier decision, not a failure"
+        );
+        let withheld_row = screen
+            .summary_rows
+            .iter()
+            .find(|row| {
+                row.status
+                    .as_ref()
+                    .is_some_and(|status| status.label == "Unverified — withheld")
+            })
+            .expect("a verifier error is recorded on the summary");
+        assert!(
+            !withheld_row.success,
+            "a verifier that errors out is a genuine failure"
+        );
     }
 
     #[test]
@@ -2683,6 +3084,19 @@ mod tests {
         assert_eq!(screen.findings.len(), 2);
         assert!(screen.findings.contains(&revised));
         assert!(screen.findings.contains(&second));
+        let revised_row = screen
+            .summary_rows
+            .iter()
+            .find(|row| {
+                row.status
+                    .as_ref()
+                    .is_some_and(|status| status.label == "Revised")
+            })
+            .expect("a revision is recorded on the summary");
+        assert!(
+            revised_row.success,
+            "a revised finding is a correct verifier decision, not a failure"
+        );
     }
 
     #[test]
@@ -2767,15 +3181,59 @@ mod tests {
         screen.take_next_scan_file();
         screen.take_next_scan_file();
         screen.take_coverage_scan();
-        let dump = render_dump(&mut screen, 80, 10);
+        let dump = render_dump(&mut screen, 80, 12);
         assert!(
-            dump.contains("Scanning 2 changed files + test coverage (0 done)"),
+            dump.contains("Reviewing 2 changed files + test coverage"),
             "{dump}"
         );
-        assert!(dump.contains("Reviewing"), "{dump}");
+        assert!(dump.contains("Under review"), "{dump}");
         assert!(dump.contains("src/lib/deep.rs"), "{dump}");
         assert!(dump.contains("src/other.rs"), "{dump}");
-        assert!(dump.contains("test coverage"), "{dump}");
+        assert!(dump.contains("coverage"), "{dump}");
+        // The pipeline stepper and the severity tally replace the opaque
+        // "N finding(s) so far" line.
+        assert!(dump.contains("Scan"), "{dump}");
+        assert!(dump.contains("Verify"), "{dump}");
+        assert!(dump.contains("Findings"), "{dump}");
+    }
+
+    #[test]
+    fn scanning_dashboard_breaks_findings_down_by_severity() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+        screen.take_next_scan_file();
+        screen.record_scan_result(vec![
+            finding("a.rs", Some(2), ReviewSeverity::Critical),
+            finding("a.rs", Some(3), ReviewSeverity::Low),
+            finding("a.rs", Some(4), ReviewSeverity::Low),
+        ]);
+        // One Critical, two Low, three total — broken out per severity.
+        assert_eq!(screen.severity_counts(), [1, 0, 0, 2]);
+        let dump = render_dump(&mut screen, 80, 12);
+        // The severity tally with colored circles replaces "N finding(s) so far".
+        assert!(dump.contains("Findings"), "{dump}");
+        assert!(dump.contains("🔴"), "{dump}");
+        assert!(dump.contains("⚪"), "{dump}");
+        assert!(dump.contains("· 3 total"), "{dump}");
+        assert!(!dump.contains("finding(s) so far"), "{dump}");
+    }
+
+    #[test]
+    fn verify_phase_shows_verify_stage_active_with_progress() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+        screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::Critical)]);
+        screen.finish_scanning();
+        let candidates = screen.begin_verification();
+        assert_eq!(candidates.len(), 1, "a Critical finding needs verifying");
+        let dump = render_dump(&mut screen, 80, 12);
+        assert!(dump.contains("Verify"), "{dump}");
+        // The bar tracks verification progress: none confirmed yet.
+        assert!(dump.contains("0/1"), "{dump}");
+        // The panel describes the pass rather than listing files.
+        assert!(dump.contains("re-checking"), "{dump}");
     }
 
     #[test]
@@ -2807,7 +3265,7 @@ mod tests {
             "sha".into(),
         );
         screen.begin_scan_phase();
-        assert!(screen.phase_message.contains("1 changed files (0 done)"));
+        assert!(screen.phase_message.contains("Reviewing 1 changed file"));
         screen.take_next_scan_file();
         assert!(screen.take_coverage_scan().is_none());
         screen.record_scan_result(Vec::new());
@@ -2827,7 +3285,7 @@ mod tests {
         assert!(screen.scans_pending(), "a.rs is still out");
         let row = &screen.summary_rows[0];
         assert_eq!(row.status.as_ref().unwrap().label, "Failed");
-        assert!(row.command.contains("test coverage"));
+        assert!(row.command.contains("coverage group 1 of 1"));
     }
 
     #[test]
@@ -2910,6 +3368,38 @@ mod tests {
         assert!(dump.contains("│  Request changes  │"), "{dump}");
         assert!(dump.contains("│  Comment  │"), "{dump}");
         assert!(dump.contains("│  Skip  │"), "{dump}");
+    }
+
+    #[test]
+    fn summary_panel_scrolls_naturally_and_clamps_to_the_bottom() {
+        let mut screen = screen_on_decision();
+        let body = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.enter_summary(body);
+        // Render short so the panel overflows and the max-scroll cache fills.
+        let _ = render_dump(&mut screen, 80, 16);
+        let max = screen.decision_max_scroll.get();
+        assert!(max > 0, "summary should overflow a 16-row viewport");
+
+        // Wheel down moves toward the bottom; wheel up moves back up.
+        assert!(screen.handle_mouse_scroll_down(3));
+        assert_eq!(screen.decision_scroll, 3);
+        assert!(screen.handle_mouse_scroll_up(2));
+        assert_eq!(screen.decision_scroll, 1);
+        // Scrolling above the top saturates at 0, never negative.
+        assert!(screen.handle_mouse_scroll_up(50));
+        assert_eq!(screen.decision_scroll, 0);
+
+        // Scrolling far past the bottom is clamped to `max`, so a single
+        // wheel-up immediately reverses instead of burning dead ticks.
+        for _ in 0..100 {
+            screen.handle_mouse_scroll_down(3);
+        }
+        assert_eq!(screen.decision_scroll, max);
+        screen.handle_mouse_scroll_up(1);
+        assert_eq!(screen.decision_scroll, max - 1);
     }
 
     fn screen_on_decision() -> ReviewPullRequestScreen {
