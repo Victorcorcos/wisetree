@@ -972,6 +972,9 @@ Implement the feature.
         let plan = plan();
         let one = render_sections_for_prompt(&[&plan.sections[1]]);
         assert!(one.contains("### Section 2 — Exporter"), "{one}");
+        assert!(one.contains("goal for Exporter"), "{one}");
+        assert!(one.contains("src/Exporter.rs"), "{one}");
+        assert!(one.contains("criterion a"), "{one}");
         assert!(!one.contains("Data model"), "{one}");
         assert!(!one.contains("CLI flag"), "{one}");
         let all: Vec<&PlanSection> = plan.sections.iter().collect();
