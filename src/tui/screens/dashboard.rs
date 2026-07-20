@@ -101,6 +101,11 @@ pub struct UpdatePullRequestRequest {
     /// after the branch has been pushed and its local upstream tracking now
     /// points at `origin/<branch>`. `None` when unknown.
     pub pr_base_ref: Option<String>,
+    /// When `true` (the default), the AI resolves merge conflicts on its own.
+    /// When `false`, the AI must ask the user for clarification when the
+    /// conflict contains contradictory assumptions, business rules, or
+    /// security/policy checks.
+    pub autonomous: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3038,6 +3043,9 @@ fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> 
         // base even after the branch tracks `origin/<branch>`.
         base_ref: None,
         pr_base_ref: pr.base_ref_name.clone(),
+        // The dashboard action always defaults to autonomous mode; the user
+        // can toggle it on the confirm screen before the update starts.
+        autonomous: true,
     })
 }
 
@@ -3185,6 +3193,9 @@ fn build_push_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> {
         // A push needs no base ref, so resolution never runs for this payload.
         base_ref: None,
         pr_base_ref: pr.base_ref_name.clone(),
+        // Push-only never merges, so the autonomous flag is irrelevant; keep
+        // the struct valid with the default.
+        autonomous: true,
     })
 }
 
