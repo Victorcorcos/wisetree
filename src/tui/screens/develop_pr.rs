@@ -49,8 +49,8 @@ use crate::tui::screens::dashboard::DevelopRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
     code_span, labeled_line, render_summary_table, spinner_frame, AiRoleRow, ConfirmationChoice,
-    ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView,
-    Status, StatusIndicator, SummaryRow,
+    ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup,
+    OptionsGroupItem, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -147,6 +147,9 @@ pub enum DevelopAction {
     CheckMarkDone,
     /// Done page: a key was pressed; return to the dashboard + refresh.
     Done,
+    /// Forward raw bytes to the embedded PTY (page-scroll keys in Planning
+    /// or Implementing).
+    WritePty(Vec<u8>),
 }
 
 pub struct DevelopPullRequestScreen {
@@ -581,6 +584,11 @@ impl DevelopPullRequestScreen {
         self.commit_count += 1;
     }
 
+    /// How many sections were committed (Done-page summary count).
+    pub fn commit_count(&self) -> usize {
+        self.commit_count
+    }
+
     /// Spawn opencode inside the embedded PTY. A spawn failure surfaces as
     /// an error notice.
     pub fn spawn_opencode_pty(
@@ -617,6 +625,13 @@ impl DevelopPullRequestScreen {
 
     pub fn kill_pty(&mut self) {
         self.pty = None;
+    }
+
+    /// Send raw bytes to the embedded PTY, if one is alive.
+    pub fn send_pty_input(&mut self, bytes: &[u8]) {
+        if let Some(pty) = self.pty.as_mut() {
+            pty.send_input(bytes);
+        }
     }
 
     pub fn enter_done(&mut self) {
@@ -851,14 +866,8 @@ impl DevelopPullRequestScreen {
             return DevelopAction::Continue;
         }
         match key.code {
-            KeyCode::PageUp => {
-                self.handle_mouse_scroll_up(10);
-                DevelopAction::Continue
-            }
-            KeyCode::PageDown => {
-                self.handle_mouse_scroll_down(10);
-                DevelopAction::Continue
-            }
+            KeyCode::PageUp => DevelopAction::WritePty(PTY_PAGE_UP.to_vec()),
+            KeyCode::PageDown => DevelopAction::WritePty(PTY_PAGE_DOWN.to_vec()),
             KeyCode::Enter => {
                 self.finalize_confirm = Some(build_plan_continue_modal());
                 DevelopAction::Continue
@@ -963,14 +972,8 @@ impl DevelopPullRequestScreen {
             return DevelopAction::Continue;
         }
         match key.code {
-            KeyCode::PageUp => {
-                self.handle_mouse_scroll_up(10);
-                DevelopAction::Continue
-            }
-            KeyCode::PageDown => {
-                self.handle_mouse_scroll_down(10);
-                DevelopAction::Continue
-            }
+            KeyCode::PageUp => DevelopAction::WritePty(PTY_PAGE_UP.to_vec()),
+            KeyCode::PageDown => DevelopAction::WritePty(PTY_PAGE_DOWN.to_vec()),
             KeyCode::Home => {
                 if let Some(pty) = self.pty.as_mut() {
                     pty.scroll_to_top();
@@ -1149,61 +1152,32 @@ impl DevelopPullRequestScreen {
             .title_color(colors::ORANGE)
             .block(self.confirm_detail_lines())
             .steps(&steps)
-            .block(self.toggle_lines())
             .ai_roles(self.confirm_ai_roles())
+            .options(Some(self.options_group()))
             .modal(self.confirm.as_ref())
             .render(frame, area);
     }
 
-    /// The two focusable Confirm-page toggles (Ralph Loop + Commit sections),
-    /// each with a ▸ focus marker on the active row. ↑/↓ moves focus, Space
-    /// flips the focused toggle.
-    fn toggle_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = vec![self.toggle_line(
-            0,
-            self.ralph,
-            "Ralph Loop",
-            "a fresh opencode terminal per section: cheaper (small context each run) and more \
-             reliable.",
-        )];
-        lines.push(self.toggle_line(
-            1,
-            self.commit_sections,
-            "Commit sections",
-            "commit each finished section as a checkpoint (develop: section N — …); off leaves \
-             everything uncommitted.",
-        ));
-        lines.push(Line::from(vec![
-            Span::styled("↑ ↓ ".to_string(), Style::default().fg(colors::BRAND)),
-            Span::styled("Move".to_string(), muted_dim()),
-            Span::styled("   ".to_string(), muted_dim()),
-            Span::styled("Space ".to_string(), Style::default().fg(colors::BRAND)),
-            Span::styled("Toggle".to_string(), muted_dim()),
-        ]));
-        lines
-    }
-
-    fn toggle_line(&self, index: usize, on: bool, label: &str, description: &str) -> Line<'static> {
-        let focused = self.toggle_focus == index;
-        let marker = if focused { "▸ " } else { "  " };
-        let checkbox = if on { "☒" } else { "☐" };
-        Line::from(vec![
-            Span::styled(marker.to_string(), Style::default().fg(colors::ORANGE)),
-            Span::styled(
-                format!("{checkbox} {label}"),
-                Style::default()
-                    .fg(colors::BRAND)
-                    .add_modifier(Modifier::BOLD),
+    /// The grouped Confirm-page options (Ralph Loop + Commit sections). The
+    /// shared OptionsGroup renders the checkboxes with the gray palette and the
+    /// same bordered-block style used elsewhere.
+    fn options_group(&self) -> OptionsGroup {
+        OptionsGroup::new(vec![
+            OptionsGroupItem::new(
+                self.ralph,
+                "Ralph Loop",
+                "a fresh opencode terminal per section: cheaper (small context each run) and more \
+                 reliable.",
             ),
-            Span::styled(
-                format!("  — {description}"),
-                Style::default().fg(if focused {
-                    colors::GRAY_LIGHT
-                } else {
-                    colors::GRAY_DARK
-                }),
+            OptionsGroupItem::new(
+                self.commit_sections,
+                "Commit sections",
+                "commit each finished section as a checkpoint (develop: section N — …); off leaves \
+                 everything uncommitted.",
             ),
         ])
+        .with_focused_index(Some(self.toggle_focus))
+        .with_hint("↑ ↓ Move · Space Toggle")
     }
 
     /// Labeled detail rows for the confirm panel: an optional `PR` row, then
@@ -2598,6 +2572,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn planning_forwards_page_scroll_keys_to_pty() {
+        let mut s = screen();
+        s.start_planning(false);
+
+        assert_eq!(
+            s.handle_key(key(KeyCode::PageUp)),
+            DevelopAction::WritePty(PTY_PAGE_UP.to_vec())
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::PageDown)),
+            DevelopAction::WritePty(PTY_PAGE_DOWN.to_vec())
+        );
+    }
+
     // ── PlanReview + Feedback loop ──────────────────────────────────────
 
     fn screen_on_review() -> DevelopPullRequestScreen {
@@ -2775,6 +2764,21 @@ mod tests {
         let mut s = screen_on_review();
         s.begin_implement_run(Some(0));
         assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
+    }
+
+    #[test]
+    fn implementing_forwards_page_scroll_keys_to_pty() {
+        let mut s = screen_on_review();
+        s.begin_implement_run(Some(0));
+
+        assert_eq!(
+            s.handle_key(key(KeyCode::PageUp)),
+            DevelopAction::WritePty(PTY_PAGE_UP.to_vec())
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::PageDown)),
+            DevelopAction::WritePty(PTY_PAGE_DOWN.to_vec())
+        );
     }
 
     // ── Verifying + CheckFailed ─────────────────────────────────────────
