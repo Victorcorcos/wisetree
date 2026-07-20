@@ -9501,7 +9501,9 @@ mod tests {
     use super::*;
     use crate::config::schema::WorktreeConfig;
     use crate::config::service::ConfigService;
-    use crate::services::{AiStatusReport, DevelopPlan, PlanSection, PullRequest, ReviewerSummary};
+    use crate::services::{
+        AiStatusReport, DevelopPlan, DevelopPreflight, PlanSection, PullRequest, ReviewerSummary,
+    };
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
     use ratatui::backend::TestBackend;
@@ -12103,6 +12105,188 @@ mod tests {
             assert_eq!(screen.step(), DevelopStep::CheckFailed);
             assert!(!screen.plan().unwrap().sections[0].done);
             assert_eq!(screen.check_failure(), Some(output));
+        });
+    }
+
+    // ── Develop preflight outcomes ─────────────────────────────────────
+
+    #[test]
+    fn develop_preflight_terminal_error_returns_to_dashboard_with_toast() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            // A None git root lets the return-to-dashboard step skip spawning a
+            // watch, keeping the test free of a Tokio runtime.
+            app.git_root = None;
+
+            app.apply_develop_prepared(
+                1,
+                Err("terminal preparation failed".to_string()),
+                &app_event_tx(),
+            );
+
+            assert_eq!(app.screen, Screen::Dashboard);
+            assert!(app.develop_pr.is_none());
+            assert!(app.active_develop_operation_id.is_none());
+            let toast = app.toast.current().expect("failure toast");
+            assert_eq!(toast.variant, ToastVariant::Error);
+            assert!(toast.message.contains("Develop preparation failed"));
+        });
+    }
+
+    #[test]
+    fn develop_preflight_missing_ai_configuration_returns_to_dashboard_with_toast() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.git_root = None;
+
+            app.apply_develop_prepared(
+                1,
+                Ok(Box::new(DevelopPreflightOutcome::AiNotConfigured)),
+                &app_event_tx(),
+            );
+
+            assert_eq!(app.screen, Screen::Dashboard);
+            assert!(app.develop_pr.is_none());
+            assert!(app.active_develop_operation_id.is_none());
+            let toast = app.toast.current().expect("warning toast");
+            assert_eq!(toast.variant, ToastVariant::Warning);
+            assert_eq!(toast.message, "ai.develop.plan model is not configured.");
+        });
+    }
+
+    #[test]
+    fn develop_preflight_unavailable_cli_returns_to_dashboard_with_toast() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.git_root = None;
+
+            app.apply_develop_prepared(
+                1,
+                Ok(Box::new(DevelopPreflightOutcome::AiUnavailable)),
+                &app_event_tx(),
+            );
+
+            assert_eq!(app.screen, Screen::Dashboard);
+            assert!(app.develop_pr.is_none());
+            assert!(app.active_develop_operation_id.is_none());
+            let toast = app.toast.current().expect("error toast");
+            assert_eq!(toast.variant, ToastVariant::Error);
+            assert!(toast.message.contains("opencode"));
+            assert!(toast.message.contains("PATH"));
+        });
+    }
+
+    #[test]
+    fn develop_preflight_without_plan_prompts_to_describe_task() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let tx = app_event_tx();
+
+            app.apply_develop_prepared(
+                1,
+                Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
+                    DevelopPreflight {
+                        base_ref: Some("main".to_string()),
+                        resume: DevelopResumeState::Absent,
+                    },
+                )))),
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::DescribeTask);
+            assert_eq!(screen.base_ref(), Some("main"));
+        });
+    }
+
+    #[test]
+    fn develop_preflight_with_unparseable_plan_prompts_to_overwrite() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let tx = app_event_tx();
+
+            app.apply_develop_prepared(
+                1,
+                Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
+                    DevelopPreflight {
+                        base_ref: Some("main".to_string()),
+                        resume: DevelopResumeState::Unparseable,
+                    },
+                )))),
+                &tx,
+            );
+
+            {
+                let screen = app.develop_pr.as_ref().expect("Develop screen");
+                assert_eq!(screen.step(), DevelopStep::ResumePrompt);
+                assert_eq!(screen.base_ref(), Some("main"));
+            }
+            // Choosing Start fresh moves to an empty describe prompt because no
+            // plan was recovered.
+            app.apply_develop_action(DevelopAction::StartFresh, &tx);
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::DescribeTask);
+            assert!(screen.task_description().is_empty());
+        });
+    }
+
+    #[test]
+    fn develop_preflight_with_parsed_plan_prompts_to_resume() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let plan = develop_plan();
+            let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            app.apply_develop_prepared(
+                1,
+                Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
+                    DevelopPreflight {
+                        base_ref: Some("main".to_string()),
+                        resume: DevelopResumeState::Parsed(plan.clone()),
+                    },
+                )))),
+                &tx,
+            );
+
+            runtime.block_on(async {
+                {
+                    let screen = app.develop_pr.as_ref().expect("Develop screen");
+                    assert_eq!(screen.step(), DevelopStep::ResumePrompt);
+                    assert_eq!(screen.base_ref(), Some("main"));
+                }
+
+                // Choosing Resume adopts the recovered plan and starts implementing.
+                app.apply_develop_action(DevelopAction::Resume, &tx);
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("implement event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopImplementReady {
+                        operation_id,
+                        section,
+                        ..
+                    } => {
+                        assert_eq!(operation_id, 1);
+                        assert_eq!(section, Some(0));
+                    }
+                    _other => panic!("expected DevelopImplementReady, got a different event"),
+                }
+                let screen = app.develop_pr.as_ref().expect("Develop screen");
+                assert_eq!(screen.plan(), Some(&plan));
+                assert_eq!(screen.task_description(), plan.task_description);
+                assert_eq!(screen.step(), DevelopStep::Working);
+            });
         });
     }
 
