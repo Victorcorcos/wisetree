@@ -302,6 +302,9 @@ impl DevelopPullRequestScreen {
     pub fn plan(&self) -> Option<&DevelopPlan> {
         self.plan.as_ref()
     }
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
     /// The pending revision context (previous plan contract + feedback),
     /// replayed on the corrective retry of a revision run.
     pub fn revision(&self) -> Option<(String, String)> {

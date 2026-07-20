@@ -917,8 +917,8 @@ Implement the feature.
         // plan AI is asked to emit, so a revision run starts from parity.
         let mut plan = plan();
         plan.mark_done(0);
-        plan.sections[1].body = "**Goal**: goal for Exporter\n**Acceptance criteria**:\n- [ ] criterion a"
-            .to_string();
+        plan.sections[1].body =
+            "**Goal**: goal for Exporter\n**Acceptance criteria**:\n- [ ] criterion a".to_string();
         let contract = render_plan_contract(&plan);
         let reparsed = parse_plan_transcript(&contract).expect("contract parses");
         assert_eq!(reparsed.task_description, plan.task_description);
