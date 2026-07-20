@@ -41,8 +41,8 @@ use crate::tui::screens::dashboard::FixPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
     labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView, Status,
-    StatusIndicator, SummaryRow,
+    ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup, OptionsGroupItem, PrConfirmView,
+    PtyView, Status, StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -132,6 +132,12 @@ pub struct FixPullRequestScreen {
     /// Resolved `ai.fix` config (plan + apply models), shown on the confirm
     /// panel's "which AIs run" table.
     ai: AiFixConfig,
+    /// The Autonomous toggle on the Confirm page (Space flips ☒/☐). When ☒
+    /// the App auto-approves each fix plan (no Apply/Other/Skip prompt) and
+    /// watches opencode's database to commit each fix the moment its turn
+    /// finishes; when ☐ (default) the user drives every decision by hand,
+    /// exactly as before.
+    autonomous: bool,
     confirm: Option<ConfirmationModal>,
     phase_message: String,
     /// True only during the "Analyzing comment #N…" planning phase, so the
@@ -178,6 +184,7 @@ impl FixPullRequestScreen {
             confirm: Some(build_confirm(&request)),
             request,
             ai,
+            autonomous: false,
             phase_message: String::new(),
             analyzing: false,
             owner: String::new(),
@@ -218,6 +225,16 @@ impl FixPullRequestScreen {
     }
     pub fn repo(&self) -> &str {
         &self.repo
+    }
+    /// Whether the Autonomous toggle is on. The App reads this to auto-approve
+    /// each fix plan and to decide, when it spawns the apply PTY, between
+    /// watching opencode's turn (☒) and waiting for the user's Enter + finalize
+    /// confirm (☐).
+    pub fn autonomous(&self) -> bool {
+        self.autonomous
+    }
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
     }
     pub fn groups_len(&self) -> usize {
         self.groups.len()
@@ -545,6 +562,13 @@ impl FixPullRequestScreen {
         }
         match self.step {
             FixStep::Confirm => {
+                // Space flips the Autonomous toggle before the modal sees the
+                // key (the modal only reacts to Left/Right/y/n/Enter/Esc, so
+                // they never conflict).
+                if matches!(key.code, KeyCode::Char(' ')) {
+                    self.autonomous = !self.autonomous;
+                    return FixAction::Continue;
+                }
                 let Some(dialog) = self.confirm.as_mut() else {
                     return FixAction::Cancelled;
                 };
@@ -854,6 +878,11 @@ impl FixPullRequestScreen {
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
+        let description = if self.autonomous {
+            "wisetree approves each fix and commits it when opencode finishes — no prompts"
+        } else {
+            "you choose Apply / Other / Skip per comment and finalize each fix with Enter"
+        };
         PrConfirmView::new(format!(
             "Fix review comments on Pull Request #{}?",
             self.request.number
@@ -875,6 +904,14 @@ impl FixPullRequestScreen {
                 self.ai.apply.thinking.clone(),
             ),
         ])
+        .options(Some(
+            OptionsGroup::new(vec![OptionsGroupItem::new(
+                self.autonomous,
+                "Autonomous",
+                description,
+            )])
+            .with_hint("Toggle"),
+        ))
         .modal(self.confirm.as_ref())
         .render(frame, area);
     }
@@ -1696,6 +1733,40 @@ mod tests {
         assert!(dump.contains("opencode/fix-plan"), "{dump}");
         assert!(dump.contains("apply"), "{dump}");
         assert!(dump.contains("opencode/fix-apply"), "{dump}");
+    }
+
+    #[test]
+    fn confirm_renders_autonomous_toggle_default_unchecked() {
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
+        let dump = render_dump(&mut screen, 110, 40);
+        assert!(dump.contains("Autonomous"), "{dump}");
+        assert!(dump.contains("☐"), "{dump}");
+        assert!(dump.contains("you choose Apply / Other / Skip"), "{dump}");
+        assert!(dump.contains("Space"), "{dump}");
+        assert!(dump.contains("Toggle"), "{dump}");
+    }
+
+    #[test]
+    fn spacebar_toggles_autonomous_checkbox() {
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
+        assert!(!screen.autonomous());
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char(' '))),
+            FixAction::Continue
+        );
+        assert!(screen.autonomous());
+        let dump = render_dump(&mut screen, 110, 40);
+        assert!(dump.contains("☒"), "{dump}");
+        assert!(
+            dump.contains("wisetree approves each fix and commits it"),
+            "{dump}"
+        );
+        // Toggling again returns to manual.
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char(' '))),
+            FixAction::Continue
+        );
+        assert!(!screen.autonomous());
     }
 
     #[test]

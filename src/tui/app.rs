@@ -62,7 +62,7 @@ use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
 };
 use crate::tui::screens::enrich_pr::{EnrichAction, EnrichPullRequestScreen, EnrichStep};
-use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome};
+use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome, FixStep};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
 #[cfg(test)]
@@ -446,6 +446,11 @@ pub struct App {
     /// to Review once opencode finishes writing `pull_request.md`. `Some`
     /// only while the `Enriching` step is active.
     enrich_draft: Option<OpencodeTurnWatcher>,
+    /// Same idea for the Fix screen's apply TUI in Autonomous mode — commits
+    /// each fix + replies the moment opencode's turn finishes, so the user
+    /// never has to press Enter. `Some` only while an autonomous `Applying`
+    /// step is live.
+    fix_apply_watch: Option<OpencodeTurnWatcher>,
     /// Same idea for Update PR's (and "Update branch (locally)"'s) conflict-
     /// resolution TUI — marks the AI done automatically once opencode
     /// finishes. `Some` only while that AI is actively streaming.
@@ -566,6 +571,7 @@ impl App {
             bugkill_pr: None,
             bugkill_investigation: None,
             enrich_draft: None,
+            fix_apply_watch: None,
             update_conflict: None,
             update_branch: None,
             ai_model_picker: None,
@@ -733,14 +739,32 @@ impl App {
                         }
                     }
                     // Same for the Fix PR apply PTY — a child exit means
-                    // opencode finished editing, so commit + reply now.
-                    let fix_exited = self
+                    // opencode finished editing, so commit + reply now (manual
+                    // and autonomous alike). In Autonomous mode a finished
+                    // opencode turn (detected via the database) also commits
+                    // the fix, so wisetree advances without the user pressing
+                    // Enter — exactly how Enrich auto-advances on its turn.
+                    let fix_status = self
                         .fix_pr
                         .as_mut()
-                        .map(|screen| screen.tick_pty(None))
-                        .unwrap_or(false);
-                    if fix_exited {
-                        self.on_fix_apply_done(&tx);
+                        .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()));
+                    match fix_status {
+                        Some((true, _, _)) => {
+                            self.fix_apply_watch = None;
+                            self.on_fix_apply_done(&tx);
+                        }
+                        Some((false, FixStep::Applying, true)) => {
+                            if let Some(turn) = self
+                                .fix_apply_watch
+                                .as_mut()
+                                .and_then(OpencodeTurnWatcher::poll)
+                            {
+                                self.on_fix_turn(turn, &tx);
+                            }
+                        }
+                        _ => {
+                            self.fix_apply_watch = None;
+                        }
                     }
                     // Same for the Bugkill PTYs. The Investigating TUI never
                     // exits on its own, so completion comes from the turn
@@ -795,6 +819,7 @@ impl App {
         self.enrich_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.update_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.bugkill_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.fix_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -2442,6 +2467,29 @@ impl App {
         );
     }
 
+    /// Autonomous Fix apply: opencode's turn finished (or errored) in the
+    /// database. A finished turn commits + replies; a failed turn records the
+    /// error as a Failed row and advances to the next comment.
+    fn on_fix_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match turn {
+            OpencodeTurn::Working => {}
+            OpencodeTurn::Finished { .. } => {
+                self.fix_apply_watch = None;
+                self.on_fix_apply_done(tx);
+            }
+            OpencodeTurn::Failed { message } => {
+                self.fix_apply_watch = None;
+                if let Some(screen) = self.fix_pr.as_mut() {
+                    screen.record_outcome(FixRowOutcome::Failed(format!(
+                        "opencode reported an error: {}",
+                        truncate_error(&message)
+                    )));
+                }
+                self.advance_fix(tx);
+            }
+        }
+    }
+
     // ── "Review Pull Request" orchestration ────────────────────────────
 
     fn start_review_pr_flow(
@@ -3903,8 +3951,16 @@ impl App {
                 );
             }
             Ok(FixVerdict::Fix(plan)) => {
+                let autonomous = self.fix_pr.as_ref().is_some_and(|s| s.autonomous());
                 if let Some(s) = self.fix_pr.as_mut() {
                     s.show_decision(plan);
+                }
+                // Autonomous mode approves the plan for the user: apply it now
+                // instead of pausing on the Apply / Other / Skip page. This is
+                // exactly the path `FixAction::Apply` drives when the user picks
+                // Apply by hand, so the rest of the loop is unchanged.
+                if autonomous {
+                    self.apply_fix_action(FixAction::Apply, tx);
                 }
             }
             Err(msg) => {
@@ -3953,6 +4009,12 @@ impl App {
             Ok(handoff) => {
                 let handoff = *handoff;
                 if let Some(s) = self.fix_pr.as_mut() {
+                    // In Autonomous mode, watch opencode's database so the
+                    // finished turn commits the fix automatically; manual mode
+                    // waits for the user's Enter + finalize confirm instead.
+                    if s.autonomous() {
+                        self.fix_apply_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                    }
                     s.spawn_opencode_pty(
                         handoff.opencode_binary,
                         handoff.opencode_args,

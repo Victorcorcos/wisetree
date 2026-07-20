@@ -9,6 +9,7 @@ pub mod command_list_progress;
 pub mod command_progress;
 pub mod confirmation_modal;
 pub mod input_prompt;
+pub mod options_group;
 pub mod pr_confirm;
 pub mod pty_view;
 pub mod scrollbar;
@@ -28,6 +29,7 @@ pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
 pub use confirmation_modal::{ConfirmationChoice, ConfirmationModal, ConfirmationOutcome};
 pub use input_prompt::{InputOutcome, InputPrompt};
+pub use options_group::{OptionsGroup, OptionsGroupItem};
 pub use pr_confirm::{
     code_lines, code_span, code_spans, code_style, labeled_line, labeled_spans, will_run_lines,
     AiRoleRow, PrConfirmView,
