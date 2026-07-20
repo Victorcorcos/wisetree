@@ -162,11 +162,15 @@ fn parse_fields<const N: usize>(lines: &[&str], keys: [&str; N]) -> [Option<Stri
 
 fn parse_task_block(lines: &[&str]) -> Option<(String, u8)> {
     let [description, complexity] = parse_fields(lines, ["DESCRIPTION:", "COMPLEXITY:"]);
+    let description = description?.trim().to_string();
+    if description.is_empty() {
+        return None;
+    }
     let complexity: u8 = complexity?.trim().parse().ok()?;
     if !(1..=99).contains(&complexity) {
         return None;
     }
-    Some((description?.trim().to_string(), complexity))
+    Some((description, complexity))
 }
 
 fn parse_section_block(lines: &[&str]) -> Option<PlanSection> {
@@ -179,6 +183,9 @@ fn parse_section_block(lines: &[&str]) -> Option<PlanSection> {
         return None;
     }
     let goal = goal?.trim().to_string();
+    if goal.is_empty() {
+        return None;
+    }
     let criteria = criteria?;
     let mut body = format!("**Goal**: {goal}\n");
     if let Some(files) = files.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
