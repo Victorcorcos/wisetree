@@ -10421,6 +10421,85 @@ so the intent reads clearly.
         assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
     }
 
+    #[test]
+    fn prepare_develop_implement_builds_expected_handoff() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.implement.model = " provider/model ".to_string();
+        service.config.develop.check_command = "cargo test --all".to_string();
+
+        let handoff = service
+            .prepare_develop_implement(
+                worktree.path().to_str().unwrap(),
+                "Implement task",
+                "SECTION content",
+                "1. Section [pending]",
+                Some("previous check failure"),
+            )
+            .unwrap();
+
+        assert_eq!(handoff.opencode_binary, service.opencode_binary);
+        assert_eq!(handoff.cwd, worktree.path());
+        assert_eq!(
+            handoff.opencode_args[handoff
+                .opencode_args
+                .iter()
+                .position(|arg| arg == "-m")
+                .unwrap()
+                + 1],
+            "provider/model"
+        );
+        let prompt = &handoff.opencode_args[handoff
+            .opencode_args
+            .iter()
+            .position(|arg| arg == "--prompt")
+            .unwrap()
+            + 1];
+        assert!(prompt.contains("Implement task"));
+        assert!(prompt.contains("SECTION content"));
+        assert!(prompt.contains("1. Section [pending]"));
+        assert!(prompt.contains("previous check failure"));
+    }
+
+    #[test]
+    fn prepare_develop_implement_rejects_missing_model() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.implement.model = "   ".to_string();
+
+        let error = service
+            .prepare_develop_implement(
+                worktree.path().to_str().unwrap(),
+                "task",
+                "sections",
+                "outline",
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "ai.develop.implement model is not configured."
+        );
+    }
+
+    #[test]
+    fn prepare_develop_implement_rejects_unavailable_opencode_binary() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.implement.model = "provider/model".to_string();
+        service.opencode_binary = worktree.path().join("missing-opencode");
+
+        let error = service
+            .prepare_develop_implement(
+                worktree.path().to_str().unwrap(),
+                "task",
+                "sections",
+                "outline",
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
+    }
+
     #[tokio::test]
     async fn develop_preflight_reports_ai_not_configured_for_blank_planning_model() {
         let (_tmp, repo) = develop_repo();
