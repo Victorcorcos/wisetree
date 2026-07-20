@@ -12719,4 +12719,119 @@ mod tests {
             );
         });
     }
+
+    fn config() -> DashboardConfig {
+        DashboardConfig::default()
+    }
+
+    fn preflight_request() -> (String, u64) {
+        ("/tmp/missing".into(), 1)
+    }
+
+    fn plan_request() -> (DevelopPreparePlanRequest, u64) {
+        (
+            DevelopPreparePlanRequest {
+                worktree_path: "/tmp/missing".into(),
+                task_description: "add csv export".into(),
+                base_ref: None,
+                revision: None,
+                corrective: false,
+            },
+            1,
+        )
+    }
+
+    fn implementation_request() -> (DevelopPrepareImplementRequest, u64) {
+        (
+            DevelopPrepareImplementRequest {
+                worktree_path: "/tmp/missing".into(),
+                task_description: "add csv export".into(),
+                sections: "sections".into(),
+                outline: "outline".into(),
+                section: None,
+                check_failure: None,
+            },
+            1,
+        )
+    }
+
+    fn check_request() -> (String, u64) {
+        ("/tmp/missing".into(), 1)
+    }
+
+    fn commit_request() -> (String, String, u64) {
+        ("/tmp/missing".into(), "section commit".into(), 1)
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_without_git_root_sends_preflight_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (worktree_path, operation_id) = preflight_request();
+
+        kick_off_develop_preflight(None, config(), worktree_path, operation_id, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopPrepared { operation_id: _, result: Err(message) }
+                if message == "Could not resolve git root."
+        ));
+    }
+
+    #[tokio::test]
+    async fn develop_plan_without_git_root_sends_plan_preparation_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (req, operation_id) = plan_request();
+
+        kick_off_develop_prepare_plan(None, config(), req, operation_id, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopPlanReady { result: Err(message), .. }
+                if message == "Could not resolve git root."
+        ));
+    }
+
+    #[tokio::test]
+    async fn develop_implementation_without_git_root_sends_preparation_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (req, operation_id) = implementation_request();
+
+        kick_off_develop_prepare_implement(None, config(), req, operation_id, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopImplementReady { result: Err(message), .. }
+                if message == "Could not resolve git root."
+        ));
+    }
+
+    #[tokio::test]
+    async fn develop_check_without_git_root_sends_failed_check() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (worktree_path, operation_id) = check_request();
+
+        kick_off_develop_check(None, config(), worktree_path, operation_id, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopChecked {
+                operation_id: _,
+                outcome: DevelopCheckOutcome::Failed { output }
+            } if output == "Could not resolve git root."
+        ));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_without_git_root_sends_commit_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (worktree_path, subject, operation_id) = commit_request();
+
+        kick_off_develop_commit(None, config(), worktree_path, subject, operation_id, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopCommitted { result: Err(message), .. }
+                if message == "Could not resolve git root."
+        ));
+    }
 }
