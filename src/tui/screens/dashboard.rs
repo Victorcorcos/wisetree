@@ -3850,20 +3850,23 @@ mod tests {
     }
 
     #[test]
-    fn d_shortcut_dispatches_develop_action() {
-        let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
-        screen.handle_key(key_event(KeyCode::Enter));
-        screen.handle_key(key_event(KeyCode::Tab));
-        let action = screen.handle_key(key_event(KeyCode::Char('d')));
-        match action {
-            DashboardAction::Develop(request) => {
-                assert_eq!(request.branch, "feature");
-                assert_eq!(request.worktree_path, "/tmp/repo-feature");
-                assert_eq!(request.number, Some(42));
+    fn develop_shortcut_dispatches_develop_action() {
+        let base_row = row(Some(open_pr()), Some(branch_status(3, 0)));
+        for shortcut in ['d', 'D'] {
+            let mut screen = screen_with_row(base_row.clone());
+            screen.handle_key(key_event(KeyCode::Enter));
+            screen.handle_key(key_event(KeyCode::Tab));
+            let action = screen.handle_key(key_event(KeyCode::Char(shortcut)));
+            match action {
+                DashboardAction::Develop(request) => {
+                    assert_eq!(request.branch, "feature");
+                    assert_eq!(request.worktree_path, "/tmp/repo-feature");
+                    assert_eq!(request.number, Some(42));
+                }
+                other => panic!("expected Develop, got {other:?}"),
             }
-            other => panic!("expected Develop, got {other:?}"),
+            assert!(screen.pr_commands.is_empty());
         }
-        assert!(screen.pr_commands.is_empty());
     }
 
     #[test]
