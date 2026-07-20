@@ -9955,6 +9955,7 @@ mod tests {
 
     fn develop_app_implementing(
         check_command: Option<&str>,
+        section: Option<usize>,
     ) -> (
         App,
         mpsc::UnboundedSender<AppEvent>,
@@ -9976,7 +9977,7 @@ mod tests {
         let screen = app.develop_pr.as_mut().unwrap();
         screen.set_plan(develop_plan());
         screen.set_check_command(check_command.map(str::to_string));
-        screen.begin_implement_run(Some(0));
+        screen.begin_implement_run(section);
         let (tx, rx) = mpsc::unbounded_channel();
         (app, tx, rx)
     }
@@ -9988,7 +9989,7 @@ mod tests {
         mpsc::UnboundedSender<AppEvent>,
         mpsc::UnboundedReceiver<AppEvent>,
     ) {
-        develop_app_implementing(Some(check_command))
+        develop_app_implementing(Some(check_command), Some(0))
     }
 
     fn develop_app_implementing_without_check() -> (
@@ -9996,7 +9997,7 @@ mod tests {
         mpsc::UnboundedSender<AppEvent>,
         mpsc::UnboundedReceiver<AppEvent>,
     ) {
-        develop_app_implementing(None)
+        develop_app_implementing(None, Some(0))
     }
 
     async fn assert_develop_check_requested(
@@ -11800,6 +11801,91 @@ mod tests {
             assert!(screen.plan().unwrap().sections[0].done);
             assert_ne!(screen.step(), DevelopStep::Verifying);
             assert_no_develop_check_requested(&mut rx).await;
+        });
+    }
+
+    #[test]
+    fn finalizing_named_section_with_checkpoints_persists_and_requests_commit() {
+        let (mut app, tx, mut rx) = develop_app_implementing(None, Some(0));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.finalize_develop_section(&tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert!(!screen.plan().unwrap().sections[1].done);
+
+            // Both the plan rewrite and the checkpoint commit are requested.
+            let mut file_rewritten = false;
+            let mut commit_requested = false;
+            for _ in 0..2 {
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("expected event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopFileRewritten { .. } => {
+                        assert!(!file_rewritten, "plan should be rewritten exactly once");
+                        file_rewritten = true;
+                    }
+                    AppEvent::DevelopCommitted {
+                        operation_id,
+                        result,
+                    } => {
+                        assert!(!commit_requested, "commit should be requested exactly once");
+                        assert_eq!(operation_id, 1);
+                        assert!(result.is_ok());
+                        commit_requested = true;
+                    }
+                    _other => panic!("expected DevelopFileRewritten or DevelopCommitted"),
+                }
+            }
+            assert!(file_rewritten);
+            assert!(commit_requested);
+
+            // The workflow does not advance before the checkpoint finishes.
+            assert!(rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn finalizing_without_a_target_and_without_checkpoints_advances_once() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = develop_repo(&home);
+        let _ = home.keep();
+        let mut app = develop_app(&repo);
+        let screen = app.develop_pr.as_mut().unwrap();
+        // Move focus from the Ralph Loop toggle to the checkpoint toggle and
+        // flip it off.
+        let _ = screen.handle_key(key(KeyCode::Down));
+        let _ = screen.handle_key(key(KeyCode::Char(' ')));
+        assert!(!screen.commit_sections(), "checkpoints should be disabled");
+        screen.set_plan(develop_plan());
+        screen.set_check_command(None);
+        screen.begin_implement_run(None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.finalize_develop_section(&tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert!(screen.plan().unwrap().sections[1].done);
+
+            // Completion is persisted.
+            assert_plan_write_requested(&mut rx).await;
+
+            // No commit is requested and the workflow advances exactly once.
+            assert!(rx.try_recv().is_err());
+            assert_eq!(screen.step(), DevelopStep::Done);
         });
     }
 
