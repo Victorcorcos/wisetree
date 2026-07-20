@@ -4641,11 +4641,22 @@ impl SettingsScreen {
             // show a compact "configured / total" summary rather than a single
             // model value (per-command models live on the sub-screen).
             let leaves = ai_slot_models(&editor.ai);
-            let configured = leaves.iter().filter(|m| !m.model.trim().is_empty()).count();
-            Line::from(Span::styled(
-                format!("{configured}/{} AI commands configured", leaves.len()),
-                Style::default().fg(colors::MUTED),
-            ))
+            let configured_models: Vec<&str> = leaves
+                .iter()
+                .map(|m| m.model.trim())
+                .filter(|m| !m.is_empty())
+                .collect();
+            let configured = configured_models.len();
+            let summary = if configured_models.is_empty() {
+                format!("{configured}/{} AI commands configured", leaves.len())
+            } else {
+                format!(
+                    "{configured}/{} AI commands configured: {}",
+                    leaves.len(),
+                    configured_models.join(", ")
+                )
+            };
+            Line::from(Span::styled(summary, Style::default().fg(colors::MUTED)))
         } else if value.is_empty() {
             let placeholder = Style::default()
                 .fg(colors::MUTED)
@@ -6076,6 +6087,68 @@ mod tests {
             .iter()
             .position(|candidate| *candidate == field)
             .expect("dashboard field exists")
+    }
+
+    /// Build a `WorktreeConfig` whose per-command AI model slots are all blank
+    /// so tests can selectively set the leaves they care about.
+    fn config_with_blank_ai_models() -> WorktreeConfig {
+        WorktreeConfig {
+            dashboard: DashboardConfig {
+                ai: AiConfig {
+                    enrich: AiModelConfig::default(),
+                    fix: AiFixConfig {
+                        plan: AiModelConfig::default(),
+                        apply: AiModelConfig::default(),
+                    },
+                    review: AiModelConfig::default(),
+                    update: AiModelConfig::default(),
+                    bugkill: AiBugkillConfig {
+                        investigate: AiModelConfig::default(),
+                        fix: AiModelConfig::default(),
+                        judge: AiModelConfig::default(),
+                    },
+                    develop: AiDevelopConfig {
+                        plan: AiModelConfig::default(),
+                        implement: AiModelConfig::default(),
+                    },
+                },
+                ..DashboardConfig::default()
+            },
+            ..WorktreeConfig::default()
+        }
+    }
+
+    /// Render the Dashboard settings screen and return the text of the `ai`
+    /// summary rectangle.
+    fn render_dashboard_ai_summary(config: &WorktreeConfig) -> String {
+        let mut screen = SettingsScreen::new(config.clone(), "test.json".to_string());
+        screen.step = SettingsStep::Dashboard;
+        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+
+        let backend = TestBackend::new(120, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn dashboard_ai_summary_renders_both_develop_models() {
+        let mut config = config_with_blank_ai_models();
+        config.dashboard.ai.develop.plan.model = "develop-plan-model".to_string();
+        config.dashboard.ai.develop.implement.model = "develop-implement-model".to_string();
+
+        let rendered = render_dashboard_ai_summary(&config);
+
+        assert!(rendered.contains("develop-plan-model"));
+        assert!(rendered.contains("develop-implement-model"));
     }
 
     #[test]
