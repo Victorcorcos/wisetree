@@ -798,14 +798,7 @@ impl App {
                     match develop_exited {
                         Some((true, DevelopStep::Planning)) => self.on_develop_plan_pty_exited(&tx),
                         Some((true, DevelopStep::Implementing)) => {
-                            // opencode exited on its own — read whatever
-                            // transcript the watcher captured for the note.
-                            let transcript = self
-                                .develop_watch
-                                .as_mut()
-                                .and_then(OpencodeTurnWatcher::transcript_now)
-                                .unwrap_or_default();
-                            self.on_develop_implement_done(transcript, &tx)
+                            self.on_develop_implement_pty_exited(&tx)
                         }
                         Some((false, DevelopStep::Planning | DevelopStep::Implementing)) => {
                             if let Some(turn) = self
@@ -3915,6 +3908,29 @@ impl App {
                 if let Some(screen) = self.develop_pr.as_mut() {
                     screen.kill_pty();
                     screen.set_error("opencode exited before the plan was finished.".to_string());
+                }
+            }
+            turn => self.on_develop_turn(turn, tx),
+        }
+    }
+
+    /// The implementation TUI exited before the watcher saw a completed turn
+    /// (the user quit opencode, or it crashed). Check the database once —
+    /// otherwise error.
+    fn on_develop_implement_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = self
+            .develop_watch
+            .as_mut()
+            .map(OpencodeTurnWatcher::check_now)
+            .unwrap_or(OpencodeTurn::Working);
+        match turn {
+            OpencodeTurn::Working => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(
+                        "opencode exited before the implementation finished.".to_string(),
+                    );
                 }
             }
             turn => self.on_develop_turn(turn, tx),
