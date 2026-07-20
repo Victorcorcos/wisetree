@@ -11937,6 +11937,89 @@ mod tests {
         });
     }
 
+    #[test]
+    fn develop_ignores_verification_results_outside_verifying_step() {
+        let (mut app, tx, _rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done("Implemented section 0.".into(), &tx);
+            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            let step_after_pass = screen.step();
+            assert_ne!(step_after_pass, DevelopStep::Verifying);
+            assert!(screen.plan().unwrap().sections[0].done);
+
+            // Deliver a delayed check result that belongs to the now-finalized
+            // verification window. It must not mutate the current step or undo
+            // the finalized section.
+            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), step_after_pass);
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert!(!screen.plan().unwrap().sections[1].done);
+        });
+    }
+
+    #[test]
+    fn develop_finalizes_when_verification_passes() {
+        let (mut app, tx, _rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done("Implemented section 0.".into(), &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::Verifying);
+            assert!(!screen.plan().unwrap().sections[0].done);
+
+            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert_ne!(screen.step(), DevelopStep::Verifying);
+            assert!(screen.check_failure().is_none());
+        });
+    }
+
+    #[test]
+    fn develop_exposes_output_when_verification_fails() {
+        let (mut app, tx, _rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done("Implemented section 0.".into(), &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::Verifying);
+
+            let output = "test foo::bar ... FAILED\nassertion `left == right` failed".to_string();
+            app.apply_develop_checked(
+                1,
+                DevelopCheckOutcome::Failed {
+                    output: output.clone(),
+                },
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::CheckFailed);
+            assert!(!screen.plan().unwrap().sections[0].done);
+            assert_eq!(screen.check_failure(), Some(output));
+        });
+    }
+
     // ── Develop plan parsing outcomes ───────────────────────────────────
 
     fn app_with_active_develop_flow(
