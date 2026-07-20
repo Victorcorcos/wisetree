@@ -3638,36 +3638,48 @@ impl DashboardService {
     }
 
     /// Commit one finished section — the harness, never the AI — as a
-    /// Ralph-canon checkpoint. Stages everything **except** the harness-owned
-    /// `PLAN.md` (`git add -A -- . ':(exclude)PLAN.md'`), then commits with
-    /// `subject` (build it with [`develop_commit_subject`]). Returns the new
-    /// sha, or `Ok(None)` when there was nothing to commit (the run made no
-    /// change, or touched only `PLAN.md`) so the caller records no checkpoint
-    /// rather than erroring.
+    /// Ralph-canon checkpoint. `preexisting_paths` holds the paths that were
+    /// already dirty before this section's run started; they are left
+    /// untouched so unrelated worktree changes are not absorbed into the
+    /// checkpoint. The harness-owned `PLAN.md` is also excluded. Returns the
+    /// new sha, or `Ok(None)` when there was nothing to commit (the run made
+    /// no change, or touched only pre-existing work / `PLAN.md`).
     pub async fn develop_commit_section(
         &self,
         worktree_path: &str,
         subject: &str,
+        preexisting_paths: &[String],
     ) -> Result<Option<String>> {
         let cwd = PathBuf::from(worktree_path);
         // Ensure a plan staged before this checkpoint cannot be committed.
         self.develop_git(&cwd, &["reset", "--", DEVELOP_PLAN_FILE])
             .await
             .map_err(WisetreeError::other)?;
-        // Stage all tracked + untracked changes but the plan file. The
-        // pathspec `:(exclude)PLAN.md` drops it wherever it sits.
-        let exclude_plan = format!(":(exclude){DEVELOP_PLAN_FILE}");
-        self.develop_git(&cwd, &["add", "-A", "--", ".", &exclude_plan])
+        // Compute the current dirty files and drop anything that was already
+        // dirty before this section started or is harness-owned output.
+        let status = self
+            .develop_git(&cwd, &["status", "--porcelain=v2", "-z", "--untracked-files=all"])
             .await
             .map_err(WisetreeError::other)?;
-        // Nothing staged (empty diff, or only PLAN.md changed) → no commit.
-        let staged = self
-            .develop_git(&cwd, &["diff", "--cached", "--name-only"])
-            .await
-            .map_err(WisetreeError::other)?;
-        if staged.trim().is_empty() {
+        let current = parse_porcelain_v2(&status);
+        let mut section_paths: Vec<String> = current
+            .tracked
+            .into_iter()
+            .chain(current.untracked)
+            .filter(|p| *p != DEVELOP_PLAN_FILE && !preexisting_paths.contains(p))
+            .collect();
+        section_paths.sort();
+        section_paths.dedup();
+        if section_paths.is_empty() {
             return Ok(None);
         }
+        // Stage only the paths this section intended to change.
+        let mut add_args: Vec<&str> = vec!["add", "--"];
+        let path_refs: Vec<&str> = section_paths.iter().map(String::as_str).collect();
+        add_args.extend_from_slice(&path_refs);
+        self.develop_git(&cwd, &add_args)
+            .await
+            .map_err(WisetreeError::other)?;
         self.develop_git(&cwd, &["commit", "-m", subject])
             .await
             .map_err(|err| {
@@ -3681,6 +3693,27 @@ impl DashboardService {
             .await
             .map_err(WisetreeError::other)?;
         Ok(Some(sha.trim().to_string()))
+    }
+
+    /// Return every path that is currently dirty in the worktree, including
+    /// untracked files. Used to record a baseline before a section run so the
+    /// later commit can exclude pre-existing work.
+    pub async fn develop_dirty_files(&self, worktree_path: &str) -> Result<Vec<String>> {
+        let cwd = PathBuf::from(worktree_path);
+        let status = self
+            .develop_git(&cwd, &["status", "--porcelain=v2", "-z", "--untracked-files=all"])
+            .await
+            .map_err(WisetreeError::other)?;
+        let parsed = parse_porcelain_v2(&status);
+        let mut paths: Vec<String> = parsed
+            .tracked
+            .into_iter()
+            .chain(parsed.untracked)
+            .filter(|p| !p.is_empty())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 
     /// Run one git command inside `cwd` under the Develop check timeout,
@@ -7376,8 +7409,8 @@ mod tests {
     #[test]
     fn develop_plan_prompt_caps_multibyte_inputs() {
         let oversized_task = "🦀".repeat(DEVELOP_TASK_MAX_BYTES);
-        let oversized_plan = "🦀".repeat(DEVELOP_PLAN_MAX_BYTES);
-        let oversized_feedback = "🦀".repeat(DEVELOP_FEEDBACK_MAX_BYTES);
+        let oversized_plan = "🐢".repeat(DEVELOP_PLAN_MAX_BYTES);
+        let oversized_feedback = "🐙".repeat(DEVELOP_FEEDBACK_MAX_BYTES);
 
         let prompt = build_develop_plan_prompt(
             &oversized_task,
@@ -7400,9 +7433,11 @@ mod tests {
         assert!(expected_task.is_char_boundary(expected_task.len()));
         assert!(expected_plan.is_char_boundary(expected_plan.len()));
         assert!(expected_feedback.is_char_boundary(expected_feedback.len()));
-        assert!(expected_task.len() <= DEVELOP_TASK_MAX_BYTES);
-        assert!(expected_plan.len() <= DEVELOP_PLAN_MAX_BYTES);
-        assert!(expected_feedback.len() <= DEVELOP_FEEDBACK_MAX_BYTES);
+        // The truncated content is at most the byte limit; the marker adds a
+        // few bytes, so the full expected string is slightly over the limit.
+        assert!(expected_task.len() <= DEVELOP_TASK_MAX_BYTES + "…[truncated]".len());
+        assert!(expected_plan.len() <= DEVELOP_PLAN_MAX_BYTES + "…[truncated]".len());
+        assert!(expected_feedback.len() <= DEVELOP_FEEDBACK_MAX_BYTES + "…[truncated]".len());
     }
 
     // ── Review pipeline: diff split + findings parsing ─────────────────
@@ -10850,7 +10885,7 @@ so the intent reads clearly.
         std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
 
         let sha = service
-            .develop_commit_section(repo_str, &develop_commit_subject(Some((2, "Exporter"))))
+            .develop_commit_section(repo_str, &develop_commit_subject(Some((2, "Exporter"))), &[])
             .await
             .expect("commit ok")
             .expect("a commit was made");
@@ -10874,7 +10909,7 @@ so the intent reads clearly.
         // Only the harness-owned plan file changed → nothing to checkpoint.
         std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
         let sha = service
-            .develop_commit_section(repo_str, &develop_commit_subject(Some((1, "Data model"))))
+            .develop_commit_section(repo_str, &develop_commit_subject(Some((1, "Data model"))), &[])
             .await
             .expect("commit ok");
         assert_eq!(sha, None);
@@ -10888,7 +10923,7 @@ so the intent reads clearly.
         let service = dashboard_with_failing_git(&repo, "add", "staging failed");
 
         let error = service
-            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section")
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
             .await
             .unwrap_err();
 
@@ -10901,7 +10936,7 @@ so the intent reads clearly.
         let service = dashboard_with_failing_git(&repo, "diff --cached --name-only", "diff failed");
 
         let error = service
-            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section")
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
             .await
             .unwrap_err();
 
@@ -10914,7 +10949,7 @@ so the intent reads clearly.
         let service = dashboard_with_failing_git(&repo, "commit", "");
 
         let error = service
-            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section")
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
             .await
             .unwrap_err();
 
@@ -10930,11 +10965,41 @@ so the intent reads clearly.
         let service = dashboard_with_failing_git(&repo, "rev-parse HEAD", "HEAD resolution failed");
 
         let error = service
-            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section")
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
             .await
             .unwrap_err();
 
         assert!(error.to_string().contains("HEAD resolution failed"));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_excludes_preexisting_paths() {
+        let (_tmp, repo) = develop_repo();
+        let repo_str = repo.to_str().unwrap();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default());
+
+        // A pre-existing dirty file and a new file created by this section.
+        std::fs::write(repo.join("preexisting.txt"), "pre-existing").unwrap();
+        std::fs::write(repo.join("section.txt"), "section work").unwrap();
+
+        let sha = service
+            .develop_commit_section(
+                repo_str,
+                &develop_commit_subject(Some((2, "Exporter"))),
+                &["preexisting.txt".to_string()],
+            )
+            .await
+            .expect("commit ok")
+            .expect("a commit was made");
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%s"]),
+            "develop: section 2 — Exporter"
+        );
+        // The section's file is committed; the pre-existing file is not.
+        assert!(git(&repo, &["ls-files", "section.txt"]).contains("section.txt"));
+        assert!(git(&repo, &["ls-files", "preexisting.txt"]).is_empty());
+        assert!(git(&repo, &["status", "--porcelain"]).contains("preexisting.txt"));
     }
 
     #[test]

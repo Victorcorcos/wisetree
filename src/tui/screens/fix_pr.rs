@@ -41,8 +41,8 @@ use crate::tui::screens::dashboard::FixPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
     labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView, Status,
-    StatusIndicator, SummaryRow,
+    ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup, OptionsGroupItem, PrConfirmView,
+    PtyView, Status, StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -876,6 +876,11 @@ impl FixPullRequestScreen {
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
+        let description = if self.autonomous {
+            "wisetree detects when opencode finishes each fix and commits it automatically"
+        } else {
+            "you press Enter in the opencode panel to finalize each fix (or keep chatting first)"
+        };
         PrConfirmView::new(format!(
             "Fix review comments on Pull Request #{}?",
             self.request.number
@@ -883,7 +888,6 @@ impl FixPullRequestScreen {
         .title_color(colors::CYAN)
         .block(build_detail_lines(&self.request))
         .steps(&FIX_STEPS)
-        .block(self.autonomous_toggle_lines())
         .ai_roles(vec![
             AiRoleRow::new(
                 "plan",
@@ -898,40 +902,16 @@ impl FixPullRequestScreen {
                 self.ai.apply.thinking.clone(),
             ),
         ])
+        .options(Some(
+            OptionsGroup::new(vec![OptionsGroupItem::new(
+                self.autonomous,
+                "Autonomous",
+                description,
+            )])
+            .with_hint("Toggle"),
+        ))
         .modal(self.confirm.as_ref())
         .render(frame, area);
-    }
-
-    /// The Autonomous toggle shown on the Confirm page. Space flips ☒/☐:
-    /// ☒ lets wisetree detect when the embedded opencode finishes each fix and
-    /// commit it automatically; ☐ (default) waits for the user to press Enter
-    /// in the opencode panel to finalize each fix, as before.
-    fn autonomous_toggle_lines(&self) -> Vec<Line<'static>> {
-        let checkbox = if self.autonomous { "☒" } else { "☐" };
-        let description = if self.autonomous {
-            "wisetree detects when opencode finishes each fix and commits it automatically."
-        } else {
-            "you press Enter in the opencode panel to finalize each fix (or keep chatting first)."
-        };
-        vec![
-            Line::from(vec![
-                Span::styled("▸ ".to_string(), Style::default().fg(colors::CYAN)),
-                Span::styled(
-                    format!("{checkbox} Autonomous"),
-                    Style::default()
-                        .fg(colors::BRAND)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  — {description}"),
-                    Style::default().fg(colors::GRAY_LIGHT),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Space ".to_string(), Style::default().fg(colors::CYAN)),
-                Span::styled("Toggle".to_string(), muted_dim()),
-            ]),
-        ]
     }
 
     fn render_decision(&self, frame: &mut Frame, area: Rect) {

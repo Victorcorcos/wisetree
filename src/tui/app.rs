@@ -258,37 +258,46 @@ enum AppEvent {
     /// detection).
     DevelopPrepared {
         operation_id: u64,
+        generation: u64,
         result: Result<Box<DevelopPreflightOutcome>, String>,
     },
     /// Spawn params for one live planning run are ready (or a gate failed).
     /// `corrective` marks the single retry after a parse failure.
     DevelopPlanReady {
         operation_id: u64,
+        generation: u64,
         corrective: bool,
         result: Result<Box<FixApplyHandoff>, String>,
     },
     /// Spawn params for one live implement run are ready. `section` is the
     /// Ralph Loop target (`None` = one run for every pending section).
+    /// `preexisting_paths` is the baseline of dirty files captured before the
+    /// run so a later section commit can exclude them.
     DevelopImplementReady {
         operation_id: u64,
+        generation: u64,
         section: Option<usize>,
+        preexisting_paths: Vec<String>,
         result: Result<Box<FixApplyHandoff>, String>,
     },
     /// Rewriting `PLAN.md` finished (best-effort warning on failure).
     DevelopFileRewritten {
         operation_id: u64,
+        generation: u64,
         revision: u64,
         result: Result<(), String>,
     },
     /// The post-section check command finished (Ralph-canon backpressure).
     DevelopChecked {
         operation_id: u64,
+        generation: u64,
         outcome: DevelopCheckOutcome,
     },
     /// A section checkpoint commit finished. `Ok(Some(sha))` when a commit
     /// landed, `Ok(None)` when there was nothing to commit.
     DevelopCommitted {
         operation_id: u64,
+        generation: u64,
         result: Result<Option<String>, String>,
     },
     /// Result of the background fetch that powers the AI provider/model
@@ -352,6 +361,7 @@ struct UpdatePrFailure {
 
 struct DevelopFileWrite {
     operation_id: u64,
+    generation: u64,
     revision: u64,
     path: PathBuf,
     content: String,
@@ -473,6 +483,8 @@ pub struct App {
     develop_pr: Option<DevelopPullRequestScreen>,
     next_develop_operation_id: u64,
     active_develop_operation_id: Option<u64>,
+    next_develop_generation: u64,
+    active_develop_generation: Option<u64>,
     next_develop_file_revision: u64,
     develop_write_in_flight: bool,
     pending_develop_write: Option<DevelopFileWrite>,
@@ -614,6 +626,8 @@ impl App {
             develop_pr: None,
             next_develop_operation_id: 0,
             active_develop_operation_id: None,
+            next_develop_generation: 0,
+            active_develop_generation: None,
             next_develop_file_revision: 0,
             develop_write_in_flight: false,
             pending_develop_write: None,
@@ -844,18 +858,41 @@ impl App {
                     // through opencode's database: a completed Planning turn
                     // carries the plan transcript; a completed Implementing
                     // turn marks the section(s) ✅ and (on a Ralph Loop)
-                    // opens the next run. An early PTY exit falls back to
-                    // the same handlers.
+                    // opens the next run. An early PTY exit falls back to the
+                    // same handlers, but only when the child exited with status
+                    // 0 — a crashed or force-quit opencode session is treated
+                    // as a failure rather than a successful completion.
                     let develop_exited = self
                         .develop_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step()));
                     match develop_exited {
-                        Some((true, DevelopStep::Planning)) => self.on_develop_plan_pty_exited(&tx),
-                        Some((true, DevelopStep::Implementing)) => {
+                        Some((Some(0), DevelopStep::Planning)) => {
+                            self.on_develop_plan_pty_exited(&tx)
+                        }
+                        Some((Some(0), DevelopStep::Implementing)) => {
                             self.on_develop_implement_pty_exited(&tx)
                         }
-                        Some((false, DevelopStep::Planning | DevelopStep::Implementing)) => {
+                        Some((Some(_), DevelopStep::Planning)) => {
+                            self.develop_watch = None;
+                            if let Some(screen) = self.develop_pr.as_mut() {
+                                screen.kill_pty();
+                                screen.set_error(
+                                    "opencode exited before the plan was finished.".to_string(),
+                                );
+                            }
+                        }
+                        Some((Some(_), DevelopStep::Implementing)) => {
+                            self.develop_watch = None;
+                            if let Some(screen) = self.develop_pr.as_mut() {
+                                screen.kill_pty();
+                                screen.set_error(
+                                    "opencode exited before the implementation finished."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Some((None, DevelopStep::Planning | DevelopStep::Implementing)) => {
                             if let Some(turn) = self
                                 .develop_watch
                                 .as_mut()
@@ -3767,6 +3804,9 @@ impl App {
         let mut screen = DevelopPullRequestScreen::new(request, ai);
         screen.set_check_command((!check_command.is_empty()).then_some(check_command));
         self.active_develop_operation_id = Some(self.next_develop_operation_id());
+        // Generation 0 is reserved for the pre-flight phase; the first async
+        // kickoff will bump it to 1.
+        self.active_develop_generation = Some(0);
         self.develop_pr = Some(screen);
         self.develop_watch = None;
         self.screen = Screen::DevelopPullRequest;
@@ -3790,6 +3830,16 @@ impl App {
 
     fn is_active_develop_operation(&self, operation_id: u64) -> bool {
         self.active_develop_operation_id() == Some(operation_id)
+    }
+
+    fn next_develop_generation(&mut self) -> u64 {
+        self.next_develop_generation = self.next_develop_generation.wrapping_add(1);
+        self.active_develop_generation = Some(self.next_develop_generation);
+        self.next_develop_generation
+    }
+
+    fn is_current_develop_generation(&self, generation: u64) -> bool {
+        self.active_develop_generation == Some(generation)
     }
 
     fn handle_develop_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -3816,6 +3866,7 @@ impl App {
                     .take()
                     .map(|s| s.request().worktree_path.clone());
                 self.active_develop_operation_id = None;
+                self.active_develop_generation = None;
                 self.develop_watch = None;
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
@@ -3823,6 +3874,7 @@ impl App {
                 let Some(operation_id) = self.active_develop_operation_id else {
                     return;
                 };
+                let generation = self.next_develop_generation();
                 let Some(screen) = self.develop_pr.as_mut() else {
                     return;
                 };
@@ -3833,6 +3885,7 @@ impl App {
                     self.current_dashboard_config(),
                     worktree_path,
                     operation_id,
+                    generation,
                     tx.clone(),
                 );
             }
@@ -3880,7 +3933,13 @@ impl App {
             DevelopAction::Done => {
                 self.develop_pr = None;
                 self.active_develop_operation_id = None;
+                self.active_develop_generation = None;
                 self.enter_screen(Screen::Dashboard, tx);
+            }
+            DevelopAction::WritePty(bytes) => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.send_pty_input(&bytes);
+                }
             }
         }
     }
@@ -3888,19 +3947,29 @@ impl App {
     /// Kick off one live planning run: build the opencode TUI spawn params,
     /// then show it in the embedded PTY. On a revision the screen carries
     /// the rejected plan + feedback; `corrective` is only set on the
-    /// automatic retry after an unparseable transcript.
+    /// automatic retry after an unparseable transcript. Each new run bumps
+    /// the flow generation so stale async results from earlier cycles are
+    /// ignored.
     fn start_develop_planning(&mut self, corrective: bool, tx: &mpsc::UnboundedSender<AppEvent>) {
         self.develop_watch = None;
         let Some(operation_id) = self.active_develop_operation_id else {
             return;
         };
+        let (worktree_path, description, base_ref, revision) = {
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
+            (
+                screen.request().worktree_path.clone(),
+                screen.task_description().to_string(),
+                screen.base_ref().map(str::to_string),
+                screen.revision(),
+            )
+        };
+        let generation = self.next_develop_generation();
         let Some(screen) = self.develop_pr.as_mut() else {
             return;
         };
-        let worktree_path = screen.request().worktree_path.clone();
-        let description = screen.task_description().to_string();
-        let base_ref = screen.base_ref().map(str::to_string);
-        let revision = screen.revision();
         screen.start_working("Preparing the plan...");
         kick_off_develop_prepare_plan(
             self.git_root.clone(),
@@ -3913,33 +3982,43 @@ impl App {
                 corrective,
             },
             operation_id,
+            generation,
             tx.clone(),
         );
     }
 
     /// Kick off the next implement run: one section on a Ralph Loop, or
     /// every pending section in a single run. With nothing pending, the
-    /// pipeline is already complete.
+    /// pipeline is already complete. Each new run bumps the flow generation
+    /// so stale async results from earlier cycles are ignored.
     fn start_develop_implement_run(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         self.develop_watch = None;
         let Some(operation_id) = self.active_develop_operation_id else {
             return;
         };
+        let (_next, section, sections_block, outline, check_failure, worktree_path, description) = {
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
+            let Some(next) = screen.next_pending() else {
+                screen.enter_done();
+                return;
+            };
+            let section = screen.ralph().then_some(next);
+            (
+                next,
+                section,
+                screen.sections_for_run(section),
+                screen.outline_for_run(section),
+                screen.check_failure(),
+                screen.request().worktree_path.clone(),
+                screen.task_description().to_string(),
+            )
+        };
+        let generation = self.next_develop_generation();
         let Some(screen) = self.develop_pr.as_mut() else {
             return;
         };
-        let Some(next) = screen.next_pending() else {
-            screen.enter_done();
-            return;
-        };
-        let section = screen.ralph().then_some(next);
-        let sections_block = screen.sections_for_run(section);
-        let outline = screen.outline_for_run(section);
-        // On a check-fix retry the failing output is still stashed on the
-        // screen; a fresh section run has none.
-        let check_failure = screen.check_failure();
-        let worktree_path = screen.request().worktree_path.clone();
-        let description = screen.task_description().to_string();
         screen.start_working("Preparing the implementation...");
         kick_off_develop_prepare_implement(
             self.git_root.clone(),
@@ -3953,6 +4032,7 @@ impl App {
                 check_failure,
             },
             operation_id,
+            generation,
             tx.clone(),
         );
     }
@@ -4120,12 +4200,17 @@ impl App {
         screen.record_run_summary(summarize_transcript(&transcript));
         if screen.has_check() {
             let worktree_path = screen.request().worktree_path.clone();
+            let generation = self.next_develop_generation();
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
             screen.start_verifying();
             kick_off_develop_check(
                 self.git_root.clone(),
                 self.current_dashboard_config(),
                 worktree_path,
                 operation_id,
+                generation,
                 tx.clone(),
             );
         } else {
@@ -4135,14 +4220,18 @@ impl App {
 
     /// The check finished: pass on failure (CheckFailed prompt) or finalize
     /// the section on success. A result arriving after the user already
-    /// paused (screen gone, or no longer Verifying) is ignored.
+    /// paused (screen gone, no longer Verifying, or from an older generation)
+    /// is ignored.
     fn apply_develop_checked(
         &mut self,
         operation_id: u64,
+        generation: u64,
         outcome: DevelopCheckOutcome,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        if !self.is_active_develop_operation(operation_id) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
             return;
         }
         let Some(screen) = self.develop_pr.as_mut() else {
@@ -4164,26 +4253,34 @@ impl App {
         let Some(operation_id) = self.active_develop_operation_id else {
             return;
         };
-        let Some(screen) = self.develop_pr.as_mut() else {
-            return;
+        let (commit, target, preexisting_paths, worktree_path) = {
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
+            (
+                screen.commit_sections(),
+                screen.finish_section(),
+                screen.preexisting_paths().to_vec(),
+                screen.request().worktree_path.clone(),
+            )
         };
-        let commit = screen.commit_sections();
-        let target = screen.finish_section();
         self.rewrite_develop_file(tx);
-        let Some(screen) = self.develop_pr.as_mut() else {
-            return;
-        };
         if commit {
+            let generation = self.next_develop_generation();
             let subject =
                 develop_commit_subject(target.as_ref().map(|(n, name)| (*n, name.as_str())));
-            let worktree_path = screen.request().worktree_path.clone();
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
             screen.start_working("Committing the section...");
             kick_off_develop_commit(
                 self.git_root.clone(),
                 self.current_dashboard_config(),
                 worktree_path,
                 subject,
+                preexisting_paths,
                 operation_id,
+                generation,
                 tx.clone(),
             );
         } else {
@@ -4200,19 +4297,24 @@ impl App {
         let Some(operation_id) = self.active_develop_operation_id else {
             return;
         };
-        self.apply_develop_committed(operation_id, result, tx);
+        let generation = self.active_develop_generation.unwrap_or(0);
+        self.apply_develop_committed(operation_id, generation, result, tx);
     }
 
     /// A section commit finished: count it (Done-page summary) and advance
     /// to the next run. A commit failure is a non-fatal toast — the section
-    /// is already marked done and its edits remain in the worktree.
+    /// is already marked done and its edits remain in the worktree. Stale
+    /// results from an earlier generation are ignored.
     fn apply_develop_committed(
         &mut self,
         operation_id: u64,
+        generation: u64,
         result: Result<Option<String>, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        if !self.is_active_develop_operation(operation_id) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
             return;
         }
         match result {
@@ -4241,6 +4343,7 @@ impl App {
         self.show_toast(variant, message.into());
         self.develop_pr = None;
         self.active_develop_operation_id = None;
+        self.active_develop_generation = None;
         self.enter_screen(Screen::Dashboard, tx);
     }
 
@@ -4262,8 +4365,12 @@ impl App {
         let Some(operation_id) = self.active_develop_operation_id() else {
             return;
         };
+        let Some(generation) = self.active_develop_generation else {
+            return;
+        };
         let write = DevelopFileWrite {
             operation_id,
+            generation,
             revision: self.next_develop_file_revision(),
             path,
             content,
@@ -4289,13 +4396,14 @@ impl App {
     fn apply_develop_file_rewritten(
         &mut self,
         operation_id: u64,
+        generation: u64,
         revision: u64,
         result: Result<(), String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         self.develop_write_in_flight = false;
 
-        if self.is_current_develop_revision(operation_id, revision) {
+        if self.is_current_develop_revision(operation_id, generation, revision) {
             if let Err(error) = result {
                 self.show_toast(
                     ToastVariant::Warning,
@@ -4309,18 +4417,27 @@ impl App {
         }
     }
 
-    fn is_current_develop_revision(&self, operation_id: u64, revision: u64) -> bool {
+    fn is_current_develop_revision(
+        &self,
+        operation_id: u64,
+        generation: u64,
+        revision: u64,
+    ) -> bool {
         self.is_active_develop_operation(operation_id)
+            && self.is_current_develop_generation(generation)
             && self.next_develop_file_revision == revision
     }
 
     fn apply_develop_prepared(
         &mut self,
         operation_id: u64,
+        generation: u64,
         result: Result<Box<DevelopPreflightOutcome>, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        if !self.is_active_develop_operation(operation_id) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
             return;
         }
         match result {
@@ -4362,10 +4479,13 @@ impl App {
     fn apply_develop_plan_ready(
         &mut self,
         operation_id: u64,
+        generation: u64,
         corrective: bool,
         result: Result<Box<FixApplyHandoff>, String>,
     ) {
-        if !self.is_active_develop_operation(operation_id) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
             return;
         }
         let Some(screen) = self.develop_pr.as_mut() else {
@@ -4389,15 +4509,20 @@ impl App {
     fn apply_develop_implement_ready(
         &mut self,
         operation_id: u64,
+        generation: u64,
         section: Option<usize>,
+        preexisting_paths: Vec<String>,
         result: Result<Box<FixApplyHandoff>, String>,
     ) {
-        if !self.is_active_develop_operation(operation_id) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
             return;
         }
         let Some(screen) = self.develop_pr.as_mut() else {
             return;
         };
+        screen.set_preexisting_paths(preexisting_paths);
         match result {
             Ok(handoff) => {
                 self.develop_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
@@ -5933,31 +6058,44 @@ impl App {
             AppEvent::BugkillRolledBack(result) => self.apply_bugkill_rolled_back(result, tx),
             AppEvent::DevelopPrepared {
                 operation_id,
+                generation,
                 result,
-            } => self.apply_develop_prepared(operation_id, result, tx),
+            } => self.apply_develop_prepared(operation_id, generation, result, tx),
             AppEvent::DevelopPlanReady {
                 operation_id,
+                generation,
                 corrective,
                 result,
-            } => self.apply_develop_plan_ready(operation_id, corrective, result),
+            } => self.apply_develop_plan_ready(operation_id, generation, corrective, result),
             AppEvent::DevelopImplementReady {
                 operation_id,
+                generation,
                 section,
+                preexisting_paths,
                 result,
-            } => self.apply_develop_implement_ready(operation_id, section, result),
+            } => self.apply_develop_implement_ready(
+                operation_id,
+                generation,
+                section,
+                preexisting_paths,
+                result,
+            ),
             AppEvent::DevelopFileRewritten {
                 operation_id,
+                generation,
                 revision,
                 result,
-            } => self.apply_develop_file_rewritten(operation_id, revision, result, tx),
+            } => self.apply_develop_file_rewritten(operation_id, generation, revision, result, tx),
             AppEvent::DevelopChecked {
                 operation_id,
+                generation,
                 outcome,
-            } => self.apply_develop_checked(operation_id, outcome, tx),
+            } => self.apply_develop_checked(operation_id, generation, outcome, tx),
             AppEvent::DevelopCommitted {
                 operation_id,
+                generation,
                 result,
-            } => self.apply_develop_committed(operation_id, result, tx),
+            } => self.apply_develop_committed(operation_id, generation, result, tx),
             AppEvent::BugkillFileWriteFailed(err) => self.show_toast(
                 ToastVariant::Warning,
                 format!("Could not write BUG_INVESTIGATION.md: {err}"),
@@ -8811,11 +8949,13 @@ fn kick_off_develop_preflight(
     config: DashboardConfig,
     worktree_path: String,
     operation_id: u64,
+    generation: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::DevelopPrepared {
             operation_id,
+            generation,
             result: Err("Could not resolve git root.".to_string()),
         });
         return;
@@ -8829,6 +8969,7 @@ fn kick_off_develop_preflight(
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopPrepared {
             operation_id,
+            generation,
             result,
         });
     });
@@ -8839,12 +8980,14 @@ fn kick_off_develop_prepare_plan(
     config: DashboardConfig,
     req: DevelopPreparePlanRequest,
     operation_id: u64,
+    generation: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let corrective = req.corrective;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::DevelopPlanReady {
             operation_id,
+            generation,
             corrective,
             result: Err("Could not resolve git root.".to_string()),
         });
@@ -8871,6 +9014,7 @@ fn kick_off_develop_prepare_plan(
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopPlanReady {
             operation_id,
+            generation,
             corrective,
             result,
         });
@@ -8894,19 +9038,28 @@ fn kick_off_develop_prepare_implement(
     config: DashboardConfig,
     req: DevelopPrepareImplementRequest,
     operation_id: u64,
+    generation: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let section = req.section;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::DevelopImplementReady {
             operation_id,
+            generation,
             section,
+            preexisting_paths: Vec::new(),
             result: Err("Could not resolve git root.".to_string()),
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
+        // Capture the baseline of dirty files before the run so the section
+        // commit can isolate this run's changes from pre-existing work.
+        let preexisting_paths = service
+            .develop_dirty_files(&req.worktree_path)
+            .await
+            .unwrap_or_default();
         let result = service
             .prepare_develop_implement(
                 &req.worktree_path,
@@ -8919,7 +9072,9 @@ fn kick_off_develop_prepare_implement(
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopImplementReady {
             operation_id,
+            generation,
             section,
+            preexisting_paths,
             result,
         });
     });
@@ -8933,11 +9088,13 @@ fn kick_off_develop_check(
     config: DashboardConfig,
     worktree_path: String,
     operation_id: u64,
+    generation: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::DevelopChecked {
             operation_id,
+            generation,
             outcome: DevelopCheckOutcome::Failed {
                 output: "Could not resolve git root.".to_string(),
             },
@@ -8949,6 +9106,7 @@ fn kick_off_develop_check(
         let outcome = service.develop_run_check(&worktree_path).await;
         let _ = tx.send(AppEvent::DevelopChecked {
             operation_id,
+            generation,
             outcome,
         });
     });
@@ -8961,12 +9119,15 @@ fn kick_off_develop_commit(
     config: DashboardConfig,
     worktree_path: String,
     subject: String,
+    preexisting_paths: Vec<String>,
     operation_id: u64,
+    generation: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::DevelopCommitted {
             operation_id,
+            generation,
             result: Err("Could not resolve git root.".to_string()),
         });
         return;
@@ -8974,11 +9135,12 @@ fn kick_off_develop_commit(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let result = service
-            .develop_commit_section(&worktree_path, &subject)
+            .develop_commit_section(&worktree_path, &subject, &preexisting_paths)
             .await
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopCommitted {
             operation_id,
+            generation,
             result,
         });
     });
@@ -8991,6 +9153,7 @@ fn kick_off_develop_file_write(write: DevelopFileWrite, tx: mpsc::UnboundedSende
             .map_err(|err| err.to_string());
         let _ = tx.send(AppEvent::DevelopFileRewritten {
             operation_id: write.operation_id,
+            generation: write.generation,
             revision: write.revision,
             result,
         });
@@ -11784,7 +11947,7 @@ mod tests {
             assert_eq!(screen.step(), DevelopStep::Verifying);
             assert_develop_check_requested(&mut rx, "cargo test").await;
 
-            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
             let screen = app.develop_pr.as_ref().unwrap();
             assert_eq!(
                 screen.plan().unwrap().notes,
@@ -11923,7 +12086,7 @@ mod tests {
             assert_eq!(screen.step(), DevelopStep::Verifying);
             assert_develop_check_requested(&mut rx, "cargo test").await;
 
-            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
             let screen = app.develop_pr.as_ref().expect("Develop screen");
             assert_eq!(
                 screen.plan().unwrap().notes,
@@ -12047,7 +12210,7 @@ mod tests {
 
         runtime.block_on(async {
             app.on_develop_implement_done("Implemented section 0.".into(), &tx);
-            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
 
             let screen = app.develop_pr.as_ref().expect("Develop screen");
             let step_after_pass = screen.step();
@@ -12057,7 +12220,7 @@ mod tests {
             // Deliver a delayed check result that belongs to the now-finalized
             // verification window. It must not mutate the current step or undo
             // the finalized section.
-            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
 
             let screen = app.develop_pr.as_ref().expect("Develop screen");
             assert_eq!(screen.step(), step_after_pass);
@@ -12081,7 +12244,7 @@ mod tests {
             assert_eq!(screen.step(), DevelopStep::Verifying);
             assert!(!screen.plan().unwrap().sections[0].done);
 
-            app.apply_develop_checked(1, DevelopCheckOutcome::Passed, &tx);
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
 
             let screen = app.develop_pr.as_ref().expect("Develop screen");
             assert!(screen.plan().unwrap().sections[0].done);

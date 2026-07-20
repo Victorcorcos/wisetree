@@ -34,6 +34,7 @@ use ratatui::widgets::{Cell as TableCell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use super::confirmation_modal::ConfirmationModal;
+use super::options_group::OptionsGroup;
 use crate::messages::colors;
 
 /// Rows reserved for the `ConfirmationModal` slot. Matches the footprint the
@@ -219,6 +220,9 @@ pub struct PrConfirmView<'a> {
     /// dropped so they take up no space.
     blocks: Vec<Vec<Line<'static>>>,
     ai_roles: Vec<AiRoleRow>,
+    /// Optional grouped checkbox options block (e.g. the Update PR Autonomous
+    /// toggle). Rendered after the AI roles table and before the modal.
+    options: Option<OptionsGroup>,
     modal: Option<&'a ConfirmationModal>,
 }
 
@@ -232,6 +236,7 @@ impl<'a> PrConfirmView<'a> {
             title_color: colors::BRAND,
             blocks: Vec::new(),
             ai_roles: Vec::new(),
+            options: None,
             modal: None,
         }
     }
@@ -266,6 +271,13 @@ impl<'a> PrConfirmView<'a> {
         self
     }
 
+    /// Attach a grouped checkbox options block rendered after the AI roles table
+    /// and before the confirmation modal. `None` drops the block entirely.
+    pub fn options(mut self, options: Option<OptionsGroup>) -> Self {
+        self.options = options;
+        self
+    }
+
     /// Attach the confirmation modal rendered at the bottom of the panel.
     pub fn modal(mut self, modal: Option<&'a ConfirmationModal>) -> Self {
         self.modal = modal;
@@ -293,6 +305,9 @@ impl<'a> PrConfirmView<'a> {
         if table > 0 {
             height = height.saturating_add(1 + table);
         }
+        if let Some(options) = self.options.as_ref() {
+            height = height.saturating_add(1 + options.content_height());
+        }
         if self.modal.is_some() {
             height = height.saturating_add(1 + MODAL_HEIGHT);
         }
@@ -311,6 +326,10 @@ impl<'a> PrConfirmView<'a> {
         if table_height > 0 {
             constraints.push(Constraint::Length(1)); // blank
             constraints.push(Constraint::Length(table_height));
+        }
+        if let Some(options) = self.options.as_ref() {
+            constraints.push(Constraint::Length(1)); // blank
+            constraints.push(Constraint::Length(options.content_height()));
         }
         if self.modal.is_some() {
             constraints.push(Constraint::Length(1)); // blank
@@ -342,6 +361,10 @@ impl<'a> PrConfirmView<'a> {
         }
         if table_height > 0 {
             self.render_ai_table(frame, chunks[idx + 1]);
+            idx += 2;
+        }
+        if let Some(options) = self.options.as_ref() {
+            options.render(frame, chunks[idx + 1]);
             idx += 2;
         }
         if let Some(modal) = self.modal {

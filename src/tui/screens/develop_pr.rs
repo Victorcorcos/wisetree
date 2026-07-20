@@ -216,6 +216,10 @@ pub struct DevelopPullRequestScreen {
     /// the run finishes and pushed to the notes ledger when the section is
     /// finalized (survives the Verifying / CheckFailed detour).
     pending_summary: Option<String>,
+    /// Paths that were already dirty before the current implement run started.
+    /// A section commit excludes these so it does not absorb pre-existing
+    /// worktree changes.
+    preexisting_paths: Vec<String>,
     step_before_error: Option<DevelopStep>,
     pub tick: usize,
 }
@@ -257,6 +261,7 @@ impl DevelopPullRequestScreen {
             plan_corrective: false,
             current_section: None,
             pending_summary: None,
+            preexisting_paths: Vec::new(),
             step_before_error: None,
             tick: 0,
         }
@@ -522,6 +527,14 @@ impl DevelopPullRequestScreen {
         self.pending_summary = summary;
     }
 
+    pub fn preexisting_paths(&self) -> &[String] {
+        &self.preexisting_paths
+    }
+
+    pub fn set_preexisting_paths(&mut self, paths: Vec<String>) {
+        self.preexisting_paths = paths;
+    }
+
     /// Enter the quiet Verifying spinner while the harness runs the check.
     pub fn start_verifying(&mut self) {
         let command = self.check_command.clone().unwrap_or_default();
@@ -604,23 +617,27 @@ impl DevelopPullRequestScreen {
         }
     }
 
-    /// Poll the embedded PTY for child exit and resize it. Returns `true`
-    /// exactly once — on the tick opencode exits.
-    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> bool {
+    /// Poll the embedded PTY for child exit and resize it. Returns `None`
+    /// while opencode is still running, and `Some(exit_code)` exactly once —
+    /// on the tick opencode exits. The caller routes non-zero exits to the
+    /// failure/recovery state instead of treating every completed PTY as
+    /// successful.
+    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> Option<i32> {
         let Some(pty) = self.pty.as_mut() else {
-            return false;
+            return None;
         };
         if let Some((rows, cols)) = panel_inner {
             pty.resize(rows, cols);
         }
         if pty.poll_exited() {
             if self.ai_done {
-                return false;
+                return None;
             }
             self.ai_done = true;
-            return true;
+            pty.exit_code()
+        } else {
+            None
         }
-        false
     }
 
     pub fn kill_pty(&mut self) {
