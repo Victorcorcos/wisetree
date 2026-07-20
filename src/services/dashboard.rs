@@ -7303,6 +7303,69 @@ mod tests {
     use super::*;
     use crate::services::develop::{render_plan_md, PlanSection};
 
+    #[test]
+    fn develop_plan_prompt_renders_first_run_with_unresolved_base() {
+        let prompt = build_develop_plan_prompt("Add dashboard filtering", None, None, None);
+
+        assert!(prompt.contains("Add dashboard filtering"));
+        assert!(prompt.contains("(none resolved)"));
+        assert!(!prompt.contains("TASK_DESCRIPTION"));
+        assert!(!prompt.contains("BASE_REF"));
+        assert!(!prompt.contains("PREVIOUS_PLAN"));
+        assert!(!prompt.contains("USER_FEEDBACK"));
+    }
+
+    #[test]
+    fn develop_plan_prompt_renders_revision_context() {
+        let prompt = build_develop_plan_prompt(
+            "Add dashboard filtering",
+            Some("origin/main"),
+            Some("## Section 1\nImplement the filter"),
+            Some("Keep the existing keyboard shortcut"),
+        );
+
+        assert!(prompt.contains("Add dashboard filtering"));
+        assert!(prompt.contains("origin/main"));
+        assert!(prompt.contains("## Section 1\nImplement the filter"));
+        assert!(prompt.contains("Keep the existing keyboard shortcut"));
+        assert!(!prompt.contains("TASK_DESCRIPTION"));
+        assert!(!prompt.contains("BASE_REF"));
+        assert!(!prompt.contains("PREVIOUS_PLAN"));
+        assert!(!prompt.contains("USER_FEEDBACK"));
+    }
+
+    #[test]
+    fn develop_plan_prompt_caps_multibyte_inputs() {
+        let oversized_task = "🦀".repeat(DEVELOP_TASK_MAX_BYTES);
+        let oversized_plan = "🦀".repeat(DEVELOP_PLAN_MAX_BYTES);
+        let oversized_feedback = "🦀".repeat(DEVELOP_FEEDBACK_MAX_BYTES);
+
+        let prompt = build_develop_plan_prompt(
+            &oversized_task,
+            Some("main"),
+            Some(&oversized_plan),
+            Some(&oversized_feedback),
+        );
+
+        let expected_task = truncate_bugkill_field(&oversized_task, DEVELOP_TASK_MAX_BYTES);
+        let expected_plan = truncate_bugkill_field(&oversized_plan, DEVELOP_PLAN_MAX_BYTES);
+        let expected_feedback =
+            truncate_bugkill_field(&oversized_feedback, DEVELOP_FEEDBACK_MAX_BYTES);
+
+        assert!(prompt.contains(&expected_task));
+        assert!(prompt.contains(&expected_plan));
+        assert!(prompt.contains(&expected_feedback));
+        assert!(!prompt.contains(&oversized_task));
+        assert!(!prompt.contains(&oversized_plan));
+        assert!(!prompt.contains(&oversized_feedback));
+        assert!(expected_task.is_char_boundary(expected_task.len()));
+        assert!(expected_plan.is_char_boundary(expected_plan.len()));
+        assert!(expected_feedback.is_char_boundary(expected_feedback.len()));
+        assert!(expected_task.len() <= DEVELOP_TASK_MAX_BYTES);
+        assert!(expected_plan.len() <= DEVELOP_PLAN_MAX_BYTES);
+        assert!(expected_feedback.len() <= DEVELOP_FEEDBACK_MAX_BYTES);
+    }
+
     // ── Review pipeline: diff split + findings parsing ─────────────────
 
     const SAMPLE_DIFF: &str = "\
