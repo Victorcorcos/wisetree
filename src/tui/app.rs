@@ -63,7 +63,7 @@ use crate::tui::screens::delete::{
 };
 use crate::tui::screens::develop_pr::{DevelopAction, DevelopPullRequestScreen, DevelopStep};
 use crate::tui::screens::enrich_pr::{EnrichAction, EnrichPullRequestScreen, EnrichStep};
-use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome};
+use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome, FixStep};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
 use crate::tui::screens::review_pr::{
@@ -492,7 +492,6 @@ pub struct App {
     /// enabled the Autonomous toggle, in which case a finished turn commits
     /// + replies automatically instead of waiting on the user's Enter.
     ///   `Some` only while an autonomous `Applying` step is live.
-    #[allow(dead_code)]
     fix_apply_watch: Option<OpencodeTurnWatcher>,
     /// Same idea for Update PR's (and "Update branch (locally)"'s) conflict-
     /// resolution TUI — marks the AI done automatically once opencode
@@ -788,15 +787,32 @@ impl App {
                             self.enrich_draft = None;
                         }
                     }
-                    // Same for the Fix PR apply PTY — a child exit means
-                    // opencode finished editing, so commit + reply now.
-                    let fix_exited = self
+                    // Same for the Fix PR apply PTY. In autonomous mode a
+                    // finished opencode turn (detected via the database) OR a
+                    // PTY exit commits the fix automatically; in manual mode
+                    // the user finalizes with Enter, so PTY exit is ignored.
+                    let fix_status = self
                         .fix_pr
                         .as_mut()
-                        .map(|screen| screen.tick_pty(None))
-                        .unwrap_or(false);
-                    if fix_exited {
-                        self.on_fix_apply_done(&tx);
+                        .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()))
+                        .unwrap_or((false, FixStep::Confirm, false));
+                    match fix_status {
+                        (true, FixStep::Applying, true) => {
+                            self.fix_apply_watch = None;
+                            self.on_fix_apply_done(&tx);
+                        }
+                        (false, FixStep::Applying, true) => {
+                            if let Some(turn) = self
+                                .fix_apply_watch
+                                .as_mut()
+                                .and_then(OpencodeTurnWatcher::poll)
+                            {
+                                self.on_fix_turn(turn, &tx);
+                            }
+                        }
+                        _ => {
+                            self.fix_apply_watch = None;
+                        }
                     }
                     // Same for the Bugkill PTYs. The Investigating TUI never
                     // exits on its own, so completion comes from the turn
@@ -878,6 +894,7 @@ impl App {
             || self.update_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.bugkill_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.develop_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.fix_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -2577,6 +2594,29 @@ impl App {
             },
             tx.clone(),
         );
+    }
+
+    /// Autonomous Fix apply: opencode's turn finished (or errored) in the
+    /// database. A finished turn commits + replies; a failed turn records the
+    /// error as a Failed row and advances to the next comment.
+    fn on_fix_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match turn {
+            OpencodeTurn::Working => {}
+            OpencodeTurn::Finished { .. } => {
+                self.fix_apply_watch = None;
+                self.on_fix_apply_done(tx);
+            }
+            OpencodeTurn::Failed { message } => {
+                self.fix_apply_watch = None;
+                if let Some(screen) = self.fix_pr.as_mut() {
+                    screen.record_outcome(FixRowOutcome::Failed(format!(
+                        "opencode reported an error: {}",
+                        truncate_error(&message)
+                    )));
+                }
+                self.advance_fix(tx);
+            }
+        }
     }
 
     // ── "Review Pull Request" orchestration ────────────────────────────
@@ -4552,6 +4592,9 @@ impl App {
             Ok(handoff) => {
                 let handoff = *handoff;
                 if let Some(s) = self.fix_pr.as_mut() {
+                    if s.autonomous() {
+                        self.fix_apply_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                    }
                     s.spawn_opencode_pty(
                         handoff.opencode_binary,
                         handoff.opencode_args,
@@ -11687,6 +11730,141 @@ mod tests {
             assert!(app.develop_pr.is_none());
             assert!(app.active_develop_operation_id.is_none());
             assert!(app.develop_watch.is_none());
+        });
+    }
+
+    // ── Develop plan parsing outcomes ───────────────────────────────────
+
+    fn app_with_active_develop_flow(
+        repo: &std::path::Path,
+    ) -> (
+        App,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let mut app = develop_app(repo);
+        app.develop_pr
+            .as_mut()
+            .unwrap()
+            .set_task_description("add csv export".to_string());
+        app.develop_pr.as_mut().unwrap().start_planning(false);
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        (app, tx, rx)
+    }
+
+    fn valid_develop_plan_transcript() -> String {
+        "==== TASK ====\n\
+        DESCRIPTION: Add CSV export\n\
+        COMPLEXITY: 5\n\
+        ==== END ====\n\
+        ==== SECTION ====\n\
+        NAME: Data model\n\
+        GOAL: Implement the data model.\n\
+        CRITERIA:\n\
+        - [ ] Define the CSV schema\n\
+        ==== END ====\n"
+            .to_string()
+    }
+
+    async fn assert_plan_write_requested(rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("plan write event should arrive")
+            .expect("channel should stay open");
+        match event {
+            AppEvent::DevelopFileRewritten { .. } => {}
+            _other => panic!("expected DevelopFileRewritten, got a different event"),
+        }
+    }
+
+    async fn assert_corrective_plan_requested(rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("corrective plan event should arrive")
+            .expect("channel should stay open");
+        match event {
+            AppEvent::DevelopPlanReady {
+                operation_id,
+                corrective,
+                ..
+            } => {
+                assert_eq!(operation_id, 1);
+                assert!(corrective);
+            }
+            _other => panic!("expected DevelopPlanReady, got a different event"),
+        }
+    }
+
+    #[test]
+    fn valid_develop_plan_enters_review_and_writes_plan() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let transcript = valid_develop_plan_transcript();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.finish_develop_plan(transcript, &tx);
+
+                let screen = app.develop_pr.as_ref().unwrap();
+                assert_eq!(screen.step(), DevelopStep::PlanReview);
+                assert!(screen.plan().is_some());
+                assert_plan_write_requested(&mut rx).await;
+            });
+        });
+    }
+
+    #[test]
+    fn first_invalid_develop_plan_starts_one_corrective_retry() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.finish_develop_plan("not a plan".to_string(), &tx);
+
+                let screen = app.develop_pr.as_ref().unwrap();
+                assert_eq!(screen.step(), DevelopStep::Working);
+                assert!(screen.plan().is_none());
+                assert_corrective_plan_requested(&mut rx).await;
+                assert!(rx.try_recv().is_err());
+            });
+        });
+    }
+
+    #[test]
+    fn second_invalid_develop_plan_surfaces_tail_without_retrying() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.finish_develop_plan("first invalid result".to_string(), &tx);
+                assert_corrective_plan_requested(&mut rx).await;
+
+                // Simulate the corrective retry entering the Planning step.
+                app.develop_pr.as_mut().unwrap().start_planning(true);
+
+                let transcript = format!("ignored prefix\n{}", "terminal transcript tail");
+                app.finish_develop_plan(transcript, &tx);
+
+                let screen = app.develop_pr.as_ref().unwrap();
+                assert!(screen
+                    .error()
+                    .is_some_and(|error| error.contains("terminal transcript tail")));
+                assert!(rx.try_recv().is_err());
+            });
         });
     }
 }
