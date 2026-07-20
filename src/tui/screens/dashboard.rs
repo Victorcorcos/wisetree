@@ -3558,6 +3558,18 @@ mod tests {
         }
     }
 
+    fn dashboard_row_with_pr(state: PrState, number: u64, title: &str) -> DashboardRow {
+        let mut pr = open_pr();
+        pr.state = state;
+        pr.number = number;
+        pr.title = title.to_string();
+        row(Some(pr), Some(branch_status(0, 0)))
+    }
+
+    fn dashboard_row_without_pr() -> DashboardRow {
+        row(None, Some(branch_status(0, 0)))
+    }
+
     fn pr_labels(row: &DashboardRow) -> Vec<String> {
         let screen = DashboardScreen::new(false, false, false, Vec::new(), Vec::new(), true);
         screen
@@ -3801,6 +3813,40 @@ mod tests {
         r.worktree.is_main = true;
         assert!(build_develop_request(&r).is_none());
         assert!(!pr_labels(&r).iter().any(|l| l == "Develop"));
+    }
+
+    #[test]
+    fn develop_request_includes_active_pr_metadata() {
+        for state in [PrState::Open, PrState::Draft] {
+            let row = dashboard_row_with_pr(state, 42, "Develop request title");
+
+            let request = build_develop_request(&row).expect("non-main worktree");
+
+            assert_eq!(request.number, Some(42));
+            assert_eq!(request.title.as_deref(), Some("Develop request title"));
+        }
+    }
+
+    #[test]
+    fn develop_request_omits_metadata_when_pr_is_absent() {
+        let row = dashboard_row_without_pr();
+
+        let request = build_develop_request(&row).expect("non-main worktree");
+
+        assert_eq!(request.number, None);
+        assert_eq!(request.title, None);
+    }
+
+    #[test]
+    fn develop_request_omits_terminal_pr_metadata() {
+        for state in [PrState::Closed, PrState::Merged] {
+            let row = dashboard_row_with_pr(state, 42, "Terminal PR");
+
+            let request = build_develop_request(&row).expect("non-main worktree");
+
+            assert_eq!(request.number, None);
+            assert_eq!(request.title, None);
+        }
     }
 
     #[test]
