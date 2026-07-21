@@ -45,7 +45,7 @@ enum ActionChoice {
     OpenWithCommand,
     CopyPath,
     OpenPullRequest,
-    EnrichPullRequest,
+    ExplainPullRequest,
     FixPullRequest,
     ReviewPullRequest,
     BugkillPullRequest,
@@ -117,13 +117,13 @@ pub struct ClosePullRequestRequest {
     pub worktree_path: String,
 }
 
-/// Payload the dashboard hands to the "Enrich Pull Request" screen. The AI
+/// Payload the dashboard hands to the "Explain Pull Request" screen. The AI
 /// drafts a title + description into `pull_request.md`; the harness then
 /// either creates a new PR (`number == None`) or updates the existing one
 /// (`number == Some`). `base_ref` is resolved by the app layer before the
 /// pipeline runs, exactly like `UpdatePullRequestRequest`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnrichPullRequestRequest {
+pub struct ExplainPullRequestRequest {
     pub branch: String,
     pub worktree_path: String,
     pub base_ref: Option<String>,
@@ -293,7 +293,7 @@ pub enum DashboardAction {
     /// Draft a PR title + description with the AI and open (or update) the
     /// pull request. Offered on any non-mother worktree that either has an
     /// open PR or has commits ahead of its base ref.
-    EnrichPullRequest(Box<EnrichPullRequestRequest>),
+    ExplainPullRequest(Box<ExplainPullRequestRequest>),
     /// Walk the PR's review comments and resolve each one interactively
     /// (plan → apply → commit → reply). Offered on a non-mother worktree
     /// whose PR is open or draft.
@@ -985,7 +985,7 @@ impl DashboardScreen {
     /// Build the "Pull Request Commands" buttons for `row`. Each button is
     /// gated by the same condition that previously guarded its menu entry,
     /// so the buttons and the dispatch stay in lockstep. The order matches
-    /// the lifecycle a PR moves through: Open, Enrich, Update, Push, Merge,
+    /// the lifecycle a PR moves through: Open, Explain, Update, Push, Merge,
     /// Close. Unavailable actions are simply omitted (no greyed-out
     /// buttons), so arrow navigation only ever lands on a valid action.
     fn build_pr_commands(&self, row: &DashboardRow) -> Vec<PrCommand> {
@@ -1006,12 +1006,12 @@ impl DashboardScreen {
                 color: colors::PRIMARY,
             });
         }
-        // Enrich drafts a title + description with the AI, then opens a new PR
+        // Explain drafts a title + description with the AI, then opens a new PR
         // (branch ahead, none yet) or refreshes an open/draft PR's description.
-        if build_enrich_request(row).is_some() {
+        if build_explain_request(row).is_some() {
             commands.push(PrCommand {
-                label: "Enrich",
-                choice: ActionChoice::EnrichPullRequest,
+                label: "Explain",
+                choice: ActionChoice::ExplainPullRequest,
                 color: colors::BRAND,
             });
         }
@@ -1128,7 +1128,7 @@ impl DashboardScreen {
     }
 
     /// Reopen the action menu for the worktree at `worktree_path`. Used when
-    /// a PR command screen (Merge/Update/Enrich/Fix/Bugkill) is cancelled —
+    /// a PR command screen (Merge/Update/Explain/Fix/Bugkill) is cancelled —
     /// Esc there should land back on the menu it was launched from rather
     /// than the bare table. Falls back to the plain table if the worktree
     /// is no longer present (e.g. it was deleted while the command screen
@@ -1249,7 +1249,7 @@ impl DashboardScreen {
             // exclusive, so 'u' covers whichever the row exposes.
             let shortcut_choices: &[ActionChoice] = match key.code {
                 KeyCode::Char('o') | KeyCode::Char('O') => &[ActionChoice::OpenPullRequest],
-                KeyCode::Char('e') | KeyCode::Char('E') => &[ActionChoice::EnrichPullRequest],
+                KeyCode::Char('e') | KeyCode::Char('E') => &[ActionChoice::ExplainPullRequest],
                 KeyCode::Char('f') | KeyCode::Char('F') => &[ActionChoice::FixPullRequest],
                 KeyCode::Char('r') | KeyCode::Char('R') => &[ActionChoice::ReviewPullRequest],
                 KeyCode::Char('b') | KeyCode::Char('B') => &[ActionChoice::BugkillPullRequest],
@@ -1319,7 +1319,7 @@ impl DashboardScreen {
         let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
         let merge_request = build_merge_request(row);
         let update_request = build_update_request(row);
-        let enrich_request = build_enrich_request(row);
+        let explain_request = build_explain_request(row);
         let fix_request = build_fix_request(row);
         let review_request = build_review_request(row);
         let bugkill_request = build_bugkill_request(row);
@@ -1357,10 +1357,10 @@ impl DashboardScreen {
                     .map(|request| DashboardAction::UpdatePullRequest(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
-            ActionChoice::EnrichPullRequest => {
+            ActionChoice::ExplainPullRequest => {
                 self.mode = DashboardMode::Table;
-                enrich_request
-                    .map(|request| DashboardAction::EnrichPullRequest(Box::new(request)))
+                explain_request
+                    .map(|request| DashboardAction::ExplainPullRequest(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
             ActionChoice::FixPullRequest => {
@@ -3004,7 +3004,7 @@ pub(crate) fn row_has_unpushed(row: &DashboardRow) -> bool {
 }
 
 /// True for PR states that still accept the non-merge lifecycle commands
-/// (Enrich / Update / Push / Close). Open and Draft both qualify; Merged and
+/// (Explain / Update / Push / Close). Open and Draft both qualify; Merged and
 /// Closed are terminal. Merge stays Open-only (see [`build_merge_request`])
 /// because GitHub refuses to merge a draft until it's marked ready.
 fn pr_accepts_lifecycle_commands(state: PrState) -> bool {
@@ -3049,13 +3049,13 @@ fn build_update_request(row: &DashboardRow) -> Option<UpdatePullRequestRequest> 
     })
 }
 
-/// Assemble the payload the "Enrich Pull Request" screen needs. Returns
+/// Assemble the payload the "Explain Pull Request" screen needs. Returns
 /// `None` (so the menu entry is hidden) on the mother worktree, or on a
 /// worktree that has neither an open PR to refresh nor any commits ahead
 /// of its base to describe. When an open PR exists the draft updates it
 /// (`number = Some`); otherwise a branch that is ahead opens a new one
 /// (`number = None`).
-fn build_enrich_request(row: &DashboardRow) -> Option<EnrichPullRequestRequest> {
+fn build_explain_request(row: &DashboardRow) -> Option<ExplainPullRequestRequest> {
     // The mother worktree never owns a PR of its own.
     if row.worktree.is_main {
         return None;
@@ -3064,7 +3064,7 @@ fn build_enrich_request(row: &DashboardRow) -> Option<EnrichPullRequestRequest> 
     let worktree_path = row.worktree.path.clone();
     match row.pull_request.as_ref() {
         // Open or draft PR → refresh its description.
-        Some(pr) if pr_accepts_lifecycle_commands(pr.state) => Some(EnrichPullRequestRequest {
+        Some(pr) if pr_accepts_lifecycle_commands(pr.state) => Some(ExplainPullRequestRequest {
             branch,
             worktree_path,
             base_ref: None,
@@ -3087,7 +3087,7 @@ fn build_enrich_request(row: &DashboardRow) -> Option<EnrichPullRequestRequest> 
             if ahead == 0 {
                 return None;
             }
-            Some(EnrichPullRequestRequest {
+            Some(ExplainPullRequestRequest {
                 branch,
                 worktree_path,
                 base_ref: None,
@@ -3696,7 +3696,7 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Enrich", "Fix", "Review", "Bugkill", "Upload", "Merge", "Close"]
+            vec!["Open", "Explain", "Fix", "Review", "Bugkill", "Upload", "Merge", "Close"]
         );
     }
 
@@ -3705,7 +3705,7 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(1, 3)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Enrich", "Fix", "Review", "Bugkill", "Update", "Merge", "Close"]
+            vec!["Open", "Explain", "Fix", "Review", "Bugkill", "Update", "Merge", "Close"]
         );
     }
 
@@ -3808,12 +3808,12 @@ mod tests {
     }
 
     #[test]
-    fn e_shortcut_dispatches_enrich_action() {
+    fn e_shortcut_dispatches_explain_action() {
         let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
         screen.handle_key(key_event(KeyCode::Enter));
         screen.handle_key(key_event(KeyCode::Tab));
         let action = screen.handle_key(key_event(KeyCode::Char('e')));
-        assert!(matches!(action, DashboardAction::EnrichPullRequest(_)));
+        assert!(matches!(action, DashboardAction::ExplainPullRequest(_)));
         assert!(screen.pr_commands.is_empty());
     }
 
@@ -3841,14 +3841,14 @@ mod tests {
 
     #[test]
     fn reopen_action_menu_for_worktree_restores_the_action_menu() {
-        // Launching a PR command (e.g. Enrich) resets the menu and drops the
+        // Launching a PR command (e.g. Explain) resets the menu and drops the
         // dashboard into Table mode. Cancelling that command should be able
         // to restore the exact menu state Esc is expected to land back on.
         let mut screen = screen_with_row(row(Some(open_pr()), Some(branch_status(3, 0))));
         screen.handle_key(key_event(KeyCode::Enter));
         screen.handle_key(key_event(KeyCode::Tab));
         let action = screen.handle_key(key_event(KeyCode::Char('e')));
-        assert!(matches!(action, DashboardAction::EnrichPullRequest(_)));
+        assert!(matches!(action, DashboardAction::ExplainPullRequest(_)));
         assert!(matches!(screen.mode, DashboardMode::Table));
         assert!(screen.pr_commands.is_empty());
 

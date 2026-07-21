@@ -72,7 +72,7 @@ fn sh_quote(path: &Path) -> String {
 fn blank_ai() -> wisetree::config::schema::AiConfig {
     use wisetree::config::schema::{AiBugkillConfig, AiConfig, AiFixConfig, AiModelConfig};
     AiConfig {
-        enrich: AiModelConfig::default(),
+        explain: AiModelConfig::default(),
         fix: AiFixConfig {
             plan: AiModelConfig::default(),
             apply: AiModelConfig::default(),
