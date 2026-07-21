@@ -220,8 +220,9 @@ pub struct PrConfirmView<'a> {
     /// dropped so they take up no space.
     blocks: Vec<Vec<Line<'static>>>,
     ai_roles: Vec<AiRoleRow>,
-    /// Optional grouped checkbox options block (e.g. the Update PR Autonomous
-    /// toggle). Rendered after the AI roles table and before the modal.
+    /// Optional grouped checkbox options block (e.g. the Develop PR options or
+    /// Fix PR Autonomous toggle). Rendered after the AI roles table and before
+    /// the modal.
     options: Option<OptionsGroup>,
     modal: Option<&'a ConfirmationModal>,
 }

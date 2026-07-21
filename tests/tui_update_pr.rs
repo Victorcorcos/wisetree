@@ -249,7 +249,7 @@ async fn pipeline_returns_already_up_to_date_when_branch_matches_base() {
     let service = fx.ai_service().with_opencode_binary(stub);
 
     let outcome = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
         .await
         .expect("update should succeed");
 
@@ -269,7 +269,7 @@ async fn pipeline_returns_merged_cleanly_when_no_conflicts() {
     let service = fx.ai_service().with_opencode_binary(stub);
 
     let outcome = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
         .await
         .expect("update should succeed");
 
@@ -298,7 +298,7 @@ async fn pipeline_returns_conflicts_require_ai_when_ai_model_is_blank() {
     let service = fx.service();
 
     let outcome = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
         .await
         .expect("update should succeed");
 
@@ -334,7 +334,7 @@ async fn pipeline_returns_ai_unavailable_when_opencode_binary_is_missing() {
     let service = fx.ai_service().with_opencode_binary(nope);
 
     let outcome = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
         .await
         .expect("update should succeed");
 
@@ -374,7 +374,7 @@ async fn pipeline_hands_off_to_ui_when_conflicts_detected_and_opencode_available
     let service = fx.ai_service().with_opencode_binary(stub.clone());
 
     let outcome = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
         .await
         .expect("update should succeed");
 
@@ -437,6 +437,40 @@ async fn pipeline_hands_off_to_ui_when_conflicts_detected_and_opencode_available
 }
 
 #[tokio::test]
+async fn pipeline_hands_off_non_autonomous_prompt_instructs_ai_to_ask() {
+    let fx = Fixture::new();
+    fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
+    git(&fx.src, &["add", "README.md"]);
+    git(&fx.src, &["commit", "-q", "-m", "feat edit"]);
+    git(&fx.src, &["push", "-q", "origin", "feat"]);
+    fx.advance_main("README.md", "main side\n");
+
+    let stub = fx.write_resolved_readme_stub();
+    let service = fx.ai_service().with_opencode_binary(stub);
+
+    let outcome = service
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", false)
+        .await
+        .expect("update should succeed");
+
+    match outcome {
+        UpdatePullRequestOutcome::ConflictsHandedOffToUi { opencode_args, .. } => {
+            assert_eq!(opencode_args[0], "--prompt");
+            let prompt = &opencode_args[1];
+            assert!(
+                prompt.contains("Clarification mode"),
+                "non-autonomous prompt should mention Clarification mode, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains("ask the user for clarification"),
+                "non-autonomous prompt should instruct the AI to ask, got:\n{prompt}"
+            );
+        }
+        other => panic!("expected ConflictsHandedOffToUi, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn commit_and_push_ai_merge_pushes_and_returns_merged_with_ai_resolution() {
     let fx = Fixture::new();
     fs::write(fx.src.join("README.md"), "feat side\n").unwrap();
@@ -452,7 +486,7 @@ async fn commit_and_push_ai_merge_pushes_and_returns_merged_with_ai_resolution()
     // opencode itself — it returns `ConflictsHandedOffToUi` and the UI
     // takes over.
     let _initial = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
         .await
         .expect("update should succeed");
 
@@ -496,7 +530,7 @@ async fn abort_ai_merge_resets_to_pre_merge_state() {
     let stub = fx.write_resolved_readme_stub();
     let service = fx.ai_service().with_opencode_binary(stub);
     let _initial = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
         .await
         .expect("update should succeed");
 
@@ -542,7 +576,7 @@ async fn pipeline_returns_push_failed_when_remote_is_unwritable() {
 
     let service = fx.ai_service().with_opencode_binary(stub);
     let outcome = service
-        .update_pull_request(fx.src.to_str().unwrap(), "origin/main")
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
         .await
         .expect("update should not panic");
 

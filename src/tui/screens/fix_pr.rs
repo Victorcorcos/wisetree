@@ -133,9 +133,10 @@ pub struct FixPullRequestScreen {
     /// panel's "which AIs run" table.
     ai: AiFixConfig,
     /// The Autonomous toggle on the Confirm page (Space flips ☒/☐). When ☒
-    /// the App watches opencode's database and commits each fix the moment
-    /// its turn finishes; when ☐ (default) the user finalizes each apply with
-    /// Enter, exactly as before.
+    /// the App auto-approves each fix plan (no Apply/Other/Skip prompt) and
+    /// watches opencode's database to commit each fix the moment its turn
+    /// finishes; when ☐ (default) the user drives every decision by hand,
+    /// exactly as before.
     autonomous: bool,
     confirm: Option<ConfirmationModal>,
     phase_message: String,
@@ -225,9 +226,10 @@ impl FixPullRequestScreen {
     pub fn repo(&self) -> &str {
         &self.repo
     }
-    /// Whether the Autonomous toggle is on — the App reads this when it spawns
-    /// the apply PTY to decide between watching opencode's turn (☒) and waiting
-    /// for the user's Enter + finalize confirm (☐).
+    /// Whether the Autonomous toggle is on. The App reads this to auto-approve
+    /// each fix plan and to decide, when it spawns the apply PTY, between
+    /// watching opencode's turn (☒) and waiting for the user's Enter + finalize
+    /// confirm (☐).
     pub fn autonomous(&self) -> bool {
         self.autonomous
     }
@@ -877,9 +879,9 @@ impl FixPullRequestScreen {
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
         let description = if self.autonomous {
-            "wisetree detects when opencode finishes each fix and commits it automatically"
+            "wisetree approves each fix and commits it when opencode finishes — no prompts"
         } else {
-            "you press Enter in the opencode panel to finalize each fix (or keep chatting first)"
+            "you choose Apply / Other / Skip per comment and finalize each fix with Enter"
         };
         PrConfirmView::new(format!(
             "Fix review comments on Pull Request #{}?",
@@ -1736,13 +1738,10 @@ mod tests {
     #[test]
     fn confirm_renders_autonomous_toggle_default_unchecked() {
         let mut screen = FixPullRequestScreen::new(request(), test_ai());
-        let dump = render_dump(&mut screen, 110, 34);
+        let dump = render_dump(&mut screen, 110, 40);
         assert!(dump.contains("Autonomous"), "{dump}");
         assert!(dump.contains("☐"), "{dump}");
-        assert!(
-            dump.contains("you press Enter in the opencode panel"),
-            "{dump}"
-        );
+        assert!(dump.contains("you choose Apply / Other / Skip"), "{dump}");
         assert!(dump.contains("Space"), "{dump}");
         assert!(dump.contains("Toggle"), "{dump}");
     }
@@ -1756,10 +1755,10 @@ mod tests {
             FixAction::Continue
         );
         assert!(screen.autonomous());
-        let dump = render_dump(&mut screen, 110, 34);
+        let dump = render_dump(&mut screen, 110, 40);
         assert!(dump.contains("☒"), "{dump}");
         assert!(
-            dump.contains("wisetree detects when opencode finishes"),
+            dump.contains("wisetree approves each fix and commits it"),
             "{dump}"
         );
         // Toggling again returns to manual.

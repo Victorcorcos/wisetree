@@ -500,10 +500,10 @@ pub struct App {
     /// to Review once opencode finishes writing `pull_request.md`. `Some`
     /// only while the `Enriching` step is active.
     enrich_draft: Option<OpencodeTurnWatcher>,
-    /// Same idea for the Fix screen's apply TUI — only set when the user
-    /// enabled the Autonomous toggle, in which case a finished turn commits
-    /// + replies automatically instead of waiting on the user's Enter.
-    ///   `Some` only while an autonomous `Applying` step is live.
+    /// Same idea for the Fix screen's apply TUI in Autonomous mode — commits
+    /// each fix + replies the moment opencode's turn finishes, so the user
+    /// never has to press Enter. `Some` only while an autonomous `Applying`
+    /// step is live.
     fix_apply_watch: Option<OpencodeTurnWatcher>,
     /// Same idea for Update PR's (and "Update branch (locally)"'s) conflict-
     /// resolution TUI — marks the AI done automatically once opencode
@@ -802,20 +802,19 @@ impl App {
                         }
                     }
                     // Same for the Fix PR apply PTY. In autonomous mode a
-                    // finished opencode turn (detected via the database) OR a
+                    // finished opencode turn (detected via the database) or a
                     // PTY exit commits the fix automatically; in manual mode
                     // the user finalizes with Enter, so PTY exit is ignored.
                     let fix_status = self
                         .fix_pr
                         .as_mut()
-                        .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()))
-                        .unwrap_or((false, FixStep::Confirm, false));
+                        .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()));
                     match fix_status {
-                        (true, FixStep::Applying, true) => {
+                        Some((true, FixStep::Applying, true)) => {
                             self.fix_apply_watch = None;
                             self.on_fix_apply_done(&tx);
                         }
-                        (false, FixStep::Applying, true) => {
+                        Some((false, FixStep::Applying, true)) => {
                             if let Some(turn) = self
                                 .fix_apply_watch
                                 .as_mut()
@@ -4706,8 +4705,16 @@ impl App {
                 );
             }
             Ok(FixVerdict::Fix(plan)) => {
+                let autonomous = self.fix_pr.as_ref().is_some_and(|s| s.autonomous());
                 if let Some(s) = self.fix_pr.as_mut() {
                     s.show_decision(plan);
+                }
+                // Autonomous mode approves the plan for the user: apply it now
+                // instead of pausing on the Apply / Other / Skip page. This is
+                // exactly the path `FixAction::Apply` drives when the user picks
+                // Apply by hand, so the rest of the loop is unchanged.
+                if autonomous {
+                    self.apply_fix_action(FixAction::Apply, tx);
                 }
             }
             Err(msg) => {
@@ -4756,6 +4763,9 @@ impl App {
             Ok(handoff) => {
                 let handoff = *handoff;
                 if let Some(s) = self.fix_pr.as_mut() {
+                    // In Autonomous mode, watch opencode's database so the
+                    // finished turn commits the fix automatically; manual mode
+                    // waits for the user's Enter + finalize confirm instead.
                     if s.autonomous() {
                         self.fix_apply_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
                     }
@@ -6223,6 +6233,9 @@ impl App {
             behind: 0,
             base_ref: Some(base_ref),
             pr_base_ref: None,
+            // The local-conflict tail skips the confirm screen, so it cannot
+            // expose the autonomous toggle; keep the default behavior.
+            autonomous: true,
         };
         let ai = self.current_dashboard_config().ai.update.clone();
         let mut screen = UpdatePullRequestScreen::new_local_conflict(request, ai);
@@ -9276,7 +9289,12 @@ fn kick_off_update_pull_request(
         });
 
         let result = service
-            .update_pull_request_with_progress(&request.worktree_path, &base_ref, Some(progress_tx))
+            .update_pull_request_with_progress(
+                &request.worktree_path,
+                &base_ref,
+                request.autonomous,
+                Some(progress_tx),
+            )
             .await;
         // Drop the progress sender (the service already did, but be
         // explicit) and wait for the forwarder to drain before emitting
