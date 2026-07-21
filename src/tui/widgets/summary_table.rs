@@ -1,6 +1,6 @@
 //! Summary table widget: a bordered table showing commands that ran, their
 //! success/failure status, and an optional failure reason. Used on any "Done"
-//! page that finishes a multi-command pipeline (create worktree, enrich PR, …).
+//! page that finishes a multi-command pipeline (create worktree, explain PR, …).
 
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Modifier, Style};

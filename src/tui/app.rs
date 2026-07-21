@@ -39,11 +39,11 @@ use crate::services::{
     parse_pull_request_md, resolve_dashboard_columns, AiStatus, AttemptChanges, BugHypothesis,
     BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
     CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
-    DashboardWatch, EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff,
-    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
-    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
-    ReviewPreparation, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase,
-    UpdateProgress, UpdateSource,
+    DashboardWatch, ExplainPreparation, ExplainSubmitOutcome, ExplainSubmitRequest,
+    FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult,
+    MultiSourceUpdateResult, OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile,
+    ReviewFinding, ReviewPreparation, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -54,13 +54,13 @@ use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BugkillRequest, BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
-    EnrichPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
+    ExplainPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
     ReviewPullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
 };
-use crate::tui::screens::enrich_pr::{EnrichAction, EnrichPullRequestScreen, EnrichStep};
+use crate::tui::screens::explain_pr::{ExplainAction, ExplainPullRequestScreen, ExplainStep};
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome, FixStep};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
@@ -152,18 +152,18 @@ enum AppEvent {
     },
     UpdatePrFinished(Result<UpdatePrSuccess, UpdatePrFailure>),
     UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
-    /// Base ref resolved for the "Enrich Pull Request" flow.
-    EnrichPrBaseRefResolved {
+    /// Base ref resolved for the "Explain Pull Request" flow.
+    ExplainPrBaseRefResolved {
         base_ref: Option<String>,
     },
     /// Read-only preparation finished — either the opencode spawn params
     /// (`HandedOffToUi`) or a terminal non-handoff variant.
-    EnrichPrPrepared(Result<Box<EnrichPreparation>, String>),
+    ExplainPrPrepared(Result<Box<ExplainPreparation>, String>),
     /// The drafted PR was submitted (created or updated).
-    EnrichPrSubmitted(Result<EnrichSubmitOutcome, String>),
+    ExplainPrSubmitted(Result<ExplainSubmitOutcome, String>),
     /// A line of terminal output from the git push / gh pr create pipeline.
     /// Routed into the Terminal Activity panel under the Opening step.
-    EnrichPrActivity {
+    ExplainPrActivity {
         text: String,
         kind: crate::files::ActivityKind,
     },
@@ -420,7 +420,7 @@ pub struct App {
     setup_project: Option<SetupProjectScreen>,
     merge_pr: Option<MergePullRequestScreen>,
     update_pr: Option<UpdatePullRequestScreen>,
-    enrich_pr: Option<EnrichPullRequestScreen>,
+    explain_pr: Option<ExplainPullRequestScreen>,
     fix_pr: Option<FixPullRequestScreen>,
     review_pr: Option<ReviewPullRequestScreen>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
@@ -428,10 +428,10 @@ pub struct App {
     /// turn to complete — the TUI never exits on its own, so this is what
     /// advances the `Investigating` step. `Some` only while investigating.
     bugkill_investigation: Option<OpencodeTurnWatcher>,
-    /// Same idea for the Enrich screen's drafting TUI — advances straight
+    /// Same idea for the Explain screen's drafting TUI — advances straight
     /// to Review once opencode finishes writing `pull_request.md`. `Some`
-    /// only while the `Enriching` step is active.
-    enrich_draft: Option<OpencodeTurnWatcher>,
+    /// only while the `Explaining` step is active.
+    explain_draft: Option<OpencodeTurnWatcher>,
     /// Same idea for the Fix screen's apply TUI in Autonomous mode — commits
     /// each fix + replies the moment opencode's turn finishes, so the user
     /// never has to press Enter. `Some` only while an autonomous `Applying`
@@ -551,12 +551,12 @@ impl App {
             setup_project: None,
             merge_pr: None,
             update_pr: None,
-            enrich_pr: None,
+            explain_pr: None,
             fix_pr: None,
             review_pr: None,
             bugkill_pr: None,
             bugkill_investigation: None,
-            enrich_draft: None,
+            explain_draft: None,
             fix_apply_watch: None,
             update_conflict: None,
             update_branch: None,
@@ -696,32 +696,32 @@ impl App {
                     if self.update_all.is_some() {
                         self.on_update_all_tick(&tx);
                     }
-                    // Same for the Enrich PR PTY — but here a child exit means
+                    // Same for the Explain PR PTY — but here a child exit means
                     // opencode finished drafting `pull_request.md`, so read
-                    // the file and flip the screen into Review. The Enriching
+                    // the file and flip the screen into Review. The Explaining
                     // TUI also never exits on its own, so the turn watcher is
                     // the primary completion signal; PTY exit remains a
                     // fallback for a user who quits opencode manually.
-                    let enrich_status = self
-                        .enrich_pr
+                    let explain_status = self
+                        .explain_pr
                         .as_mut()
-                        .map(|screen| (screen.tick_pty(None), screen.is_enriching()));
-                    match enrich_status {
+                        .map(|screen| (screen.tick_pty(None), screen.is_explaining()));
+                    match explain_status {
                         Some((true, _)) => {
-                            self.enrich_draft = None;
-                            self.on_enrich_ready_to_review(&tx);
+                            self.explain_draft = None;
+                            self.on_explain_ready_to_review(&tx);
                         }
                         Some((false, true)) => {
                             if let Some(turn) = self
-                                .enrich_draft
+                                .explain_draft
                                 .as_mut()
                                 .and_then(OpencodeTurnWatcher::poll)
                             {
-                                self.on_enrich_turn(turn, &tx);
+                                self.on_explain_turn(turn, &tx);
                             }
                         }
                         Some((false, false)) | None => {
-                            self.enrich_draft = None;
+                            self.explain_draft = None;
                         }
                     }
                     // Same for the Fix PR apply PTY — a child exit means
@@ -729,7 +729,7 @@ impl App {
                     // and autonomous alike). In Autonomous mode a finished
                     // opencode turn (detected via the database) also commits
                     // the fix, so wisetree advances without the user pressing
-                    // Enter — exactly how Enrich auto-advances on its turn.
+                    // Enter — exactly how Explain auto-advances on its turn.
                     let fix_status = self
                         .fix_pr
                         .as_mut()
@@ -802,7 +802,7 @@ impl App {
     /// Whether any screen currently embeds a live opencode PTY. Used to
     /// detect the teardown edge that requires a full terminal repaint.
     fn pty_active(&self) -> bool {
-        self.enrich_pr.as_ref().is_some_and(|s| s.has_pty())
+        self.explain_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.update_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.bugkill_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.fix_pr.as_ref().is_some_and(|s| s.has_pty())
@@ -1044,26 +1044,26 @@ impl App {
                     update_pr.render(frame, panel);
                 }
             }
-            Screen::EnrichPullRequest => {
-                // The Enriching step (live opencode PTY), the Confirm
+            Screen::ExplainPullRequest => {
+                // The Explaining step (live opencode PTY), the Confirm
                 // explanation, and Opening's live Terminal Activity all want
                 // the full bottom region. Loading / Review stay compact.
-                let expand = self.enrich_pr.as_ref().is_some_and(|s| {
-                    s.is_enriching()
-                        || matches!(s.step(), EnrichStep::Confirm | EnrichStep::Opening)
+                let expand = self.explain_pr.as_ref().is_some_and(|s| {
+                    s.is_explaining()
+                        || matches!(s.step(), ExplainStep::Confirm | ExplainStep::Opening)
                 });
                 let panel = if expand {
                     self.render_framed_panel_fill(frame, area)
                 } else {
                     let h = self
-                        .enrich_pr
+                        .explain_pr
                         .as_ref()
                         .map_or(8, |s| s.preferred_content_height());
                     self.render_framed_panel(frame, area, h)
                 };
-                if let Some(enrich_pr) = self.enrich_pr.as_mut() {
-                    enrich_pr.tick = self.tick;
-                    enrich_pr.render(frame, panel);
+                if let Some(explain_pr) = self.explain_pr.as_mut() {
+                    explain_pr.tick = self.tick;
+                    explain_pr.render(frame, panel);
                 }
             }
             Screen::FixPullRequest => {
@@ -1280,8 +1280,8 @@ impl App {
                     };
                 }
             }
-            Screen::EnrichPullRequest => {
-                if let Some(screen) = self.enrich_pr.as_mut() {
+            Screen::ExplainPullRequest => {
+                if let Some(screen) = self.explain_pr.as_mut() {
                     match direction {
                         ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
                         ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
@@ -1326,8 +1326,8 @@ impl App {
                 .update_pr
                 .as_mut()
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
-            Screen::EnrichPullRequest => self
-                .enrich_pr
+            Screen::ExplainPullRequest => self
+                .explain_pr
                 .as_mut()
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             Screen::FixPullRequest => self
@@ -1464,7 +1464,7 @@ impl App {
             Screen::SetupProject => self.handle_setup_project_key(key, tx),
             Screen::MergePullRequest => self.handle_merge_pr_key(key, tx),
             Screen::UpdatePullRequest => self.handle_update_pr_key(key, tx),
-            Screen::EnrichPullRequest => self.handle_enrich_pr_key(key, tx),
+            Screen::ExplainPullRequest => self.handle_explain_pr_key(key, tx),
             Screen::FixPullRequest => self.handle_fix_pr_key(key, tx),
             Screen::ReviewPullRequest => self.handle_review_pr_key(key, tx),
             Screen::BugkillPullRequest => self.handle_bugkill_key(key, tx),
@@ -1853,13 +1853,13 @@ impl App {
                     UpdateAction::TerminalDiscard => self.terminal_discard(tx),
                 }
             }
-            Screen::EnrichPullRequest => {
+            Screen::ExplainPullRequest => {
                 let action = self
-                    .enrich_pr
+                    .explain_pr
                     .as_mut()
                     .map(|screen| screen.handle_mouse_click(position))
-                    .unwrap_or(EnrichAction::Continue);
-                self.apply_enrich_action(action, tx);
+                    .unwrap_or(ExplainAction::Continue);
+                self.apply_explain_action(action, tx);
             }
             Screen::FixPullRequest => {
                 let action = self
@@ -2144,52 +2144,56 @@ impl App {
         }
     }
 
-    fn handle_enrich_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
-        let action = match self.enrich_pr.as_mut() {
+    fn handle_explain_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.explain_pr.as_mut() {
             Some(screen) => screen.handle_key(key),
             None => return,
         };
-        self.apply_enrich_action(action, tx);
+        self.apply_explain_action(action, tx);
     }
 
-    /// Single handler for `EnrichAction`s arriving from either keyboard or
+    /// Single handler for `ExplainAction`s arriving from either keyboard or
     /// mouse. Drives the screen transitions and kicks off the async pipeline
     /// stages (prepare → spawn opencode → submit).
-    fn apply_enrich_action(&mut self, action: EnrichAction, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn apply_explain_action(
+        &mut self,
+        action: ExplainAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
         match action {
-            EnrichAction::Continue => {}
-            EnrichAction::Cancelled => {
+            ExplainAction::Continue => {}
+            ExplainAction::Cancelled => {
                 let worktree_path = self
-                    .enrich_pr
+                    .explain_pr
                     .take()
                     .map(|s| s.request().worktree_path.clone());
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
-            EnrichAction::Confirmed => {
-                let Some(screen) = self.enrich_pr.as_mut() else {
+            ExplainAction::Confirmed => {
+                let Some(screen) = self.explain_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
-                screen.start_enriching();
-                kick_off_prepare_enrich(
+                screen.start_explaining();
+                kick_off_prepare_explain(
                     self.git_root.clone(),
                     self.current_dashboard_config(),
                     request,
                     tx.clone(),
                 );
             }
-            EnrichAction::ReadyToReview => self.on_enrich_ready_to_review(tx),
-            EnrichAction::Submit => {
-                let Some(screen) = self.enrich_pr.as_mut() else {
+            ExplainAction::ReadyToReview => self.on_explain_ready_to_review(tx),
+            ExplainAction::Submit => {
+                let Some(screen) = self.explain_pr.as_mut() else {
                     return;
                 };
                 let request = screen.request().clone();
                 let Some(title) = screen.draft_title().map(str::to_string) else {
-                    self.enrich_pr = None;
+                    self.explain_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
                     return;
                 };
-                let submit = EnrichSubmitRequest {
+                let submit = ExplainSubmitRequest {
                     worktree_path: request.worktree_path.clone(),
                     branch: request.branch.clone(),
                     number: request.number,
@@ -2208,16 +2212,16 @@ impl App {
                     tx.clone(),
                 );
             }
-            EnrichAction::Finish => {
+            ExplainAction::Finish => {
                 self.show_toast(
                     ToastVariant::Info,
                     "Draft saved to pull_request.md — no pull request was opened.".to_string(),
                 );
-                self.enrich_pr = None;
+                self.explain_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
-            EnrichAction::Done => {
-                self.enrich_pr = None;
+            ExplainAction::Done => {
+                self.explain_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
         }
@@ -2226,8 +2230,8 @@ impl App {
     /// opencode finished drafting: read `pull_request.md` from the worktree,
     /// parse the title + body, and move the screen into Review. A missing or
     /// empty file surfaces an error (the AI likely didn't finish).
-    fn on_enrich_ready_to_review(&mut self, _tx: &mpsc::UnboundedSender<AppEvent>) {
-        let Some(screen) = self.enrich_pr.as_mut() else {
+    fn on_explain_ready_to_review(&mut self, _tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.explain_pr.as_mut() else {
             return;
         };
         let path = PathBuf::from(&screen.request().worktree_path).join("pull_request.md");
@@ -2246,22 +2250,22 @@ impl App {
         }
     }
 
-    /// The Enrich turn watcher fired — advance exactly like a PTY exit
+    /// The Explain turn watcher fired — advance exactly like a PTY exit
     /// would (reading `pull_request.md` off disk), just without requiring
     /// the user to quit opencode or confirm the draft is ready themselves.
     /// Clears the watcher immediately on a terminal outcome — `set_error`
-    /// does not change the screen's step, so the tick loop's `is_enriching`
+    /// does not change the screen's step, so the tick loop's `is_explaining`
     /// gate alone would keep re-polling (and re-erroring) every second.
-    fn on_enrich_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn on_explain_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
             OpencodeTurn::Working => {}
             OpencodeTurn::Finished { .. } => {
-                self.enrich_draft = None;
-                self.on_enrich_ready_to_review(tx);
+                self.explain_draft = None;
+                self.on_explain_ready_to_review(tx);
             }
             OpencodeTurn::Failed { message } => {
-                self.enrich_draft = None;
-                if let Some(screen) = self.enrich_pr.as_mut() {
+                self.explain_draft = None;
+                if let Some(screen) = self.explain_pr.as_mut() {
                     screen.set_error(format!("opencode reported an error: {message}"));
                 }
             }
@@ -3991,8 +3995,8 @@ impl App {
             DashboardAction::UpdatePullRequest(request) => {
                 self.start_update_pr_flow(*request, tx);
             }
-            DashboardAction::EnrichPullRequest(request) => {
-                self.start_enrich_pr_flow(*request, tx);
+            DashboardAction::ExplainPullRequest(request) => {
+                self.start_explain_pr_flow(*request, tx);
             }
             DashboardAction::FixPullRequest(request) => {
                 self.start_fix_pr_flow(*request, tx);
@@ -4408,19 +4412,19 @@ impl App {
         kick_off_resolve_base_ref(worktree_path, number, pr_base_ref, tx.clone());
     }
 
-    fn start_enrich_pr_flow(
+    fn start_explain_pr_flow(
         &mut self,
-        request: EnrichPullRequestRequest,
+        request: ExplainPullRequestRequest,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let worktree_path = request.worktree_path.clone();
         let pr_base_ref = request.pr_base_ref.clone();
-        let ai = self.current_dashboard_config().ai.enrich.clone();
+        let ai = self.current_dashboard_config().ai.explain.clone();
         // Mount with `base_ref = None` so the confirm panel renders straight
         // away; the resolver populates the field in the background.
-        self.enrich_pr = Some(EnrichPullRequestScreen::new(request, ai));
-        self.screen = Screen::EnrichPullRequest;
-        kick_off_resolve_enrich_base_ref(worktree_path, pr_base_ref, tx.clone());
+        self.explain_pr = Some(ExplainPullRequestScreen::new(request, ai));
+        self.screen = Screen::ExplainPullRequest;
+        kick_off_resolve_explain_base_ref(worktree_path, pr_base_ref, tx.clone());
     }
     /// Mount the push-only confirmation screen. A push needs no base ref,
     /// so — unlike `start_update_pr_flow` — there's no resolver kick-off;
@@ -5079,13 +5083,13 @@ impl App {
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
             AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
-            AppEvent::EnrichPrBaseRefResolved { base_ref } => {
-                self.apply_enrich_pr_base_ref(base_ref);
+            AppEvent::ExplainPrBaseRefResolved { base_ref } => {
+                self.apply_explain_pr_base_ref(base_ref);
             }
-            AppEvent::EnrichPrPrepared(result) => self.apply_enrich_pr_prepared(result, tx),
-            AppEvent::EnrichPrSubmitted(result) => self.apply_enrich_pr_submitted(result, tx),
-            AppEvent::EnrichPrActivity { text, kind } => {
-                if let Some(screen) = self.enrich_pr.as_mut() {
+            AppEvent::ExplainPrPrepared(result) => self.apply_explain_pr_prepared(result, tx),
+            AppEvent::ExplainPrSubmitted(result) => self.apply_explain_pr_submitted(result, tx),
+            AppEvent::ExplainPrActivity { text, kind } => {
+                if let Some(screen) = self.explain_pr.as_mut() {
                     screen.append_terminal_line(text, kind);
                 }
             }
@@ -5650,8 +5654,8 @@ impl App {
         self.enter_screen(Screen::Dashboard, tx);
     }
 
-    fn apply_enrich_pr_base_ref(&mut self, base_ref: Option<String>) {
-        let Some(screen) = self.enrich_pr.as_mut() else {
+    fn apply_explain_pr_base_ref(&mut self, base_ref: Option<String>) {
+        let Some(screen) = self.explain_pr.as_mut() else {
             return;
         };
         match base_ref {
@@ -5667,54 +5671,54 @@ impl App {
     /// Handle the read-only preparation result. `HandedOffToUi` spawns
     /// opencode inside the screen's PTY; every other variant is terminal and
     /// toasts back to the dashboard.
-    fn apply_enrich_pr_prepared(
+    fn apply_explain_pr_prepared(
         &mut self,
-        result: Result<Box<EnrichPreparation>, String>,
+        result: Result<Box<ExplainPreparation>, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        if self.enrich_pr.is_none() {
+        if self.explain_pr.is_none() {
             return;
         }
         match result {
             Ok(prep) => match *prep {
-                EnrichPreparation::HandedOffToUi {
+                ExplainPreparation::HandedOffToUi {
                     opencode_binary,
                     opencode_args,
                     cwd,
                     ..
                 } => {
-                    if let Some(screen) = self.enrich_pr.as_mut() {
+                    if let Some(screen) = self.explain_pr.as_mut() {
                         // Watcher must exist before the spawn so its start
                         // timestamp precedes the session row opencode creates.
-                        self.enrich_draft = Some(OpencodeTurnWatcher::new(&cwd));
+                        self.explain_draft = Some(OpencodeTurnWatcher::new(&cwd));
                         screen.spawn_opencode_pty(opencode_binary, opencode_args, cwd, Vec::new());
                     }
                 }
-                EnrichPreparation::NothingToDescribe => {
+                ExplainPreparation::NothingToDescribe => {
                     self.show_toast(
                         ToastVariant::Info,
                         "No commits ahead of the base ref — nothing to describe yet.".to_string(),
                     );
-                    self.enrich_pr = None;
+                    self.explain_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
                 }
-                EnrichPreparation::AiNotConfigured => {
+                ExplainPreparation::AiNotConfigured => {
                     self.show_toast(
                         ToastVariant::Warning,
-                        "Set the `ai.enrich` model (Settings → Dashboard → ai) so we can draft the PR description with AI."
+                        "Set the `ai.explain` model (Settings → Dashboard → ai) so we can draft the PR description with AI."
                             .to_string(),
                     );
-                    self.enrich_pr = None;
+                    self.explain_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
                 }
-                EnrichPreparation::AiUnavailable => {
+                ExplainPreparation::AiUnavailable => {
                     self.show_toast(
                         ToastVariant::Error,
                         "`opencode` CLI is not on PATH — install it from \
                          https://opencode.ai then retry."
                             .to_string(),
                     );
-                    self.enrich_pr = None;
+                    self.explain_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
                 }
             },
@@ -5723,22 +5727,22 @@ impl App {
                     ToastVariant::Error,
                     format!("Failed to prepare PR draft: {}", truncate_error(&message)),
                 );
-                self.enrich_pr = None;
+                self.explain_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
         }
     }
 
-    fn apply_enrich_pr_submitted(
+    fn apply_explain_pr_submitted(
         &mut self,
-        result: Result<EnrichSubmitOutcome, String>,
+        result: Result<ExplainSubmitOutcome, String>,
         _tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let outcome = match result {
             Ok(outcome) => outcome,
-            Err(message) => EnrichSubmitOutcome::SubmitFailed(message),
+            Err(message) => ExplainSubmitOutcome::SubmitFailed(message),
         };
-        if let Some(screen) = self.enrich_pr.as_mut() {
+        if let Some(screen) = self.explain_pr.as_mut() {
             screen.enter_done(outcome);
         }
     }
@@ -5939,10 +5943,10 @@ impl App {
                     self.back_to_menu();
                 }
             }
-            Screen::EnrichPullRequest => {
-                // Only reachable through `start_enrich_pr_flow`, which seeds
-                // `enrich_pr` before flipping the screen.
-                if self.enrich_pr.is_none() {
+            Screen::ExplainPullRequest => {
+                // Only reachable through `start_explain_pr_flow`, which seeds
+                // `explain_pr` before flipping the screen.
+                if self.explain_pr.is_none() {
                     self.back_to_menu();
                 }
             }
@@ -6008,7 +6012,7 @@ impl App {
         self.setup_project = None;
         self.merge_pr = None;
         self.update_pr = None;
-        self.enrich_pr = None;
+        self.explain_pr = None;
         self.fix_pr = None;
         self.bugkill_pr = None;
         self.update_branch = None;
@@ -6025,7 +6029,7 @@ impl App {
         self.menu = Some(self.build_menu_screen());
     }
 
-    /// Return from a cancelled PR-command screen (Merge/Update/Enrich/Fix/
+    /// Return from a cancelled PR-command screen (Merge/Update/Explain/Fix/
     /// Bugkill) to the dashboard's action menu for the worktree the command
     /// was launched from, instead of the bare table. Cancel only ever fires
     /// before any git state changes, so the dashboard's already-loaded rows
@@ -6992,7 +6996,7 @@ fn kick_off_fetch_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let result = match fetch_opencode_models().await {
             Ok(mut models) => {
-                // Enrich the models.dev catalogue with the authoritative
+                // Explain the models.dev catalogue with the authoritative
                 // per-model variant sets from the local CLI. Best-effort: if
                 // the CLI is missing or errors, every model keeps `variants:
                 // None` and the picker falls back to the generic ladder.
@@ -7170,7 +7174,7 @@ fn kick_off_resolve_base_ref(
     });
 }
 
-fn kick_off_resolve_enrich_base_ref(
+fn kick_off_resolve_explain_base_ref(
     worktree_path: String,
     pr_base_ref: Option<String>,
     tx: mpsc::UnboundedSender<AppEvent>,
@@ -7181,18 +7185,18 @@ fn kick_off_resolve_enrich_base_ref(
             pr_base_ref.as_deref(),
         )
         .await;
-        let _ = tx.send(AppEvent::EnrichPrBaseRefResolved { base_ref });
+        let _ = tx.send(AppEvent::ExplainPrBaseRefResolved { base_ref });
     });
 }
 
-fn kick_off_prepare_enrich(
+fn kick_off_prepare_explain(
     git_root: Option<String>,
     config: DashboardConfig,
-    request: EnrichPullRequestRequest,
+    request: ExplainPullRequestRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
-        let _ = tx.send(AppEvent::EnrichPrPrepared(Err(
+        let _ = tx.send(AppEvent::ExplainPrPrepared(Err(
             "Could not resolve git root for the PR draft.".to_string(),
         )));
         return;
@@ -7201,31 +7205,31 @@ fn kick_off_prepare_enrich(
         // `base_ref` is populated by the resolver before the user can
         // confirm; guard anyway so a race can't blow up the worker.
         let Some(base_ref) = request.base_ref.clone() else {
-            let _ = tx.send(AppEvent::EnrichPrPrepared(Err(
+            let _ = tx.send(AppEvent::ExplainPrPrepared(Err(
                 "Base ref was not resolved before confirmation.".to_string(),
             )));
             return;
         };
         let service = DashboardService::new(root, config);
         let event = match service
-            .prepare_enrich(&request.worktree_path, &request.branch, &base_ref)
+            .prepare_explain(&request.worktree_path, &request.branch, &base_ref)
             .await
         {
             Ok(prep) => Ok(Box::new(prep)),
             Err(err) => Err(user_friendly_message(&err)),
         };
-        let _ = tx.send(AppEvent::EnrichPrPrepared(event));
+        let _ = tx.send(AppEvent::ExplainPrPrepared(event));
     });
 }
 
 fn kick_off_submit_pull_request(
     git_root: Option<String>,
     config: DashboardConfig,
-    params: EnrichSubmitRequest,
+    params: ExplainSubmitRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
-        let _ = tx.send(AppEvent::EnrichPrSubmitted(Err(
+        let _ = tx.send(AppEvent::ExplainPrSubmitted(Err(
             "Could not resolve git root for the pull request.".to_string(),
         )));
         return;
@@ -7238,7 +7242,7 @@ fn kick_off_submit_pull_request(
         let forward_tx = tx.clone();
         let forwarder = tokio::spawn(async move {
             while let Some((text, kind)) = activity_rx.recv().await {
-                let _ = forward_tx.send(AppEvent::EnrichPrActivity { text, kind });
+                let _ = forward_tx.send(AppEvent::ExplainPrActivity { text, kind });
             }
         });
 
@@ -7252,7 +7256,7 @@ fn kick_off_submit_pull_request(
         };
         drop(activity_tx);
         let _ = forwarder.await;
-        let _ = tx.send(AppEvent::EnrichPrSubmitted(event));
+        let _ = tx.send(AppEvent::ExplainPrSubmitted(event));
     });
 }
 
@@ -9919,13 +9923,13 @@ mod tests {
     }
 
     #[test]
-    fn enrich_opening_terminal_activity_uses_full_height_panel() {
+    fn explain_opening_terminal_activity_uses_full_height_panel() {
         let mut app = initialized_menu_app();
-        app.screen = Screen::EnrichPullRequest;
-        app.enrich_pr = Some(EnrichPullRequestScreen::new(
-            EnrichPullRequestRequest {
-                branch: "feature/enrich".into(),
-                worktree_path: "/tmp/repo/feature/enrich".into(),
+        app.screen = Screen::ExplainPullRequest;
+        app.explain_pr = Some(ExplainPullRequestScreen::new(
+            ExplainPullRequestRequest {
+                branch: "feature/explain".into(),
+                worktree_path: "/tmp/repo/feature/explain".into(),
                 base_ref: Some("upstream/main".into()),
                 pr_base_ref: None,
                 number: None,
@@ -9935,7 +9939,7 @@ mod tests {
             },
             crate::config::schema::AiModelConfig::default(),
         ));
-        let screen = app.enrich_pr.as_mut().unwrap();
+        let screen = app.explain_pr.as_mut().unwrap();
         screen.start_opening();
         screen.append_terminal_line("running tests".into(), crate::files::ActivityKind::Stdout);
 
