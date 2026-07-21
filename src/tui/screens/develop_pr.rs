@@ -1805,7 +1805,7 @@ impl DevelopPullRequestScreen {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn render_plan_review(&self, frame: &mut Frame, area: Rect) {
+    fn render_plan_review(&mut self, frame: &mut Frame, area: Rect) {
         let Some(plan) = self.plan.as_ref() else {
             return;
         };
@@ -1843,7 +1843,7 @@ impl DevelopPullRequestScreen {
             ))),
             chunks[1],
         );
-        render_text_panel(
+        self.review_scroll = render_text_panel(
             frame,
             chunks[3],
             self.plan_review_lines(),
@@ -1959,7 +1959,7 @@ impl DevelopPullRequestScreen {
     /// The CheckFailed page — Bugkill-style: title, context subtitle, the
     /// failing check's output in a scrollable panel, then the three recovery
     /// buttons (Fix with AI / Mark done anyway / Pause).
-    fn render_check_failed(&self, frame: &mut Frame, area: Rect) {
+    fn render_check_failed(&mut self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2011,7 +2011,7 @@ impl DevelopPullRequestScreen {
                 Style::default().fg(colors::GRAY_LIGHT),
             )));
         }
-        render_text_panel(frame, chunks[3], lines, self.check_scroll);
+        self.check_scroll = render_text_panel(frame, chunks[3], lines, self.check_scroll);
 
         let labels = ["Fix with AI", "Mark done anyway", "Pause"];
         let colors_by = [colors::INFO, colors::WARNING, colors::ERROR];
@@ -2226,8 +2226,11 @@ fn muted_dim() -> Style {
         .add_modifier(Modifier::DIM)
 }
 
-/// Bordered, scrollable text panel for the plan review.
-fn render_text_panel(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, scroll: u16) {
+/// Bordered, scrollable text panel for the plan review. Returns the scroll
+/// offset actually applied — clamped to the panel's content — so the caller
+/// can persist it and never leave the stored offset stranded past the end
+/// (which would make the first few scroll-up presses look unresponsive).
+fn render_text_panel(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, scroll: u16) -> u16 {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -2236,26 +2239,26 @@ fn render_text_panel(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, s
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
-        return;
+        return scroll;
     }
-    let line_count = lines.len();
-    let max_scroll = (line_count as u16).saturating_sub(inner.height);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Long lines wrap, so the scrollable height is the wrapped row count, not
+    // the logical line count — clamping to the latter would strand the tail of
+    // the plan below the fold and make scrolling look broken.
+    let total_rows = paragraph.line_count(inner.width) as u16;
+    let max_scroll = total_rows.saturating_sub(inner.height);
     let scroll = scroll.min(max_scroll);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        inner,
-    );
-    if line_count as u16 > inner.height {
+    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
+    if total_rows > inner.height {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(colors::MUTED))
             .thumb_style(Style::default().fg(colors::INFO));
-        let mut state = ScrollbarState::new(line_count)
+        let mut state = ScrollbarState::new(total_rows as usize)
             .viewport_content_length(inner.height as usize)
             .position(scroll as usize);
         frame.render_stateful_widget(scrollbar, inner, &mut state);
     }
+    scroll
 }
 
 /// Clip to `max` chars with an ellipsis.
@@ -2644,6 +2647,88 @@ mod tests {
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
             DevelopAction::PlanApproved
+        );
+    }
+
+    /// A plan whose long criteria wrap to several rows each, so it overflows a
+    /// short panel and can only be read in full with wrap-aware scrolling. Each
+    /// section carries a unique `tail marker N` on its last line.
+    fn wrapping_plan_on_review() -> DevelopPullRequestScreen {
+        let long = "x".repeat(240);
+        let sections: Vec<PlanSection> = (1..=6)
+            .map(|n| PlanSection {
+                number: n,
+                name: format!("Section name {n}"),
+                body: format!(
+                    "**Goal**: {long}\n**Acceptance criteria**:\n- [ ] {long}\n- [ ] tail marker {n}"
+                ),
+                done: false,
+            })
+            .collect();
+        let mut s = screen();
+        s.set_task_description("Add CSV export".to_string());
+        s.set_plan(DevelopPlan {
+            task_description: "Add CSV export".to_string(),
+            complexity: 8,
+            overview: None,
+            sections,
+            notes: Vec::new(),
+        });
+        s.enter_plan_review();
+        s
+    }
+
+    #[test]
+    fn plan_review_scrolls_to_reveal_wrapped_bottom_sections() {
+        // Long criteria wrap to several rows each, so the plan is far taller
+        // than its logical line count. The regression sized the scroll by the
+        // unwrapped count, clamping it short and stranding the last section
+        // below the fold no matter how far you paged.
+        let mut s = wrapping_plan_on_review();
+
+        // The last section sits below the fold on the first render.
+        let top = render_dump(&mut s, 100, 20);
+        assert!(
+            !top.contains("tail marker 6"),
+            "last section should start hidden:\n{top}"
+        );
+
+        // Paging down must eventually reach it — the wrapped height is what
+        // bounds the scroll now, not the logical line count.
+        for _ in 0..40 {
+            s.handle_key(key(KeyCode::PageDown));
+        }
+        let bottom = render_dump(&mut s, 100, 20);
+        assert!(
+            bottom.contains("tail marker 6"),
+            "scrolling should reveal the last section:\n{bottom}"
+        );
+    }
+
+    #[test]
+    fn plan_review_scroll_clamps_at_the_bottom_and_page_up_responds() {
+        // Paging far past the end must not leave the stored offset stranded
+        // beyond the content: once at the bottom, more page-downs are no-ops
+        // and a single page-up moves the view immediately.
+        let mut s = wrapping_plan_on_review();
+        for _ in 0..40 {
+            s.handle_key(key(KeyCode::PageDown));
+        }
+        render_dump(&mut s, 100, 20); // render clamps the offset to the content
+        let bottom = s.review_scroll;
+
+        s.handle_key(key(KeyCode::PageDown));
+        render_dump(&mut s, 100, 20);
+        assert_eq!(
+            s.review_scroll, bottom,
+            "at the bottom, further page-down must not grow the offset"
+        );
+
+        s.handle_key(key(KeyCode::PageUp));
+        render_dump(&mut s, 100, 20);
+        assert!(
+            s.review_scroll < bottom,
+            "page-up from the bottom should move immediately, not after unwinding overshoot"
         );
     }
 
