@@ -55,19 +55,19 @@ const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// completes in ~1s; the cap stops a slow network from stalling the on-cycle
 /// tick.
 const BASE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Timeouts for the "Enrich Pull Request" pipeline. Gathering the diff/log is
+/// Timeouts for the "Explain Pull Request" pipeline. Gathering the diff/log is
 /// read-only but can be large on a long branch; push + `gh pr create/edit`
 /// talk to the network.
-const ENRICH_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
-const ENRICH_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
-const ENRICH_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+const EXPLAIN_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
+const EXPLAIN_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+const EXPLAIN_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Soft cap on the embedded diff size inside the AI prompt. opencode
 /// receives the whole prompt as a single argv entry, so an unbounded diff
 /// risks exceeding the OS argument-length limit and failing to spawn.
 /// Diffs above this are truncated with a marker so the launch always
 /// succeeds; the AI still has the commit log + the bulk of the diff to work
 /// from.
-const ENRICH_DIFF_MAX_BYTES: usize = 120_000;
+const EXPLAIN_DIFF_MAX_BYTES: usize = 120_000;
 /// Timeouts for the "Fix Pull Request" pipeline (resolve review comments).
 /// Sync + fetch are network paths; the captured planning call drives a full
 /// model turn so it gets the longest leash; commit/reply/push are local-ish.
@@ -545,12 +545,12 @@ pub enum UpdateBranchOutcome {
     AiUnavailable { conflicts: Vec<String> },
 }
 
-/// Result of the read-only preparation phase of the "Enrich Pull Request"
-/// pipeline (`prepare_enrich`). On `HandedOffToUi` the UI spawns opencode in
+/// Result of the read-only preparation phase of the "Explain Pull Request"
+/// pipeline (`prepare_explain`). On `HandedOffToUi` the UI spawns opencode in
 /// its embedded PTY to draft `pull_request.md`; the other variants are
 /// terminal and map straight to a toast.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnrichPreparation {
+pub enum ExplainPreparation {
     /// Diff/log gathered, prompt built, `ai.model` set and `opencode` on PATH.
     /// The UI owns the PTY lifecycle from here; once opencode finishes the
     /// screen reads `pull_request.md` and offers to open/update the PR.
@@ -569,7 +569,7 @@ pub enum EnrichPreparation {
 }
 
 /// Parameters for opening or updating a pull request via `submit_pull_request`.
-pub struct EnrichSubmitRequest {
+pub struct ExplainSubmitRequest {
     pub worktree_path: String,
     pub branch: String,
     /// `Some` → update an existing PR; `None` → push + create a new one.
@@ -594,7 +594,7 @@ pub struct EnrichSubmitRequest {
 /// Outcome of submitting the drafted PR (`submit_pull_request`): either a
 /// brand-new PR was created or the existing one's title/body were updated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnrichSubmitOutcome {
+pub enum ExplainSubmitOutcome {
     /// `gh pr create` succeeded. `url` is parsed from gh's stdout.
     Created { number: u64, url: String },
     /// `gh pr edit` succeeded for the existing PR.
@@ -727,7 +727,7 @@ pub enum FixVerdict {
 }
 
 /// Spawn parameters for the live apply phase, mirroring
-/// [`EnrichPreparation::HandedOffToUi`]. The UI owns the PTY from here.
+/// [`ExplainPreparation::HandedOffToUi`]. The UI owns the PTY from here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixApplyHandoff {
     pub opencode_binary: PathBuf,
@@ -2413,18 +2413,18 @@ impl DashboardService {
         }
     }
 
-    /// Read-only preparation for the "Enrich Pull Request" flow. Gathers the
+    /// Read-only preparation for the "Explain Pull Request" flow. Gathers the
     /// commit log + diff against `base_ref`, extracts the ticket from the
     /// branch name, reads the repo's PR template (falling back to the
-    /// embedded one), and renders `prompts/enricher.md` into the opencode
+    /// embedded one), and renders `prompts/explainer.md` into the opencode
     /// command the UI will spawn. No git mutation happens here — the AI's
     /// only job is to write `pull_request.md`.
-    pub async fn prepare_enrich(
+    pub async fn prepare_explain(
         &self,
         worktree_path: &str,
         branch: &str,
         base_ref: &str,
-    ) -> Result<EnrichPreparation> {
+    ) -> Result<ExplainPreparation> {
         let cwd = PathBuf::from(worktree_path);
 
         // Commit log (oldest first) and full diff against the base ref.
@@ -2432,7 +2432,7 @@ impl DashboardService {
         let diff_range = format!("{base_ref}...HEAD");
         let git_log = with_timeout(
             "git log",
-            ENRICH_CONTEXT_TIMEOUT,
+            EXPLAIN_CONTEXT_TIMEOUT,
             run_command(
                 &self.git_binary,
                 &["log", &log_range, "--reverse", "--format=### %s%n%n%b"],
@@ -2443,34 +2443,35 @@ impl DashboardService {
         .unwrap_or_default();
         let git_diff = with_timeout(
             "git diff",
-            ENRICH_CONTEXT_TIMEOUT,
+            EXPLAIN_CONTEXT_TIMEOUT,
             run_command(&self.git_binary, &["diff", &diff_range], Some(&cwd)),
         )
         .await?
         .unwrap_or_default();
 
         if git_diff.trim().is_empty() && git_log.trim().is_empty() {
-            return Ok(EnrichPreparation::NothingToDescribe);
+            return Ok(ExplainPreparation::NothingToDescribe);
         }
 
-        let model = self.config.ai.enrich.model.trim().to_string();
+        let model = self.config.ai.explain.model.trim().to_string();
         if model.is_empty() {
-            return Ok(EnrichPreparation::AiNotConfigured);
+            return Ok(ExplainPreparation::AiNotConfigured);
         }
         if !binary_available(&self.opencode_binary) {
-            return Ok(EnrichPreparation::AiUnavailable);
+            return Ok(ExplainPreparation::AiUnavailable);
         }
 
         let ticket = extract_ticket(branch).unwrap_or_default();
         let template = read_pr_template(&cwd).await;
-        let prompt = build_enrich_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
+        let prompt =
+            build_explain_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
 
         // Invoke opencode's default TUI (no subcommand) with `--prompt` so
-        // the enricher instructions auto-send on launch and `-m <model>` so
+        // the explainer instructions auto-send on launch and `-m <model>` so
         // the user's configured model is honored — mirrors the merge flow.
         // The TUI takes no `--variant`, so the reasoning effort is seeded into
         // opencode's `model.json` first (see `seed_opencode_tui_variant`).
-        seed_opencode_tui_variant(&model, &self.config.ai.enrich.thinking);
+        seed_opencode_tui_variant(&model, &self.config.ai.explain.thinking);
         let mut opencode_args: Vec<String> = vec![
             "--prompt".to_string(),
             prompt,
@@ -2479,7 +2480,7 @@ impl DashboardService {
         ];
         opencode_args.push(cwd.to_string_lossy().to_string());
 
-        Ok(EnrichPreparation::HandedOffToUi {
+        Ok(ExplainPreparation::HandedOffToUi {
             opencode_binary: self.opencode_binary.clone(),
             opencode_args,
             cwd,
@@ -2496,10 +2497,10 @@ impl DashboardService {
     /// via `--assignee "@me"` / `--add-assignee "@me"`.
     pub async fn submit_pull_request(
         &self,
-        params: &EnrichSubmitRequest,
+        params: &ExplainSubmitRequest,
         activity: Option<&mpsc::UnboundedSender<(String, ActivityKind)>>,
-    ) -> Result<EnrichSubmitOutcome> {
-        let EnrichSubmitRequest {
+    ) -> Result<ExplainSubmitOutcome> {
+        let ExplainSubmitRequest {
             worktree_path,
             branch,
             number,
@@ -2558,13 +2559,13 @@ impl DashboardService {
                 let edit_args_ref: Vec<&str> = edit_args.iter().map(String::as_str).collect();
                 let edit_result = with_timeout(
                     "gh pr edit",
-                    ENRICH_SUBMIT_TIMEOUT,
+                    EXPLAIN_SUBMIT_TIMEOUT,
                     run_command_streamed(&self.gh_binary, &edit_args_ref, Some(&cwd), activity),
                 )
                 .await?;
                 match edit_result {
-                    Ok(_) => Ok(EnrichSubmitOutcome::Updated { number: *number }),
-                    Err(err) => Ok(EnrichSubmitOutcome::SubmitFailed(err)),
+                    Ok(_) => Ok(ExplainSubmitOutcome::Updated { number: *number }),
+                    Err(err) => Ok(ExplainSubmitOutcome::SubmitFailed(err)),
                 }
             }
             // Create a brand-new PR: push the branch, then `gh pr create`.
@@ -2572,7 +2573,7 @@ impl DashboardService {
                 emit(&format!("$ git push -u origin {branch}"));
                 let push = with_timeout(
                     "git push",
-                    ENRICH_PUSH_TIMEOUT,
+                    EXPLAIN_PUSH_TIMEOUT,
                     run_command_streamed(
                         &self.git_binary,
                         &["push", "-u", "origin", branch],
@@ -2582,7 +2583,7 @@ impl DashboardService {
                 )
                 .await?;
                 if let Err(err) = push {
-                    return Ok(EnrichSubmitOutcome::PushFailed(err));
+                    return Ok(ExplainSubmitOutcome::PushFailed(err));
                 }
 
                 // `--head owner:branch` keeps `gh` from aborting when the
@@ -2644,7 +2645,7 @@ impl DashboardService {
                 let create_args_ref: Vec<&str> = create_args.iter().map(String::as_str).collect();
                 let create = with_timeout(
                     "gh pr create",
-                    ENRICH_SUBMIT_TIMEOUT,
+                    EXPLAIN_SUBMIT_TIMEOUT,
                     run_command_streamed(&self.gh_binary, &create_args_ref, Some(&cwd), activity),
                 )
                 .await?;
@@ -2652,9 +2653,9 @@ impl DashboardService {
                     Ok(out) => {
                         let url = pr_url_from_output(&out);
                         let number = pr_number_from_url(&url).unwrap_or(0);
-                        Ok(EnrichSubmitOutcome::Created { number, url })
+                        Ok(ExplainSubmitOutcome::Created { number, url })
                     }
-                    Err(err) => Ok(EnrichSubmitOutcome::SubmitFailed(err)),
+                    Err(err) => Ok(ExplainSubmitOutcome::SubmitFailed(err)),
                 }
             }
         }
@@ -6335,7 +6336,7 @@ fn build_merge_prompt(base_ref: &str, conflicts: &[String], autonomous: bool) ->
 /// Fallback PR template used when the repo ships none of the well-known
 /// template files. Mirrors the `filler` skill's reference template so the
 /// native flow produces the same section layout the team is used to.
-const ENRICH_TEMPLATE_FALLBACK: &str = "# Description ✍️
+const EXPLAIN_TEMPLATE_FALLBACK: &str = "# Description ✍️
 
 Brief explanation of the PR purpose
 
@@ -6386,13 +6387,13 @@ async fn read_pr_template(cwd: &Path) -> String {
             }
         }
     }
-    ENRICH_TEMPLATE_FALLBACK.to_string()
+    EXPLAIN_TEMPLATE_FALLBACK.to_string()
 }
 
-/// Render `prompts/enricher.md` into a concrete prompt by substituting the
+/// Render `prompts/explainer.md` into a concrete prompt by substituting the
 /// harness-gathered inputs. The diff is embedded last (and truncated if
 /// huge) so the earlier placeholder substitutions never scan the diff body.
-fn build_enrich_prompt(
+fn build_explain_prompt(
     base_ref: &str,
     branch: &str,
     ticket: &str,
@@ -6400,9 +6401,9 @@ fn build_enrich_prompt(
     git_diff: &str,
     template: &str,
 ) -> String {
-    const ENRICHER_PROMPT: &str = include_str!("../../prompts/enricher.md");
-    let diff = truncate_for_prompt(git_diff, ENRICH_DIFF_MAX_BYTES);
-    ENRICHER_PROMPT
+    const EXPLAINER_PROMPT: &str = include_str!("../../prompts/explainer.md");
+    let diff = truncate_for_prompt(git_diff, EXPLAIN_DIFF_MAX_BYTES);
+    EXPLAINER_PROMPT
         .replace("BASE_REF", base_ref)
         .replace("CURRENT_BRANCH", branch)
         .replace("TICKET", ticket)
@@ -13905,8 +13906,8 @@ so the intent reads clearly.
     }
 
     #[test]
-    fn build_enrich_prompt_substitutes_all_inputs() {
-        let prompt = build_enrich_prompt(
+    fn build_explain_prompt_substitutes_all_inputs() {
+        let prompt = build_explain_prompt(
             "upstream/main",
             "digit-3131-retry",
             "DIGIT-3131",

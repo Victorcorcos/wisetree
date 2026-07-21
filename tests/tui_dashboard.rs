@@ -1269,7 +1269,7 @@ fn action_menu_hides_merge_option_for_draft_pr_row() {
 #[test]
 fn action_menu_shows_pr_commands_for_draft_pr_row() {
     // A draft-PR worktree must expose the same Pull Request Commands as an
-    // open one — Open, Enrich, Upload (ahead-not-behind), Close — with Merge
+    // open one — Open, Explain, Upload (ahead-not-behind), Close — with Merge
     // the only omission (GitHub won't merge a draft).
     let mut screen = DashboardScreen::new(
         true,
@@ -1291,8 +1291,8 @@ fn action_menu_shows_pr_commands_for_draft_pr_row() {
         "draft PR should expose Open: {labels:?}"
     );
     assert!(
-        labels.iter().any(|l| l == "Enrich"),
-        "draft PR should expose Enrich: {labels:?}"
+        labels.iter().any(|l| l == "Explain"),
+        "draft PR should expose Explain: {labels:?}"
     );
     assert!(
         labels.iter().any(|l| l == "Upload"),
