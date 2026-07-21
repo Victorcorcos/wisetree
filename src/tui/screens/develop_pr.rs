@@ -2136,7 +2136,7 @@ impl DevelopPullRequestScreen {
                 Span::styled(
                     format!(
                         "left uncommitted on {} — review the diff, run the tests, then commit \
-                         (or Enrich a PR).",
+                         (or Explain a PR).",
                         self.request.branch
                     ),
                     Style::default().fg(colors::SUCCESS),

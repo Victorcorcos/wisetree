@@ -17,7 +17,7 @@
 //!   merge / Update-PR pages use — while opencode edits the file(s) live. Tab
 //!   toggles focus between Wisetree and opencode.
 //! - `Done`      : a results table (one row per comment group) mirroring the
-//!   Enrich / Merge Done page.
+//!   Explain / Merge Done page.
 //!
 //! All async + git/gh/AI work is owned by `App`; this screen is a presentation
 //! state machine that records per-group outcomes for the final table.
@@ -166,7 +166,7 @@ pub struct FixPullRequestScreen {
     /// Scroll offset for the (potentially long) proposal text on Decision.
     decision_scroll: u16,
     other_input: Option<InputPrompt>,
-    // ── live-apply PTY state (mirrors Enrich PR) ──────────────────────────
+    // ── live-apply PTY state (mirrors Explain PR) ──────────────────────────
     ai_done: bool,
     pty: Option<PtyView>,
     pty_focused: bool,

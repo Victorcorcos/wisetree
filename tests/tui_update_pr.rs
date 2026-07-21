@@ -74,7 +74,7 @@ fn blank_ai() -> wisetree::config::schema::AiConfig {
         AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiModelConfig,
     };
     AiConfig {
-        enrich: AiModelConfig::default(),
+        explain: AiModelConfig::default(),
         fix: AiFixConfig {
             plan: AiModelConfig::default(),
             apply: AiModelConfig::default(),

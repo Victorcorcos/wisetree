@@ -28,11 +28,12 @@ pub use dashboard::{
     BugkillUnverdicted, CheckStatus, CommentGroup, CommitSummary, DashboardNotice,
     DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
     DevelopCheckOutcome, DevelopPreflight, DevelopPreflightOutcome, DevelopResumeState,
-    EnrichPreparation, EnrichSubmitOutcome, EnrichSubmitRequest, FixApplyHandoff, FixCommitOutcome,
-    FixPlan, FixPreparation, FixVerdict, MergeStatus, PrState, PullRequest, PullRequestDetails,
-    ReviewComment, ReviewFile, ReviewFinding, ReviewPreparation, ReviewSeverity, ReviewSkippedFile,
-    ReviewStatus, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
-    UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
+    ExplainPreparation, ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff,
+    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, MergeStatus, PrState, PullRequest,
+    PullRequestDetails, ReviewComment, ReviewFile, ReviewFinding, ReviewPreparation,
+    ReviewSeverity, ReviewSkippedFile, ReviewStatus, ReviewerSummary, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
+    PR_REFRESH_PERIOD_MS,
 };
 pub use develop::{parse_plan_transcript, summarize_transcript, DevelopPlan, PlanSection};
 pub use opencode_models::{

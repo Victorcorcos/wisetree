@@ -45,7 +45,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::Cache => Some("Cache"),
             Screen::MergePullRequest => Some("Merge Pull Request"),
             Screen::UpdatePullRequest => Some("Update Pull Request"),
-            Screen::EnrichPullRequest => Some("Enrich Pull Request"),
+            Screen::ExplainPullRequest => Some("Explain Pull Request"),
             Screen::FixPullRequest => Some("Fix Pull Request"),
             Screen::ReviewPullRequest => Some("Review Pull Request"),
             Screen::BugkillPullRequest => Some("Bugkill Pull Request"),

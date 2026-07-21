@@ -1,5 +1,5 @@
 //! Shared confirmation layout for the AI-assisted Pull Request commands
-//! (Bugkill, Enrich, Fix, Update/Upload, Merge). It renders the same
+//! (Bugkill, Explain, Fix, Update/Upload, Merge). It renders the same
 //! top-to-bottom stack on every page so all five read as one component:
 //!
 //! ```text
@@ -14,7 +14,7 @@
 //!   2. …
 //!
 //! Role         Model      Thinking   ← centered "which AIs run" table
-//! enrich       glm-5.2    max
+//! explain       glm-5.2    max
 //!
 //! ┌──────── Are you sure ────────┐   ← ConfirmationModal (Yes / No)
 //! └──────────────────────────────┘
@@ -50,7 +50,7 @@ const LABEL_WIDTH: usize = 12;
 
 /// One `Role / Model / Thinking` row in the "which AIs will run" table. The
 /// `role` label mirrors the command's `ai.*` config key (e.g. `investigate`,
-/// `plan`, `apply`, `enrich`, `update`) so a reader can map the row straight
+/// `plan`, `apply`, `explain`, `update`) so a reader can map the row straight
 /// back to the setting that drives it.
 #[derive(Debug, Clone)]
 pub struct AiRoleRow {
@@ -212,7 +212,7 @@ pub fn will_run_lines<S: AsRef<str>>(steps: &[S]) -> Vec<Line<'static>> {
 pub struct PrConfirmView<'a> {
     title: String,
     /// Color for the title heading. Defaults to `BRAND`; each PR command
-    /// overrides it with its signature color (Enrich purple, Merge green,
+    /// overrides it with its signature color (Explain purple, Merge green,
     /// …) so the confirm screen matches the command's dashboard button.
     title_color: Color,
     /// Ordered text blocks (details, `Will run:` preview, description snippet,

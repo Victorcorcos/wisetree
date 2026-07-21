@@ -7,7 +7,7 @@ use wisetree::config::schema::DashboardConfig;
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::services::{
     is_behind, resolve_base_ref, CheckStatus, DashboardNoticeLevel, DashboardRow, DashboardService,
-    EnrichSubmitOutcome, EnrichSubmitRequest, MergeStatus, PrState, PullRequest,
+    ExplainSubmitOutcome, ExplainSubmitRequest, MergeStatus, PrState, PullRequest,
 };
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
@@ -929,7 +929,7 @@ async fn submit_new_pr_passes_resolved_base_to_gh_create() {
     let service =
         DashboardService::new(repo.clone(), DashboardConfig::default()).with_gh_binary(gh_path);
 
-    let request = EnrichSubmitRequest {
+    let request = ExplainSubmitRequest {
         worktree_path: repo.to_string_lossy().to_string(),
         branch: "feat-base".to_string(),
         number: None,
@@ -945,7 +945,7 @@ async fn submit_new_pr_passes_resolved_base_to_gh_create() {
         .await
         .expect("submit");
     assert!(
-        matches!(outcome, EnrichSubmitOutcome::Created { number: 7, .. }),
+        matches!(outcome, ExplainSubmitOutcome::Created { number: 7, .. }),
         "expected a created PR, got {outcome:?}"
     );
 

@@ -134,11 +134,11 @@ pub struct AiModelConfig {
 
 // Out-of-the-box defaults per AI command. These point at opencode's free /
 // cheap router models so AI-assisted flows work without the user wiring up
-// their own keys: `enrich` and `fix.plan` get a roomier reasoning budget
+// their own keys: `explain` and `fix.plan` get a roomier reasoning budget
 // (`max`), while the heavier-traffic `fix.apply` / `update` run at the model's
 // default effort. Used both for `*Config::default()` and as the per-command
 // fallback when a slot is absent from the persisted config.
-fn default_enrich_ai() -> AiModelConfig {
+fn default_explain_ai() -> AiModelConfig {
     AiModelConfig {
         model: "opencode-go/deepseek-v4-flash".to_string(),
         thinking: "max".to_string(),
@@ -274,7 +274,7 @@ impl Default for AiDevelopConfig {
 ///
 /// ```json
 /// "ai": {
-///   "enrich": { "model": "opencode-go/deepseek-v4-flash", "thinking": "max" },
+///   "explain": { "model": "opencode-go/deepseek-v4-flash", "thinking": "max" },
 ///   "fix": {
 ///     "plan":  { "model": "opencode-go/glm-5.2", "thinking": "max" },
 ///     "apply": { "model": "opencode-go/kimi-k2.7-code", "thinking": "default" }
@@ -283,7 +283,7 @@ impl Default for AiDevelopConfig {
 /// }
 /// ```
 ///
-/// `enrich` drives the "Enrich Pull Request" draft; `fix.plan` / `fix.apply`
+/// `explain` drives the "Explain Pull Request" draft; `fix.plan` / `fix.apply`
 /// drive the two Fix phases; `update` drives the AI merge-conflict resolution
 /// shared by "Update Pull Request" and "Update branch (locally)".
 ///
@@ -296,7 +296,7 @@ impl Default for AiDevelopConfig {
 /// [`Deserialize`] impl below). Serialization always emits the nested shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct AiConfig {
-    pub enrich: AiModelConfig,
+    pub explain: AiModelConfig,
     pub fix: AiFixConfig,
     /// Drives the "Review Pull Request" per-file diff scan.
     pub review: AiModelConfig,
@@ -309,7 +309,7 @@ pub struct AiConfig {
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            enrich: default_enrich_ai(),
+            explain: default_explain_ai(),
             fix: AiFixConfig::default(),
             review: default_review_ai(),
             update: default_update_ai(),
@@ -337,7 +337,7 @@ impl<'de> Deserialize<'de> for AiConfig {
             thinking: Option<String>,
             // Current per-command shape.
             #[serde(default)]
-            enrich: Option<AiModelConfig>,
+            explain: Option<AiModelConfig>,
             #[serde(default)]
             fix: Option<AiFixConfig>,
             #[serde(default)]
@@ -365,10 +365,10 @@ impl<'de> Deserialize<'de> for AiConfig {
         };
 
         Ok(AiConfig {
-            enrich: raw
-                .enrich
+            explain: raw
+                .explain
                 .or_else(|| legacy.clone())
-                .unwrap_or_else(default_enrich_ai),
+                .unwrap_or_else(default_explain_ai),
             fix: raw.fix.unwrap_or_else(|| match &legacy {
                 Some(l) => AiFixConfig {
                     plan: l.clone(),
@@ -419,7 +419,7 @@ pub struct DashboardConfig {
     pub columns: Vec<String>,
 
     /// Per-command AI model + thinking strength for opencode-assisted flows
-    /// (enrich, fix plan/apply, update conflict resolution). When a command's
+    /// (explain, fix plan/apply, update conflict resolution). When a command's
     /// `model` is empty, that AI step is disabled and the user acts manually.
     #[serde(rename = "ai", default)]
     pub ai: AiConfig,
@@ -650,7 +650,7 @@ mod ai_config_tests {
         let json = r#"{ "model": "opencode/deepseek-v4-flash-free", "thinking": "max" }"#;
         let ai: AiConfig = serde_json::from_str(json).expect("legacy ai parses");
         for leaf in [
-            &ai.enrich,
+            &ai.explain,
             &ai.fix.plan,
             &ai.fix.apply,
             &ai.review,
@@ -669,7 +669,7 @@ mod ai_config_tests {
     #[test]
     fn nested_per_command_ai_parses_each_slot() {
         let json = r#"{
-            "enrich": { "model": "opencode/deepseek-v4-flash-free", "thinking": "max" },
+            "explain": { "model": "opencode/deepseek-v4-flash-free", "thinking": "max" },
             "fix": {
                 "plan":  { "model": "openai/gpt-5.5", "thinking": "high" },
                 "apply": { "model": "opencode-go/kimi-k2.7-code" }
@@ -677,8 +677,8 @@ mod ai_config_tests {
             "update": { "model": "opencode-go/kimi-k2.7-code" }
         }"#;
         let ai: AiConfig = serde_json::from_str(json).expect("nested ai parses");
-        assert_eq!(ai.enrich.model, "opencode/deepseek-v4-flash-free");
-        assert_eq!(ai.enrich.thinking, "max");
+        assert_eq!(ai.explain.model, "opencode/deepseek-v4-flash-free");
+        assert_eq!(ai.explain.thinking, "max");
         assert_eq!(ai.fix.plan.model, "openai/gpt-5.5");
         assert_eq!(ai.fix.plan.thinking, "high");
         assert_eq!(ai.fix.apply.model, "opencode-go/kimi-k2.7-code");
@@ -690,8 +690,8 @@ mod ai_config_tests {
     fn empty_ai_object_uses_per_command_defaults() {
         let ai: AiConfig = serde_json::from_str("{}").expect("empty ai parses");
         assert_eq!(ai, AiConfig::default());
-        assert_eq!(ai.enrich.model, "opencode-go/deepseek-v4-flash");
-        assert_eq!(ai.enrich.thinking, "max");
+        assert_eq!(ai.explain.model, "opencode-go/deepseek-v4-flash");
+        assert_eq!(ai.explain.thinking, "max");
         assert_eq!(ai.fix.plan.model, "opencode-go/glm-5.2");
         assert_eq!(ai.fix.plan.thinking, "max");
         assert_eq!(ai.fix.apply.model, "opencode-go/kimi-k2.7-code");
@@ -714,10 +714,10 @@ mod ai_config_tests {
 
     #[test]
     fn absent_slot_falls_back_to_its_default_other_slots_explicit() {
-        // Only `enrich` configured → fix/update fall back to their defaults.
-        let json = r#"{ "enrich": { "model": "x", "thinking": "low" } }"#;
+        // Only `explain` configured → fix/update fall back to their defaults.
+        let json = r#"{ "explain": { "model": "x", "thinking": "low" } }"#;
         let ai: AiConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(ai.enrich.model, "x");
+        assert_eq!(ai.explain.model, "x");
         assert_eq!(ai.fix.plan.model, "opencode-go/glm-5.2");
         assert_eq!(ai.update.model, "opencode-go/kimi-k2.7-code");
     }
@@ -729,7 +729,7 @@ mod ai_config_tests {
         let json = r#"{ "model": "legacy/model", "thinking": "low" }"#;
         let ai: AiConfig = serde_json::from_str(json).unwrap();
         for leaf in [
-            &ai.enrich,
+            &ai.explain,
             &ai.fix.plan,
             &ai.fix.apply,
             &ai.review,
@@ -748,7 +748,7 @@ mod ai_config_tests {
     #[test]
     fn unknown_ai_key_is_rejected() {
         // Strictness is preserved: a typo'd key must error, not silently drop.
-        let json = r#"{ "enrich": { "model": "x" }, "bogus": {} }"#;
+        let json = r#"{ "explain": { "model": "x" }, "bogus": {} }"#;
         assert!(serde_json::from_str::<AiConfig>(json).is_err());
     }
 
@@ -790,7 +790,7 @@ mod ai_config_tests {
         let legacy = r#"{ "model": "m", "thinking": "high" }"#;
         let ai: AiConfig = serde_json::from_str(legacy).unwrap();
         let serialized = serde_json::to_string(&ai).unwrap();
-        assert!(serialized.contains("\"enrich\""));
+        assert!(serialized.contains("\"explain\""));
         assert!(serialized.contains("\"fix\""));
         assert!(serialized.contains("\"update\""));
         assert!(serialized.contains("\"bugkill\""));

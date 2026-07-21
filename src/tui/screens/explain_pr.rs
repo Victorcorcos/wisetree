@@ -1,10 +1,10 @@
-//! "Enrich Pull Request" screen. Five-step state machine:
+//! "Explain Pull Request" screen. Five-step state machine:
 //!
 //! - `Loading` : spinner while `App` resolves the base ref (needed to
 //!   diff the branch against its base for the AI prompt).
 //! - `Confirm` : details panel on top, `ConfirmationModal` (Yes/No, **No**
-//!   default). Enter on Yes returns `EnrichAction::Confirmed`.
-//! - `Enriching` : spinner + a bordered "AI Activity" panel that embeds the
+//!   default). Enter on Yes returns `ExplainAction::Confirmed`.
+//! - `Explaining` : spinner + a bordered "AI Activity" panel that embeds the
 //!   real opencode TUI inside a PTY. opencode drafts `pull_request.md`.
 //!   The TUI never exits on its own, so the App watches opencode's
 //!   database with an `OpencodeTurnWatcher` and advances automatically
@@ -35,9 +35,9 @@ use ratatui::Frame;
 use crate::config::schema::AiModelConfig;
 use crate::files::ActivityKind;
 use crate::messages::colors;
-use crate::services::dashboard::{AiActivityEvent, EnrichSubmitOutcome};
+use crate::services::dashboard::{AiActivityEvent, ExplainSubmitOutcome};
 use crate::tui::screens::create::{render_terminal_activity, TerminalLine};
-use crate::tui::screens::dashboard::EnrichPullRequestRequest;
+use crate::tui::screens::dashboard::ExplainPullRequestRequest;
 use crate::tui::screens::update_pr::{
     ai_activity_event_to_line, button_paragraph, contains_position, key_event_to_pty_bytes,
 };
@@ -47,8 +47,8 @@ use crate::tui::widgets::{
     SummaryRow,
 };
 
-const ENRICH_LOADING_MESSAGE: &str = "Resolving base ref...";
-const ENRICH_PREPARING_MESSAGE: &str = "Gathering diff and preparing prompt...";
+const EXPLAIN_LOADING_MESSAGE: &str = "Resolving base ref...";
+const EXPLAIN_PREPARING_MESSAGE: &str = "Gathering diff and preparing prompt...";
 
 /// Hard cap on retained AI activity lines (fallback log only — the live
 /// view is the PTY embed). Matches the Update PR screen.
@@ -60,10 +60,10 @@ const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
 const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnrichStep {
+pub enum ExplainStep {
     Loading,
     Confirm,
-    Enriching,
+    Explaining,
     Review,
     Opening,
     /// Commands finished — shows the result (success URL / error) before
@@ -78,12 +78,12 @@ enum ReviewButton {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnrichAction {
+pub enum ExplainAction {
     Continue,
     /// Esc / No — abort the flow and return to the dashboard. The PTY (if
     /// any) is torn down via `Drop` when the screen is replaced.
     Cancelled,
-    /// User confirmed the explanation panel — start the enrich pipeline.
+    /// User confirmed the explanation panel — start the explain pipeline.
     Confirmed,
     /// opencode finished (exited or the user confirmed the draft is ready).
     /// The App reads `pull_request.md` and calls `enter_review` / `set_error`.
@@ -96,23 +96,23 @@ pub enum EnrichAction {
     Done,
 }
 
-pub struct EnrichPullRequestScreen {
-    request: EnrichPullRequestRequest,
-    /// Resolved `ai.enrich` config, shown on the confirm panel's "which AIs
+pub struct ExplainPullRequestScreen {
+    request: ExplainPullRequestRequest,
+    /// Resolved `ai.explain` config, shown on the confirm panel's "which AIs
     /// run" table so the user sees which model drafts the description.
     ai: AiModelConfig,
     confirm: Option<ConfirmationModal>,
     phase_message: String,
     ai_log: Vec<AiActivityEvent>,
     ai_scroll: u16,
-    /// `true` once the Enriching step is active so the AI Activity panel is
-    /// shown (enrich always uses the AI, so this is set on `start_enriching`).
+    /// `true` once the Explaining step is active so the AI Activity panel is
+    /// shown (explain always uses the AI, so this is set on `start_explaining`).
     ai_active: bool,
     /// Set once opencode has finished (exited or finalize-confirmed) so the
     /// PTY-exit poll only fires the `ReadyToReview` transition a single time.
     ai_done: bool,
     /// Embedded opencode subprocess + vt100 emulator. `Some` from the moment
-    /// the App hands over spawn parameters until the screen leaves Enriching.
+    /// the App hands over spawn parameters until the screen leaves Explaining.
     pty: Option<PtyView>,
     /// `true` when keystrokes flow into the inner opencode TUI; `false`
     /// (default) when the outer Wisetree TUI owns the keyboard. Tab toggles.
@@ -127,7 +127,7 @@ pub struct EnrichPullRequestScreen {
     review_button: ReviewButton,
     review_button_rects: Cell<[Rect; 2]>,
     error: Option<String>,
-    step: EnrichStep,
+    step: ExplainStep,
     pub tick: usize,
     /// Streamed lines from git push / gh pr create — shown in the Terminal
     /// Activity panel during Opening and retained on the Done page.
@@ -135,24 +135,24 @@ pub struct EnrichPullRequestScreen {
     /// Scroll offset (lines from tail). `0` = live tail; positive = scrolled up.
     terminal_scroll: u16,
     /// Stored outcome of the submission — used to render the Done page header.
-    submit_outcome: Option<EnrichSubmitOutcome>,
+    submit_outcome: Option<ExplainSubmitOutcome>,
     /// Summary rows built from the terminal log when the submission finishes.
     /// Shown as a table on the Done page (mirrors the create-worktree success page).
     summary_rows: Vec<SummaryRow>,
 }
 
-impl EnrichPullRequestScreen {
-    pub fn new(request: EnrichPullRequestRequest, ai: AiModelConfig) -> Self {
+impl ExplainPullRequestScreen {
+    pub fn new(request: ExplainPullRequestRequest, ai: AiModelConfig) -> Self {
         let (confirm, step) = if request.base_ref.is_some() {
-            (Some(build_confirm(&request)), EnrichStep::Confirm)
+            (Some(build_confirm(&request)), ExplainStep::Confirm)
         } else {
-            (None, EnrichStep::Loading)
+            (None, ExplainStep::Loading)
         };
         Self {
             request,
             ai,
             confirm,
-            phase_message: ENRICH_PREPARING_MESSAGE.to_string(),
+            phase_message: EXPLAIN_PREPARING_MESSAGE.to_string(),
             ai_log: Vec::new(),
             ai_scroll: 0,
             ai_active: false,
@@ -175,11 +175,11 @@ impl EnrichPullRequestScreen {
         }
     }
 
-    pub fn request(&self) -> &EnrichPullRequestRequest {
+    pub fn request(&self) -> &ExplainPullRequestRequest {
         &self.request
     }
 
-    pub fn step(&self) -> EnrichStep {
+    pub fn step(&self) -> ExplainStep {
         self.step
     }
 
@@ -187,8 +187,8 @@ impl EnrichPullRequestScreen {
         self.error.as_deref()
     }
 
-    pub fn is_enriching(&self) -> bool {
-        matches!(self.step, EnrichStep::Enriching)
+    pub fn is_explaining(&self) -> bool {
+        matches!(self.step, ExplainStep::Explaining)
     }
 
     pub fn ai_active(&self) -> bool {
@@ -228,7 +228,7 @@ impl EnrichPullRequestScreen {
         self.request.base_ref = Some(base_ref);
         self.confirm = Some(build_confirm(&self.request));
         self.error = None;
-        self.step = EnrichStep::Confirm;
+        self.step = ExplainStep::Confirm;
     }
 
     pub fn set_error(&mut self, message: String) {
@@ -236,11 +236,11 @@ impl EnrichPullRequestScreen {
         self.pty = None;
     }
 
-    /// Begin the enrich phase: show the AI Activity panel and reset PTY state.
-    /// The App kicks off `prepare_enrich` and then `spawn_opencode_pty`.
-    pub fn start_enriching(&mut self) {
-        self.step = EnrichStep::Enriching;
-        self.phase_message = ENRICH_PREPARING_MESSAGE.to_string();
+    /// Begin the explain phase: show the AI Activity panel and reset PTY state.
+    /// The App kicks off `prepare_explain` and then `spawn_opencode_pty`.
+    pub fn start_explaining(&mut self) {
+        self.step = ExplainStep::Explaining;
+        self.phase_message = EXPLAIN_PREPARING_MESSAGE.to_string();
         self.ai_log.clear();
         self.ai_scroll = 0;
         self.ai_active = true;
@@ -298,12 +298,12 @@ impl EnrichPullRequestScreen {
         self.pty = None;
         self.finalize_confirm = None;
         self.error = None;
-        self.step = EnrichStep::Review;
+        self.step = ExplainStep::Review;
     }
 
     /// Move into the Opening step (spinner + Terminal Activity) while the App submits the PR.
     pub fn start_opening(&mut self) {
-        self.step = EnrichStep::Opening;
+        self.step = ExplainStep::Opening;
         self.phase_message = if self.request.number.is_some() {
             "Updating pull request...".to_string()
         } else {
@@ -339,7 +339,7 @@ impl EnrichPullRequestScreen {
     }
 
     /// Transition from Opening → Done once the submission finishes.
-    pub fn enter_done(&mut self, outcome: EnrichSubmitOutcome) {
+    pub fn enter_done(&mut self, outcome: ExplainSubmitOutcome) {
         // Collect the command labels emitted during Opening (Status lines
         // starting with `$`) so we can build the summary table.
         let commands: Vec<String> = self
@@ -350,11 +350,11 @@ impl EnrichPullRequestScreen {
             .collect();
 
         self.summary_rows = match &outcome {
-            EnrichSubmitOutcome::Created { .. } | EnrichSubmitOutcome::Updated { .. } => commands
+            ExplainSubmitOutcome::Created { .. } | ExplainSubmitOutcome::Updated { .. } => commands
                 .iter()
                 .map(|c| SummaryRow::success(c.clone()))
                 .collect(),
-            EnrichSubmitOutcome::PushFailed(err) => {
+            ExplainSubmitOutcome::PushFailed(err) => {
                 // Only the push ran and it failed; any trailing commands
                 // (there shouldn't be any) are marked as not reached.
                 commands
@@ -369,7 +369,7 @@ impl EnrichPullRequestScreen {
                     })
                     .collect()
             }
-            EnrichSubmitOutcome::SubmitFailed(err) => {
+            ExplainSubmitOutcome::SubmitFailed(err) => {
                 // Everything before the last command succeeded; the last one
                 // failed (git push OK but gh pr create/edit failed).
                 let n = commands.len();
@@ -389,7 +389,7 @@ impl EnrichPullRequestScreen {
 
         self.submit_outcome = Some(outcome);
         self.terminal_scroll = 0;
-        self.step = EnrichStep::Done;
+        self.step = ExplainStep::Done;
     }
 
     pub fn set_phase_message(&mut self, message: impl Into<String>) {
@@ -430,11 +430,11 @@ impl EnrichPullRequestScreen {
     }
 
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
-        if matches!(self.step, EnrichStep::Opening | EnrichStep::Done) {
+        if matches!(self.step, ExplainStep::Opening | ExplainStep::Done) {
             self.scroll_terminal_up(lines);
             return true;
         }
-        if !self.is_enriching() {
+        if !self.is_explaining() {
             return false;
         }
         if let Some(pty) = self.pty.as_mut() {
@@ -446,11 +446,11 @@ impl EnrichPullRequestScreen {
     }
 
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
-        if matches!(self.step, EnrichStep::Opening | EnrichStep::Done) {
+        if matches!(self.step, ExplainStep::Opening | ExplainStep::Done) {
             self.scroll_terminal_down(lines);
             return true;
         }
-        if !self.is_enriching() {
+        if !self.is_explaining() {
             return false;
         }
         if let Some(pty) = self.pty.as_mut() {
@@ -498,70 +498,70 @@ impl EnrichPullRequestScreen {
         }
     }
 
-    fn handle_finalize_modal_key(&mut self, key: KeyEvent) -> EnrichAction {
+    fn handle_finalize_modal_key(&mut self, key: KeyEvent) -> ExplainAction {
         let modal = self
             .finalize_confirm
             .as_mut()
             .expect("handle_finalize_modal_key called with no modal open");
         match modal.handle_key(key) {
-            ConfirmationOutcome::Pending => EnrichAction::Continue,
+            ConfirmationOutcome::Pending => ExplainAction::Continue,
             ConfirmationOutcome::Confirmed => {
                 self.finalize_confirm = None;
                 self.ai_done = true;
-                EnrichAction::ReadyToReview
+                ExplainAction::ReadyToReview
             }
             ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
                 self.finalize_confirm = None;
-                EnrichAction::Continue
+                ExplainAction::Continue
             }
         }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> EnrichAction {
+    pub fn handle_key(&mut self, key: KeyEvent) -> ExplainAction {
         if self.error.is_some() {
-            return EnrichAction::Cancelled;
+            return ExplainAction::Cancelled;
         }
         match self.step {
-            EnrichStep::Loading => match key.code {
-                KeyCode::Esc => EnrichAction::Cancelled,
-                _ => EnrichAction::Continue,
+            ExplainStep::Loading => match key.code {
+                KeyCode::Esc => ExplainAction::Cancelled,
+                _ => ExplainAction::Continue,
             },
-            EnrichStep::Opening => match key.code {
+            ExplainStep::Opening => match key.code {
                 KeyCode::PageUp | KeyCode::Up => {
                     self.scroll_terminal_up(Self::KEYBOARD_PAGE_SCROLL);
-                    EnrichAction::Continue
+                    ExplainAction::Continue
                 }
                 KeyCode::PageDown | KeyCode::Down => {
                     self.scroll_terminal_down(Self::KEYBOARD_PAGE_SCROLL);
-                    EnrichAction::Continue
+                    ExplainAction::Continue
                 }
-                _ => EnrichAction::Continue,
+                _ => ExplainAction::Continue,
             },
-            EnrichStep::Done => EnrichAction::Done,
-            EnrichStep::Enriching => self.handle_enriching_key(key),
-            EnrichStep::Review => self.handle_review_key(key),
-            EnrichStep::Confirm => {
+            ExplainStep::Done => ExplainAction::Done,
+            ExplainStep::Explaining => self.handle_explaining_key(key),
+            ExplainStep::Review => self.handle_review_key(key),
+            ExplainStep::Confirm => {
                 let Some(dialog) = self.confirm.as_mut() else {
-                    return EnrichAction::Cancelled;
+                    return ExplainAction::Cancelled;
                 };
                 match dialog.handle_key(key) {
-                    ConfirmationOutcome::Confirmed => EnrichAction::Confirmed,
+                    ConfirmationOutcome::Confirmed => ExplainAction::Confirmed,
                     ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
-                        EnrichAction::Cancelled
+                        ExplainAction::Cancelled
                     }
-                    ConfirmationOutcome::Pending => EnrichAction::Continue,
+                    ConfirmationOutcome::Pending => ExplainAction::Continue,
                 }
             }
         }
     }
 
-    fn handle_enriching_key(&mut self, key: KeyEvent) -> EnrichAction {
+    fn handle_explaining_key(&mut self, key: KeyEvent) -> ExplainAction {
         if self.finalize_confirm.is_some() {
             return self.handle_finalize_modal_key(key);
         }
         if self.pty.is_some() && matches!(key.code, KeyCode::Tab) {
             self.pty_focused = !self.pty_focused;
-            return EnrichAction::Continue;
+            return ExplainAction::Continue;
         }
         if self.pty_focused {
             if let Some(pty) = self.pty.as_mut() {
@@ -569,10 +569,10 @@ impl EnrichPullRequestScreen {
                     pty.send_input(&bytes);
                 }
             }
-            return EnrichAction::Continue;
+            return ExplainAction::Continue;
         }
         if self.handle_outer_scroll_key(&key) {
-            return EnrichAction::Continue;
+            return ExplainAction::Continue;
         }
         match key.code {
             // Enter on outer focus → manual "draft ready?" fallback for when
@@ -581,92 +581,94 @@ impl EnrichPullRequestScreen {
             // advances the screen on its own.
             KeyCode::Enter => {
                 self.finalize_confirm = Some(build_finalize_modal());
-                EnrichAction::Continue
+                ExplainAction::Continue
             }
-            // Esc on outer focus → abort the enrich entirely.
-            KeyCode::Esc => EnrichAction::Cancelled,
-            _ => EnrichAction::Continue,
+            // Esc on outer focus → abort the explain entirely.
+            KeyCode::Esc => ExplainAction::Cancelled,
+            _ => ExplainAction::Continue,
         }
     }
 
-    fn handle_review_key(&mut self, key: KeyEvent) -> EnrichAction {
+    fn handle_review_key(&mut self, key: KeyEvent) -> ExplainAction {
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                 self.review_button = match self.review_button {
                     ReviewButton::Submit => ReviewButton::Finish,
                     ReviewButton::Finish => ReviewButton::Submit,
                 };
-                EnrichAction::Continue
+                ExplainAction::Continue
             }
             KeyCode::Enter => match self.review_button {
-                ReviewButton::Submit => EnrichAction::Submit,
-                ReviewButton::Finish => EnrichAction::Finish,
+                ReviewButton::Submit => ExplainAction::Submit,
+                ReviewButton::Finish => ExplainAction::Finish,
             },
-            KeyCode::Esc => EnrichAction::Finish,
-            _ => EnrichAction::Continue,
+            KeyCode::Esc => ExplainAction::Finish,
+            _ => ExplainAction::Continue,
         }
     }
 
-    pub fn handle_mouse_click(&mut self, position: Position) -> EnrichAction {
+    pub fn handle_mouse_click(&mut self, position: Position) -> ExplainAction {
         if self.error.is_some()
             || matches!(
                 self.step,
-                EnrichStep::Loading | EnrichStep::Opening | EnrichStep::Done
+                ExplainStep::Loading | ExplainStep::Opening | ExplainStep::Done
             )
         {
-            return EnrichAction::Continue;
+            return ExplainAction::Continue;
         }
         match self.step {
-            EnrichStep::Enriching => {
+            ExplainStep::Explaining => {
                 if let Some(modal) = self.finalize_confirm.as_mut() {
                     return match modal.handle_mouse_click(position) {
                         ConfirmationOutcome::Confirmed => {
                             self.finalize_confirm = None;
                             self.ai_done = true;
-                            EnrichAction::ReadyToReview
+                            ExplainAction::ReadyToReview
                         }
                         ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
                             self.finalize_confirm = None;
-                            EnrichAction::Continue
+                            ExplainAction::Continue
                         }
-                        ConfirmationOutcome::Pending => EnrichAction::Continue,
+                        ConfirmationOutcome::Pending => ExplainAction::Continue,
                     };
                 }
-                EnrichAction::Continue
+                ExplainAction::Continue
             }
-            EnrichStep::Review => {
+            ExplainStep::Review => {
                 let [submit_rect, finish_rect] = self.review_button_rects.get();
                 if contains_position(submit_rect, position) {
                     self.review_button = ReviewButton::Submit;
-                    return EnrichAction::Submit;
+                    return ExplainAction::Submit;
                 }
                 if contains_position(finish_rect, position) {
                     self.review_button = ReviewButton::Finish;
-                    return EnrichAction::Finish;
+                    return ExplainAction::Finish;
                 }
-                EnrichAction::Continue
+                ExplainAction::Continue
             }
-            EnrichStep::Confirm => {
+            ExplainStep::Confirm => {
                 let Some(dialog) = self.confirm.as_mut() else {
-                    return EnrichAction::Cancelled;
+                    return ExplainAction::Cancelled;
                 };
                 match dialog.handle_mouse_click(position) {
-                    ConfirmationOutcome::Confirmed => EnrichAction::Confirmed,
+                    ConfirmationOutcome::Confirmed => ExplainAction::Confirmed,
                     ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
-                        EnrichAction::Cancelled
+                        ExplainAction::Cancelled
                     }
-                    ConfirmationOutcome::Pending => EnrichAction::Continue,
+                    ConfirmationOutcome::Pending => ExplainAction::Continue,
                 }
             }
-            EnrichStep::Loading | EnrichStep::Opening | EnrichStep::Done => EnrichAction::Continue,
+            ExplainStep::Loading | ExplainStep::Opening | ExplainStep::Done => {
+                ExplainAction::Continue
+            }
         }
     }
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
-            EnrichStep::Loading => 3,
-            EnrichStep::Opening => 22,
-            EnrichStep::Done => {
+            ExplainStep::Loading => 3,
+            ExplainStep::Opening => 22,
+            ExplainStep::Done => {
                 // 3 (status indicator) + table + 1 (footer hint)
                 let table_rows = (self.summary_rows.len() as u16).min(12);
                 let table_height = if self.summary_rows.is_empty() {
@@ -676,12 +678,12 @@ impl EnrichPullRequestScreen {
                 };
                 (3 + table_height + 1).max(10)
             }
-            EnrichStep::Enriching => 25,
-            EnrichStep::Review => {
+            ExplainStep::Explaining => 25,
+            ExplainStep::Review => {
                 let body_rows = self.draft_body.is_some() as u16 * 4;
                 12u16.saturating_add(body_rows)
             }
-            EnrichStep::Confirm => self.confirm_view().content_height().max(18),
+            ExplainStep::Confirm => self.confirm_view().content_height().max(18),
         }
     }
 
@@ -693,7 +695,7 @@ impl EnrichPullRequestScreen {
                 .split(area);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!("Cannot enrich pull request: {err}"),
+                    format!("Cannot explain pull request: {err}"),
                     Style::default().fg(colors::ERROR),
                 )))
                 .wrap(ratatui::widgets::Wrap { trim: true }),
@@ -710,16 +712,16 @@ impl EnrichPullRequestScreen {
             return;
         }
         match self.step {
-            EnrichStep::Loading => {
-                StatusIndicator::new(Status::Loading, ENRICH_LOADING_MESSAGE)
+            ExplainStep::Loading => {
+                StatusIndicator::new(Status::Loading, EXPLAIN_LOADING_MESSAGE)
                     .with_tick(self.tick)
                     .render(frame, area);
             }
-            EnrichStep::Opening => self.render_opening(frame, area),
-            EnrichStep::Done => self.render_done(frame, area),
-            EnrichStep::Enriching => self.render_enriching(frame, area),
-            EnrichStep::Review => self.render_review(frame, area),
-            EnrichStep::Confirm => self.render_confirm(frame, area),
+            ExplainStep::Opening => self.render_opening(frame, area),
+            ExplainStep::Done => self.render_done(frame, area),
+            ExplainStep::Explaining => self.render_explaining(frame, area),
+            ExplainStep::Review => self.render_review(frame, area),
+            ExplainStep::Confirm => self.render_confirm(frame, area),
         }
     }
 
@@ -743,7 +745,7 @@ impl EnrichPullRequestScreen {
     fn render_done(&self, frame: &mut Frame, area: Rect) {
         let outcome = self.submit_outcome.as_ref();
         let (status, headline) = match outcome {
-            Some(EnrichSubmitOutcome::Created { number, url }) => {
+            Some(ExplainSubmitOutcome::Created { number, url }) => {
                 let msg = if *number > 0 {
                     format!("Pull request #{number} opened successfully!")
                 } else if !url.is_empty() {
@@ -753,14 +755,14 @@ impl EnrichPullRequestScreen {
                 };
                 (Status::Success, msg)
             }
-            Some(EnrichSubmitOutcome::Updated { number }) => (
+            Some(ExplainSubmitOutcome::Updated { number }) => (
                 Status::Success,
                 format!("Pull request #{number} updated successfully!"),
             ),
-            Some(EnrichSubmitOutcome::PushFailed(_)) => {
+            Some(ExplainSubmitOutcome::PushFailed(_)) => {
                 (Status::Error, "Failed to push the branch.".to_string())
             }
-            Some(EnrichSubmitOutcome::SubmitFailed(_)) => (
+            Some(ExplainSubmitOutcome::SubmitFailed(_)) => (
                 Status::Error,
                 "Failed to submit the pull request.".to_string(),
             ),
@@ -801,7 +803,7 @@ impl EnrichPullRequestScreen {
     }
 
     /// The shared confirm layout: labeled details, the `Will run:` preview,
-    /// and the single-role AI table for `ai.enrich`. Built in one place so
+    /// and the single-role AI table for `ai.explain`. Built in one place so
     /// [`Self::preferred_content_height`] and the render agree on the height.
     fn confirm_view(&self) -> PrConfirmView<'_> {
         PrConfirmView::new(confirm_title(&self.request))
@@ -809,7 +811,7 @@ impl EnrichPullRequestScreen {
             .block(build_detail_lines(&self.request))
             .steps(&build_steps(&self.request))
             .ai_roles(vec![AiRoleRow::new(
-                "enrich",
+                "explain",
                 colors::BRAND,
                 self.ai.model.clone(),
                 self.ai.thinking.clone(),
@@ -817,7 +819,7 @@ impl EnrichPullRequestScreen {
             .modal(self.confirm.as_ref())
     }
 
-    fn render_enriching(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_explaining(&mut self, frame: &mut Frame, area: Rect) {
         if area.height < 5 {
             StatusIndicator::new(Status::Loading, self.phase_message.clone())
                 .with_tick(self.tick)
@@ -1125,14 +1127,14 @@ impl EnrichPullRequestScreen {
     }
 }
 
-fn confirm_title(request: &EnrichPullRequestRequest) -> String {
+fn confirm_title(request: &ExplainPullRequestRequest) -> String {
     match request.number {
-        Some(number) => format!("Enrich & Update Pull Request #{number}?"),
-        None => "Enrich & Open Pull Request?".to_string(),
+        Some(number) => format!("Explain & Update Pull Request #{number}?"),
+        None => "Explain & Open Pull Request?".to_string(),
     }
 }
 
-fn build_confirm(request: &EnrichPullRequestRequest) -> ConfirmationModal {
+fn build_confirm(request: &ExplainPullRequestRequest) -> ConfirmationModal {
     let subtitle = match request.number {
         Some(number) => {
             format!("Draft a fresh description with AI and update pull request #{number}?")
@@ -1161,7 +1163,7 @@ fn build_finalize_modal() -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Confirm)
 }
 
-fn build_detail_lines(request: &EnrichPullRequestRequest) -> Vec<Line<'static>> {
+fn build_detail_lines(request: &ExplainPullRequestRequest) -> Vec<Line<'static>> {
     let mut rows: Vec<Line<'static>> = Vec::new();
 
     match request.number {
@@ -1257,7 +1259,7 @@ fn build_detail_lines(request: &EnrichPullRequestRequest) -> Vec<Line<'static>> 
 /// The `Will run:` step text for the confirm panel. The shared
 /// [`PrConfirmView`] owns the numbering + styling; the final step depends on
 /// whether an existing PR is being updated or a new one opened.
-fn build_steps(request: &EnrichPullRequestRequest) -> Vec<String> {
+fn build_steps(request: &ExplainPullRequestRequest) -> Vec<String> {
     let submit_step = match request.number {
         Some(number) => {
             format!("On confirm: `gh pr edit` #{number} (existing media preserved)")
@@ -1279,7 +1281,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn render_dump(screen: &mut EnrichPullRequestScreen, width: u16, height: u16) -> String {
+    fn render_dump(screen: &mut ExplainPullRequestScreen, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| screen.render(f, f.area())).unwrap();
@@ -1294,8 +1296,8 @@ mod tests {
             .join("\n")
     }
 
-    fn create_request() -> EnrichPullRequestRequest {
-        EnrichPullRequestRequest {
+    fn create_request() -> ExplainPullRequestRequest {
+        ExplainPullRequestRequest {
             branch: "digit-3131-retry".to_string(),
             worktree_path: "/tmp/repo-retry".to_string(),
             base_ref: None,
@@ -1307,8 +1309,8 @@ mod tests {
         }
     }
 
-    fn update_request() -> EnrichPullRequestRequest {
-        EnrichPullRequestRequest {
+    fn update_request() -> ExplainPullRequestRequest {
+        ExplainPullRequestRequest {
             branch: "digit-3131-retry".to_string(),
             worktree_path: "/tmp/repo-retry".to_string(),
             base_ref: None,
@@ -1322,7 +1324,7 @@ mod tests {
 
     fn test_ai() -> AiModelConfig {
         AiModelConfig {
-            model: "opencode/enrich-model".to_string(),
+            model: "opencode/explain-model".to_string(),
             thinking: "max".to_string(),
         }
     }
@@ -1333,15 +1335,15 @@ mod tests {
 
     #[test]
     fn starts_in_loading_without_base_ref() {
-        let screen = EnrichPullRequestScreen::new(create_request(), test_ai());
-        assert_eq!(screen.step(), EnrichStep::Loading);
+        let screen = ExplainPullRequestScreen::new(create_request(), test_ai());
+        assert_eq!(screen.step(), ExplainStep::Loading);
     }
 
     #[test]
     fn set_base_ref_moves_to_confirm_default_no() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
-        assert_eq!(screen.step(), EnrichStep::Confirm);
+        assert_eq!(screen.step(), ExplainStep::Confirm);
         assert_eq!(
             screen.confirm.as_ref().unwrap().selected(),
             ConfirmationChoice::Cancel
@@ -1350,85 +1352,94 @@ mod tests {
 
     #[test]
     fn esc_during_loading_cancels() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         assert_eq!(
             screen.handle_key(key(KeyCode::Esc)),
-            EnrichAction::Cancelled
+            ExplainAction::Cancelled
         );
     }
 
     #[test]
     fn enter_on_no_returns_cancelled() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         assert_eq!(
             screen.handle_key(key(KeyCode::Enter)),
-            EnrichAction::Cancelled
+            ExplainAction::Cancelled
         );
     }
 
     #[test]
     fn tab_then_enter_confirms() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
-        assert_eq!(screen.handle_key(key(KeyCode::Tab)), EnrichAction::Continue);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Tab)),
+            ExplainAction::Continue
+        );
         assert_eq!(
             screen.handle_key(key(KeyCode::Enter)),
-            EnrichAction::Confirmed
+            ExplainAction::Confirmed
         );
     }
 
     #[test]
-    fn enriching_enter_opens_finalize_then_confirms_review() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+    fn explaining_enter_opens_finalize_then_confirms_review() {
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
-        screen.start_enriching();
+        screen.start_explaining();
         // Enter on outer focus opens the finalize modal (no PTY in tests).
         assert_eq!(
             screen.handle_key(key(KeyCode::Enter)),
-            EnrichAction::Continue
+            ExplainAction::Continue
         );
         assert!(screen.finalize_confirm.is_some());
         // Yes is preselected → Enter confirms → ReadyToReview.
         assert_eq!(
             screen.handle_key(key(KeyCode::Enter)),
-            EnrichAction::ReadyToReview
+            ExplainAction::ReadyToReview
         );
         assert!(screen.finalize_confirm.is_none());
     }
 
     #[test]
-    fn enriching_esc_cancels() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+    fn explaining_esc_cancels() {
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
-        screen.start_enriching();
+        screen.start_explaining();
         assert_eq!(
             screen.handle_key(key(KeyCode::Esc)),
-            EnrichAction::Cancelled
+            ExplainAction::Cancelled
         );
     }
 
     #[test]
     fn review_buttons_drive_submit_and_finish() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.enter_review("My title".to_string(), "# Description".to_string(), vec![]);
-        assert_eq!(screen.step(), EnrichStep::Review);
+        assert_eq!(screen.step(), ExplainStep::Review);
         // Default focus is the submit button.
-        assert_eq!(screen.handle_key(key(KeyCode::Enter)), EnrichAction::Submit);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ExplainAction::Submit
+        );
         // Switch to Finish then confirm.
         assert_eq!(
             screen.handle_key(key(KeyCode::Right)),
-            EnrichAction::Continue
+            ExplainAction::Continue
         );
-        assert_eq!(screen.handle_key(key(KeyCode::Enter)), EnrichAction::Finish);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ExplainAction::Finish
+        );
         // Esc finishes from anywhere.
-        assert_eq!(screen.handle_key(key(KeyCode::Esc)), EnrichAction::Finish);
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), ExplainAction::Finish);
     }
 
     #[test]
     fn review_shows_title_and_open_button_for_new_pr() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.enter_review(
             "DIGIT-3131 Add retry".to_string(),
@@ -1443,7 +1454,7 @@ mod tests {
 
     #[test]
     fn review_shows_update_button_for_existing_pr() {
-        let mut screen = EnrichPullRequestScreen::new(update_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(update_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.enter_review("New title".to_string(), "body".to_string(), vec![]);
         let dump = render_dump(&mut screen, 100, 20);
@@ -1453,22 +1464,22 @@ mod tests {
 
     #[test]
     fn confirm_renders_steps_and_mode_for_new_pr() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         // Tall enough for the details + Will-run steps + AI table + modal.
         let dump = render_dump(&mut screen, 100, 32);
-        assert!(dump.contains("Enrich & Open Pull Request?"), "{dump}");
+        assert!(dump.contains("Explain & Open Pull Request?"), "{dump}");
         assert!(dump.contains("upstream/main"), "{dump}");
         assert!(dump.contains("git push"), "{dump}");
-        // The resolved enrich model appears in the "which AIs run" table.
-        assert!(dump.contains("opencode/enrich-model"), "{dump}");
+        // The resolved explain model appears in the "which AIs run" table.
+        assert!(dump.contains("opencode/explain-model"), "{dump}");
     }
 
     #[test]
     fn tick_pty_without_pty_is_noop() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
-        screen.start_enriching();
+        screen.start_explaining();
         assert!(!screen.tick_pty(None));
     }
 
@@ -1484,10 +1495,10 @@ mod tests {
     fn has_pty_tracks_spawn_and_teardown_edge() {
         // The App keys its "force a full terminal repaint" guard off this
         // edge: a torn-down PTY desyncs the inline `Viewport::Fixed` diff and
-        // bleeds scrollback into the Enrich "Done" header. Lock the signal in.
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        // bleeds scrollback into the Explain "Done" header. Lock the signal in.
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
-        screen.start_enriching();
+        screen.start_explaining();
         assert!(!screen.has_pty(), "no PTY before spawn");
 
         let Some(sleep) = resolve_on_path("sleep") else {
@@ -1509,26 +1520,26 @@ mod tests {
 
     #[test]
     fn set_error_shows_error_view() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_error("boom".to_string());
         assert_eq!(
             screen.handle_key(key(KeyCode::Char('x'))),
-            EnrichAction::Cancelled
+            ExplainAction::Cancelled
         );
         let dump = render_dump(&mut screen, 80, 6);
-        assert!(dump.contains("Cannot enrich pull request"), "{dump}");
+        assert!(dump.contains("Cannot explain pull request"), "{dump}");
     }
 
     #[test]
     fn done_renders_summary_table_on_success() {
-        let mut screen = EnrichPullRequestScreen::new(update_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(update_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_opening();
         screen.append_terminal_line(
             "$ gh pr edit #42 --title (skipped) --body <body> --add-assignee @me".to_string(),
             ActivityKind::Status,
         );
-        screen.enter_done(EnrichSubmitOutcome::Updated { number: 42 });
+        screen.enter_done(ExplainSubmitOutcome::Updated { number: 42 });
         let dump = render_dump(&mut screen, 100, 15);
         assert!(
             dump.contains("Pull request #42 updated successfully!"),
@@ -1541,14 +1552,14 @@ mod tests {
 
     #[test]
     fn done_renders_summary_table_on_push_failure() {
-        let mut screen = EnrichPullRequestScreen::new(create_request(), test_ai());
+        let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_opening();
         screen.append_terminal_line(
             "$ git push -u origin digit-3131-retry".to_string(),
             ActivityKind::Status,
         );
-        screen.enter_done(EnrichSubmitOutcome::PushFailed(
+        screen.enter_done(ExplainSubmitOutcome::PushFailed(
             "authentication failed".to_string(),
         ));
         let dump = render_dump(&mut screen, 100, 15);

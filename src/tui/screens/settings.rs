@@ -1141,7 +1141,7 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
         AiModelConfig { model, thinking }
     };
     AiConfig {
-        enrich: clean(&ai.enrich),
+        explain: clean(&ai.explain),
         fix: AiFixConfig {
             plan: clean(&ai.fix.plan),
             apply: clean(&ai.fix.apply),
@@ -1164,7 +1164,7 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
 /// sub-screen. Order matches the rectangles top-to-bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiSlot {
-    Enrich,
+    Explain,
     FixPlan,
     FixApply,
     Review,
@@ -1178,7 +1178,7 @@ pub enum AiSlot {
 
 impl AiSlot {
     pub const ALL: [AiSlot; 10] = [
-        AiSlot::Enrich,
+        AiSlot::Explain,
         AiSlot::FixPlan,
         AiSlot::FixApply,
         AiSlot::Review,
@@ -1192,7 +1192,7 @@ impl AiSlot {
 
     fn label(self) -> &'static str {
         match self {
-            AiSlot::Enrich => "enrich",
+            AiSlot::Explain => "explain",
             AiSlot::FixPlan => "fix_plan",
             AiSlot::FixApply => "fix_apply",
             AiSlot::Review => "review",
@@ -1207,7 +1207,7 @@ impl AiSlot {
 
     fn hint(self) -> &'static str {
         match self {
-            AiSlot::Enrich => "Drafts the PR title + description (Enrich)",
+            AiSlot::Explain => "Drafts the PR title + description (Explain)",
             AiSlot::FixPlan => "Plans review-comment fixes — pick a stronger model (Fix · plan)",
             AiSlot::FixApply => "Applies the approved fix live (Fix · apply)",
             AiSlot::Review => {
@@ -1235,7 +1235,7 @@ impl AiSlot {
 
     fn get(self, ai: &AiConfig) -> &AiModelConfig {
         match self {
-            AiSlot::Enrich => &ai.enrich,
+            AiSlot::Explain => &ai.explain,
             AiSlot::FixPlan => &ai.fix.plan,
             AiSlot::FixApply => &ai.fix.apply,
             AiSlot::Review => &ai.review,
@@ -1250,7 +1250,7 @@ impl AiSlot {
 
     fn get_mut(self, ai: &mut AiConfig) -> &mut AiModelConfig {
         match self {
-            AiSlot::Enrich => &mut ai.enrich,
+            AiSlot::Explain => &mut ai.explain,
             AiSlot::FixPlan => &mut ai.fix.plan,
             AiSlot::FixApply => &mut ai.fix.apply,
             AiSlot::Review => &mut ai.review,
@@ -1268,7 +1268,7 @@ impl AiSlot {
 /// the AI Settings editor.
 fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 10] {
     [
-        &ai.enrich,
+        &ai.explain,
         &ai.fix.plan,
         &ai.fix.apply,
         &ai.review,
@@ -6095,7 +6095,7 @@ mod tests {
         WorktreeConfig {
             dashboard: DashboardConfig {
                 ai: AiConfig {
-                    enrich: AiModelConfig::default(),
+                    explain: AiModelConfig::default(),
                     fix: AiFixConfig {
                         plan: AiModelConfig::default(),
                         apply: AiModelConfig::default(),
@@ -6341,7 +6341,7 @@ mod tests {
                 assert_eq!(cfg.ai.fix.plan.model, "openai/gpt-5.5");
                 assert_eq!(cfg.ai.fix.plan.thinking, "minimal");
                 // Untouched slots keep their per-command default.
-                assert_eq!(cfg.ai.enrich.model, "opencode-go/deepseek-v4-flash");
+                assert_eq!(cfg.ai.explain.model, "opencode-go/deepseek-v4-flash");
             }
             other => panic!("expected SaveDashboard, got {other:?}"),
         }
@@ -6455,7 +6455,7 @@ mod tests {
         assert_eq!(screen.step, SettingsStep::Dashboard);
         assert!(screen.ai_settings_editor.is_none());
         let dash = screen.dashboard_editor.as_ref().unwrap();
-        assert_eq!(dash.ai.enrich.model, "opencode/big-pickle");
+        assert_eq!(dash.ai.explain.model, "opencode/big-pickle");
         let idx = ai_field_index().unwrap();
         assert_eq!(dash.statuses[idx], DashboardRectStatus::Modified);
     }
