@@ -1244,10 +1244,10 @@ impl ReviewFinding {
             }
         }
         body.push_str(&format!(
-            "\n\n<p align=\"center\">\n{} [{} {}] [{}]\n</p>",
-            self.severity.emoji(),
+            "\n\n<p align=\"center\">\n[{} {}] [{} {}]\n</p>",
             category_emoji(&self.category),
             self.category,
+            self.severity.emoji(),
             self.severity.label()
         ));
         body
@@ -9802,7 +9802,7 @@ copy to src/copied_again.rs
         assert!(body.starts_with("### Hardcoded API key"));
         assert!(body.contains("Secrets in source leak through history."));
         assert!(body.contains("```suggestion\nlet key = env::var(\"API_KEY\")?;\n```"));
-        assert!(body.ends_with("<p align=\"center\">\n🔴 [🛡️ Security] [Critical]\n</p>"));
+        assert!(body.ends_with("<p align=\"center\">\n[🛡️ Security] [🔴 Critical]\n</p>"));
         // Inline comments don't repeat the path — GitHub anchors them.
         assert!(!body.contains("📄"));
     }
@@ -9826,7 +9826,31 @@ copy to src/copied_again.rs
         assert!(body.contains("📄 `src/auth.rs`"));
         assert!(!body.contains("```suggestion"));
         assert!(body.contains("**Proposed code:**\n```\nassert!(auth(bad).is_err());\n```"));
-        assert!(body.ends_with("<p align=\"center\">\n🟠 [🧪 Test] [High]\n</p>"));
+        assert!(body.ends_with("<p align=\"center\">\n[🧪 Test] [🟠 High]\n</p>"));
+    }
+
+    #[test]
+    fn review_finding_comment_body_places_each_severity_emoji_with_its_label() {
+        for (severity, emoji, label) in [
+            (ReviewSeverity::Critical, "🔴", "Critical"),
+            (ReviewSeverity::High, "🟠", "High"),
+            (ReviewSeverity::Medium, "🟡", "Medium"),
+            (ReviewSeverity::Low, "⚪", "Low"),
+        ] {
+            let finding = ReviewFinding {
+                category: "Code Smell".to_string(),
+                severity,
+                file: "src/lib.rs".to_string(),
+                start_line: None,
+                line: Some(1),
+                title: "Example finding".to_string(),
+                explanation: String::new(),
+                suggestion: None,
+            };
+            assert!(finding
+                .comment_body()
+                .ends_with(&format!("[🧹 Code Smell] [{emoji} {label}]\n</p>")));
+        }
     }
 
     #[test]
