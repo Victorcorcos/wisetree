@@ -4173,11 +4173,12 @@ impl DashboardService {
                 "review summary overview timed out after 30s",
             )),
             Ok(Err(err)) => Err(WisetreeError::other(err)),
-            Ok(Ok(output)) => validate_review_summary_overview(
-                &output,
-                group_findings_by_issue(posted).len(),
-            )
-            .ok_or_else(|| WisetreeError::other("review summary overview was not concise prose")),
+            Ok(Ok(output)) => {
+                validate_review_summary_overview(&output, group_findings_by_issue(posted).len())
+                    .ok_or_else(|| {
+                        WisetreeError::other("review summary overview was not concise prose")
+                    })
+            }
         };
         let usage = opencode_usage_for_title(title).await;
         make_attempt(result, usage)
