@@ -10933,7 +10933,7 @@ so the intent reads clearly.
 
     #[tokio::test]
     async fn develop_commit_section_propagates_staging_failure() {
-        let repo = initialized_temp_repo();
+        let repo = initialized_temp_repo_with_change();
         let service = dashboard_with_failing_git(&repo, "add", "staging failed");
 
         let error = service
@@ -10945,16 +10945,16 @@ so the intent reads clearly.
     }
 
     #[tokio::test]
-    async fn develop_commit_section_propagates_cached_diff_failure() {
-        let repo = initialized_temp_repo();
-        let service = dashboard_with_failing_git(&repo, "diff --cached --name-only", "diff failed");
+    async fn develop_commit_section_propagates_status_failure() {
+        let repo = initialized_temp_repo_with_change();
+        let service = dashboard_with_failing_git(&repo, "status", "status failed");
 
         let error = service
             .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("diff failed"));
+        assert!(error.to_string().contains("status failed"));
     }
 
     #[tokio::test]

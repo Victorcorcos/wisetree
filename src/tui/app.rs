@@ -9114,6 +9114,7 @@ fn kick_off_develop_check(
 
 /// Commit one finished section as a checkpoint (opt-in). A missing git root
 /// reports the error; the pipeline treats a commit failure as non-fatal.
+#[allow(clippy::too_many_arguments)]
 fn kick_off_develop_commit(
     git_root: Option<String>,
     config: DashboardConfig,
@@ -12012,6 +12013,7 @@ mod tests {
                     AppEvent::DevelopCommitted {
                         operation_id,
                         result,
+                        ..
                     } => {
                         assert!(!commit_requested, "commit should be requested exactly once");
                         assert_eq!(operation_id, 1);
@@ -12270,6 +12272,7 @@ mod tests {
             let output = "test foo::bar ... FAILED\nassertion `left == right` failed".to_string();
             app.apply_develop_checked(
                 1,
+                1,
                 DevelopCheckOutcome::Failed {
                     output: output.clone(),
                 },
@@ -12385,6 +12388,7 @@ mod tests {
 
             app.apply_develop_prepared(
                 1,
+                0,
                 Err("terminal preparation failed".to_string()),
                 &app_event_tx(),
             );
@@ -12407,6 +12411,7 @@ mod tests {
 
             app.apply_develop_prepared(
                 1,
+                0,
                 Ok(Box::new(DevelopPreflightOutcome::AiNotConfigured)),
                 &app_event_tx(),
             );
@@ -12429,6 +12434,7 @@ mod tests {
 
             app.apply_develop_prepared(
                 1,
+                0,
                 Ok(Box::new(DevelopPreflightOutcome::AiUnavailable)),
                 &app_event_tx(),
             );
@@ -12452,6 +12458,7 @@ mod tests {
 
             app.apply_develop_prepared(
                 1,
+                0,
                 Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
                     DevelopPreflight {
                         base_ref: Some("main".to_string()),
@@ -12476,6 +12483,7 @@ mod tests {
 
             app.apply_develop_prepared(
                 1,
+                0,
                 Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
                     DevelopPreflight {
                         base_ref: Some("main".to_string()),
@@ -12513,6 +12521,7 @@ mod tests {
 
             app.apply_develop_prepared(
                 1,
+                0,
                 Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
                     DevelopPreflight {
                         base_ref: Some("main".to_string()),
@@ -12801,7 +12810,7 @@ mod tests {
                 cwd: repo.clone(),
             };
 
-            app.apply_develop_plan_ready(1, true, Ok(Box::new(handoff)));
+            app.apply_develop_plan_ready(1, 0, true, Ok(Box::new(handoff)));
 
             let screen = app.develop_pr.as_ref().unwrap();
             assert!(app.develop_watch.is_some(), "watcher should be installed");
@@ -12820,7 +12829,7 @@ mod tests {
             let repo = develop_repo(home);
             let mut app = develop_app(&repo);
 
-            app.apply_develop_plan_ready(1, false, Err("planning handoff failed".to_string()));
+            app.apply_develop_plan_ready(1, 0, false, Err("planning handoff failed".to_string()));
 
             let screen = app.develop_pr.as_ref().unwrap();
             assert!(
@@ -12845,7 +12854,7 @@ mod tests {
                 cwd: repo.clone(),
             };
 
-            app.apply_develop_implement_ready(1, Some(0), Ok(Box::new(handoff)));
+            app.apply_develop_implement_ready(1, 0, Some(0), Vec::new(), Ok(Box::new(handoff)));
 
             let screen = app.develop_pr.as_ref().unwrap();
             assert!(app.develop_watch.is_some(), "watcher should be installed");
@@ -12864,7 +12873,9 @@ mod tests {
 
             app.apply_develop_implement_ready(
                 1,
+                0,
                 Some(0),
+                Vec::new(),
                 Err("implementation handoff failed".to_string()),
             );
 
@@ -12931,11 +12942,11 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (worktree_path, operation_id) = preflight_request();
 
-        kick_off_develop_preflight(None, config(), worktree_path, operation_id, tx);
+        kick_off_develop_preflight(None, config(), worktree_path, operation_id, 1, tx);
 
         assert!(matches!(
             rx.recv().await.unwrap(),
-            AppEvent::DevelopPrepared { operation_id: _, result: Err(message) }
+            AppEvent::DevelopPrepared { result: Err(message), .. }
                 if message == "Could not resolve git root."
         ));
     }
@@ -12945,7 +12956,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (req, operation_id) = plan_request();
 
-        kick_off_develop_prepare_plan(None, config(), req, operation_id, tx);
+        kick_off_develop_prepare_plan(None, config(), req, operation_id, 1, tx);
 
         assert!(matches!(
             rx.recv().await.unwrap(),
@@ -12959,7 +12970,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (req, operation_id) = implementation_request();
 
-        kick_off_develop_prepare_implement(None, config(), req, operation_id, tx);
+        kick_off_develop_prepare_implement(None, config(), req, operation_id, 1, tx);
 
         assert!(matches!(
             rx.recv().await.unwrap(),
@@ -12973,13 +12984,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (worktree_path, operation_id) = check_request();
 
-        kick_off_develop_check(None, config(), worktree_path, operation_id, tx);
+        kick_off_develop_check(None, config(), worktree_path, operation_id, 1, tx);
 
         assert!(matches!(
             rx.recv().await.unwrap(),
             AppEvent::DevelopChecked {
-                operation_id: _,
-                outcome: DevelopCheckOutcome::Failed { output }
+                outcome: DevelopCheckOutcome::Failed { output },
+                ..
             } if output == "Could not resolve git root."
         ));
     }
@@ -12989,7 +13000,16 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (worktree_path, subject, operation_id) = commit_request();
 
-        kick_off_develop_commit(None, config(), worktree_path, subject, operation_id, tx);
+        kick_off_develop_commit(
+            None,
+            config(),
+            worktree_path,
+            subject,
+            Vec::new(),
+            operation_id,
+            1,
+            tx,
+        );
 
         assert!(matches!(
             rx.recv().await.unwrap(),

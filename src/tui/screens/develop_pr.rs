@@ -623,9 +623,7 @@ impl DevelopPullRequestScreen {
     /// failure/recovery state instead of treating every completed PTY as
     /// successful.
     pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> Option<i32> {
-        let Some(pty) = self.pty.as_mut() else {
-            return None;
-        };
+        let pty = self.pty.as_mut()?;
         if let Some((rows, cols)) = panel_inner {
             pty.resize(rows, cols);
         }
