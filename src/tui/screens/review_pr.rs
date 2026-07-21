@@ -104,7 +104,8 @@ pub enum ReviewStep {
     /// Deterministic edit form for the current finding — no AI, no tokens.
     EditFinding,
     OtherInput,
-    /// The deterministic review summary + Request changes / Comment / Skip.
+    /// The review summary + Request changes / Comment / Skip. Its overview is
+    /// utility-generated when possible; rows and charts remain deterministic.
     Summary,
     Done,
 }
@@ -1068,6 +1069,12 @@ impl ReviewPullRequestScreen {
         self.scanning = false;
     }
 
+    pub fn start_generating_summary(&mut self) {
+        self.step = ReviewStep::Working;
+        self.phase_message = "Writing the review summary overview...".to_string();
+        self.scanning = false;
+    }
+
     /// Record a per-finding outcome as a colored summary-table row.
     pub fn record_outcome(&mut self, outcome: ReviewRowOutcome) {
         let n = self.current + 1;
@@ -1100,8 +1107,8 @@ impl ReviewPullRequestScreen {
         self.current < self.findings.len()
     }
 
-    /// Walkthrough finished with posted comments: show the deterministic
-    /// summary and the Request changes / Comment / Skip choice.
+    /// Walkthrough finished with posted comments: show the assembled summary
+    /// and the Request changes / Comment / Skip choice.
     pub fn enter_summary(&mut self, body: String) {
         self.summary_body = body;
         self.summary_button = SummaryButton::Comment;
@@ -2449,7 +2456,7 @@ const REVIEW_STEPS: [&str; 7] = [
     "AI scans files in parallel; one whole-diff pass alone judges test coverage",
     "You choose Post / Edit / Other / Skip per finding (Edit is AI-free)",
     "Approved findings are posted as inline PR comments (with suggestions)",
-    "A review summary is assembled from the posted comments (no AI)",
+    "A utility AI writes the summary overview; rows and charts stay deterministic",
     "You choose Request changes / Comment / Skip for the summary",
 ];
 

@@ -89,6 +89,7 @@ const FIX_CODE_MAX_BYTES: usize = 24_000;
 const REVIEW_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_SCAN_TIMEOUT: Duration = Duration::from_secs(240);
+const REVIEW_SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_POST_TIMEOUT: Duration = Duration::from_secs(30);
 /// GitHub's API occasionally answers a healthy PR with a transient 5xx (a
 /// blip in their infra, not a real problem with the PR or its diff). Retried
@@ -1187,6 +1188,14 @@ pub struct ReviewScanAttempt {
 #[derive(Debug)]
 pub struct ReviewVerificationAttempt {
     pub result: Result<ReviewVerification>,
+    pub telemetry: ReviewScanTelemetry,
+}
+
+/// One utility-model attempt to write the prose opening of the otherwise
+/// deterministic review summary.
+#[derive(Debug)]
+pub struct ReviewSummaryAttempt {
+    pub result: Result<String>,
     pub telemetry: ReviewScanTelemetry,
 }
 
@@ -4100,6 +4109,78 @@ impl DashboardService {
             raw_output,
             &selection,
         )
+    }
+
+    /// Generate only the prose overview for already-posted findings. The
+    /// summary table and charts stay deterministic and are never model input.
+    pub async fn generate_review_summary_overview(
+        &self,
+        worktree_path: &str,
+        posted: &[ReviewFinding],
+    ) -> ReviewSummaryAttempt {
+        let started = Instant::now();
+        let prompt = build_review_summary_prompt(posted);
+        let prompt_bytes = prompt.len();
+        let selection = self.review_model_selection(ReviewModelProfile::Utility);
+        let make_attempt =
+            |result: Result<String>, usage: Option<ReviewTokenUsage>| ReviewSummaryAttempt {
+                result,
+                telemetry: ReviewScanTelemetry {
+                    scan: "summary".to_string(),
+                    scan_role: "summary".to_string(),
+                    retry_role: "initial".to_string(),
+                    model_profile: selection.profile.label().to_string(),
+                    model: selection.model.clone(),
+                    thinking: selection.thinking.clone(),
+                    prompt_bytes,
+                    usage: usage.unwrap_or_default(),
+                    duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    findings: group_findings_by_issue(posted).len(),
+                },
+            };
+        if selection.model.is_empty() {
+            return make_attempt(
+                Err(WisetreeError::other(
+                    "ai.review.utility model is not configured.",
+                )),
+                None,
+            );
+        }
+        let title = review_scan_title();
+        let mut args = vec![
+            "run".to_string(),
+            prompt,
+            "-m".to_string(),
+            selection.model.clone(),
+            "--agent".to_string(),
+            "plan".to_string(),
+            "--title".to_string(),
+            title.clone(),
+        ];
+        args.extend(run_variant_args(&selection.thinking));
+        let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = match time::timeout(
+            REVIEW_SUMMARY_TIMEOUT,
+            run_command(
+                &self.opencode_binary,
+                &args_ref,
+                Some(Path::new(worktree_path)),
+            ),
+        )
+        .await
+        {
+            Err(_) => Err(WisetreeError::other(
+                "review summary overview timed out after 30s",
+            )),
+            Ok(Err(err)) => Err(WisetreeError::other(err)),
+            Ok(Ok(output)) => validate_review_summary_overview(
+                &output,
+                group_findings_by_issue(posted).len(),
+            )
+            .ok_or_else(|| WisetreeError::other("review summary overview was not concise prose")),
+        };
+        let usage = opencode_usage_for_title(title).await;
+        make_attempt(result, usage)
     }
 
     /// Post one approved finding to the PR — inline when it carries a
@@ -9058,18 +9139,22 @@ fn category_emoji(category: &str) -> &'static str {
 }
 
 /// Build the review-summary markdown from the findings that were actually
-/// posted — a fixed template over structured data, zero AI involvement.
+/// posted. The overview defaults to deterministic prose; table and chart data
+/// always come from the structured findings.
 /// Findings that share an issue title collapse into one row so the table stays
 /// scannable; the "Location" cell then lists each location the issue occurs at.
 pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
+    build_review_summary_with_overview(posted, &deterministic_review_summary_overview(posted))
+}
+
+pub fn build_review_summary_with_overview(posted: &[ReviewFinding], overview: &str) -> String {
     let groups = group_findings_by_issue(posted);
-    let noun = if groups.len() == 1 { "issue" } else { "issues" };
+    let overview = validate_review_summary_overview(overview, groups.len())
+        .unwrap_or_else(|| deterministic_review_summary_overview(posted));
     let mut body = format!(
-        "## Review Summary\n\nI reviewed this PR and found {} {noun} that should be \
-          addressed before merge.\n\n### Requested Improvements\n\n\
+        "## Review Summary\n\n{overview}\n\n### Requested Improvements\n\n\
           | Type | Level | Issue | Location |\n\
           | --- | --- | --- | --- |\n",
-        groups.len()
     );
     for group in &groups {
         // Each location is one code span. Kept whole (not hard-broken): GitHub
@@ -9100,6 +9185,95 @@ pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
         groups.iter().map(|group| group.severity.label()),
     ));
     body
+}
+
+fn deterministic_review_summary_overview(posted: &[ReviewFinding]) -> String {
+    let groups = group_findings_by_issue(posted);
+    let count = groups.len();
+    let noun = if count == 1 { "issue" } else { "issues" };
+    let types = unique_summary_values(groups.iter().map(|group| group.category.as_str()));
+    let levels = unique_summary_values(groups.iter().map(|group| group.severity.label()));
+    let highest = groups
+        .iter()
+        .min_by_key(|group| group.severity.rank())
+        .map(|group| format!("The most urgent concern is {}.", group.title))
+        .unwrap_or_default();
+    format!(
+        "I found {count} {noun} that should be addressed before merge. The review covers {} concerns at {} level{}.{highest}",
+        human_list(&types),
+        human_list(&levels),
+        if levels.len() == 1 { "" } else { "s" },
+    )
+}
+
+fn build_review_summary_prompt(posted: &[ReviewFinding]) -> String {
+    const SUMMARY_PROMPT: &str = include_str!("../../prompts/reviewer_summary.md");
+    let groups = group_findings_by_issue(posted);
+    let types = unique_summary_values(groups.iter().map(|group| group.category.as_str()));
+    let levels = unique_summary_values(groups.iter().map(|group| group.severity.label()));
+    let findings = groups
+        .iter()
+        .map(|group| {
+            format!(
+                "- [{}] [{}] {}",
+                group.severity.label(),
+                group.category,
+                group.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    substitute_review_prompt(
+        SUMMARY_PROMPT,
+        &[(
+            "SUMMARY_FACTS",
+            &format!(
+                "Exact issue count: {}\nRepresented types: {}\nRepresented levels: {}\nApproved issues:\n{}",
+                groups.len(),
+                types.join(", "),
+                levels.join(", "),
+                findings,
+            ),
+        )],
+    )
+}
+
+fn validate_review_summary_overview(value: &str, issue_count: usize) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 700
+        || value.contains('\n')
+        || value.contains('|')
+        || value.contains("```")
+        || value.starts_with('#')
+        || value.starts_with('-')
+    {
+        return None;
+    }
+    let exact_count = format!(
+        "{issue_count} issue{}",
+        if issue_count == 1 { "" } else { "s" }
+    );
+    if !value.contains(&exact_count) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn unique_summary_values<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn human_list(values: &[String]) -> String {
+    match values {
+        [] => "no recorded".to_string(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// Render a Mermaid pie chart from grouped issue values. Labels are normalized
@@ -9917,6 +10091,65 @@ copy to src/copied_again.rs
         assert!(!body.contains("### Notes"));
         assert!(body.contains("### Issues by Type\n\n```mermaid\npie showData\n    title Issues by Type\n    \"Performance\" : 1\n```"));
         assert!(body.contains("### Issues by Level\n\n```mermaid\npie showData\n    title Issues by Level\n    \"High\" : 1\n```"));
+    }
+
+    #[test]
+    fn summary_overview_prompt_uses_only_approved_grouped_findings() {
+        let posted = vec![ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: "src/auth.rs".to_string(),
+            start_line: None,
+            line: Some(9),
+            title: "Authorization is skipped".to_string(),
+            explanation: "untrusted detail is intentionally excluded".to_string(),
+            suggestion: None,
+        }];
+        let prompt = build_review_summary_prompt(&posted);
+        assert!(prompt.contains("Exact issue count: 1"));
+        assert!(prompt.contains("Represented types: Security"));
+        assert!(prompt.contains("Represented levels: High"));
+        assert!(prompt.contains("[High] [Security] Authorization is skipped"));
+        assert!(!prompt.contains("untrusted detail is intentionally excluded"));
+        assert!(prompt.contains("Do not add, remove, merge"));
+    }
+
+    #[test]
+    fn summary_overview_validation_rejects_non_prose_and_falls_back_to_exact_facts() {
+        assert_eq!(
+            validate_review_summary_overview(
+                "I found 1 issue: the authorization check needs attention.",
+                1,
+            ),
+            Some("I found 1 issue: the authorization check needs attention.".to_string())
+        );
+        assert!(validate_review_summary_overview("## Heading", 1).is_none());
+        assert!(validate_review_summary_overview("- A list item", 1).is_none());
+        assert!(validate_review_summary_overview("Two lines\nare not allowed.", 1).is_none());
+
+        let posted = vec![ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: "src/auth.rs".to_string(),
+            start_line: None,
+            line: Some(9),
+            title: "Authorization is skipped".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        }];
+        let body = build_review_summary_with_overview(&posted, "## malformed");
+        assert!(body.contains("I found 1 issue that should be addressed before merge."));
+        assert!(body.contains("Security concerns at High level."));
+    }
+
+    #[test]
+    fn summary_generation_selects_the_utility_profile() {
+        let mut config = DashboardConfig::default();
+        config.ai.review.utility.model = "utility/model".to_string();
+        let service = DashboardService::new(PathBuf::new(), config);
+        let selection = service.review_model_selection(ReviewModelProfile::Utility);
+        assert_eq!(selection.profile, ReviewModelProfile::Utility);
+        assert_eq!(selection.model, "utility/model");
     }
 
     #[test]

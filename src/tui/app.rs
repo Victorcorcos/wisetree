@@ -34,16 +34,16 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::dashboard::{review_feedback_needs_expanded_context, ReviewRevisionMode};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
-    build_review_summary, check_for_updates_all_sources, compute_attempt_changes,
-    default_dashboard_warning, detect_shell_integration, fetch_free_opencode_models,
-    fetch_opencode_model_variants, fetch_opencode_models, install_shell_integration,
-    parse_pull_request_md, resolve_dashboard_columns, AiStatus, AttemptChanges, BugHypothesis,
-    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
-    CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
-    DashboardWatch, ExplainPreparation, ExplainSubmitOutcome, ExplainSubmitRequest,
-    FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult,
-    MultiSourceUpdateResult, OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState,
-    ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
+    build_review_summary, build_review_summary_with_overview, check_for_updates_all_sources,
+    compute_attempt_changes, default_dashboard_warning, detect_shell_integration,
+    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
+    install_shell_integration, parse_pull_request_md, resolve_dashboard_columns, AiStatus,
+    AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
+    BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
+    DashboardService, DashboardUpdate, DashboardWatch, ExplainPreparation, ExplainSubmitOutcome,
+    ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
+    JudgeResult, MultiSourceUpdateResult, OpencodeModel, OpencodeTurn, OpencodeTurnWatcher,
+    PrState, ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
     ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
     UpdatePhase, UpdateProgress, UpdateSource,
 };
@@ -223,6 +223,12 @@ enum AppEvent {
     ReviewPrPosted {
         index: usize,
         result: Result<(), String>,
+    },
+    /// The utility model generated (or failed to generate) the prose-only
+    /// overview that precedes the deterministic summary data.
+    ReviewPrSummaryGenerated {
+        result: Result<String, String>,
+        telemetry: Option<ReviewScanTelemetry>,
     },
     /// The review summary submission finished.
     ReviewPrSummarySubmitted {
@@ -2816,11 +2822,10 @@ impl App {
         }
     }
 
-    /// Advance the walkthrough to the next finding, or close it: with posted
-    /// comments the deterministic summary is shown, otherwise straight to
-    /// the final report.
+    /// Advance the walkthrough to the next finding, or close it: posted
+    /// comments first get a utility-written overview, then the deterministic
+    /// summary; otherwise go straight to the final report.
     fn advance_review_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
-        let _ = tx;
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
@@ -2829,9 +2834,39 @@ impl App {
         } else if screen.posted_findings().is_empty() {
             screen.enter_done();
         } else {
-            let body = build_review_summary(screen.posted_findings());
-            screen.enter_summary(body);
+            let worktree_path = screen.request().worktree_path.clone();
+            let posted = screen.posted_findings().to_vec();
+            screen.start_generating_summary();
+            kick_off_generate_review_summary(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                worktree_path,
+                posted,
+                tx.clone(),
+            );
         }
+    }
+
+    fn apply_review_pr_summary_generated(
+        &mut self,
+        result: Result<String, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    ) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if screen.step() != crate::tui::screens::review_pr::ReviewStep::Working {
+            return;
+        }
+        if let Some(telemetry) = telemetry {
+            screen.record_scan_telemetry(telemetry);
+        }
+        let posted = screen.posted_findings();
+        let body = match result {
+            Ok(overview) => build_review_summary_with_overview(posted, &overview),
+            Err(_) => build_review_summary(posted),
+        };
+        screen.enter_summary(body);
     }
 
     fn fail_review(
@@ -5310,6 +5345,9 @@ impl App {
             AppEvent::ReviewPrPosted { index, result } => {
                 self.apply_review_pr_posted(index, result, tx)
             }
+            AppEvent::ReviewPrSummaryGenerated { result, telemetry } => {
+                self.apply_review_pr_summary_generated(result, telemetry)
+            }
             AppEvent::ReviewPrSummarySubmitted {
                 request_changes,
                 result,
@@ -7777,6 +7815,33 @@ struct ReviewPostRequest {
     index: usize,
 }
 
+fn kick_off_generate_review_summary(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    posted: Vec<ReviewFinding>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrSummaryGenerated {
+            result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let attempt = service
+            .generate_review_summary_overview(&worktree_path, &posted)
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrSummaryGenerated {
+            result,
+            telemetry: Some(attempt.telemetry),
+        });
+    });
+}
+
 fn kick_off_prepare_review(
     git_root: Option<String>,
     config: DashboardConfig,
@@ -9142,6 +9207,45 @@ mod tests {
             crate::tui::screens::review_pr::ReviewStep::Done
         );
         assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 3);
+    }
+
+    #[test]
+    fn summary_generation_transitions_to_preview_and_falls_back_on_failure() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![ReviewFinding {
+            category: "Security".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Authorization is skipped".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        }]);
+        screen.finish_scanning();
+        screen.record_outcome(ReviewRowOutcome::Posted);
+        let tx = app_event_tx();
+        app.advance_review_finding(&tx);
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Working
+        );
+
+        app.apply_review_pr_summary_generated(
+            Err("utility unavailable".to_string()),
+            Some(ReviewScanTelemetry {
+                model_profile: "utility".to_string(),
+                ..review_test_telemetry("summary")
+            }),
+        );
+        let screen = app.review_pr.as_ref().unwrap();
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Summary
+        );
+        assert!(screen.summary_body().contains("I found 1 issue"));
+        assert_eq!(screen.scan_telemetry_len(), 1);
     }
 
     #[test]
