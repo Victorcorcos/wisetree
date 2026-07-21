@@ -3658,7 +3658,10 @@ impl DashboardService {
         // Compute the current dirty files and drop anything that was already
         // dirty before this section started or is harness-owned output.
         let status = self
-            .develop_git(&cwd, &["status", "--porcelain=v2", "-z", "--untracked-files=all"])
+            .develop_git(
+                &cwd,
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            )
             .await
             .map_err(WisetreeError::other)?;
         let current = parse_porcelain_v2(&status);
@@ -3701,7 +3704,10 @@ impl DashboardService {
     pub async fn develop_dirty_files(&self, worktree_path: &str) -> Result<Vec<String>> {
         let cwd = PathBuf::from(worktree_path);
         let status = self
-            .develop_git(&cwd, &["status", "--porcelain=v2", "-z", "--untracked-files=all"])
+            .develop_git(
+                &cwd,
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            )
             .await
             .map_err(WisetreeError::other)?;
         let parsed = parse_porcelain_v2(&status);
@@ -10885,7 +10891,11 @@ so the intent reads clearly.
         std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
 
         let sha = service
-            .develop_commit_section(repo_str, &develop_commit_subject(Some((2, "Exporter"))), &[])
+            .develop_commit_section(
+                repo_str,
+                &develop_commit_subject(Some((2, "Exporter"))),
+                &[],
+            )
             .await
             .expect("commit ok")
             .expect("a commit was made");
@@ -10909,7 +10919,11 @@ so the intent reads clearly.
         // Only the harness-owned plan file changed → nothing to checkpoint.
         std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
         let sha = service
-            .develop_commit_section(repo_str, &develop_commit_subject(Some((1, "Data model"))), &[])
+            .develop_commit_section(
+                repo_str,
+                &develop_commit_subject(Some((1, "Data model"))),
+                &[],
+            )
             .await
             .expect("commit ok");
         assert_eq!(sha, None);
