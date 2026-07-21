@@ -41,7 +41,7 @@ pub struct DevelopPlan {
     pub complexity: u8,
     /// A Mermaid `mindmap` body (raw, unfenced) surveying the whole task,
     /// emitted by the plan AI only for significant work (complexity ≥ 5) and
-    /// rendered under the `# Overview` heading. `None` for smaller tasks.
+    /// rendered under the `## Overview` heading. `None` for smaller tasks.
     pub overview: Option<String>,
     pub sections: Vec<PlanSection>,
     /// Cross-run learnings ledger — the Ralph-canon `fix_plan.md` discovery
@@ -263,7 +263,7 @@ fn checkbox_lines(field: &str) -> String {
 // ── PLAN.md renderer + resume parser ────────────────────────────────────
 
 const TASK_HEADING: &str = "## Task Description";
-const OVERVIEW_HEADING: &str = "# Overview";
+const OVERVIEW_HEADING: &str = "## Overview";
 const SECTIONS_HEADING: &str = "## Implementation Sections";
 const TRACKER_HEADING: &str = "## Progress Tracker";
 const NOTES_HEADING: &str = "## Section Notes";
@@ -361,7 +361,7 @@ pub fn parse_plan_md(content: &str) -> Option<DevelopPlan> {
         .parse()
         .ok()?;
 
-    // Overview: the optional `# Overview` heading between the complexity line
+    // Overview: the optional `## Overview` heading between the complexity line
     // and the sections, whose fenced `mermaid` block holds the mindmap body.
     // Absent for small tasks.
     let overview = parse_overview_section(&lines[complexity_idx..sections_idx]);
@@ -425,7 +425,7 @@ pub fn parse_plan_md(content: &str) -> Option<DevelopPlan> {
     })
 }
 
-/// Recover the Mermaid mindmap body from a rendered plan's `# Overview`
+/// Recover the Mermaid mindmap body from a rendered plan's `## Overview`
 /// section: the lines between its ```` ```mermaid ```` fence and the closing
 /// ```` ``` ````. Returns `None` when the heading, either fence, or a
 /// non-empty body is missing — the inverse of [`render_plan_md`]'s overview
@@ -865,15 +865,15 @@ CRITERIA: - c";
         let mut plan = plan();
         plan.overview = Some(MINDMAP.to_string());
         let rendered = render_plan_md(&plan);
-        // The mindmap lands in a fenced mermaid block under `# Overview`,
+        // The mindmap lands in a fenced mermaid block under `## Overview`,
         // ahead of the implementation sections.
         assert!(
-            rendered.contains("# Overview\n\n```mermaid\n"),
+            rendered.contains("## Overview\n\n```mermaid\n"),
             "{rendered}"
         );
         assert!(rendered.contains("  root((CSV export))"), "{rendered}");
         assert!(
-            rendered.find("# Overview").unwrap()
+            rendered.find("## Overview").unwrap()
                 < rendered.find("## Implementation Sections").unwrap(),
             "{rendered}"
         );
@@ -885,7 +885,7 @@ CRITERIA: - c";
     #[test]
     fn absent_overview_omits_the_heading_and_round_trips() {
         let rendered = render_plan_md(&plan());
-        assert!(!rendered.contains("# Overview"), "{rendered}");
+        assert!(!rendered.contains("## Overview"), "{rendered}");
         assert!(!rendered.contains("```mermaid"), "{rendered}");
         assert_eq!(parse_plan_md(&rendered).unwrap().overview, None);
     }
