@@ -9060,15 +9060,15 @@ fn category_emoji(category: &str) -> &'static str {
 /// Build the review-summary markdown from the findings that were actually
 /// posted — a fixed template over structured data, zero AI involvement.
 /// Findings that share an issue title collapse into one row so the table stays
-/// scannable; the "Where?" cell then lists each location the issue occurs at.
+/// scannable; the "Location" cell then lists each location the issue occurs at.
 pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
     let groups = group_findings_by_issue(posted);
     let noun = if groups.len() == 1 { "issue" } else { "issues" };
     let mut body = format!(
         "## Review Summary\n\nI reviewed this PR and found {} {noun} that should be \
-         addressed before merge.\n\n### Requested Improvements\n\n\
-         | Type | Issue | Level | Where? |\n\
-         | --- | --- | --- | --- |\n",
+          addressed before merge.\n\n### Requested Improvements\n\n\
+          | Type | Level | Issue | Location |\n\
+          | --- | --- | --- | --- |\n",
         groups.len()
     );
     for group in &groups {
@@ -9084,12 +9084,50 @@ pub fn build_review_summary(posted: &[ReviewFinding]) -> String {
         body.push_str(&format!(
             "| {} | {} | {} | {} |\n",
             category_emoji(&group.category),
+            group.severity.emoji(),
             md_table_cell(&group.title),
-            md_table_cell(group.severity.label()),
             where_cell,
         ));
     }
+    body.push_str("\n### Issues by Type\n\n");
+    body.push_str(&mermaid_pie_chart(
+        "Issues by Type",
+        groups.iter().map(|group| group.category.as_str()),
+    ));
+    body.push_str("\n\n### Issues by Level\n\n");
+    body.push_str(&mermaid_pie_chart(
+        "Issues by Level",
+        groups.iter().map(|group| group.severity.label()),
+    ));
     body
+}
+
+/// Render a Mermaid pie chart from grouped issue values. Labels are normalized
+/// to one line and quoted so unexpected category text cannot break the chart.
+fn mermaid_pie_chart<'a>(title: &str, values: impl Iterator<Item = &'a str>) -> String {
+    let mut counts = BTreeMap::new();
+    for value in values {
+        *counts.entry(mermaid_pie_label(value)).or_insert(0usize) += 1;
+    }
+    let mut chart = format!("```mermaid\npie showData\n    title {title}\n");
+    for (label, count) in counts {
+        chart.push_str(&format!("    \"{label}\" : {count}\n"));
+    }
+    chart.push_str("```");
+    chart
+}
+
+fn mermaid_pie_label(value: &str) -> String {
+    let label = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'");
+    if label.is_empty() {
+        "Unknown".to_string()
+    } else {
+        label
+    }
 }
 
 /// One summary-table row: an issue (by title) with every location it was
@@ -9871,12 +9909,14 @@ copy to src/copied_again.rs
         assert!(body.contains("found 1 issue that should be addressed"));
         assert!(!body.contains("issue(s)"));
         // "Issue" column, title only — the explanation stays out of the table.
-        assert!(body.contains("| Type | Issue | Level | Where? |"));
+        assert!(body.contains("| Type | Level | Issue | Location |"));
         // The Type column shows the category emoji alone.
-        assert!(body.contains("| 🚀 | N+1 query in loop | High | `src/db.rs:23` |"));
+        assert!(body.contains("| 🚀 | 🟠 | N+1 query in loop | `src/db.rs:23` |"));
         assert!(!body.contains("each iteration hits the DB again"));
         // The redundant Notes section is gone.
         assert!(!body.contains("### Notes"));
+        assert!(body.contains("### Issues by Type\n\n```mermaid\npie showData\n    title Issues by Type\n    \"Performance\" : 1\n```"));
+        assert!(body.contains("### Issues by Level\n\n```mermaid\npie showData\n    title Issues by Level\n    \"High\" : 1\n```"));
     }
 
     #[test]
@@ -9899,7 +9939,10 @@ copy to src/copied_again.rs
         // Two findings, one shared issue → one row, counted as a single issue.
         assert!(body.contains("found 1 issue that should be addressed"));
         // Both locations in one cell, each on its own line; highest severity wins.
-        assert!(body.contains("| 🧪 | Missing coverage | High | `src/a.rs:12`<br>`src/b.rs:40` |"));
+        assert!(body.contains("| 🧪 | 🟠 | Missing coverage | `src/a.rs:12`<br>`src/b.rs:40` |"));
+        // Charts use the same grouped issue count as the table and overview.
+        assert!(body.contains("\"Test\" : 1"));
+        assert!(body.contains("\"High\" : 1"));
     }
 
     #[test]
@@ -9932,8 +9975,12 @@ copy to src/copied_again.rs
         assert!(body.contains("found 2 issues that should be addressed"));
         // Pipe in the title escaped.
         assert!(body.contains("Unsanitized `a \\| b` input"));
-        // A line range renders in the Where? cell; the Type shows the emoji alone.
-        assert!(body.contains("| 🧹 | Dead branch | Low | `src/b.rs:4-6` |"));
+        // A line range renders in the Location cell; the Type shows the emoji alone.
+        assert!(body.contains("| 🧹 | ⚪ | Dead branch | `src/b.rs:4-6` |"));
+        assert!(body.contains("\"Security\" : 1"));
+        assert!(body.contains("\"Code Smell\" : 1"));
+        assert!(body.contains("\"Critical\" : 1"));
+        assert!(body.contains("\"Low\" : 1"));
     }
 
     #[test]
@@ -9954,6 +10001,24 @@ copy to src/copied_again.rs
         assert!(body.contains(
             "| `lib/components/attachment/attachment_viewer_content_desktop.dart:155` |"
         ));
+    }
+
+    #[test]
+    fn review_summary_mermaid_labels_handle_unexpected_category_text() {
+        let posted = vec![ReviewFinding {
+            category: "Unexpected \"type\"\nlabel".to_string(),
+            severity: ReviewSeverity::Medium,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Unexpected category".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        }];
+        let body = build_review_summary(&posted);
+        assert!(body.contains("    \"Unexpected 'type' label\" : 1"));
+        assert_eq!(body.matches("```mermaid").count(), 2);
+        assert_eq!(body.matches("```").count(), 4);
     }
 
     #[test]
