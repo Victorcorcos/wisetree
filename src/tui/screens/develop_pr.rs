@@ -2360,6 +2360,7 @@ mod tests {
         DevelopPlan {
             task_description: "Add CSV export".to_string(),
             complexity: 5,
+            overview: None,
             sections: vec![section(1, "Data model"), section(2, "CLI flag")],
             notes: Vec::new(),
         }

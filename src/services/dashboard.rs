@@ -10838,6 +10838,7 @@ so the intent reads clearly.
         let expected_plan = DevelopPlan {
             task_description: "Add Develop preflight coverage".to_string(),
             complexity: 3,
+            overview: None,
             sections: vec![PlanSection {
                 number: 1,
                 name: "Preflight tests".to_string(),

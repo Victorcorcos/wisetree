@@ -10136,6 +10136,7 @@ mod tests {
         DevelopPlan {
             task_description: "Add CSV export".to_string(),
             complexity: 5,
+            overview: None,
             sections: vec![
                 PlanSection {
                     number: 1,
@@ -12328,6 +12329,7 @@ mod tests {
         DevelopPlan {
             task_description: "Add CSV export".to_string(),
             complexity: 3,
+            overview: None,
             sections: vec![PlanSection {
                 number: 1,
                 name: "Data model".to_string(),

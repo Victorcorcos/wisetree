@@ -39,6 +39,10 @@ pub struct DevelopPlan {
     pub task_description: String,
     /// Fibonacci-style complexity estimate in points.
     pub complexity: u8,
+    /// A Mermaid `mindmap` body (raw, unfenced) surveying the whole task,
+    /// emitted by the plan AI only for significant work (complexity ≥ 5) and
+    /// rendered under the `# Overview` heading. `None` for smaller tasks.
+    pub overview: Option<String>,
     pub sections: Vec<PlanSection>,
     /// Cross-run learnings ledger — the Ralph-canon `fix_plan.md` discovery
     /// log. Each implement run's closing summary is appended here by the
@@ -82,6 +86,7 @@ impl DevelopPlan {
 // ── Plan-contract parser ────────────────────────────────────────────────
 
 const TASK_OPEN: &str = "==== TASK ====";
+const OVERVIEW_OPEN: &str = "==== OVERVIEW ====";
 const SECTION_OPEN: &str = "==== SECTION ====";
 const BLOCK_CLOSE: &str = "==== END ====";
 
@@ -92,30 +97,54 @@ const BLOCK_CLOSE: &str = "==== END ====";
 /// one invalid block invalidates the whole parse (triggering the caller's
 /// single corrective retry).
 pub fn parse_plan_transcript(transcript: &str) -> Option<DevelopPlan> {
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Task,
+        Overview,
+        Section,
+    }
     let mut task: Option<(String, u8)> = None;
+    let mut overview: Option<String> = None;
     let mut sections: Vec<PlanSection> = Vec::new();
-    let mut block: Option<(bool, Vec<&str>)> = None; // (is_task, lines)
+    let mut block: Option<(Kind, Vec<&str>)> = None;
     for line in transcript.lines() {
         let trimmed = line.trim();
         match &mut block {
             None => {
                 if trimmed == TASK_OPEN {
-                    block = Some((true, Vec::new()));
+                    block = Some((Kind::Task, Vec::new()));
+                } else if trimmed == OVERVIEW_OPEN {
+                    block = Some((Kind::Overview, Vec::new()));
                 } else if trimmed == SECTION_OPEN {
-                    block = Some((false, Vec::new()));
+                    block = Some((Kind::Section, Vec::new()));
                 }
             }
-            Some((is_task, lines)) => {
+            Some((kind, lines)) => {
                 if trimmed == BLOCK_CLOSE {
-                    if *is_task {
-                        if task.is_some() || !sections.is_empty() {
-                            return None;
+                    match *kind {
+                        Kind::Task => {
+                            // The task block must be the very first block.
+                            if task.is_some() || overview.is_some() || !sections.is_empty() {
+                                return None;
+                            }
+                            task = Some(parse_task_block(lines)?);
                         }
-                        task = Some(parse_task_block(lines)?);
-                    } else {
-                        let mut section = parse_section_block(lines)?;
-                        section.number = sections.len() + 1;
-                        sections.push(section);
+                        Kind::Overview => {
+                            // At most one overview, and it precedes the sections.
+                            if overview.is_some() || !sections.is_empty() {
+                                return None;
+                            }
+                            let body = lines.join("\n").trim().to_string();
+                            if body.is_empty() {
+                                return None;
+                            }
+                            overview = Some(body);
+                        }
+                        Kind::Section => {
+                            let mut section = parse_section_block(lines)?;
+                            section.number = sections.len() + 1;
+                            sections.push(section);
+                        }
                     }
                     block = None;
                 } else {
@@ -137,6 +166,7 @@ pub fn parse_plan_transcript(transcript: &str) -> Option<DevelopPlan> {
     Some(DevelopPlan {
         task_description,
         complexity,
+        overview,
         sections,
         notes: Vec::new(),
     })
@@ -233,6 +263,7 @@ fn checkbox_lines(field: &str) -> String {
 // ── PLAN.md renderer + resume parser ────────────────────────────────────
 
 const TASK_HEADING: &str = "## Task Description";
+const OVERVIEW_HEADING: &str = "# Overview";
 const SECTIONS_HEADING: &str = "## Implementation Sections";
 const TRACKER_HEADING: &str = "## Progress Tracker";
 const NOTES_HEADING: &str = "## Section Notes";
@@ -251,11 +282,17 @@ fn render_section_name(name: &str) -> String {
 /// human, never input for the AI.
 pub fn render_plan_md(plan: &DevelopPlan) -> String {
     let mut out = format!(
-        "# Development Plan\n\n{TASK_HEADING}\n\n{}\n\n**Complexity**: {} points\n\n---\n\n\
-         {SECTIONS_HEADING}\n",
+        "# Development Plan\n\n{TASK_HEADING}\n\n{}\n\n**Complexity**: {} points\n\n---\n\n",
         plan.task_description.trim(),
         plan.complexity
     );
+    if let Some(overview) = &plan.overview {
+        out.push_str(&format!(
+            "{OVERVIEW_HEADING}\n\n```mermaid\n{}\n```\n\n---\n\n",
+            overview.trim()
+        ));
+    }
+    out.push_str(&format!("{SECTIONS_HEADING}\n"));
     for section in &plan.sections {
         let done = if section.done { DONE_SUFFIX } else { "" };
         let name = render_section_name(&section.name);
@@ -324,6 +361,11 @@ pub fn parse_plan_md(content: &str) -> Option<DevelopPlan> {
         .parse()
         .ok()?;
 
+    // Overview: the optional `# Overview` heading between the complexity line
+    // and the sections, whose fenced `mermaid` block holds the mindmap body.
+    // Absent for small tasks.
+    let overview = parse_overview_section(&lines[complexity_idx..sections_idx]);
+
     let mut sections: Vec<PlanSection> = Vec::new();
     let mut cursor = sections_idx + 1;
     while cursor < tracker_idx {
@@ -377,9 +419,34 @@ pub fn parse_plan_md(content: &str) -> Option<DevelopPlan> {
     Some(DevelopPlan {
         task_description,
         complexity,
+        overview,
         sections,
         notes,
     })
+}
+
+/// Recover the Mermaid mindmap body from a rendered plan's `# Overview`
+/// section: the lines between its ```` ```mermaid ```` fence and the closing
+/// ```` ``` ````. Returns `None` when the heading, either fence, or a
+/// non-empty body is missing — the inverse of [`render_plan_md`]'s overview
+/// rendering.
+fn parse_overview_section(lines: &[&str]) -> Option<String> {
+    let heading = lines.iter().position(|l| l.trim() == OVERVIEW_HEADING)?;
+    let fence_open = lines[heading + 1..]
+        .iter()
+        .position(|l| l.trim() == "```mermaid")?
+        + heading
+        + 1;
+    let fence_close = lines[fence_open + 1..]
+        .iter()
+        .position(|l| l.trim() == "```")?
+        + fence_open
+        + 1;
+    let body = lines[fence_open + 1..fence_close]
+        .join("\n")
+        .trim()
+        .to_string();
+    (!body.is_empty()).then_some(body)
 }
 
 // ── Prompt-side renderers ───────────────────────────────────────────────
@@ -395,6 +462,12 @@ pub fn render_plan_contract(plan: &DevelopPlan) -> String {
         plan.task_description.trim(),
         plan.complexity
     );
+    if let Some(overview) = &plan.overview {
+        out.push_str(&format!(
+            "{OVERVIEW_OPEN}\n{}\n{BLOCK_CLOSE}\n",
+            overview.trim()
+        ));
+    }
     for section in &plan.sections {
         let (goal, files, criteria, edge_cases) = split_body(&section.body);
         out.push_str(&format!(
@@ -584,6 +657,7 @@ mod tests {
         DevelopPlan {
             task_description: "Add CSV export.\nWith a --csv flag.".to_string(),
             complexity: 5,
+            overview: None,
             sections: vec![
                 section(1, "Data model", true),
                 section(2, "Exporter", false),
@@ -592,6 +666,18 @@ mod tests {
             notes: Vec::new(),
         }
     }
+
+    const MINDMAP: &str = "\
+mindmap
+  root((CSV export))
+    Backend
+      Model
+        Record type
+    CLI
+      Flag
+        --csv parsing
+    Publish
+      Docs";
 
     // ── contract parser ─────────────────────────────────────────────────
 
@@ -643,6 +729,56 @@ trailing noise";
         assert!(!plan.sections[1].body.contains("**Edge cases**"));
         assert_eq!(plan.sections[1].number, 2);
         assert!(plan.first_pending() == Some(0));
+        // No overview block was present, so none is recorded.
+        assert_eq!(plan.overview, None);
+    }
+
+    #[test]
+    fn parses_optional_overview_block_preserving_indentation() {
+        let transcript = format!(
+            "==== TASK ====\nDESCRIPTION: d\nCOMPLEXITY: 8\n==== END ====\n\
+             ==== OVERVIEW ====\n{MINDMAP}\n==== END ====\n\
+             ==== SECTION ====\nNAME: a\nGOAL: g\nCRITERIA: - c\n==== END ====\n"
+        );
+        let plan = parse_plan_transcript(&transcript).expect("parses");
+        assert_eq!(plan.overview.as_deref(), Some(MINDMAP));
+        // Sections still parse normally after the overview block.
+        assert_eq!(plan.sections.len(), 1);
+        assert_eq!(plan.sections[0].number, 1);
+    }
+
+    #[test]
+    fn overview_after_a_section_or_duplicated_fails() {
+        // Overview must precede the sections.
+        let out_of_order = "\
+==== TASK ====
+DESCRIPTION: d
+COMPLEXITY: 8
+==== END ====
+==== SECTION ====
+NAME: a
+GOAL: g
+CRITERIA: - c
+==== END ====
+==== OVERVIEW ====
+mindmap
+  root((x))
+==== END ====";
+        assert_eq!(parse_plan_transcript(out_of_order), None);
+        // An empty overview body is a parse failure, not a silent omission.
+        let empty_overview = "\
+==== TASK ====
+DESCRIPTION: d
+COMPLEXITY: 8
+==== END ====
+==== OVERVIEW ====
+==== END ====
+==== SECTION ====
+NAME: a
+GOAL: g
+CRITERIA: - c
+==== END ====";
+        assert_eq!(parse_plan_transcript(empty_overview), None);
     }
 
     #[test]
@@ -722,6 +858,36 @@ CRITERIA: - c";
         let rendered = render_plan_md(&plan);
         let parsed = parse_plan_md(&rendered).expect("round-trip parses");
         assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn overview_renders_under_heading_and_round_trips() {
+        let mut plan = plan();
+        plan.overview = Some(MINDMAP.to_string());
+        let rendered = render_plan_md(&plan);
+        // The mindmap lands in a fenced mermaid block under `# Overview`,
+        // ahead of the implementation sections.
+        assert!(
+            rendered.contains("# Overview\n\n```mermaid\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  root((CSV export))"), "{rendered}");
+        assert!(
+            rendered.find("# Overview").unwrap()
+                < rendered.find("## Implementation Sections").unwrap(),
+            "{rendered}"
+        );
+        let parsed = parse_plan_md(&rendered).expect("round-trip parses");
+        assert_eq!(parsed, plan);
+        assert_eq!(parsed.overview.as_deref(), Some(MINDMAP));
+    }
+
+    #[test]
+    fn absent_overview_omits_the_heading_and_round_trips() {
+        let rendered = render_plan_md(&plan());
+        assert!(!rendered.contains("# Overview"), "{rendered}");
+        assert!(!rendered.contains("```mermaid"), "{rendered}");
+        assert_eq!(parse_plan_md(&rendered).unwrap().overview, None);
     }
 
     #[test]
@@ -966,6 +1132,21 @@ Implement the feature.
                 "- [ ] criterion a"
             )
         );
+    }
+
+    #[test]
+    fn plan_contract_carries_the_overview_across_a_revision() {
+        // On a revision the compact payload must re-emit the mindmap so the
+        // plan AI edits it rather than losing it.
+        let mut plan = plan();
+        plan.overview = Some(MINDMAP.to_string());
+        let contract = render_plan_contract(&plan);
+        assert!(
+            contract.contains("==== OVERVIEW ====\nmindmap\n"),
+            "{contract}"
+        );
+        let reparsed = parse_plan_transcript(&contract).expect("contract parses");
+        assert_eq!(reparsed.overview.as_deref(), Some(MINDMAP));
     }
 
     #[test]

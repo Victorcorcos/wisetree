@@ -35,13 +35,37 @@ When the previous plan above is non-empty: revise it according to the feedback i
 
 Estimate the overall task on a Fibonacci scale: 1 trivial · 2 small · 3 medium · 5 significant · 8 large · 13 very large · 20 epic. At 13 or above, still emit the plan but say in the task description that splitting into multiple independent tasks is recommended.
 
+## Overview mindmap — only when COMPLEXITY is 5 or higher
+
+For a significant task (COMPLEXITY ≥ 5) a bird's-eye view helps the human grasp the whole before the sections. In that case emit ONE OVERVIEW block (right after the TASK block) holding a Mermaid `mindmap` that surveys every functionality the plan touches: how the pieces group (by layer, subsystem, or phase — e.g. Backend / Frontend / Infrastructure / Publish) and how they connect. Root the tree at the system or feature, branch into the major areas, and leaf into the concrete activities. When COMPLEXITY is below 5, omit the OVERVIEW block entirely.
+
+Emit the mindmap body only — start at the `mindmap` line and use indentation for nesting; do NOT wrap it in ```` ```mermaid ```` fences, the harness adds those. Shape:
+
+```
+mindmap
+  root((Feature))
+    Backend
+      API
+        Activity 1
+      Model
+        Activity 2
+    Frontend
+      UI
+        Activity 3
+    Publish
+      Activity 4
+```
+
 ## Output contract — emit ONLY the delimited blocks, nothing else
 
-First exactly one TASK block, then one SECTION block per section (2–8 sections is typical). Marker lines and field keys must be byte-exact, with no code fences and no prose outside the blocks. CRITERIA and EDGE_CASES list one item per line, each starting with `- `.
+First exactly one TASK block, then — only when COMPLEXITY ≥ 5 — one OVERVIEW block, then one SECTION block per section (2–8 sections is typical). Marker lines and field keys must be byte-exact, with no code fences and no prose outside the blocks. CRITERIA and EDGE_CASES list one item per line, each starting with `- `.
 
 ==== TASK ====
 DESCRIPTION: <clear task description: what it is, why it matters, and the high-level approach; may span multiple lines>
 COMPLEXITY: <integer from the Fibonacci scale>
+==== END ====
+==== OVERVIEW ====
+<Mermaid mindmap body starting at the `mindmap` line; include this block only when COMPLEXITY ≥ 5, otherwise omit it entirely>
 ==== END ====
 ==== SECTION ====
 NAME: <short descriptive name, one line>
