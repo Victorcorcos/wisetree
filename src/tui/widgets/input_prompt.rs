@@ -14,10 +14,11 @@
 //! fixed-height (8-row) bordered area with wrapping and vertical scrolling
 //! that follows the cursor: **Enter submits, Ctrl+J (or Alt+Enter) inserts a
 //! newline, Esc cancels**, ↑/↓ move between lines, and Home/End plus Ctrl+A/E
-//! work per line. Ctrl+Backspace clears the whole field, and Ctrl+S is a
-//! copy-everything shortcut: [`InputPrompt::wants_copy_all`] reports the
-//! keypress so the caller (which owns clipboard access) can read `value` and
-//! copy it. Single-line callers are untouched. A further opt-in
+//! work per line. Ctrl+Backspace (or Ctrl+L, since most terminals never
+//! report Backspace with a CONTROL modifier) clears the whole field, and
+//! Ctrl+S is a copy-everything shortcut: [`InputPrompt::wants_copy_all`]
+//! reports the keypress so the caller (which owns clipboard access) can read
+//! `value` and copy it. Single-line callers are untouched. A further opt-in
 //! [`InputPrompt::expand_to_fill`] makes the box grow to (almost) the whole
 //! area it's given instead of staying fixed at 8 rows, for screens that hand
 //! the field most of the page (e.g. Bugkill's "Describe the bug").
@@ -365,8 +366,18 @@ impl InputPrompt {
                 }
                 // Ctrl+Backspace clears the whole field — a fast reset when
                 // starting the description over, distinct from Alt+Backspace
-                // (previous word only) handled below.
+                // (previous word only) handled below. Most terminals never
+                // send Backspace with a CONTROL modifier without the kitty
+                // keyboard protocol (which most don't support), so Ctrl+L is
+                // the reliable alias — same "clear" mnemonic as the shell's
+                // Ctrl+L, and a plain Ctrl+letter combo works everywhere.
                 KeyCode::Backspace if ctrl => {
+                    self.value.clear();
+                    self.cursor = 0;
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') if ctrl => {
                     self.value.clear();
                     self.cursor = 0;
                     self.error = None;
@@ -819,6 +830,18 @@ mod tests {
         let mut prompt = InputPrompt::new("label").multiline();
         type_str(&mut prompt, "line one\nline two");
         prompt.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(prompt.value, "");
+        assert_eq!(prompt.cursor, 0);
+    }
+
+    #[test]
+    fn multiline_ctrl_l_also_clears_the_whole_field() {
+        // Alias for Ctrl+Backspace: most terminals never report Backspace
+        // with a CONTROL modifier without the kitty keyboard protocol, so
+        // this is the shortcut that actually reaches most users.
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "line one\nline two");
+        prompt.handle_key(ctrl('l'));
         assert_eq!(prompt.value, "");
         assert_eq!(prompt.cursor, 0);
     }
