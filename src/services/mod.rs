@@ -8,6 +8,10 @@ pub mod develop;
 pub mod opencode_models;
 pub mod opencode_turn;
 pub mod presets;
+pub mod review_telemetry;
+pub(crate) mod reviewer_evidence;
+pub(crate) mod reviewer_routing;
+pub(crate) mod reviewer_tests;
 pub mod shell_integration;
 pub mod update;
 
@@ -22,24 +26,28 @@ pub use bugkill::{
     ParsedInvestigation,
 };
 pub use dashboard::{
-    build_review_summary, default_dashboard_warning, develop_commit_subject, is_behind,
-    parse_pull_request_md, resolve_base_ref, resolve_dashboard_columns, split_duplicate_findings,
-    BugkillPreflight, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
-    BugkillUnverdicted, CheckStatus, CommentGroup, CommitSummary, DashboardNotice,
-    DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
-    DevelopCheckOutcome, DevelopPreflight, DevelopPreflightOutcome, DevelopResumeState,
-    ExplainPreparation, ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff,
-    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, MergeStatus, PrState, PullRequest,
-    PullRequestDetails, ReviewComment, ReviewFile, ReviewFinding, ReviewPreparation,
-    ReviewSeverity, ReviewSkippedFile, ReviewStatus, ReviewerSummary, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
-    PR_REFRESH_PERIOD_MS,
+    build_review_summary, build_review_summary_with_overview, default_dashboard_warning,
+    develop_commit_subject, is_behind, parse_pull_request_md, resolve_base_ref,
+    resolve_dashboard_columns, split_duplicate_findings, BugkillPreflight, BugkillPreflightOutcome,
+    BugkillResumeState, BugkillSnapshot, BugkillUnverdicted, CheckStatus, CommentGroup,
+    CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, DashboardService,
+    DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopPreflight,
+    DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome,
+    ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
+    MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewBenchmarkOutcome, ReviewComment,
+    ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewScanMode,
+    ReviewSeverity, ReviewSkippedFile, ReviewStatus, ReviewSummaryAttempt, ReviewVerification,
+    ReviewVerificationAttempt, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
+    UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };
 pub use develop::{parse_plan_transcript, summarize_transcript, DevelopPlan, PlanSection};
 pub use opencode_models::{
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,
 };
 pub use opencode_turn::{OpencodeTurn, OpencodeTurnWatcher};
+pub use review_telemetry::{
+    opencode_usage_for_title, review_scan_title, ReviewScanTelemetry, ReviewTokenUsage,
+};
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,

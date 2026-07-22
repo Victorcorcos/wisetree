@@ -19,6 +19,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -45,3 +47,9 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-features
+
+      - name: reviewer benchmark deterministic gates
+        run: |
+          cargo run --quiet --bin reviewer_corpus -- check benchmarks/reviewer/corpus.public.json
+          cargo run --quiet --bin reviewer_benchmark -- benchmarks/reviewer/corpus.json benchmarks/reviewer/captured/pipeline.fixture.json benchmarks/reviewer/captured/skill.fixture.json
+          cargo run --quiet --bin reviewer_superiority -- check-status benchmarks/reviewer/superiority-status.json

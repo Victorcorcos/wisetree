@@ -31,21 +31,22 @@ use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
+use crate::services::dashboard::{review_feedback_needs_expanded_context, ReviewRevisionMode};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
-    build_review_summary, check_for_updates_all_sources, compute_attempt_changes,
-    default_dashboard_warning, detect_shell_integration, develop_commit_subject,
-    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
-    install_shell_integration, parse_plan_transcript, parse_pull_request_md,
+    build_review_summary, build_review_summary_with_overview, check_for_updates_all_sources,
+    compute_attempt_changes, default_dashboard_warning, detect_shell_integration,
+    develop_commit_subject, fetch_free_opencode_models, fetch_opencode_model_variants,
+    fetch_opencode_models, install_shell_integration, parse_plan_transcript, parse_pull_request_md,
     resolve_dashboard_columns, summarize_transcript, AiStatus, AttemptChanges, BugHypothesis,
     BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
     CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
     DashboardWatch, DevelopCheckOutcome, DevelopPreflightOutcome, DevelopResumeState,
     ExplainPreparation, ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff,
     FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
-    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewFile, ReviewFinding,
-    ReviewPreparation, Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase,
-    UpdateProgress, UpdateSource,
+    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewContext, ReviewFile,
+    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification,
+    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -67,9 +68,9 @@ use crate::tui::screens::explain_pr::{ExplainAction, ExplainPullRequestScreen, E
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome, FixStep};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
-use crate::tui::screens::review_pr::{
-    ReviewAction, ReviewPullRequestScreen, ReviewRowOutcome, COVERAGE_SCAN_INDEX,
-};
+#[cfg(test)]
+use crate::tui::screens::review_pr::COVERAGE_SCAN_INDEX;
+use crate::tui::screens::review_pr::{ReviewAction, ReviewPullRequestScreen, ReviewRowOutcome};
 use crate::tui::screens::settings::{
     CopyDirection, SettingsAction, SettingsScreen, SettingsStep, UpgradeOutcome,
 };
@@ -198,19 +199,38 @@ enum AppEvent {
     ReviewPrScanned {
         /// File index the scan belongs to — guards against a stale result.
         file_index: usize,
-        /// True when this was already the one retry after unparseable output.
-        retried: bool,
+        retry: ReviewScanRetry,
         result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+        raw_output: Option<String>,
     },
     /// An "Other" revision of the current finding returned.
     ReviewPrRevised {
         index: usize,
+        mode: ReviewRevisionMode,
+        feedback: String,
         result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    },
+    ReviewPrVerified {
+        index: usize,
+        result: Result<ReviewVerification, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    },
+    ReviewPrGapAudited {
+        result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
     },
     /// One approved finding was posted (or failed to post) on the PR.
     ReviewPrPosted {
         index: usize,
         result: Result<(), String>,
+    },
+    /// The utility model generated (or failed to generate) the prose-only
+    /// overview that precedes the deterministic summary data.
+    ReviewPrSummaryGenerated {
+        result: Result<String, String>,
+        telemetry: Option<ReviewScanTelemetry>,
     },
     /// The review summary submission finished.
     ReviewPrSummarySubmitted {
@@ -1095,9 +1115,10 @@ impl App {
             }
             Screen::Settings => {
                 let panel = match self.settings.as_ref().map(|s| s.step()) {
-                    Some(SettingsStep::Menu) | Some(SettingsStep::DeleteBranch) | None => {
-                        self.render_framed_panel_fill(frame, area)
-                    }
+                    Some(SettingsStep::Menu)
+                    | Some(SettingsStep::DeleteBranch)
+                    | Some(SettingsStep::AiSettings)
+                    | None => self.render_framed_panel_fill(frame, area),
                     Some(_) => {
                         let h = self
                             .settings
@@ -2776,8 +2797,8 @@ impl App {
                 let Some(finding) = screen.current_finding() else {
                     return;
                 };
-                // The scanned file is re-rendered into the prompt so the
-                // revision judges the same diff the original scan saw.
+                // The dedicated revision prompt receives only focused context
+                // around this finding, independent of merged/split routing.
                 let Some(file) = screen.file_for(&finding) else {
                     screen.reshow_decision();
                     return;
@@ -2785,7 +2806,12 @@ impl App {
                 let request = ReviewReviseRequest {
                     worktree_path: screen.request().worktree_path.clone(),
                     file,
-                    previous_finding: finding.rendered_for_revision(),
+                    finding,
+                    mode: if review_feedback_needs_expanded_context(&feedback) {
+                        ReviewRevisionMode::Expanded
+                    } else {
+                        ReviewRevisionMode::Focused
+                    },
                     feedback,
                     index: screen.current_index(),
                 };
@@ -2842,7 +2868,7 @@ impl App {
                 break;
             }
         }
-        self.settle_review_scans();
+        self.settle_review_scans(tx);
     }
 
     /// Hand the next un-dispatched scan to a task: the files first, then the
@@ -2852,30 +2878,41 @@ impl App {
             return false;
         };
         let worktree_path = screen.request().worktree_path.clone();
-        if let Some((file_index, file)) = screen.take_next_scan_file() {
+        let context = screen.review_context();
+        if let Some((file_index, group)) = screen.take_next_scan_file() {
             kick_off_scan_review_file(
                 self.git_root.clone(),
                 self.current_dashboard_config(),
                 ReviewScanRequest {
                     worktree_path,
-                    file,
+                    group,
+                    context,
                     file_index,
-                    retried: false,
+                    retry: ReviewScanRetry::Initial,
+                    raw_output: None,
                 },
                 tx.clone(),
             );
             return true;
         }
-        let Some(files) = screen.take_coverage_scan() else {
+        let Some((scan_index, files)) = screen.take_coverage_scan() else {
             return false;
         };
+        let mode = screen.scan_mode();
+        let context = screen.review_context();
+        let tester_findings = screen.tester_findings();
         kick_off_scan_review_coverage(
             self.git_root.clone(),
             self.current_dashboard_config(),
             ReviewCoverageScanRequest {
                 worktree_path,
                 files,
-                retried: false,
+                scan_index,
+                mode,
+                context,
+                tester_findings,
+                retry: ReviewScanRetry::Initial,
+                raw_output: None,
             },
             tx.clone(),
         );
@@ -2884,26 +2921,39 @@ impl App {
 
     /// Re-kick one scan after unparseable output — its slot in the pool
     /// stays occupied, so no extra scan starts.
-    fn retry_review_scan(&mut self, file_index: usize, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn retry_review_scan(
+        &mut self,
+        file_index: usize,
+        retry: ReviewScanRetry,
+        raw_output: Option<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
         let worktree_path = screen.request().worktree_path.clone();
-        if file_index == COVERAGE_SCAN_INDEX {
-            let files = screen.all_files();
+        let context = screen.review_context();
+        if let Some(files) = screen.coverage_group(file_index) {
+            let mode = screen.scan_mode();
+            let tester_findings = screen.tester_findings();
             kick_off_scan_review_coverage(
                 self.git_root.clone(),
                 self.current_dashboard_config(),
                 ReviewCoverageScanRequest {
                     worktree_path,
                     files,
-                    retried: true,
+                    scan_index: file_index,
+                    mode,
+                    context,
+                    tester_findings,
+                    retry,
+                    raw_output,
                 },
                 tx.clone(),
             );
             return;
         }
-        let Some(file) = screen.file_at(file_index) else {
+        let Some(group) = screen.scan_group(file_index) else {
             return;
         };
         kick_off_scan_review_file(
@@ -2911,9 +2961,11 @@ impl App {
             self.current_dashboard_config(),
             ReviewScanRequest {
                 worktree_path,
-                file,
+                group,
+                context,
                 file_index,
-                retried: true,
+                retry,
+                raw_output,
             },
             tx.clone(),
         );
@@ -2922,25 +2974,65 @@ impl App {
     /// Close the scan phase once every file reached a terminal state: sort
     /// the findings and enter the walkthrough (or jump straight to Done on
     /// a clean review).
-    fn settle_review_scans(&mut self) {
+    fn settle_review_scans(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
         if screen.scans_pending() {
             return;
         }
+        if screen.should_run_gap_audit() {
+            screen.begin_gap_audit();
+            let (worktree_path, files, context, relationship_edges, skipped, findings) =
+                screen.gap_audit_inputs();
+            kick_off_review_gap_audit(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                ReviewGapAuditRequest {
+                    worktree_path,
+                    files,
+                    context,
+                    relationship_edges,
+                    skipped,
+                    findings,
+                },
+                tx.clone(),
+            );
+            return;
+        }
         if screen.finish_scanning() {
-            screen.enter_decision();
+            let worktree_path = screen.request().worktree_path.clone();
+            let context = screen.review_context();
+            let candidates = screen.begin_verification();
+            if candidates.is_empty() {
+                screen.enter_decision();
+                return;
+            }
+            let config = self.current_dashboard_config();
+            for (index, file, finding, strong) in candidates {
+                kick_off_verify_review_finding(
+                    self.git_root.clone(),
+                    config.clone(),
+                    ReviewVerifyRequest {
+                        worktree_path: worktree_path.clone(),
+                        file,
+                        finding,
+                        context: context.clone(),
+                        index,
+                        strong,
+                    },
+                    tx.clone(),
+                );
+            }
         } else {
             screen.enter_done();
         }
     }
 
-    /// Advance the walkthrough to the next finding, or close it: with posted
-    /// comments the deterministic summary is shown, otherwise straight to
-    /// the final report.
+    /// Advance the walkthrough to the next finding, or close it: posted
+    /// comments first get a utility-written overview, then the deterministic
+    /// summary; otherwise go straight to the final report.
     fn advance_review_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
-        let _ = tx;
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
@@ -2949,9 +3041,39 @@ impl App {
         } else if screen.posted_findings().is_empty() {
             screen.enter_done();
         } else {
-            let body = build_review_summary(screen.posted_findings());
-            screen.enter_summary(body);
+            let worktree_path = screen.request().worktree_path.clone();
+            let posted = screen.posted_findings().to_vec();
+            screen.start_generating_summary();
+            kick_off_generate_review_summary(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                worktree_path,
+                posted,
+                tx.clone(),
+            );
         }
+    }
+
+    fn apply_review_pr_summary_generated(
+        &mut self,
+        result: Result<String, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    ) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if screen.step() != crate::tui::screens::review_pr::ReviewStep::Working {
+            return;
+        }
+        if let Some(telemetry) = telemetry {
+            screen.record_scan_telemetry(telemetry);
+        }
+        let posted = screen.posted_findings();
+        let body = match result {
+            Ok(overview) => build_review_summary_with_overview(posted, &overview),
+            Err(_) => build_review_summary(posted),
+        };
+        screen.enter_summary(body);
     }
 
     fn fail_review(
@@ -2977,12 +3099,16 @@ impl App {
             Ok(prep) => match *prep {
                 ReviewPreparation::Ready {
                     files,
+                    scan_mode,
+                    context,
                     skipped,
                     owner,
                     repo,
                     head_sha,
                 } => {
                     if let Some(screen) = self.review_pr.as_mut() {
+                        screen.set_scan_mode(scan_mode);
+                        screen.set_review_context(context);
                         screen.set_files(files, owner, repo, head_sha);
                         screen.record_skipped_files(&skipped);
                     }
@@ -3005,8 +3131,8 @@ impl App {
                 ),
                 ReviewPreparation::AiNotConfigured => self.fail_review(
                     ToastVariant::Warning,
-                    "Set the `ai.review` model (Settings → Dashboard → ai) so the AI can scan \
-                     the diff."
+                    "Set both Review discovery profiles (`strong` and `balanced`) in Settings → \
+                     Dashboard → ai so the AI can scan the diff."
                         .to_string(),
                     tx,
                 ),
@@ -3034,8 +3160,10 @@ impl App {
     fn apply_review_pr_scanned(
         &mut self,
         file_index: usize,
-        retried: bool,
+        retry: ReviewScanRetry,
         result: Result<Vec<ReviewFinding>, String>,
+        mut telemetry: Option<ReviewScanTelemetry>,
+        raw_output: Option<String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         // Guard against a late arrival after the user cancelled or the scan
@@ -3047,9 +3175,21 @@ impl App {
         if !active {
             return;
         }
+        if let Some(telemetry) = telemetry.as_mut() {
+            telemetry.retry_role = match retry {
+                ReviewScanRetry::Initial => "initial",
+                ReviewScanRetry::Reformat => "reformat",
+                ReviewScanRetry::Full => "full-rescan",
+            }
+            .to_string();
+        }
+        if let (Some(screen), Some(telemetry)) = (self.review_pr.as_mut(), telemetry) {
+            screen.record_scan_telemetry(telemetry);
+        }
         match result {
             Ok(findings) => {
                 if let Some(screen) = self.review_pr.as_mut() {
+                    screen.record_tester_findings(file_index, &findings);
                     // Deterministic dedup: findings the PR already carries
                     // as a wisetree comment never re-enter the walkthrough,
                     // regardless of whether the model honored the
@@ -3061,20 +3201,23 @@ impl App {
                     screen.note_scan_done(file_index);
                 }
                 if !self.dispatch_next_review_scan(tx) {
-                    self.settle_review_scans();
+                    self.settle_review_scans(tx);
                 }
             }
-            // One retry per file for unparseable output; a second failure
-            // records a Failed row and frees the slot — one bad file never
-            // aborts the whole review.
-            Err(_) if !retried => self.retry_review_scan(file_index, tx),
             Err(message) => {
+                if let Some(next) = next_review_retry(retry, raw_output.is_some()) {
+                    let raw_output = (next == ReviewScanRetry::Reformat)
+                        .then_some(raw_output)
+                        .flatten();
+                    self.retry_review_scan(file_index, next, raw_output, tx);
+                    return;
+                }
                 if let Some(screen) = self.review_pr.as_mut() {
                     screen.record_scan_failure(file_index, truncate_error(&message));
                     screen.note_scan_done(file_index);
                 }
                 if !self.dispatch_next_review_scan(tx) {
-                    self.settle_review_scans();
+                    self.settle_review_scans(tx);
                 }
             }
         }
@@ -3083,12 +3226,17 @@ impl App {
     fn apply_review_pr_revised(
         &mut self,
         index: usize,
+        mode: ReviewRevisionMode,
+        feedback: String,
         result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        let _ = tx;
         if !self.review_at_index(index) {
             return;
+        }
+        if let (Some(screen), Some(telemetry)) = (self.review_pr.as_mut(), telemetry) {
+            screen.record_scan_telemetry(telemetry);
         }
         // A revision must always return to the Decision screen — with the
         // revised comment when the model obeyed, otherwise with the previous
@@ -3106,6 +3254,29 @@ impl App {
                 }
             }
             other => {
+                if mode == ReviewRevisionMode::Focused {
+                    let request = self.review_pr.as_ref().and_then(|screen| {
+                        let finding = screen.current_finding()?;
+                        let file = screen.file_for(&finding)?;
+                        Some(ReviewReviseRequest {
+                            worktree_path: screen.request().worktree_path.clone(),
+                            file,
+                            finding,
+                            feedback: feedback.clone(),
+                            mode: ReviewRevisionMode::Expanded,
+                            index,
+                        })
+                    });
+                    if let Some(request) = request {
+                        kick_off_revise_review_finding(
+                            self.git_root.clone(),
+                            self.current_dashboard_config(),
+                            request,
+                            tx.clone(),
+                        );
+                        return;
+                    }
+                }
                 if let Some(screen) = self.review_pr.as_mut() {
                     screen.reshow_decision();
                 }
@@ -3118,6 +3289,45 @@ impl App {
                 self.show_toast(ToastVariant::Warning, message);
             }
         }
+    }
+
+    fn apply_review_pr_verified(
+        &mut self,
+        index: usize,
+        result: Result<ReviewVerification, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    ) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if let Some(telemetry) = telemetry {
+            screen.record_scan_telemetry(telemetry);
+        }
+        screen.record_verification(index, result);
+        if screen.verification_pending() {
+            return;
+        }
+        if screen.finish_verification() {
+            screen.enter_decision();
+        } else {
+            screen.enter_done();
+        }
+    }
+
+    fn apply_review_pr_gap_audited(
+        &mut self,
+        result: Result<Vec<ReviewFinding>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if let Some(telemetry) = telemetry {
+            screen.record_scan_telemetry(telemetry);
+        }
+        screen.record_gap_audit_result(result);
+        self.settle_review_scans(tx);
     }
 
     fn apply_review_pr_posted(
@@ -6115,14 +6325,31 @@ impl App {
             AppEvent::ReviewPrPrepared(result) => self.apply_review_pr_prepared(result, tx),
             AppEvent::ReviewPrScanned {
                 file_index,
-                retried,
+                retry,
                 result,
-            } => self.apply_review_pr_scanned(file_index, retried, result, tx),
-            AppEvent::ReviewPrRevised { index, result } => {
-                self.apply_review_pr_revised(index, result, tx)
+                telemetry,
+                raw_output,
+            } => self.apply_review_pr_scanned(file_index, retry, result, telemetry, raw_output, tx),
+            AppEvent::ReviewPrRevised {
+                index,
+                mode,
+                feedback,
+                result,
+                telemetry,
+            } => self.apply_review_pr_revised(index, mode, feedback, result, telemetry, tx),
+            AppEvent::ReviewPrVerified {
+                index,
+                result,
+                telemetry,
+            } => self.apply_review_pr_verified(index, result, telemetry),
+            AppEvent::ReviewPrGapAudited { result, telemetry } => {
+                self.apply_review_pr_gap_audited(result, telemetry, tx)
             }
             AppEvent::ReviewPrPosted { index, result } => {
                 self.apply_review_pr_posted(index, result, tx)
+            }
+            AppEvent::ReviewPrSummaryGenerated { result, telemetry } => {
+                self.apply_review_pr_summary_generated(result, telemetry)
             }
             AppEvent::ReviewPrSummarySubmitted {
                 request_changes,
@@ -8563,32 +8790,73 @@ fn kick_off_push_fix(
 /// hammering the provider.
 const REVIEW_SCAN_CONCURRENCY: usize = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewScanRetry {
+    Initial,
+    Reformat,
+    Full,
+}
+
+fn next_review_retry(retry: ReviewScanRetry, has_raw_output: bool) -> Option<ReviewScanRetry> {
+    match retry {
+        ReviewScanRetry::Initial if has_raw_output => Some(ReviewScanRetry::Reformat),
+        ReviewScanRetry::Initial | ReviewScanRetry::Reformat => Some(ReviewScanRetry::Full),
+        ReviewScanRetry::Full => None,
+    }
+}
+
 /// Inputs for one captured per-file scan call. `file_index` identifies the
 /// file the result belongs to (scans run in parallel); `retried` marks the
 /// one retry allowed after unparseable output.
 struct ReviewScanRequest {
     worktree_path: String,
-    file: ReviewFile,
+    group: crate::services::dashboard::ReviewFileGroup,
+    context: ReviewContext,
     file_index: usize,
-    retried: bool,
+    retry: ReviewScanRetry,
+    raw_output: Option<String>,
 }
 
 /// Inputs for the single whole-diff coverage scan. Its result comes back
-/// through the same `ReviewPrScanned` event under [`COVERAGE_SCAN_INDEX`],
+/// through the same `ReviewPrScanned` event under a synthetic group index,
 /// so it shares the pool's completion/retry/failure plumbing.
 struct ReviewCoverageScanRequest {
     worktree_path: String,
     files: Vec<ReviewFile>,
-    retried: bool,
+    scan_index: usize,
+    mode: ReviewScanMode,
+    context: ReviewContext,
+    tester_findings: Vec<ReviewFinding>,
+    retry: ReviewScanRetry,
+    raw_output: Option<String>,
 }
 
 /// Inputs for an "Other" revision of a single finding.
 struct ReviewReviseRequest {
     worktree_path: String,
     file: ReviewFile,
-    previous_finding: String,
+    finding: ReviewFinding,
     feedback: String,
+    mode: ReviewRevisionMode,
     index: usize,
+}
+
+struct ReviewVerifyRequest {
+    worktree_path: String,
+    file: ReviewFile,
+    finding: ReviewFinding,
+    context: ReviewContext,
+    index: usize,
+    strong: bool,
+}
+
+struct ReviewGapAuditRequest {
+    worktree_path: String,
+    files: Vec<ReviewFile>,
+    context: ReviewContext,
+    relationship_edges: String,
+    skipped: Vec<crate::services::ReviewSkippedFile>,
+    findings: Vec<ReviewFinding>,
 }
 
 /// Inputs for posting one approved finding on the PR.
@@ -8600,6 +8868,33 @@ struct ReviewPostRequest {
     head_sha: String,
     finding: ReviewFinding,
     index: usize,
+}
+
+fn kick_off_generate_review_summary(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    posted: Vec<ReviewFinding>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrSummaryGenerated {
+            result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let attempt = service
+            .generate_review_summary_overview(&worktree_path, &posted)
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrSummaryGenerated {
+            result,
+            telemetry: Some(attempt.telemetry),
+        });
+    });
 }
 
 fn kick_off_prepare_review(
@@ -8632,25 +8927,42 @@ fn kick_off_scan_review_file(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let file_index = req.file_index;
-    let retried = req.retried;
+    let retry = req.retry;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index,
-            retried,
+            retry,
             result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+            raw_output: None,
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service
-            .scan_review_file(&req.worktree_path, &req.file, None, None)
-            .await
-            .map_err(|err| user_friendly_message(&err));
+        let attempt = match retry {
+            ReviewScanRetry::Reformat => {
+                service
+                    .reformat_review_group_output(
+                        &req.worktree_path,
+                        &req.group,
+                        req.raw_output.as_deref().unwrap_or_default(),
+                    )
+                    .await
+            }
+            ReviewScanRetry::Initial | ReviewScanRetry::Full => {
+                service
+                    .scan_review_group(&req.worktree_path, &req.group, &req.context)
+                    .await
+            }
+        };
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {
             file_index,
-            retried,
+            retry,
             result,
+            telemetry: Some(attempt.telemetry),
+            raw_output: attempt.raw_output,
         });
     });
 }
@@ -8661,25 +8973,71 @@ fn kick_off_scan_review_coverage(
     req: ReviewCoverageScanRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    let retried = req.retried;
+    let retry = req.retry;
+    let scan_index = req.scan_index;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrScanned {
-            file_index: COVERAGE_SCAN_INDEX,
-            retried,
+            file_index: scan_index,
+            retry,
             result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+            raw_output: None,
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service
-            .scan_review_coverage(&req.worktree_path, &req.files)
-            .await
-            .map_err(|err| user_friendly_message(&err));
+        let attempt = match retry {
+            ReviewScanRetry::Reformat => match req.mode {
+                ReviewScanMode::Merged => {
+                    service
+                        .reformat_review_merged_output(
+                            &req.worktree_path,
+                            &req.files,
+                            req.raw_output.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                }
+                ReviewScanMode::Split => {
+                    service
+                        .reformat_review_coverage_output(
+                            &req.worktree_path,
+                            &req.files,
+                            req.raw_output.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                }
+            },
+            ReviewScanRetry::Initial | ReviewScanRetry::Full => match req.mode {
+                ReviewScanMode::Merged => {
+                    service
+                        .scan_review_merged(
+                            &req.worktree_path,
+                            &req.files,
+                            &req.context,
+                            &req.tester_findings,
+                        )
+                        .await
+                }
+                ReviewScanMode::Split => {
+                    service
+                        .scan_review_coverage(
+                            &req.worktree_path,
+                            &req.files,
+                            &req.context,
+                            &req.tester_findings,
+                        )
+                        .await
+                }
+            },
+        };
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrScanned {
-            file_index: COVERAGE_SCAN_INDEX,
-            retried,
+            file_index: scan_index,
+            retry,
             result,
+            telemetry: Some(attempt.telemetry),
+            raw_output: attempt.raw_output,
         });
     });
 }
@@ -8691,25 +9049,105 @@ fn kick_off_revise_review_finding(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let index = req.index;
+    let mode = req.mode;
+    let feedback = req.feedback.clone();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrRevised {
             index,
+            mode,
+            feedback,
             result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
         });
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service
-            .scan_review_file(
+        let attempt = service
+            .revise_review_finding(
                 &req.worktree_path,
                 &req.file,
-                Some(&req.feedback),
-                Some(&req.previous_finding),
+                &req.finding,
+                &req.feedback,
+                req.mode,
             )
-            .await
-            .map_err(|err| user_friendly_message(&err));
-        let _ = tx.send(AppEvent::ReviewPrRevised { index, result });
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrRevised {
+            index,
+            mode,
+            feedback,
+            result,
+            telemetry: Some(attempt.telemetry),
+        });
+    });
+}
+
+fn kick_off_verify_review_finding(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: ReviewVerifyRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let index = req.index;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrVerified {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let attempt = service
+            .verify_review_finding(
+                &req.worktree_path,
+                &req.file,
+                &req.finding,
+                &req.context,
+                req.strong,
+            )
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrVerified {
+            index,
+            result,
+            telemetry: Some(attempt.telemetry),
+        });
+    });
+}
+
+fn kick_off_review_gap_audit(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: ReviewGapAuditRequest,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrGapAudited {
+            result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let attempt = service
+            .scan_review_gap_audit(
+                &req.worktree_path,
+                &req.files,
+                &req.context,
+                &req.relationship_edges,
+                &req.skipped,
+                &req.findings,
+            )
+            .await;
+        let result = attempt.result.map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ReviewPrGapAudited {
+            result,
+            telemetry: Some(attempt.telemetry),
+        });
     });
 }
 
@@ -9807,6 +10245,329 @@ mod tests {
     fn app_event_tx() -> mpsc::UnboundedSender<AppEvent> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
+    }
+
+    #[test]
+    fn review_retry_routes_parse_failures_through_reformat_then_full_scan() {
+        assert_eq!(
+            next_review_retry(ReviewScanRetry::Initial, true),
+            Some(ReviewScanRetry::Reformat)
+        );
+        assert_eq!(
+            next_review_retry(ReviewScanRetry::Reformat, true),
+            Some(ReviewScanRetry::Full)
+        );
+        assert_eq!(next_review_retry(ReviewScanRetry::Full, true), None);
+        // A spawn/timeout failure has no raw text to reformat, so preserve the
+        // former behavior: go straight to the one full retry.
+        assert_eq!(
+            next_review_retry(ReviewScanRetry::Initial, false),
+            Some(ReviewScanRetry::Full)
+        );
+    }
+
+    fn review_scan_test_app(mode: ReviewScanMode, paths: &[&str]) -> App {
+        let request = ReviewPullRequestRequest {
+            number: 42,
+            title: "Review retries".to_string(),
+            url: "https://example.test/pull/42".to_string(),
+            branch: "review-retries".to_string(),
+            worktree_path: "/tmp/review-retries".to_string(),
+        };
+        let model = crate::config::schema::AiModelConfig {
+            model: "opencode/test".to_string(),
+            thinking: "max".to_string(),
+        };
+        let ai = crate::config::schema::AiReviewConfig {
+            strong: model.clone(),
+            balanced: model.clone(),
+            utility: model,
+        };
+        let files = paths
+            .iter()
+            .map(|path| ReviewFile {
+                path: (*path).to_string(),
+                annotated_diff: "@@ -1 +1 @@\n     1 +changed".to_string(),
+                full_content: None,
+                commentable_lines: std::collections::BTreeSet::from([1]),
+                existing_comments: String::new(),
+                existing_keys: Vec::new(),
+            })
+            .collect();
+        let mut screen = ReviewPullRequestScreen::new(request, ai);
+        screen.set_scan_mode(mode);
+        screen.set_files(files, "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+
+        let mut app = App::new(AppMode::Dashboard, false);
+        app.screen = Screen::ReviewPullRequest;
+        app.review_pr = Some(screen);
+        app
+    }
+
+    fn review_test_telemetry(scan: &str) -> ReviewScanTelemetry {
+        ReviewScanTelemetry {
+            scan: scan.to_string(),
+            scan_role: "test".to_string(),
+            retry_role: "initial".to_string(),
+            model_profile: "balanced".to_string(),
+            model: "openai/gpt-5.6-terra".to_string(),
+            thinking: "medium".to_string(),
+            prompt_bytes: 100,
+            usage: crate::services::ReviewTokenUsage {
+                uncached_input: Some(10),
+                cache_read: Some(0),
+                cache_write: Some(0),
+                output: Some(2),
+                reasoning: Some(0),
+                cost_usd: None,
+            },
+            duration_ms: 5,
+            findings: 0,
+        }
+    }
+
+    #[test]
+    fn review_file_reformat_success_settles_the_scan() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["tests/unit_test.rs"]);
+        app.review_pr.as_mut().unwrap().take_next_scan_file();
+        let tx = app_event_tx();
+        app.apply_review_pr_scanned(
+            0,
+            ReviewScanRetry::Initial,
+            Err("malformed".to_string()),
+            None,
+            Some("bad output".to_string()),
+            &tx,
+        );
+        assert!(app.review_pr.as_ref().unwrap().scan_phase_active());
+        app.apply_review_pr_scanned(
+            0,
+            ReviewScanRetry::Reformat,
+            Ok(Vec::new()),
+            None,
+            None,
+            &tx,
+        );
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+        app.apply_review_pr_scanned(
+            0,
+            ReviewScanRetry::Full,
+            Ok(Vec::new()),
+            Some(ReviewScanTelemetry {
+                scan: "late:test".to_string(),
+                scan_role: "test".to_string(),
+                retry_role: "full-rescan".to_string(),
+                model_profile: "balanced".to_string(),
+                model: "openai/gpt-5.6-terra".to_string(),
+                thinking: "medium".to_string(),
+                prompt_bytes: 1,
+                usage: crate::services::ReviewTokenUsage {
+                    uncached_input: Some(1),
+                    cache_read: Some(0),
+                    cache_write: Some(0),
+                    output: Some(1),
+                    reasoning: Some(0),
+                    cost_usd: None,
+                },
+                duration_ms: 1,
+                findings: 0,
+            }),
+            None,
+            &tx,
+        );
+        assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 0);
+    }
+
+    #[test]
+    fn review_multi_file_tester_group_retries_and_settles_once() {
+        let mut app = review_scan_test_app(
+            ReviewScanMode::Split,
+            &["tests/user_test.rs", "tests/user_spec.rs"],
+        );
+        let group_index = app
+            .review_pr
+            .as_mut()
+            .unwrap()
+            .take_next_scan_file()
+            .unwrap()
+            .0;
+        let tx = app_event_tx();
+        app.apply_review_pr_scanned(
+            group_index,
+            ReviewScanRetry::Initial,
+            Err("malformed".to_string()),
+            None,
+            Some("bad output".to_string()),
+            &tx,
+        );
+        app.apply_review_pr_scanned(
+            group_index,
+            ReviewScanRetry::Reformat,
+            Ok(Vec::new()),
+            None,
+            None,
+            &tx,
+        );
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+    }
+
+    #[test]
+    fn failed_focused_revision_dispatches_one_expanded_retry() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![ReviewFinding {
+            category: "Code Smell".to_string(),
+            severity: crate::services::ReviewSeverity::Low,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Unclear branch".to_string(),
+            explanation: "The branch is hard to follow.".to_string(),
+            suggestion: None,
+        }]);
+        screen.finish_scanning();
+        screen.enter_decision();
+        screen.start_revising();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.apply_review_pr_revised(
+            0,
+            ReviewRevisionMode::Focused,
+            "use more context".to_string(),
+            Err("malformed".to_string()),
+            None,
+            &tx,
+        );
+        let event = rx.try_recv().expect("expanded retry event");
+        assert!(matches!(
+            event,
+            AppEvent::ReviewPrRevised {
+                mode: ReviewRevisionMode::Expanded,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn review_coverage_reformat_failure_falls_back_to_one_full_scan() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.take_next_scan_file();
+        screen.take_coverage_scan();
+        let tx = app_event_tx();
+        app.apply_review_pr_scanned(0, ReviewScanRetry::Initial, Ok(Vec::new()), None, None, &tx);
+        app.apply_review_pr_scanned(
+            COVERAGE_SCAN_INDEX,
+            ReviewScanRetry::Initial,
+            Err("malformed".to_string()),
+            Some(review_test_telemetry("coverage")),
+            Some("bad output".to_string()),
+            &tx,
+        );
+        app.apply_review_pr_scanned(
+            COVERAGE_SCAN_INDEX,
+            ReviewScanRetry::Reformat,
+            Err("still malformed".to_string()),
+            Some(review_test_telemetry("reformat:coverage")),
+            Some("still bad".to_string()),
+            &tx,
+        );
+        app.apply_review_pr_scanned(
+            COVERAGE_SCAN_INDEX,
+            ReviewScanRetry::Full,
+            Ok(Vec::new()),
+            Some(review_test_telemetry("coverage")),
+            None,
+            &tx,
+        );
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+        assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 3);
+    }
+
+    #[test]
+    fn summary_generation_transitions_to_preview_and_falls_back_on_failure() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![ReviewFinding {
+            category: "Security".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Authorization is skipped".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        }]);
+        screen.finish_scanning();
+        screen.record_outcome(ReviewRowOutcome::Posted);
+        let tx = app_event_tx();
+        app.advance_review_finding(&tx);
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Working
+        );
+
+        app.apply_review_pr_summary_generated(
+            Err("utility unavailable".to_string()),
+            Some(ReviewScanTelemetry {
+                model_profile: "utility".to_string(),
+                ..review_test_telemetry("summary")
+            }),
+        );
+        let screen = app.review_pr.as_ref().unwrap();
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Summary
+        );
+        assert!(screen.summary_body().contains("I found 1 issue"));
+        assert_eq!(screen.scan_telemetry_len(), 1);
+    }
+
+    #[test]
+    fn review_retry_terminal_failures_settle_file_and_merged_scans() {
+        for (mode, path, index) in [
+            (ReviewScanMode::Split, "tests/unit_test.rs", 0),
+            (ReviewScanMode::Merged, "src/lib.rs", COVERAGE_SCAN_INDEX),
+        ] {
+            let mut app = review_scan_test_app(mode, &[path]);
+            let screen = app.review_pr.as_mut().unwrap();
+            if index == COVERAGE_SCAN_INDEX {
+                screen.take_coverage_scan();
+            } else {
+                screen.take_next_scan_file();
+            }
+            let tx = app_event_tx();
+            for (retry, raw_output) in [
+                (ReviewScanRetry::Initial, Some("bad output".to_string())),
+                (
+                    ReviewScanRetry::Reformat,
+                    Some("still malformed".to_string()),
+                ),
+                (ReviewScanRetry::Full, None),
+            ] {
+                app.apply_review_pr_scanned(
+                    index,
+                    retry,
+                    Err("malformed".to_string()),
+                    None,
+                    raw_output,
+                    &tx,
+                );
+            }
+            assert_eq!(
+                app.review_pr.as_ref().unwrap().step(),
+                crate::tui::screens::review_pr::ReviewStep::Done
+            );
+        }
     }
 
     fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> NotificationsConfig {

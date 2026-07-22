@@ -21,8 +21,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::config::schema::{
-    AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiModelConfig, DashboardConfig,
-    LinkStrategy, NotificationsConfig, WorktreeConfig,
+    AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiModelConfig, AiReviewConfig,
+    DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig,
 };
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
@@ -1146,7 +1146,11 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
             plan: clean(&ai.fix.plan),
             apply: clean(&ai.fix.apply),
         },
-        review: clean(&ai.review),
+        review: AiReviewConfig {
+            strong: clean(&ai.review.strong),
+            balanced: clean(&ai.review.balanced),
+            utility: clean(&ai.review.utility),
+        },
         update: clean(&ai.update),
         bugkill: AiBugkillConfig {
             investigate: clean(&ai.bugkill.investigate),
@@ -1167,7 +1171,9 @@ pub enum AiSlot {
     Explain,
     FixPlan,
     FixApply,
-    Review,
+    ReviewStrong,
+    ReviewBalanced,
+    ReviewUtility,
     Update,
     BugkillInvestigate,
     BugkillFix,
@@ -1177,11 +1183,13 @@ pub enum AiSlot {
 }
 
 impl AiSlot {
-    pub const ALL: [AiSlot; 10] = [
+    pub const ALL: [AiSlot; 12] = [
         AiSlot::Explain,
         AiSlot::FixPlan,
         AiSlot::FixApply,
-        AiSlot::Review,
+        AiSlot::ReviewStrong,
+        AiSlot::ReviewBalanced,
+        AiSlot::ReviewUtility,
         AiSlot::Update,
         AiSlot::BugkillInvestigate,
         AiSlot::BugkillFix,
@@ -1195,7 +1203,9 @@ impl AiSlot {
             AiSlot::Explain => "explain",
             AiSlot::FixPlan => "fix_plan",
             AiSlot::FixApply => "fix_apply",
-            AiSlot::Review => "review",
+            AiSlot::ReviewStrong => "review_strong",
+            AiSlot::ReviewBalanced => "review_balanced",
+            AiSlot::ReviewUtility => "review_utility",
             AiSlot::Update => "update",
             AiSlot::BugkillInvestigate => "bugkill_investigate",
             AiSlot::BugkillFix => "bugkill_fix",
@@ -1210,10 +1220,14 @@ impl AiSlot {
             AiSlot::Explain => "Drafts the PR title + description (Explain)",
             AiSlot::FixPlan => "Plans review-comment fixes — pick a stronger model (Fix · plan)",
             AiSlot::FixApply => "Applies the approved fix live (Fix · apply)",
-            AiSlot::Review => {
-                "Scans each changed file and drafts review comments — pick a stronger model \
-                 (Review)"
+            AiSlot::ReviewStrong => {
+                "Cross-file discovery, coverage, audits, and high-risk verification (Review · \
+                 strong)"
             }
+            AiSlot::ReviewBalanced => {
+                "Focused application/test scans and revisions (Review · balanced)"
+            }
+            AiSlot::ReviewUtility => "Repairs malformed structured output only (Review · utility)",
             AiSlot::Update => "Resolves merge conflicts (Update Pull Request / branch)",
             AiSlot::BugkillInvestigate => {
                 "Investigates the bug and ranks root causes — pick a stronger model \
@@ -1238,7 +1252,9 @@ impl AiSlot {
             AiSlot::Explain => &ai.explain,
             AiSlot::FixPlan => &ai.fix.plan,
             AiSlot::FixApply => &ai.fix.apply,
-            AiSlot::Review => &ai.review,
+            AiSlot::ReviewStrong => &ai.review.strong,
+            AiSlot::ReviewBalanced => &ai.review.balanced,
+            AiSlot::ReviewUtility => &ai.review.utility,
             AiSlot::Update => &ai.update,
             AiSlot::BugkillInvestigate => &ai.bugkill.investigate,
             AiSlot::BugkillFix => &ai.bugkill.fix,
@@ -1253,7 +1269,9 @@ impl AiSlot {
             AiSlot::Explain => &mut ai.explain,
             AiSlot::FixPlan => &mut ai.fix.plan,
             AiSlot::FixApply => &mut ai.fix.apply,
-            AiSlot::Review => &mut ai.review,
+            AiSlot::ReviewStrong => &mut ai.review.strong,
+            AiSlot::ReviewBalanced => &mut ai.review.balanced,
+            AiSlot::ReviewUtility => &mut ai.review.utility,
             AiSlot::Update => &mut ai.update,
             AiSlot::BugkillInvestigate => &mut ai.bugkill.investigate,
             AiSlot::BugkillFix => &mut ai.bugkill.fix,
@@ -1264,14 +1282,16 @@ impl AiSlot {
     }
 }
 
-/// The ten leaf models in slot order — used by the dashboard `ai` summary and
+/// The twelve leaf models in slot order — used by the dashboard `ai` summary and
 /// the AI Settings editor.
-fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 10] {
+fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 12] {
     [
         &ai.explain,
         &ai.fix.plan,
         &ai.fix.apply,
-        &ai.review,
+        &ai.review.strong,
+        &ai.review.balanced,
+        &ai.review.utility,
         &ai.update,
         &ai.bugkill.investigate,
         &ai.bugkill.fix,
@@ -1333,6 +1353,22 @@ impl AiSettingsEditor {
     /// Model + thinking for the targeted slot, used to pre-fill the picker.
     pub fn focused_model(&self) -> AiModelConfig {
         Self::slot(self.target_idx()).get(&self.ai).clone()
+    }
+
+    /// Slot indices to render given the rows capacity, keeping the active
+    /// slot in view. Mirrors [`PostCmdEditor::visible_range`].
+    fn visible_range(&self, max_visible: usize) -> Range<usize> {
+        let total = AiSlot::ALL.len();
+        if max_visible == 0 {
+            return 0..0;
+        }
+        if total <= max_visible {
+            return 0..total;
+        }
+        let active = self.target_idx();
+        let start = active.saturating_add(1).saturating_sub(max_visible);
+        let end = (start + max_visible).min(total);
+        end.saturating_sub(max_visible)..end
     }
 
     /// Stamp a picked model + thinking into the targeted slot (Modified, not
@@ -4386,6 +4422,8 @@ impl SettingsScreen {
 
     /// Render the AI Settings sub-screen: one rectangle per AI command (model +
     /// thinking strength), a shared free-model chip row, and a Save button.
+    /// The slot rectangles scroll as a window (keeping the active slot in
+    /// view) since the slot count can exceed the terminal height.
     fn render_ai_settings(&self, frame: &mut Frame, area: Rect) {
         let editor = match &self.ai_settings_editor {
             Some(e) => e,
@@ -4398,48 +4436,21 @@ impl SettingsScreen {
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
-        // Each slot needs a 3-row rectangle plus a 1-row hint. Keep the Save
-        // button and fixed header/footer rows visible by only rendering the
-        // slots that fit in the available height, scrolling to follow focus.
-        const SLOT_HEIGHT: u16 = 4;
-        const SAVE_HEIGHT: u16 = 3;
-        const FIXED_OVERHEAD: u16 = 1 + 1 + 1 + 1 + 1; // title, description, chips, chip hint, footer hint
-
-        let slot_viewport_height = area.height.saturating_sub(FIXED_OVERHEAD + SAVE_HEIGHT);
-        let visible_slots = usize::from(
-            slot_viewport_height
-                .checked_div(SLOT_HEIGHT)
-                .unwrap_or(0)
-                .max(1),
-        )
-        .min(AiSlot::ALL.len());
-
-        let focused_slot = match editor.selection {
-            AiSettingsSelection::Rect(i) => i,
-            AiSettingsSelection::FreeModels(_) => editor.last_rect,
-            AiSettingsSelection::Save => AiSlot::ALL.len() - 1,
-        }
-        .min(AiSlot::ALL.len() - 1);
-        let first_visible = focused_slot
-            .saturating_add(1)
-            .saturating_sub(visible_slots)
-            .min(AiSlot::ALL.len() - visible_slots);
-        let visible_range = first_visible..first_visible + visible_slots;
-
-        let mut constraints: Vec<Constraint> = vec![Constraint::Length(1), Constraint::Length(1)];
-        for _ in visible_range.clone() {
-            constraints.push(Constraint::Length(3));
-            constraints.push(Constraint::Length(1));
-        }
-        constraints.push(Constraint::Length(1)); // chips line
-        constraints.push(Constraint::Length(1)); // chip-action hint
-        constraints.push(Constraint::Min(0));
-        constraints.push(Constraint::Length(SAVE_HEIGHT)); // Save
-        constraints.push(Constraint::Length(1)); // bottom hint
+        // Each visible slot occupies a 3-row rectangle plus a 1-row hint.
+        const SLOT_ROW_HEIGHT: u16 = 4;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
+            .constraints([
+                Constraint::Length(1),            // title
+                Constraint::Length(1),            // description
+                Constraint::Min(SLOT_ROW_HEIGHT), // scrollable slot rectangles
+                Constraint::Length(1),            // scroll indicator
+                Constraint::Length(1),            // chips line
+                Constraint::Length(1),            // chip-action hint
+                Constraint::Length(3),            // Save
+                Constraint::Length(1),            // bottom hint
+            ])
             .split(area);
 
         frame.render_widget(
@@ -4454,28 +4465,46 @@ impl SettingsScreen {
             chunks[1],
         );
 
-        let mut cursor = 2usize;
-        for i in visible_range.clone() {
-            self.render_ai_settings_rectangle(frame, chunks[cursor], chunks[cursor + 1], editor, i);
-            cursor += 2;
+        let slot_area = chunks[2];
+        let rows_capacity = (slot_area.height / SLOT_ROW_HEIGHT) as usize;
+        let visible_range = editor.visible_range(rows_capacity);
+        let hidden_above = visible_range.start;
+        let hidden_below = AiSlot::ALL.len().saturating_sub(visible_range.end);
+        let is_scrollable = hidden_above > 0 || hidden_below > 0;
+
+        for (row, i) in visible_range.enumerate() {
+            let rect_area = Rect {
+                x: slot_area.x,
+                y: slot_area.y + (row as u16) * SLOT_ROW_HEIGHT,
+                width: slot_area.width,
+                height: 3,
+            };
+            let hint_area = Rect {
+                x: slot_area.x,
+                y: rect_area.y + 3,
+                width: slot_area.width,
+                height: 1,
+            };
+            self.render_ai_settings_rectangle(frame, rect_area, hint_area, editor, i);
         }
 
-        self.render_ai_settings_free_models(frame, chunks[cursor], chunks[cursor + 1]);
-        cursor += 2;
+        if is_scrollable {
+            self.render_scroll_indicator(frame, chunks[3], hidden_above, hidden_below);
+        }
 
-        // `cursor` now points at `Min(0)`; Save is one past it.
-        self.render_ai_settings_save_button(frame, chunks[cursor + 1], editor);
+        self.render_ai_settings_free_models(frame, chunks[4], chunks[5]);
+
+        self.render_ai_settings_save_button(frame, chunks[6], editor);
 
         let on_chips = matches!(editor.selection, AiSettingsSelection::FreeModels(_));
         let hint = if on_chips {
             "← → cycle chips • Enter stages • ↑↓ leave row • Esc back to Dashboard"
+        } else if is_scrollable {
+            "▲/▼ scroll • ← → thinking strength • Enter pick model/Save • Esc back to Dashboard"
         } else {
             "↑↓ move • ← → thinking strength • Enter pick model/Save • Esc back to Dashboard"
         };
-        frame.render_widget(
-            Paragraph::new(hint).style(dim_muted_style),
-            chunks[cursor + 2],
-        );
+        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
     }
 
     fn render_ai_settings_rectangle(
@@ -5272,7 +5301,7 @@ impl SettingsScreen {
         }
 
         if is_scrollable {
-            self.render_post_cmd_scroll_indicator(frame, chunks[3], hidden_above, hidden_below);
+            self.render_scroll_indicator(frame, chunks[3], hidden_above, hidden_below);
         }
 
         self.render_post_cmd_buttons(frame, chunks[4], editor);
@@ -5323,7 +5352,7 @@ impl SettingsScreen {
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[8]);
     }
 
-    fn render_post_cmd_scroll_indicator(
+    fn render_scroll_indicator(
         &self,
         frame: &mut Frame,
         area: Rect,
@@ -6100,7 +6129,11 @@ mod tests {
                         plan: AiModelConfig::default(),
                         apply: AiModelConfig::default(),
                     },
-                    review: AiModelConfig::default(),
+                    review: AiReviewConfig {
+                        strong: AiModelConfig::default(),
+                        balanced: AiModelConfig::default(),
+                        utility: AiModelConfig::default(),
+                    },
                     update: AiModelConfig::default(),
                     bugkill: AiBugkillConfig {
                         investigate: AiModelConfig::default(),
@@ -6341,7 +6374,7 @@ mod tests {
                 assert_eq!(cfg.ai.fix.plan.model, "openai/gpt-5.5");
                 assert_eq!(cfg.ai.fix.plan.thinking, "minimal");
                 // Untouched slots keep their per-command default.
-                assert_eq!(cfg.ai.explain.model, "opencode-go/deepseek-v4-flash");
+                assert_eq!(cfg.ai.explain.model, "opencode/deepseek-v4-flash-free");
             }
             other => panic!("expected SaveDashboard, got {other:?}"),
         }
@@ -6433,17 +6466,17 @@ mod tests {
     #[test]
     fn apply_ai_selection_targets_focused_slot() {
         let mut screen = ai_settings_screen(vec![]);
-        focus_ai_slot(&mut screen, 3); // update
+        focus_ai_slot(&mut screen, 6); // update
         screen.apply_ai_selection(
             "anthropic/claude-sonnet-4-5".to_string(),
             "high".to_string(),
         );
         let editor = screen.ai_settings_editor.as_ref().unwrap();
-        let slot = AiSlot::ALL[3].get(&editor.ai);
+        let slot = AiSlot::ALL[6].get(&editor.ai);
         assert_eq!(slot.model, "anthropic/claude-sonnet-4-5");
         assert_eq!(slot.thinking, "high");
-        assert_eq!(editor.statuses[3], DashboardRectStatus::Modified);
-        assert_eq!(editor.selection, AiSettingsSelection::Rect(3));
+        assert_eq!(editor.statuses[6], DashboardRectStatus::Modified);
+        assert_eq!(editor.selection, AiSettingsSelection::Rect(6));
     }
 
     #[test]
@@ -6458,6 +6491,79 @@ mod tests {
         assert_eq!(dash.ai.explain.model, "opencode/big-pickle");
         let idx = ai_field_index().unwrap();
         assert_eq!(dash.statuses[idx], DashboardRectStatus::Modified);
+    }
+
+    fn render_dump(screen: &SettingsScreen, w: u16, h: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| screen.render_ai_settings(f, f.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// At a terminal height too short for all ten slots, the focused (first)
+    /// slot's model text must stay visible — this is the bug report: on a
+    /// short terminal the top rectangle rendered with an empty interior
+    /// because the layout let a `Length` constraint get silently squeezed.
+    #[test]
+    fn ai_settings_short_terminal_keeps_focused_slot_readable() {
+        let mut screen = ai_settings_screen(vec![]);
+        set_slot_model(&mut screen, 0, "openai/gpt-5.6-sol");
+        let dump = render_dump(&screen, 100, 20);
+        assert!(
+            dump.contains("openai/gpt-5.6-sol"),
+            "focused slot's model text missing from a short render:\n{dump}"
+        );
+        assert!(
+            dump.contains("below"),
+            "expected a scroll indicator:\n{dump}"
+        );
+    }
+
+    /// Scrolling down keeps the active slot in view and eventually shows the
+    /// last slot with an "above" indicator instead of clipping it.
+    #[test]
+    fn ai_settings_scroll_follows_selection_to_last_slot() {
+        let mut screen = ai_settings_screen(vec![]);
+        set_slot_model(&mut screen, AiSlot::ALL.len() - 1, "openai/gpt-5.6-terra");
+        focus_ai_slot(&mut screen, AiSlot::ALL.len() - 1);
+        let dump = render_dump(&screen, 100, 20);
+        assert!(
+            dump.contains("openai/gpt-5.6-terra"),
+            "last slot's model text missing after scrolling down:\n{dump}"
+        );
+        assert!(
+            dump.contains("above"),
+            "expected a scroll indicator:\n{dump}"
+        );
+    }
+
+    /// A tall enough terminal shows every slot label with no scroll
+    /// indicator at all.
+    #[test]
+    fn ai_settings_tall_terminal_shows_all_slots_unscrolled() {
+        let screen = ai_settings_screen(vec![]);
+        let dump = render_dump(&screen, 100, 60);
+        for slot in AiSlot::ALL {
+            assert!(
+                dump.contains(slot.label()),
+                "missing slot '{}' in unscrolled render:\n{dump}",
+                slot.label()
+            );
+        }
+        assert!(!dump.contains("above"));
+        assert!(!dump.contains("below"));
     }
 
     #[test]

@@ -69,6 +69,27 @@ impl SummaryRow {
             }),
         }
     }
+
+    /// A row with an explicit colored status word and an informational `note`
+    /// shown in the detail column. Unlike [`Self::with_status`], the note never
+    /// marks the row as a failure — use it for successful outcomes that still
+    /// carry an explanation (e.g. a verifier rejecting or revising a finding).
+    pub fn with_note(
+        command: impl Into<String>,
+        label: impl Into<String>,
+        color: Color,
+        note: Option<String>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            success: true,
+            failure: note,
+            status: Some(RowStatus {
+                label: label.into(),
+                color,
+            }),
+        }
+    }
 }
 
 /// Render a bordered summary table for the given rows.
@@ -105,7 +126,16 @@ pub fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) 
                 }
             };
             let (failure_text, failure_style) = match &r.failure {
-                Some(reason) => (truncate_failure(reason), Style::default().fg(colors::ERROR)),
+                // A detail on a successful row is an informational note, not a
+                // failure — render it muted so it never reads as an error.
+                Some(reason) => {
+                    let color = if r.success {
+                        colors::MUTED
+                    } else {
+                        colors::ERROR
+                    };
+                    (truncate_failure(reason), Style::default().fg(color))
+                }
                 None => ("None".to_string(), Style::default().fg(colors::MUTED)),
             };
             Row::new(vec![

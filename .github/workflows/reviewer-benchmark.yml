@@ -1,0 +1,50 @@
+name: Reviewer stochastic benchmark
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: reviewer-stochastic-benchmark
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: controlled paired comparison
+    runs-on: [self-hosted, reviewer-benchmark]
+    timeout-minutes: 1440
+    env:
+      WISETREE_REVIEWER_CAPTURE_DIR: ${{ runner.temp }}/reviewer-captures
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify controlled runner
+        run: |
+          command -v cargo
+          command -v opencode
+          test -f /Users/victorcorcos/Desktop/repositories/skills/skills/reviewer/SKILL.md
+          test -f /Users/victorcorcos/.codex/skills/reviewer/SKILL.md
+
+      - name: Run ten paired public-corpus repetitions
+        run: bash benchmarks/reviewer/live_compare.sh openai/gpt-5.6-terra high 10 240
+
+      - name: Alert on material public-corpus regression
+        run: |
+          cargo run --quiet --bin reviewer_superiority -- nightly \
+            benchmarks/reviewer/preregistration.json \
+            benchmarks/reviewer/corpus.public.json \
+            "$WISETREE_REVIEWER_CAPTURE_DIR/pipeline.json" \
+            "$WISETREE_REVIEWER_CAPTURE_DIR/skill.json" \
+            "$WISETREE_REVIEWER_CAPTURE_DIR/nightly-status.json"
+
+      - name: Preserve complete and partial evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviewer-benchmark-${{ github.run_id }}
+          path: ${{ runner.temp }}/reviewer-captures
+          if-no-files-found: warn
+          retention-days: 30

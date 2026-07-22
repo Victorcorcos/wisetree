@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "minimumPrivateCases": 100,
+  "targetCombinedCases": 200,
+  "locationPolicy": "outside-repository",
+  "hashAlgorithm": "blake3",
+  "hashSource": "WISETREE_REVIEWER_HOLDOUT_HASH",
+  "pathSource": "WISETREE_REVIEWER_HOLDOUT_CORPUS"
+}

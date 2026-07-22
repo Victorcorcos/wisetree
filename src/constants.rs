@@ -20,6 +20,9 @@ pub const CACHE_DIR_NAME: &str = "cache";
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 
+/// Filename of the bounded Review Pull Request scan-telemetry history.
+pub const REVIEW_TELEMETRY_FILE_NAME: &str = "review_telemetry.json";
+
 /// Commit message title written when the "Update Pull Request" flow
 /// committed the result of an AI-assisted conflict resolution. Kept as a
 /// constant so downstream tooling (release notes, blame heuristics) can
@@ -69,6 +72,11 @@ pub fn global_cache_dir() -> PathBuf {
 /// Path to the dashboard PR cache (`~/.wisetree/dashboard_pr_cache.json`).
 pub fn dashboard_pr_cache_file() -> PathBuf {
     global_config_dir().join(DASHBOARD_PR_CACHE_FILE_NAME)
+}
+
+/// Path to the bounded Review Pull Request telemetry history.
+pub fn review_telemetry_file() -> PathBuf {
+    global_config_dir().join(REVIEW_TELEMETRY_FILE_NAME)
 }
 
 /// Resolve opencode's persisted model-state file
