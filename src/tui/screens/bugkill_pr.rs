@@ -141,6 +141,9 @@ pub enum BugkillAction {
     VerdictNo,
     /// "Other" freeform answer submitted — judge it.
     OtherSubmitted(String),
+    /// Ctrl+S in the describe/other textarea — copy its full text to the
+    /// OS clipboard.
+    CopyToClipboard(String),
     /// RetryPrompt: retry the same row with the feedback (no revert).
     RetryWithFeedback,
     /// RetryPrompt: roll back & choose another (= the No path).
@@ -605,7 +608,8 @@ impl BugkillPullRequestScreen {
     pub fn show_other_input(&mut self) {
         self.input = Some(
             InputPrompt::new("Tell what happened — the judge AI will decide if the bug is fixed.")
-                .multiline(),
+                .multiline()
+                .expand_to_fill(),
         );
         self.step = BugkillStep::OtherInput;
     }
@@ -724,6 +728,9 @@ impl BugkillPullRequestScreen {
         let Some(input) = self.input.as_mut() else {
             return BugkillAction::Cancelled;
         };
+        if input.wants_copy_all(&key) {
+            return BugkillAction::CopyToClipboard(input.value.clone());
+        }
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
                 // Validation is pure code: nothing reaches the AI empty.
@@ -996,6 +1003,9 @@ impl BugkillPullRequestScreen {
             self.enter_verdict(note);
             return BugkillAction::Continue;
         };
+        if input.wants_copy_all(&key) {
+            return BugkillAction::CopyToClipboard(input.value.clone());
+        }
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
                 let trimmed = text.trim().to_string();
@@ -1878,10 +1888,9 @@ impl BugkillPullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // heading
-                Constraint::Length(1),  // blank
-                Constraint::Length(12), // multiline input
-                Constraint::Min(0),
+                Constraint::Length(1), // heading
+                Constraint::Length(1), // blank
+                Constraint::Min(12),   // input prompt — grows to fill the page
             ])
             .split(area);
         frame.render_widget(

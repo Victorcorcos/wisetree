@@ -14,7 +14,10 @@
 //! fixed-height (8-row) bordered area with wrapping and vertical scrolling
 //! that follows the cursor: **Enter submits, Ctrl+J (or Alt+Enter) inserts a
 //! newline, Esc cancels**, ↑/↓ move between lines, and Home/End plus Ctrl+A/E
-//! work per line. Single-line callers are untouched. A further opt-in
+//! work per line. Ctrl+Backspace clears the whole field, and Ctrl+S is a
+//! copy-everything shortcut: [`InputPrompt::wants_copy_all`] reports the
+//! keypress so the caller (which owns clipboard access) can read `value` and
+//! copy it. Single-line callers are untouched. A further opt-in
 //! [`InputPrompt::expand_to_fill`] makes the box grow to (almost) the whole
 //! area it's given instead of staying fixed at 8 rows, for screens that hand
 //! the field most of the page (e.g. Bugkill's "Describe the bug").
@@ -116,6 +119,16 @@ impl InputPrompt {
 
     fn validate(&self) -> Option<String> {
         self.validator.as_ref().and_then(|v| v(&self.value))
+    }
+
+    /// True when `key` is the multiline "copy everything" shortcut
+    /// (Ctrl+S). Copying to the OS clipboard needs an async dispatch this
+    /// widget doesn't have, so callers check this before `handle_key` and
+    /// read `value` themselves to hand off to the clipboard.
+    pub fn wants_copy_all(&self, key: &KeyEvent) -> bool {
+        self.multiline
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
     }
 
     fn char_len(&self) -> usize {
@@ -350,6 +363,15 @@ impl InputPrompt {
                     self.error = None;
                     return InputOutcome::Pending;
                 }
+                // Ctrl+Backspace clears the whole field — a fast reset when
+                // starting the description over, distinct from Alt+Backspace
+                // (previous word only) handled below.
+                KeyCode::Backspace if ctrl => {
+                    self.value.clear();
+                    self.cursor = 0;
+                    self.error = None;
+                    return InputOutcome::Pending;
+                }
                 _ => {}
             }
         }
@@ -547,7 +569,8 @@ impl InputPrompt {
         }
 
         let hint_text = if self.multiline {
-            "Enter to submit · Ctrl+J for newline · Esc to cancel"
+            "Enter submits · Esc cancels · Ctrl+J newline · Ctrl+S copy all · Ctrl+A line \
+             start · Ctrl+E line end · Ctrl+K clear to line end"
         } else {
             "Press Enter to confirm, Esc to cancel"
         };
@@ -789,6 +812,35 @@ mod tests {
 
         // Never shrinks below the fixed default, even in a tiny area.
         assert_eq!(expanded.box_height(4), MULTILINE_BOX_ROWS);
+    }
+
+    #[test]
+    fn multiline_ctrl_backspace_clears_the_whole_field() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "line one\nline two");
+        prompt.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(prompt.value, "");
+        assert_eq!(prompt.cursor, 0);
+    }
+
+    #[test]
+    fn single_line_ctrl_backspace_still_deletes_previous_word() {
+        // Only the multiline field repurposes Ctrl+Backspace to clear
+        // everything; single-line fields keep the readline-style word delete.
+        let mut prompt = InputPrompt::new("label");
+        type_str(&mut prompt, "hello world");
+        prompt.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(prompt.value, "hello ");
+    }
+
+    #[test]
+    fn wants_copy_all_only_fires_for_ctrl_s_in_multiline_mode() {
+        let multiline = InputPrompt::new("label").multiline();
+        assert!(multiline.wants_copy_all(&ctrl('s')));
+        assert!(!multiline.wants_copy_all(&key(KeyCode::Char('s'))));
+
+        let single_line = InputPrompt::new("label");
+        assert!(!single_line.wants_copy_all(&ctrl('s')));
     }
 
     #[test]
