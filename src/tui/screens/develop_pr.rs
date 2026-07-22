@@ -135,6 +135,9 @@ pub enum DevelopAction {
     PlanApproved,
     /// PlanReview → Feedback submitted: revise the plan with this input.
     PlanRejected(String),
+    /// Ctrl+S in the describe/feedback textarea — copy its full text to the
+    /// OS clipboard.
+    CopyToClipboard(String),
     /// `Implementing` finished (turn completed, opencode exited, or the
     /// user confirmed) — the App captures the run's summary and either runs
     /// the check (backpressure) or finishes the section directly.
@@ -387,7 +390,8 @@ impl DevelopPullRequestScreen {
                 "Include what to build, why, and any constraints or edge cases you already \
                  know about.",
             )
-            .multiline(),
+            .multiline()
+            .expand_to_fill(),
         );
         self.step = DevelopStep::DescribeTask;
     }
@@ -484,7 +488,8 @@ impl DevelopPullRequestScreen {
             InputPrompt::new(
                 "Explain what to change — the plan AI revises PLAN.md from this feedback.",
             )
-            .multiline(),
+            .multiline()
+            .expand_to_fill(),
         );
         self.step = DevelopStep::Feedback;
     }
@@ -813,6 +818,9 @@ impl DevelopPullRequestScreen {
         let Some(input) = self.input.as_mut() else {
             return DevelopAction::Cancelled;
         };
+        if input.wants_copy_all(&key) {
+            return DevelopAction::CopyToClipboard(input.value.clone());
+        }
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
                 // Validation is pure code: nothing reaches the AI empty.
@@ -943,6 +951,9 @@ impl DevelopPullRequestScreen {
             self.enter_plan_review();
             return DevelopAction::Continue;
         };
+        if input.wants_copy_all(&key) {
+            return DevelopAction::CopyToClipboard(input.value.clone());
+        }
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
                 let trimmed = text.trim().to_string();
@@ -1269,11 +1280,10 @@ impl DevelopPullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // title
-                Constraint::Length(1),  // blank
-                Constraint::Length(12), // input prompt (label + 8-row box + hint)
-                Constraint::Length(1),  // warning
-                Constraint::Min(0),
+                Constraint::Length(1), // title
+                Constraint::Length(1), // blank
+                Constraint::Min(12),   // input prompt — grows to fill the page
+                Constraint::Length(1), // warning
             ])
             .split(area);
         frame.render_widget(
@@ -1936,10 +1946,9 @@ impl DevelopPullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // heading
-                Constraint::Length(1),  // blank
-                Constraint::Length(12), // multiline input
-                Constraint::Min(0),
+                Constraint::Length(1), // heading
+                Constraint::Length(1), // blank
+                Constraint::Min(12),   // input prompt — grows to fill the page
             ])
             .split(area);
         frame.render_widget(

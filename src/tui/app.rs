@@ -2797,6 +2797,9 @@ impl App {
                     tx.clone(),
                 );
             }
+            ReviewAction::CopyToClipboard(text) => {
+                kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
+            }
             ReviewAction::SubmitSummary { request_changes } => {
                 let Some(screen) = self.review_pr.as_mut() else {
                     return;
@@ -3309,6 +3312,9 @@ impl App {
                     text,
                     tx.clone(),
                 );
+            }
+            BugkillAction::CopyToClipboard(text) => {
+                kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
             }
             BugkillAction::RetryWithFeedback => {
                 // Re-enter the fix phase for the same row, without reverting:
@@ -3945,6 +3951,9 @@ impl App {
                 // The screen already stashed the rejected plan + feedback in
                 // `revision()` — replan with that context.
                 self.start_develop_planning(false, tx);
+            }
+            DevelopAction::CopyToClipboard(text) => {
+                kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
             }
             DevelopAction::ImplementFinished => {
                 // The user confirmed from the PTY; pull the transcript from
