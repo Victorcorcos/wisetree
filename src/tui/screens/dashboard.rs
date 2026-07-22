@@ -242,12 +242,15 @@ impl BulkDeleteStatus {
     }
 }
 
-/// The two "Update all" buttons rendered to the right of the bulk-delete
-/// row. `Branches` runs "Update branch (locally)" on every displayed
-/// worktree; `PullRequests` runs the full "Update" (merge base + push) on
-/// every displayed worktree with an Update-eligible PR.
+/// The three "Update all" buttons rendered to the right of the bulk-delete
+/// row. `All` makes a per-worktree choice between the other two: the Pull
+/// Requests flow when the worktree has an Update-eligible PR, the Branches
+/// flow otherwise. `Branches` runs "Update branch (locally)" on every
+/// displayed worktree; `PullRequests` runs the full "Update" (merge base +
+/// push) on every displayed worktree with an Update-eligible PR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAllTarget {
+    All,
     Branches,
     PullRequests,
 }
@@ -255,6 +258,7 @@ pub enum UpdateAllTarget {
 impl UpdateAllTarget {
     fn button_label(self) -> &'static str {
         match self {
+            UpdateAllTarget::All => "All",
             UpdateAllTarget::Branches => "Branches",
             UpdateAllTarget::PullRequests => "Pull Requests",
         }
@@ -262,8 +266,9 @@ impl UpdateAllTarget {
 
     fn color(self) -> ratatui::style::Color {
         match self {
+            UpdateAllTarget::All => colors::GREEN,
             UpdateAllTarget::Branches => colors::TEAL,
-            UpdateAllTarget::PullRequests => colors::GREEN,
+            UpdateAllTarget::PullRequests => colors::BRAND,
         }
     }
 }
@@ -286,6 +291,11 @@ pub enum DashboardAction {
     /// "Update all → Pull Requests": run the full "Update" (merge base +
     /// push) on each displayed worktree with an Update-eligible PR.
     UpdateAllPullRequests(Vec<UpdatePullRequestRequest>),
+    /// "Update all → All": per displayed worktree, run the full "Update"
+    /// (merge base + push) when it has an Update-eligible PR, otherwise run
+    /// "Update branch (locally)". First `Vec` is the Branches-flow targets,
+    /// second is the Pull-Requests-flow targets.
+    UpdateAll(Vec<(String, String)>, Vec<UpdatePullRequestRequest>),
     CopyPath(String),
     OpenPullRequest(String),
     MergePullRequest(Box<MergePullRequestRequest>),
@@ -913,6 +923,10 @@ impl DashboardScreen {
     /// side-effect-free.
     fn trigger_update_all(&self, target: UpdateAllTarget) -> DashboardAction {
         match target {
+            UpdateAllTarget::All => {
+                let (branches, pull_requests) = self.update_all_smart_targets();
+                DashboardAction::UpdateAll(branches, pull_requests)
+            }
             UpdateAllTarget::Branches => {
                 DashboardAction::UpdateAllBranches(self.update_all_branch_targets())
             }
@@ -942,6 +956,28 @@ impl DashboardScreen {
             .filter_map(|index| self.rows.get(index))
             .filter_map(build_update_request)
             .collect()
+    }
+
+    /// Per-row split for the "All" button: a worktree with an
+    /// Update-eligible pull request goes to the Pull Requests flow; every
+    /// other displayed worktree (no PR, a terminal-state PR, or a PR that's
+    /// already in sync) falls back to the Branches flow — the same
+    /// eligibility gate `PullRequests` already uses via
+    /// [`build_update_request`], so "All" is exactly the union of the other
+    /// two buttons' targets with no overlap.
+    fn update_all_smart_targets(&self) -> (Vec<(String, String)>, Vec<UpdatePullRequestRequest>) {
+        let mut branches = Vec::new();
+        let mut pull_requests = Vec::new();
+        for index in self.filtered_indices() {
+            let Some(row) = self.rows.get(index) else {
+                continue;
+            };
+            match build_update_request(row) {
+                Some(request) => pull_requests.push(request),
+                None => branches.push((row.worktree.path.clone(), row.worktree.branch.clone())),
+            }
+        }
+        (branches, pull_requests)
     }
 
     /// Build the searchable "General Commands" list — every action that
@@ -2198,17 +2234,17 @@ impl DashboardScreen {
             self.bulk_button_rects.push((*status, rect));
         }
 
-        // Right-aligned "Update all: | Branches | | Pull Requests |" cluster,
-        // rendered only when it fits in the width left over after the
-        // delete buttons (same graceful-degradation policy as above).
+        // Right-aligned "Update: | All | | Branches | | Pull Requests |"
+        // cluster, rendered only when it fits in the width left over after
+        // the delete buttons (same graceful-degradation policy as above).
         self.render_update_all_buttons(frame, area, used_width, gap, muted_dim);
     }
 
-    /// Render the "Update all" label + the teal Branches / green Pull
-    /// Requests buttons, right-aligned within `area`. `delete_width` is how
-    /// much of `area` the delete cluster already consumed; the update-all
-    /// cluster is omitted entirely if it would collide with it. These
-    /// buttons are click-only, so there is no focus highlight.
+    /// Render the "Update:" label + the green All / teal Branches / purple
+    /// Pull Requests buttons, right-aligned within `area`. `delete_width` is
+    /// how much of `area` the delete cluster already consumed; the
+    /// update-all cluster is omitted entirely if it would collide with it.
+    /// These buttons are click-only, so there is no focus highlight.
     fn render_update_all_buttons(
         &mut self,
         frame: &mut Frame,
@@ -2217,11 +2253,12 @@ impl DashboardScreen {
         gap: u16,
         muted_dim: Style,
     ) {
-        let prefix = "Update all:";
+        let prefix = "Update:";
         let prefix_width = prefix.chars().count() as u16 + 1; // trailing space
+        let all_width = UpdateAllTarget::All.button_label().chars().count() as u16 + 4;
         let branches_width = UpdateAllTarget::Branches.button_label().chars().count() as u16 + 4;
         let pr_width = UpdateAllTarget::PullRequests.button_label().chars().count() as u16 + 4;
-        let cluster_width = prefix_width + branches_width + gap + pr_width;
+        let cluster_width = prefix_width + all_width + gap + branches_width + gap + pr_width;
 
         // Need a separating gap between the delete cluster and this one, plus
         // the cluster itself, all inside the row.
@@ -2244,6 +2281,8 @@ impl DashboardScreen {
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Length(prefix_width),
+                Constraint::Length(all_width),
+                Constraint::Length(gap),
                 Constraint::Length(branches_width),
                 Constraint::Length(gap),
                 Constraint::Length(pr_width),
@@ -2265,8 +2304,9 @@ impl DashboardScreen {
         }
 
         for (target, rect) in [
-            (UpdateAllTarget::Branches, cols[1]),
-            (UpdateAllTarget::PullRequests, cols[3]),
+            (UpdateAllTarget::All, cols[1]),
+            (UpdateAllTarget::Branches, cols[3]),
+            (UpdateAllTarget::PullRequests, cols[5]),
         ] {
             if rect.width == 0 {
                 continue;
@@ -3988,17 +4028,63 @@ mod tests {
             DashboardAction::UpdateAllPullRequests(targets) => assert_eq!(targets.len(), 1),
             other => panic!("expected UpdateAllPullRequests, got {other:?}"),
         }
+        match screen.trigger_update_all(UpdateAllTarget::All) {
+            DashboardAction::UpdateAll(branches, pull_requests) => {
+                assert_eq!(branches.len(), 0);
+                assert_eq!(pull_requests.len(), 1);
+            }
+            other => panic!("expected UpdateAll, got {other:?}"),
+        }
     }
 
     #[test]
     fn update_all_target_colors_and_labels() {
+        assert_eq!(UpdateAllTarget::All.button_label(), "All");
         assert_eq!(UpdateAllTarget::Branches.button_label(), "Branches");
         assert_eq!(
             UpdateAllTarget::PullRequests.button_label(),
             "Pull Requests"
         );
+        assert_eq!(UpdateAllTarget::All.color(), colors::GREEN);
         assert_eq!(UpdateAllTarget::Branches.color(), colors::TEAL);
-        assert_eq!(UpdateAllTarget::PullRequests.color(), colors::GREEN);
+        assert_eq!(UpdateAllTarget::PullRequests.color(), colors::BRAND);
+    }
+
+    #[test]
+    fn update_all_smart_targets_splits_by_pr_eligibility() {
+        // Mother (no PR) and the PR-less row fall back to Branches; the
+        // update-eligible open PR goes to Pull Requests; the already-synced
+        // open PR (ahead-only) also falls back to Branches, matching
+        // `update_all_pr_targets`'s eligibility gate.
+        let screen = screen_with_rows(vec![
+            named_row("/tmp/repo", "main", true, None, Some(branch_status(0, 0))),
+            named_row(
+                "/tmp/repo-a",
+                "feature-a",
+                false,
+                Some(open_pr()),
+                Some(branch_status(1, 2)),
+            ),
+            named_row(
+                "/tmp/repo-b",
+                "feature-b",
+                false,
+                Some(open_pr()),
+                Some(branch_status(3, 0)),
+            ),
+            named_row("/tmp/repo-c", "feature-c", false, None, None),
+        ]);
+        let (branches, pull_requests) = screen.update_all_smart_targets();
+        assert_eq!(
+            branches,
+            vec![
+                ("/tmp/repo".to_string(), "main".to_string()),
+                ("/tmp/repo-b".to_string(), "feature-b".to_string()),
+                ("/tmp/repo-c".to_string(), "feature-c".to_string()),
+            ]
+        );
+        let pr_branches: Vec<String> = pull_requests.into_iter().map(|r| r.branch).collect();
+        assert_eq!(pr_branches, vec!["feature-a".to_string()]);
     }
 
     #[test]
@@ -4025,10 +4111,11 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(dumped.contains("Update all"), "label missing: {dumped}");
+        assert!(dumped.contains("Update:"), "label missing: {dumped}");
+        assert!(dumped.contains("All"));
         assert!(dumped.contains("Branches"));
         assert!(dumped.contains("Pull Requests"));
-        // Both buttons captured a hit-test rect for mouse clicks.
-        assert_eq!(screen.update_all_button_rects.len(), 2);
+        // All three buttons captured a hit-test rect for mouse clicks.
+        assert_eq!(screen.update_all_button_rects.len(), 3);
     }
 }

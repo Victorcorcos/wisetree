@@ -475,6 +475,10 @@ pub struct App {
 enum UpdateAllKind {
     Branches,
     PullRequests,
+    /// The "All" button: a per-worktree wise choice between the other two
+    /// (see [`UpdateAllRun::all`]). Drains `branch_queue` first, then
+    /// `pr_queue`.
+    All,
 }
 
 /// State for an in-flight "Update all" batch: a queue of worktrees to update
@@ -518,6 +522,26 @@ impl UpdateAllRun {
             total: targets.len(),
             branch_queue: Vec::new(),
             pr_queue: targets,
+            updated: 0,
+            resolved: 0,
+            skipped: 0,
+            failed: Vec::new(),
+        }
+    }
+
+    /// "All" button: `branch_targets` are worktrees updated locally,
+    /// `pr_targets` are worktrees whose pull request gets updated. The two
+    /// sets are disjoint by construction (`DashboardScreen::
+    /// update_all_smart_targets`), so `total` is just their combined size.
+    fn all(
+        branch_targets: Vec<(String, String)>,
+        pr_targets: Vec<UpdatePullRequestRequest>,
+    ) -> Self {
+        Self {
+            kind: UpdateAllKind::All,
+            total: branch_targets.len() + pr_targets.len(),
+            branch_queue: branch_targets,
+            pr_queue: pr_targets,
             updated: 0,
             resolved: 0,
             skipped: 0,
@@ -3978,6 +4002,9 @@ impl App {
             DashboardAction::UpdateAllPullRequests(targets) => {
                 self.start_update_all_prs(targets, tx);
             }
+            DashboardAction::UpdateAll(branch_targets, pr_targets) => {
+                self.start_update_all(branch_targets, pr_targets, tx);
+            }
             DashboardAction::CopyPath(path) => {
                 let success_message = format!("Copied {} to clipboard.", fold_path(&path));
                 kick_off_clipboard_copy(path, success_message, tx.clone());
@@ -4094,19 +4121,48 @@ impl App {
         self.dispatch_next_update_all_pr(tx);
     }
 
-    /// Pop the next Branches target and run its fetch + merge, or finish the
-    /// batch when the queue is empty.
+    /// "All" button: run the Branches flow on worktrees without an
+    /// Update-eligible PR and the Pull Requests flow on the rest, worktrees
+    /// with an eligible PR. Branches are dispatched first; the
+    /// `branch_queue`-drained fallthrough in `dispatch_next_update_all_branch`
+    /// then chains into the Pull Requests phase.
+    fn start_update_all(
+        &mut self,
+        branch_targets: Vec<(String, String)>,
+        pr_targets: Vec<UpdatePullRequestRequest>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if branch_targets.is_empty() && pr_targets.is_empty() {
+            self.show_toast(ToastVariant::Info, "No worktrees to update.");
+            return;
+        }
+        self.update_all = Some(UpdateAllRun::all(branch_targets, pr_targets));
+        self.dispatch_next_update_all_branch(tx);
+    }
+
+    /// Pop the next Branches target and run its fetch + merge. Once the
+    /// branch queue drains, an "All" batch chains into the Pull Requests
+    /// phase (`pr_queue`); a pure Branches batch (whose `pr_queue` is always
+    /// empty) finishes instead.
     fn dispatch_next_update_all_branch(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let next = self.update_all.as_mut().and_then(|run| {
             if run.branch_queue.is_empty() {
                 return None;
             }
             let (path, branch) = run.branch_queue.remove(0);
-            let done = run.total - run.branch_queue.len();
+            let done = run.total - (run.branch_queue.len() + run.pr_queue.len());
             Some((path, branch, done, run.total))
         });
         let Some((path, branch, done, total)) = next else {
-            self.finish_update_all(tx);
+            let has_pending_prs = self
+                .update_all
+                .as_ref()
+                .is_some_and(|run| !run.pr_queue.is_empty());
+            if has_pending_prs {
+                self.dispatch_next_update_all_pr(tx);
+            } else {
+                self.finish_update_all(tx);
+            }
             return;
         };
         let message = format!("Updating {branch} ({done}/{total})...");
@@ -4295,6 +4351,11 @@ impl App {
         let commit_done = screen.commit_push_done();
         let commit_ok = screen.commit_push_succeeded();
         let branch = screen.request().branch.clone();
+        // Distinguishes which phase this conflict belongs to (an "All" batch
+        // can have both in flight, never at the same time): `local_only`
+        // means `start_local_conflict_resolution` mounted this screen for a
+        // Branches-flow item; otherwise it's a real Pull-Requests-flow item.
+        let local_only = screen.local_only();
 
         if opencode_finished && matches!(step, UpdateStep::Updating) {
             // opencode resolved the conflicts → commit (local for Branches,
@@ -4311,10 +4372,10 @@ impl App {
                     "{branch}: committing the resolved merge failed."
                 ));
             }
-            match self.update_all.as_ref().map(|run| run.kind) {
-                Some(UpdateAllKind::Branches) => self.dispatch_next_update_all_branch(tx),
-                Some(UpdateAllKind::PullRequests) => self.dispatch_next_update_all_pr(tx),
-                None => {}
+            if local_only {
+                self.dispatch_next_update_all_branch(tx);
+            } else {
+                self.dispatch_next_update_all_pr(tx);
             }
         }
     }
@@ -4355,6 +4416,7 @@ impl App {
         let noun = match run.kind {
             UpdateAllKind::Branches => "branches",
             UpdateAllKind::PullRequests => "pull requests",
+            UpdateAllKind::All => "worktrees",
         };
         self.enter_screen(Screen::Dashboard, tx);
         let variant = if run.failed.is_empty() {
@@ -5189,12 +5251,13 @@ impl App {
         result: Result<UpdateBranchOutcome, String>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // During an "Update all → Branches" batch this event belongs to the
-        // batch driver, which tallies + advances instead of toasting and
-        // returning to the dashboard.
+        // During an "Update all → Branches" (or the Branches phase of an
+        // "All") batch this event belongs to the batch driver, which
+        // tallies + advances instead of toasting and returning to the
+        // dashboard.
         if matches!(
             self.update_all.as_ref().map(|run| run.kind),
-            Some(UpdateAllKind::Branches)
+            Some(UpdateAllKind::Branches) | Some(UpdateAllKind::All)
         ) {
             self.apply_update_all_branch_finished(result, tx);
             return;
@@ -5504,12 +5567,13 @@ impl App {
                 return;
             }
         }
-        // During an "Update all → Pull Requests" batch, every non-conflict
-        // outcome (including a failed push) is tallied and advances the queue
-        // rather than toasting or opening the interactive recovery panel.
+        // During an "Update all → Pull Requests" (or the Pull Requests phase
+        // of an "All") batch, every non-conflict outcome (including a failed
+        // push) is tallied and advances the queue rather than toasting or
+        // opening the interactive recovery panel.
         if matches!(
             self.update_all.as_ref().map(|run| run.kind),
-            Some(UpdateAllKind::PullRequests)
+            Some(UpdateAllKind::PullRequests) | Some(UpdateAllKind::All)
         ) {
             self.apply_update_all_pr_finished(result, tx);
             return;
