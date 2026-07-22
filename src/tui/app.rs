@@ -2616,6 +2616,9 @@ impl App {
                     tx.clone(),
                 );
             }
+            ReviewAction::CopyToClipboard(text) => {
+                kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
+            }
             ReviewAction::SubmitSummary { request_changes } => {
                 let Some(screen) = self.review_pr.as_mut() else {
                     return;
@@ -3128,6 +3131,9 @@ impl App {
                     text,
                     tx.clone(),
                 );
+            }
+            BugkillAction::CopyToClipboard(text) => {
+                kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
             }
             BugkillAction::RetryWithFeedback => {
                 // Re-enter the fix phase for the same row, without reverting:
