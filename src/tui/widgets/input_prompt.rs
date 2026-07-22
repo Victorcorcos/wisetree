@@ -14,7 +14,7 @@
 //! fixed-height (8-row) bordered area with wrapping and vertical scrolling
 //! that follows the cursor: **Enter submits, Ctrl+J (or Alt+Enter) inserts a
 //! newline, Esc cancels**, ↑/↓ move between lines, and Home/End plus Ctrl+A/E
-//! work per line. Ctrl+Backspace (or Ctrl+L, since most terminals never
+//! work per line. Ctrl+Backspace (or Ctrl+R, since most terminals never
 //! report Backspace with a CONTROL modifier) clears the whole field, and
 //! Ctrl+S is a copy-everything shortcut: [`InputPrompt::wants_copy_all`]
 //! reports the keypress so the caller (which owns clipboard access) can read
@@ -368,16 +368,17 @@ impl InputPrompt {
                 // starting the description over, distinct from Alt+Backspace
                 // (previous word only) handled below. Most terminals never
                 // send Backspace with a CONTROL modifier without the kitty
-                // keyboard protocol (which most don't support), so Ctrl+L is
-                // the reliable alias — same "clear" mnemonic as the shell's
-                // Ctrl+L, and a plain Ctrl+letter combo works everywhere.
+                // keyboard protocol (which most don't support), so Ctrl+R is
+                // the reliable alias — a plain Ctrl+letter combo works
+                // everywhere, and it isn't already claimed by a terminal
+                // convention the way Ctrl+L (clear screen) is.
                 KeyCode::Backspace if ctrl => {
                     self.value.clear();
                     self.cursor = 0;
                     self.error = None;
                     return InputOutcome::Pending;
                 }
-                KeyCode::Char('l') | KeyCode::Char('L') if ctrl => {
+                KeyCode::Char('r') | KeyCode::Char('R') if ctrl => {
                     self.value.clear();
                     self.cursor = 0;
                     self.error = None;
@@ -581,7 +582,7 @@ impl InputPrompt {
 
         let hint_text = if self.multiline {
             "Enter submits · Esc cancels · Ctrl+J newline · Ctrl+S copy all · Ctrl+A line \
-             start · Ctrl+E line end · Ctrl+K clear to line end"
+             start · Ctrl+E line end · Ctrl+K clear to line end · Ctrl+R clear all"
         } else {
             "Press Enter to confirm, Esc to cancel"
         };
@@ -835,13 +836,13 @@ mod tests {
     }
 
     #[test]
-    fn multiline_ctrl_l_also_clears_the_whole_field() {
+    fn multiline_ctrl_r_also_clears_the_whole_field() {
         // Alias for Ctrl+Backspace: most terminals never report Backspace
         // with a CONTROL modifier without the kitty keyboard protocol, so
         // this is the shortcut that actually reaches most users.
         let mut prompt = InputPrompt::new("label").multiline();
         type_str(&mut prompt, "line one\nline two");
-        prompt.handle_key(ctrl('l'));
+        prompt.handle_key(ctrl('r'));
         assert_eq!(prompt.value, "");
         assert_eq!(prompt.cursor, 0);
     }
