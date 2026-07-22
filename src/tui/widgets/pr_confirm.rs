@@ -14,7 +14,7 @@
 //!   2. …
 //!
 //! Role         Model      Thinking   ← centered "which AIs run" table
-//! explain       glm-5.2    max
+//! explain       deepseek-v4-flash-free    max
 //!
 //! ┌──────── Are you sure ────────┐   ← ConfirmationModal (Yes / No)
 //! └──────────────────────────────┘

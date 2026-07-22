@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "claimEnabled": false,
+  "stale": false,
+  "baselineKey": null,
+  "evaluatedAtMs": null,
+  "reason": "No preregistered private-holdout live comparison and blind evidence packet has passed all gates."
+}

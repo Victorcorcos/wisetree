@@ -6,12 +6,12 @@
 //!
 //! - `Confirm`   : explanation panel + `ConfirmationModal` (Yes/No, **No**
 //!   default). Enter on Yes returns `ReviewAction::Confirmed`.
-//! - `Working`   : a quiet spinner + step toast. Covers every captured /
-//!   deterministic phase the `App` drives: syncing + fetching the diff,
-//!   scanning the files (`Scanning N changed files (M done)…`), posting a
-//!   comment, revising a finding, and submitting the review summary. The
-//!   scan phase shows the files currently being scanned in a panel below
-//!   the spinner.
+//! - `Working`   : a quiet spinner + step toast for the captured/deterministic
+//!   phases the `App` drives (syncing + fetching the diff, posting a comment,
+//!   revising a finding, submitting the summary). The multi-pass scan instead
+//!   renders a live progress dashboard: a `Scan → Audit → Verify` stepper, a
+//!   per-stage progress bar, an "Under review" panel naming the files/passes
+//!   in flight, and a running per-severity findings tally.
 //! - `Decision`  : one finding at a time — category/severity badge, the exact
 //!   comment body that would be posted, then native **Post / Edit / Other /
 //!   Skip** buttons.
@@ -35,6 +35,7 @@
 //! choice here.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -43,26 +44,54 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::config::schema::AiModelConfig;
+use crate::config::schema::AiReviewConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{
-    is_test_file, split_duplicate_findings, split_run_duplicate_findings, ReviewFile,
-    ReviewFinding, ReviewSeverity, ReviewSkippedFile,
+    review_coverage_groups, review_file_groups, split_duplicate_findings,
+    split_run_duplicate_findings, ReviewContext, ReviewFile, ReviewFileGroup, ReviewFinding,
+    ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile, ReviewVerification,
 };
+use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
+use crate::tui::widgets::spinner::spinner_frame;
 use crate::tui::widgets::{
     labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
     ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, Status, StatusIndicator,
     SummaryRow,
 };
 
-/// Sentinel `file_index` for the whole-diff test-coverage scan — it occupies
-/// one pool slot like a file scan but isn't any single file.
+/// First synthetic `file_index` for coverage-group scans. Further groups use
+/// descending values, keeping them disjoint from ordinary file indices.
 pub const COVERAGE_SCAN_INDEX: usize = usize::MAX;
+const FILE_GROUP_SCAN_INDEX: usize = usize::MAX / 2;
+
+fn coverage_scan_index(group_index: usize) -> usize {
+    COVERAGE_SCAN_INDEX - group_index
+}
 
 /// Label for the coverage scan in the in-flight panel and report rows.
-const COVERAGE_SCAN_LABEL: &str = "test coverage";
+const COVERAGE_SCAN_LABEL: &str = "coverage";
+const MERGED_SCAN_LABEL: &str = "merged review";
+
+/// The three passes the Review pipeline runs, in order. Drives the progress
+/// stepper and the per-stage bar on the Working view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineStage {
+    Scan,
+    Audit,
+    Verify,
+}
+
+/// One stepper cell's state, mirroring the post-create command list icons
+/// (`✓` done, spinner active, `○` pending, `–` skipped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageState {
+    Done,
+    Active,
+    Pending,
+    Skipped,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewStep {
@@ -75,7 +104,8 @@ pub enum ReviewStep {
     /// Deterministic edit form for the current finding — no AI, no tokens.
     EditFinding,
     OtherInput,
-    /// The deterministic review summary + Request changes / Comment / Skip.
+    /// The review summary + Request changes / Comment / Skip. Its overview is
+    /// utility-generated when possible; rows and charts remain deterministic.
     Summary,
     Done,
 }
@@ -210,8 +240,8 @@ pub enum ReviewAction {
 
 pub struct ReviewPullRequestScreen {
     request: ReviewPullRequestRequest,
-    /// Resolved `ai.review` config, shown on the confirm panel's AI table.
-    ai: AiModelConfig,
+    /// Resolved `ai.review` profiles, shown on the confirm panel's AI table.
+    ai: AiReviewConfig,
     confirm: Option<ConfirmationModal>,
     phase_message: String,
     /// True only during the per-file scan phase, so the Working view shows
@@ -226,22 +256,44 @@ pub struct ReviewPullRequestScreen {
     /// The changed files to scan, in diff order. Empty until preparation.
     /// Kept whole so an "Other" revision can re-render the file's prompt.
     files: Vec<ReviewFile>,
-    /// Index of the next file not yet handed to a scan task.
+    context: ReviewContext,
+    /// Small diffs combine application review and coverage in the sentinel
+    /// call; large diffs retain per-file application scans plus coverage.
+    scan_mode: ReviewScanMode,
+    /// Budgeted groups in dispatch order: tester groups first, then split-mode
+    /// application groups. `next_scan` indexes this list.
+    scan_groups: Vec<(usize, ReviewFileGroup)>,
     next_scan: usize,
-    /// Whether this run includes the whole-diff test-coverage pass — only
-    /// when at least one changed application (non-test) file survived the
-    /// filter, since a tests-only diff has no coverage to judge.
-    has_coverage_scan: bool,
-    /// The coverage pass has been handed to a scan task.
-    coverage_dispatched: bool,
+    tester_scans_total: usize,
+    tester_scans_done: usize,
+    tester_findings: Vec<ReviewFinding>,
+    /// Deterministic coverage groups. Application-file sets are disjoint;
+    /// changed tests are repeated as evidence. Empty for tests-only diffs.
+    coverage_groups: Vec<Vec<ReviewFile>>,
+    next_coverage_group: usize,
     /// Paths currently being scanned in parallel — the Working panel's
     /// content while the scan phase runs.
     in_flight: Vec<String>,
+    /// Which pipeline pass the Working view is currently showing (scan / audit
+    /// / verify), so the stepper and progress bar stay honest across phases.
+    stage: PipelineStage,
+    /// Whether the cross-group omission audit is expected to run this review,
+    /// captured when scanning begins so the stepper can show it as a real
+    /// upcoming stage (or as skipped) rather than guessing.
+    plan_audit: bool,
+    /// Total findings queued for high-risk verification, so the Verify bar can
+    /// show progress as `verification_outstanding` drains.
+    verification_total: usize,
     /// Files whose scan reached a terminal state (parsed or failed twice).
     scans_done: usize,
     /// Findings aggregated across every scanned file, sorted by severity
     /// once scanning completes.
     findings: Vec<ReviewFinding>,
+    skipped_files: Vec<ReviewSkippedFile>,
+    gap_audit_started: bool,
+    audit_finding_titles: BTreeSet<String>,
+    verification_outstanding: BTreeSet<usize>,
+    verification_results: Vec<Option<ReviewFinding>>,
     /// Index of the finding currently on the Decision step.
     current: usize,
     /// Findings actually posted, in posting order — the summary's input.
@@ -257,16 +309,21 @@ pub struct ReviewPullRequestScreen {
     summary_button_rects: Cell<[Rect; 3]>,
     /// Scroll offset for the (potentially long) comment preview / summary.
     decision_scroll: u16,
+    /// Max scroll offset from the last render, so scrolling can't overshoot
+    /// the bottom and leave the reverse direction feeling dead.
+    decision_max_scroll: Cell<u16>,
     other_input: Option<InputPrompt>,
     // ── results ─────────────────────────────────────────────────────────
     summary_rows: Vec<SummaryRow>,
+    scan_telemetry: Vec<ReviewScanTelemetry>,
+    telemetry_reported: bool,
     error: Option<String>,
     step: ReviewStep,
     pub tick: usize,
 }
 
 impl ReviewPullRequestScreen {
-    pub fn new(request: ReviewPullRequestRequest, ai: AiModelConfig) -> Self {
+    pub fn new(request: ReviewPullRequestRequest, ai: AiReviewConfig) -> Self {
         Self {
             confirm: Some(build_confirm(&request)),
             request,
@@ -277,12 +334,26 @@ impl ReviewPullRequestScreen {
             repo: String::new(),
             head_sha: String::new(),
             files: Vec::new(),
+            context: ReviewContext::default(),
+            scan_mode: ReviewScanMode::Split,
+            scan_groups: Vec::new(),
             next_scan: 0,
-            has_coverage_scan: false,
-            coverage_dispatched: false,
+            tester_scans_total: 0,
+            tester_scans_done: 0,
+            tester_findings: Vec::new(),
+            coverage_groups: Vec::new(),
+            next_coverage_group: 0,
             in_flight: Vec::new(),
+            stage: PipelineStage::Scan,
+            plan_audit: false,
+            verification_total: 0,
             scans_done: 0,
             findings: Vec::new(),
+            skipped_files: Vec::new(),
+            gap_audit_started: false,
+            audit_finding_titles: BTreeSet::new(),
+            verification_outstanding: BTreeSet::new(),
+            verification_results: Vec::new(),
             current: 0,
             posted: Vec::new(),
             summary_body: String::new(),
@@ -292,8 +363,11 @@ impl ReviewPullRequestScreen {
             summary_button: SummaryButton::Comment,
             summary_button_rects: Cell::new([Rect::default(); 3]),
             decision_scroll: 0,
+            decision_max_scroll: Cell::new(0),
             other_input: None,
             summary_rows: Vec::new(),
+            scan_telemetry: Vec::new(),
+            telemetry_reported: false,
             error: None,
             step: ReviewStep::Confirm,
             tick: 0,
@@ -340,8 +414,8 @@ impl ReviewPullRequestScreen {
     pub fn current_finding(&self) -> Option<ReviewFinding> {
         self.findings.get(self.current).cloned()
     }
-    /// The scanned file a finding belongs to — an "Other" revision re-renders
-    /// this file's prompt with the user's feedback threaded in.
+    /// The scanned file a finding belongs to — an "Other" revision derives
+    /// its focused hunk and optional inlined content from this snapshot.
     pub fn file_for(&self, finding: &ReviewFinding) -> Option<ReviewFile> {
         self.files.iter().find(|f| f.path == finding.file).cloned()
     }
@@ -384,13 +458,40 @@ impl ReviewPullRequestScreen {
         self.owner = owner;
         self.repo = repo;
         self.head_sha = sha;
+        self.rebuild_scan_order();
         self.next_scan = 0;
-        self.has_coverage_scan = self.files.iter().any(|f| !is_test_file(&f.path));
-        self.coverage_dispatched = false;
+        self.tester_scans_total = self
+            .scan_groups
+            .iter()
+            .filter(|(_, group)| group.profile == ReviewGroupProfile::Tester)
+            .count();
+        self.tester_scans_done = 0;
+        self.tester_findings.clear();
+        self.rebuild_coverage_groups();
         self.in_flight.clear();
         self.scans_done = 0;
         self.findings.clear();
         self.posted.clear();
+        self.scan_telemetry.clear();
+        self.telemetry_reported = false;
+    }
+
+    pub fn set_scan_mode(&mut self, scan_mode: ReviewScanMode) {
+        self.scan_mode = scan_mode;
+        self.rebuild_scan_order();
+        self.rebuild_coverage_groups();
+    }
+
+    pub fn set_review_context(&mut self, context: ReviewContext) {
+        self.context = context;
+    }
+
+    pub fn review_context(&self) -> ReviewContext {
+        self.context.clone()
+    }
+
+    pub fn scan_mode(&self) -> ReviewScanMode {
+        self.scan_mode
     }
 
     /// Working step for the parallel scan phase: the spinner message tracks
@@ -398,60 +499,75 @@ impl ReviewPullRequestScreen {
     pub fn begin_scan_phase(&mut self) {
         self.step = ReviewStep::Working;
         self.scanning = true;
+        self.stage = PipelineStage::Scan;
+        self.plan_audit = self.should_run_gap_audit();
         self.refresh_scan_message();
     }
 
     fn refresh_scan_message(&mut self) {
-        let coverage = if self.has_coverage_scan {
-            " + test coverage"
+        let combined = if !self.coverage_groups.is_empty() {
+            match self.scan_mode {
+                ReviewScanMode::Merged => " + merged review",
+                ReviewScanMode::Split => " + test coverage",
+            }
         } else {
             ""
         };
+        let files = self.files.len();
         self.phase_message = format!(
-            "Scanning {} changed files{coverage} ({} done)...",
-            self.files.len(),
-            self.scans_done
+            "Reviewing {files} changed file{}{combined}",
+            if files == 1 { "" } else { "s" },
         );
     }
 
-    /// Hand out the next file to scan, tracking it as in-flight. `None`
-    /// once every file has been dispatched.
-    pub fn take_next_scan_file(&mut self) -> Option<(usize, ReviewFile)> {
-        let file = self.files.get(self.next_scan)?.clone();
-        let index = self.next_scan;
+    /// Hand out the next focus-budget group, tracking it as in-flight.
+    pub(crate) fn take_next_scan_file(&mut self) -> Option<(usize, ReviewFileGroup)> {
+        let (index, group) = self.scan_groups.get(self.next_scan)?.clone();
         self.next_scan += 1;
-        self.in_flight.push(file.path.clone());
-        Some((index, file))
+        self.in_flight.push(self.scan_group_label(&group));
+        Some((index, group))
     }
 
-    /// Hand out the whole-diff coverage scan, tracking it as in-flight.
-    /// `None` when this run has no coverage pass or it already went out.
-    pub fn take_coverage_scan(&mut self) -> Option<Vec<ReviewFile>> {
-        if !self.has_coverage_scan || self.coverage_dispatched {
+    /// Hand out the next deterministic coverage group after tester scans
+    /// settle. The synthetic index keeps retry/failure accounting scoped to
+    /// the group that produced the event.
+    pub fn take_coverage_scan(&mut self) -> Option<(usize, Vec<ReviewFile>)> {
+        if self.tester_scans_done < self.tester_scans_total {
             return None;
         }
-        self.coverage_dispatched = true;
-        self.in_flight.push(COVERAGE_SCAN_LABEL.to_string());
-        Some(self.files.clone())
+        let group_index = self.next_coverage_group;
+        let files = self.coverage_groups.get(group_index)?.clone();
+        self.next_coverage_group += 1;
+        let scan_index = coverage_scan_index(group_index);
+        self.in_flight.push(self.coverage_scan_label(group_index));
+        Some((scan_index, files))
     }
 
-    /// The full file list — re-kicking the coverage scan after a bad reply
-    /// needs it again (its take-slot was consumed on dispatch).
-    pub fn all_files(&self) -> Vec<ReviewFile> {
-        self.files.clone()
+    /// Recover a dispatched coverage group for a reformat/full retry.
+    pub fn coverage_group(&self, scan_index: usize) -> Option<Vec<ReviewFile>> {
+        let group_index = COVERAGE_SCAN_INDEX.checked_sub(scan_index)?;
+        self.coverage_groups.get(group_index).cloned()
     }
 
     /// One scan reached a terminal state (result recorded or failed twice):
     /// update the progress message and the in-flight panel.
     pub fn note_scan_done(&mut self, file_index: usize) {
         self.scans_done += 1;
-        let label = if file_index == COVERAGE_SCAN_INDEX {
-            Some(COVERAGE_SCAN_LABEL)
+        if self.coverage_group_index(file_index).is_none()
+            && self
+                .scan_group(file_index)
+                .is_some_and(|group| group.profile == ReviewGroupProfile::Tester)
+        {
+            self.tester_scans_done += 1;
+        }
+        let label = if let Some(group_index) = self.coverage_group_index(file_index) {
+            Some(self.coverage_scan_label(group_index))
         } else {
-            self.files.get(file_index).map(|f| f.path.as_str())
+            self.scan_group(file_index)
+                .map(|group| self.scan_group_label(&group))
         };
         if let Some(label) = label {
-            if let Some(pos) = self.in_flight.iter().position(|p| p == label) {
+            if let Some(pos) = self.in_flight.iter().position(|p| p == &label) {
                 self.in_flight.remove(pos);
             }
         }
@@ -461,7 +577,87 @@ impl ReviewPullRequestScreen {
     /// True while some scan (a file's or the coverage pass) hasn't reached
     /// its terminal state yet.
     pub fn scans_pending(&self) -> bool {
-        self.scans_done < self.files.len() + usize::from(self.has_coverage_scan)
+        self.scans_done < self.scan_units_total()
+    }
+
+    fn scan_units_total(&self) -> usize {
+        self.scan_groups.len() + self.coverage_groups.len()
+    }
+
+    fn rebuild_scan_order(&mut self) {
+        self.scan_groups = review_file_groups(&self.files, self.scan_mode)
+            .into_iter()
+            .enumerate()
+            .map(|(group_index, group)| {
+                let scan_index = if group.files.len() == 1 {
+                    self.files
+                        .iter()
+                        .position(|file| file.path == group.files[0].path)
+                        .unwrap_or(FILE_GROUP_SCAN_INDEX - group_index)
+                } else {
+                    FILE_GROUP_SCAN_INDEX - group_index
+                };
+                (scan_index, group)
+            })
+            .collect();
+    }
+
+    fn rebuild_coverage_groups(&mut self) {
+        self.coverage_groups = review_coverage_groups(&self.files, self.scan_mode);
+        self.next_coverage_group = 0;
+    }
+
+    pub fn record_tester_findings(&mut self, file_index: usize, findings: &[ReviewFinding]) {
+        if self
+            .scan_group(file_index)
+            .is_some_and(|group| group.profile == ReviewGroupProfile::Tester)
+        {
+            self.tester_findings.extend_from_slice(findings);
+        }
+    }
+
+    pub fn tester_findings(&self) -> Vec<ReviewFinding> {
+        self.tester_findings.clone()
+    }
+
+    fn coverage_group_index(&self, scan_index: usize) -> Option<usize> {
+        let group_index = COVERAGE_SCAN_INDEX.checked_sub(scan_index)?;
+        (group_index < self.coverage_groups.len()).then_some(group_index)
+    }
+
+    fn coverage_scan_label(&self, group_index: usize) -> String {
+        if self.scan_mode == ReviewScanMode::Merged {
+            MERGED_SCAN_LABEL.to_string()
+        } else {
+            format!(
+                "{COVERAGE_SCAN_LABEL} group {} of {}",
+                group_index + 1,
+                self.coverage_groups.len()
+            )
+        }
+    }
+
+    pub(crate) fn scan_group(&self, scan_index: usize) -> Option<ReviewFileGroup> {
+        self.scan_groups
+            .iter()
+            .find(|(index, _)| *index == scan_index)
+            .map(|(_, group)| group.clone())
+    }
+
+    fn scan_group_label(&self, group: &ReviewFileGroup) -> String {
+        let prefix = match group.profile {
+            ReviewGroupProfile::Application => "app",
+            ReviewGroupProfile::Tester => "tests",
+        };
+        format!(
+            "{prefix}: {}",
+            group
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 
     /// Deterministic dedup of one scan's findings against the wisetree
@@ -473,11 +669,13 @@ impl ReviewPullRequestScreen {
         file_index: usize,
         findings: Vec<ReviewFinding>,
     ) -> (Vec<ReviewFinding>, Vec<ReviewFinding>) {
-        if file_index != COVERAGE_SCAN_INDEX {
-            return match self.files.get(file_index) {
-                Some(file) => split_duplicate_findings(findings, &file.existing_keys),
-                None => (findings, Vec::new()),
+        if self.coverage_group_index(file_index).is_none() {
+            let Some(group) = self.scan_group(file_index) else {
+                return (findings, Vec::new());
             };
+            if group.files.len() == 1 {
+                return split_duplicate_findings(findings, &group.files[0].existing_keys);
+            }
         }
         let mut fresh = Vec::new();
         let mut duplicates = Vec::new();
@@ -499,6 +697,7 @@ impl ReviewPullRequestScreen {
     /// muted row each on the final report, reason in the status label —
     /// the user sees why a changed file never produced findings.
     pub fn record_skipped_files(&mut self, skipped: &[ReviewSkippedFile]) {
+        self.skipped_files.extend_from_slice(skipped);
         for file in skipped {
             self.summary_rows.push(SummaryRow::with_status(
                 format!("skip {}", file.path),
@@ -542,17 +741,25 @@ impl ReviewPullRequestScreen {
         self.findings.extend(findings);
     }
 
+    pub fn record_scan_telemetry(&mut self, telemetry: ReviewScanTelemetry) {
+        self.scan_telemetry.push(telemetry);
+    }
+
+    #[cfg(test)]
+    pub fn scan_telemetry_len(&self) -> usize {
+        self.scan_telemetry.len()
+    }
+
     /// A scan that failed twice gets its own Failed row and the pool moves
     /// on — one bad file (or the coverage pass) never aborts the whole
     /// review.
     pub fn record_scan_failure(&mut self, file_index: usize, message: String) {
-        let path = if file_index == COVERAGE_SCAN_INDEX {
-            COVERAGE_SCAN_LABEL.to_string()
+        let path = if let Some(group_index) = self.coverage_group_index(file_index) {
+            self.coverage_scan_label(group_index)
+        } else if let Some(group) = self.scan_group(file_index) {
+            self.scan_group_label(&group)
         } else {
-            self.files
-                .get(file_index)
-                .map(|f| f.path.clone())
-                .unwrap_or_default()
+            String::new()
         };
         self.summary_rows.push(SummaryRow::with_status(
             format!("scan {path}"),
@@ -560,6 +767,94 @@ impl ReviewPullRequestScreen {
             colors::ERROR,
             Some(message),
         ));
+    }
+
+    pub fn should_run_gap_audit(&self) -> bool {
+        !self.gap_audit_started
+            && self.scan_mode == ReviewScanMode::Split
+            && self.coverage_groups.len() > 1
+            && self
+                .files
+                .iter()
+                .any(|file| !crate::services::dashboard::review_file_is_test(file))
+    }
+
+    pub fn begin_gap_audit(&mut self) {
+        self.gap_audit_started = true;
+        self.scanning = true;
+        self.stage = PipelineStage::Audit;
+        self.phase_message =
+            "Cross-checking every group for issues a single pass might miss".to_string();
+    }
+
+    pub fn gap_audit_inputs(
+        &self,
+    ) -> (
+        String,
+        Vec<ReviewFile>,
+        ReviewContext,
+        String,
+        Vec<ReviewSkippedFile>,
+        Vec<ReviewFinding>,
+    ) {
+        let edges = self
+            .scan_groups
+            .iter()
+            .filter_map(|(_, group)| {
+                (!group.relationship_summary.is_empty())
+                    .then_some(group.relationship_summary.as_str())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            self.request.worktree_path.clone(),
+            self.files.clone(),
+            self.context.clone(),
+            edges,
+            self.skipped_files.clone(),
+            self.findings.clone(),
+        )
+    }
+
+    pub fn record_gap_audit_result(&mut self, result: Result<Vec<ReviewFinding>, String>) {
+        self.scanning = false;
+        match result {
+            Ok(findings) => {
+                let existing = self
+                    .findings
+                    .iter()
+                    .map(|finding| {
+                        (
+                            finding.file.clone(),
+                            finding.line,
+                            finding.title.to_ascii_lowercase(),
+                        )
+                    })
+                    .collect::<BTreeSet<_>>();
+                for finding in findings {
+                    let key = (
+                        finding.file.clone(),
+                        finding.line,
+                        finding.title.to_ascii_lowercase(),
+                    );
+                    if existing.contains(&key) {
+                        self.record_run_duplicate_findings(std::slice::from_ref(&finding));
+                        continue;
+                    }
+                    self.audit_finding_titles
+                        .insert(finding.title.to_ascii_lowercase());
+                    self.findings.push(finding);
+                }
+            }
+            Err(message) => self.summary_rows.push(SummaryRow::with_status(
+                "global omission audit",
+                "Failed — primary findings kept",
+                colors::WARNING,
+                Some(message),
+            )),
+        }
     }
 
     /// Scanning finished: sort the aggregate by severity (Critical first)
@@ -583,6 +878,123 @@ impl ReviewPullRequestScreen {
         let (kept, duplicates) = split_run_duplicate_findings(std::mem::take(&mut self.findings));
         self.findings = kept;
         self.record_run_duplicate_findings(&duplicates);
+        self.current = 0;
+        !self.findings.is_empty()
+    }
+
+    pub fn begin_verification(&mut self) -> Vec<(usize, ReviewFile, ReviewFinding, bool)> {
+        self.verification_results = self.findings.iter().cloned().map(Some).collect();
+        let mut candidates = Vec::new();
+        for (index, finding) in self.findings.iter().enumerate() {
+            if !self.finding_requires_verification(finding) {
+                continue;
+            }
+            if let Some(file) = self.files.iter().find(|file| file.path == finding.file) {
+                self.verification_outstanding.insert(index);
+                candidates.push((
+                    index,
+                    file.clone(),
+                    finding.clone(),
+                    self.finding_requires_strong_verification(finding),
+                ));
+            }
+        }
+        if !candidates.is_empty() {
+            self.scanning = true;
+            self.stage = PipelineStage::Verify;
+            self.verification_total = candidates.len();
+            self.phase_message = format!(
+                "Double-checking {} high-risk finding{} before you review",
+                candidates.len(),
+                if candidates.len() == 1 { "" } else { "s" },
+            );
+        }
+        candidates
+    }
+
+    fn finding_requires_verification(&self, finding: &ReviewFinding) -> bool {
+        finding.severity.rank() <= ReviewSeverity::High.rank()
+            || finding.category.eq_ignore_ascii_case("security")
+            || finding.line.is_none()
+            || finding.suggestion.is_some()
+            || self
+                .audit_finding_titles
+                .contains(&finding.title.to_ascii_lowercase())
+            || self.scan_groups.iter().any(|(_, group)| {
+                !group.relationship_summary.is_empty()
+                    && group
+                        .relationship_summary
+                        .contains(&format!("`{}`", finding.file))
+            })
+    }
+
+    fn finding_requires_strong_verification(&self, finding: &ReviewFinding) -> bool {
+        matches!(
+            finding.severity,
+            ReviewSeverity::Critical | ReviewSeverity::High
+        ) || finding.category.eq_ignore_ascii_case("security")
+            || self
+                .audit_finding_titles
+                .contains(&finding.title.to_ascii_lowercase())
+            || self.scan_groups.iter().any(|(_, group)| {
+                !group.relationship_summary.is_empty()
+                    && group
+                        .relationship_summary
+                        .contains(&format!("`{}`", finding.file))
+            })
+    }
+
+    pub fn record_verification(
+        &mut self,
+        index: usize,
+        result: Result<ReviewVerification, String>,
+    ) {
+        if !self.verification_outstanding.remove(&index) {
+            return;
+        }
+        match result {
+            Ok(ReviewVerification::Confirmed { .. }) => {}
+            Ok(ReviewVerification::RejectedFalsePositive { reason }) => {
+                self.verification_results[index] = None;
+                self.summary_rows.push(SummaryRow::with_note(
+                    format!("verify {}", self.findings[index].descriptor()),
+                    "Rejected false positive",
+                    colors::MUTED,
+                    (!reason.is_empty()).then_some(reason),
+                ));
+            }
+            Ok(ReviewVerification::Revise { reason, finding }) => {
+                self.verification_results[index] = Some(finding);
+                self.summary_rows.push(SummaryRow::with_note(
+                    format!("verify {}", self.findings[index].descriptor()),
+                    "Revised",
+                    colors::EMPHASIS,
+                    (!reason.is_empty()).then_some(reason),
+                ));
+            }
+            Err(message) => {
+                self.verification_results[index] = None;
+                self.summary_rows.push(SummaryRow::with_status(
+                    format!("verify {}", self.findings[index].descriptor()),
+                    "Unverified — withheld",
+                    colors::WARNING,
+                    Some(message),
+                ));
+            }
+        }
+        self.phase_message = "Double-checking high-risk findings".to_string();
+    }
+
+    pub fn verification_pending(&self) -> bool {
+        !self.verification_outstanding.is_empty()
+    }
+
+    pub fn finish_verification(&mut self) -> bool {
+        self.scanning = false;
+        self.findings = std::mem::take(&mut self.verification_results)
+            .into_iter()
+            .flatten()
+            .collect();
         self.current = 0;
         !self.findings.is_empty()
     }
@@ -660,6 +1072,12 @@ impl ReviewPullRequestScreen {
         self.scanning = false;
     }
 
+    pub fn start_generating_summary(&mut self) {
+        self.step = ReviewStep::Working;
+        self.phase_message = "Writing the review summary overview...".to_string();
+        self.scanning = false;
+    }
+
     /// Record a per-finding outcome as a colored summary-table row.
     pub fn record_outcome(&mut self, outcome: ReviewRowOutcome) {
         let n = self.current + 1;
@@ -692,8 +1110,8 @@ impl ReviewPullRequestScreen {
         self.current < self.findings.len()
     }
 
-    /// Walkthrough finished with posted comments: show the deterministic
-    /// summary and the Request changes / Comment / Skip choice.
+    /// Walkthrough finished with posted comments: show the assembled summary
+    /// and the Request changes / Comment / Skip choice.
     pub fn enter_summary(&mut self, body: String) {
         self.summary_body = body;
         self.summary_button = SummaryButton::Comment;
@@ -716,15 +1134,40 @@ impl ReviewPullRequestScreen {
     }
 
     pub fn enter_done(&mut self) {
+        if !self.telemetry_reported && !self.scan_telemetry.is_empty() {
+            let label = review_telemetry_label(&self.scan_telemetry);
+            self.summary_rows.push(SummaryRow::with_status(
+                "AI scan usage",
+                label,
+                colors::MUTED,
+                None,
+            ));
+            persist_scan_telemetry(&self.scan_telemetry);
+            self.telemetry_reported = true;
+        }
         self.step = ReviewStep::Done;
     }
 
     // ── input ───────────────────────────────────────────────────────────
 
+    /// Scroll the comment/summary panel toward the top (smaller offset).
+    fn scroll_panel_up(&mut self, lines: u16) {
+        self.decision_scroll = self.decision_scroll.saturating_sub(lines);
+    }
+
+    /// Scroll toward the bottom, clamped to the last render's max offset so
+    /// the offset can't run past the end and make scrolling back feel dead.
+    fn scroll_panel_down(&mut self, lines: u16) {
+        self.decision_scroll = self
+            .decision_scroll
+            .saturating_add(lines)
+            .min(self.decision_max_scroll.get());
+    }
+
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
         match self.step {
             ReviewStep::Decision | ReviewStep::Summary => {
-                self.decision_scroll = self.decision_scroll.saturating_add(lines);
+                self.scroll_panel_up(lines);
                 true
             }
             _ => false,
@@ -734,7 +1177,7 @@ impl ReviewPullRequestScreen {
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
         match self.step {
             ReviewStep::Decision | ReviewStep::Summary => {
-                self.decision_scroll = self.decision_scroll.saturating_sub(lines);
+                self.scroll_panel_down(lines);
                 true
             }
             _ => false,
@@ -781,11 +1224,11 @@ impl ReviewPullRequestScreen {
                 ReviewAction::Continue
             }
             KeyCode::Up => {
-                self.decision_scroll = self.decision_scroll.saturating_add(1);
+                self.scroll_panel_up(1);
                 ReviewAction::Continue
             }
             KeyCode::Down => {
-                self.decision_scroll = self.decision_scroll.saturating_sub(1);
+                self.scroll_panel_down(1);
                 ReviewAction::Continue
             }
             KeyCode::Enter => match self.decision_button {
@@ -928,11 +1371,11 @@ impl ReviewPullRequestScreen {
                 ReviewAction::Continue
             }
             KeyCode::Up => {
-                self.decision_scroll = self.decision_scroll.saturating_add(1);
+                self.scroll_panel_up(1);
                 ReviewAction::Continue
             }
             KeyCode::Down => {
-                self.decision_scroll = self.decision_scroll.saturating_sub(1);
+                self.scroll_panel_down(1);
                 ReviewAction::Continue
             }
             KeyCode::Enter => match self.summary_button {
@@ -1032,10 +1475,12 @@ impl ReviewPullRequestScreen {
 
     pub fn preferred_content_height(&self) -> u16 {
         match self.step {
-            // spinner (+ blank + 3-line file panel while scanning).
+            // Scanning shows the progress dashboard (spinner + stepper + bar +
+            // the "Under review" panel); every other Working phase is a quiet
+            // one-line spinner.
             ReviewStep::Working => {
                 if self.scanning {
-                    7
+                    12
                 } else {
                     3
                 }
@@ -1094,21 +1539,36 @@ impl ReviewPullRequestScreen {
             .title_color(colors::NAVY)
             .block(build_detail_lines(&self.request))
             .steps(&REVIEW_STEPS)
-            .ai_roles(vec![AiRoleRow::new(
-                "review",
-                colors::NAVY,
-                self.ai.model.clone(),
-                self.ai.thinking.clone(),
-            )])
+            .ai_roles(vec![
+                AiRoleRow::new(
+                    "strong",
+                    colors::NAVY,
+                    self.ai.strong.model.clone(),
+                    self.ai.strong.thinking.clone(),
+                ),
+                AiRoleRow::new(
+                    "balanced",
+                    colors::NAVY,
+                    self.ai.balanced.model.clone(),
+                    self.ai.balanced.thinking.clone(),
+                ),
+                AiRoleRow::new(
+                    "utility",
+                    colors::NAVY,
+                    self.ai.utility.model.clone(),
+                    self.ai.utility.thinking.clone(),
+                ),
+            ])
             .modal(self.confirm.as_ref())
             .render(frame, area);
     }
 
-    /// Working spinner. While scanning, the files currently under review are
-    /// shown in a panel below (same rounded-border, bold-title treatment as
-    /// the other PR-command panels).
+    /// Working spinner. While scanning, a live progress dashboard sits below
+    /// it: the pipeline stepper (Scan → Audit → Verify), a per-stage bar, the
+    /// files/passes currently under review, and a running findings tally —
+    /// so the user can see exactly what the AI is doing in the background.
     fn render_working(&self, frame: &mut Frame, area: Rect) {
-        if !self.scanning || area.height < 5 {
+        if !self.scanning || area.height < 7 {
             StatusIndicator::new(Status::Loading, self.phase_message.clone())
                 .with_tick(self.tick)
                 .render(frame, area);
@@ -1117,19 +1577,68 @@ impl ReviewPullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // spinner
+                Constraint::Length(1), // spinner headline
+                Constraint::Length(1), // pipeline stepper
+                Constraint::Length(1), // progress bar
                 Constraint::Length(1), // blank
-                Constraint::Min(3),    // file panel
+                Constraint::Min(3),    // "Under review" + findings panel
             ])
             .split(area);
         StatusIndicator::new(Status::Loading, self.phase_message.clone())
             .with_tick(self.tick)
             .render(frame, chunks[0]);
-        self.render_scan_panel(frame, chunks[2]);
+        self.render_pipeline_stepper(frame, chunks[1]);
+        self.render_progress_bar(frame, chunks[2]);
+        self.render_scan_panel(frame, chunks[4]);
+    }
+
+    /// The `Scan → Audit → Verify` stepper. Each cell reuses the post-create
+    /// command-list icon vocabulary: `✓` done, spinner active, `○` pending,
+    /// `–` skipped (an audit that this diff does not qualify for).
+    fn render_pipeline_stepper(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = Vec::new();
+        for (i, (name, state)) in self.pipeline_stages().into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("  →  ".to_string(), muted_dim()));
+            }
+            let (icon, icon_style) = match state {
+                StageState::Done => ("✓".to_string(), Style::default().fg(colors::SUCCESS)),
+                StageState::Active => (
+                    spinner_frame(self.tick).to_string(),
+                    Style::default().fg(colors::NAVY),
+                ),
+                StageState::Pending => ("○".to_string(), muted_dim()),
+                StageState::Skipped => ("–".to_string(), muted_dim()),
+            };
+            let label_style = match state {
+                StageState::Active => Style::default()
+                    .fg(colors::EMPHASIS)
+                    .add_modifier(Modifier::BOLD),
+                StageState::Done => Style::default().fg(colors::EMPHASIS),
+                _ => muted_dim(),
+            };
+            spans.push(Span::styled(icon, icon_style));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(name.to_string(), label_style));
+            if matches!(state, StageState::Skipped) {
+                spans.push(Span::styled(" (n/a)".to_string(), muted_dim()));
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The active stage's progress bar. Countable stages (scan / verify) show
+    /// a filled block bar with `done/total · pct%`; the single-call audit pass
+    /// shows an indeterminate sweep so the user still sees it is alive.
+    fn render_progress_bar(&self, frame: &mut Frame, area: Rect) {
+        let line = match self.stage_progress() {
+            Some((done, total)) => progress_bar_line(done, total, area.width),
+            None => indeterminate_bar_line(self.tick, area.width),
+        };
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_scan_panel(&self, frame: &mut Frame, area: Rect) {
-        let paths = self.in_flight.join("  ·  ");
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -1137,7 +1646,7 @@ impl ReviewPullRequestScreen {
             .title(Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
-                    "Reviewing",
+                    "Under review",
                     Style::default()
                         .fg(colors::NAVY)
                         .add_modifier(Modifier::BOLD),
@@ -1149,20 +1658,186 @@ impl ReviewPullRequestScreen {
         if inner.height == 0 || inner.width == 0 {
             return;
         }
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    sanitize_row(&paths),
-                    Style::default().fg(colors::EMPHASIS),
-                )),
-                Line::from(Span::styled(
-                    format!("{} finding(s) so far", self.findings.len()),
-                    muted_dim(),
-                )),
-            ])
-            .wrap(Wrap { trim: false }),
-            inner,
-        );
+        // Activity fills the top; the findings tally is pinned to the bottom
+        // row so it stays put as scans come and go.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        let activity = self.activity_lines(rows[0].height as usize, inner.width as usize);
+        frame.render_widget(Paragraph::new(activity), rows[0]);
+        frame.render_widget(Paragraph::new(self.findings_tally_line()), rows[1]);
+    }
+
+    /// The pipeline stages paired with each one's current state. `Audit` is a
+    /// real stage only when the diff qualifies for the cross-group omission
+    /// pass; otherwise it renders as skipped.
+    fn pipeline_stages(&self) -> [(&'static str, StageState); 3] {
+        let scan = match self.stage {
+            PipelineStage::Scan => StageState::Active,
+            _ => StageState::Done,
+        };
+        let audit = if !self.plan_audit {
+            StageState::Skipped
+        } else {
+            match self.stage {
+                PipelineStage::Scan => StageState::Pending,
+                PipelineStage::Audit => StageState::Active,
+                PipelineStage::Verify => StageState::Done,
+            }
+        };
+        let verify = match self.stage {
+            PipelineStage::Verify => StageState::Active,
+            _ => StageState::Pending,
+        };
+        [("Scan", scan), ("Audit", audit), ("Verify", verify)]
+    }
+
+    /// `(done, total)` for the active stage's bar, or `None` for the single
+    /// indeterminate audit call.
+    fn stage_progress(&self) -> Option<(usize, usize)> {
+        match self.stage {
+            PipelineStage::Scan => Some((self.scans_done, self.scan_units_total())),
+            PipelineStage::Audit => None,
+            PipelineStage::Verify => Some((
+                self.verification_total
+                    .saturating_sub(self.verification_outstanding.len()),
+                self.verification_total,
+            )),
+        }
+    }
+
+    /// Findings tallied per severity (Critical, High, Medium, Low).
+    fn severity_counts(&self) -> [usize; 4] {
+        let mut counts = [0usize; 4];
+        for finding in &self.findings {
+            counts[finding.severity.rank() as usize] += 1;
+        }
+        counts
+    }
+
+    /// The rows inside the "Under review" panel, capped at `max_rows`. During
+    /// the scan pass these name the files/passes in flight; the audit and
+    /// verify passes carry no per-file work, so they describe what is running.
+    fn activity_lines(&self, max_rows: usize, width: usize) -> Vec<Line<'static>> {
+        if max_rows == 0 {
+            return Vec::new();
+        }
+        match self.stage {
+            PipelineStage::Scan => {
+                if self.in_flight.is_empty() {
+                    return vec![Line::from(Span::styled(
+                        "  wrapping up the last scans…".to_string(),
+                        muted_dim(),
+                    ))];
+                }
+                let mut lines = Vec::new();
+                let overflow = self.in_flight.len() > max_rows;
+                let visible = if overflow {
+                    max_rows - 1
+                } else {
+                    self.in_flight.len()
+                };
+                for label in self.in_flight.iter().take(visible) {
+                    lines.push(self.activity_row(label, width));
+                }
+                if overflow {
+                    let more = self.in_flight.len() - visible;
+                    lines.push(Line::from(Span::styled(
+                        format!("  … +{more} more in parallel"),
+                        muted_dim(),
+                    )));
+                }
+                lines
+            }
+            PipelineStage::Audit => vec![self.activity_note(
+                "re-reading every changed file together to catch cross-file gaps",
+                width,
+            )],
+            PipelineStage::Verify => {
+                let n = self.verification_outstanding.len();
+                vec![self.activity_note(
+                    &format!(
+                        "independently re-checking {n} high-risk finding{} against the code",
+                        if n == 1 { "" } else { "s" },
+                    ),
+                    width,
+                )]
+            }
+        }
+    }
+
+    /// One in-flight scan row: spinner + a colored kind badge (app / tests /
+    /// coverage / review) + the file paths or coverage group under review.
+    fn activity_row(&self, label: &str, width: usize) -> Line<'static> {
+        const BADGE_W: usize = 8;
+        const PREFIX_W: usize = 2 + BADGE_W + 1; // "⠋ " + badge + " "
+        let (badge, detail) = split_activity_label(label);
+        let detail = truncate_to(&sanitize_row(&detail), width.saturating_sub(PREFIX_W));
+        Line::from(vec![
+            Span::styled(
+                spinner_frame(self.tick).to_string(),
+                Style::default().fg(colors::PRIMARY),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{badge:<BADGE_W$}"),
+                Style::default()
+                    .fg(activity_badge_color(badge))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(detail, Style::default().fg(colors::EMPHASIS)),
+        ])
+    }
+
+    /// A single descriptive row for the passes that do no per-file work.
+    fn activity_note(&self, text: &str, width: usize) -> Line<'static> {
+        let text = truncate_to(&sanitize_row(text), width.saturating_sub(2));
+        Line::from(vec![
+            Span::styled(
+                spinner_frame(self.tick).to_string(),
+                Style::default().fg(colors::PRIMARY),
+            ),
+            Span::raw(" "),
+            Span::styled(text, Style::default().fg(colors::EMPHASIS)),
+        ])
+    }
+
+    /// The running findings tally, broken down by severity with colored counts
+    /// instead of one opaque total.
+    fn findings_tally_line(&self) -> Line<'static> {
+        let counts = self.severity_counts();
+        let total: usize = counts.iter().sum();
+        let mut spans = vec![Span::styled(
+            "Findings  ".to_string(),
+            Style::default().fg(colors::EMPHASIS),
+        )];
+        if total == 0 {
+            spans.push(Span::styled("none surfaced yet".to_string(), muted_dim()));
+            return Line::from(spans);
+        }
+        let by_severity = [
+            (ReviewSeverity::Critical, counts[0]),
+            (ReviewSeverity::High, counts[1]),
+            (ReviewSeverity::Medium, counts[2]),
+            (ReviewSeverity::Low, counts[3]),
+        ];
+        for (severity, count) in by_severity {
+            let style = if count == 0 {
+                muted_dim()
+            } else {
+                Style::default()
+                    .fg(severity_color(severity))
+                    .add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(
+                format!("{} {count}  ", severity.emoji()),
+                style,
+            ));
+        }
+        spans.push(Span::styled(format!("· {total} total"), muted_dim()));
+        Line::from(spans)
     }
 
     fn render_decision(&self, frame: &mut Frame, area: Rect) {
@@ -1221,6 +1896,7 @@ impl ReviewPullRequestScreen {
         };
         frame.render_widget(block, chunks[1]);
         let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+        self.decision_max_scroll.set(max_scroll);
         let scroll = self.decision_scroll.min(max_scroll);
         frame.render_widget(
             Paragraph::new(lines)
@@ -1453,6 +2129,7 @@ impl ReviewPullRequestScreen {
             .collect();
         frame.render_widget(block, chunks[1]);
         let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+        self.decision_max_scroll.set(max_scroll);
         let scroll = self.decision_scroll.min(max_scroll);
         frame.render_widget(
             Paragraph::new(lines)
@@ -1537,6 +2214,18 @@ impl ReviewPullRequestScreen {
             chunks[2],
         );
     }
+}
+
+fn persist_scan_telemetry(scans: &[ReviewScanTelemetry]) {
+    #[cfg(not(test))]
+    {
+        let scans = scans.to_vec();
+        tokio::task::spawn_blocking(move || {
+            crate::services::review_telemetry::persist_review_telemetry(&scans);
+        });
+    }
+    #[cfg(test)]
+    let _ = scans;
 }
 
 /// Render a centered row of bordered buttons, each sized to exactly its own
@@ -1769,11 +2458,11 @@ fn build_detail_lines(request: &ReviewPullRequestRequest) -> Vec<Line<'static>> 
 /// owns the numbering + styling.
 const REVIEW_STEPS: [&str; 7] = [
     "Sync the branch + fetch the PR diff and its existing comments",
-    "Lockfiles, minified/generated files and snapshots are skipped (no AI cost)",
+    "Only binary or blank-only changes are skipped; risky text changes stay reviewable",
     "AI scans files in parallel; one whole-diff pass alone judges test coverage",
     "You choose Post / Edit / Other / Skip per finding (Edit is AI-free)",
     "Approved findings are posted as inline PR comments (with suggestions)",
-    "A review summary is assembled from the posted comments (no AI)",
+    "A utility AI writes the summary overview; rows and charts stay deterministic",
     "You choose Request changes / Comment / Skip for the summary",
 ];
 
@@ -1898,9 +2587,108 @@ fn sanitize_row(s: &str) -> String {
     out
 }
 
+/// Bar cells the progress line ever draws — kept short so a wide terminal does
+/// not stretch it into a runway.
+const PROGRESS_BAR_MAX: usize = 32;
+
+/// A determinate progress bar: `████████░░░░  8/12 · 67%`.
+fn progress_bar_line(done: usize, total: usize, width: u16) -> Line<'static> {
+    if total == 0 {
+        return Line::from("");
+    }
+    let done = done.min(total);
+    let suffix = format!("  {done}/{total} · {}%", done * 100 / total);
+    let bar_w = (width as usize)
+        .saturating_sub(suffix.chars().count())
+        .min(PROGRESS_BAR_MAX);
+    let filled = (bar_w * done + total / 2) / total;
+    let filled = filled.min(bar_w);
+    Line::from(vec![
+        Span::styled("█".repeat(filled), Style::default().fg(colors::NAVY)),
+        Span::styled("░".repeat(bar_w - filled), muted_dim()),
+        Span::styled(suffix, Style::default().fg(colors::EMPHASIS)),
+    ])
+}
+
+/// An indeterminate bar: a filled window sweeps back and forth over a muted
+/// track, so a single long-running call still reads as alive.
+fn indeterminate_bar_line(tick: usize, width: u16) -> Line<'static> {
+    let bar_w = (width as usize).min(PROGRESS_BAR_MAX);
+    if bar_w == 0 {
+        return Line::from("");
+    }
+    let window = 6.min(bar_w);
+    let span = bar_w - window;
+    let start = if span == 0 {
+        0
+    } else {
+        let p = tick % (span * 2);
+        if p <= span {
+            p
+        } else {
+            span * 2 - p
+        }
+    };
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("░".repeat(start), muted_dim()));
+    }
+    spans.push(Span::styled(
+        "█".repeat(window),
+        Style::default().fg(colors::NAVY),
+    ));
+    let tail = bar_w - start - window;
+    if tail > 0 {
+        spans.push(Span::styled("░".repeat(tail), muted_dim()));
+    }
+    Line::from(spans)
+}
+
+/// Split an in-flight scan label into a short kind badge and its detail. The
+/// labels are produced by `scan_group_label` / `coverage_scan_label`, so the
+/// prefixes are ours to rely on.
+fn split_activity_label(label: &str) -> (&'static str, String) {
+    if let Some(rest) = label.strip_prefix("app: ") {
+        ("app", rest.to_string())
+    } else if let Some(rest) = label.strip_prefix("tests: ") {
+        ("tests", rest.to_string())
+    } else if let Some(rest) = label.strip_prefix(&format!("{COVERAGE_SCAN_LABEL} ")) {
+        ("coverage", rest.to_string())
+    } else if label == MERGED_SCAN_LABEL {
+        ("review", "whole diff + test coverage".to_string())
+    } else {
+        ("scan", label.to_string())
+    }
+}
+
+fn activity_badge_color(badge: &str) -> Color {
+    match badge {
+        "app" => colors::CYAN,
+        "tests" => colors::GREEN,
+        "coverage" => colors::ACCENT,
+        "review" => colors::NAVY,
+        _ => colors::EMPHASIS,
+    }
+}
+
+/// Truncate to `max` display columns (char count is a fair proxy for the ASCII
+/// paths and ASCII labels this renders), adding an ellipsis when it clips.
+fn truncate_to(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::AiModelConfig;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1916,10 +2704,15 @@ mod tests {
         }
     }
 
-    fn test_ai() -> AiModelConfig {
-        AiModelConfig {
+    fn test_ai() -> AiReviewConfig {
+        let model = AiModelConfig {
             model: "opencode/review-scan".to_string(),
             thinking: "max".to_string(),
+        };
+        AiReviewConfig {
+            strong: model.clone(),
+            balanced: model.clone(),
+            utility: model,
         }
     }
 
@@ -1929,6 +2722,7 @@ mod tests {
             annotated_diff:
                 "@@ -1,2 +1,3 @@\n     1  fn main() {\n     2 +    let x = 1;\n     3  }"
                     .to_string(),
+            full_content: None,
             commentable_lines: BTreeSet::from([1, 2, 3]),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
@@ -1997,7 +2791,9 @@ mod tests {
         assert!(dump.contains("#42"), "{dump}");
         assert!(dump.contains("Add retry logic"), "{dump}");
         assert!(dump.contains("Will run:"), "{dump}");
-        assert!(dump.contains("review"), "{dump}");
+        assert!(dump.contains("strong"), "{dump}");
+        assert!(dump.contains("balanced"), "{dump}");
+        assert!(dump.contains("utility"), "{dump}");
         assert!(dump.contains("opencode/review-scan"), "{dump}");
     }
 
@@ -2034,29 +2830,32 @@ mod tests {
         assert!(screen.scan_phase_active());
         assert!(screen
             .phase_message
-            .contains("2 changed files + test coverage (0 done)"));
-        let (first, file_a) = screen.take_next_scan_file().unwrap();
-        let (second, file_b) = screen.take_next_scan_file().unwrap();
-        assert_eq!((first, second), (0, 1));
+            .contains("Reviewing 2 changed files + test coverage"));
+        let (group_index, group) = screen.take_next_scan_file().unwrap();
+        assert_eq!(group_index, FILE_GROUP_SCAN_INDEX);
         assert_eq!(
-            (file_a.path.as_str(), file_b.path.as_str()),
-            ("a.rs", "b.rs")
+            group
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.rs", "b.rs"]
         );
         assert!(screen.take_next_scan_file().is_none());
         // App files changed, so the whole-diff coverage pass fills the last
         // pool slot — exactly once.
-        let coverage_files = screen.take_coverage_scan().unwrap();
+        let (coverage_index, coverage_files) = screen.take_coverage_scan().unwrap();
+        assert_eq!(coverage_index, COVERAGE_SCAN_INDEX);
         assert_eq!(coverage_files.len(), 2);
         assert!(screen.take_coverage_scan().is_none());
 
-        // Results arrive out of order — the second file finishes first.
+        // One grouped result can contain findings from both files.
         screen.record_scan_result(vec![finding("b.rs", Some(3), ReviewSeverity::Critical)]);
-        screen.note_scan_done(1);
-        assert!(screen.phase_message.contains("(1 done)"));
-        assert!(screen.scans_pending());
         screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::Low)]);
-        screen.note_scan_done(0);
-        assert!(screen.scans_pending(), "the coverage pass is still out");
+        screen.note_scan_done(group_index);
+        // The progress bar carries the count now: 1 of 2 scan units done.
+        assert!(render_dump(&mut screen, 80, 14).contains("1/2"));
+        assert!(screen.scans_pending());
         screen.record_scan_result(Vec::new());
         screen.note_scan_done(COVERAGE_SCAN_INDEX);
         assert!(!screen.scans_pending());
@@ -2066,6 +2865,110 @@ mod tests {
         assert!(!screen.scan_phase_active());
         assert_eq!(screen.findings_len(), 2);
         assert_eq!(screen.current_finding().unwrap().file, "b.rs");
+    }
+
+    #[test]
+    fn merged_scan_pool_dispatches_testers_and_one_combined_scan() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_scan_mode(ReviewScanMode::Merged);
+        screen.set_files(
+            vec![file("src/a.rs"), file("tests/a_test.rs"), file("src/b.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        screen.begin_scan_phase();
+        assert!(screen.phase_message.contains("+ merged review"));
+        let (index, tester) = screen.take_next_scan_file().unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(tester.files[0].path, "tests/a_test.rs");
+        assert!(screen.take_next_scan_file().is_none());
+        assert!(screen.take_coverage_scan().is_none());
+        screen.note_scan_done(index);
+        assert!(screen.scans_pending());
+        assert_eq!(screen.take_coverage_scan().unwrap().1.len(), 3);
+        screen.note_scan_done(COVERAGE_SCAN_INDEX);
+        assert!(!screen.scans_pending());
+    }
+
+    #[test]
+    fn split_pool_prioritizes_testers_and_gates_coverage_until_they_settle() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![
+                file("src/a.rs"),
+                file("tests/a_test.rs"),
+                file("tests/b_test.rs"),
+                file("src/b.rs"),
+            ],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        let indices = (0..2)
+            .map(|_| screen.take_next_scan_file().unwrap().0)
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![1, 2]);
+        assert!(screen.take_coverage_scan().is_none());
+
+        let weak = finding("tests/a_test.rs", Some(3), ReviewSeverity::Medium);
+        let second_weak = finding("tests/b_test.rs", Some(2), ReviewSeverity::Low);
+        screen.record_tester_findings(indices[0], std::slice::from_ref(&weak));
+        screen.record_tester_findings(indices[1], std::slice::from_ref(&second_weak));
+        screen.note_scan_done(indices[0]);
+        assert_eq!(screen.tester_findings(), vec![weak, second_weak]);
+        assert!(screen.take_coverage_scan().is_none());
+        screen.note_scan_done(indices[1]);
+        assert_eq!(screen.take_coverage_scan().unwrap().1.len(), 4);
+    }
+
+    #[test]
+    fn split_pool_settles_multiple_coverage_groups_independently() {
+        let mut first = file("src/first.rs");
+        first.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_MERGED_FOCUS_BYTES);
+        let second = file("src/tail.rs");
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![first, second], "o".into(), "r".into(), "sha".into());
+
+        let first_file = screen.take_next_scan_file().unwrap().0;
+        let second_file = screen.take_next_scan_file().unwrap().0;
+        let (first_group, first_files) = screen.take_coverage_scan().unwrap();
+        let (second_group, second_files) = screen.take_coverage_scan().unwrap();
+        assert_eq!(first_group, COVERAGE_SCAN_INDEX);
+        assert_eq!(second_group, COVERAGE_SCAN_INDEX - 1);
+        assert_eq!(first_files[0].path, "src/first.rs");
+        assert_eq!(second_files[0].path, "src/tail.rs");
+
+        screen.record_scan_failure(first_group, "bad group".to_string());
+        screen.note_scan_done(first_group);
+        screen.note_scan_done(first_file);
+        screen.note_scan_done(second_file);
+        assert!(
+            screen.scans_pending(),
+            "tail coverage group is still active"
+        );
+        screen.note_scan_done(second_group);
+        assert!(!screen.scans_pending());
+        assert!(screen.summary_rows[0]
+            .command
+            .contains("coverage group 1 of 2"));
+        assert!(screen.coverage_group(second_group).is_some());
+    }
+
+    #[test]
+    fn merged_tests_only_diff_has_no_combined_coverage_owner() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_scan_mode(ReviewScanMode::Merged);
+        screen.set_files(
+            vec![file("tests/a_test.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        let (index, _) = screen.take_next_scan_file().unwrap();
+        assert!(screen.take_coverage_scan().is_none());
+        screen.note_scan_done(index);
+        assert!(!screen.scans_pending());
     }
 
     #[test]
@@ -2096,6 +2999,165 @@ mod tests {
             .find(|r| r.status.as_ref().is_some_and(|s| s.label == "Duplicate"))
             .expect("a Duplicate row should be recorded");
         assert!(dup_row.command.contains("a.rs:9"));
+    }
+
+    #[test]
+    fn verification_policy_filters_high_risk_and_withholds_failures() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        let mut low_prose = finding_with("a.rs", Some(2), ReviewSeverity::Low, None);
+        low_prose.category = "Code Smell".to_string();
+        low_prose.title = "Minor naming issue".to_string();
+        let mut high = finding_with("a.rs", Some(2), ReviewSeverity::High, None);
+        high.title = "High impact bug".to_string();
+        let mut suggestion = finding_with("a.rs", Some(3), ReviewSeverity::Low, Some("fixed"));
+        suggestion.category = "Convention".to_string();
+        suggestion.title = "Direct replacement".to_string();
+        screen.record_scan_result(vec![low_prose.clone(), high, suggestion]);
+        assert!(screen.finish_scanning());
+        let candidates = screen.begin_verification();
+        assert_eq!(
+            candidates.len(),
+            2,
+            "low-severity prose should bypass verifier"
+        );
+        let routed_profiles = candidates
+            .iter()
+            .map(|(_, _, finding, strong)| (finding.title.as_str(), *strong))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(routed_profiles.get("High impact bug"), Some(&true));
+        assert_eq!(routed_profiles.get("Direct replacement"), Some(&false));
+        let rejected = candidates[0].0;
+        screen.record_verification(
+            rejected,
+            Ok(ReviewVerification::RejectedFalsePositive {
+                reason: "guard already applies".to_string(),
+            }),
+        );
+        let failed = candidates[1].0;
+        screen.record_verification(failed, Err("malformed verifier output".to_string()));
+        assert!(!screen.verification_pending());
+        assert!(screen.finish_verification());
+        assert_eq!(screen.findings, vec![low_prose]);
+        let rejected_row = screen
+            .summary_rows
+            .iter()
+            .find(|row| {
+                row.status
+                    .as_ref()
+                    .is_some_and(|status| status.label == "Rejected false positive")
+            })
+            .expect("rejection is recorded on the summary");
+        assert!(
+            rejected_row.success,
+            "a rejected false positive is a correct verifier decision, not a failure"
+        );
+        let withheld_row = screen
+            .summary_rows
+            .iter()
+            .find(|row| {
+                row.status
+                    .as_ref()
+                    .is_some_and(|status| status.label == "Unverified — withheld")
+            })
+            .expect("a verifier error is recorded on the summary");
+        assert!(
+            !withheld_row.success,
+            "a verifier that errors out is a genuine failure"
+        );
+    }
+
+    #[test]
+    fn verifier_revision_replaces_candidate_without_colliding_shared_anchor() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        let mut first = finding_with("a.rs", Some(2), ReviewSeverity::High, None);
+        first.title = "First concern".to_string();
+        let mut second = finding_with("a.rs", Some(2), ReviewSeverity::High, None);
+        second.title = "Second concern".to_string();
+        screen.record_scan_result(vec![first, second.clone()]);
+        screen.finish_scanning();
+        let candidates = screen.begin_verification();
+        let mut revised = candidates[0].2.clone();
+        revised.title = "Corrected first concern".to_string();
+        screen.record_verification(
+            candidates[0].0,
+            Ok(ReviewVerification::Revise {
+                reason: "anchor retained".to_string(),
+                finding: revised.clone(),
+            }),
+        );
+        screen.record_verification(
+            candidates[1].0,
+            Ok(ReviewVerification::Confirmed {
+                reason: "independent concern".to_string(),
+            }),
+        );
+        screen.finish_verification();
+        assert_eq!(screen.findings.len(), 2);
+        assert!(screen.findings.contains(&revised));
+        assert!(screen.findings.contains(&second));
+        let revised_row = screen
+            .summary_rows
+            .iter()
+            .find(|row| {
+                row.status
+                    .as_ref()
+                    .is_some_and(|status| status.label == "Revised")
+            })
+            .expect("a revision is recorded on the summary");
+        assert!(
+            revised_row.success,
+            "a revised finding is a correct verifier decision, not a failure"
+        );
+    }
+
+    #[test]
+    fn gap_audit_runs_only_for_decomposed_application_reviews() {
+        let mut large = file("src/large.rs");
+        large.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_MERGED_FOCUS_BYTES);
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![large, file("src/tail.rs")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        assert!(screen.should_run_gap_audit());
+        screen.begin_gap_audit();
+        assert!(!screen.should_run_gap_audit());
+        assert!(screen.scan_phase_active());
+
+        let mut tests_only = ReviewPullRequestScreen::new(request(), test_ai());
+        tests_only.set_files(
+            vec![file("tests/a_test.rs"), file("e2e/login.cy.ts")],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        assert!(!tests_only.should_run_gap_audit());
+    }
+
+    #[test]
+    fn gap_audit_failure_keeps_primary_findings_and_duplicates_are_suppressed() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        let primary = finding_with("a.rs", Some(2), ReviewSeverity::Medium, None);
+        screen.record_scan_result(vec![primary.clone()]);
+        screen.record_gap_audit_result(Ok(vec![primary.clone()]));
+        assert_eq!(screen.findings, vec![primary.clone()]);
+        assert!(screen.summary_rows.iter().any(|row| row
+            .status
+            .as_ref()
+            .is_some_and(|status| status.label == "Duplicate")));
+
+        screen.record_gap_audit_result(Err("audit unavailable".to_string()));
+        assert_eq!(screen.findings, vec![primary]);
+        assert!(screen.summary_rows.iter().any(|row| {
+            row.status
+                .as_ref()
+                .is_some_and(|status| status.label == "Failed — primary findings kept")
+        }));
     }
 
     #[test]
@@ -2132,15 +3194,59 @@ mod tests {
         screen.take_next_scan_file();
         screen.take_next_scan_file();
         screen.take_coverage_scan();
-        let dump = render_dump(&mut screen, 80, 10);
+        let dump = render_dump(&mut screen, 80, 12);
         assert!(
-            dump.contains("Scanning 2 changed files + test coverage (0 done)"),
+            dump.contains("Reviewing 2 changed files + test coverage"),
             "{dump}"
         );
-        assert!(dump.contains("Reviewing"), "{dump}");
+        assert!(dump.contains("Under review"), "{dump}");
         assert!(dump.contains("src/lib/deep.rs"), "{dump}");
         assert!(dump.contains("src/other.rs"), "{dump}");
-        assert!(dump.contains("test coverage"), "{dump}");
+        assert!(dump.contains("coverage"), "{dump}");
+        // The pipeline stepper and the severity tally replace the opaque
+        // "N finding(s) so far" line.
+        assert!(dump.contains("Scan"), "{dump}");
+        assert!(dump.contains("Verify"), "{dump}");
+        assert!(dump.contains("Findings"), "{dump}");
+    }
+
+    #[test]
+    fn scanning_dashboard_breaks_findings_down_by_severity() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+        screen.take_next_scan_file();
+        screen.record_scan_result(vec![
+            finding("a.rs", Some(2), ReviewSeverity::Critical),
+            finding("a.rs", Some(3), ReviewSeverity::Low),
+            finding("a.rs", Some(4), ReviewSeverity::Low),
+        ]);
+        // One Critical, two Low, three total — broken out per severity.
+        assert_eq!(screen.severity_counts(), [1, 0, 0, 2]);
+        let dump = render_dump(&mut screen, 80, 12);
+        // The severity tally with colored circles replaces "N finding(s) so far".
+        assert!(dump.contains("Findings"), "{dump}");
+        assert!(dump.contains("🔴"), "{dump}");
+        assert!(dump.contains("⚪"), "{dump}");
+        assert!(dump.contains("· 3 total"), "{dump}");
+        assert!(!dump.contains("finding(s) so far"), "{dump}");
+    }
+
+    #[test]
+    fn verify_phase_shows_verify_stage_active_with_progress() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+        screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::Critical)]);
+        screen.finish_scanning();
+        let candidates = screen.begin_verification();
+        assert_eq!(candidates.len(), 1, "a Critical finding needs verifying");
+        let dump = render_dump(&mut screen, 80, 12);
+        assert!(dump.contains("Verify"), "{dump}");
+        // The bar tracks verification progress: none confirmed yet.
+        assert!(dump.contains("0/1"), "{dump}");
+        // The panel describes the pass rather than listing files.
+        assert!(dump.contains("re-checking"), "{dump}");
     }
 
     #[test]
@@ -2153,9 +3259,9 @@ mod tests {
             "sha".into(),
         );
         screen.begin_scan_phase();
-        screen.take_next_scan_file();
-        screen.record_scan_failure(0, "model returned garbage".to_string());
-        screen.note_scan_done(0);
+        let group_index = screen.take_next_scan_file().unwrap().0;
+        screen.record_scan_failure(group_index, "model returned garbage".to_string());
+        screen.note_scan_done(group_index);
         assert!(screen.scans_pending());
         let row = &screen.summary_rows[0];
         assert_eq!(row.status.as_ref().unwrap().label, "Failed");
@@ -2172,7 +3278,7 @@ mod tests {
             "sha".into(),
         );
         screen.begin_scan_phase();
-        assert!(screen.phase_message.contains("1 changed files (0 done)"));
+        assert!(screen.phase_message.contains("Reviewing 1 changed file"));
         screen.take_next_scan_file();
         assert!(screen.take_coverage_scan().is_none());
         screen.record_scan_result(Vec::new());
@@ -2192,7 +3298,22 @@ mod tests {
         assert!(screen.scans_pending(), "a.rs is still out");
         let row = &screen.summary_rows[0];
         assert_eq!(row.status.as_ref().unwrap().label, "Failed");
-        assert!(row.command.contains("test coverage"));
+        assert!(row.command.contains("coverage group 1 of 1"));
+    }
+
+    #[test]
+    fn merged_scan_failure_row_names_the_combined_pass() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_scan_mode(ReviewScanMode::Merged);
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.begin_scan_phase();
+        screen.take_coverage_scan();
+        screen.record_scan_failure(COVERAGE_SCAN_INDEX, "model returned garbage".to_string());
+        screen.note_scan_done(COVERAGE_SCAN_INDEX);
+        assert!(!screen.scans_pending());
+        let row = &screen.summary_rows[0];
+        assert_eq!(row.status.as_ref().unwrap().label, "Failed");
+        assert!(row.command.contains("merged review"));
     }
 
     #[test]
@@ -2260,6 +3381,38 @@ mod tests {
         assert!(dump.contains("│  Request changes  │"), "{dump}");
         assert!(dump.contains("│  Comment  │"), "{dump}");
         assert!(dump.contains("│  Skip  │"), "{dump}");
+    }
+
+    #[test]
+    fn summary_panel_scrolls_naturally_and_clamps_to_the_bottom() {
+        let mut screen = screen_on_decision();
+        let body = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.enter_summary(body);
+        // Render short so the panel overflows and the max-scroll cache fills.
+        let _ = render_dump(&mut screen, 80, 16);
+        let max = screen.decision_max_scroll.get();
+        assert!(max > 0, "summary should overflow a 16-row viewport");
+
+        // Wheel down moves toward the bottom; wheel up moves back up.
+        assert!(screen.handle_mouse_scroll_down(3));
+        assert_eq!(screen.decision_scroll, 3);
+        assert!(screen.handle_mouse_scroll_up(2));
+        assert_eq!(screen.decision_scroll, 1);
+        // Scrolling above the top saturates at 0, never negative.
+        assert!(screen.handle_mouse_scroll_up(50));
+        assert_eq!(screen.decision_scroll, 0);
+
+        // Scrolling far past the bottom is clamped to `max`, so a single
+        // wheel-up immediately reverses instead of burning dead ticks.
+        for _ in 0..100 {
+            screen.handle_mouse_scroll_down(3);
+        }
+        assert_eq!(screen.decision_scroll, max);
+        screen.handle_mouse_scroll_up(1);
+        assert_eq!(screen.decision_scroll, max - 1);
     }
 
     fn screen_on_decision() -> ReviewPullRequestScreen {
@@ -2463,16 +3616,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_revision_returns_to_the_existing_finding() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "s".into());
+        let original = finding("a.rs", Some(2), ReviewSeverity::High);
+        screen.record_scan_result(vec![original.clone()]);
+        screen.finish_scanning();
+        screen.enter_decision();
+        screen.start_revising();
+        screen.reshow_decision();
+        assert_eq!(screen.step(), ReviewStep::Decision);
+        assert_eq!(screen.current_finding(), Some(original));
+    }
+
+    #[test]
     fn record_outcome_builds_colored_rows_and_tracks_posted() {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "s".into());
         // Three genuinely distinct findings (distinct fixes), so the same-run
         // dedup keeps all three.
-        screen.record_scan_result(vec![
-            finding_with("a.rs", Some(2), ReviewSeverity::Critical, Some("fix a")),
-            finding_with("a.rs", Some(3), ReviewSeverity::High, Some("fix b")),
-            finding_with("a.rs", None, ReviewSeverity::Low, Some("fix c")),
-        ]);
+        let mut critical = finding_with("a.rs", Some(2), ReviewSeverity::Critical, Some("fix a"));
+        critical.title = "Critical concern".to_string();
+        let mut high = finding_with("a.rs", Some(3), ReviewSeverity::High, Some("fix b"));
+        high.title = "High concern".to_string();
+        let mut low = finding_with("a.rs", None, ReviewSeverity::Low, Some("fix c"));
+        low.title = "Low concern".to_string();
+        screen.record_scan_result(vec![critical, high, low]);
         screen.finish_scanning();
         screen.record_outcome(ReviewRowOutcome::Posted);
         assert!(screen.advance_finding());
@@ -2564,6 +3733,42 @@ mod tests {
         assert!(dump.contains("Posted 1 review comment"), "{dump}");
         assert!(dump.contains("Submitted"), "{dump}");
         assert!(dump.contains("Press any key"), "{dump}");
+    }
+
+    #[test]
+    fn done_report_includes_aggregate_scan_telemetry_once() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.record_scan_telemetry(ReviewScanTelemetry {
+            scan: "app:a.rs".to_string(),
+            scan_role: "application".to_string(),
+            retry_role: "initial".to_string(),
+            model_profile: "balanced".to_string(),
+            model: "openai/gpt-5.6-terra".to_string(),
+            thinking: "medium".to_string(),
+            prompt_bytes: 1200,
+            usage: crate::services::review_telemetry::ReviewTokenUsage {
+                uncached_input: Some(40_000),
+                cache_read: Some(0),
+                cache_write: Some(0),
+                output: Some(8_000),
+                reasoning: Some(0),
+                cost_usd: None,
+            },
+            duration_ms: 250,
+            findings: 1,
+        });
+        screen.enter_done();
+        screen.enter_done();
+        let rows = screen
+            .summary_rows
+            .iter()
+            .filter(|row| row.command == "AI scan usage")
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status.as_ref().unwrap().label,
+            "~48k logical tokens across 1 call"
+        );
     }
 
     #[test]
