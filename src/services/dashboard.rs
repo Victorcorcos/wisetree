@@ -9175,17 +9175,34 @@ pub fn build_review_summary_with_overview(posted: &[ReviewFinding], overview: &s
             where_cell,
         ));
     }
-    body.push_str("\n### Issues by Type\n\n");
-    body.push_str(&mermaid_pie_chart(
-        "Issues by Type",
-        groups.iter().map(|group| group.category.as_str()),
-    ));
-    body.push_str("\n\n### Issues by Level\n\n");
-    body.push_str(&mermaid_pie_chart(
-        "Issues by Level",
-        groups.iter().map(|group| group.severity.label()),
-    ));
+    // A pie chart is only informative once there's an actual split to show;
+    // with one or two issues it's just a circle telling you what you already
+    // read in the table above.
+    if groups.len() > 2 {
+        body.push('\n');
+        body.push_str(&mermaid_pie_chart_table(&groups));
+    }
     body
+}
+
+/// Render the "Issues by Type" / "Issues by Level" pie charts side by side.
+/// GitHub only renders a fenced ```mermaid``` block as a diagram when it's
+/// parsed as its own markdown block; a plain GFM pipe table can't hold one
+/// (a table row is a single line). An HTML `<table>` still gets its cell
+/// contents parsed as markdown as long as each fence is set off by blank
+/// lines, so that's what lays the two charts out side by side.
+fn mermaid_pie_chart_table(groups: &[IssueGroup]) -> String {
+    format!(
+        "<table>\n<tr><th>Issues by Type</th><th>Issues by Level</th></tr>\n<tr>\n<td>\n\n{}\n\n</td>\n<td>\n\n{}\n\n</td>\n</tr>\n</table>",
+        mermaid_pie_chart(
+            "Issues by Type",
+            groups.iter().map(|group| group.category.as_str())
+        ),
+        mermaid_pie_chart(
+            "Issues by Level",
+            groups.iter().map(|group| group.severity.label())
+        ),
+    )
 }
 
 fn deterministic_review_summary_overview(posted: &[ReviewFinding]) -> String {
@@ -9197,7 +9214,7 @@ fn deterministic_review_summary_overview(posted: &[ReviewFinding]) -> String {
     let highest = groups
         .iter()
         .min_by_key(|group| group.severity.rank())
-        .map(|group| format!("The most urgent concern is {}.", group.title))
+        .map(|group| format!(" The most urgent concern is {}.", group.title))
         .unwrap_or_default();
     format!(
         "I found {count} {noun} that should be addressed before merge. The review covers {} concerns at {} level{}.{highest}",
@@ -10090,8 +10107,8 @@ copy to src/copied_again.rs
         assert!(!body.contains("each iteration hits the DB again"));
         // The redundant Notes section is gone.
         assert!(!body.contains("### Notes"));
-        assert!(body.contains("### Issues by Type\n\n```mermaid\npie showData\n    title Issues by Type\n    \"Performance\" : 1\n```"));
-        assert!(body.contains("### Issues by Level\n\n```mermaid\npie showData\n    title Issues by Level\n    \"High\" : 1\n```"));
+        // A single issue doesn't get a pie chart — nothing left to compare.
+        assert!(!body.contains("```mermaid"));
     }
 
     #[test]
@@ -10140,7 +10157,10 @@ copy to src/copied_again.rs
         }];
         let body = build_review_summary_with_overview(&posted, "## malformed");
         assert!(body.contains("I found 1 issue that should be addressed before merge."));
-        assert!(body.contains("Security concerns at High level."));
+        // A space must separate the two sentences — no "level.The most" glue.
+        assert!(body.contains(
+            "Security concerns at High level. The most urgent concern is Authorization is skipped."
+        ));
     }
 
     #[test]
@@ -10174,9 +10194,8 @@ copy to src/copied_again.rs
         assert!(body.contains("found 1 issue that should be addressed"));
         // Both locations in one cell, each on its own line; highest severity wins.
         assert!(body.contains("| 🧪 | 🟠 | Missing coverage | `src/a.rs:12`<br>`src/b.rs:40` |"));
-        // Charts use the same grouped issue count as the table and overview.
-        assert!(body.contains("\"Test\" : 1"));
-        assert!(body.contains("\"High\" : 1"));
+        // A single grouped issue doesn't get a pie chart.
+        assert!(!body.contains("```mermaid"));
     }
 
     #[test]
@@ -10211,10 +10230,8 @@ copy to src/copied_again.rs
         assert!(body.contains("Unsanitized `a \\| b` input"));
         // A line range renders in the Location cell; the Type shows the emoji alone.
         assert!(body.contains("| 🧹 | ⚪ | Dead branch | `src/b.rs:4-6` |"));
-        assert!(body.contains("\"Security\" : 1"));
-        assert!(body.contains("\"Code Smell\" : 1"));
-        assert!(body.contains("\"Critical\" : 1"));
-        assert!(body.contains("\"Low\" : 1"));
+        // Only two distinct issues — still not enough to bother charting.
+        assert!(!body.contains("```mermaid"));
     }
 
     #[test]
@@ -10239,20 +10256,88 @@ copy to src/copied_again.rs
 
     #[test]
     fn review_summary_mermaid_labels_handle_unexpected_category_text() {
-        let posted = vec![ReviewFinding {
-            category: "Unexpected \"type\"\nlabel".to_string(),
-            severity: ReviewSeverity::Medium,
-            file: "src/lib.rs".to_string(),
-            start_line: None,
-            line: Some(1),
-            title: "Unexpected category".to_string(),
-            explanation: String::new(),
-            suggestion: None,
-        }];
+        let posted = vec![
+            ReviewFinding {
+                category: "Unexpected \"type\"\nlabel".to_string(),
+                severity: ReviewSeverity::Medium,
+                file: "src/lib.rs".to_string(),
+                start_line: None,
+                line: Some(1),
+                title: "Unexpected category".to_string(),
+                explanation: String::new(),
+                suggestion: None,
+            },
+            ReviewFinding {
+                category: "Security".to_string(),
+                severity: ReviewSeverity::High,
+                file: "src/a.rs".to_string(),
+                start_line: None,
+                line: Some(2),
+                title: "Second issue".to_string(),
+                explanation: String::new(),
+                suggestion: None,
+            },
+            ReviewFinding {
+                category: "Test".to_string(),
+                severity: ReviewSeverity::Low,
+                file: "src/b.rs".to_string(),
+                start_line: None,
+                line: Some(3),
+                title: "Third issue".to_string(),
+                explanation: String::new(),
+                suggestion: None,
+            },
+        ];
+        // Three or more issues is where the pie charts kick in.
         let body = build_review_summary(&posted);
         assert!(body.contains("    \"Unexpected 'type' label\" : 1"));
         assert_eq!(body.matches("```mermaid").count(), 2);
         assert_eq!(body.matches("```").count(), 4);
+    }
+
+    #[test]
+    fn review_summary_charts_are_side_by_side_in_an_html_table() {
+        let make = |title: &str, category: &str, severity: ReviewSeverity| ReviewFinding {
+            category: category.to_string(),
+            severity,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: title.to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        };
+        let posted = vec![
+            make("Issue one", "Security", ReviewSeverity::Critical),
+            make("Issue two", "Test", ReviewSeverity::High),
+            make("Issue three", "Performance", ReviewSeverity::Low),
+        ];
+        let body = build_review_summary(&posted);
+        // A plain GFM pipe table can't hold a fenced code block, so the two
+        // charts are laid out with an HTML table instead.
+        assert!(body.contains("<table>\n<tr><th>Issues by Type</th><th>Issues by Level</th></tr>"));
+        assert!(body.contains("<td>\n\n```mermaid\npie showData\n    title Issues by Type"));
+        assert!(body.contains("<td>\n\n```mermaid\npie showData\n    title Issues by Level"));
+        assert!(body.contains("</table>"));
+    }
+
+    #[test]
+    fn review_summary_omits_charts_for_one_or_two_issues() {
+        let make = |title: &str| ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: title.to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        };
+        assert!(!build_review_summary(&[make("Only issue")]).contains("```mermaid"));
+        assert!(
+            !build_review_summary(&[make("First issue"), make("Second issue")])
+                .contains("```mermaid")
+        );
     }
 
     #[test]
