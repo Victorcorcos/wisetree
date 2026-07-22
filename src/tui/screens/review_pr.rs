@@ -225,6 +225,9 @@ pub enum ReviewAction {
     Skip,
     /// OtherInput submitted — revise the current finding with this feedback.
     Revise(String),
+    /// Ctrl+S in the explanation textarea — copy its full text to the OS
+    /// clipboard.
+    CopyToClipboard(String),
     /// Summary: submit via `gh pr review` (blocking when `request_changes`).
     SubmitSummary {
         request_changes: bool,
@@ -1254,6 +1257,9 @@ impl ReviewPullRequestScreen {
             return ReviewAction::Continue;
         };
         if let Some(input) = edit.input.as_mut() {
+            if input.wants_copy_all(&key) {
+                return ReviewAction::CopyToClipboard(input.value.clone());
+            }
             match input.handle_key(key) {
                 InputOutcome::Submitted(text) => {
                     let text = text.trim().to_string();
