@@ -14,7 +14,10 @@
 //! fixed-height (8-row) bordered area with wrapping and vertical scrolling
 //! that follows the cursor: **Enter submits, Ctrl+J (or Alt+Enter) inserts a
 //! newline, Esc cancels**, ↑/↓ move between lines, and Home/End plus Ctrl+A/E
-//! work per line. Single-line callers are untouched.
+//! work per line. Single-line callers are untouched. A further opt-in
+//! [`InputPrompt::expand_to_fill`] makes the box grow to (almost) the whole
+//! area it's given instead of staying fixed at 8 rows, for screens that hand
+//! the field most of the page (e.g. Bugkill's "Describe the bug").
 //!
 //! All cursor math is char-indexed (not byte-indexed) so multi-byte unicode is
 //! handled atomically.
@@ -50,6 +53,9 @@ pub struct InputPrompt {
     pub footer_spacer: bool,
     /// Multiline mode: Enter submits, Ctrl+J inserts a newline.
     multiline: bool,
+    /// Grow the multiline box to fill the area it's rendered into, instead of
+    /// the fixed [`MULTILINE_BOX_ROWS`] height.
+    expand: bool,
     validator: Option<Validator>,
 }
 
@@ -63,6 +69,7 @@ impl InputPrompt {
             cursor: 0,
             footer_spacer: false,
             multiline: false,
+            expand: false,
             validator: None,
         }
     }
@@ -72,6 +79,14 @@ impl InputPrompt {
     /// area with wrapping and vertical scrolling that follows the cursor.
     pub fn multiline(mut self) -> Self {
         self.multiline = true;
+        self
+    }
+
+    /// Grow the multiline box to fill (almost) the whole area it's given
+    /// instead of the fixed 8-row default. For screens whose caller already
+    /// hands the field most of the page.
+    pub fn expand_to_fill(mut self) -> Self {
+        self.expand = true;
         self
     }
 
@@ -207,9 +222,12 @@ impl InputPrompt {
         self.cursor = 0;
     }
 
+    /// Kill from the cursor to the end of the current line (not the whole
+    /// value) so Ctrl+K in a multiline field only clears the line it's on.
     fn kill_to_end(&mut self) {
         let start = self.byte_offset(self.cursor);
-        self.value.drain(start..);
+        let end = self.byte_offset(self.line_end());
+        self.value.drain(start..end);
     }
 
     /// Char index of the start of the line the cursor is on.
@@ -433,11 +451,35 @@ impl InputPrompt {
         if self.cursor > self.char_len() {
             self.cursor = self.char_len();
         }
-        for c in text.chars() {
+        // Clipboard content can use CRLF or lone-CR line endings depending on
+        // its source. `insert_char` only special-cases `\n`, so a bare `\r`
+        // would otherwise be silently dropped as a control character —
+        // collapsing every line break and leaving pasted multi-line text
+        // mangled onto one line. Normalize to `\n` first so line breaks
+        // always survive regardless of where the text was copied from.
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for c in normalized.chars() {
             self.insert_char(c);
         }
         self.error = None;
         InputOutcome::Pending
+    }
+
+    /// The bordered box height for a given render area: fixed at
+    /// [`MULTILINE_BOX_ROWS`] normally, or grown to fill `area_height` (minus
+    /// the label/error/hint chrome) when [`InputPrompt::expand_to_fill`] is
+    /// set. Single-line fields always get a 3-row box.
+    fn box_height(&self, area_height: u16) -> u16 {
+        if self.multiline {
+            if self.expand {
+                let reserved = 3 + if self.footer_spacer { 1 } else { 0 };
+                area_height.saturating_sub(reserved).max(MULTILINE_BOX_ROWS)
+            } else {
+                MULTILINE_BOX_ROWS
+            }
+        } else {
+            3
+        }
     }
 
     /// Render the prompt. `tick` is accepted for signature parity with other
@@ -456,11 +498,7 @@ impl InputPrompt {
             colors::SUCCESS
         };
 
-        let box_height = if self.multiline {
-            MULTILINE_BOX_ROWS
-        } else {
-            3
-        };
+        let box_height = self.box_height(area.height);
         let mut constraints = vec![
             Constraint::Length(1),
             Constraint::Length(box_height),
@@ -723,6 +761,44 @@ mod tests {
             InputOutcome::Submitted(value) => assert_eq!(value, "first\nsecond"),
             _ => panic!("expected explicit Enter to submit after paste"),
         }
+    }
+
+    #[test]
+    fn multiline_paste_normalizes_crlf_and_bare_cr_line_endings() {
+        // Clipboard content copied from other tools/OSes can use "\r\n" or a
+        // lone "\r" for line breaks. Both must become "\n" instead of being
+        // silently dropped (a bare "\r" is a control char and isn't the "\n"
+        // exemption in `insert_char`), which used to flatten pasted
+        // multi-line text onto a single line.
+        let mut prompt = InputPrompt::new("label").multiline();
+        prompt.paste("first\r\nsecond\rthird");
+        assert_eq!(prompt.value, "first\nsecond\nthird");
+    }
+
+    #[test]
+    fn expand_to_fill_grows_the_box_to_the_given_area() {
+        // Without `expand_to_fill`, the box stays at the fixed default
+        // regardless of how much area it's handed.
+        let plain = InputPrompt::new("label").multiline();
+        assert_eq!(plain.box_height(30), MULTILINE_BOX_ROWS);
+
+        // With `expand_to_fill`, the box grows to fill the extra rows (30
+        // minus the 3 reserved label/error/hint rows).
+        let expanded = InputPrompt::new("label").multiline().expand_to_fill();
+        assert_eq!(expanded.box_height(30), 27);
+
+        // Never shrinks below the fixed default, even in a tiny area.
+        assert_eq!(expanded.box_height(4), MULTILINE_BOX_ROWS);
+    }
+
+    #[test]
+    fn multiline_ctrl_k_only_kills_the_current_line() {
+        let mut prompt = InputPrompt::new("label").multiline();
+        type_str(&mut prompt, "line one\nline two\nline three\nline four");
+        // Move to the start of "line two" (right after the first newline).
+        prompt.cursor = "line one\n".chars().count();
+        prompt.handle_key(ctrl('k'));
+        assert_eq!(prompt.value, "line one\n\nline three\nline four");
     }
 
     #[test]

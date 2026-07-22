@@ -337,7 +337,8 @@ impl BugkillPullRequestScreen {
                 "Include observed behavior, expected behavior, and reproduction steps or \
                  logs if you have them.",
             )
-            .multiline(),
+            .multiline()
+            .expand_to_fill(),
         );
         self.step = BugkillStep::DescribeBug;
     }
@@ -1216,11 +1217,10 @@ impl BugkillPullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // title
-                Constraint::Length(1),  // blank
-                Constraint::Length(12), // input prompt (label + 8-row box + hint)
-                Constraint::Length(1),  // warning
-                Constraint::Min(0),
+                Constraint::Length(1), // title
+                Constraint::Length(1), // blank
+                Constraint::Min(12),   // input prompt — grows to fill the page
+                Constraint::Length(1), // warning
             ])
             .split(area);
         frame.render_widget(
