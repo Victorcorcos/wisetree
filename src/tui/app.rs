@@ -5779,7 +5779,7 @@ impl App {
             // bulk markers that `leave_delete_screen` inspects.
             self.pending_delete_path = None;
             self.pending_bulk_delete_paths.clear();
-            self.maybe_redirect_git_root_to_mother();
+            self.maybe_redirect_git_root_to_mother(tx);
             if self.quit_requested {
                 return;
             }
@@ -5802,7 +5802,7 @@ impl App {
         let from_dashboard_single = self.pending_delete_path.take().is_some();
         let from_dashboard_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false)
             || !self.pending_bulk_delete_paths.is_empty();
-        self.maybe_redirect_git_root_to_mother();
+        self.maybe_redirect_git_root_to_mother(tx);
         if self.quit_requested {
             return;
         }
@@ -5816,8 +5816,10 @@ impl App {
     /// If the current `git_root` directory no longer exists on disk (e.g. the
     /// user just deleted the worktree they launched wisetree from), redirect
     /// to the main/mother worktree: update `git_root`, change this process's
-    /// cwd, and — in wrapper mode — quit so the shell lands in the mother path.
-    fn maybe_redirect_git_root_to_mother(&mut self) {
+    /// cwd, and re-initialize so config/services no longer point at the dead
+    /// path. wisetree stays open on the mother worktree; the caller re-renders
+    /// the Dashboard from the updated `git_root`.
+    fn maybe_redirect_git_root_to_mother(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let needs_redirect = self
             .git_root
             .as_deref()
@@ -5830,13 +5832,23 @@ impl App {
             return;
         };
         self.git_root = Some(main_path.clone());
-        // Update the process cwd so git commands executed from here resolve
-        // correctly even if the caller stays in the TUI (non-wrapper mode).
+        // Move the process cwd to the mother so git commands (and the
+        // re-initialize below, which resolves the root from cwd) resolve
+        // correctly now that the old worktree is gone.
         let _ = std::env::set_current_dir(&main_path);
+        // In wrapper mode the parent shell's cwd is still inside the deleted
+        // worktree — a dead directory. We can't move the shell while the TUI
+        // is open, but recording the mother path as the selection means the
+        // wrapper `cd`s there when the user eventually quits, rescuing the
+        // shell instead of leaving it stranded.
         if self.is_from_wrapper {
             self.selected_path = Some(main_path);
-            self.quit_requested = true;
         }
+        // Rebuild the worktree service/config against the mother path so a
+        // stale config_service doesn't keep pointing at the deleted worktree
+        // (e.g. its `.wisetree.json`). apply_init_outcome re-enters the
+        // current screen once the fresh service arrives.
+        kick_off_initialize(tx.clone());
     }
 
     /// Cancel the Delete screen and return to the preserved dashboard. Unlike
