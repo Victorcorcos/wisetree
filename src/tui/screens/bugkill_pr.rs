@@ -264,6 +264,9 @@ impl BugkillPullRequestScreen {
     pub fn step(&self) -> BugkillStep {
         self.step
     }
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
     pub fn bug_description(&self) -> &str {
         &self.bug_description
     }
