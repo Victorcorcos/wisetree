@@ -97,7 +97,7 @@ use crate::worktree::WorktreeService;
 use crate::VERSION;
 
 #[cfg(test)]
-use crate::services::{OpencodeTurn, OpencodeTurnWatcher};
+use crate::services::OpencodeTurn;
 
 const SETTINGS_PATH_COPIED_MESSAGE: &str =
     "Setting file copied to Clipboard, edit it with your favorite editor!";
