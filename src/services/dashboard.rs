@@ -758,6 +758,14 @@ pub struct FixApplyHandoff {
     pub cwd: PathBuf,
 }
 
+/// Spawn parameters for a Develop phase. Unlike older live workflows, Develop
+/// can use any configured harness, so the watcher must retain its identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevelopHandoff {
+    pub command: AiCommand,
+    pub harness: AiHarness,
+}
+
 /// Result of the post-apply [`DashboardService::commit_and_reply`] step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixCommitOutcome {
@@ -4734,7 +4742,7 @@ impl DashboardService {
     // gates, PLAN.md rendering/parsing, progress tracking, the approval
     // loop — is deterministic Rust. The AI never reads or writes PLAN.md.
 
-    /// Deterministic Develop pre-flight: model + opencode gates, base-ref
+    /// Deterministic Develop pre-flight: model + harness gates, base-ref
     /// resolution, and detection of a resumable `PLAN.md`.
     pub async fn develop_preflight(&self, worktree_path: &str) -> Result<DevelopPreflightOutcome> {
         if self.config.ai.develop.plan.model.trim().is_empty()
@@ -4742,10 +4750,36 @@ impl DashboardService {
         {
             return Ok(DevelopPreflightOutcome::AiNotConfigured);
         }
-        if !binary_available(&self.opencode_binary) {
-            return Ok(DevelopPreflightOutcome::AiUnavailable);
-        }
         let cwd = PathBuf::from(worktree_path);
+        let runner = self.develop_runner();
+        for (slot, config, permission) in [
+            (
+                "dashboard.ai.develop.plan",
+                &self.config.ai.develop.plan,
+                AiPermission::Plan,
+            ),
+            (
+                "dashboard.ai.develop.implement",
+                &self.config.ai.develop.implement,
+                AiPermission::Implement,
+            ),
+        ] {
+            if runner
+                .command(&AiRunRequest {
+                    slot: slot.to_string(),
+                    config: config.clone(),
+                    prompt: String::new(),
+                    cwd: cwd.clone(),
+                    mode: AiRunMode::Interactive,
+                    permission,
+                    timeout: Duration::from_secs(1),
+                    activity_limit: 1,
+                })
+                .is_err()
+            {
+                return Ok(DevelopPreflightOutcome::AiUnavailable);
+            }
+        }
         let status = self
             .develop_git(&cwd, &["status", "--porcelain", "--untracked-files=all"])
             .await
@@ -4785,16 +4819,13 @@ impl DashboardService {
         previous_plan: Option<&str>,
         feedback: Option<&str>,
         corrective: bool,
-    ) -> Result<FixApplyHandoff> {
+    ) -> Result<DevelopHandoff> {
         let slot = &self.config.ai.develop.plan;
         let model = slot.model.trim().to_string();
         if model.is_empty() {
             return Err(WisetreeError::other(
                 "ai.develop.plan model is not configured.",
             ));
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let cwd = PathBuf::from(worktree_path);
         let mut prompt =
@@ -4805,22 +4836,19 @@ impl DashboardService {
                  delimited blocks, exactly as specified."
             );
         }
-        // The opencode TUI takes no `--variant`; it honors reasoning effort
-        // solely via the persisted `model.json`, so seed it before spawning.
-        seed_opencode_tui_variant(&model, &slot.thinking);
-        let opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
+        let command = self.develop_runner().command(&AiRunRequest {
+            slot: "dashboard.ai.develop.plan".to_string(),
+            config: slot.clone(),
             prompt,
-            "-m".to_string(),
-            model,
-            "--agent".to_string(),
-            "plan".to_string(),
-            cwd.to_string_lossy().to_string(),
-        ];
-        Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
             cwd,
+            mode: AiRunMode::Interactive,
+            permission: AiPermission::Plan,
+            timeout: Duration::from_secs(1),
+            activity_limit: 1,
+        })?;
+        Ok(DevelopHandoff {
+            command,
+            harness: slot.harness,
         })
     }
 
@@ -4837,16 +4865,13 @@ impl DashboardService {
         sections: &str,
         outline: &str,
         check_failure: Option<&str>,
-    ) -> Result<FixApplyHandoff> {
+    ) -> Result<DevelopHandoff> {
         let slot = &self.config.ai.develop.implement;
         let model = slot.model.trim().to_string();
         if model.is_empty() {
             return Err(WisetreeError::other(
                 "ai.develop.implement model is not configured.",
             ));
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_develop_implement_prompt(
@@ -4856,21 +4881,24 @@ impl DashboardService {
             self.config.develop.check_command.trim(),
             check_failure,
         );
-        // The opencode TUI takes no `--variant`; it honors reasoning effort
-        // solely via the persisted `model.json`, so seed it before spawning.
-        seed_opencode_tui_variant(&model, &slot.thinking);
-        let opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
+        let command = self.develop_runner().command(&AiRunRequest {
+            slot: "dashboard.ai.develop.implement".to_string(),
+            config: slot.clone(),
             prompt,
-            "-m".to_string(),
-            model,
-            cwd.to_string_lossy().to_string(),
-        ];
-        Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
             cwd,
+            mode: AiRunMode::Interactive,
+            permission: AiPermission::Implement,
+            timeout: Duration::from_secs(1),
+            activity_limit: 1,
+        })?;
+        Ok(DevelopHandoff {
+            command,
+            harness: slot.harness,
         })
+    }
+
+    fn develop_runner(&self) -> AiRunner {
+        AiRunner::default().with_binary(AiHarness::OpenCode, self.opencode_binary.clone())
     }
 
     /// Run the configured check command (Ralph-canon backpressure) in the
@@ -15144,24 +15172,22 @@ so the intent reads clearly.
             )
             .unwrap();
 
-        assert_eq!(handoff.opencode_binary, service.opencode_binary);
-        assert_eq!(handoff.cwd, worktree.path());
+        assert_eq!(handoff.command.binary, service.opencode_binary);
+        assert_eq!(handoff.command.cwd, worktree.path());
         assert_eq!(
-            handoff.opencode_args[2..6],
+            handoff.command.args[2..6],
             ["-m", "test-model", "--agent", "plan"]
         );
         assert!(handoff
-            .opencode_args
+            .command
+            .args
             .get(1)
             .unwrap()
             .contains("Add dashboard filtering"));
-        assert!(handoff
-            .opencode_args
-            .get(1)
-            .unwrap()
-            .contains("origin/main"));
+        assert!(handoff.command.args.get(1).unwrap().contains("origin/main"));
         assert!(!handoff
-            .opencode_args
+            .command
+            .args
             .get(1)
             .unwrap()
             .contains("Your previous output could not be parsed"));
@@ -15182,7 +15208,7 @@ so the intent reads clearly.
             )
             .unwrap();
 
-        assert!(handoff.opencode_args.get(1).unwrap().ends_with(
+        assert!(handoff.command.args.get(1).unwrap().ends_with(
             "Your previous output could not be parsed. Reply with ONLY the \
              delimited blocks, exactly as specified."
         ));
@@ -15226,7 +15252,9 @@ so the intent reads clearly.
             )
             .unwrap_err();
 
-        assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
+        assert!(error
+            .to_string()
+            .contains("CLI binary is not available on PATH"));
     }
 
     #[test]
@@ -15245,19 +15273,21 @@ so the intent reads clearly.
             )
             .unwrap();
 
-        assert_eq!(handoff.opencode_binary, service.opencode_binary);
-        assert_eq!(handoff.cwd, worktree.path());
+        assert_eq!(handoff.command.binary, service.opencode_binary);
+        assert_eq!(handoff.command.cwd, worktree.path());
         assert_eq!(
-            handoff.opencode_args[handoff
-                .opencode_args
+            handoff.command.args[handoff
+                .command
+                .args
                 .iter()
                 .position(|arg| arg == "-m")
                 .unwrap()
                 + 1],
             "provider/model"
         );
-        let prompt = &handoff.opencode_args[handoff
-            .opencode_args
+        let prompt = &handoff.command.args[handoff
+            .command
+            .args
             .iter()
             .position(|arg| arg == "--prompt")
             .unwrap()
@@ -15305,7 +15335,9 @@ so the intent reads clearly.
             )
             .unwrap_err();
 
-        assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
+        assert!(error
+            .to_string()
+            .contains("CLI binary is not available on PATH"));
     }
 
     #[tokio::test]

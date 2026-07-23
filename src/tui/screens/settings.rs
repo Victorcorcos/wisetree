@@ -1255,6 +1255,10 @@ impl AiSlot {
         }
     }
 
+    fn supports_harness(self, harness: AiHarness) -> bool {
+        matches!(self, Self::DevelopPlan | Self::DevelopImplement) || harness == AiHarness::OpenCode
+    }
+
     fn get(self, ai: &AiConfig) -> &AiModelConfig {
         match self {
             AiSlot::Explain => &ai.explain,
@@ -1922,7 +1926,10 @@ impl SettingsScreen {
         let (harness, thinking) = match self.ai_settings_editor.as_ref() {
             Some(editor) => {
                 let current = editor.focused_model();
-                let harness = if AiHarness::accepted_for_model(&model).contains(&current.harness) {
+                let slot = AiSettingsEditor::slot(editor.target_idx());
+                let harness = if slot.supports_harness(current.harness)
+                    && AiHarness::accepted_for_model(&model).contains(&current.harness)
+                {
                     current.harness
                 } else {
                     AiHarness::OpenCode
@@ -3517,7 +3524,11 @@ impl SettingsScreen {
                 current.thinking.clone(),
             )
         };
-        let accepted = AiHarness::accepted_for_model(&model);
+        let accepted = AiHarness::accepted_for_model(&model)
+            .iter()
+            .copied()
+            .filter(|candidate| AiSettingsEditor::slot(idx).supports_harness(*candidate))
+            .collect::<Vec<_>>();
         let next = accepted
             .iter()
             .position(|candidate| *candidate == harness)
@@ -6235,6 +6246,16 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_develop_slots_enable_codex_and_claude() {
+        for slot in AiSlot::ALL {
+            let expected = matches!(slot, AiSlot::DevelopPlan | AiSlot::DevelopImplement);
+            assert_eq!(slot.supports_harness(AiHarness::Codex), expected);
+            assert_eq!(slot.supports_harness(AiHarness::ClaudeCode), expected);
+            assert!(slot.supports_harness(AiHarness::OpenCode));
+        }
+    }
     use crate::config::schema::{AiStatusConfig, WorktreeConfig};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

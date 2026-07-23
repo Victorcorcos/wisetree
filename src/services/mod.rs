@@ -40,7 +40,7 @@ pub use dashboard::{
     resolve_dashboard_columns, split_duplicate_findings, BugkillPreflight, BugkillPreflightOutcome,
     BugkillResumeState, BugkillSnapshot, BugkillUnverdicted, CheckStatus, CommentGroup,
     CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, DashboardService,
-    DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopPreflight,
+    DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff, DevelopPreflight,
     DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome,
     ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
     MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewBenchmarkOutcome, ReviewComment,

@@ -41,15 +41,16 @@ use crate::services::{
     develop_commit_subject, fetch_claude_effort_levels, fetch_codex_reasoning_levels,
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
     install_shell_integration, parse_plan_transcript, parse_pull_request_md,
-    resolve_dashboard_columns, summarize_transcript, AiStatus, AttemptChanges, BugHypothesis,
-    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
-    CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
-    DashboardWatch, DevelopCheckOutcome, DevelopPreflightOutcome, DevelopResumeState,
-    ExplainPreparation, ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff,
-    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
-    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewContext, ReviewFile,
-    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification,
-    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    resolve_dashboard_columns, summarize_transcript, AiStatus, AiTurn, AiTurnWatcher,
+    AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
+    BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
+    DashboardService, DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff,
+    DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome,
+    ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
+    JudgeResult, MultiSourceUpdateResult, OpencodeModel, OpencodeTurn, OpencodeTurnWatcher,
+    PrState, ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
+    ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -291,7 +292,7 @@ enum AppEvent {
         operation_id: u64,
         generation: u64,
         corrective: bool,
-        result: Result<Box<FixApplyHandoff>, String>,
+        result: Result<Box<DevelopHandoff>, String>,
     },
     /// Spawn params for one live implement run are ready. `section` is the
     /// Ralph Loop target (`None` = one run for every pending section).
@@ -302,7 +303,7 @@ enum AppEvent {
         generation: u64,
         section: Option<usize>,
         preexisting_paths: Vec<String>,
-        result: Result<Box<FixApplyHandoff>, String>,
+        result: Result<Box<DevelopHandoff>, String>,
     },
     /// Rewriting `PLAN.md` finished (best-effort warning on failure).
     DevelopFileRewritten {
@@ -523,7 +524,7 @@ pub struct App {
     /// Same idea for the Develop screen's Planning + Implementing TUIs —
     /// advances the plan into review, and (on a Ralph Loop) closes one
     /// section's run and opens the next. `Some` only while one is live.
-    develop_watch: Option<OpencodeTurnWatcher>,
+    develop_watch: Option<AiTurnWatcher>,
     /// Same idea for the Explain screen's drafting TUI — advances straight
     /// to Review once opencode finishes writing `pull_request.md`. `Some`
     /// only while the `Explaining` step is active.
@@ -929,7 +930,7 @@ impl App {
                             if let Some(screen) = self.develop_pr.as_mut() {
                                 screen.kill_pty();
                                 screen.set_error(
-                                    "opencode exited before the plan was finished.".to_string(),
+                                    "AI CLI exited before the plan was finished.".to_string(),
                                 );
                             }
                         }
@@ -938,16 +939,13 @@ impl App {
                             if let Some(screen) = self.develop_pr.as_mut() {
                                 screen.kill_pty();
                                 screen.set_error(
-                                    "opencode exited before the implementation finished."
-                                        .to_string(),
+                                    "AI CLI exited before the implementation finished.".to_string(),
                                 );
                             }
                         }
                         Some((None, DevelopStep::Planning | DevelopStep::Implementing)) => {
-                            if let Some(turn) = self
-                                .develop_watch
-                                .as_mut()
-                                .and_then(OpencodeTurnWatcher::poll)
+                            if let Some(turn) =
+                                self.develop_watch.as_mut().and_then(AiTurnWatcher::poll)
                             {
                                 self.on_develop_turn(turn, &tx);
                             }
@@ -2494,7 +2492,7 @@ impl App {
             OpencodeTurn::Failed { message } => {
                 self.explain_draft = None;
                 if let Some(screen) = self.explain_pr.as_mut() {
-                    screen.set_error(format!("opencode reported an error: {message}"));
+                    screen.set_error(format!("AI CLI reported an error: {message}"));
                 }
             }
         }
@@ -4173,7 +4171,7 @@ impl App {
                 let transcript = self
                     .develop_watch
                     .as_mut()
-                    .and_then(OpencodeTurnWatcher::transcript_now)
+                    .and_then(AiTurnWatcher::transcript_now)
                     .unwrap_or_default();
                 self.on_develop_implement_done(transcript, tx);
             }
@@ -4288,19 +4286,20 @@ impl App {
 
     /// The turn watcher fired (or a PTY exit fell back here) — dispatch on
     /// the live step.
-    fn on_develop_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn on_develop_turn(&mut self, turn: impl Into<AiTurn>, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = turn.into();
         let step = self.develop_pr.as_ref().map(|s| s.step());
         match (step, turn) {
-            (_, OpencodeTurn::Working) => {}
-            (Some(DevelopStep::Planning), OpencodeTurn::Finished { transcript }) => {
+            (_, AiTurn::Working) => {}
+            (Some(DevelopStep::Planning), AiTurn::Finished { transcript }) => {
                 self.finish_develop_plan(transcript, tx)
             }
             // The implement transcript's closing line becomes the section
             // note (Ralph-canon learnings ledger) — capture it here.
-            (Some(DevelopStep::Implementing), OpencodeTurn::Finished { transcript }) => {
+            (Some(DevelopStep::Implementing), AiTurn::Finished { transcript }) => {
                 self.on_develop_implement_done(transcript, tx)
             }
-            (_, OpencodeTurn::Failed { message }) => {
+            (_, AiTurn::Failed { message }) => {
                 self.develop_watch = None;
                 if let Some(screen) = self.develop_pr.as_mut() {
                     screen.kill_pty();
@@ -4344,14 +4343,14 @@ impl App {
         let turn = self
             .develop_watch
             .as_mut()
-            .map(OpencodeTurnWatcher::check_now)
-            .unwrap_or(OpencodeTurn::Working);
+            .map(AiTurnWatcher::check_now)
+            .unwrap_or(AiTurn::Working);
         match turn {
-            OpencodeTurn::Working => {
+            AiTurn::Working => {
                 self.develop_watch = None;
                 if let Some(screen) = self.develop_pr.as_mut() {
                     screen.kill_pty();
-                    screen.set_error("opencode exited before the plan was finished.".to_string());
+                    screen.set_error("AI CLI exited before the plan was finished.".to_string());
                 }
             }
             turn => self.on_develop_turn(turn, tx),
@@ -4365,16 +4364,15 @@ impl App {
         let turn = self
             .develop_watch
             .as_mut()
-            .map(OpencodeTurnWatcher::check_now)
-            .unwrap_or(OpencodeTurn::Working);
+            .map(AiTurnWatcher::check_now)
+            .unwrap_or(AiTurn::Working);
         match turn {
-            OpencodeTurn::Working => {
+            AiTurn::Working => {
                 self.develop_watch = None;
                 if let Some(screen) = self.develop_pr.as_mut() {
                     screen.kill_pty();
-                    screen.set_error(
-                        "opencode exited before the implementation finished.".to_string(),
-                    );
+                    screen
+                        .set_error("AI CLI exited before the implementation finished.".to_string());
                 }
             }
             turn => self.on_develop_turn(turn, tx),
@@ -4390,7 +4388,7 @@ impl App {
             return;
         };
         match watcher.check_now() {
-            OpencodeTurn::Working => {
+            AiTurn::Working => {
                 let transcript = watcher.transcript_now().unwrap_or_default();
                 if parse_plan_transcript(&transcript).is_some() {
                     self.finish_develop_plan(transcript, tx);
@@ -4423,7 +4421,7 @@ impl App {
                 self.develop_watch = None;
                 if let Some(screen) = self.develop_pr.as_mut() {
                     screen.kill_pty();
-                    screen.set_error(format!("opencode reported an error: {message}"));
+                    screen.set_error(format!("AI CLI reported an error: {message}"));
                 }
             }
         }
@@ -4703,8 +4701,7 @@ impl App {
                 ),
                 DevelopPreflightOutcome::AiUnavailable => self.fail_develop(
                     ToastVariant::Error,
-                    "`opencode` CLI is not on PATH — install it from https://opencode.ai then \
-                     retry.",
+                    "The configured AI CLI is not available on PATH.",
                     tx,
                 ),
                 DevelopPreflightOutcome::Ready(preflight) => {
@@ -4730,7 +4727,7 @@ impl App {
         operation_id: u64,
         generation: u64,
         corrective: bool,
-        result: Result<Box<FixApplyHandoff>, String>,
+        result: Result<Box<DevelopHandoff>, String>,
     ) {
         if !self.is_active_develop_operation(operation_id)
             || !self.is_current_develop_generation(generation)
@@ -4742,12 +4739,13 @@ impl App {
         };
         match result {
             Ok(handoff) => {
-                self.develop_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                self.develop_watch =
+                    Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                 screen.start_planning(corrective);
                 screen.spawn_opencode_pty(
-                    handoff.opencode_binary,
-                    handoff.opencode_args,
-                    handoff.cwd,
+                    handoff.command.binary,
+                    handoff.command.args,
+                    handoff.command.cwd,
                     Vec::new(),
                 );
             }
@@ -4761,7 +4759,7 @@ impl App {
         generation: u64,
         section: Option<usize>,
         preexisting_paths: Vec<String>,
-        result: Result<Box<FixApplyHandoff>, String>,
+        result: Result<Box<DevelopHandoff>, String>,
     ) {
         if !self.is_active_develop_operation(operation_id)
             || !self.is_current_develop_generation(generation)
@@ -4774,12 +4772,13 @@ impl App {
         screen.set_preexisting_paths(preexisting_paths);
         match result {
             Ok(handoff) => {
-                self.develop_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                self.develop_watch =
+                    Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                 screen.begin_implement_run(section);
                 screen.spawn_opencode_pty(
-                    handoff.opencode_binary,
-                    handoff.opencode_args,
-                    handoff.cwd,
+                    handoff.command.binary,
+                    handoff.command.args,
+                    handoff.command.cwd,
                     Vec::new(),
                 );
             }
@@ -13341,7 +13340,7 @@ mod tests {
             assert!(app.active_develop_operation_id.is_none());
             let toast = app.toast.current().expect("error toast");
             assert_eq!(toast.variant, ToastVariant::Error);
-            assert!(toast.message.contains("opencode"));
+            assert!(toast.message.contains("configured AI CLI"));
             assert!(toast.message.contains("PATH"));
         });
     }
@@ -13701,10 +13700,13 @@ mod tests {
             let repo = develop_repo(home);
             let mut app = develop_app(&repo);
             let binary = resolve_on_path("true").expect("`true` binary should be on PATH");
-            let handoff = FixApplyHandoff {
-                opencode_binary: binary,
-                opencode_args: Vec::new(),
-                cwd: repo.clone(),
+            let handoff = DevelopHandoff {
+                command: crate::services::AiCommand {
+                    binary,
+                    args: Vec::new(),
+                    cwd: repo.clone(),
+                },
+                harness: AiHarness::OpenCode,
             };
 
             app.apply_develop_plan_ready(1, 0, true, Ok(Box::new(handoff)));
@@ -13745,10 +13747,13 @@ mod tests {
             let mut app = develop_app(&repo);
             app.develop_pr.as_mut().unwrap().set_plan(develop_plan());
             let binary = resolve_on_path("true").expect("`true` binary should be on PATH");
-            let handoff = FixApplyHandoff {
-                opencode_binary: binary,
-                opencode_args: Vec::new(),
-                cwd: repo.clone(),
+            let handoff = DevelopHandoff {
+                command: crate::services::AiCommand {
+                    binary,
+                    args: Vec::new(),
+                    cwd: repo.clone(),
+                },
+                harness: AiHarness::OpenCode,
             };
 
             app.apply_develop_implement_ready(1, 0, Some(0), Vec::new(), Ok(Box::new(handoff)));
