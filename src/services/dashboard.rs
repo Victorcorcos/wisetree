@@ -2910,15 +2910,16 @@ impl DashboardService {
     ) -> Result<FixApplyHandoff> {
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_fix_apply_prompt(group, plan);
-        let command = self.ai_command(
-            "dashboard.ai.fix.apply",
-            &self.config.ai.fix.apply,
-            prompt,
-            cwd.clone(),
-            AiRunMode::Interactive,
-            AiPermission::Implement,
-        )
-        .await?;
+        let command = self
+            .ai_command(
+                "dashboard.ai.fix.apply",
+                &self.config.ai.fix.apply,
+                prompt,
+                cwd.clone(),
+                AiRunMode::Interactive,
+                AiPermission::Implement,
+            )
+            .await?;
         Ok(FixApplyHandoff {
             command,
             harness: self.config.ai.fix.apply.harness,

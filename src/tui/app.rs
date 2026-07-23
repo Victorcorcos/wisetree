@@ -850,25 +850,27 @@ impl App {
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.is_explaining()));
                     match explain_status {
-                        Some((true, _)) if self
-                            .explain_pr
-                            .as_ref()
-                            .and_then(|screen| screen.pty_exit_code())
-                            == Some(0) => {
+                        Some((true, _))
+                            if self
+                                .explain_pr
+                                .as_ref()
+                                .and_then(|screen| screen.pty_exit_code())
+                                == Some(0) =>
+                        {
                             self.explain_draft = None;
                             self.on_explain_ready_to_review(&tx);
                         }
                         Some((true, _)) => {
                             self.explain_draft = None;
                             if let Some(screen) = self.explain_pr.as_mut() {
-                                screen.set_error("AI CLI exited before the PR draft was finished.".to_string());
+                                screen.set_error(
+                                    "AI CLI exited before the PR draft was finished.".to_string(),
+                                );
                             }
                         }
                         Some((false, true)) => {
-                            if let Some(turn) = self
-                                .explain_draft
-                                .as_mut()
-                                .and_then(AiTurnWatcher::poll)
+                            if let Some(turn) =
+                                self.explain_draft.as_mut().and_then(AiTurnWatcher::poll)
                             {
                                 self.on_explain_turn(turn, &tx);
                             }
@@ -886,11 +888,13 @@ impl App {
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()));
                     match fix_status {
-                        Some((true, FixStep::Applying, true)) if self
-                            .fix_pr
-                            .as_ref()
-                            .and_then(|screen| screen.pty_exit_code())
-                            == Some(0) => {
+                        Some((true, FixStep::Applying, true))
+                            if self
+                                .fix_pr
+                                .as_ref()
+                                .and_then(|screen| screen.pty_exit_code())
+                                == Some(0) =>
+                        {
                             self.fix_apply_watch = None;
                             self.on_fix_apply_done(&tx);
                         }
@@ -911,14 +915,14 @@ impl App {
                                 != Some(0) =>
                         {
                             if let Some(screen) = self.fix_pr.as_mut() {
-                                screen.set_error("AI CLI exited before applying the fix.".to_string());
+                                screen.set_error(
+                                    "AI CLI exited before applying the fix.".to_string(),
+                                );
                             }
                         }
                         Some((false, FixStep::Applying, true)) => {
-                            if let Some(turn) = self
-                                .fix_apply_watch
-                                .as_mut()
-                                .and_then(AiTurnWatcher::poll)
+                            if let Some(turn) =
+                                self.fix_apply_watch.as_mut().and_then(AiTurnWatcher::poll)
                             {
                                 self.on_fix_turn(turn, &tx);
                             }
@@ -7056,7 +7060,9 @@ impl App {
         }
         match result {
             Ok(prep) => match *prep {
-                ExplainPreparation::HandedOffToUi { command, harness, .. } => {
+                ExplainPreparation::HandedOffToUi {
+                    command, harness, ..
+                } => {
                     if let Some(screen) = self.explain_pr.as_mut() {
                         // Watcher must exist before the spawn so its start
                         // timestamp precedes the session row opencode creates.
@@ -7089,8 +7095,7 @@ impl App {
                 ExplainPreparation::AiUnavailable => {
                     self.show_toast(
                         ToastVariant::Error,
-                        "The configured AI CLI is not on PATH. Install it, then retry."
-                            .to_string(),
+                        "The configured AI CLI is not on PATH. Install it, then retry.".to_string(),
                     );
                     self.explain_pr = None;
                     self.enter_screen(Screen::Dashboard, tx);
@@ -8605,9 +8610,7 @@ fn kick_off_prepare_explain(
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ExplainPrPrepared {
             operation_id,
-            result: Err(
-            "Could not resolve git root for the PR draft.".to_string(),
-            ),
+            result: Err("Could not resolve git root for the PR draft.".to_string()),
         });
         return;
     };
@@ -8617,9 +8620,7 @@ fn kick_off_prepare_explain(
         let Some(base_ref) = request.base_ref.clone() else {
             let _ = tx.send(AppEvent::ExplainPrPrepared {
                 operation_id,
-                result: Err(
-                "Base ref was not resolved before confirmation.".to_string(),
-                ),
+                result: Err("Base ref was not resolved before confirmation.".to_string()),
             });
             return;
         };
