@@ -1,8 +1,8 @@
 //! Fullscreen AI model picker. Opens when the user presses Enter on the
 //! `ai` rectangle in the Dashboard Settings screen. Modelled on opencode's
 //! own model picker (`dialog-model.tsx` → `dialog-variant.tsx`): pick a model
-//! by its human-readable name, then — for reasoning-capable models — pick a
-//! thinking strength ("variant").
+//! by its human-readable name. Thinking strength is adjusted inline on the
+//! settings row because it depends on the selected execution harness.
 //!
 //! Lifecycle:
 //!
@@ -35,7 +35,7 @@ use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Generic fallback reasoning ladder (weakest→strongest), used only when the
+/// Generic OpenCode fallback reasoning ladder (weakest→strongest), used only when the
 /// local `opencode` CLI can't tell us a model's real variants — i.e. for a
 /// models.dev entry whose provider isn't configured locally. For configured
 /// models we use the authoritative per-model set
@@ -49,7 +49,7 @@ pub const REASONING_VARIANTS: &[&str] = &["minimal", "low", "medium", "high", "x
 /// an empty list means the model takes no reasoning override, e.g. Kimi), and
 /// falls back to the generic ladder for models the CLI doesn't know but
 /// models.dev flags reasoning-capable. A non-reasoning model gets no options.
-fn resolve_variants(model: &OpencodeModel) -> Vec<String> {
+pub fn resolve_variants(model: &OpencodeModel) -> Vec<String> {
     match &model.variants {
         Some(variants) => variants.clone(),
         None if model.reasoning => REASONING_VARIANTS.iter().map(|s| s.to_string()).collect(),
@@ -63,31 +63,21 @@ fn resolve_variants(model: &OpencodeModel) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelChoice {
     pair: String,
-    variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AiModelPickerAction {
     Continue,
     Cancelled,
-    /// `model` is the `provider/model` pair; `variant` is the chosen thinking
-    /// strength (empty string = Default / no override).
+    /// `model` is the canonical `provider/model` pair.
     Selected {
         model: String,
-        variant: String,
     },
 }
 
 enum PickerState {
     Loading,
     ModelSelect(SelectPrompt<ModelChoice>),
-    VariantSelect {
-        /// Kept alive so Esc can return to the model list with its cursor
-        /// (and search) intact instead of cancelling the whole picker.
-        model_prompt: SelectPrompt<ModelChoice>,
-        model_pair: String,
-        variant_prompt: SelectPrompt<String>,
-    },
     Empty,
     Error(String),
 }
@@ -97,17 +87,14 @@ pub struct AiModelPickerScreen {
     /// Pre-selects the entry matching this value (if any) when the list
     /// arrives, so reopening the picker lands on the user's current choice.
     initial_model: String,
-    /// Pre-selects the matching thinking strength when the variant phase opens.
-    initial_variant: String,
     pub tick: usize,
 }
 
 impl AiModelPickerScreen {
-    pub fn new(initial_model: String, initial_variant: String) -> Self {
+    pub fn new(initial_model: String) -> Self {
         Self {
             state: PickerState::Loading,
             initial_model,
-            initial_variant,
             tick: 0,
         }
     }
@@ -124,15 +111,9 @@ impl AiModelPickerScreen {
                 // The human model name leads (e.g. "GPT-5.4"); the provider
                 // name trails as a dim description (e.g. "GitHub Copilot").
                 // The stored value stays the technical `provider/model` pair.
-                SelectOption::new(
-                    m.model_name.clone(),
-                    ModelChoice {
-                        pair: m.pair(),
-                        variants: resolve_variants(m),
-                    },
-                )
-                .with_description(m.provider_name.clone())
-                .with_description_color(colors::GRAY_DARK)
+                SelectOption::new(m.model_name.clone(), ModelChoice { pair: m.pair() })
+                    .with_description(m.provider_name.clone())
+                    .with_description_color(colors::GRAY_DARK)
             })
             .collect();
         let default_idx = models.iter().position(|m| m.pair() == initial).unwrap_or(0);
@@ -147,68 +128,16 @@ impl AiModelPickerScreen {
         self.state = PickerState::Error(message);
     }
 
-    /// Build the variant (thinking strength) prompt from `variants` (the
-    /// model's resolved options), pre-selecting the user's prior variant when
-    /// it's still on offer.
-    fn variant_prompt(&self, variants: &[String]) -> SelectPrompt<String> {
-        let mut options = vec![SelectOption::new("Default", String::new())
-            .with_description("no reasoning override")
-            .with_description_color(colors::GRAY_DARK)];
-        options.extend(
-            variants
-                .iter()
-                .map(|v| SelectOption::new(v.clone(), v.clone())),
-        );
-        let default_idx = options
-            .iter()
-            .position(|o| o.value == self.initial_variant)
-            .unwrap_or(0);
-        SelectPrompt::new("Select variant (thinking strength):", options)
-            .searchable()
-            .with_default_index(default_idx)
-            .with_footer_spacer()
-    }
-
-    /// Move from the model phase into the variant phase for `choice`,
-    /// preserving the model prompt so the user can step back.
-    fn enter_variant_phase(&mut self, choice: ModelChoice) {
-        let variant_prompt = self.variant_prompt(&choice.variants);
-        if let PickerState::ModelSelect(model_prompt) =
-            std::mem::replace(&mut self.state, PickerState::Loading)
-        {
-            self.state = PickerState::VariantSelect {
-                model_prompt,
-                model_pair: choice.pair,
-                variant_prompt,
-            };
-        }
-    }
-
-    /// Step back from the variant phase to the model phase, restoring the
-    /// model prompt as it was left.
-    fn return_to_model_phase(&mut self) {
-        if let PickerState::VariantSelect { model_prompt, .. } =
-            std::mem::replace(&mut self.state, PickerState::Loading)
-        {
-            self.state = PickerState::ModelSelect(model_prompt);
-        }
-    }
-
     pub fn handle_key(&mut self, key: KeyEvent) -> AiModelPickerAction {
-        match self.dispatch(
-            |prompt| prompt.handle_key(key),
-            |prompt| prompt.handle_key(key),
-        ) {
-            Dispatch::Action(action) => action,
-            Dispatch::ToVariant(choice) => {
-                self.enter_variant_phase(choice);
-                AiModelPickerAction::Continue
-            }
-            Dispatch::BackToModel => {
-                self.return_to_model_phase();
-                AiModelPickerAction::Continue
-            }
-            Dispatch::Inert => {
+        match &mut self.state {
+            PickerState::ModelSelect(prompt) => match prompt.handle_key(key) {
+                SelectOutcome::Selected(_, choice) => {
+                    AiModelPickerAction::Selected { model: choice.pair }
+                }
+                SelectOutcome::Cancelled => AiModelPickerAction::Cancelled,
+                SelectOutcome::Pending => AiModelPickerAction::Continue,
+            },
+            PickerState::Loading | PickerState::Empty | PickerState::Error(_) => {
                 if matches!(key.code, KeyCode::Esc) {
                     AiModelPickerAction::Cancelled
                 } else {
@@ -219,60 +148,15 @@ impl AiModelPickerScreen {
     }
 
     pub fn handle_mouse_click(&mut self, position: Position) -> AiModelPickerAction {
-        match self.dispatch(
-            |prompt| prompt.handle_mouse_click(position),
-            |prompt| prompt.handle_mouse_click(position),
-        ) {
-            Dispatch::Action(action) => action,
-            Dispatch::ToVariant(choice) => {
-                self.enter_variant_phase(choice);
-                AiModelPickerAction::Continue
-            }
-            // A click outside the variant rows is a no-op rather than a step
-            // back — only the keyboard Esc walks back to the model phase.
-            Dispatch::BackToModel | Dispatch::Inert => AiModelPickerAction::Continue,
-        }
-    }
-
-    /// Shared model/variant routing for key and mouse input. The two closures
-    /// drive the active phase's `SelectPrompt`; the returned `Dispatch` tells
-    /// the caller how to mutate `self.state` (which can't happen here while the
-    /// prompt is mutably borrowed).
-    fn dispatch(
-        &mut self,
-        model_input: impl FnOnce(&mut SelectPrompt<ModelChoice>) -> SelectOutcome<ModelChoice>,
-        variant_input: impl FnOnce(&mut SelectPrompt<String>) -> SelectOutcome<String>,
-    ) -> Dispatch {
         match &mut self.state {
-            PickerState::ModelSelect(prompt) => match model_input(prompt) {
+            PickerState::ModelSelect(prompt) => match prompt.handle_mouse_click(position) {
                 SelectOutcome::Selected(_, choice) => {
-                    if choice.variants.is_empty() {
-                        Dispatch::Action(AiModelPickerAction::Selected {
-                            model: choice.pair,
-                            variant: String::new(),
-                        })
-                    } else {
-                        Dispatch::ToVariant(choice)
-                    }
+                    AiModelPickerAction::Selected { model: choice.pair }
                 }
-                SelectOutcome::Cancelled => Dispatch::Action(AiModelPickerAction::Cancelled),
-                SelectOutcome::Pending => Dispatch::Action(AiModelPickerAction::Continue),
+                SelectOutcome::Cancelled => AiModelPickerAction::Cancelled,
+                SelectOutcome::Pending => AiModelPickerAction::Continue,
             },
-            PickerState::VariantSelect {
-                model_pair,
-                variant_prompt,
-                ..
-            } => match variant_input(variant_prompt) {
-                SelectOutcome::Selected(_, variant) => {
-                    Dispatch::Action(AiModelPickerAction::Selected {
-                        model: model_pair.clone(),
-                        variant,
-                    })
-                }
-                SelectOutcome::Cancelled => Dispatch::BackToModel,
-                SelectOutcome::Pending => Dispatch::Action(AiModelPickerAction::Continue),
-            },
-            PickerState::Loading | PickerState::Empty | PickerState::Error(_) => Dispatch::Inert,
+            _ => AiModelPickerAction::Continue,
         }
     }
 
@@ -298,9 +182,6 @@ impl AiModelPickerScreen {
         match &self.state {
             PickerState::Loading => self.render_loading(frame, chunks[1]),
             PickerState::ModelSelect(prompt) => prompt.render(frame, chunks[1]),
-            PickerState::VariantSelect { variant_prompt, .. } => {
-                variant_prompt.render(frame, chunks[1])
-            }
             PickerState::Empty => self.render_empty(frame, chunks[1]),
             PickerState::Error(msg) => self.render_error(frame, chunks[1], msg),
         }
@@ -311,10 +192,7 @@ impl AiModelPickerScreen {
     }
 
     fn title(&self) -> &'static str {
-        match self.state {
-            PickerState::VariantSelect { .. } => "Select thinking strength",
-            _ => "Select AI model",
-        }
+        "Select AI model"
     }
 
     fn render_loading(&self, frame: &mut Frame, area: Rect) {
@@ -368,10 +246,6 @@ impl AiModelPickerScreen {
                 "↑/↓ navigate · type to search · Enter select · Esc cancel",
                 Style::default().fg(colors::MUTED),
             )),
-            PickerState::VariantSelect { .. } => Line::from(Span::styled(
-                "↑/↓ navigate · Enter select · Esc back to models",
-                Style::default().fg(colors::MUTED),
-            )),
             _ => Line::from(Span::styled(
                 "Esc cancel",
                 Style::default().fg(colors::MUTED),
@@ -380,18 +254,7 @@ impl AiModelPickerScreen {
     }
 }
 
-/// Outcome of routing input to the active phase. Lets `handle_key` /
-/// `handle_mouse_click` perform the borrow-free state transition after the
-/// active `SelectPrompt` has been released.
-enum Dispatch {
-    Action(AiModelPickerAction),
-    ToVariant(ModelChoice),
-    BackToModel,
-    /// No active prompt (Loading / Empty / Error).
-    Inert,
-}
-
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

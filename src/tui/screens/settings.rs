@@ -21,8 +21,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::config::schema::{
-    AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiModelConfig, AiReviewConfig,
-    DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig,
+    AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiHarness, AiModelConfig,
+    AiReviewConfig, DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig,
 };
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
@@ -106,7 +106,7 @@ pub enum SettingsAction {
     /// writes the user's choice back via `apply_ai_selection`.
     OpenAiModelPicker {
         model: String,
-        variant: String,
+        harness: AiHarness,
     },
     /// Kick off the background `opencode models opencode` shell-out that
     /// populates the Dashboard editor's inline free-model quick-pick row.
@@ -1320,6 +1320,13 @@ pub enum AiSettingsSelection {
     Save,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSettingsField {
+    Model,
+    Thinking,
+    Harness,
+}
+
 /// Editor backing the AI Settings sub-screen: one rectangle per AI command,
 /// each opening the model picker (Enter) and cycling its thinking strength
 /// (←/→), plus a shared free-model quick-pick row and a Save button. Mirrors
@@ -1331,6 +1338,7 @@ pub struct AiSettingsEditor {
     pub ai: AiConfig,
     pub statuses: Vec<DashboardRectStatus>,
     pub selection: AiSettingsSelection,
+    pub field: AiSettingsField,
     /// Slot the chip row applies to — the rectangle the cursor was last on.
     last_rect: usize,
 }
@@ -1342,6 +1350,7 @@ impl AiSettingsEditor {
             ai: ai.clone(),
             statuses: vec![DashboardRectStatus::Saved; AiSlot::ALL.len()],
             selection: AiSettingsSelection::Rect(0),
+            field: AiSettingsField::Model,
             last_rect: 0,
         }
     }
@@ -1381,11 +1390,12 @@ impl AiSettingsEditor {
 
     /// Stamp a picked model + thinking into the targeted slot (Modified, not
     /// Saved — persisted via the Save button).
-    pub fn apply_selection(&mut self, model: String, thinking: String) {
+    pub fn apply_selection(&mut self, model: String, thinking: String, harness: AiHarness) {
         let idx = self.target_idx();
         let target = Self::slot(idx).get_mut(&mut self.ai);
         target.model = model;
         target.thinking = thinking;
+        target.harness = harness;
         self.statuses[idx] = DashboardRectStatus::Modified;
         self.selection = AiSettingsSelection::Rect(idx);
         self.last_rect = idx;
@@ -1398,6 +1408,7 @@ impl AiSettingsEditor {
         let target = Self::slot(idx).get_mut(&mut self.ai);
         target.model = pair;
         target.thinking.clear();
+        target.harness = AiHarness::OpenCode;
         self.statuses[idx] = DashboardRectStatus::Modified;
     }
 
@@ -1550,6 +1561,9 @@ pub struct SettingsScreen {
     /// actually accepts. `None` until the background fetch lands; a model
     /// missing from the map falls back to the generic ladder.
     ai_model_variants: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Harness-specific capability responses. Missing/failed discovery is not
+    /// authoritative, so Codex and Claude expose Default only until known.
+    ai_harness_variants: Vec<(AiHarness, std::collections::HashMap<String, Vec<String>>)>,
     copy_settings_select: Option<SelectPrompt<CopyDirection>>,
     update_result: Option<MultiSourceUpdateResult>,
     checking_updates: bool,
@@ -1601,6 +1615,7 @@ impl SettingsScreen {
             notifications_editor: None,
             free_models: None,
             ai_model_variants: None,
+            ai_harness_variants: Vec::new(),
             copy_settings_select: None,
             update_result: None,
             checking_updates: false,
@@ -1848,18 +1863,48 @@ impl SettingsScreen {
         self.ai_model_variants = Some(variants);
     }
 
+    pub fn set_ai_harness_variants(
+        &mut self,
+        harness: AiHarness,
+        variants: std::collections::HashMap<String, Vec<String>>,
+    ) {
+        // A delayed response must not affect a row currently using another
+        // harness. Cache it for a later explicit switch instead.
+        self.ai_harness_variants
+            .retain(|(cached, _)| *cached != harness);
+        self.ai_harness_variants.push((harness, variants));
+    }
+
     /// The reasoning ladder (weakest→strongest, excluding "Default") to cycle
     /// for `pair`. Prefers the authoritative set from the local CLI — which may
     /// legitimately be empty, meaning the model accepts no reasoning override —
     /// and falls back to the generic ladder for models the CLI doesn't know (or
     /// before the fetch lands).
-    fn ai_thinking_ladder(&self, pair: &str) -> Vec<String> {
-        if let Some(map) = &self.ai_model_variants {
-            if let Some(variants) = map.get(pair) {
-                return variants.clone();
+    fn ai_thinking_ladder(&self, harness: AiHarness, pair: &str) -> Vec<String> {
+        match harness {
+            AiHarness::OpenCode => {
+                if let Some(map) = &self.ai_model_variants {
+                    if let Some(variants) = map.get(pair) {
+                        return variants.clone();
+                    }
+                }
+                REASONING_VARIANTS.iter().map(|s| s.to_string()).collect()
             }
+            AiHarness::Codex => self
+                .ai_harness_variants
+                .iter()
+                .find(|(cached, _)| *cached == harness)
+                .and_then(|(_, map)| map.get(pair))
+                .cloned()
+                .unwrap_or_default(),
+            AiHarness::ClaudeCode => self
+                .ai_harness_variants
+                .iter()
+                .find(|(cached, _)| *cached == harness)
+                .and_then(|(_, map)| map.get("*"))
+                .cloned()
+                .unwrap_or_default(),
         }
-        REASONING_VARIANTS.iter().map(|s| s.to_string()).collect()
     }
 
     /// Stamp the picked model + thinking strength into the focused slot of the
@@ -1868,7 +1913,32 @@ impl SettingsScreen {
     /// of every other settings page. Leaves the editor on screen.
     pub fn apply_ai_selection(&mut self, model: String, thinking: String) {
         if let Some(editor) = self.ai_settings_editor.as_mut() {
-            editor.apply_selection(model, thinking);
+            let harness = editor.focused_model().harness;
+            editor.apply_selection(model, thinking, harness);
+        }
+    }
+
+    pub fn apply_ai_model_selection(&mut self, model: String) {
+        let (harness, thinking) = match self.ai_settings_editor.as_ref() {
+            Some(editor) => {
+                let current = editor.focused_model();
+                let harness = if AiHarness::accepted_for_model(&model).contains(&current.harness) {
+                    current.harness
+                } else {
+                    AiHarness::OpenCode
+                };
+                let ladder = self.ai_thinking_ladder(harness, &model);
+                let thinking = ladder
+                    .iter()
+                    .any(|level| level == &current.thinking)
+                    .then_some(current.thinking)
+                    .unwrap_or_default();
+                (harness, thinking)
+            }
+            None => return,
+        };
+        if let Some(editor) = self.ai_settings_editor.as_mut() {
+            editor.apply_selection(model, thinking, harness);
         }
     }
 
@@ -3148,37 +3218,48 @@ impl SettingsScreen {
                 SettingsAction::Continue
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if !self.ai_settings_adjust_thinking(false) {
+                if !self.ai_settings_move_field(false) {
                     self.ai_settings_cycle_chip(false);
                 }
                 SettingsAction::Continue
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if !self.ai_settings_adjust_thinking(true) {
+                if !self.ai_settings_move_field(true) {
                     self.ai_settings_cycle_chip(true);
                 }
                 SettingsAction::Continue
             }
             KeyCode::Enter => match editor.selection {
-                AiSettingsSelection::Rect(_) => {
-                    // Open the model picker pre-filled with this slot's model +
-                    // thinking. The picker writes back via `apply_ai_selection`.
+                AiSettingsSelection::Rect(_) if editor.field == AiSettingsField::Model => {
                     open_picker = Some(editor.focused_model());
                     SettingsAction::Continue
                 }
+                AiSettingsSelection::Rect(_) => SettingsAction::Continue,
                 AiSettingsSelection::FreeModels(_) => {
                     self.apply_focused_free_model_ai();
                     SettingsAction::Continue
                 }
                 AiSettingsSelection::Save => self.save_ai_settings(),
             },
+            KeyCode::Char(' ') => {
+                match editor.selection {
+                    AiSettingsSelection::Rect(_) if editor.field == AiSettingsField::Thinking => {
+                        self.ai_settings_cycle_thinking();
+                    }
+                    AiSettingsSelection::Rect(_) if editor.field == AiSettingsField::Harness => {
+                        self.ai_settings_cycle_harness();
+                    }
+                    _ => {}
+                }
+                SettingsAction::Continue
+            }
             _ => SettingsAction::Continue,
         };
 
         if let Some(model) = open_picker {
             return SettingsAction::OpenAiModelPicker {
                 model: model.model,
-                variant: model.thinking,
+                harness: model.harness,
             };
         }
 
@@ -3365,45 +3446,98 @@ impl SettingsScreen {
         }
     }
 
-    /// Left/Right on a slot rectangle adjusts that slot's thinking strength.
-    /// The empty string is the persisted "Default"; concrete variants follow
-    /// the chosen model's own weakest-to-strongest ladder. Returns `true` when
-    /// the cursor was on a rectangle (so the caller skips chip cycling).
-    fn ai_settings_adjust_thinking(&mut self, increase: bool) -> bool {
-        // Read the targeted slot + its model up front so the immutable borrow
-        // is released before `ai_thinking_ladder` (which also borrows `self`).
-        let (idx, pair, current) = {
-            let Some(editor) = self.ai_settings_editor.as_ref() else {
-                return false;
-            };
-            let AiSettingsSelection::Rect(idx) = editor.selection else {
-                return false;
-            };
-            let model = AiSettingsEditor::slot(idx).get(&editor.ai);
-            let pair = model.model.trim().to_string();
-            if pair.is_empty() {
-                return true;
-            }
-            (idx, pair, model.thinking.clone())
-        };
-
-        let ladder = self.ai_thinking_ladder(&pair);
-        let current_idx = reasoning_level_index(&ladder, &current);
-        let next_idx = if increase {
-            (current_idx + 1).min(reasoning_level_count(&ladder) - 1)
-        } else {
-            current_idx.saturating_sub(1)
-        };
-        let next = reasoning_level_at(&ladder, next_idx).unwrap_or_default();
+    fn ai_settings_move_field(&mut self, forward: bool) -> bool {
         let Some(editor) = self.ai_settings_editor.as_mut() else {
             return false;
         };
+        if !matches!(editor.selection, AiSettingsSelection::Rect(_)) {
+            return false;
+        }
+        editor.field = match (editor.field, forward) {
+            (AiSettingsField::Model, false) | (AiSettingsField::Harness, true) => editor.field,
+            (AiSettingsField::Model, true) => AiSettingsField::Thinking,
+            (AiSettingsField::Thinking, false) => AiSettingsField::Model,
+            (AiSettingsField::Thinking, true) => AiSettingsField::Harness,
+            (AiSettingsField::Harness, false) => AiSettingsField::Thinking,
+        };
+        true
+    }
+
+    fn ai_settings_cycle_thinking(&mut self) {
+        let (idx, pair, current, harness) = {
+            let Some(editor) = self.ai_settings_editor.as_ref() else {
+                return;
+            };
+            let AiSettingsSelection::Rect(idx) = editor.selection else {
+                return;
+            };
+            let model = AiSettingsEditor::slot(idx).get(&editor.ai);
+            if model.model.trim().is_empty() {
+                return;
+            }
+            (
+                idx,
+                model.model.trim().to_string(),
+                model.thinking.clone(),
+                model.harness,
+            )
+        };
+        let ladder = self.ai_thinking_ladder(harness, &pair);
+        if ladder.is_empty() {
+            return;
+        }
+        let next = reasoning_level_at(
+            &ladder,
+            (reasoning_level_index(&ladder, &current) + 1) % reasoning_level_count(&ladder),
+        )
+        .unwrap_or_default();
+        let Some(editor) = self.ai_settings_editor.as_mut() else {
+            return;
+        };
         let target = AiSettingsEditor::slot(idx).get_mut(&mut editor.ai);
-        if next != target.thinking {
+        if target.thinking != next {
             target.thinking = next;
             editor.statuses[idx] = DashboardRectStatus::Modified;
         }
-        true
+    }
+
+    fn ai_settings_cycle_harness(&mut self) {
+        let (idx, model, harness, thinking) = {
+            let Some(editor) = self.ai_settings_editor.as_ref() else {
+                return;
+            };
+            let AiSettingsSelection::Rect(idx) = editor.selection else {
+                return;
+            };
+            let current = AiSettingsEditor::slot(idx).get(&editor.ai);
+            (
+                idx,
+                current.model.clone(),
+                current.harness,
+                current.thinking.clone(),
+            )
+        };
+        let accepted = AiHarness::accepted_for_model(&model);
+        let next = accepted
+            .iter()
+            .position(|candidate| *candidate == harness)
+            .map(|i| accepted[(i + 1) % accepted.len()])
+            .unwrap_or(AiHarness::OpenCode);
+        let ladder = self.ai_thinking_ladder(next, &model);
+        let thinking = ladder
+            .iter()
+            .any(|level| level == &thinking)
+            .then_some(thinking)
+            .unwrap_or_default();
+        let Some(editor) = self.ai_settings_editor.as_mut() else {
+            return;
+        };
+        let target = AiSettingsEditor::slot(idx).get_mut(&mut editor.ai);
+        if target.harness != next || target.thinking != thinking {
+            target.harness = next;
+            target.thinking = thinking;
+            editor.statuses[idx] = DashboardRectStatus::Modified;
+        }
     }
 
     /// Stage the chip-row cursor's pair into the targeted slot without saving —
@@ -4467,7 +4601,7 @@ impl SettingsScreen {
         );
         frame.render_widget(
             Paragraph::new(Line::from(branded_line(
-                "Pick a model + thinking strength per AI command:",
+                "Pick a model + thinking strength + harness per AI command:",
                 muted_style,
             ))),
             chunks[1],
@@ -4508,9 +4642,9 @@ impl SettingsScreen {
         let hint = if on_chips {
             "← → cycle chips • Enter stages • ↑↓ leave row • Esc back to Dashboard"
         } else if is_scrollable {
-            "▲/▼ scroll • ← → thinking strength • Enter pick model/Save • Esc back to Dashboard"
+            "▲/▼ scroll • ← → choose field • Space change value • Enter pick model/Save • Esc back"
         } else {
-            "↑↓ move • ← → thinking strength • Enter pick model/Save • Esc back to Dashboard"
+            "↑↓ move • ← → choose field • Space change value • Enter pick model/Save • Esc back"
         };
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
     }
@@ -4553,19 +4687,27 @@ impl SettingsScreen {
                     .add_modifier(Modifier::DIM),
             ))
         } else {
+            let focus = editor.field;
             Line::from(vec![
-                Span::raw(model.model.clone()),
+                Span::styled(
+                    model.model.clone(),
+                    focused_ai_field_style(focus == AiSettingsField::Model),
+                ),
+                Span::styled("  ·  ", Style::default().fg(colors::MUTED)),
                 Span::styled(
                     format!(
-                        "  ·  {}",
+                        "{}",
                         reasoning_level_label(
-                            &self.ai_thinking_ladder(model.model.trim()),
+                            &self.ai_thinking_ladder(model.harness, model.model.trim()),
                             &model.thinking,
                         )
                     ),
-                    Style::default()
-                        .fg(colors::MUTED)
-                        .add_modifier(Modifier::DIM),
+                    focused_ai_field_style(focus == AiSettingsField::Thinking),
+                ),
+                Span::styled("  ·  ", Style::default().fg(colors::MUTED)),
+                Span::styled(
+                    ai_harness_label(model.harness),
+                    focused_ai_field_style(focus == AiSettingsField::Harness),
                 ),
             ])
         };
@@ -5820,6 +5962,26 @@ Safety features:\n\
     }
 }
 
+fn focused_ai_field_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(colors::WHITE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(colors::MUTED)
+            .add_modifier(Modifier::DIM)
+    }
+}
+
+fn ai_harness_label(harness: AiHarness) -> &'static str {
+    match harness {
+        AiHarness::OpenCode => "opencode",
+        AiHarness::Codex => "codex",
+        AiHarness::ClaudeCode => "claude code",
+    }
+}
+
 fn link_strategy_label(strategy: LinkStrategy) -> &'static str {
     match strategy {
         LinkStrategy::CreateEmpty => "CreateEmpty",
@@ -6245,6 +6407,8 @@ mod tests {
         );
         let _ = screen.handle_ai_settings(key(KeyCode::Right));
         let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
         // Wraps forward.
         assert_eq!(
             screen.ai_settings_editor.as_ref().unwrap().selection,
@@ -6288,12 +6452,12 @@ mod tests {
         focus_ai_slot(&mut screen, 0);
         set_slot_model(&mut screen, 0, "opencode/big-pickle");
 
-        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
         let editor = screen.ai_settings_editor.as_ref().unwrap();
         assert_eq!(AiSlot::ALL[0].get(&editor.ai).thinking, "minimal");
         assert_eq!(editor.statuses[0], DashboardRectStatus::Modified);
 
-        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
         assert_eq!(
             AiSlot::ALL[0]
                 .get(&screen.ai_settings_editor.as_ref().unwrap().ai)
@@ -6301,8 +6465,9 @@ mod tests {
             "low"
         );
 
-        let _ = screen.handle_ai_settings(key(KeyCode::Left));
-        let _ = screen.handle_ai_settings(key(KeyCode::Left));
+        for _ in 0..5 {
+            let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
+        }
         assert_eq!(
             AiSlot::ALL[0]
                 .get(&screen.ai_settings_editor.as_ref().unwrap().ai)
@@ -6330,11 +6495,12 @@ mod tests {
                 .clone()
         };
         let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
         assert_eq!(slot_thinking(&screen), "high");
-        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
         assert_eq!(slot_thinking(&screen), "max");
-        let _ = screen.handle_ai_settings(key(KeyCode::Right));
-        assert_eq!(slot_thinking(&screen), "max");
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
+        assert_eq!(slot_thinking(&screen), "");
     }
 
     #[test]
@@ -6374,7 +6540,8 @@ mod tests {
         let mut screen = ai_settings_screen(vec![]);
         focus_ai_slot(&mut screen, 1); // fix_plan
         set_slot_model(&mut screen, 1, "openai/gpt-5.5");
-        let _ = screen.handle_ai_settings(key(KeyCode::Right)); // minimal thinking
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' '))); // minimal thinking
         screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::Save;
 
         match screen.handle_ai_settings(key(KeyCode::Enter)) {

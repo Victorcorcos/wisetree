@@ -22,7 +22,9 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::cli::AppMode;
-use crate::config::schema::{DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig};
+use crate::config::schema::{
+    AiHarness, DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig,
+};
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
 use crate::errors::user_friendly_message;
@@ -36,8 +38,9 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     build_review_summary, build_review_summary_with_overview, check_for_updates_all_sources,
     compute_attempt_changes, default_dashboard_warning, detect_shell_integration,
-    develop_commit_subject, fetch_free_opencode_models, fetch_opencode_model_variants,
-    fetch_opencode_models, install_shell_integration, parse_plan_transcript, parse_pull_request_md,
+    develop_commit_subject, fetch_claude_effort_levels, fetch_codex_reasoning_levels,
+    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
+    install_shell_integration, parse_plan_transcript, parse_pull_request_md,
     resolve_dashboard_columns, summarize_transcript, AiStatus, AttemptChanges, BugHypothesis,
     BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
     CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
@@ -331,6 +334,10 @@ enum AppEvent {
     /// each `provider/model` to its authoritative reasoning variants, powering
     /// the AI Settings slots' per-model ←/→ reasoning cycle.
     AiModelVariantsFetched(Result<std::collections::HashMap<String, Vec<String>>, String>),
+    AiHarnessVariantsFetched {
+        harness: AiHarness,
+        result: Result<std::collections::HashMap<String, Vec<String>>, String>,
+    },
     ShellIntegrationDetected(ShellIntegrationStatus),
 }
 
@@ -1937,8 +1944,8 @@ impl App {
                             }
                         }
                     }
-                    SettingsAction::OpenAiModelPicker { model, variant } => {
-                        self.open_ai_model_picker(model, variant, tx);
+                    SettingsAction::OpenAiModelPicker { model, harness: _ } => {
+                        self.open_ai_model_picker(model, tx);
                     }
                     SettingsAction::FetchFreeModels => {
                         kick_off_fetch_free_opencode_models(tx.clone());
@@ -2124,9 +2131,9 @@ impl App {
                 match action {
                     AiModelPickerAction::Continue => {}
                     AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
-                    AiModelPickerAction::Selected { model, variant } => {
+                    AiModelPickerAction::Selected { model } => {
                         if let Some(settings) = self.settings.as_mut() {
-                            settings.apply_ai_selection(model, variant);
+                            settings.apply_ai_model_selection(model);
                         }
                         self.close_ai_model_picker();
                     }
@@ -2147,7 +2154,7 @@ impl App {
         match action {
             AiModelPickerAction::Continue => {}
             AiModelPickerAction::Cancelled => self.close_ai_model_picker(),
-            AiModelPickerAction::Selected { model, variant } => {
+            AiModelPickerAction::Selected { model } => {
                 // Stamp the chosen model + thinking strength into the still-live
                 // Dashboard editor and drop back onto it — the user persists the
                 // change by pressing the editor's Save button (same pattern as
@@ -2155,7 +2162,7 @@ impl App {
                 // user past the editor to the Settings menu, which they
                 // don't expect.
                 if let Some(settings) = self.settings.as_mut() {
-                    settings.apply_ai_selection(model, variant);
+                    settings.apply_ai_model_selection(model);
                 }
                 self.close_ai_model_picker();
                 let _ = tx;
@@ -2167,13 +2174,8 @@ impl App {
     /// background catalogue fetch, and flip the route. The picker reads the
     /// current `model` / `variant` so reopening it lands on the user's prior
     /// choice (and pre-selects their thinking strength).
-    fn open_ai_model_picker(
-        &mut self,
-        model: String,
-        variant: String,
-        tx: &mpsc::UnboundedSender<AppEvent>,
-    ) {
-        self.ai_model_picker = Some(AiModelPickerScreen::new(model, variant));
+    fn open_ai_model_picker(&mut self, model: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.ai_model_picker = Some(AiModelPickerScreen::new(model));
         self.screen = Screen::AiModelPicker;
         kick_off_fetch_opencode_models(tx.clone());
     }
@@ -6008,8 +6010,8 @@ impl App {
                     }
                 }
             }
-            SettingsAction::OpenAiModelPicker { model, variant } => {
-                self.open_ai_model_picker(model, variant, tx);
+            SettingsAction::OpenAiModelPicker { model, harness: _ } => {
+                self.open_ai_model_picker(model, tx);
             }
             SettingsAction::FetchFreeModels => {
                 kick_off_fetch_free_opencode_models(tx.clone());
@@ -6459,6 +6461,11 @@ impl App {
                 // errors (the cycle falls back to the generic ladder).
                 if let (Some(settings), Ok(variants)) = (self.settings.as_mut(), result) {
                     settings.set_ai_model_variants(variants);
+                }
+            }
+            AppEvent::AiHarnessVariantsFetched { harness, result } => {
+                if let (Some(settings), Ok(variants)) = (self.settings.as_mut(), result) {
+                    settings.set_ai_harness_variants(harness, variants);
                 }
             }
             AppEvent::ShellIntegrationDetected(status) => {
@@ -8331,10 +8338,28 @@ fn kick_off_fetch_free_opencode_models(tx: mpsc::UnboundedSender<AppEvent>) {
 /// free-model fetch — failures leave the Settings screen on the generic
 /// fallback ladder.
 fn kick_off_fetch_ai_model_variants(tx: mpsc::UnboundedSender<AppEvent>) {
+    let opencode_tx = tx.clone();
     tokio::spawn(async move {
         let binary = PathBuf::from(crate::constants::OPENCODE_CLI_BINARY);
         let result = fetch_opencode_model_variants(&binary).await;
-        let _ = tx.send(AppEvent::AiModelVariantsFetched(result));
+        let _ = opencode_tx.send(AppEvent::AiModelVariantsFetched(result));
+    });
+    let codex_tx = tx.clone();
+    tokio::spawn(async move {
+        let result = fetch_codex_reasoning_levels(&PathBuf::from("codex")).await;
+        let _ = codex_tx.send(AppEvent::AiHarnessVariantsFetched {
+            harness: AiHarness::Codex,
+            result,
+        });
+    });
+    tokio::spawn(async move {
+        let result = fetch_claude_effort_levels(&PathBuf::from("claude"))
+            .await
+            .map(|levels| std::collections::HashMap::from([("*".to_string(), levels)]));
+        let _ = tx.send(AppEvent::AiHarnessVariantsFetched {
+            harness: AiHarness::ClaudeCode,
+            result,
+        });
     });
 }
 
