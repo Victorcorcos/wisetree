@@ -10,6 +10,7 @@ use globset::{Glob, GlobSetBuilder};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -28,6 +29,7 @@ use crate::services::bugkill::{
     parse_porcelain_v2, AttemptChanges, BugHypothesis, BugkillVerdict, JudgeResult,
     ParsedInvestigation, INVESTIGATION_FILE,
 };
+use crate::services::develop::{parse_plan_md, DevelopPlan, PLAN_FILE};
 use crate::services::review_telemetry::{
     opencode_usage_for_title, review_scan_title, ReviewScanTelemetry, ReviewTokenUsage,
 };
@@ -130,6 +132,23 @@ const BUGKILL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// prompt argv never approaches OS limits.
 const BUGKILL_DESCRIPTION_MAX_BYTES: usize = 16_000;
 const BUGKILL_FIELD_MAX_BYTES: usize = 8_000;
+/// Byte caps applied to Develop prompt inputs before templating. The
+/// previous-plan block embedded on a revision can hold a whole plan, so it
+/// gets a roomier cap than the freeform fields.
+const DEVELOP_TASK_MAX_BYTES: usize = 16_000;
+const DEVELOP_FEEDBACK_MAX_BYTES: usize = 8_000;
+const DEVELOP_PLAN_MAX_BYTES: usize = 48_000;
+/// How long the post-section check command may run before it is killed and
+/// reported as a failure. A full test suite is slower than a git op, so this
+/// gets a generous leash.
+const DEVELOP_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Bytes of the check command's combined output kept (the tail) for the UI
+/// and the corrective prompt — the failing assertions are near the end.
+const DEVELOP_CHECK_OUTPUT_MAX_BYTES: usize = 12_000;
+/// The harness-owned plan file, always excluded from a section commit — like
+/// Bugkill's `BUG_INVESTIGATION.md`, it is output for the human, not part of
+/// the delivered change.
+const DEVELOP_PLAN_FILE: &str = "PLAN.md";
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -1353,6 +1372,47 @@ pub enum BugkillPreflightOutcome {
     LeftoverAttempt {
         tracked: Vec<String>,
     },
+}
+
+/// What the Develop preflight found on disk about a previous run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevelopResumeState {
+    /// No `PLAN.md` — collect a task description.
+    Absent,
+    /// The file exists but is not in Develop's format — Overwrite/Cancel.
+    Unparseable,
+    /// A parseable plan. With pending sections the UI offers Resume; a fully
+    /// implemented plan only offers Start fresh.
+    Parsed(DevelopPlan),
+}
+
+/// Everything the deterministic Develop pre-flight gathered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevelopPreflight {
+    /// First reachable ref from `BASE_REF_PRIORITY` (prompt context only,
+    /// rendered as `(none resolved)` when absent).
+    pub base_ref: Option<String>,
+    pub resume: DevelopResumeState,
+}
+
+/// Outcome of [`DashboardService::develop_preflight`]. The non-`Ready`
+/// variants map straight to a toast in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevelopPreflightOutcome {
+    Ready(Box<DevelopPreflight>),
+    /// `ai.develop.plan.model` is blank.
+    AiNotConfigured,
+    /// `opencode` is not on PATH.
+    AiUnavailable,
+}
+
+/// Result of running the configured post-section check command (Ralph-canon
+/// backpressure). `Failed` carries the captured output tail so the UI can
+/// show it and the corrective run can embed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevelopCheckOutcome {
+    Passed,
+    Failed { output: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4647,6 +4707,280 @@ impl DashboardService {
         })
     }
 
+    // ── "Develop" pipeline ─────────────────────────────────────────────
+    //
+    // AI is called in exactly two places: plan (once per revision, live TUI
+    // watched by the turn watcher) and implement (one run per section on a
+    // Ralph Loop, or a single run for the whole plan). Everything else —
+    // gates, PLAN.md rendering/parsing, progress tracking, the approval
+    // loop — is deterministic Rust. The AI never reads or writes PLAN.md.
+
+    /// Deterministic Develop pre-flight: model + opencode gates, base-ref
+    /// resolution, and detection of a resumable `PLAN.md`.
+    pub async fn develop_preflight(&self, worktree_path: &str) -> Result<DevelopPreflightOutcome> {
+        if self.config.ai.develop.plan.model.trim().is_empty()
+            || self.config.ai.develop.implement.model.trim().is_empty()
+        {
+            return Ok(DevelopPreflightOutcome::AiNotConfigured);
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Ok(DevelopPreflightOutcome::AiUnavailable);
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let status = self
+            .develop_git(&cwd, &["status", "--porcelain", "--untracked-files=all"])
+            .await
+            .map_err(WisetreeError::other)?;
+        if !status.trim().is_empty() {
+            return Err(WisetreeError::other(
+                "Develop requires a clean worktree before starting.".to_string(),
+            ));
+        }
+        let resume = match tokio::fs::read_to_string(cwd.join(PLAN_FILE)).await.ok() {
+            None => DevelopResumeState::Absent,
+            Some(content) => match parse_plan_md(&content) {
+                None => DevelopResumeState::Unparseable,
+                Some(plan) => DevelopResumeState::Parsed(plan),
+            },
+        };
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await;
+        Ok(DevelopPreflightOutcome::Ready(Box::new(DevelopPreflight {
+            base_ref,
+            resume,
+        })))
+    }
+
+    /// Build the spawn parameters for one live planning run: the full
+    /// opencode **TUI** pinned to the read-only Plan agent, embedded in the
+    /// AI Activity panel. The TUI never exits on its own — the App detects
+    /// completion through an `OpencodeTurnWatcher` and reads the transcript
+    /// from opencode's database. `previous_plan` + `feedback` are set on a
+    /// revision after the user rejects the plan; `corrective` appends the
+    /// stricter-contract suffix used on the single retry after a parse
+    /// failure.
+    pub fn prepare_develop_plan(
+        &self,
+        worktree_path: &str,
+        task_description: &str,
+        base_ref: Option<&str>,
+        previous_plan: Option<&str>,
+        feedback: Option<&str>,
+        corrective: bool,
+    ) -> Result<FixApplyHandoff> {
+        let slot = &self.config.ai.develop.plan;
+        let model = slot.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other(
+                "ai.develop.plan model is not configured.",
+            ));
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Err(WisetreeError::other("opencode CLI is not on PATH."));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let mut prompt =
+            build_develop_plan_prompt(task_description, base_ref, previous_plan, feedback);
+        if corrective {
+            prompt = format!(
+                "{prompt}\n\nYour previous output could not be parsed. Reply with ONLY the \
+                 delimited blocks, exactly as specified."
+            );
+        }
+        // The opencode TUI takes no `--variant`; it honors reasoning effort
+        // solely via the persisted `model.json`, so seed it before spawning.
+        seed_opencode_tui_variant(&model, &slot.thinking);
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            "--agent".to_string(),
+            "plan".to_string(),
+            cwd.to_string_lossy().to_string(),
+        ];
+        Ok(FixApplyHandoff {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+        })
+    }
+
+    /// Build the spawn parameters for one live implement run. `sections`
+    /// holds only the section block(s) this run must build — one section on
+    /// a Ralph Loop, all pending sections otherwise — so no tokens are spent
+    /// re-reading the rest of the plan; `outline` is the one-line-per-section
+    /// roadmap (names + statuses, never bodies) that keeps the run in its
+    /// lane.
+    pub fn prepare_develop_implement(
+        &self,
+        worktree_path: &str,
+        task_description: &str,
+        sections: &str,
+        outline: &str,
+        check_failure: Option<&str>,
+    ) -> Result<FixApplyHandoff> {
+        let slot = &self.config.ai.develop.implement;
+        let model = slot.model.trim().to_string();
+        if model.is_empty() {
+            return Err(WisetreeError::other(
+                "ai.develop.implement model is not configured.",
+            ));
+        }
+        if !binary_available(&self.opencode_binary) {
+            return Err(WisetreeError::other("opencode CLI is not on PATH."));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        let prompt = build_develop_implement_prompt(
+            task_description,
+            sections,
+            outline,
+            self.config.develop.check_command.trim(),
+            check_failure,
+        );
+        // The opencode TUI takes no `--variant`; it honors reasoning effort
+        // solely via the persisted `model.json`, so seed it before spawning.
+        seed_opencode_tui_variant(&model, &slot.thinking);
+        let opencode_args: Vec<String> = vec![
+            "--prompt".to_string(),
+            prompt,
+            "-m".to_string(),
+            model,
+            cwd.to_string_lossy().to_string(),
+        ];
+        Ok(FixApplyHandoff {
+            opencode_binary: self.opencode_binary.clone(),
+            opencode_args,
+            cwd,
+        })
+    }
+
+    /// Run the configured check command (Ralph-canon backpressure) in the
+    /// worktree, deterministically — no AI. The command is run through the
+    /// user's login shell so their PATH / toolchain shims resolve exactly as
+    /// in a real terminal; stdout and stderr are merged (test runners split
+    /// across both) and the tail is kept. A non-zero exit or a timeout is a
+    /// `Failed`; the caller decides what to do with it (never the harness
+    /// silently). Assumes a non-blank command — the pipeline skips the check
+    /// entirely when `develop.checkCommand` is empty, so this is never called
+    /// with nothing to run.
+    pub async fn develop_run_check(&self, worktree_path: &str) -> DevelopCheckOutcome {
+        let command = self.config.develop.check_command.trim().to_string();
+        let cwd = PathBuf::from(worktree_path);
+        let (shell, args) = login_shell_check_command(&command);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = time::timeout(
+            DEVELOP_CHECK_TIMEOUT,
+            run_command_combined(&shell, &arg_refs, Some(&cwd)),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => DevelopCheckOutcome::Passed,
+            Ok(Err(output)) => DevelopCheckOutcome::Failed {
+                output: clip_output_tail(&output, DEVELOP_CHECK_OUTPUT_MAX_BYTES),
+            },
+            Err(_) => DevelopCheckOutcome::Failed {
+                output: format!("`{command}` timed out after 10 minutes."),
+            },
+        }
+    }
+
+    /// Commit one finished section — the harness, never the AI — as a
+    /// Ralph-canon checkpoint. `preexisting_paths` holds the paths that were
+    /// already dirty before this section's run started; they are left
+    /// untouched so unrelated worktree changes are not absorbed into the
+    /// checkpoint. The harness-owned `PLAN.md` is also excluded. Returns the
+    /// new sha, or `Ok(None)` when there was nothing to commit (the run made
+    /// no change, or touched only pre-existing work / `PLAN.md`).
+    pub async fn develop_commit_section(
+        &self,
+        worktree_path: &str,
+        subject: &str,
+        preexisting_paths: &[String],
+    ) -> Result<Option<String>> {
+        let cwd = PathBuf::from(worktree_path);
+        // Ensure a plan staged before this checkpoint cannot be committed.
+        self.develop_git(&cwd, &["reset", "--", DEVELOP_PLAN_FILE])
+            .await
+            .map_err(WisetreeError::other)?;
+        // Compute the current dirty files and drop anything that was already
+        // dirty before this section started or is harness-owned output.
+        let status = self
+            .develop_git(
+                &cwd,
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            )
+            .await
+            .map_err(WisetreeError::other)?;
+        let current = parse_porcelain_v2(&status);
+        let mut section_paths: Vec<String> = current
+            .tracked
+            .into_iter()
+            .chain(current.untracked)
+            .filter(|p| *p != DEVELOP_PLAN_FILE && !preexisting_paths.contains(p))
+            .collect();
+        section_paths.sort();
+        section_paths.dedup();
+        if section_paths.is_empty() {
+            return Ok(None);
+        }
+        // Stage only the paths this section intended to change.
+        let mut add_args: Vec<&str> = vec!["add", "--"];
+        let path_refs: Vec<&str> = section_paths.iter().map(String::as_str).collect();
+        add_args.extend_from_slice(&path_refs);
+        self.develop_git(&cwd, &add_args)
+            .await
+            .map_err(WisetreeError::other)?;
+        self.develop_git(&cwd, &["commit", "-m", subject])
+            .await
+            .map_err(|err| {
+                WisetreeError::other(if err.trim().is_empty() {
+                    "git commit failed after staging the section.".to_string()
+                } else {
+                    err
+                })
+            })?;
+        let sha = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+        Ok(Some(sha.trim().to_string()))
+    }
+
+    /// Return every path that is currently dirty in the worktree, including
+    /// untracked files. Used to record a baseline before a section run so the
+    /// later commit can exclude pre-existing work.
+    pub async fn develop_dirty_files(&self, worktree_path: &str) -> Result<Vec<String>> {
+        let cwd = PathBuf::from(worktree_path);
+        let status = self
+            .develop_git(
+                &cwd,
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            )
+            .await
+            .map_err(WisetreeError::other)?;
+        let parsed = parse_porcelain_v2(&status);
+        let mut paths: Vec<String> = parsed
+            .tracked
+            .into_iter()
+            .chain(parsed.untracked)
+            .filter(|p| !p.is_empty())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Run one git command inside `cwd` under the Develop check timeout,
+    /// mirroring [`Self::bugkill_git`].
+    async fn develop_git(&self, cwd: &Path, args: &[&str]) -> std::result::Result<String, String> {
+        let subcommand = args.first().copied().unwrap_or("command");
+        time::timeout(
+            BUGKILL_GIT_TIMEOUT,
+            run_command(&self.git_binary, args, Some(cwd)),
+        )
+        .await
+        .unwrap_or_else(|_| Err(format!("git {subcommand} timed out")))
+    }
+
     /// Gather worktree + git-derived state (status, upstream diff, last commit)
     /// for every worktree in parallel, then layer cached PR data on top. No
     /// network calls — safe to emit immediately so the UI can render before
@@ -6870,6 +7204,211 @@ fn build_bug_judge_prompt(row: &BugHypothesis, user_text: &str) -> String {
             "USER_FEEDBACK",
             &truncate_bugkill_field(user_text, BUGKILL_FIELD_MAX_BYTES),
         )
+}
+
+/// Render `prompts/develop_plan.md` for one live planning run.
+/// `previous_plan` is the compact contract-format rendering of the plan
+/// being revised; both revision slots are empty on a first run.
+fn build_develop_plan_prompt(
+    task_description: &str,
+    base_ref: Option<&str>,
+    previous_plan: Option<&str>,
+    feedback: Option<&str>,
+) -> String {
+    const PROMPT: &str = include_str!("../../prompts/develop_plan.md");
+    PROMPT
+        .replace(
+            "TASK_DESCRIPTION",
+            &truncate_bugkill_field(task_description, DEVELOP_TASK_MAX_BYTES),
+        )
+        .replace("BASE_REF", base_ref.unwrap_or("(none resolved)"))
+        .replace(
+            "PREVIOUS_PLAN",
+            &truncate_bugkill_field(previous_plan.unwrap_or(""), DEVELOP_PLAN_MAX_BYTES),
+        )
+        .replace(
+            "USER_FEEDBACK",
+            &truncate_bugkill_field(feedback.unwrap_or(""), DEVELOP_FEEDBACK_MAX_BYTES),
+        )
+}
+
+/// Render `prompts/develop_implement.md` for one live implement run. Only
+/// the section block(s) the run must build go in — never the whole plan
+/// file (token-efficiency invariant) — plus the compact outline so the run
+/// knows what belongs to other sections. `check_command` is the check the
+/// harness runs after the run (blank = none); `check_failure` is the
+/// captured output from the previous run's failed check on a corrective
+/// retry (empty on a first attempt).
+fn build_develop_implement_prompt(
+    task_description: &str,
+    sections: &str,
+    outline: &str,
+    check_command: &str,
+    check_failure: Option<&str>,
+) -> String {
+    const PROMPT: &str = include_str!("../../prompts/develop_implement.md");
+    let check_command = if check_command.is_empty() {
+        "(no automated check configured — rely on the acceptance criteria)".to_string()
+    } else {
+        check_command.to_string()
+    };
+    PROMPT
+        .replace(
+            "TASK_DESCRIPTION",
+            &truncate_bugkill_field(task_description, DEVELOP_TASK_MAX_BYTES),
+        )
+        // `PLAN_OUTLINE` before `SECTIONS`: the outline placeholder contains
+        // the word SECTIONS nowhere, but replacing the more specific token
+        // first keeps the templating order-independent regardless.
+        .replace(
+            "PLAN_OUTLINE",
+            &truncate_bugkill_field(outline, DEVELOP_FEEDBACK_MAX_BYTES),
+        )
+        .replace(
+            "CHECK_COMMAND",
+            &truncate_bugkill_field(&check_command, DEVELOP_FEEDBACK_MAX_BYTES),
+        )
+        .replace(
+            "CHECK_FAILURE",
+            &truncate_bugkill_field(check_failure.unwrap_or(""), DEVELOP_PLAN_MAX_BYTES),
+        )
+        .replace(
+            "SECTIONS",
+            &truncate_bugkill_field(sections, DEVELOP_PLAN_MAX_BYTES),
+        )
+}
+
+/// Build a section-commit subject. Ralph mode passes the section's
+/// `Some((number, name))` → `develop: section N — <name>`; single-run mode
+/// passes `None` → `develop: implement plan`. The name's first line is
+/// clipped to 60 chars so the subject stays one tidy line.
+pub fn develop_commit_subject(section: Option<(usize, &str)>) -> String {
+    match section {
+        Some((number, name)) => {
+            let first = name.lines().next().unwrap_or("").trim();
+            let clipped: String = if first.chars().count() <= 60 {
+                first.to_string()
+            } else {
+                let head: String = first.chars().take(60).collect();
+                format!("{head}…")
+            };
+            format!("develop: section {number} — {clipped}")
+        }
+        None => "develop: implement plan".to_string(),
+    }
+}
+
+/// Keep the last `max_bytes` of `text` on a char boundary, prefixing `…`
+/// when clipped. Used for the check-command output tail (failures cluster at
+/// the end of a test run).
+fn clip_output_tail(text: &str, max_bytes: usize) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.len() <= max_bytes {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len() - max_bytes;
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &trimmed[start..])
+}
+
+/// Build the `(shell, args)` that run `command` through the user's login
+/// shell so their PATH / toolchain shims resolve as in a real terminal.
+/// Mirrors `files::service`'s post-create runner: `-l` for shells that
+/// support it, then `-c <command>`. No `-i` — there is no PTY.
+fn login_shell_check_command(command: &str) -> (PathBuf, Vec<String>) {
+    let shell = std::env::var("SHELL").ok();
+    login_shell_check_command_for_shell(command, shell.as_deref())
+}
+
+fn login_shell_check_command_for_shell(
+    command: &str,
+    configured_shell: Option<&str>,
+) -> (PathBuf, Vec<String>) {
+    let shell = configured_shell
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/bin/sh");
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sh")
+        .trim_start_matches('-');
+    let mut args = Vec::new();
+    if matches!(
+        shell_name,
+        "bash" | "zsh" | "fish" | "ksh" | "ksh93" | "mksh" | "tcsh" | "csh"
+    ) {
+        args.push("-l".to_string());
+    }
+    args.push("-c".to_string());
+    args.push(command.to_string());
+    (PathBuf::from(shell), args)
+}
+
+async fn read_bounded_tail<R>(mut reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tail = Vec::new();
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+
+        if read >= max_bytes {
+            tail.clear();
+            tail.extend_from_slice(&chunk[read - max_bytes..read]);
+        } else {
+            let excess = tail.len().saturating_add(read).saturating_sub(max_bytes);
+            if excess > 0 {
+                tail.drain(..excess);
+            }
+            tail.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    Ok(tail)
+}
+
+/// Like [`run_command_once`] but merges stdout+stderr and returns `Ok(())`
+/// on a zero exit or `Err(combined_output)` otherwise — the shape the check
+/// runner needs (a test runner writes results to both streams, and success
+/// carries no message).
+async fn run_command_combined(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> std::result::Result<(), String> {
+    let mut cmd = Command::new(binary);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd.spawn().map_err(|err| err.to_string())?;
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (status, stdout, stderr) = tokio::try_join!(
+        child.wait(),
+        read_bounded_tail(stdout, DEVELOP_CHECK_OUTPUT_MAX_BYTES),
+        read_bounded_tail(stderr, DEVELOP_CHECK_OUTPUT_MAX_BYTES),
+    )
+    .map_err(|err| err.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        let mut combined = stdout;
+        combined.extend_from_slice(&stderr);
+        let start = combined
+            .len()
+            .saturating_sub(DEVELOP_CHECK_OUTPUT_MAX_BYTES);
+        Err(String::from_utf8_lossy(&combined[start..]).into_owned())
+    }
 }
 
 /// Hash every untracked file (excluding `BUG_INVESTIGATION.md`) so a later
@@ -9675,6 +10214,104 @@ pub fn resolve_dashboard_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::develop::{render_plan_md, PlanSection};
+
+    #[test]
+    fn login_shell_check_uses_login_mode_for_supported_shell() {
+        let (shell, args) = login_shell_check_command_for_shell("cargo test", Some("/bin/zsh"));
+
+        assert_eq!(shell, PathBuf::from("/bin/zsh"));
+        assert_eq!(args, ["-l", "-c", "cargo test"]);
+    }
+
+    #[test]
+    fn login_shell_check_omits_login_mode_for_unsupported_shell() {
+        let (shell, args) = login_shell_check_command_for_shell("cargo test", Some("/usr/bin/nu"));
+
+        assert_eq!(shell, PathBuf::from("/usr/bin/nu"));
+        assert_eq!(args, ["-c", "cargo test"]);
+    }
+
+    #[test]
+    fn login_shell_check_falls_back_for_empty_shell() {
+        let (shell, args) = login_shell_check_command_for_shell("cargo test", Some(""));
+
+        assert_eq!(shell, PathBuf::from("/bin/sh"));
+        assert_eq!(args, ["-c", "cargo test"]);
+    }
+
+    #[test]
+    fn login_shell_check_falls_back_for_missing_shell() {
+        let (shell, args) = login_shell_check_command_for_shell("cargo test", None);
+
+        assert_eq!(shell, PathBuf::from("/bin/sh"));
+        assert_eq!(args, ["-c", "cargo test"]);
+    }
+
+    #[test]
+    fn develop_plan_prompt_renders_first_run_with_unresolved_base() {
+        let prompt = build_develop_plan_prompt("Add dashboard filtering", None, None, None);
+
+        assert!(prompt.contains("Add dashboard filtering"));
+        assert!(prompt.contains("(none resolved)"));
+        assert!(!prompt.contains("TASK_DESCRIPTION"));
+        assert!(!prompt.contains("BASE_REF"));
+        assert!(!prompt.contains("PREVIOUS_PLAN"));
+        assert!(!prompt.contains("USER_FEEDBACK"));
+    }
+
+    #[test]
+    fn develop_plan_prompt_renders_revision_context() {
+        let prompt = build_develop_plan_prompt(
+            "Add dashboard filtering",
+            Some("origin/main"),
+            Some("## Section 1\nImplement the filter"),
+            Some("Keep the existing keyboard shortcut"),
+        );
+
+        assert!(prompt.contains("Add dashboard filtering"));
+        assert!(prompt.contains("origin/main"));
+        assert!(prompt.contains("## Section 1\nImplement the filter"));
+        assert!(prompt.contains("Keep the existing keyboard shortcut"));
+        assert!(!prompt.contains("TASK_DESCRIPTION"));
+        assert!(!prompt.contains("BASE_REF"));
+        assert!(!prompt.contains("PREVIOUS_PLAN"));
+        assert!(!prompt.contains("USER_FEEDBACK"));
+    }
+
+    #[test]
+    fn develop_plan_prompt_caps_multibyte_inputs() {
+        let oversized_task = "🦀".repeat(DEVELOP_TASK_MAX_BYTES);
+        let oversized_plan = "🐢".repeat(DEVELOP_PLAN_MAX_BYTES);
+        let oversized_feedback = "🐙".repeat(DEVELOP_FEEDBACK_MAX_BYTES);
+
+        let prompt = build_develop_plan_prompt(
+            &oversized_task,
+            Some("main"),
+            Some(&oversized_plan),
+            Some(&oversized_feedback),
+        );
+
+        let expected_task = truncate_bugkill_field(&oversized_task, DEVELOP_TASK_MAX_BYTES);
+        let expected_plan = truncate_bugkill_field(&oversized_plan, DEVELOP_PLAN_MAX_BYTES);
+        let expected_feedback =
+            truncate_bugkill_field(&oversized_feedback, DEVELOP_FEEDBACK_MAX_BYTES);
+
+        assert!(prompt.contains(&expected_task));
+        assert!(prompt.contains(&expected_plan));
+        assert!(prompt.contains(&expected_feedback));
+        assert!(!prompt.contains(&oversized_task));
+        assert!(!prompt.contains(&oversized_plan));
+        assert!(!prompt.contains(&oversized_feedback));
+        assert!(expected_task.is_char_boundary(expected_task.len()));
+        assert!(expected_plan.is_char_boundary(expected_plan.len()));
+        assert!(expected_feedback.is_char_boundary(expected_feedback.len()));
+        // The truncated content is at most the byte limit; the marker adds a
+        // few bytes, so the full expected string is slightly over the limit.
+        assert!(expected_task.len() <= DEVELOP_TASK_MAX_BYTES + "…[truncated]".len());
+        assert!(expected_plan.len() <= DEVELOP_PLAN_MAX_BYTES + "…[truncated]".len());
+        assert!(expected_feedback.len() <= DEVELOP_FEEDBACK_MAX_BYTES + "…[truncated]".len());
+    }
 
     // ── Review pipeline: diff split + findings parsing ─────────────────
 
@@ -14384,5 +15021,668 @@ so the intent reads clearly.
     fn pr_url_from_output_finds_last_url_line() {
         let out = "Warning: 3 uncommitted changes\nhttps://github.com/o/r/pull/9";
         assert_eq!(pr_url_from_output(out), "https://github.com/o/r/pull/9");
+    }
+
+    // ── Develop: check command + section commit ─────────────────────────
+
+    /// A config whose only non-default is the Develop check command.
+    fn develop_config(check_command: &str) -> DashboardConfig {
+        let mut config = DashboardConfig::default();
+        config.develop.check_command = check_command.to_string();
+        config
+    }
+
+    /// A committed git repo with identity set, ready for section commits.
+    fn develop_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("work");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        std::fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        (tmp, repo)
+    }
+
+    /// A temp repo with an initial commit, ready for failure-path tests.
+    fn initialized_temp_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.name", "t"]);
+        git(repo, &["config", "user.email", "t@example.com"]);
+        std::fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "seed"]);
+        tmp
+    }
+
+    fn initialized_temp_repo_with_change() -> tempfile::TempDir {
+        let tmp = initialized_temp_repo();
+        std::fs::write(tmp.path().join("seed.txt"), "changed").unwrap();
+        tmp
+    }
+
+    /// Wrap the real git binary with a script that fails on a specific command.
+    fn dashboard_with_failing_git(
+        repo: &tempfile::TempDir,
+        trigger: &str,
+        stderr: &str,
+    ) -> DashboardService {
+        let parent = repo.path().parent().expect("tempdir parent");
+        let name = repo
+            .path()
+            .file_name()
+            .expect("tempdir name")
+            .to_string_lossy();
+        let wrapper = parent.join(format!("{name}-git"));
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+             \"{trigger}\"|\"{trigger} \"*)\n\
+             if [ -n \"{stderr}\" ]; then\n\
+             printf '%s\\n' \"{stderr}\" >&2\n\
+             fi\n\
+             exit 1\n\
+             ;;\n\
+             esac\n\
+             exec git \"$@\"\n"
+        );
+        std::fs::write(&wrapper, script).expect("write wrapper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod wrapper");
+        }
+        DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default())
+            .with_git_binary(wrapper)
+    }
+
+    fn develop_dashboard_service() -> (DashboardService, tempfile::TempDir) {
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let mut config = DashboardConfig::default();
+        config.ai.develop.plan.model = " test-model ".to_string();
+        let service = DashboardService::new(worktree.path().to_path_buf(), config)
+            .with_opencode_binary(PathBuf::from("git"));
+        (service, worktree)
+    }
+
+    #[test]
+    fn prepare_develop_plan_builds_plan_agent_handoff() {
+        let (service, worktree) = develop_dashboard_service();
+
+        let handoff = service
+            .prepare_develop_plan(
+                worktree.path().to_str().unwrap(),
+                "Add dashboard filtering",
+                Some("origin/main"),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(handoff.opencode_binary, service.opencode_binary);
+        assert_eq!(handoff.cwd, worktree.path());
+        assert_eq!(
+            handoff.opencode_args[2..6],
+            ["-m", "test-model", "--agent", "plan"]
+        );
+        assert!(handoff
+            .opencode_args
+            .get(1)
+            .unwrap()
+            .contains("Add dashboard filtering"));
+        assert!(handoff
+            .opencode_args
+            .get(1)
+            .unwrap()
+            .contains("origin/main"));
+        assert!(!handoff
+            .opencode_args
+            .get(1)
+            .unwrap()
+            .contains("Your previous output could not be parsed"));
+    }
+
+    #[test]
+    fn prepare_develop_plan_appends_corrective_retry_instruction() {
+        let (service, worktree) = develop_dashboard_service();
+
+        let handoff = service
+            .prepare_develop_plan(
+                worktree.path().to_str().unwrap(),
+                "Add dashboard filtering",
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+
+        assert!(handoff.opencode_args.get(1).unwrap().ends_with(
+            "Your previous output could not be parsed. Reply with ONLY the \
+             delimited blocks, exactly as specified."
+        ));
+    }
+
+    #[test]
+    fn prepare_develop_plan_rejects_missing_model() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.plan.model = "   ".to_string();
+
+        let error = service
+            .prepare_develop_plan(
+                worktree.path().to_str().unwrap(),
+                "Add dashboard filtering",
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "ai.develop.plan model is not configured."
+        );
+    }
+
+    #[test]
+    fn prepare_develop_plan_rejects_unavailable_opencode_binary() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.opencode_binary = worktree.path().join("missing-opencode");
+
+        let error = service
+            .prepare_develop_plan(
+                worktree.path().to_str().unwrap(),
+                "Add dashboard filtering",
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
+    }
+
+    #[test]
+    fn prepare_develop_implement_builds_expected_handoff() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.implement.model = " provider/model ".to_string();
+        service.config.develop.check_command = "cargo test --all".to_string();
+
+        let handoff = service
+            .prepare_develop_implement(
+                worktree.path().to_str().unwrap(),
+                "Implement task",
+                "SECTION content",
+                "1. Section [pending]",
+                Some("previous check failure"),
+            )
+            .unwrap();
+
+        assert_eq!(handoff.opencode_binary, service.opencode_binary);
+        assert_eq!(handoff.cwd, worktree.path());
+        assert_eq!(
+            handoff.opencode_args[handoff
+                .opencode_args
+                .iter()
+                .position(|arg| arg == "-m")
+                .unwrap()
+                + 1],
+            "provider/model"
+        );
+        let prompt = &handoff.opencode_args[handoff
+            .opencode_args
+            .iter()
+            .position(|arg| arg == "--prompt")
+            .unwrap()
+            + 1];
+        assert!(prompt.contains("Implement task"));
+        assert!(prompt.contains("SECTION content"));
+        assert!(prompt.contains("1. Section [pending]"));
+        assert!(prompt.contains("previous check failure"));
+    }
+
+    #[test]
+    fn prepare_develop_implement_rejects_missing_model() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.implement.model = "   ".to_string();
+
+        let error = service
+            .prepare_develop_implement(
+                worktree.path().to_str().unwrap(),
+                "task",
+                "sections",
+                "outline",
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "ai.develop.implement model is not configured."
+        );
+    }
+
+    #[test]
+    fn prepare_develop_implement_rejects_unavailable_opencode_binary() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.implement.model = "provider/model".to_string();
+        service.opencode_binary = worktree.path().join("missing-opencode");
+
+        let error = service
+            .prepare_develop_implement(
+                worktree.path().to_str().unwrap(),
+                "task",
+                "sections",
+                "outline",
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_reports_ai_not_configured_for_blank_planning_model() {
+        let (_tmp, repo) = develop_repo();
+        let mut config = DashboardConfig::default();
+        config.ai.develop.plan.model = " \t ".to_string();
+        let service = DashboardService::new(repo.clone(), config);
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DevelopPreflightOutcome::AiNotConfigured));
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_reports_ai_not_configured_for_blank_implementation_model() {
+        let (_tmp, repo) = develop_repo();
+        let mut config = DashboardConfig::default();
+        config.ai.develop.implement.model = " \t ".to_string();
+        let service = DashboardService::new(repo.clone(), config);
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DevelopPreflightOutcome::AiNotConfigured));
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_reports_ai_unavailable_when_opencode_is_missing() {
+        let (_tmp, repo) = develop_repo();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(repo.join("missing-opencode"));
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DevelopPreflightOutcome::AiUnavailable));
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_is_ready_with_an_absent_plan() {
+        let (_tmp, repo) = develop_repo();
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let expected_base_ref = Some("origin/main".to_string());
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let DevelopPreflightOutcome::Ready(preflight) = outcome else {
+            panic!("expected Develop preflight to be ready");
+        };
+        assert!(matches!(preflight.resume, DevelopResumeState::Absent));
+        assert_eq!(preflight.base_ref, expected_base_ref);
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_is_ready_with_an_unparseable_plan() {
+        let (_tmp, repo) = develop_repo();
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(repo.join(PLAN_FILE), "# Not a development plan").unwrap();
+        git(&repo, &["add", PLAN_FILE]);
+        git(&repo, &["commit", "-q", "-m", "add malformed plan"]);
+        let expected_base_ref = Some("origin/main".to_string());
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let DevelopPreflightOutcome::Ready(preflight) = outcome else {
+            panic!("expected Develop preflight to be ready");
+        };
+        assert!(matches!(preflight.resume, DevelopResumeState::Unparseable));
+        assert_eq!(preflight.base_ref, expected_base_ref);
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_is_ready_with_a_parsed_plan() {
+        let (_tmp, repo) = develop_repo();
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let expected_plan = DevelopPlan {
+            task_description: "Add Develop preflight coverage".to_string(),
+            complexity: 3,
+            overview: None,
+            sections: vec![PlanSection {
+                number: 1,
+                name: "Preflight tests".to_string(),
+                body: "**Goal**: Cover resume states\n**Acceptance criteria**:\n- [ ] Tests pass"
+                    .to_string(),
+                done: false,
+            }],
+            notes: vec!["Planning complete".to_string()],
+        };
+        std::fs::write(repo.join(PLAN_FILE), render_plan_md(&expected_plan)).unwrap();
+        git(&repo, &["add", PLAN_FILE]);
+        git(&repo, &["commit", "-q", "-m", "add valid plan"]);
+        let expected_base_ref = Some("origin/main".to_string());
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let outcome = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let DevelopPreflightOutcome::Ready(preflight) = outcome else {
+            panic!("expected Develop preflight to be ready");
+        };
+        let DevelopResumeState::Parsed(plan) = preflight.resume else {
+            panic!("expected a parsed Develop plan");
+        };
+        assert_eq!(plan, expected_plan);
+        assert_eq!(preflight.base_ref, expected_base_ref);
+    }
+
+    #[tokio::test]
+    async fn develop_run_check_passes_and_captures_failures() {
+        let (_tmp, repo) = develop_repo();
+        let repo_str = repo.to_str().unwrap();
+
+        let ok = DashboardService::new(repo.clone(), develop_config("exit 0"));
+        assert_eq!(
+            ok.develop_run_check(repo_str).await,
+            DevelopCheckOutcome::Passed
+        );
+
+        // A failing check surfaces its combined stdout+stderr tail.
+        let bad = DashboardService::new(
+            repo.clone(),
+            develop_config("echo boom-out; echo boom-err 1>&2; exit 1"),
+        );
+        match bad.develop_run_check(repo_str).await {
+            DevelopCheckOutcome::Failed { output } => {
+                assert!(output.contains("boom-out"), "{output}");
+                assert!(output.contains("boom-err"), "{output}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn develop_run_check_reports_timeout() {
+        let (_tmp, repo) = develop_repo();
+        let service = DashboardService::new(repo.clone(), develop_config("sleep 601"));
+
+        let outcome = service.develop_run_check(repo.to_str().unwrap()).await;
+
+        assert_eq!(
+            outcome,
+            DevelopCheckOutcome::Failed {
+                output: "`sleep 601` timed out after 10 minutes.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn clip_output_tail_keeps_only_the_configured_ascii_tail() {
+        assert_eq!(clip_output_tail("0123456789", 4), "…6789");
+    }
+
+    #[test]
+    fn clip_output_tail_preserves_utf8_when_limit_splits_a_character() {
+        let output = "prefix-αβγ";
+
+        let clipped = clip_output_tail(output, 5);
+
+        assert_eq!(clipped, "…βγ");
+        assert!(clipped.strip_prefix('…').unwrap().len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_commits_everything_but_plan_md() {
+        let (_tmp, repo) = develop_repo();
+        let repo_str = repo.to_str().unwrap();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default());
+
+        // A source change plus a harness-owned PLAN.md write.
+        std::fs::write(repo.join("src.txt"), "impl").unwrap();
+        std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
+
+        let sha = service
+            .develop_commit_section(
+                repo_str,
+                &develop_commit_subject(Some((2, "Exporter"))),
+                &[],
+            )
+            .await
+            .expect("commit ok")
+            .expect("a commit was made");
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%s"]),
+            "develop: section 2 — Exporter"
+        );
+        // src.txt is committed; PLAN.md stays uncommitted (still dirty).
+        assert!(git(&repo, &["ls-files", "src.txt"]).contains("src.txt"));
+        assert!(git(&repo, &["ls-files", "PLAN.md"]).is_empty());
+        assert!(git(&repo, &["status", "--porcelain"]).contains("PLAN.md"));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_no_op_when_only_plan_changed() {
+        let (_tmp, repo) = develop_repo();
+        let repo_str = repo.to_str().unwrap();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default());
+
+        // Only the harness-owned plan file changed → nothing to checkpoint.
+        std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
+        let sha = service
+            .develop_commit_section(
+                repo_str,
+                &develop_commit_subject(Some((1, "Data model"))),
+                &[],
+            )
+            .await
+            .expect("commit ok");
+        assert_eq!(sha, None);
+        // No new commit was created.
+        assert_eq!(git(&repo, &["log", "-1", "--format=%s"]), "seed");
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_propagates_staging_failure() {
+        let repo = initialized_temp_repo_with_change();
+        let service = dashboard_with_failing_git(&repo, "add", "staging failed");
+
+        let error = service
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("staging failed"));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_propagates_status_failure() {
+        let repo = initialized_temp_repo_with_change();
+        let service = dashboard_with_failing_git(&repo, "status", "status failed");
+
+        let error = service
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("status failed"));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_uses_fallback_for_empty_commit_error() {
+        let repo = initialized_temp_repo_with_change();
+        let service = dashboard_with_failing_git(&repo, "commit", "");
+
+        let error = service
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "git commit failed after staging the section."
+        );
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_propagates_head_resolution_failure() {
+        let repo = initialized_temp_repo_with_change();
+        let service = dashboard_with_failing_git(&repo, "rev-parse HEAD", "HEAD resolution failed");
+
+        let error = service
+            .develop_commit_section(repo.path().to_str().unwrap(), "Develop: section", &[])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("HEAD resolution failed"));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_section_excludes_preexisting_paths() {
+        let (_tmp, repo) = develop_repo();
+        let repo_str = repo.to_str().unwrap();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default());
+
+        // A pre-existing dirty file and a new file created by this section.
+        std::fs::write(repo.join("preexisting.txt"), "pre-existing").unwrap();
+        std::fs::write(repo.join("section.txt"), "section work").unwrap();
+
+        let sha = service
+            .develop_commit_section(
+                repo_str,
+                &develop_commit_subject(Some((2, "Exporter"))),
+                &["preexisting.txt".to_string()],
+            )
+            .await
+            .expect("commit ok")
+            .expect("a commit was made");
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%s"]),
+            "develop: section 2 — Exporter"
+        );
+        // The section's file is committed; the pre-existing file is not.
+        assert!(git(&repo, &["ls-files", "section.txt"]).contains("section.txt"));
+        assert!(git(&repo, &["ls-files", "preexisting.txt"]).is_empty());
+        assert!(git(&repo, &["status", "--porcelain"]).contains("preexisting.txt"));
+    }
+
+    #[test]
+    fn develop_commit_subject_obeys_name_boundaries() {
+        let sixty = "a".repeat(60);
+        assert_eq!(
+            develop_commit_subject(Some((2, &sixty))),
+            format!("develop: section 2 — {sixty}")
+        );
+
+        let sixty_one = "a".repeat(61);
+        assert_eq!(
+            develop_commit_subject(Some((2, &sixty_one))),
+            format!("develop: section 2 — {}…", "a".repeat(60))
+        );
+
+        let unicode = "界".repeat(61);
+        assert_eq!(
+            develop_commit_subject(Some((3, &unicode))),
+            format!("develop: section 3 — {}…", "界".repeat(60))
+        );
+
+        assert_eq!(
+            develop_commit_subject(Some((4, "  First line  \nSecond line"))),
+            "develop: section 4 — First line"
+        );
+        assert_eq!(
+            develop_commit_subject(Some((5, ""))),
+            "develop: section 5 — "
+        );
+    }
+
+    #[test]
+    fn implement_prompt_templates_check_command_and_failure() {
+        let with_check = build_develop_implement_prompt(
+            "task",
+            "### Section 1 — A",
+            "1. A — THIS RUN",
+            "cargo test --all",
+            Some("assertion failed: left == right"),
+        );
+        assert!(with_check.contains("cargo test --all"), "{with_check}");
+        assert!(
+            with_check.contains("assertion failed: left == right"),
+            "{with_check}"
+        );
+
+        // No check configured → a clear placeholder, no empty CHECK_COMMAND.
+        let no_check = build_develop_implement_prompt("task", "s", "o", "", None);
+        assert!(
+            no_check.contains("no automated check configured"),
+            "{no_check}"
+        );
+        assert!(!no_check.contains("CHECK_COMMAND"), "{no_check}");
+        assert!(!no_check.contains("CHECK_FAILURE"), "{no_check}");
+    }
+
+    #[test]
+    fn renders_implementation_context_and_operational_constraints() {
+        let prompt = build_develop_implement_prompt(
+            "Implement task",
+            "Section 2 acceptance criteria",
+            "Section 1: done\nSection 2: THIS RUN\nSection 3: later",
+            "cargo test --all",
+            Some("previous check failure"),
+        );
+
+        assert!(prompt.contains("Implement task"));
+        assert!(prompt.contains("Section 1: done\nSection 2: THIS RUN\nSection 3: later"));
+        assert!(prompt.contains("Section 2 acceptance criteria"));
+        assert!(prompt.contains("cargo test --all"));
+        assert!(prompt.contains("previous check failure"));
+        assert!(prompt.contains("Write or update tests for the behavior each section introduces"));
+        assert!(prompt.contains("Anything marked `later` in the outline belongs to a future run"));
+        assert!(prompt.contains("Do NOT run `git add`"));
+        assert!(prompt.contains("do NOT run any `gh` command"));
+        assert!(prompt.contains("Do NOT create, read, or modify `PLAN.md`"));
+        assert!(prompt.contains(
+            "Stop and state in one short line what you implemented and whether the tests pass."
+        ));
     }
 }

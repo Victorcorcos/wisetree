@@ -36,16 +36,17 @@ use crate::services::presets::WisePresetDiscovery;
 use crate::services::{
     build_review_summary, build_review_summary_with_overview, check_for_updates_all_sources,
     compute_attempt_changes, default_dashboard_warning, detect_shell_integration,
-    fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
-    install_shell_integration, parse_pull_request_md, resolve_dashboard_columns, AiStatus,
-    AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
-    BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
-    DashboardService, DashboardUpdate, DashboardWatch, ExplainPreparation, ExplainSubmitOutcome,
-    ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    JudgeResult, MultiSourceUpdateResult, OpencodeModel, OpencodeTurn, OpencodeTurnWatcher,
-    PrState, ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
-    ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdateSource,
+    develop_commit_subject, fetch_free_opencode_models, fetch_opencode_model_variants,
+    fetch_opencode_models, install_shell_integration, parse_plan_transcript, parse_pull_request_md,
+    resolve_dashboard_columns, summarize_transcript, AiStatus, AttemptChanges, BugHypothesis,
+    BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus,
+    CommentGroup, DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate,
+    DashboardWatch, DevelopCheckOutcome, DevelopPreflightOutcome, DevelopResumeState,
+    ExplainPreparation, ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff,
+    FixCommitOutcome, FixPlan, FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult,
+    OpencodeModel, OpencodeTurn, OpencodeTurnWatcher, PrState, ReviewContext, ReviewFile,
+    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification,
+    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -56,12 +57,13 @@ use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BugkillRequest, BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
-    ExplainPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
+    DevelopRequest, ExplainPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
     ReviewPullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
 };
+use crate::tui::screens::develop_pr::{DevelopAction, DevelopPullRequestScreen, DevelopStep};
 use crate::tui::screens::explain_pr::{ExplainAction, ExplainPullRequestScreen, ExplainStep};
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome, FixStep};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
@@ -273,6 +275,52 @@ enum AppEvent {
     BugkillRolledBack(Result<(), String>),
     /// Rewriting `BUG_INVESTIGATION.md` failed (best-effort warning).
     BugkillFileWriteFailed(String),
+    /// "Develop": deterministic preflight finished (gates, base ref, resume
+    /// detection).
+    DevelopPrepared {
+        operation_id: u64,
+        generation: u64,
+        result: Result<Box<DevelopPreflightOutcome>, String>,
+    },
+    /// Spawn params for one live planning run are ready (or a gate failed).
+    /// `corrective` marks the single retry after a parse failure.
+    DevelopPlanReady {
+        operation_id: u64,
+        generation: u64,
+        corrective: bool,
+        result: Result<Box<FixApplyHandoff>, String>,
+    },
+    /// Spawn params for one live implement run are ready. `section` is the
+    /// Ralph Loop target (`None` = one run for every pending section).
+    /// `preexisting_paths` is the baseline of dirty files captured before the
+    /// run so a later section commit can exclude them.
+    DevelopImplementReady {
+        operation_id: u64,
+        generation: u64,
+        section: Option<usize>,
+        preexisting_paths: Vec<String>,
+        result: Result<Box<FixApplyHandoff>, String>,
+    },
+    /// Rewriting `PLAN.md` finished (best-effort warning on failure).
+    DevelopFileRewritten {
+        operation_id: u64,
+        generation: u64,
+        revision: u64,
+        result: Result<(), String>,
+    },
+    /// The post-section check command finished (Ralph-canon backpressure).
+    DevelopChecked {
+        operation_id: u64,
+        generation: u64,
+        outcome: DevelopCheckOutcome,
+    },
+    /// A section checkpoint commit finished. `Ok(Some(sha))` when a commit
+    /// landed, `Ok(None)` when there was nothing to commit.
+    DevelopCommitted {
+        operation_id: u64,
+        generation: u64,
+        result: Result<Option<String>, String>,
+    },
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
@@ -330,6 +378,14 @@ struct UpdatePrSuccess {
 struct UpdatePrFailure {
     number: u64,
     message: String,
+}
+
+struct DevelopFileWrite {
+    operation_id: u64,
+    generation: u64,
+    revision: u64,
+    path: PathBuf,
+    content: String,
 }
 
 #[derive(Debug, Default)]
@@ -445,10 +501,22 @@ pub struct App {
     fix_pr: Option<FixPullRequestScreen>,
     review_pr: Option<ReviewPullRequestScreen>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
+    develop_pr: Option<DevelopPullRequestScreen>,
+    next_develop_operation_id: u64,
+    active_develop_operation_id: Option<u64>,
+    next_develop_generation: u64,
+    active_develop_generation: Option<u64>,
+    next_develop_file_revision: u64,
+    develop_write_in_flight: bool,
+    pending_develop_write: Option<DevelopFileWrite>,
     /// Watches opencode's database for the embedded investigation TUI's
     /// turn to complete — the TUI never exits on its own, so this is what
     /// advances the `Investigating` step. `Some` only while investigating.
     bugkill_investigation: Option<OpencodeTurnWatcher>,
+    /// Same idea for the Develop screen's Planning + Implementing TUIs —
+    /// advances the plan into review, and (on a Ralph Loop) closes one
+    /// section's run and opens the next. `Some` only while one is live.
+    develop_watch: Option<OpencodeTurnWatcher>,
     /// Same idea for the Explain screen's drafting TUI — advances straight
     /// to Review once opencode finishes writing `pull_request.md`. `Some`
     /// only while the `Explaining` step is active.
@@ -600,7 +668,16 @@ impl App {
             fix_pr: None,
             review_pr: None,
             bugkill_pr: None,
+            develop_pr: None,
+            next_develop_operation_id: 0,
+            active_develop_operation_id: None,
+            next_develop_generation: 0,
+            active_develop_generation: None,
+            next_develop_file_revision: 0,
+            develop_write_in_flight: false,
+            pending_develop_write: None,
             bugkill_investigation: None,
+            develop_watch: None,
             explain_draft: None,
             fix_apply_watch: None,
             update_conflict: None,
@@ -769,18 +846,16 @@ impl App {
                             self.explain_draft = None;
                         }
                     }
-                    // Same for the Fix PR apply PTY — a child exit means
-                    // opencode finished editing, so commit + reply now (manual
-                    // and autonomous alike). In Autonomous mode a finished
-                    // opencode turn (detected via the database) also commits
-                    // the fix, so wisetree advances without the user pressing
-                    // Enter — exactly how Explain auto-advances on its turn.
+                    // Same for the Fix PR apply PTY. In autonomous mode a
+                    // finished opencode turn (detected via the database) or a
+                    // PTY exit commits the fix automatically; in manual mode
+                    // the user finalizes with Enter, so PTY exit is ignored.
                     let fix_status = self
                         .fix_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()));
                     match fix_status {
-                        Some((true, _, _)) => {
+                        Some((true, FixStep::Applying, true)) => {
                             self.fix_apply_watch = None;
                             self.on_fix_apply_done(&tx);
                         }
@@ -823,6 +898,55 @@ impl App {
                         }
                         _ => {}
                     }
+                    // Same for the Develop TUIs. Both live steps are watched
+                    // through opencode's database: a completed Planning turn
+                    // carries the plan transcript; a completed Implementing
+                    // turn marks the section(s) ✅ and (on a Ralph Loop)
+                    // opens the next run. An early PTY exit falls back to the
+                    // same handlers, but only when the child exited with status
+                    // 0 — a crashed or force-quit opencode session is treated
+                    // as a failure rather than a successful completion.
+                    let develop_exited = self
+                        .develop_pr
+                        .as_mut()
+                        .map(|screen| (screen.tick_pty(None), screen.step()));
+                    match develop_exited {
+                        Some((Some(0), DevelopStep::Planning)) => {
+                            self.on_develop_plan_pty_exited(&tx)
+                        }
+                        Some((Some(0), DevelopStep::Implementing)) => {
+                            self.on_develop_implement_pty_exited(&tx)
+                        }
+                        Some((Some(_), DevelopStep::Planning)) => {
+                            self.develop_watch = None;
+                            if let Some(screen) = self.develop_pr.as_mut() {
+                                screen.kill_pty();
+                                screen.set_error(
+                                    "opencode exited before the plan was finished.".to_string(),
+                                );
+                            }
+                        }
+                        Some((Some(_), DevelopStep::Implementing)) => {
+                            self.develop_watch = None;
+                            if let Some(screen) = self.develop_pr.as_mut() {
+                                screen.kill_pty();
+                                screen.set_error(
+                                    "opencode exited before the implementation finished."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Some((None, DevelopStep::Planning | DevelopStep::Implementing)) => {
+                            if let Some(turn) = self
+                                .develop_watch
+                                .as_mut()
+                                .and_then(OpencodeTurnWatcher::poll)
+                            {
+                                self.on_develop_turn(turn, &tx);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Event::Resize(width, height) => {
                     // `Viewport::Fixed` (see `terminal::app_viewport`) does
@@ -850,6 +974,7 @@ impl App {
         self.explain_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.update_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.bugkill_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.develop_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.fix_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
@@ -1179,6 +1304,29 @@ impl App {
                     bugkill_pr.render(frame, panel);
                 }
             }
+            Screen::DevelopPullRequest => {
+                // Expanded steps (Confirm, DescribeTask, PlanReview, the
+                // live Planning/Implementing PTYs, Done…) want the whole
+                // bottom region; the compact Working / ResumePrompt steps
+                // stay sized.
+                let expand = self
+                    .develop_pr
+                    .as_ref()
+                    .is_some_and(|s| s.wants_full_panel());
+                let panel = if expand {
+                    self.render_framed_panel_fill(frame, area)
+                } else {
+                    let h = self
+                        .develop_pr
+                        .as_ref()
+                        .map_or(8, |s| s.preferred_content_height());
+                    self.render_framed_panel(frame, area, h)
+                };
+                if let Some(develop_pr) = self.develop_pr.as_mut() {
+                    develop_pr.tick = self.tick;
+                    develop_pr.render(frame, panel);
+                }
+            }
             Screen::UpdateBranch => {
                 let h = self
                     .update_branch
@@ -1300,6 +1448,17 @@ impl App {
             self.apply_bugkill_action(action, tx);
             return;
         }
+        // Develop consumes pastes atomically too (multi-line task
+        // descriptions and plan feedback).
+        if matches!(self.screen, Screen::DevelopPullRequest) {
+            let action = self
+                .develop_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(DevelopAction::Continue);
+            self.apply_develop_action(action, tx);
+            return;
+        }
         for ch in text.chars() {
             if ch.is_control() {
                 continue;
@@ -1358,6 +1517,14 @@ impl App {
                     };
                 }
             }
+            Screen::DevelopPullRequest => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
             _ => {}
         }
     }
@@ -1382,6 +1549,10 @@ impl App {
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             Screen::BugkillPullRequest => self
                 .bugkill_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            Screen::DevelopPullRequest => self
+                .develop_pr
                 .as_mut()
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             _ => false,
@@ -1514,6 +1685,7 @@ impl App {
             Screen::FixPullRequest => self.handle_fix_pr_key(key, tx),
             Screen::ReviewPullRequest => self.handle_review_pr_key(key, tx),
             Screen::BugkillPullRequest => self.handle_bugkill_key(key, tx),
+            Screen::DevelopPullRequest => self.handle_develop_key(key, tx),
             Screen::UpdateBranch => {
                 if let Some(screen) = self.update_branch.as_mut() {
                     screen.handle_key(key);
@@ -1930,6 +2102,14 @@ impl App {
                     .map(|screen| screen.handle_mouse_click(position))
                     .unwrap_or(BugkillAction::Continue);
                 self.apply_bugkill_action(action, tx);
+            }
+            Screen::DevelopPullRequest => {
+                let action = self
+                    .develop_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(DevelopAction::Continue);
+                self.apply_develop_action(action, tx);
             }
             Screen::UpdateBranch => {}
             Screen::AiModelPicker => {
@@ -3853,6 +4033,758 @@ impl App {
         }
     }
 
+    // ── "Develop" orchestration ─────────────────────────────────────────
+
+    fn start_develop_flow(
+        &mut self,
+        request: DevelopRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        // Lands on the Confirm step immediately; the preflight only runs
+        // once the user has confirmed.
+        let config = self.current_dashboard_config();
+        let ai = config.ai.develop.clone();
+        let check_command = config.develop.check_command.trim().to_string();
+        let mut screen = DevelopPullRequestScreen::new(request, ai);
+        screen.set_check_command((!check_command.is_empty()).then_some(check_command));
+        self.active_develop_operation_id = Some(self.next_develop_operation_id());
+        // Generation 0 is reserved for the pre-flight phase; the first async
+        // kickoff will bump it to 1.
+        self.active_develop_generation = Some(0);
+        self.develop_pr = Some(screen);
+        self.develop_watch = None;
+        self.screen = Screen::DevelopPullRequest;
+    }
+
+    fn next_develop_operation_id(&mut self) -> u64 {
+        self.next_develop_operation_id = self.next_develop_operation_id.wrapping_add(1);
+        self.next_develop_operation_id
+    }
+
+    fn active_develop_operation_id(&self) -> Option<u64> {
+        self.develop_pr
+            .as_ref()
+            .and(self.active_develop_operation_id)
+    }
+
+    fn next_develop_file_revision(&mut self) -> u64 {
+        self.next_develop_file_revision = self.next_develop_file_revision.wrapping_add(1);
+        self.next_develop_file_revision
+    }
+
+    fn is_active_develop_operation(&self, operation_id: u64) -> bool {
+        self.active_develop_operation_id() == Some(operation_id)
+    }
+
+    fn next_develop_generation(&mut self) -> u64 {
+        self.next_develop_generation = self.next_develop_generation.wrapping_add(1);
+        self.active_develop_generation = Some(self.next_develop_generation);
+        self.next_develop_generation
+    }
+
+    fn is_current_develop_generation(&self, generation: u64) -> bool {
+        self.active_develop_generation == Some(generation)
+    }
+
+    fn handle_develop_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = match self.develop_pr.as_mut() {
+            Some(screen) => screen.handle_key(key),
+            None => return,
+        };
+        self.apply_develop_action(action, tx);
+    }
+
+    /// Single handler for `DevelopAction`s from keyboard or mouse. Drives
+    /// the screen transitions and kicks off each async stage; the approval
+    /// loop, progress tracking, and every file write stay in Rust.
+    fn apply_develop_action(
+        &mut self,
+        action: DevelopAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match action {
+            DevelopAction::Continue => {}
+            DevelopAction::Cancelled => {
+                let worktree_path = self
+                    .develop_pr
+                    .take()
+                    .map(|s| s.request().worktree_path.clone());
+                self.active_develop_operation_id = None;
+                self.active_develop_generation = None;
+                self.develop_watch = None;
+                self.back_to_dashboard_action_menu(worktree_path, tx);
+            }
+            DevelopAction::Confirmed => {
+                let Some(operation_id) = self.active_develop_operation_id else {
+                    return;
+                };
+                let generation = self.next_develop_generation();
+                let Some(screen) = self.develop_pr.as_mut() else {
+                    return;
+                };
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_working("Preparing...");
+                kick_off_develop_preflight(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    operation_id,
+                    generation,
+                    tx.clone(),
+                );
+            }
+            DevelopAction::TaskSubmitted(description) => {
+                let Some(screen) = self.develop_pr.as_mut() else {
+                    return;
+                };
+                screen.set_task_description(description);
+                self.start_develop_planning(false, tx);
+            }
+            DevelopAction::Resume => {
+                let Some(screen) = self.develop_pr.as_mut() else {
+                    return;
+                };
+                // Adopt the parsed plan and go straight to implementing the
+                // pending sections — the plan was already approved when it
+                // was first written.
+                screen.apply_resume();
+                self.start_develop_implement_run(tx);
+            }
+            DevelopAction::StartFresh => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.show_describe();
+                }
+            }
+            DevelopAction::ForcePlanDone => self.force_develop_plan_done(tx),
+            DevelopAction::PlanApproved => self.start_develop_implement_run(tx),
+            DevelopAction::PlanRejected(_) => {
+                // The screen already stashed the rejected plan + feedback in
+                // `revision()` — replan with that context.
+                self.start_develop_planning(false, tx);
+            }
+            DevelopAction::CopyToClipboard(text) => {
+                kick_off_clipboard_copy(text, "Copied to clipboard".to_string(), tx.clone());
+            }
+            DevelopAction::ImplementFinished => {
+                // The user confirmed from the PTY; pull the transcript from
+                // the watcher so the run's summary is still recorded.
+                let transcript = self
+                    .develop_watch
+                    .as_mut()
+                    .and_then(OpencodeTurnWatcher::transcript_now)
+                    .unwrap_or_default();
+                self.on_develop_implement_done(transcript, tx);
+            }
+            DevelopAction::CheckFixWithAi => self.start_develop_implement_run(tx),
+            DevelopAction::CheckMarkDone => self.finalize_develop_section(tx),
+            DevelopAction::Done => {
+                self.develop_pr = None;
+                self.active_develop_operation_id = None;
+                self.active_develop_generation = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
+            DevelopAction::WritePty(bytes) => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.send_pty_input(&bytes);
+                }
+            }
+        }
+    }
+
+    /// Kick off one live planning run: build the opencode TUI spawn params,
+    /// then show it in the embedded PTY. On a revision the screen carries
+    /// the rejected plan + feedback; `corrective` is only set on the
+    /// automatic retry after an unparseable transcript. Each new run bumps
+    /// the flow generation so stale async results from earlier cycles are
+    /// ignored.
+    fn start_develop_planning(&mut self, corrective: bool, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.develop_watch = None;
+        let Some(operation_id) = self.active_develop_operation_id else {
+            return;
+        };
+        let (worktree_path, description, base_ref, revision) = {
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
+            (
+                screen.request().worktree_path.clone(),
+                screen.task_description().to_string(),
+                screen.base_ref().map(str::to_string),
+                screen.revision(),
+            )
+        };
+        let generation = self.next_develop_generation();
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        screen.start_working("Preparing the plan...");
+        kick_off_develop_prepare_plan(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            DevelopPreparePlanRequest {
+                worktree_path,
+                task_description: description,
+                base_ref,
+                revision,
+                corrective,
+            },
+            operation_id,
+            generation,
+            tx.clone(),
+        );
+    }
+
+    /// Kick off the next implement run: one section on a Ralph Loop, or
+    /// every pending section in a single run. With nothing pending, the
+    /// pipeline is already complete. Each new run bumps the flow generation
+    /// so stale async results from earlier cycles are ignored.
+    fn start_develop_implement_run(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.develop_watch = None;
+        let Some(operation_id) = self.active_develop_operation_id else {
+            return;
+        };
+        let (_next, section, sections_block, outline, check_failure, worktree_path, description) = {
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
+            let Some(next) = screen.next_pending() else {
+                screen.enter_done();
+                return;
+            };
+            let section = screen.ralph().then_some(next);
+            (
+                next,
+                section,
+                screen.sections_for_run(section),
+                screen.outline_for_run(section),
+                screen.check_failure(),
+                screen.request().worktree_path.clone(),
+                screen.task_description().to_string(),
+            )
+        };
+        let generation = self.next_develop_generation();
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        screen.start_working("Preparing the implementation...");
+        kick_off_develop_prepare_implement(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            DevelopPrepareImplementRequest {
+                worktree_path,
+                task_description: description,
+                sections: sections_block,
+                outline,
+                section,
+                check_failure,
+            },
+            operation_id,
+            generation,
+            tx.clone(),
+        );
+    }
+
+    /// The turn watcher fired (or a PTY exit fell back here) — dispatch on
+    /// the live step.
+    fn on_develop_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let step = self.develop_pr.as_ref().map(|s| s.step());
+        match (step, turn) {
+            (_, OpencodeTurn::Working) => {}
+            (Some(DevelopStep::Planning), OpencodeTurn::Finished { transcript }) => {
+                self.finish_develop_plan(transcript, tx)
+            }
+            // The implement transcript's closing line becomes the section
+            // note (Ralph-canon learnings ledger) — capture it here.
+            (Some(DevelopStep::Implementing), OpencodeTurn::Finished { transcript }) => {
+                self.on_develop_implement_done(transcript, tx)
+            }
+            (_, OpencodeTurn::Failed { message }) => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(format!("opencode reported an error: {message}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The plan transcript is in: tear the TUI down and parse the sections.
+    /// An unparseable transcript earns one corrective retry (stricter
+    /// prompt); a second failure surfaces the tail.
+    fn finish_develop_plan(&mut self, transcript: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.develop_watch = None;
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        let corrective = screen.plan_corrective();
+        screen.kill_pty();
+        match parse_plan_transcript(&transcript) {
+            Some(plan) => {
+                screen.set_plan(plan);
+                self.rewrite_develop_file(tx);
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.enter_plan_review();
+                }
+            }
+            None if !corrective => self.start_develop_planning(true, tx),
+            None => screen.set_error(format!(
+                "could not parse the plan from the planning output. Raw tail:\n{}",
+                crate::services::transcript_tail(&transcript)
+            )),
+        }
+    }
+
+    /// The planning TUI exited before the watcher saw a completed turn (the
+    /// user quit opencode, or it crashed). Check the database once —
+    /// otherwise error.
+    fn on_develop_plan_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = self
+            .develop_watch
+            .as_mut()
+            .map(OpencodeTurnWatcher::check_now)
+            .unwrap_or(OpencodeTurn::Working);
+        match turn {
+            OpencodeTurn::Working => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error("opencode exited before the plan was finished.".to_string());
+                }
+            }
+            turn => self.on_develop_turn(turn, tx),
+        }
+    }
+
+    /// The implementation TUI exited before the watcher saw a completed turn
+    /// (the user quit opencode, or it crashed). Check the database once —
+    /// otherwise error.
+    fn on_develop_implement_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = self
+            .develop_watch
+            .as_mut()
+            .map(OpencodeTurnWatcher::check_now)
+            .unwrap_or(OpencodeTurn::Working);
+        match turn {
+            OpencodeTurn::Working => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(
+                        "opencode exited before the implementation finished.".to_string(),
+                    );
+                }
+            }
+            turn => self.on_develop_turn(turn, tx),
+        }
+    }
+
+    /// Enter → "Continue now" confirmed during Planning: re-check once; if
+    /// the turn still looks unfinished, try whatever transcript exists — if
+    /// the contract parser accepts it the detection was simply blind,
+    /// otherwise keep waiting and say so.
+    fn force_develop_plan_done(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(watcher) = self.develop_watch.as_mut() else {
+            return;
+        };
+        match watcher.check_now() {
+            OpencodeTurn::Working => {
+                let transcript = watcher.transcript_now().unwrap_or_default();
+                if parse_plan_transcript(&transcript).is_some() {
+                    self.finish_develop_plan(transcript, tx);
+                } else if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.note_planning_waiting();
+                }
+            }
+            turn => self.on_develop_turn(turn, tx),
+        }
+    }
+
+    #[cfg(test)]
+    fn on_develop_plan_pty_exit_with_turn(
+        &mut self,
+        transcript: String,
+        turn: Result<OpencodeTurn, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match turn {
+            Ok(OpencodeTurn::Working) if parse_plan_transcript(&transcript).is_some() => {
+                self.finish_develop_plan(transcript, tx)
+            }
+            Ok(OpencodeTurn::Working) => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.note_planning_waiting();
+                }
+            }
+            Ok(turn) => self.on_develop_turn(turn, tx),
+            Err(message) => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(format!("opencode reported an error: {message}"));
+                }
+            }
+        }
+    }
+
+    /// One implement run finished (turn completed, opencode exited, or the
+    /// user confirmed). Capture the run's closing summary for the notes
+    /// ledger, then either run the configured check (Ralph-canon
+    /// backpressure) or finalize the section directly when no check is set.
+    fn on_develop_implement_done(
+        &mut self,
+        transcript: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.develop_watch = None;
+        let Some(operation_id) = self.active_develop_operation_id else {
+            return;
+        };
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        screen.kill_pty();
+        screen.record_run_summary(summarize_transcript(&transcript));
+        if screen.has_check() {
+            let worktree_path = screen.request().worktree_path.clone();
+            let generation = self.next_develop_generation();
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
+            screen.start_verifying();
+            kick_off_develop_check(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                worktree_path,
+                operation_id,
+                generation,
+                tx.clone(),
+            );
+        } else {
+            self.finalize_develop_section(tx);
+        }
+    }
+
+    /// The check finished: pass on failure (CheckFailed prompt) or finalize
+    /// the section on success. A result arriving after the user already
+    /// paused (screen gone, no longer Verifying, or from an older generation)
+    /// is ignored.
+    fn apply_develop_checked(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        outcome: DevelopCheckOutcome,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
+            return;
+        }
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        if screen.step() != DevelopStep::Verifying {
+            return;
+        }
+        match outcome {
+            DevelopCheckOutcome::Passed => self.finalize_develop_section(tx),
+            DevelopCheckOutcome::Failed { output } => screen.show_check_failed(output),
+        }
+    }
+
+    /// Accept the current section (check passed or the user overrode it):
+    /// push its note + mark it ✅, rewrite `PLAN.md`, then commit the
+    /// checkpoint (if the toggle is on) or advance straight to the next run.
+    fn finalize_develop_section(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(operation_id) = self.active_develop_operation_id else {
+            return;
+        };
+        let (commit, target, preexisting_paths, worktree_path) = {
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
+            (
+                screen.commit_sections(),
+                screen.finish_section(),
+                screen.preexisting_paths().to_vec(),
+                screen.request().worktree_path.clone(),
+            )
+        };
+        self.rewrite_develop_file(tx);
+        if commit {
+            let generation = self.next_develop_generation();
+            let subject =
+                develop_commit_subject(target.as_ref().map(|(n, name)| (*n, name.as_str())));
+            let Some(screen) = self.develop_pr.as_mut() else {
+                return;
+            };
+            screen.start_working("Committing the section...");
+            kick_off_develop_commit(
+                self.git_root.clone(),
+                self.current_dashboard_config(),
+                worktree_path,
+                subject,
+                preexisting_paths,
+                operation_id,
+                generation,
+                tx.clone(),
+            );
+        } else {
+            self.start_develop_implement_run(tx);
+        }
+    }
+
+    #[cfg(test)]
+    fn on_develop_section_commit_result(
+        &mut self,
+        result: Result<Option<String>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(operation_id) = self.active_develop_operation_id else {
+            return;
+        };
+        let generation = self.active_develop_generation.unwrap_or(0);
+        self.apply_develop_committed(operation_id, generation, result, tx);
+    }
+
+    /// A section commit finished: count it (Done-page summary) and advance
+    /// to the next run. A commit failure is a non-fatal toast — the section
+    /// is already marked done and its edits remain in the worktree. Stale
+    /// results from an earlier generation are ignored.
+    fn apply_develop_committed(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        result: Result<Option<String>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
+            return;
+        }
+        match result {
+            Ok(Some(_sha)) => {
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.record_commit();
+                }
+            }
+            Ok(None) => {}
+            Err(message) => self.show_toast(
+                ToastVariant::Warning,
+                format!("Section commit failed: {}", truncate_error(&message)),
+            ),
+        }
+        self.start_develop_implement_run(tx);
+    }
+
+    /// Surface a terminal preflight failure as a toast and return to the
+    /// dashboard, dropping the Develop screen.
+    fn fail_develop(
+        &mut self,
+        variant: ToastVariant,
+        message: impl Into<String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.show_toast(variant, message.into());
+        self.develop_pr = None;
+        self.active_develop_operation_id = None;
+        self.active_develop_generation = None;
+        self.enter_screen(Screen::Dashboard, tx);
+    }
+
+    /// Re-render `PLAN.md` from the in-memory model and write it to the
+    /// worktree root (called after every mutation — the AI never touches
+    /// the file).
+    fn rewrite_develop_file(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let (content, path) = {
+            let Some(screen) = self.develop_pr.as_ref() else {
+                return;
+            };
+            let Some(content) = screen.render_plan() else {
+                return;
+            };
+            let path = PathBuf::from(&screen.request().worktree_path)
+                .join(crate::services::develop::PLAN_FILE);
+            (content, path)
+        };
+        let Some(operation_id) = self.active_develop_operation_id() else {
+            return;
+        };
+        let Some(generation) = self.active_develop_generation else {
+            return;
+        };
+        let write = DevelopFileWrite {
+            operation_id,
+            generation,
+            revision: self.next_develop_file_revision(),
+            path,
+            content,
+        };
+        if self.develop_write_in_flight {
+            // Keep only the newest snapshot while the current write finishes.
+            self.pending_develop_write = Some(write);
+            return;
+        }
+
+        self.start_develop_file_write(write, tx);
+    }
+
+    fn start_develop_file_write(
+        &mut self,
+        write: DevelopFileWrite,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.develop_write_in_flight = true;
+        kick_off_develop_file_write(write, tx.clone());
+    }
+
+    fn apply_develop_file_rewritten(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        revision: u64,
+        result: Result<(), String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.develop_write_in_flight = false;
+
+        if self.is_current_develop_revision(operation_id, generation, revision) {
+            if let Err(error) = result {
+                self.show_toast(
+                    ToastVariant::Warning,
+                    format!("Could not write PLAN.md: {}", truncate_error(&error)),
+                );
+            }
+        }
+
+        if let Some(write) = self.pending_develop_write.take() {
+            self.start_develop_file_write(write, tx);
+        }
+    }
+
+    fn is_current_develop_revision(
+        &self,
+        operation_id: u64,
+        generation: u64,
+        revision: u64,
+    ) -> bool {
+        self.is_active_develop_operation(operation_id)
+            && self.is_current_develop_generation(generation)
+            && self.next_develop_file_revision == revision
+    }
+
+    fn apply_develop_prepared(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        result: Result<Box<DevelopPreflightOutcome>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
+            return;
+        }
+        match result {
+            Err(message) => self.fail_develop(
+                ToastVariant::Error,
+                format!("Develop preparation failed: {}", truncate_error(&message)),
+                tx,
+            ),
+            Ok(outcome) => match *outcome {
+                DevelopPreflightOutcome::AiNotConfigured => self.fail_develop(
+                    ToastVariant::Warning,
+                    "ai.develop.plan model is not configured.",
+                    tx,
+                ),
+                DevelopPreflightOutcome::AiUnavailable => self.fail_develop(
+                    ToastVariant::Error,
+                    "`opencode` CLI is not on PATH — install it from https://opencode.ai then \
+                     retry.",
+                    tx,
+                ),
+                DevelopPreflightOutcome::Ready(preflight) => {
+                    let Some(screen) = self.develop_pr.as_mut() else {
+                        return;
+                    };
+                    screen.set_base_ref(preflight.base_ref);
+                    match preflight.resume {
+                        DevelopResumeState::Absent => screen.show_describe(),
+                        DevelopResumeState::Unparseable => screen.show_overwrite_prompt(),
+                        DevelopResumeState::Parsed(plan) => screen.show_resume_prompt(plan),
+                    }
+                }
+            },
+        }
+    }
+
+    /// Spawn params ready → show the AI Activity panel and launch the
+    /// opencode TUI. The watcher is created **before** the spawn so its
+    /// start timestamp precedes the session row the TUI creates.
+    fn apply_develop_plan_ready(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        corrective: bool,
+        result: Result<Box<FixApplyHandoff>, String>,
+    ) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
+            return;
+        }
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(handoff) => {
+                self.develop_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                screen.start_planning(corrective);
+                screen.spawn_opencode_pty(
+                    handoff.opencode_binary,
+                    handoff.opencode_args,
+                    handoff.cwd,
+                    Vec::new(),
+                );
+            }
+            Err(message) => screen.set_error(message),
+        }
+    }
+
+    fn apply_develop_implement_ready(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        section: Option<usize>,
+        preexisting_paths: Vec<String>,
+        result: Result<Box<FixApplyHandoff>, String>,
+    ) {
+        if !self.is_active_develop_operation(operation_id)
+            || !self.is_current_develop_generation(generation)
+        {
+            return;
+        }
+        let Some(screen) = self.develop_pr.as_mut() else {
+            return;
+        };
+        screen.set_preexisting_paths(preexisting_paths);
+        match result {
+            Ok(handoff) => {
+                self.develop_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                screen.begin_implement_run(section);
+                screen.spawn_opencode_pty(
+                    handoff.opencode_binary,
+                    handoff.opencode_args,
+                    handoff.cwd,
+                    Vec::new(),
+                );
+            }
+            Err(message) => screen.set_error(message),
+        }
+    }
+
     /// Surface a terminal failure and return to the dashboard, dropping the
     /// fix screen. Shared by every non-recoverable prepare-stage outcome.
     fn fail_fix(
@@ -4250,6 +5182,9 @@ impl App {
             }
             DashboardAction::Bugkill(request) => {
                 self.start_bugkill_flow(*request, tx);
+            }
+            DashboardAction::Develop(request) => {
+                self.start_develop_flow(*request, tx);
             }
             DashboardAction::PushPullRequest(request) => {
                 self.start_push_pr_flow(*request, tx);
@@ -5446,6 +6381,46 @@ impl App {
                 self.apply_bugkill_judged(user_text, result, tx)
             }
             AppEvent::BugkillRolledBack(result) => self.apply_bugkill_rolled_back(result, tx),
+            AppEvent::DevelopPrepared {
+                operation_id,
+                generation,
+                result,
+            } => self.apply_develop_prepared(operation_id, generation, result, tx),
+            AppEvent::DevelopPlanReady {
+                operation_id,
+                generation,
+                corrective,
+                result,
+            } => self.apply_develop_plan_ready(operation_id, generation, corrective, result),
+            AppEvent::DevelopImplementReady {
+                operation_id,
+                generation,
+                section,
+                preexisting_paths,
+                result,
+            } => self.apply_develop_implement_ready(
+                operation_id,
+                generation,
+                section,
+                preexisting_paths,
+                result,
+            ),
+            AppEvent::DevelopFileRewritten {
+                operation_id,
+                generation,
+                revision,
+                result,
+            } => self.apply_develop_file_rewritten(operation_id, generation, revision, result, tx),
+            AppEvent::DevelopChecked {
+                operation_id,
+                generation,
+                outcome,
+            } => self.apply_develop_checked(operation_id, generation, outcome, tx),
+            AppEvent::DevelopCommitted {
+                operation_id,
+                generation,
+                result,
+            } => self.apply_develop_committed(operation_id, generation, result, tx),
             AppEvent::BugkillFileWriteFailed(err) => self.show_toast(
                 ToastVariant::Warning,
                 format!("Could not write BUG_INVESTIGATION.md: {err}"),
@@ -6281,6 +7256,13 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::DevelopPullRequest => {
+                // Only reachable through `start_develop_flow`, which seeds
+                // `develop_pr` before flipping the screen.
+                if self.develop_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
             Screen::UpdateBranch => {
                 // Only reachable through `start_update_branch_flow`,
                 // which seeds `update_branch` before flipping the
@@ -6325,6 +7307,9 @@ impl App {
         self.explain_pr = None;
         self.fix_pr = None;
         self.bugkill_pr = None;
+        self.develop_pr = None;
+        self.active_develop_operation_id = None;
+        self.develop_watch = None;
         self.update_branch = None;
         self.ai_model_picker = None;
         self.mouse_selection = None;
@@ -8490,6 +9475,233 @@ fn kick_off_bugkill_rollback(
     });
 }
 
+/// Inputs for one planning run: the freeform task plus the optional
+/// revision context (the rejected plan's contract block + the feedback).
+struct DevelopPreparePlanRequest {
+    worktree_path: String,
+    task_description: String,
+    base_ref: Option<String>,
+    revision: Option<(String, String)>,
+    corrective: bool,
+}
+
+fn kick_off_develop_preflight(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    operation_id: u64,
+    generation: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopPrepared {
+            operation_id,
+            generation,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .develop_preflight(&worktree_path)
+            .await
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::DevelopPrepared {
+            operation_id,
+            generation,
+            result,
+        });
+    });
+}
+
+fn kick_off_develop_prepare_plan(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: DevelopPreparePlanRequest,
+    operation_id: u64,
+    generation: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let corrective = req.corrective;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopPlanReady {
+            operation_id,
+            generation,
+            corrective,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    // A task despite the call being synchronous: the opencode-on-PATH gate
+    // inside spawns `opencode --version`, which must not block the UI.
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let (previous_plan, feedback) = match &req.revision {
+            Some((plan, feedback)) => (Some(plan.as_str()), Some(feedback.as_str())),
+            None => (None, None),
+        };
+        let result = service
+            .prepare_develop_plan(
+                &req.worktree_path,
+                &req.task_description,
+                req.base_ref.as_deref(),
+                previous_plan,
+                feedback,
+                corrective,
+            )
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::DevelopPlanReady {
+            operation_id,
+            generation,
+            corrective,
+            result,
+        });
+    });
+}
+
+/// Inputs for one implement run: the target section's block(s), the compact
+/// whole-plan outline that keeps the run in its lane, and the previous
+/// check-failure output on a corrective retry.
+struct DevelopPrepareImplementRequest {
+    worktree_path: String,
+    task_description: String,
+    sections: String,
+    outline: String,
+    section: Option<usize>,
+    check_failure: Option<String>,
+}
+
+fn kick_off_develop_prepare_implement(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    req: DevelopPrepareImplementRequest,
+    operation_id: u64,
+    generation: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let section = req.section;
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopImplementReady {
+            operation_id,
+            generation,
+            section,
+            preexisting_paths: Vec::new(),
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        // Capture the baseline of dirty files before the run so the section
+        // commit can isolate this run's changes from pre-existing work.
+        let preexisting_paths = service
+            .develop_dirty_files(&req.worktree_path)
+            .await
+            .unwrap_or_default();
+        let result = service
+            .prepare_develop_implement(
+                &req.worktree_path,
+                &req.task_description,
+                &req.sections,
+                &req.outline,
+                req.check_failure.as_deref(),
+            )
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::DevelopImplementReady {
+            operation_id,
+            generation,
+            section,
+            preexisting_paths,
+            result,
+        });
+    });
+}
+
+/// Run the configured post-section check (Ralph-canon backpressure). A
+/// missing git root reports a `Failed` so the UI shows the CheckFailed
+/// prompt rather than silently passing.
+fn kick_off_develop_check(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    operation_id: u64,
+    generation: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopChecked {
+            operation_id,
+            generation,
+            outcome: DevelopCheckOutcome::Failed {
+                output: "Could not resolve git root.".to_string(),
+            },
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let outcome = service.develop_run_check(&worktree_path).await;
+        let _ = tx.send(AppEvent::DevelopChecked {
+            operation_id,
+            generation,
+            outcome,
+        });
+    });
+}
+
+/// Commit one finished section as a checkpoint (opt-in). A missing git root
+/// reports the error; the pipeline treats a commit failure as non-fatal.
+#[allow(clippy::too_many_arguments)]
+fn kick_off_develop_commit(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    subject: String,
+    preexisting_paths: Vec<String>,
+    operation_id: u64,
+    generation: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::DevelopCommitted {
+            operation_id,
+            generation,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .develop_commit_section(&worktree_path, &subject, &preexisting_paths)
+            .await
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::DevelopCommitted {
+            operation_id,
+            generation,
+            result,
+        });
+    });
+}
+
+fn kick_off_develop_file_write(write: DevelopFileWrite, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = tokio::fs::write(write.path, write.content)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = tx.send(AppEvent::DevelopFileRewritten {
+            operation_id: write.operation_id,
+            generation: write.generation,
+            revision: write.revision,
+            result,
+        });
+    });
+}
+
 fn kick_off_update_branch(
     config: DashboardConfig,
     worktree_path: String,
@@ -9011,7 +10223,9 @@ mod tests {
     use super::*;
     use crate::config::schema::WorktreeConfig;
     use crate::config::service::ConfigService;
-    use crate::services::{AiStatusReport, PullRequest, ReviewerSummary};
+    use crate::services::{
+        AiStatusReport, DevelopPlan, DevelopPreflight, PlanSection, PullRequest, ReviewerSummary,
+    };
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
     use ratatui::backend::TestBackend;
@@ -9714,6 +10928,146 @@ mod tests {
         app.git_root = Some(repo_root.display().to_string());
         app.setup_project = Some(SetupProjectScreen::new(Some(repo_root)));
         app
+    }
+
+    // ── Develop action transition helpers ───────────────────────────────
+
+    fn git(cwd: &std::path::Path, args: &[&str]) -> String {
+        use std::process::Command;
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {cwd:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn develop_repo(home: &TempDir) -> std::path::PathBuf {
+        let repo = home.path().join("work");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        repo
+    }
+
+    fn develop_app(repo: &std::path::Path) -> App {
+        let mut app = App::new(AppMode::Dashboard, false);
+        app.phase = InitPhase::Ready;
+        app.git_root = Some(repo.display().to_string());
+        app.worktree_service = Some(WorktreeService::new(None));
+        let request = DevelopRequest {
+            branch: "feat/develop".to_string(),
+            worktree_path: repo.display().to_string(),
+            number: None,
+            title: None,
+        };
+        app.start_develop_flow(request, &app_event_tx());
+        app
+    }
+
+    fn develop_plan() -> DevelopPlan {
+        DevelopPlan {
+            task_description: "Add CSV export".to_string(),
+            complexity: 5,
+            overview: None,
+            sections: vec![
+                PlanSection {
+                    number: 1,
+                    name: "Data model".to_string(),
+                    body: "Implement the data model.".to_string(),
+                    done: false,
+                },
+                PlanSection {
+                    number: 2,
+                    name: "CLI flag".to_string(),
+                    body: "Add the CLI flag.".to_string(),
+                    done: false,
+                },
+            ],
+            notes: Vec::new(),
+        }
+    }
+
+    fn develop_app_implementing(
+        check_command: Option<&str>,
+        section: Option<usize>,
+    ) -> (
+        App,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = develop_repo(&home);
+        let _ = home.keep();
+        let mut app = develop_app(&repo);
+        if let Some(check_command) = check_command {
+            app.worktree_service
+                .as_mut()
+                .unwrap()
+                .config_service_mut()
+                .update(|config| {
+                    config.dashboard.develop.check_command = check_command.to_string();
+                });
+        }
+        let screen = app.develop_pr.as_mut().unwrap();
+        screen.set_plan(develop_plan());
+        screen.set_check_command(check_command.map(str::to_string));
+        screen.begin_implement_run(section);
+        let (tx, rx) = mpsc::unbounded_channel();
+        (app, tx, rx)
+    }
+
+    fn develop_app_implementing_with_check(
+        check_command: &str,
+    ) -> (
+        App,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        develop_app_implementing(Some(check_command), Some(0))
+    }
+
+    fn develop_app_implementing_without_check() -> (
+        App,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        develop_app_implementing(None, Some(0))
+    }
+
+    async fn assert_develop_check_requested(
+        rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+        check_command: &str,
+    ) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("develop check event should arrive")
+            .expect("channel should stay open");
+        assert!(
+            matches!(event, AppEvent::DevelopChecked { .. }),
+            "expected DevelopChecked for `{check_command}`, got a different event"
+        );
+    }
+
+    async fn assert_no_develop_check_requested(rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("plan write or next implementation event should arrive")
+            .expect("channel should stay open");
+        assert!(!matches!(event, AppEvent::DevelopChecked { .. }));
     }
 
     #[test]
@@ -10484,6 +11838,7 @@ mod tests {
                     columns: vec!["branch".into(), "status".into()],
                     ai: Default::default(),
                     ai_status: Default::default(),
+                    develop: Default::default(),
                     legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
@@ -10496,6 +11851,7 @@ mod tests {
                     columns: vec!["branch".into()],
                     ai: Default::default(),
                     ai_status: Default::default(),
+                    develop: Default::default(),
                     legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
@@ -10524,6 +11880,7 @@ mod tests {
                 ],
                 ai: Default::default(),
                 ai_status: Default::default(),
+                develop: Default::default(),
                 legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
@@ -10557,6 +11914,7 @@ mod tests {
                     columns: vec!["branch".into()],
                     ai: Default::default(),
                     ai_status: Default::default(),
+                    develop: Default::default(),
                     legacy_notifications: None,
                 },
                 ..WorktreeConfig::default()
@@ -10579,6 +11937,7 @@ mod tests {
                 columns: vec!["branch".into(), "status".into(), "ai_status".into()],
                 ai: Default::default(),
                 ai_status: Default::default(),
+                develop: Default::default(),
                 legacy_notifications: None,
             };
             app.save_dashboard(new_dashboard.clone()).unwrap();
@@ -10610,6 +11969,7 @@ mod tests {
                     columns: vec!["branch".into(), "status".into()],
                     ai: Default::default(),
                     ai_status: Default::default(),
+                    develop: Default::default(),
                     legacy_notifications: None,
                 },
                 terminal_command: "global-terminal".into(),
@@ -11257,5 +12617,1275 @@ mod tests {
         // A recorded failure downgrades the summary to a warning.
         let toast = app.toast.current().expect("failure toast");
         assert_eq!(toast.variant, ToastVariant::Warning);
+    }
+
+    // ── Develop action transitions ──────────────────────────────────────
+
+    #[test]
+    fn develop_confirmation_starts_preflight_and_advances_step() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.apply_develop_action(DevelopAction::Confirmed, &tx);
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("preflight event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopPrepared { operation_id, .. } => {
+                        assert_eq!(operation_id, 1);
+                    }
+                    _other => panic!("expected DevelopPrepared, got a different event"),
+                }
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::Working
+                );
+                assert_eq!(app.active_develop_operation_id, Some(1));
+            });
+        });
+    }
+
+    #[test]
+    fn develop_task_submission_starts_planning_and_advances_step() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.apply_develop_action(
+                    DevelopAction::TaskSubmitted("add csv export".to_string()),
+                    &tx,
+                );
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("planning event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopPlanReady {
+                        operation_id,
+                        corrective,
+                        ..
+                    } => {
+                        assert_eq!(operation_id, 1);
+                        assert!(!corrective);
+                    }
+                    _other => panic!("expected DevelopPlanReady, got a different event"),
+                }
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::Working
+                );
+                assert_eq!(app.active_develop_operation_id, Some(1));
+            });
+        });
+    }
+
+    #[test]
+    fn develop_resume_starts_the_pending_section() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr.as_mut().unwrap().set_plan(develop_plan());
+            let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.apply_develop_action(DevelopAction::Resume, &tx);
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("implement event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopImplementReady {
+                        operation_id,
+                        section,
+                        ..
+                    } => {
+                        assert_eq!(operation_id, 1);
+                        assert_eq!(
+                            section,
+                            Some(0),
+                            "Ralph Loop should target the first pending section"
+                        );
+                    }
+                    _other => panic!("expected DevelopImplementReady, got a different event"),
+                }
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::Working
+                );
+                assert_eq!(app.active_develop_operation_id, Some(1));
+            });
+        });
+    }
+
+    #[test]
+    fn develop_start_fresh_requests_a_new_plan() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr
+                .as_mut()
+                .unwrap()
+                .show_resume_prompt(develop_plan());
+
+            app.apply_develop_action(DevelopAction::StartFresh, &app_event_tx());
+
+            assert_eq!(
+                app.develop_pr.as_ref().unwrap().step(),
+                DevelopStep::DescribeTask
+            );
+            assert_eq!(app.active_develop_operation_id, Some(1));
+            assert!(app
+                .develop_pr
+                .as_ref()
+                .unwrap()
+                .task_description()
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn develop_plan_approval_starts_implementation() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr.as_mut().unwrap().set_plan(develop_plan());
+            let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.apply_develop_action(DevelopAction::PlanApproved, &tx);
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("implement event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopImplementReady {
+                        operation_id,
+                        section,
+                        ..
+                    } => {
+                        assert_eq!(operation_id, 1);
+                        assert_eq!(section, Some(0));
+                    }
+                    _other => panic!("expected DevelopImplementReady, got a different event"),
+                }
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::Working
+                );
+                assert_eq!(app.active_develop_operation_id, Some(1));
+            });
+        });
+    }
+
+    #[test]
+    fn develop_implementation_completion_records_note_and_starts_configured_check() {
+        let (mut app, tx, mut rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done(
+                "Implemented the requested behavior.\nAdded regression coverage.".into(),
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(!screen.plan().unwrap().sections[0].done);
+            assert_eq!(screen.step(), DevelopStep::Verifying);
+            assert_develop_check_requested(&mut rx, "cargo test").await;
+
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert_eq!(
+                screen.plan().unwrap().notes,
+                vec!["Section 1: Added regression coverage."]
+            );
+        });
+    }
+
+    #[test]
+    fn develop_implementation_completion_without_check_finalizes_section_directly() {
+        let (mut app, tx, mut rx) = develop_app_implementing_without_check();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done(
+                "Implemented the requested behavior.\nAdded regression coverage.".into(),
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert_eq!(
+                screen.plan().unwrap().notes,
+                vec!["Section 1: Added regression coverage."]
+            );
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert_ne!(screen.step(), DevelopStep::Verifying);
+            assert_no_develop_check_requested(&mut rx).await;
+        });
+    }
+
+    #[test]
+    fn finalizing_named_section_with_checkpoints_persists_and_requests_commit() {
+        let (mut app, tx, mut rx) = develop_app_implementing(None, Some(0));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.finalize_develop_section(&tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert!(!screen.plan().unwrap().sections[1].done);
+
+            // Both the plan rewrite and the checkpoint commit are requested.
+            let mut file_rewritten = false;
+            let mut commit_requested = false;
+            for _ in 0..2 {
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("expected event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopFileRewritten { .. } => {
+                        assert!(!file_rewritten, "plan should be rewritten exactly once");
+                        file_rewritten = true;
+                    }
+                    AppEvent::DevelopCommitted {
+                        operation_id,
+                        result,
+                        ..
+                    } => {
+                        assert!(!commit_requested, "commit should be requested exactly once");
+                        assert_eq!(operation_id, 1);
+                        assert!(result.is_ok());
+                        commit_requested = true;
+                    }
+                    _other => panic!("expected DevelopFileRewritten or DevelopCommitted"),
+                }
+            }
+            assert!(file_rewritten);
+            assert!(commit_requested);
+
+            // The workflow does not advance before the checkpoint finishes.
+            assert!(rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn finalizing_without_a_target_and_without_checkpoints_advances_once() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = develop_repo(&home);
+        let _ = home.keep();
+        let mut app = develop_app(&repo);
+        let screen = app.develop_pr.as_mut().unwrap();
+        // Move focus from the Ralph Loop toggle to the checkpoint toggle and
+        // flip it off.
+        let _ = screen.handle_key(key(KeyCode::Down));
+        let _ = screen.handle_key(key(KeyCode::Char(' ')));
+        assert!(!screen.commit_sections(), "checkpoints should be disabled");
+        screen.set_plan(develop_plan());
+        screen.set_check_command(None);
+        screen.begin_implement_run(None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.finalize_develop_section(&tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert!(screen.plan().unwrap().sections[1].done);
+
+            // Completion is persisted.
+            assert_plan_write_requested(&mut rx).await;
+
+            // No commit is requested and the workflow advances exactly once.
+            assert!(rx.try_recv().is_err());
+            assert_eq!(screen.step(), DevelopStep::Done);
+        });
+    }
+
+    #[test]
+    fn implementation_completion_records_summary_and_starts_configured_check() {
+        let (mut app, tx, mut rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_turn(
+                OpencodeTurn::Finished {
+                    transcript: "Implementation output\nCompleted the requested change.".into(),
+                },
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::Verifying);
+            assert_develop_check_requested(&mut rx, "cargo test").await;
+
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(
+                screen.plan().unwrap().notes,
+                vec!["Section 1: Completed the requested change."]
+            );
+        });
+    }
+
+    #[test]
+    fn implementation_completion_records_summary_and_finishes_without_check() {
+        let (mut app, tx, mut rx) = develop_app_implementing_without_check();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_turn(
+                OpencodeTurn::Finished {
+                    transcript: "Implementation output\nCompleted the requested change.".into(),
+                },
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(
+                screen.plan().unwrap().notes,
+                vec!["Section 1: Completed the requested change."]
+            );
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert_ne!(screen.step(), DevelopStep::Verifying);
+            assert_no_develop_check_requested(&mut rx).await;
+        });
+    }
+
+    #[test]
+    fn develop_plan_rejection_requests_revision() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr.as_mut().unwrap().set_plan(develop_plan());
+            let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.apply_develop_action(
+                    DevelopAction::PlanRejected("needs more tests".to_string()),
+                    &tx,
+                );
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("planning event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopPlanReady {
+                        operation_id,
+                        corrective,
+                        ..
+                    } => {
+                        assert_eq!(operation_id, 1);
+                        assert!(!corrective);
+                    }
+                    _other => panic!("expected DevelopPlanReady, got a different event"),
+                }
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::Working
+                );
+                assert_eq!(app.active_develop_operation_id, Some(1));
+            });
+        });
+    }
+
+    #[test]
+    fn develop_cancellation_returns_to_dashboard() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            // A None git root lets the return-to-dashboard step skip spawning a
+            // watch, keeping the test free of a Tokio runtime.
+            app.git_root = None;
+
+            app.apply_develop_action(DevelopAction::Cancelled, &app_event_tx());
+
+            assert_eq!(app.screen, Screen::Dashboard);
+            assert!(app.develop_pr.is_none());
+            assert!(app.active_develop_operation_id.is_none());
+            assert!(app.develop_watch.is_none());
+        });
+    }
+
+    #[test]
+    fn develop_completion_returns_to_dashboard() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr.as_mut().unwrap().enter_done();
+            // A None git root lets the return-to-dashboard step skip spawning a
+            // watch, keeping the test free of a Tokio runtime.
+            app.git_root = None;
+
+            app.apply_develop_action(DevelopAction::Done, &app_event_tx());
+
+            assert_eq!(app.screen, Screen::Dashboard);
+            assert!(app.develop_pr.is_none());
+            assert!(app.active_develop_operation_id.is_none());
+            assert!(app.develop_watch.is_none());
+        });
+    }
+
+    #[test]
+    fn develop_ignores_verification_results_outside_verifying_step() {
+        let (mut app, tx, _rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done("Implemented section 0.".into(), &tx);
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            let step_after_pass = screen.step();
+            assert_ne!(step_after_pass, DevelopStep::Verifying);
+            assert!(screen.plan().unwrap().sections[0].done);
+
+            // Deliver a delayed check result that belongs to the now-finalized
+            // verification window. It must not mutate the current step or undo
+            // the finalized section.
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), step_after_pass);
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert!(!screen.plan().unwrap().sections[1].done);
+        });
+    }
+
+    #[test]
+    fn develop_finalizes_when_verification_passes() {
+        let (mut app, tx, _rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done("Implemented section 0.".into(), &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::Verifying);
+            assert!(!screen.plan().unwrap().sections[0].done);
+
+            app.apply_develop_checked(1, 1, DevelopCheckOutcome::Passed, &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert!(screen.plan().unwrap().sections[0].done);
+            assert_ne!(screen.step(), DevelopStep::Verifying);
+            assert!(screen.check_failure().is_none());
+        });
+    }
+
+    #[test]
+    fn develop_exposes_output_when_verification_fails() {
+        let (mut app, tx, _rx) = develop_app_implementing_with_check("cargo test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            app.on_develop_implement_done("Implemented section 0.".into(), &tx);
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::Verifying);
+
+            let output = "test foo::bar ... FAILED\nassertion `left == right` failed".to_string();
+            app.apply_develop_checked(
+                1,
+                1,
+                DevelopCheckOutcome::Failed {
+                    output: output.clone(),
+                },
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::CheckFailed);
+            assert!(!screen.plan().unwrap().sections[0].done);
+            assert_eq!(screen.check_failure(), Some(output));
+        });
+    }
+
+    // ── Develop section commit results ───────────────────────────────────
+
+    fn app_waiting_for_section_commit() -> (App, mpsc::UnboundedSender<AppEvent>) {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = develop_repo(&home);
+        let _ = home.keep();
+        let mut app = develop_app(&repo);
+        let screen = app.develop_pr.as_mut().expect("Develop screen");
+        screen.set_plan(single_section_plan());
+        screen.begin_implement_run(Some(0));
+        screen.finish_section();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        (app, tx)
+    }
+
+    fn single_section_plan() -> DevelopPlan {
+        DevelopPlan {
+            task_description: "Add CSV export".to_string(),
+            complexity: 3,
+            overview: None,
+            sections: vec![PlanSection {
+                number: 1,
+                name: "Data model".to_string(),
+                body: "Implement the data model.".to_string(),
+                done: false,
+            }],
+            notes: Vec::new(),
+        }
+    }
+
+    fn develop_committed_section_count(app: &App) -> usize {
+        app.develop_pr
+            .as_ref()
+            .expect("Develop screen")
+            .commit_count()
+    }
+
+    fn assert_develop_advanced_to_next_section(app: &App) {
+        let screen = app.develop_pr.as_ref().expect("Develop screen");
+        assert_eq!(
+            screen.step(),
+            DevelopStep::Done,
+            "workflow should have advanced"
+        );
+    }
+
+    fn develop_warning(app: &App) -> Option<&'static str> {
+        app.toast.current().map(|snapshot| {
+            let message = snapshot.message;
+            let stripped = message
+                .strip_prefix("Section commit failed: ")
+                .map(str::to_string)
+                .unwrap_or(message);
+            &*Box::leak(stripped.into_boxed_str())
+        })
+    }
+
+    #[test]
+    fn develop_section_commit_with_sha_counts_commit_and_advances() {
+        let (mut app, tx) = app_waiting_for_section_commit();
+
+        app.on_develop_section_commit_result(Ok(Some("abc123".to_string())), &tx);
+
+        assert_eq!(develop_committed_section_count(&app), 1);
+        assert_develop_advanced_to_next_section(&app);
+        assert_eq!(develop_warning(&app), None);
+    }
+
+    #[test]
+    fn develop_section_commit_without_changes_does_not_count_and_advances() {
+        let (mut app, tx) = app_waiting_for_section_commit();
+
+        app.on_develop_section_commit_result(Ok(None), &tx);
+
+        assert_eq!(develop_committed_section_count(&app), 0);
+        assert_develop_advanced_to_next_section(&app);
+        assert_eq!(develop_warning(&app), None);
+    }
+
+    #[test]
+    fn develop_section_commit_error_warns_without_counting_and_advances() {
+        let (mut app, tx) = app_waiting_for_section_commit();
+
+        app.on_develop_section_commit_result(Err("commit failed".to_string()), &tx);
+
+        assert_eq!(develop_committed_section_count(&app), 0);
+        assert_develop_advanced_to_next_section(&app);
+        assert_eq!(develop_warning(&app), Some("commit failed"));
+    }
+
+    // ── Develop preflight outcomes ─────────────────────────────────────
+
+    #[test]
+    fn develop_preflight_terminal_error_returns_to_dashboard_with_toast() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            // A None git root lets the return-to-dashboard step skip spawning a
+            // watch, keeping the test free of a Tokio runtime.
+            app.git_root = None;
+
+            app.apply_develop_prepared(
+                1,
+                0,
+                Err("terminal preparation failed".to_string()),
+                &app_event_tx(),
+            );
+
+            assert_eq!(app.screen, Screen::Dashboard);
+            assert!(app.develop_pr.is_none());
+            assert!(app.active_develop_operation_id.is_none());
+            let toast = app.toast.current().expect("failure toast");
+            assert_eq!(toast.variant, ToastVariant::Error);
+            assert!(toast.message.contains("Develop preparation failed"));
+        });
+    }
+
+    #[test]
+    fn develop_preflight_missing_ai_configuration_returns_to_dashboard_with_toast() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.git_root = None;
+
+            app.apply_develop_prepared(
+                1,
+                0,
+                Ok(Box::new(DevelopPreflightOutcome::AiNotConfigured)),
+                &app_event_tx(),
+            );
+
+            assert_eq!(app.screen, Screen::Dashboard);
+            assert!(app.develop_pr.is_none());
+            assert!(app.active_develop_operation_id.is_none());
+            let toast = app.toast.current().expect("warning toast");
+            assert_eq!(toast.variant, ToastVariant::Warning);
+            assert_eq!(toast.message, "ai.develop.plan model is not configured.");
+        });
+    }
+
+    #[test]
+    fn develop_preflight_unavailable_cli_returns_to_dashboard_with_toast() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.git_root = None;
+
+            app.apply_develop_prepared(
+                1,
+                0,
+                Ok(Box::new(DevelopPreflightOutcome::AiUnavailable)),
+                &app_event_tx(),
+            );
+
+            assert_eq!(app.screen, Screen::Dashboard);
+            assert!(app.develop_pr.is_none());
+            assert!(app.active_develop_operation_id.is_none());
+            let toast = app.toast.current().expect("error toast");
+            assert_eq!(toast.variant, ToastVariant::Error);
+            assert!(toast.message.contains("opencode"));
+            assert!(toast.message.contains("PATH"));
+        });
+    }
+
+    #[test]
+    fn develop_preflight_without_plan_prompts_to_describe_task() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let tx = app_event_tx();
+
+            app.apply_develop_prepared(
+                1,
+                0,
+                Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
+                    DevelopPreflight {
+                        base_ref: Some("main".to_string()),
+                        resume: DevelopResumeState::Absent,
+                    },
+                )))),
+                &tx,
+            );
+
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::DescribeTask);
+            assert_eq!(screen.base_ref(), Some("main"));
+        });
+    }
+
+    #[test]
+    fn develop_preflight_with_unparseable_plan_prompts_to_overwrite() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let tx = app_event_tx();
+
+            app.apply_develop_prepared(
+                1,
+                0,
+                Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
+                    DevelopPreflight {
+                        base_ref: Some("main".to_string()),
+                        resume: DevelopResumeState::Unparseable,
+                    },
+                )))),
+                &tx,
+            );
+
+            {
+                let screen = app.develop_pr.as_ref().expect("Develop screen");
+                assert_eq!(screen.step(), DevelopStep::ResumePrompt);
+                assert_eq!(screen.base_ref(), Some("main"));
+            }
+            // Choosing Start fresh moves to an empty describe prompt because no
+            // plan was recovered.
+            app.apply_develop_action(DevelopAction::StartFresh, &tx);
+            let screen = app.develop_pr.as_ref().expect("Develop screen");
+            assert_eq!(screen.step(), DevelopStep::DescribeTask);
+            assert!(screen.task_description().is_empty());
+        });
+    }
+
+    #[test]
+    fn develop_preflight_with_parsed_plan_prompts_to_resume() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let plan = develop_plan();
+            let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            app.apply_develop_prepared(
+                1,
+                0,
+                Ok(Box::new(DevelopPreflightOutcome::Ready(Box::new(
+                    DevelopPreflight {
+                        base_ref: Some("main".to_string()),
+                        resume: DevelopResumeState::Parsed(plan.clone()),
+                    },
+                )))),
+                &tx,
+            );
+
+            runtime.block_on(async {
+                {
+                    let screen = app.develop_pr.as_ref().expect("Develop screen");
+                    assert_eq!(screen.step(), DevelopStep::ResumePrompt);
+                    assert_eq!(screen.base_ref(), Some("main"));
+                }
+
+                // Choosing Resume adopts the recovered plan and starts implementing.
+                app.apply_develop_action(DevelopAction::Resume, &tx);
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("implement event should arrive")
+                    .expect("channel should stay open");
+                match event {
+                    AppEvent::DevelopImplementReady {
+                        operation_id,
+                        section,
+                        ..
+                    } => {
+                        assert_eq!(operation_id, 1);
+                        assert_eq!(section, Some(0));
+                    }
+                    _other => panic!("expected DevelopImplementReady, got a different event"),
+                }
+                let screen = app.develop_pr.as_ref().expect("Develop screen");
+                assert_eq!(screen.plan(), Some(&plan));
+                assert_eq!(screen.task_description(), plan.task_description);
+                assert_eq!(screen.step(), DevelopStep::Working);
+            });
+        });
+    }
+
+    // ── Develop plan parsing outcomes ───────────────────────────────────
+
+    fn app_with_active_develop_flow(
+        repo: &std::path::Path,
+    ) -> (
+        App,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let mut app = develop_app(repo);
+        app.develop_pr
+            .as_mut()
+            .unwrap()
+            .set_task_description("add csv export".to_string());
+        app.develop_pr.as_mut().unwrap().start_planning(false);
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        (app, tx, rx)
+    }
+
+    fn valid_develop_plan_transcript() -> String {
+        "==== TASK ====\n\
+        DESCRIPTION: Add CSV export\n\
+        COMPLEXITY: 5\n\
+        ==== END ====\n\
+        ==== SECTION ====\n\
+        NAME: Data model\n\
+        GOAL: Implement the data model.\n\
+        CRITERIA:\n\
+        - [ ] Define the CSV schema\n\
+        ==== END ====\n"
+            .to_string()
+    }
+
+    async fn assert_plan_write_requested(rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("plan write event should arrive")
+            .expect("channel should stay open");
+        match event {
+            AppEvent::DevelopFileRewritten { .. } => {}
+            _other => panic!("expected DevelopFileRewritten, got a different event"),
+        }
+    }
+
+    async fn assert_corrective_plan_requested(rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("corrective plan event should arrive")
+            .expect("channel should stay open");
+        match event {
+            AppEvent::DevelopPlanReady {
+                operation_id,
+                corrective,
+                ..
+            } => {
+                assert_eq!(operation_id, 1);
+                assert!(corrective);
+            }
+            _other => panic!("expected DevelopPlanReady, got a different event"),
+        }
+    }
+
+    #[test]
+    fn forced_plan_completion_accepts_parseable_working_transcript() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let transcript = valid_develop_plan_transcript();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.on_develop_plan_pty_exit_with_turn(transcript, Ok(OpencodeTurn::Working), &tx);
+
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::PlanReview
+                );
+                assert_plan_write_requested(&mut rx).await;
+            });
+        });
+    }
+
+    #[test]
+    fn forced_plan_completion_keeps_waiting_for_unparseable_working_transcript() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+
+            app.on_develop_plan_pty_exit_with_turn(
+                "partial, unparseable output".to_string(),
+                Ok(OpencodeTurn::Working),
+                &tx,
+            );
+
+            assert_eq!(
+                app.develop_pr.as_ref().unwrap().step(),
+                DevelopStep::Planning
+            );
+            assert!(rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn forced_plan_completion_handles_finished_watcher_result_normally() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.on_develop_plan_pty_exit_with_turn(
+                    "partial output".to_string(),
+                    Ok(OpencodeTurn::Finished {
+                        transcript: valid_develop_plan_transcript(),
+                    }),
+                    &tx,
+                );
+
+                assert_eq!(
+                    app.develop_pr.as_ref().unwrap().step(),
+                    DevelopStep::PlanReview
+                );
+                assert_plan_write_requested(&mut rx).await;
+            });
+        });
+    }
+
+    #[test]
+    fn forced_plan_completion_preserves_watcher_failures() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, _rx) = app_with_active_develop_flow(&repo);
+
+            app.on_develop_plan_pty_exit_with_turn(
+                String::new(),
+                Err("watcher failed".to_string()),
+                &tx,
+            );
+
+            assert!(app
+                .develop_pr
+                .as_ref()
+                .unwrap()
+                .error()
+                .is_some_and(|error| error.contains("watcher failed")));
+        });
+    }
+
+    #[test]
+    fn valid_develop_plan_enters_review_and_writes_plan() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let transcript = valid_develop_plan_transcript();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.finish_develop_plan(transcript, &tx);
+
+                let screen = app.develop_pr.as_ref().unwrap();
+                assert_eq!(screen.step(), DevelopStep::PlanReview);
+                assert!(screen.plan().is_some());
+                assert_plan_write_requested(&mut rx).await;
+            });
+        });
+    }
+
+    #[test]
+    fn first_invalid_develop_plan_starts_one_corrective_retry() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.finish_develop_plan("not a plan".to_string(), &tx);
+
+                let screen = app.develop_pr.as_ref().unwrap();
+                assert_eq!(screen.step(), DevelopStep::Working);
+                assert!(screen.plan().is_none());
+                assert_corrective_plan_requested(&mut rx).await;
+                assert!(rx.try_recv().is_err());
+            });
+        });
+    }
+
+    #[test]
+    fn second_invalid_develop_plan_surfaces_tail_without_retrying() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.finish_develop_plan("first invalid result".to_string(), &tx);
+                assert_corrective_plan_requested(&mut rx).await;
+
+                // Simulate the corrective retry entering the Planning step.
+                app.develop_pr.as_mut().unwrap().start_planning(true);
+
+                let transcript = format!("ignored prefix\n{}", "terminal transcript tail");
+                app.finish_develop_plan(transcript, &tx);
+
+                let screen = app.develop_pr.as_ref().unwrap();
+                assert!(screen
+                    .error()
+                    .is_some_and(|error| error.contains("terminal transcript tail")));
+                assert!(rx.try_recv().is_err());
+            });
+        });
+    }
+
+    fn resolve_on_path(binary: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join(binary);
+            candidate.is_file().then_some(candidate)
+        })
+    }
+
+    #[test]
+    fn develop_plan_handoff_success_installs_watcher_before_spawning_pty() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            let binary = resolve_on_path("true").expect("`true` binary should be on PATH");
+            let handoff = FixApplyHandoff {
+                opencode_binary: binary,
+                opencode_args: Vec::new(),
+                cwd: repo.clone(),
+            };
+
+            app.apply_develop_plan_ready(1, 0, true, Ok(Box::new(handoff)));
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(app.develop_watch.is_some(), "watcher should be installed");
+            assert!(screen.has_pty(), "PTY should be spawned");
+            assert_eq!(screen.step(), DevelopStep::Planning);
+            assert!(
+                screen.plan_corrective(),
+                "screen should be in corrective planning state"
+            );
+        });
+    }
+
+    #[test]
+    fn develop_plan_handoff_failure_surfaces_error_without_starting_pty() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+
+            app.apply_develop_plan_ready(1, 0, false, Err("planning handoff failed".to_string()));
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(
+                app.develop_watch.is_none(),
+                "watcher should not be installed"
+            );
+            assert!(!screen.has_pty(), "PTY should not be spawned");
+            assert_eq!(screen.error(), Some("planning handoff failed"));
+        });
+    }
+
+    #[test]
+    fn develop_implementation_handoff_success_selects_ralph_section_before_spawning_pty() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr.as_mut().unwrap().set_plan(develop_plan());
+            let binary = resolve_on_path("true").expect("`true` binary should be on PATH");
+            let handoff = FixApplyHandoff {
+                opencode_binary: binary,
+                opencode_args: Vec::new(),
+                cwd: repo.clone(),
+            };
+
+            app.apply_develop_implement_ready(1, 0, Some(0), Vec::new(), Ok(Box::new(handoff)));
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(app.develop_watch.is_some(), "watcher should be installed");
+            assert!(screen.has_pty(), "PTY should be spawned");
+            assert_eq!(screen.current_section(), Some(0));
+            assert_eq!(screen.step(), DevelopStep::Implementing);
+        });
+    }
+
+    #[test]
+    fn develop_implementation_handoff_failure_surfaces_error_without_starting_pty() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let mut app = develop_app(&repo);
+            app.develop_pr.as_mut().unwrap().set_plan(develop_plan());
+
+            app.apply_develop_implement_ready(
+                1,
+                0,
+                Some(0),
+                Vec::new(),
+                Err("implementation handoff failed".to_string()),
+            );
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(
+                app.develop_watch.is_none(),
+                "watcher should not be installed"
+            );
+            assert!(!screen.has_pty(), "PTY should not be spawned");
+            assert_eq!(screen.error(), Some("implementation handoff failed"));
+            assert_eq!(
+                screen.current_section(),
+                None,
+                "section should not be advanced"
+            );
+        });
+    }
+
+    fn config() -> DashboardConfig {
+        DashboardConfig::default()
+    }
+
+    fn preflight_request() -> (String, u64) {
+        ("/tmp/missing".into(), 1)
+    }
+
+    fn plan_request() -> (DevelopPreparePlanRequest, u64) {
+        (
+            DevelopPreparePlanRequest {
+                worktree_path: "/tmp/missing".into(),
+                task_description: "add csv export".into(),
+                base_ref: None,
+                revision: None,
+                corrective: false,
+            },
+            1,
+        )
+    }
+
+    fn implementation_request() -> (DevelopPrepareImplementRequest, u64) {
+        (
+            DevelopPrepareImplementRequest {
+                worktree_path: "/tmp/missing".into(),
+                task_description: "add csv export".into(),
+                sections: "sections".into(),
+                outline: "outline".into(),
+                section: None,
+                check_failure: None,
+            },
+            1,
+        )
+    }
+
+    fn check_request() -> (String, u64) {
+        ("/tmp/missing".into(), 1)
+    }
+
+    fn commit_request() -> (String, String, u64) {
+        ("/tmp/missing".into(), "section commit".into(), 1)
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_without_git_root_sends_preflight_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (worktree_path, operation_id) = preflight_request();
+
+        kick_off_develop_preflight(None, config(), worktree_path, operation_id, 1, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopPrepared { result: Err(message), .. }
+                if message == "Could not resolve git root."
+        ));
+    }
+
+    #[tokio::test]
+    async fn develop_plan_without_git_root_sends_plan_preparation_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (req, operation_id) = plan_request();
+
+        kick_off_develop_prepare_plan(None, config(), req, operation_id, 1, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopPlanReady { result: Err(message), .. }
+                if message == "Could not resolve git root."
+        ));
+    }
+
+    #[tokio::test]
+    async fn develop_implementation_without_git_root_sends_preparation_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (req, operation_id) = implementation_request();
+
+        kick_off_develop_prepare_implement(None, config(), req, operation_id, 1, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopImplementReady { result: Err(message), .. }
+                if message == "Could not resolve git root."
+        ));
+    }
+
+    #[tokio::test]
+    async fn develop_check_without_git_root_sends_failed_check() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (worktree_path, operation_id) = check_request();
+
+        kick_off_develop_check(None, config(), worktree_path, operation_id, 1, tx);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopChecked {
+                outcome: DevelopCheckOutcome::Failed { output },
+                ..
+            } if output == "Could not resolve git root."
+        ));
+    }
+
+    #[tokio::test]
+    async fn develop_commit_without_git_root_sends_commit_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (worktree_path, subject, operation_id) = commit_request();
+
+        kick_off_develop_commit(
+            None,
+            config(),
+            worktree_path,
+            subject,
+            Vec::new(),
+            operation_id,
+            1,
+            tx,
+        );
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::DevelopCommitted { result: Err(message), .. }
+                if message == "Could not resolve git root."
+        ));
     }
 }

@@ -71,7 +71,7 @@ fn sh_quote(path: &Path) -> String {
 /// schema default now seeds free opencode models.
 fn blank_ai() -> wisetree::config::schema::AiConfig {
     use wisetree::config::schema::{
-        AiBugkillConfig, AiConfig, AiFixConfig, AiModelConfig, AiReviewConfig,
+        AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiModelConfig, AiReviewConfig,
     };
     AiConfig {
         explain: AiModelConfig::default(),
@@ -89,6 +89,10 @@ fn blank_ai() -> wisetree::config::schema::AiConfig {
             investigate: AiModelConfig::default(),
             fix: AiModelConfig::default(),
             judge: AiModelConfig::default(),
+        },
+        develop: AiDevelopConfig {
+            plan: AiModelConfig::default(),
+            implement: AiModelConfig::default(),
         },
     }
 }

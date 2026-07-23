@@ -49,6 +49,7 @@ enum ActionChoice {
     FixPullRequest,
     ReviewPullRequest,
     BugkillPullRequest,
+    DevelopPullRequest,
     MergePullRequest,
     UpdatePullRequest,
     PushPullRequest,
@@ -176,6 +177,22 @@ pub struct ReviewPullRequestRequest {
 /// surface a `PR` row like the other commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BugkillRequest {
+    pub branch: String,
+    pub worktree_path: String,
+    /// `Some(n)` when an open/draft PR exists for the branch, so the confirm
+    /// panel shows a `PR #n` row; `None` for a worktree with no PR yet.
+    pub number: Option<u64>,
+    /// Existing PR title, shown next to the `PR` row when `number` is set.
+    pub title: Option<String>,
+}
+
+/// Payload the dashboard hands to the "Develop" screen — the interactive
+/// plan → approve → implement pipeline. Like Bugkill, no PR is required:
+/// developing a feature works on any non-main worktree. When the worktree
+/// *does* have an associated PR its details are carried through so the
+/// confirm panel can surface a `PR` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevelopRequest {
     pub branch: String,
     pub worktree_path: String,
     /// `Some(n)` when an open/draft PR exists for the branch, so the confirm
@@ -316,6 +333,10 @@ pub enum DashboardAction {
     /// attempts (commit on success, `git revert` on failure). Offered on
     /// every non-mother worktree — no PR required.
     Bugkill(Box<BugkillRequest>),
+    /// Plan a described task into `PLAN.md`, gate on user approval, then
+    /// implement it section by section with the AI. Offered on every
+    /// non-mother worktree — no PR required.
+    Develop(Box<DevelopRequest>),
     /// Push the branch's local commits to origin (`git push origin HEAD`).
     /// Offered when the PR is Open and the branch is ahead-but-not-behind —
     /// the "merged-but-not-pushed" state a failed push can leave behind.
@@ -1080,6 +1101,16 @@ impl DashboardScreen {
                 color: colors::DARK_GREEN,
             });
         }
+        // Develop plans a described task into PLAN.md and implements it
+        // section by section. Same gate as Bugkill: every non-mother
+        // worktree, PR or not.
+        if build_develop_request(row).is_some() {
+            commands.push(PrCommand {
+                label: "Develop",
+                choice: ActionChoice::DevelopPullRequest,
+                color: colors::ORANGE,
+            });
+        }
         // Update when the branch is behind its base (merge_status or local
         // behind count) or when GitHub reports the PR as conflicting (`Dirty`)
         // — both need an AI-assisted base merge. Mutually exclusive with Push.
@@ -1266,7 +1297,7 @@ impl DashboardScreen {
 
     /// Keyboard handling while a PR command button owns the focus: Left /
     /// Right move between buttons, Enter runs the focused action, Esc
-    /// dismisses the whole menu. Letter shortcuts (O/E/F/R/B/U/P/M/C)
+    /// dismisses the whole menu. Letter shortcuts (O/E/F/R/B/D/U/P/M/C)
     /// trigger the matching PR command directly without needing to navigate
     /// to it first.
     fn handle_pr_command_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -1289,6 +1320,7 @@ impl DashboardScreen {
                 KeyCode::Char('f') | KeyCode::Char('F') => &[ActionChoice::FixPullRequest],
                 KeyCode::Char('r') | KeyCode::Char('R') => &[ActionChoice::ReviewPullRequest],
                 KeyCode::Char('b') | KeyCode::Char('B') => &[ActionChoice::BugkillPullRequest],
+                KeyCode::Char('d') | KeyCode::Char('D') => &[ActionChoice::DevelopPullRequest],
                 KeyCode::Char('u') | KeyCode::Char('U') => &[
                     ActionChoice::UpdatePullRequest,
                     ActionChoice::PushPullRequest,
@@ -1359,6 +1391,7 @@ impl DashboardScreen {
         let fix_request = build_fix_request(row);
         let review_request = build_review_request(row);
         let bugkill_request = build_bugkill_request(row);
+        let develop_request = build_develop_request(row);
         let push_request = build_push_request(row);
         let close_request = build_close_request(row);
         self.reset_action_menu();
@@ -1415,6 +1448,12 @@ impl DashboardScreen {
                 self.mode = DashboardMode::Table;
                 bugkill_request
                     .map(|request| DashboardAction::Bugkill(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::DevelopPullRequest => {
+                self.mode = DashboardMode::Table;
+                develop_request
+                    .map(|request| DashboardAction::Develop(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
             ActionChoice::PushPullRequest => {
@@ -3203,6 +3242,24 @@ fn build_bugkill_request(row: &DashboardRow) -> Option<BugkillRequest> {
     })
 }
 
+/// Assemble the payload the "Develop" screen needs. Returns `None` only on
+/// the mother worktree — developing works on any other worktree, PR or not.
+fn build_develop_request(row: &DashboardRow) -> Option<DevelopRequest> {
+    if row.worktree.is_main {
+        return None;
+    }
+    let pr = row
+        .pull_request
+        .as_ref()
+        .filter(|pr| pr_accepts_lifecycle_commands(pr.state));
+    Some(DevelopRequest {
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+        number: pr.map(|pr| pr.number),
+        title: pr.map(|pr| pr.title.clone()),
+    })
+}
+
 /// Assemble the payload for the push-only flow. Returns `None` unless the
 /// row's PR is Open and the branch is ahead-but-not-behind — mirrors the
 /// `row_has_unpushed` guard in `build_action_select`. Reuses the
@@ -3552,6 +3609,18 @@ mod tests {
         }
     }
 
+    fn dashboard_row_with_pr(state: PrState, number: u64, title: &str) -> DashboardRow {
+        let mut pr = open_pr();
+        pr.state = state;
+        pr.number = number;
+        pr.title = title.to_string();
+        row(Some(pr), Some(branch_status(0, 0)))
+    }
+
+    fn dashboard_row_without_pr() -> DashboardRow {
+        row(None, Some(branch_status(0, 0)))
+    }
+
     fn pr_labels(row: &DashboardRow) -> Vec<String> {
         let screen = DashboardScreen::new(false, false, false, Vec::new(), Vec::new(), true);
         screen
@@ -3736,7 +3805,10 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(3, 0)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Explain", "Fix", "Review", "Bugkill", "Upload", "Merge", "Close"]
+            vec![
+                "Open", "Explain", "Fix", "Review", "Bugkill", "Develop", "Upload", "Merge",
+                "Close"
+            ]
         );
     }
 
@@ -3745,7 +3817,10 @@ mod tests {
         let r = row(Some(open_pr()), Some(branch_status(1, 3)));
         assert_eq!(
             pr_labels(&r),
-            vec!["Open", "Explain", "Fix", "Review", "Bugkill", "Update", "Merge", "Close"]
+            vec![
+                "Open", "Explain", "Fix", "Review", "Bugkill", "Develop", "Update", "Merge",
+                "Close"
+            ]
         );
     }
 
@@ -3770,11 +3845,11 @@ mod tests {
     }
 
     #[test]
-    fn pr_commands_without_pull_request_offer_only_bugkill() {
+    fn pr_commands_without_pull_request_offer_only_bugkill_and_develop() {
         // A non-main row with no PR now shows a PR-commands section
-        // containing just Bugkill (intended: a bug hunt needs no PR).
+        // containing just Bugkill + Develop (intended: neither needs a PR).
         let r = row(None, Some(branch_status(0, 0)));
-        assert_eq!(pr_labels(&r), ["Bugkill"]);
+        assert_eq!(pr_labels(&r), ["Bugkill", "Develop"]);
     }
 
     #[test]
@@ -3783,6 +3858,68 @@ mod tests {
         r.worktree.is_main = true;
         assert!(build_bugkill_request(&r).is_none());
         assert!(!pr_labels(&r).iter().any(|l| l == "Bugkill"));
+    }
+
+    #[test]
+    fn develop_button_absent_on_the_mother_worktree() {
+        let mut r = row(Some(open_pr()), Some(branch_status(0, 0)));
+        r.worktree.is_main = true;
+        assert!(build_develop_request(&r).is_none());
+        assert!(!pr_labels(&r).iter().any(|l| l == "Develop"));
+    }
+
+    #[test]
+    fn develop_request_includes_active_pr_metadata() {
+        for state in [PrState::Open, PrState::Draft] {
+            let row = dashboard_row_with_pr(state, 42, "Develop request title");
+
+            let request = build_develop_request(&row).expect("non-main worktree");
+
+            assert_eq!(request.number, Some(42));
+            assert_eq!(request.title.as_deref(), Some("Develop request title"));
+        }
+    }
+
+    #[test]
+    fn develop_request_omits_metadata_when_pr_is_absent() {
+        let row = dashboard_row_without_pr();
+
+        let request = build_develop_request(&row).expect("non-main worktree");
+
+        assert_eq!(request.number, None);
+        assert_eq!(request.title, None);
+    }
+
+    #[test]
+    fn develop_request_omits_terminal_pr_metadata() {
+        for state in [PrState::Closed, PrState::Merged] {
+            let row = dashboard_row_with_pr(state, 42, "Terminal PR");
+
+            let request = build_develop_request(&row).expect("non-main worktree");
+
+            assert_eq!(request.number, None);
+            assert_eq!(request.title, None);
+        }
+    }
+
+    #[test]
+    fn develop_shortcut_dispatches_develop_action() {
+        let base_row = row(Some(open_pr()), Some(branch_status(3, 0)));
+        for shortcut in ['d', 'D'] {
+            let mut screen = screen_with_row(base_row.clone());
+            screen.handle_key(key_event(KeyCode::Enter));
+            screen.handle_key(key_event(KeyCode::Tab));
+            let action = screen.handle_key(key_event(KeyCode::Char(shortcut)));
+            match action {
+                DashboardAction::Develop(request) => {
+                    assert_eq!(request.branch, "feature");
+                    assert_eq!(request.worktree_path, "/tmp/repo-feature");
+                    assert_eq!(request.number, Some(42));
+                }
+                other => panic!("expected Develop, got {other:?}"),
+            }
+            assert!(screen.pr_commands.is_empty());
+        }
     }
 
     #[test]
