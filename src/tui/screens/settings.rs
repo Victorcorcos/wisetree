@@ -21,8 +21,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::config::schema::{
-    AiBugkillConfig, AiConfig, AiFixConfig, AiModelConfig, AiReviewConfig, DashboardConfig,
-    LinkStrategy, NotificationsConfig, WorktreeConfig,
+    AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiModelConfig, AiReviewConfig,
+    DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig,
 };
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
@@ -1157,6 +1157,10 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
             fix: clean(&ai.bugkill.fix),
             judge: clean(&ai.bugkill.judge),
         },
+        develop: AiDevelopConfig {
+            plan: clean(&ai.develop.plan),
+            implement: clean(&ai.develop.implement),
+        },
     }
 }
 
@@ -1174,10 +1178,12 @@ pub enum AiSlot {
     BugkillInvestigate,
     BugkillFix,
     BugkillJudge,
+    DevelopPlan,
+    DevelopImplement,
 }
 
 impl AiSlot {
-    pub const ALL: [AiSlot; 10] = [
+    pub const ALL: [AiSlot; 12] = [
         AiSlot::Explain,
         AiSlot::FixPlan,
         AiSlot::FixApply,
@@ -1188,6 +1194,8 @@ impl AiSlot {
         AiSlot::BugkillInvestigate,
         AiSlot::BugkillFix,
         AiSlot::BugkillJudge,
+        AiSlot::DevelopPlan,
+        AiSlot::DevelopImplement,
     ];
 
     fn label(self) -> &'static str {
@@ -1202,6 +1210,8 @@ impl AiSlot {
             AiSlot::BugkillInvestigate => "bugkill_investigate",
             AiSlot::BugkillFix => "bugkill_fix",
             AiSlot::BugkillJudge => "bugkill_judge",
+            AiSlot::DevelopPlan => "develop_plan",
+            AiSlot::DevelopImplement => "develop_implement",
         }
     }
 
@@ -1227,6 +1237,13 @@ impl AiSlot {
             AiSlot::BugkillJudge => {
                 "Judges a freeform \"Other\" answer — fixed or not (Bugkill · judge)"
             }
+            AiSlot::DevelopPlan => {
+                "Plans the described task into PLAN.md sections — pick a stronger model \
+                 (Develop · plan)"
+            }
+            AiSlot::DevelopImplement => {
+                "Implements the approved plan section by section (Develop · implement)"
+            }
         }
     }
 
@@ -1242,6 +1259,8 @@ impl AiSlot {
             AiSlot::BugkillInvestigate => &ai.bugkill.investigate,
             AiSlot::BugkillFix => &ai.bugkill.fix,
             AiSlot::BugkillJudge => &ai.bugkill.judge,
+            AiSlot::DevelopPlan => &ai.develop.plan,
+            AiSlot::DevelopImplement => &ai.develop.implement,
         }
     }
 
@@ -1257,13 +1276,15 @@ impl AiSlot {
             AiSlot::BugkillInvestigate => &mut ai.bugkill.investigate,
             AiSlot::BugkillFix => &mut ai.bugkill.fix,
             AiSlot::BugkillJudge => &mut ai.bugkill.judge,
+            AiSlot::DevelopPlan => &mut ai.develop.plan,
+            AiSlot::DevelopImplement => &mut ai.develop.implement,
         }
     }
 }
 
-/// The ten leaf models in slot order — used by the dashboard `ai` summary and
+/// The twelve leaf models in slot order — used by the dashboard `ai` summary and
 /// the AI Settings editor.
-fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 10] {
+fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 12] {
     [
         &ai.explain,
         &ai.fix.plan,
@@ -1275,6 +1296,8 @@ fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 10] {
         &ai.bugkill.investigate,
         &ai.bugkill.fix,
         &ai.bugkill.judge,
+        &ai.develop.plan,
+        &ai.develop.implement,
     ]
 }
 
@@ -4647,11 +4670,22 @@ impl SettingsScreen {
             // show a compact "configured / total" summary rather than a single
             // model value (per-command models live on the sub-screen).
             let leaves = ai_slot_models(&editor.ai);
-            let configured = leaves.iter().filter(|m| !m.model.trim().is_empty()).count();
-            Line::from(Span::styled(
-                format!("{configured}/{} AI commands configured", leaves.len()),
-                Style::default().fg(colors::MUTED),
-            ))
+            let configured_models: Vec<&str> = leaves
+                .iter()
+                .map(|m| m.model.trim())
+                .filter(|m| !m.is_empty())
+                .collect();
+            let configured = configured_models.len();
+            let summary = if configured_models.is_empty() {
+                format!("{configured}/{} AI commands configured", leaves.len())
+            } else {
+                format!(
+                    "{configured}/{} AI commands configured: {}",
+                    leaves.len(),
+                    configured_models.join(", ")
+                )
+            };
+            Line::from(Span::styled(summary, Style::default().fg(colors::MUTED)))
         } else if value.is_empty() {
             let placeholder = Style::default()
                 .fg(colors::MUTED)
@@ -6034,6 +6068,8 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
 mod tests {
     use super::*;
     use crate::config::schema::{AiStatusConfig, WorktreeConfig};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
@@ -6080,6 +6116,72 @@ mod tests {
             .iter()
             .position(|candidate| *candidate == field)
             .expect("dashboard field exists")
+    }
+
+    /// Build a `WorktreeConfig` whose per-command AI model slots are all blank
+    /// so tests can selectively set the leaves they care about.
+    fn config_with_blank_ai_models() -> WorktreeConfig {
+        WorktreeConfig {
+            dashboard: DashboardConfig {
+                ai: AiConfig {
+                    explain: AiModelConfig::default(),
+                    fix: AiFixConfig {
+                        plan: AiModelConfig::default(),
+                        apply: AiModelConfig::default(),
+                    },
+                    review: AiReviewConfig {
+                        strong: AiModelConfig::default(),
+                        balanced: AiModelConfig::default(),
+                        utility: AiModelConfig::default(),
+                    },
+                    update: AiModelConfig::default(),
+                    bugkill: AiBugkillConfig {
+                        investigate: AiModelConfig::default(),
+                        fix: AiModelConfig::default(),
+                        judge: AiModelConfig::default(),
+                    },
+                    develop: AiDevelopConfig {
+                        plan: AiModelConfig::default(),
+                        implement: AiModelConfig::default(),
+                    },
+                },
+                ..DashboardConfig::default()
+            },
+            ..WorktreeConfig::default()
+        }
+    }
+
+    /// Render the Dashboard settings screen and return the text of the `ai`
+    /// summary rectangle.
+    fn render_dashboard_ai_summary(config: &WorktreeConfig) -> String {
+        let mut screen = SettingsScreen::new(config.clone(), "test.json".to_string());
+        screen.step = SettingsStep::Dashboard;
+        screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
+
+        let backend = TestBackend::new(120, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn dashboard_ai_summary_renders_both_develop_models() {
+        let mut config = config_with_blank_ai_models();
+        config.dashboard.ai.develop.plan.model = "develop-plan-model".to_string();
+        config.dashboard.ai.develop.implement.model = "develop-implement-model".to_string();
+
+        let rendered = render_dashboard_ai_summary(&config);
+
+        assert!(rendered.contains("develop-plan-model"));
+        assert!(rendered.contains("develop-implement-model"));
     }
 
     #[test]
@@ -6273,6 +6375,89 @@ mod tests {
                 assert_eq!(cfg.ai.fix.plan.thinking, "minimal");
                 // Untouched slots keep their per-command default.
                 assert_eq!(cfg.ai.explain.model, "opencode/deepseek-v4-flash-free");
+            }
+            other => panic!("expected SaveDashboard, got {other:?}"),
+        }
+    }
+
+    fn ai_settings_render_text(screen: &SettingsScreen) -> String {
+        let backend = TestBackend::new(120, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn assert_selected_slot_metadata(screen: &SettingsScreen, label: &str, description: &str) {
+        let text = ai_settings_render_text(screen);
+        assert!(
+            text.contains(label),
+            "expected label {label:?} in AI settings render:\n{text}"
+        );
+        assert!(
+            text.contains(description),
+            "expected description {description:?} in AI settings render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn develop_plan_slot_renders_and_saves_its_configuration() {
+        let mut screen = ai_settings_screen(vec![]);
+        let idx = AiSlot::ALL
+            .iter()
+            .position(|s| *s == AiSlot::DevelopPlan)
+            .unwrap();
+        focus_ai_slot(&mut screen, idx);
+
+        assert_selected_slot_metadata(
+            &screen,
+            "Develop · plan",
+            "Plans the described task into PLAN.md sections",
+        );
+
+        screen.apply_ai_selection("plan-model".to_string(), "high".to_string());
+        screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::Save;
+
+        match screen.handle_ai_settings(key(KeyCode::Enter)) {
+            SettingsAction::SaveDashboard(cfg) => {
+                assert_eq!(cfg.ai.develop.plan.model, "plan-model");
+                assert_eq!(cfg.ai.develop.plan.thinking, "high");
+                assert_ne!(cfg.ai.develop.implement.model, "plan-model");
+            }
+            other => panic!("expected SaveDashboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn develop_implement_slot_renders_and_saves_its_configuration() {
+        let mut screen = ai_settings_screen(vec![]);
+        let idx = AiSlot::ALL
+            .iter()
+            .position(|s| *s == AiSlot::DevelopImplement)
+            .unwrap();
+        focus_ai_slot(&mut screen, idx);
+
+        assert_selected_slot_metadata(
+            &screen,
+            "Develop · implement",
+            "Implements the approved plan section by section",
+        );
+
+        screen.apply_ai_selection("implement-model".to_string(), "medium".to_string());
+        screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::Save;
+
+        match screen.handle_ai_settings(key(KeyCode::Enter)) {
+            SettingsAction::SaveDashboard(cfg) => {
+                assert_eq!(cfg.ai.develop.implement.model, "implement-model");
+                assert_eq!(cfg.ai.develop.implement.thinking, "medium");
+                assert_ne!(cfg.ai.develop.plan.model, "implement-model");
             }
             other => panic!("expected SaveDashboard, got {other:?}"),
         }
@@ -6508,5 +6693,30 @@ mod tests {
             screen.ai_settings_editor.as_ref().unwrap().selection,
             AiSettingsSelection::Rect(2)
         );
+    }
+
+    #[test]
+    fn ai_settings_scrolls_to_keep_focused_slot_and_save_visible() {
+        let mut screen = ai_settings_screen(vec![]);
+        let develop_idx = AiSlot::ALL
+            .iter()
+            .position(|s| *s == AiSlot::DevelopImplement)
+            .unwrap();
+        focus_ai_slot(&mut screen, develop_idx);
+
+        let backend = TestBackend::new(80, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let dumped = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(dumped.contains("develop_implement"), "{dumped}");
+        assert!(dumped.contains("Save"), "{dumped}");
     }
 }

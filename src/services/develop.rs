@@ -1,0 +1,1188 @@
+//! Pure, synchronous Develop logic: the plan data model, the plan-contract
+//! parser, the `PLAN.md` renderer + resume parser, and the section-progress
+//! helpers. No I/O lives here — `DashboardService` owns every git/AI call and
+//! `App` owns the async orchestration, so everything in this module is
+//! unit-testable with plain strings.
+//!
+//! Token-efficiency invariant: the AI never reads or writes `PLAN.md`. The
+//! plan AI emits compact delimited blocks (parsed here), the harness holds
+//! the model in memory and re-renders the whole file from it after every
+//! mutation, and the implement AI receives only the section(s) it must build
+//! — progress tracking (checkboxes, the tracker table) is done in Rust.
+
+/// The rendered plan file — harness-owned output at the worktree root.
+pub const PLAN_FILE: &str = "PLAN.md";
+
+/// Maximum number of sections kept after a contract parse; overflow is
+/// dropped so a runaway plan cannot spawn an unbounded implement loop.
+pub const MAX_PLAN_SECTIONS: usize = 16;
+
+/// One implementation section of the plan. The `body` is the markdown block
+/// rendered under the section header (Goal / Files / Acceptance criteria /
+/// Edge cases), stored verbatim so render → parse round-trips exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSection {
+    /// 1-based, in dependency order.
+    pub number: usize,
+    /// Single-line section name shown in headers and the tracker.
+    pub name: String,
+    /// Markdown body under the header (goal, files, criteria checkboxes…).
+    pub body: String,
+    /// Marked by the harness once the section's implement run finishes.
+    pub done: bool,
+}
+
+/// The in-memory plan — the single source of truth `PLAN.md` is rendered
+/// from. Recovered from disk on Resume via [`parse_plan_md`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevelopPlan {
+    pub task_description: String,
+    /// Fibonacci-style complexity estimate in points.
+    pub complexity: u8,
+    /// A Mermaid `mindmap` body (raw, unfenced) surveying the whole task,
+    /// emitted by the plan AI only for significant work (complexity ≥ 5) and
+    /// rendered under the `## Overview` heading. `None` for smaller tasks.
+    pub overview: Option<String>,
+    pub sections: Vec<PlanSection>,
+    /// Cross-run learnings ledger — the Ralph-canon `fix_plan.md` discovery
+    /// log. Each implement run's closing summary is appended here by the
+    /// harness (never by the AI), so later runs and the human see what each
+    /// section reported. Rendered as `## Section Notes`; omitted when empty.
+    pub notes: Vec<String>,
+}
+
+impl DevelopPlan {
+    /// Index of the first section not yet implemented.
+    pub fn first_pending(&self) -> Option<usize> {
+        self.sections.iter().position(|s| !s.done)
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.sections.iter().filter(|s| !s.done).count()
+    }
+
+    /// Flip one section to done, checking off its `- [ ]` boxes so the
+    /// rendered file reads as completed without any AI involvement.
+    pub fn mark_done(&mut self, index: usize) {
+        if let Some(section) = self.sections.get_mut(index) {
+            section.done = true;
+            section.body = section.body.replace("- [ ]", "- [x]");
+        }
+    }
+
+    /// Append one run's closing summary to the notes ledger under `label`
+    /// (e.g. `Section 2` in Ralph mode, `All sections` for a single run), so
+    /// the log reads as a per-run history. Blank summaries are dropped
+    /// (nothing worth recording).
+    pub fn push_note(&mut self, label: &str, summary: &str) {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return;
+        }
+        self.notes.push(format!("{label}: {summary}"));
+    }
+}
+
+// ── Plan-contract parser ────────────────────────────────────────────────
+
+const TASK_OPEN: &str = "==== TASK ====";
+const OVERVIEW_OPEN: &str = "==== OVERVIEW ====";
+const SECTION_OPEN: &str = "==== SECTION ====";
+const BLOCK_CLOSE: &str = "==== END ====";
+
+/// Parse the plan AI's transcript into a [`DevelopPlan`]. One `TASK` block
+/// (description + complexity) must precede one `SECTION` block per section;
+/// text outside blocks (opencode transcript noise) is ignored. Returns
+/// `None` when the task block or any section field is missing or invalid —
+/// one invalid block invalidates the whole parse (triggering the caller's
+/// single corrective retry).
+pub fn parse_plan_transcript(transcript: &str) -> Option<DevelopPlan> {
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Task,
+        Overview,
+        Section,
+    }
+    let mut task: Option<(String, u8)> = None;
+    let mut overview: Option<String> = None;
+    let mut sections: Vec<PlanSection> = Vec::new();
+    let mut block: Option<(Kind, Vec<&str>)> = None;
+    for line in transcript.lines() {
+        let trimmed = line.trim();
+        match &mut block {
+            None => {
+                if trimmed == TASK_OPEN {
+                    block = Some((Kind::Task, Vec::new()));
+                } else if trimmed == OVERVIEW_OPEN {
+                    block = Some((Kind::Overview, Vec::new()));
+                } else if trimmed == SECTION_OPEN {
+                    block = Some((Kind::Section, Vec::new()));
+                }
+            }
+            Some((kind, lines)) => {
+                if trimmed == BLOCK_CLOSE {
+                    match *kind {
+                        Kind::Task => {
+                            // The task block must be the very first block.
+                            if task.is_some() || overview.is_some() || !sections.is_empty() {
+                                return None;
+                            }
+                            task = Some(parse_task_block(lines)?);
+                        }
+                        Kind::Overview => {
+                            // At most one overview, and it precedes the sections.
+                            if overview.is_some() || !sections.is_empty() {
+                                return None;
+                            }
+                            let body = lines.join("\n").trim().to_string();
+                            if body.is_empty() {
+                                return None;
+                            }
+                            overview = Some(body);
+                        }
+                        Kind::Section => {
+                            let mut section = parse_section_block(lines)?;
+                            section.number = sections.len() + 1;
+                            sections.push(section);
+                        }
+                    }
+                    block = None;
+                } else {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    // An unterminated block, a missing task block, or zero sections is a
+    // parse failure, not an empty success.
+    if block.is_some() || sections.is_empty() {
+        return None;
+    }
+    let (task_description, complexity) = task?;
+    sections.truncate(MAX_PLAN_SECTIONS);
+    for (idx, section) in sections.iter_mut().enumerate() {
+        section.number = idx + 1;
+    }
+    Some(DevelopPlan {
+        task_description,
+        complexity,
+        overview,
+        sections,
+        notes: Vec::new(),
+    })
+}
+
+/// Collect `KEY:`-prefixed multiline fields from a block's lines. Lines
+/// before the first key are tolerated as noise.
+fn parse_fields<const N: usize>(lines: &[&str], keys: [&str; N]) -> [Option<String>; N] {
+    let mut fields: [Option<String>; N] = std::array::from_fn(|_| None);
+    let mut current: Option<usize> = None;
+    for line in lines {
+        if let Some(idx) = keys.iter().position(|key| line.starts_with(key)) {
+            fields[idx] = Some(line[keys[idx].len()..].trim_start().to_string());
+            current = Some(idx);
+        } else if let Some(idx) = current {
+            let value = fields[idx].as_mut().expect("current field is set");
+            value.push('\n');
+            value.push_str(line);
+        }
+    }
+    fields
+}
+
+fn parse_task_block(lines: &[&str]) -> Option<(String, u8)> {
+    let [description, complexity] = parse_fields(lines, ["DESCRIPTION:", "COMPLEXITY:"]);
+    let description = description?.trim().to_string();
+    if description.is_empty() {
+        return None;
+    }
+    let complexity: u8 = complexity?.trim().parse().ok()?;
+    if !(1..=99).contains(&complexity) {
+        return None;
+    }
+    Some((description, complexity))
+}
+
+fn parse_section_block(lines: &[&str]) -> Option<PlanSection> {
+    let [name, goal, files, criteria, edge_cases] = parse_fields(
+        lines,
+        ["NAME:", "GOAL:", "FILES:", "CRITERIA:", "EDGE_CASES:"],
+    );
+    let name = name?.lines().next().unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let goal = goal?.trim().to_string();
+    if goal.is_empty() {
+        return None;
+    }
+    let criteria = criteria?;
+    let mut body = format!("**Goal**: {goal}\n");
+    if let Some(files) = files.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        body.push_str(&format!("**Files**: {files}\n"));
+    }
+    body.push_str("**Acceptance criteria**:\n");
+    let criteria_boxes = checkbox_lines(&criteria);
+    if criteria_boxes.is_empty() {
+        return None;
+    }
+    body.push_str(&criteria_boxes);
+    if let Some(edge_cases) = edge_cases
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        let boxes = checkbox_lines(edge_cases);
+        if !boxes.is_empty() {
+            body.push_str("**Edge cases**:\n");
+            body.push_str(&boxes);
+        }
+    }
+    Some(PlanSection {
+        number: 0, // assigned by the caller
+        name,
+        body: body.trim_end().to_string(),
+        done: false,
+    })
+}
+
+/// Turn a field's `- item` lines into `- [ ] item` checkbox lines (one per
+/// non-empty line; a missing `- ` prefix is added).
+fn checkbox_lines(field: &str) -> String {
+    let mut out = String::new();
+    for line in field.lines() {
+        let item = line.trim().trim_start_matches("- ").trim();
+        if item.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("- [ ] {item}\n"));
+    }
+    out
+}
+
+// ── PLAN.md renderer + resume parser ────────────────────────────────────
+
+const TASK_HEADING: &str = "## Task Description";
+const OVERVIEW_HEADING: &str = "## Overview";
+const SECTIONS_HEADING: &str = "## Implementation Sections";
+const TRACKER_HEADING: &str = "## Progress Tracker";
+const NOTES_HEADING: &str = "## Section Notes";
+const DONE_SUFFIX: &str = " ✅";
+const ESCAPED_DONE_SUFFIX: &str = " ✅<!-- wisetree:section-name -->";
+
+fn render_section_name(name: &str) -> String {
+    match name.strip_suffix(DONE_SUFFIX) {
+        Some(name) => format!("{name}{ESCAPED_DONE_SUFFIX}"),
+        None => name.to_string(),
+    }
+}
+
+/// Render the whole `PLAN.md` from the in-memory model. The harness rewrites
+/// the file with this after **every** mutation — the file is output for the
+/// human, never input for the AI.
+pub fn render_plan_md(plan: &DevelopPlan) -> String {
+    let mut out = format!(
+        "# Development Plan\n\n{TASK_HEADING}\n\n{}\n\n**Complexity**: {} points\n\n---\n\n",
+        plan.task_description.trim(),
+        plan.complexity
+    );
+    if let Some(overview) = &plan.overview {
+        out.push_str(&format!(
+            "{OVERVIEW_HEADING}\n\n```mermaid\n{}\n```\n\n---\n\n",
+            overview.trim()
+        ));
+    }
+    out.push_str(&format!("{SECTIONS_HEADING}\n"));
+    for section in &plan.sections {
+        let done = if section.done { DONE_SUFFIX } else { "" };
+        let name = render_section_name(&section.name);
+        out.push_str(&format!(
+            "\n#### Section {} — {}{done}\n{}\n\n---\n",
+            section.number, name, section.body
+        ));
+    }
+    out.push_str(&format!(
+        "\n{TRACKER_HEADING}\n\n| Section | Name | Status |\n|---------|------|--------|\n"
+    ));
+    for section in &plan.sections {
+        let status = if section.done {
+            "✅ Done"
+        } else {
+            "⬚ Pending"
+        };
+        out.push_str(&format!(
+            "| {} | {} | {status} |\n",
+            section.number, section.name
+        ));
+    }
+    if !plan.notes.is_empty() {
+        out.push_str(&format!("\n{NOTES_HEADING}\n\n"));
+        for note in &plan.notes {
+            out.push_str(&format!("- {note}\n"));
+        }
+    }
+    out
+}
+
+/// Resume parser. Accepts a file iff it contains the Task Description
+/// heading with a `**Complexity**: N points` line, the Implementation
+/// Sections heading with at least one `#### Section N — Name` header, and
+/// the Progress Tracker heading. Section done-state comes from the header's
+/// trailing ✅. Any violation → unparseable (`None`), which the preflight
+/// turns into the Overwrite/Cancel prompt.
+/// Round-trip property: `parse(render(plan)) == plan`.
+pub fn parse_plan_md(content: &str) -> Option<DevelopPlan> {
+    let lines: Vec<&str> = content.lines().collect();
+    let task_idx = lines.iter().position(|l| l.trim() == TASK_HEADING)?;
+    let sections_idx = lines.iter().position(|l| l.trim() == SECTIONS_HEADING)?;
+    let tracker_idx = lines.iter().position(|l| l.trim() == TRACKER_HEADING)?;
+    if !(task_idx < sections_idx && sections_idx < tracker_idx) {
+        return None;
+    }
+
+    // Task description: everything between the heading and the complexity
+    // line; the complexity line must sit before the sections heading.
+    let complexity_idx = lines[task_idx..sections_idx]
+        .iter()
+        .position(|l| l.trim().starts_with("**Complexity**:"))?
+        + task_idx;
+    let task_description = lines[task_idx + 1..complexity_idx]
+        .join("\n")
+        .trim()
+        .trim_end_matches("---")
+        .trim()
+        .to_string();
+    let complexity: u8 = lines[complexity_idx]
+        .trim()
+        .strip_prefix("**Complexity**:")?
+        .trim()
+        .strip_suffix("points")?
+        .trim()
+        .parse()
+        .ok()?;
+
+    // Overview: the optional `## Overview` heading between the complexity line
+    // and the sections, whose fenced `mermaid` block holds the mindmap body.
+    // Absent for small tasks.
+    let overview = parse_overview_section(&lines[complexity_idx..sections_idx]);
+
+    let mut sections: Vec<PlanSection> = Vec::new();
+    let mut cursor = sections_idx + 1;
+    while cursor < tracker_idx {
+        let line = lines[cursor].trim();
+        if let Some(rest) = line.strip_prefix("#### Section ") {
+            let (number_part, name_part) = rest.split_once(" — ")?;
+            let number: usize = number_part.trim().parse().ok()?;
+            let (name, done) = match name_part.strip_suffix(DONE_SUFFIX) {
+                Some(name) => (name, true),
+                None => (name_part, false),
+            };
+            let name = match name.strip_suffix(ESCAPED_DONE_SUFFIX) {
+                Some(name) => format!("{name}{DONE_SUFFIX}"),
+                None => name.to_string(),
+            };
+            // Body: lines until the `---` separator (or the tracker heading).
+            let mut end = cursor + 1;
+            while end < tracker_idx && lines[end].trim() != "---" {
+                end += 1;
+            }
+            let body = lines[cursor + 1..end].join("\n").trim().to_string();
+            sections.push(PlanSection {
+                number,
+                name: name.trim().to_string(),
+                body,
+                done,
+            });
+            cursor = end + 1;
+        } else {
+            cursor += 1;
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+
+    // Section Notes: an optional `## Section Notes` list after the tracker.
+    // Every `- ` bullet under it is one note; a missing heading = no notes.
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(notes_idx) = lines[tracker_idx..]
+        .iter()
+        .position(|l| l.trim() == NOTES_HEADING)
+    {
+        for line in &lines[tracker_idx + notes_idx + 1..] {
+            if let Some(note) = line.trim().strip_prefix("- ") {
+                notes.push(note.trim().to_string());
+            }
+        }
+    }
+
+    Some(DevelopPlan {
+        task_description,
+        complexity,
+        overview,
+        sections,
+        notes,
+    })
+}
+
+/// Recover the Mermaid mindmap body from a rendered plan's `## Overview`
+/// section: the lines between its ```` ```mermaid ```` fence and the closing
+/// ```` ``` ````. Returns `None` when the heading, either fence, or a
+/// non-empty body is missing — the inverse of [`render_plan_md`]'s overview
+/// rendering.
+fn parse_overview_section(lines: &[&str]) -> Option<String> {
+    let heading = lines.iter().position(|l| l.trim() == OVERVIEW_HEADING)?;
+    let fence_open = lines[heading + 1..]
+        .iter()
+        .position(|l| l.trim() == "```mermaid")?
+        + heading
+        + 1;
+    let fence_close = lines[fence_open + 1..]
+        .iter()
+        .position(|l| l.trim() == "```")?
+        + fence_open
+        + 1;
+    let body = lines[fence_open + 1..fence_close]
+        .join("\n")
+        .trim()
+        .to_string();
+    (!body.is_empty()).then_some(body)
+}
+
+// ── Prompt-side renderers ───────────────────────────────────────────────
+
+/// Compact contract-format rendering of the current plan, fed back to the
+/// plan AI on a revision (so it edits the existing plan instead of being
+/// re-told everything through prose). Each section body is converted back
+/// to the GOAL/FILES/CRITERIA/EDGE_CASES fields, so the payload satisfies
+/// the exact contract the plan AI is asked to emit.
+pub fn render_plan_contract(plan: &DevelopPlan) -> String {
+    let mut out = format!(
+        "{TASK_OPEN}\nDESCRIPTION: {}\nCOMPLEXITY: {}\n{BLOCK_CLOSE}\n",
+        plan.task_description.trim(),
+        plan.complexity
+    );
+    if let Some(overview) = &plan.overview {
+        out.push_str(&format!(
+            "{OVERVIEW_OPEN}\n{}\n{BLOCK_CLOSE}\n",
+            overview.trim()
+        ));
+    }
+    for section in &plan.sections {
+        let (goal, files, criteria, edge_cases) = split_body(&section.body);
+        out.push_str(&format!(
+            "{SECTION_OPEN}\nNAME: {}\nGOAL: {goal}\n",
+            section.name
+        ));
+        if let Some(files) = files {
+            out.push_str(&format!("FILES: {files}\n"));
+        }
+        out.push_str(&format!("CRITERIA: {}\n", dashed_list(&criteria)));
+        if !edge_cases.is_empty() {
+            out.push_str(&format!("EDGE_CASES: {}\n", dashed_list(&edge_cases)));
+        }
+        out.push_str(BLOCK_CLOSE);
+        out.push('\n');
+    }
+    out
+}
+
+/// Join list items as the contract's `- item` lines (the first item sits on
+/// the field's own line).
+fn dashed_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Split a rendered section body back into its
+/// (goal, files, criteria, edge cases) fields — the exact inverse of
+/// [`parse_section_block`]'s body construction. Checkbox state (`[ ]`/`[x]`)
+/// is dropped: progress lives in `done`, not in the revision payload.
+fn split_body(body: &str) -> (String, Option<String>, Vec<String>, Vec<String>) {
+    #[derive(PartialEq)]
+    enum Part {
+        Goal,
+        Files,
+        Criteria,
+        EdgeCases,
+    }
+    let mut goal = String::new();
+    let mut files: Option<String> = None;
+    let mut criteria: Vec<String> = Vec::new();
+    let mut edge_cases: Vec<String> = Vec::new();
+    let mut part: Option<Part> = None;
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("**Goal**:") {
+            goal = rest.trim().to_string();
+            part = Some(Part::Goal);
+        } else if let Some(rest) = line.strip_prefix("**Files**:") {
+            files = Some(rest.trim().to_string());
+            part = Some(Part::Files);
+        } else if line.trim() == "**Acceptance criteria**:" {
+            part = Some(Part::Criteria);
+        } else if line.trim() == "**Edge cases**:" {
+            part = Some(Part::EdgeCases);
+        } else {
+            match part {
+                Some(Part::Goal) => {
+                    goal.push('\n');
+                    goal.push_str(line);
+                }
+                Some(Part::Files) => {
+                    if let Some(files) = files.as_mut() {
+                        files.push('\n');
+                        files.push_str(line);
+                    }
+                }
+                Some(Part::Criteria) => criteria.push(strip_checkbox(line)),
+                Some(Part::EdgeCases) => edge_cases.push(strip_checkbox(line)),
+                None => {}
+            }
+        }
+    }
+    (goal, files, criteria, edge_cases)
+}
+
+fn strip_checkbox(line: &str) -> String {
+    line.trim()
+        .trim_start_matches("- [ ]")
+        .trim_start_matches("- [x]")
+        .trim()
+        .to_string()
+}
+
+/// The section block(s) embedded in one implement prompt: only the sections
+/// the run must build, nothing else (token-efficiency invariant).
+pub fn render_sections_for_prompt(sections: &[&PlanSection]) -> String {
+    let mut out = String::new();
+    for section in sections {
+        out.push_str(&format!(
+            "### Section {} — {}\n{}\n\n",
+            section.number, section.name, section.body
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// The whole-plan roadmap embedded in every implement prompt: one line per
+/// section (number, name, status), never the bodies — ~a dozen tokens each.
+/// Gives a run the overview it needs to stay in its lane: `done` work is
+/// already in the code, `THIS RUN` is its job, `later` belongs to a future
+/// run and must be left alone. `current` is the Ralph Loop target (`None` =
+/// a single run building every pending section).
+pub fn render_plan_outline(plan: &DevelopPlan, current: Option<usize>) -> String {
+    let mut out = String::new();
+    for (idx, section) in plan.sections.iter().enumerate() {
+        let status = if section.done {
+            "done"
+        } else if current.map_or(true, |c| c == idx) {
+            "THIS RUN"
+        } else {
+            "later"
+        };
+        out.push_str(&format!(
+            "{}. {} — {status}\n",
+            section.number, section.name
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+// ── Section-notes summarizer ────────────────────────────────────────────
+
+/// Max chars kept from an implement run's closing summary before it lands
+/// in the notes ledger. Keeps `## Section Notes` a scannable one-liner list.
+const NOTE_MAX_CHARS: usize = 200;
+
+/// Distill an implement run's transcript into the one-line summary the
+/// prompt asks for at the end ("state in one short line what you
+/// implemented"). Takes the last non-empty line — that closing line is the
+/// run's own report — collapses internal whitespace, strips a leading
+/// markdown bullet/quote marker, and clips to [`NOTE_MAX_CHARS`]. Returns
+/// `None` when the transcript holds nothing usable, so the caller records
+/// no note rather than an empty one. Zero AI tokens: this is the run's
+/// existing output, not a fresh call.
+pub fn summarize_transcript(transcript: &str) -> Option<String> {
+    let last = transcript.lines().rev().find(|l| !l.trim().is_empty())?;
+    let collapsed = last.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = collapsed
+        .trim_start_matches(['-', '*', '>', '#', ' '])
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.chars().count() <= NOTE_MAX_CHARS {
+        return Some(cleaned.to_string());
+    }
+    let head: String = cleaned.chars().take(NOTE_MAX_CHARS).collect();
+    Some(format!("{head}…"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_transcript_keeps_summary_at_character_limit() {
+        let summary = "a".repeat(NOTE_MAX_CHARS);
+
+        assert_eq!(summarize_transcript(&summary), Some(summary));
+    }
+
+    #[test]
+    fn summarize_transcript_retains_exact_character_limit_before_ellipsis() {
+        let summary = "a".repeat(NOTE_MAX_CHARS + 1);
+        let expected = format!("{}…", "a".repeat(NOTE_MAX_CHARS));
+
+        assert_eq!(summarize_transcript(&summary), Some(expected));
+    }
+
+    fn section(number: usize, name: &str, done: bool) -> PlanSection {
+        PlanSection {
+            number,
+            name: name.to_string(),
+            body: format!(
+                "**Goal**: goal for {name}\n**Files**: src/{name}.rs\n\
+                 **Acceptance criteria**:\n- [ ] criterion a\n- [ ] criterion b\n\
+                 **Edge cases**:\n- [ ] empty input"
+            ),
+            done,
+        }
+    }
+
+    fn plan() -> DevelopPlan {
+        DevelopPlan {
+            task_description: "Add CSV export.\nWith a --csv flag.".to_string(),
+            complexity: 5,
+            overview: None,
+            sections: vec![
+                section(1, "Data model", true),
+                section(2, "Exporter", false),
+                section(3, "CLI flag", false),
+            ],
+            notes: Vec::new(),
+        }
+    }
+
+    const MINDMAP: &str = "\
+mindmap
+  root((CSV export))
+    Backend
+      Model
+        Record type
+    CLI
+      Flag
+        --csv parsing
+    Publish
+      Docs";
+
+    // ── contract parser ─────────────────────────────────────────────────
+
+    #[test]
+    fn parses_task_and_sections_with_noise() {
+        let transcript = "\
+opencode banner noise
+==== TASK ====
+DESCRIPTION: Add CSV export
+ across two lines
+COMPLEXITY: 5
+==== END ====
+chatter
+==== SECTION ====
+NAME: Data model
+GOAL: Introduce the record type
+FILES: src/model.rs
+CRITERIA: - record struct exists
+- serializes to csv row
+EDGE_CASES: - empty record list
+==== END ====
+==== SECTION ====
+NAME: CLI flag
+GOAL: Wire --csv
+FILES: src/cli.rs
+CRITERIA: flag parses
+EDGE_CASES:
+==== END ====
+trailing noise";
+        let plan = parse_plan_transcript(transcript).expect("parses");
+        assert_eq!(plan.task_description, "Add CSV export\n across two lines");
+        assert_eq!(plan.complexity, 5);
+        assert_eq!(plan.sections.len(), 2);
+        assert_eq!(plan.sections[0].number, 1);
+        assert_eq!(plan.sections[0].name, "Data model");
+        assert!(plan.sections[0]
+            .body
+            .contains("**Goal**: Introduce the record type"));
+        assert!(plan.sections[0].body.contains("**Files**: src/model.rs"));
+        assert!(plan.sections[0].body.contains("- [ ] record struct exists"));
+        assert!(plan.sections[0]
+            .body
+            .contains("- [ ] serializes to csv row"));
+        assert!(plan.sections[0].body.contains("**Edge cases**:"));
+        assert!(plan.sections[0].body.contains("- [ ] empty record list"));
+        // Bare criteria lines gain the checkbox prefix; empty edge cases are
+        // omitted entirely.
+        assert!(plan.sections[1].body.contains("- [ ] flag parses"));
+        assert!(!plan.sections[1].body.contains("**Edge cases**"));
+        assert_eq!(plan.sections[1].number, 2);
+        assert!(plan.first_pending() == Some(0));
+        // No overview block was present, so none is recorded.
+        assert_eq!(plan.overview, None);
+    }
+
+    #[test]
+    fn parses_optional_overview_block_preserving_indentation() {
+        let transcript = format!(
+            "==== TASK ====\nDESCRIPTION: d\nCOMPLEXITY: 8\n==== END ====\n\
+             ==== OVERVIEW ====\n{MINDMAP}\n==== END ====\n\
+             ==== SECTION ====\nNAME: a\nGOAL: g\nCRITERIA: - c\n==== END ====\n"
+        );
+        let plan = parse_plan_transcript(&transcript).expect("parses");
+        assert_eq!(plan.overview.as_deref(), Some(MINDMAP));
+        // Sections still parse normally after the overview block.
+        assert_eq!(plan.sections.len(), 1);
+        assert_eq!(plan.sections[0].number, 1);
+    }
+
+    #[test]
+    fn overview_after_a_section_or_duplicated_fails() {
+        // Overview must precede the sections.
+        let out_of_order = "\
+==== TASK ====
+DESCRIPTION: d
+COMPLEXITY: 8
+==== END ====
+==== SECTION ====
+NAME: a
+GOAL: g
+CRITERIA: - c
+==== END ====
+==== OVERVIEW ====
+mindmap
+  root((x))
+==== END ====";
+        assert_eq!(parse_plan_transcript(out_of_order), None);
+        // An empty overview body is a parse failure, not a silent omission.
+        let empty_overview = "\
+==== TASK ====
+DESCRIPTION: d
+COMPLEXITY: 8
+==== END ====
+==== OVERVIEW ====
+==== END ====
+==== SECTION ====
+NAME: a
+GOAL: g
+CRITERIA: - c
+==== END ====";
+        assert_eq!(parse_plan_transcript(empty_overview), None);
+    }
+
+    #[test]
+    fn missing_task_block_or_sections_fails() {
+        let no_task = "\
+==== SECTION ====
+NAME: a
+GOAL: g
+CRITERIA: - c
+==== END ====";
+        assert_eq!(parse_plan_transcript(no_task), None);
+        let no_sections = "\
+==== TASK ====
+DESCRIPTION: d
+COMPLEXITY: 3
+==== END ====";
+        assert_eq!(parse_plan_transcript(no_sections), None);
+        assert_eq!(parse_plan_transcript(""), None);
+    }
+
+    #[test]
+    fn invalid_complexity_name_or_criteria_fails() {
+        let template = "\
+==== TASK ====
+DESCRIPTION: d
+COMPLEXITY: 5
+==== END ====
+==== SECTION ====
+NAME: a
+GOAL: g
+CRITERIA: - c
+==== END ====";
+        assert!(parse_plan_transcript(template).is_some());
+        let bad_complexity = template.replace("COMPLEXITY: 5", "COMPLEXITY: huge");
+        assert_eq!(parse_plan_transcript(&bad_complexity), None);
+        let zero_complexity = template.replace("COMPLEXITY: 5", "COMPLEXITY: 0");
+        assert_eq!(parse_plan_transcript(&zero_complexity), None);
+        let empty_name = template.replace("NAME: a", "NAME:");
+        assert_eq!(parse_plan_transcript(&empty_name), None);
+        let empty_criteria = template.replace("CRITERIA: - c", "CRITERIA:");
+        assert_eq!(parse_plan_transcript(&empty_criteria), None);
+    }
+
+    #[test]
+    fn unterminated_block_fails() {
+        let transcript = "\
+==== TASK ====
+DESCRIPTION: d
+COMPLEXITY: 3
+==== END ====
+==== SECTION ====
+NAME: a
+GOAL: g
+CRITERIA: - c";
+        assert_eq!(parse_plan_transcript(transcript), None);
+    }
+
+    #[test]
+    fn overflow_sections_are_truncated_and_renumbered() {
+        let mut transcript =
+            String::from("==== TASK ====\nDESCRIPTION: d\nCOMPLEXITY: 8\n==== END ====\n");
+        for i in 0..20 {
+            transcript.push_str(&format!(
+                "==== SECTION ====\nNAME: s{i}\nGOAL: g\nCRITERIA: - c\n==== END ====\n"
+            ));
+        }
+        let plan = parse_plan_transcript(&transcript).expect("parses");
+        assert_eq!(plan.sections.len(), MAX_PLAN_SECTIONS);
+        assert_eq!(plan.sections.last().unwrap().number, MAX_PLAN_SECTIONS);
+    }
+
+    // ── render / parse round-trip ───────────────────────────────────────
+
+    #[test]
+    fn render_then_parse_round_trips() {
+        let plan = plan();
+        let rendered = render_plan_md(&plan);
+        let parsed = parse_plan_md(&rendered).expect("round-trip parses");
+        assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn overview_renders_under_heading_and_round_trips() {
+        let mut plan = plan();
+        plan.overview = Some(MINDMAP.to_string());
+        let rendered = render_plan_md(&plan);
+        // The mindmap lands in a fenced mermaid block under `## Overview`,
+        // ahead of the implementation sections.
+        assert!(
+            rendered.contains("## Overview\n\n```mermaid\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  root((CSV export))"), "{rendered}");
+        assert!(
+            rendered.find("## Overview").unwrap()
+                < rendered.find("## Implementation Sections").unwrap(),
+            "{rendered}"
+        );
+        let parsed = parse_plan_md(&rendered).expect("round-trip parses");
+        assert_eq!(parsed, plan);
+        assert_eq!(parsed.overview.as_deref(), Some(MINDMAP));
+    }
+
+    #[test]
+    fn absent_overview_omits_the_heading_and_round_trips() {
+        let rendered = render_plan_md(&plan());
+        assert!(!rendered.contains("## Overview"), "{rendered}");
+        assert!(!rendered.contains("```mermaid"), "{rendered}");
+        assert_eq!(parse_plan_md(&rendered).unwrap().overview, None);
+    }
+
+    #[test]
+    fn plan_round_trip_preserves_pending_name_ending_in_done_suffix() {
+        let mut plan = plan();
+        plan.sections[1].name = "Verification ✅".to_string();
+        let parsed = parse_plan_md(&render_plan_md(&plan)).expect("round-trip parses");
+        assert_eq!(parsed.sections[1].name, "Verification ✅");
+        assert!(!parsed.sections[1].done);
+    }
+
+    #[test]
+    fn plan_round_trip_preserves_completed_name_ending_in_done_suffix() {
+        let mut plan = plan();
+        plan.sections[1].name = "Verification ✅".to_string();
+        plan.sections[1].done = true;
+        let parsed = parse_plan_md(&render_plan_md(&plan)).expect("round-trip parses");
+        assert_eq!(parsed.sections[1].name, "Verification ✅");
+        assert!(parsed.sections[1].done);
+    }
+
+    #[test]
+    fn section_notes_render_and_round_trip() {
+        let mut plan = plan();
+        plan.push_note("Section 1", "Added the record type; 3 tests green.");
+        plan.push_note("Section 2", "Wired --csv; reused existing writer.");
+        let rendered = render_plan_md(&plan);
+        assert!(rendered.contains("## Section Notes"), "{rendered}");
+        assert!(
+            rendered.contains("- Section 1: Added the record type; 3 tests green."),
+            "{rendered}"
+        );
+        let parsed = parse_plan_md(&rendered).expect("round-trip parses");
+        assert_eq!(parsed, plan);
+        assert_eq!(parsed.notes.len(), 2);
+    }
+
+    #[test]
+    fn empty_notes_omit_the_heading() {
+        let rendered = render_plan_md(&plan());
+        assert!(!rendered.contains("## Section Notes"), "{rendered}");
+        assert!(parse_plan_md(&rendered).unwrap().notes.is_empty());
+    }
+
+    #[test]
+    fn push_note_prefixes_label_and_drops_blank_summaries() {
+        let mut plan = plan();
+        plan.push_note("Section 2", "  did the thing  ");
+        plan.push_note("Section 3", "   ");
+        plan.push_note("All sections", "one-shot run");
+        assert_eq!(
+            plan.notes,
+            vec![
+                "Section 2: did the thing".to_string(),
+                "All sections: one-shot run".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn summarize_transcript_takes_the_last_meaningful_line() {
+        let transcript = "\
+Reading files...
+Editing src/model.rs
+- Implemented the CSV record type and its serializer; all tests pass.
+";
+        assert_eq!(
+            summarize_transcript(transcript).as_deref(),
+            Some("Implemented the CSV record type and its serializer; all tests pass.")
+        );
+        // Whitespace-only / empty transcripts yield nothing to record.
+        assert_eq!(summarize_transcript("   \n\n"), None);
+        assert_eq!(summarize_transcript(""), None);
+        // Internal whitespace is collapsed and long lines are clipped.
+        let long = format!("done: {}", "x".repeat(400));
+        let summary = summarize_transcript(&long).unwrap();
+        assert!(summary.ends_with('…'));
+        assert!(summary.chars().count() <= NOTE_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn render_marks_done_sections_in_header_and_tracker() {
+        let rendered = render_plan_md(&plan());
+        assert!(
+            rendered.contains("#### Section 1 — Data model ✅"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("#### Section 2 — Exporter\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("| 1 | Data model | ✅ Done |"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("| 2 | Exporter | ⬚ Pending |"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn mark_done_checks_the_boxes_and_advances_first_pending() {
+        let mut plan = plan();
+        assert_eq!(plan.first_pending(), Some(1));
+        assert_eq!(plan.pending_count(), 2);
+        plan.mark_done(1);
+        assert!(plan.sections[1].done);
+        assert!(plan.sections[1].body.contains("- [x] criterion a"));
+        assert!(!plan.sections[1].body.contains("- [ ]"));
+        assert_eq!(plan.first_pending(), Some(2));
+        plan.mark_done(2);
+        assert_eq!(plan.first_pending(), None);
+        assert_eq!(plan.pending_count(), 0);
+    }
+
+    #[test]
+    fn parser_rejects_foreign_documents() {
+        assert_eq!(parse_plan_md("# Some other doc"), None);
+        assert_eq!(
+            parse_plan_md("## Task Description\n\nx\n\n**Complexity**: 3 points"),
+            None
+        );
+        // Headings in the wrong order.
+        let scrambled = "\
+## Progress Tracker
+## Task Description
+x
+**Complexity**: 3 points
+## Implementation Sections
+#### Section 1 — a
+body";
+        assert_eq!(parse_plan_md(scrambled), None);
+    }
+
+    #[test]
+    fn resume_parser_rejects_malformed_plans() {
+        let malformed_plans = [
+            (
+                "malformed complexity",
+                r#"# Develop Plan
+## Task Description
+Implement the feature.
+**Complexity**: unknown points
+## Implementation Sections
+#### Section 1 — Implement
+Make the change.
+---
+## Progress Tracker
+"#,
+            ),
+            (
+                "invalid section number",
+                r#"# Develop Plan
+## Task Description
+Implement the feature.
+**Complexity**: 2 points
+## Implementation Sections
+#### Section one — Implement
+Make the change.
+---
+## Progress Tracker
+"#,
+            ),
+            (
+                "invalid section delimiter",
+                r#"# Develop Plan
+## Task Description
+Implement the feature.
+**Complexity**: 2 points
+## Implementation Sections
+#### Section 1 - Implement
+Make the change.
+---
+## Progress Tracker
+"#,
+            ),
+            (
+                "no implementation sections",
+                r#"# Develop Plan
+## Task Description
+Implement the feature.
+**Complexity**: 2 points
+## Implementation Sections
+## Progress Tracker
+"#,
+            ),
+        ];
+
+        for (case, contents) in malformed_plans {
+            assert!(
+                parse_plan_md(contents).is_none(),
+                "expected {case} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_reads_done_state_from_the_header_suffix() {
+        let mut plan = plan();
+        plan.mark_done(1);
+        plan.mark_done(2);
+        let parsed = parse_plan_md(&render_plan_md(&plan)).expect("parses");
+        assert_eq!(
+            parsed.sections.iter().map(|s| s.done).collect::<Vec<_>>(),
+            vec![true, true, true]
+        );
+    }
+
+    // ── prompt-side renderers ───────────────────────────────────────────
+
+    #[test]
+    fn plan_contract_round_trips_through_the_transcript_parser() {
+        // The compact revision payload must itself satisfy the contract the
+        // plan AI is asked to emit, so a revision run starts from parity.
+        let mut plan = plan();
+        plan.mark_done(0);
+        plan.sections[1].body =
+            "**Goal**: goal for Exporter\n**Acceptance criteria**:\n- [ ] criterion a".to_string();
+        let contract = render_plan_contract(&plan);
+        let reparsed = parse_plan_transcript(&contract).expect("contract parses");
+        assert_eq!(reparsed.task_description, plan.task_description);
+        assert_eq!(reparsed.complexity, plan.complexity);
+        assert_eq!(reparsed.sections.len(), plan.sections.len());
+        assert_eq!(
+            reparsed.sections[0].body,
+            concat!(
+                "**Goal**: goal for Data model\n",
+                "**Files**: src/Data model.rs\n",
+                "**Acceptance criteria**:\n",
+                "- [ ] criterion a\n",
+                "- [ ] criterion b\n",
+                "**Edge cases**:\n",
+                "- [ ] empty input"
+            )
+        );
+        assert_eq!(
+            reparsed.sections[1].body,
+            concat!(
+                "**Goal**: goal for Exporter\n",
+                "**Acceptance criteria**:\n",
+                "- [ ] criterion a"
+            )
+        );
+    }
+
+    #[test]
+    fn plan_contract_carries_the_overview_across_a_revision() {
+        // On a revision the compact payload must re-emit the mindmap so the
+        // plan AI edits it rather than losing it.
+        let mut plan = plan();
+        plan.overview = Some(MINDMAP.to_string());
+        let contract = render_plan_contract(&plan);
+        assert!(
+            contract.contains("==== OVERVIEW ====\nmindmap\n"),
+            "{contract}"
+        );
+        let reparsed = parse_plan_transcript(&contract).expect("contract parses");
+        assert_eq!(reparsed.overview.as_deref(), Some(MINDMAP));
+    }
+
+    #[test]
+    fn plan_outline_marks_done_this_run_and_later() {
+        let mut plan = plan();
+        plan.mark_done(0);
+        // Ralph Loop: section 2 is the target; section 3 stays "later".
+        let outline = render_plan_outline(&plan, Some(1));
+        assert_eq!(
+            outline,
+            "1. Data model — done\n2. Exporter — THIS RUN\n3. CLI flag — later"
+        );
+        // Single run: every pending section is "THIS RUN".
+        let outline = render_plan_outline(&plan, None);
+        assert_eq!(
+            outline,
+            "1. Data model — done\n2. Exporter — THIS RUN\n3. CLI flag — THIS RUN"
+        );
+        // The outline never leaks section bodies.
+        assert!(!outline.contains("Goal"));
+        assert!(!outline.contains("criterion"));
+    }
+
+    #[test]
+    fn sections_for_prompt_contain_only_the_given_sections() {
+        let plan = plan();
+        let one = render_sections_for_prompt(&[&plan.sections[1]]);
+        assert!(one.contains("### Section 2 — Exporter"), "{one}");
+        assert!(one.contains("goal for Exporter"), "{one}");
+        assert!(one.contains("src/Exporter.rs"), "{one}");
+        assert!(one.contains("criterion a"), "{one}");
+        assert!(!one.contains("Data model"), "{one}");
+        assert!(!one.contains("CLI flag"), "{one}");
+        let all: Vec<&PlanSection> = plan.sections.iter().collect();
+        let block = render_sections_for_prompt(&all);
+        assert!(block.contains("### Section 1"));
+        assert!(block.contains("### Section 3"));
+    }
+}
