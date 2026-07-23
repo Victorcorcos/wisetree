@@ -10,7 +10,7 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-use wisetree::config::schema::DashboardConfig;
+use wisetree::config::schema::{AiHarness, DashboardConfig};
 use wisetree::services::bugkill::{
     compute_attempt_changes, render_investigation_md, BugHypothesis, EvidenceQuality,
 };
@@ -94,6 +94,24 @@ impl Fixture {
         DashboardService::new(self.repo.clone(), DashboardConfig::default())
             .with_cache_path(None)
             .with_opencode_binary(self.opencode.clone())
+    }
+
+    fn service_with_harness(&self, harness: AiHarness) -> DashboardService {
+        let mut config = DashboardConfig::default();
+        let model = match harness {
+            AiHarness::OpenCode | AiHarness::Codex => "openai/gpt-5.6-terra",
+            AiHarness::ClaudeCode => "anthropic/claude-sonnet-4-5",
+        }
+        .to_string();
+        config.ai.bugkill.investigate.model = model.clone();
+        config.ai.bugkill.fix.model = model.clone();
+        config.ai.bugkill.judge.model = model;
+        config.ai.bugkill.investigate.harness = harness;
+        config.ai.bugkill.fix.harness = harness;
+        config.ai.bugkill.judge.harness = harness;
+        DashboardService::new(self.repo.clone(), config)
+            .with_cache_path(None)
+            .with_ai_binary(harness, self.opencode.clone())
     }
 
     fn repo_str(&self) -> &str {
@@ -416,4 +434,86 @@ async fn unverdicted_sha_is_none_when_no_attempt_commit_exists() {
         },
         other => panic!("expected Ready, got {other:?}"),
     }
+}
+
+// ── configured harness execution ────────────────────────────────────────
+
+#[tokio::test]
+async fn bugkill_uses_each_configured_harness_for_investigation_and_fix() {
+    let fx = Fixture::new();
+    let row = fx.hypothesis(false, None);
+
+    for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
+        let service = fx.service_with_harness(harness);
+        let investigate = service
+            .prepare_bugkill_investigate(fx.repo_str(), "Saving crashes.", None, false)
+            .unwrap();
+        assert_eq!(investigate.harness, harness);
+
+        let fix = service
+            .prepare_bugkill_fix(fx.repo_str(), "Saving crashes.", &row, None)
+            .await
+            .unwrap();
+        assert_eq!(fix.harness, harness);
+
+        match harness {
+            AiHarness::OpenCode => {
+                assert!(investigate
+                    .command
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--agent", "plan"]));
+                assert!(!fix.command.args.iter().any(|arg| arg == "--agent"));
+            }
+            AiHarness::Codex => {
+                assert!(investigate
+                    .command
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--sandbox", "read-only"]));
+                assert!(fix.command.args.iter().any(|arg| arg == "--full-auto"));
+            }
+            AiHarness::ClaudeCode => {
+                assert!(investigate
+                    .command
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--permission-mode", "plan"]));
+                assert!(fix
+                    .command
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--permission-mode", "acceptEdits"]));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_judge_output_is_unclear_but_execution_failure_is_actionable() {
+    let fx = Fixture::new();
+    let row = fx.hypothesis(true, None);
+    let judge = fx._parent.path().join("bin/judge");
+    fs::write(
+        &judge,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.214'; exit 0; fi\necho 'not a verdict'\n",
+    )
+    .unwrap();
+    make_executable(&judge);
+
+    let service = fx
+        .service_with_harness(AiHarness::Codex)
+        .with_ai_binary(AiHarness::Codex, judge);
+    let verdict = service
+        .bugkill_judge(fx.repo_str(), &row, "It still crashes.")
+        .await
+        .unwrap();
+    assert_eq!(verdict.result, wisetree::services::JudgeResult::Unclear);
+
+    let failed = fx
+        .service_with_harness(AiHarness::Codex)
+        .with_ai_binary(AiHarness::Codex, fx._parent.path().join("bin/missing"))
+        .bugkill_judge(fx.repo_str(), &row, "It still crashes.")
+        .await;
+    assert!(failed.is_err());
 }

@@ -8,11 +8,10 @@
 //!   (no parseable `BUG_INVESTIGATION.md`, or Start fresh / Overwrite).
 //! - `Working`     : quiet spinner covering every captured / deterministic
 //!   phase (preflight, snapshots, commit, revert, judge).
-//! - `Investigating`: the embedded opencode **TUI** (AI Activity panel,
-//!   read-only Plan agent) showing the investigation live. The TUI never
-//!   exits on its own, so the App watches opencode's database with an
-//!   `OpencodeTurnWatcher` and advances automatically when the turn
-//!   completes, reading the transcript from that database too.
+//! - `Investigating`: the embedded configured AI harness (AI Activity panel,
+//!   read-only Plan agent) showing the investigation live. The App watches
+//!   the selected harness transcript and advances automatically when the turn
+//!   completes.
 //! - `ResumePrompt`: native buttons for the three preflight prompts —
 //!   leftover-attempt recovery, Resume / Start fresh, Overwrite / Cancel.
 //! - `Select`      : the ranked-causes table + detail panel; ↑/↓ skip
@@ -444,15 +443,14 @@ impl BugkillPullRequestScreen {
         self.pre_snapshot = Some(snapshot);
     }
 
-    /// Show the AI Activity panel for the live investigation; the App then
-    /// spawns the captured `opencode run` PTY. `corrective` marks the
+    /// Show the AI Activity panel for the live investigation. `corrective` marks the
     /// single stricter-contract retry after a parse failure.
     pub fn start_investigating(&mut self, corrective: bool) {
         self.step = BugkillStep::Investigating;
         self.phase_message = if corrective {
             "Investigation output could not be parsed — retrying once...".to_string()
         } else {
-            "Investigating the bug with opencode...".to_string()
+            "Investigating the bug with AI...".to_string()
         };
         self.investigate_corrective = corrective;
         self.ai_done = false;
@@ -482,7 +480,7 @@ impl BugkillPullRequestScreen {
         self.finalize_confirm = None;
     }
 
-    /// Spawn opencode inside the embedded PTY. A spawn failure surfaces as
+    /// Spawn the selected AI harness inside the embedded PTY. A spawn failure surfaces as
     /// an error notice.
     pub fn spawn_opencode_pty(
         &mut self,
@@ -493,28 +491,26 @@ impl BugkillPullRequestScreen {
     ) {
         match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
             Ok(pty) => self.pty = Some(pty),
-            Err(err) => self.set_error(format!("Could not spawn opencode in PTY: {err}")),
+            Err(err) => self.set_error(format!("Could not spawn AI CLI in PTY: {err}")),
         }
     }
 
-    /// Poll the embedded PTY for child exit and resize it. Returns `true`
-    /// exactly once — on the tick opencode exits — so the App can scan +
-    /// commit the attempt.
-    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> bool {
-        let Some(pty) = self.pty.as_mut() else {
-            return false;
-        };
+    /// Poll the embedded PTY for child exit and resize it. Returns its exit
+    /// code exactly once so callers only scan and commit successful fixes.
+    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> Option<i32> {
+        let pty = self.pty.as_mut()?;
         if let Some((rows, cols)) = panel_inner {
             pty.resize(rows, cols);
         }
         if pty.poll_exited() {
             if self.ai_done {
-                return false;
+                return None;
             }
             self.ai_done = true;
-            return true;
+            // An unavailable status is not evidence of a successful fix.
+            return Some(pty.exit_code().unwrap_or(-1));
         }
-        false
+        None
     }
 
     /// Tear the PTY down (Esc-abort path).

@@ -1578,6 +1578,8 @@ pub struct DashboardService {
     /// Path to the `opencode` binary. Production points at the resolved
     /// name on PATH; tests can swap in a deterministic local stub.
     opencode_binary: PathBuf,
+    codex_binary: PathBuf,
+    claude_binary: PathBuf,
     cache_path: Option<PathBuf>,
     pr_state: Arc<Mutex<PrCacheState>>,
     ai_status: AiStatusService,
@@ -1606,6 +1608,8 @@ impl DashboardService {
             git_binary,
             gh_binary,
             opencode_binary: PathBuf::from(crate::constants::OPENCODE_CLI_BINARY),
+            codex_binary: PathBuf::from("codex"),
+            claude_binary: PathBuf::from("claude"),
             cache_path: Some(dashboard_pr_cache_file()),
             pr_state: Arc::new(Mutex::new(PrCacheState::default())),
             ai_status,
@@ -1652,11 +1656,25 @@ impl DashboardService {
         self
     }
 
+    /// Override one configured AI harness binary. This keeps provider-specific
+    /// execution testable without changing the persisted harness selection.
+    pub fn with_ai_binary(mut self, harness: AiHarness, binary: PathBuf) -> Self {
+        match harness {
+            AiHarness::OpenCode => self.opencode_binary = binary,
+            AiHarness::Codex => self.codex_binary = binary,
+            AiHarness::ClaudeCode => self.claude_binary = binary,
+        }
+        self
+    }
+
     /// Builds a CLI invocation from the selected harness without changing the
     /// dashboard status detector configuration. The legacy handoff fields keep
     /// the current TUI/PTY plumbing stable while their values are now neutral.
     fn ai_runner(&self) -> AiRunner {
-        AiRunner::default().with_binary(AiHarness::OpenCode, self.opencode_binary.clone())
+        AiRunner::default()
+            .with_binary(AiHarness::OpenCode, self.opencode_binary.clone())
+            .with_binary(AiHarness::Codex, self.codex_binary.clone())
+            .with_binary(AiHarness::ClaudeCode, self.claude_binary.clone())
     }
 
     async fn ai_command(
@@ -4248,17 +4266,31 @@ impl DashboardService {
     // scans, commits, reverts, cleanup — is deterministic git work below.
     // No `gh`, no pushes anywhere in this pipeline.
 
-    /// Deterministic Bugkill pre-flight: model + opencode gates, the
+    /// Deterministic Bugkill pre-flight: investigation harness gate, the
     /// clean-tree gate, the untracked baseline snapshot, base-ref
     /// resolution, and detection of a resumable `BUG_INVESTIGATION.md`.
     pub async fn bugkill_preflight(&self, worktree_path: &str) -> Result<BugkillPreflightOutcome> {
         if self.config.ai.bugkill.investigate.model.trim().is_empty() {
             return Ok(BugkillPreflightOutcome::AiNotConfigured);
         }
-        if !binary_available(&self.opencode_binary) {
+        let cwd = PathBuf::from(worktree_path);
+        if self
+            .ai_runner()
+            .command(&AiRunRequest {
+                slot: "dashboard.ai.bugkill.investigate".to_string(),
+                config: self.config.ai.bugkill.investigate.clone(),
+                prompt: String::new(),
+                cwd: cwd.clone(),
+                mode: AiRunMode::Interactive,
+                permission: AiPermission::Plan,
+                timeout: Duration::from_secs(1),
+                activity_limit: 1,
+                session_title: None,
+            })
+            .is_err()
+        {
             return Ok(BugkillPreflightOutcome::AiUnavailable);
         }
-        let cwd = PathBuf::from(worktree_path);
         let status = self.bugkill_git_status(&cwd).await?;
 
         let investigation = tokio::fs::read_to_string(cwd.join(INVESTIGATION_FILE))
@@ -4315,13 +4347,9 @@ impl DashboardService {
         })))
     }
 
-    /// Build the spawn parameters for the live investigation: the full
-    /// opencode **TUI** pinned to the read-only Plan agent, embedded in the
-    /// AI Activity panel so the user watches opencode's own rendering. The
-    /// TUI never exits on its own — the App detects completion through an
-    /// `OpencodeTurnWatcher` and reads the transcript from opencode's
-    /// database. `corrective` appends the stricter-contract suffix used on
-    /// the single retry after a parse failure.
+    /// Build the spawn parameters for the configured live, read-only
+    /// investigation harness. `corrective` appends the stricter-contract
+    /// suffix used on the single retry after a parse failure.
     pub fn prepare_bugkill_investigate(
         &self,
         worktree_path: &str,
@@ -4330,14 +4358,10 @@ impl DashboardService {
         corrective: bool,
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.investigate;
-        let model = slot.model.trim().to_string();
-        if model.is_empty() {
+        if slot.model.trim().is_empty() {
             return Err(WisetreeError::other(
                 "ai.bugkill.investigate model is not configured.",
             ));
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let cwd = PathBuf::from(worktree_path);
         let mut prompt = build_bug_investigate_prompt(bug_description, base_ref);
@@ -4347,25 +4371,20 @@ impl DashboardService {
                  delimited block, exactly as specified."
             );
         }
-        // The opencode TUI takes no `--variant`; it honors reasoning effort
-        // solely via the persisted `model.json`, so seed it before spawning.
-        seed_opencode_tui_variant(&model, &slot.thinking);
-        let opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
+        let command = self.ai_runner().command(&AiRunRequest {
+            slot: "dashboard.ai.bugkill.investigate".to_string(),
+            config: slot.clone(),
             prompt,
-            "-m".to_string(),
-            model,
-            "--agent".to_string(),
-            "plan".to_string(),
-            cwd.to_string_lossy().to_string(),
-        ];
+            cwd,
+            mode: AiRunMode::Interactive,
+            permission: AiPermission::Plan,
+            timeout: Duration::from_secs(1),
+            activity_limit: 1,
+            session_title: None,
+        })?;
         Ok(FixApplyHandoff {
-            command: AiCommand {
-                binary: self.opencode_binary.clone(),
-                args: opencode_args,
-                cwd,
-            },
-            harness: AiHarness::OpenCode,
+            command,
+            harness: slot.harness,
         })
     }
 
@@ -4380,37 +4399,34 @@ impl DashboardService {
         feedback: Option<&str>,
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.fix;
-        let model = slot.model.trim().to_string();
-        if model.is_empty() {
+        if slot.model.trim().is_empty() {
             return Err(WisetreeError::other(
                 "ai.bugkill.fix model is not configured.",
             ));
         }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
-        }
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_bug_fix_prompt(bug_description, row, feedback);
-        // The opencode TUI takes no `--variant`; it honors reasoning effort
-        // solely via the persisted `model.json`, so seed it before spawning.
-        seed_opencode_tui_variant(&model, &slot.thinking);
-        let mut opencode_args: Vec<String> =
-            vec!["--prompt".to_string(), prompt, "-m".to_string(), model];
-        opencode_args.push(cwd.to_string_lossy().to_string());
+        let command = self.ai_runner().command(&AiRunRequest {
+            slot: "dashboard.ai.bugkill.fix".to_string(),
+            config: slot.clone(),
+            prompt,
+            cwd,
+            mode: AiRunMode::Interactive,
+            permission: AiPermission::Implement,
+            timeout: Duration::from_secs(1),
+            activity_limit: 1,
+            session_title: None,
+        })?;
         Ok(FixApplyHandoff {
-            command: AiCommand {
-                binary: self.opencode_binary.clone(),
-                args: opencode_args,
-                cwd,
-            },
-            harness: AiHarness::OpenCode,
+            command,
+            harness: slot.harness,
         })
     }
 
-    /// Classify the user's freeform "Other" answer as fixed / not fixed /
-    /// unclear with one tiny captured call. A parse failure — or a failed
-    /// call — is treated as `Unclear`, never as an error screen: the user
-    /// still owes a Yes/No and loses nothing.
+    /// Classify the user's freeform "Other" answer with the configured
+    /// read-only one-shot harness. Malformed output is unclear; execution
+    /// failures are preserved so the user can address authentication or launch
+    /// problems instead of receiving a misleading verdict.
     pub async fn bugkill_judge(
         &self,
         worktree_path: &str,
@@ -4418,40 +4434,38 @@ impl DashboardService {
         user_text: &str,
     ) -> Result<BugkillVerdict> {
         let slot = &self.config.ai.bugkill.judge;
-        let model = slot.model.trim().to_string();
-        if model.is_empty() {
+        if slot.model.trim().is_empty() {
             return Err(WisetreeError::other(
                 "ai.bugkill.judge model is not configured.",
             ));
         }
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_bug_judge_prompt(row, user_text);
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            model,
-            "--agent".to_string(),
-            "plan".to_string(),
-        ];
-        run_args.extend(run_variant_args(&slot.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let transcript = time::timeout(
-            BUGKILL_JUDGE_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        .unwrap_or_else(|_| Err("the judge call timed out".to_string()));
-        Ok(match transcript {
-            Ok(output) => parse_judge_verdict(&output).unwrap_or(BugkillVerdict {
+        let (_, cancel) = oneshot::channel();
+        let run = self
+            .ai_runner()
+            .run_captured(
+                &AiRunRequest {
+                    slot: "dashboard.ai.bugkill.judge".to_string(),
+                    config: slot.clone(),
+                    prompt,
+                    cwd,
+                    mode: AiRunMode::Captured,
+                    permission: AiPermission::Plan,
+                    timeout: BUGKILL_JUDGE_TIMEOUT,
+                    activity_limit: 1,
+                    session_title: None,
+                },
+                None,
+                cancel,
+            )
+            .await?;
+        Ok(
+            parse_judge_verdict(&run.transcript).unwrap_or(BugkillVerdict {
                 result: JudgeResult::Unclear,
                 reason: String::new(),
             }),
-            Err(_) => BugkillVerdict {
-                result: JudgeResult::Unclear,
-                reason: "The judge call failed — please answer Yes or No.".to_string(),
-            },
-        })
+        )
     }
 
     /// Fresh tracked/untracked snapshot of the worktree, with content hashes
@@ -4784,7 +4798,7 @@ impl DashboardService {
     }
 
     fn develop_runner(&self) -> AiRunner {
-        AiRunner::default().with_binary(AiHarness::OpenCode, self.opencode_binary.clone())
+        self.ai_runner()
     }
 
     /// Run the configured check command (Ralph-canon backpressure) in the
