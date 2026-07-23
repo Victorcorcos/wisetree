@@ -877,6 +877,7 @@ struct ReviewModelSelection {
     profile: ReviewModelProfile,
     model: String,
     thinking: String,
+    harness: AiHarness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1681,6 +1682,7 @@ impl DashboardService {
                 permission,
                 timeout: Duration::from_secs(0),
                 activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+                session_title: None,
             })
             .await
     }
@@ -2884,6 +2886,7 @@ impl DashboardService {
             permission: AiPermission::Plan,
             timeout: FIX_PLAN_TIMEOUT,
             activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+            session_title: None,
         };
         let (_cancel_tx, cancel_rx) = oneshot::channel();
         let output = self
@@ -3121,6 +3124,7 @@ impl DashboardService {
             profile,
             model: config.model.trim().to_string(),
             thinking: config.thinking.clone(),
+            harness: config.harness,
         }
     }
 
@@ -3137,9 +3141,6 @@ impl DashboardService {
         }
         if !self.config.ai.review.has_discovery_models() {
             return Ok(ReviewPreparation::AiNotConfigured);
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Ok(ReviewPreparation::AiUnavailable);
         }
         let cwd = PathBuf::from(worktree_path);
 
@@ -3382,33 +3383,10 @@ impl DashboardService {
             &group.relationship_summary,
         );
         let prompt_bytes = prompt.len();
-        let title = review_scan_title();
-        let mut run_args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode review group timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_multi_file_findings(&output, &group.files, None) {
+        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_multi_file_findings(&output, &group.files, None) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -3418,7 +3396,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             scan,
             prompt_bytes,
@@ -3499,35 +3476,14 @@ impl DashboardService {
                 &selection,
             );
         }
-        let title = review_scan_title();
-        let mut run_args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let result = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &run_args_ref,
-                Some(Path::new(worktree_path)),
-            ),
-        )
-        .await
-        {
-            Err(_) => Err(WisetreeError::other("review verifier timed out after 240s")),
-            Ok(Err(err)) => Err(WisetreeError::other(err)),
-            Ok(Ok(output)) => parse_review_verification(&output, file)
+        let (output, usage) = self
+            .run_review_prompt(Path::new(worktree_path), &selection, prompt)
+            .await;
+        let result = match output {
+            Err(err) => Err(err),
+            Ok(output) => parse_review_verification(&output, file)
                 .ok_or_else(|| WisetreeError::other("could not parse the review verifier output")),
         };
-        let usage = opencode_usage_for_title(title).await;
         review_verification_attempt(scan, prompt_bytes, started, usage, result, &selection)
     }
 
@@ -3541,33 +3497,10 @@ impl DashboardService {
         selection: ReviewModelSelection,
     ) -> ReviewScanAttempt {
         let prompt_bytes = prompt.len();
-        let title = review_scan_title();
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode review scan timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_review_findings(
+        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_review_findings(
                 &output,
                 &file.path,
                 &file.commentable_lines,
@@ -3582,7 +3515,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             scan,
             prompt_bytes,
@@ -3592,6 +3524,55 @@ impl DashboardService {
             raw_output,
             &selection,
         )
+    }
+
+    /// Runs exactly the configured review harness under its read-only policy.
+    /// OpenCode usage is correlated with its session title; other harnesses do
+    /// not borrow OpenCode's storage and therefore remain explicitly unknown.
+    async fn run_review_prompt(
+        &self,
+        cwd: &Path,
+        selection: &ReviewModelSelection,
+        prompt: String,
+    ) -> (Result<String>, Option<ReviewTokenUsage>) {
+        self.run_review_prompt_with_timeout(cwd, selection, prompt, REVIEW_SCAN_TIMEOUT)
+            .await
+    }
+
+    async fn run_review_prompt_with_timeout(
+        &self,
+        cwd: &Path,
+        selection: &ReviewModelSelection,
+        prompt: String,
+        timeout: Duration,
+    ) -> (Result<String>, Option<ReviewTokenUsage>) {
+        let title = (selection.harness == AiHarness::OpenCode).then(review_scan_title);
+        let request = AiRunRequest {
+            slot: format!("dashboard.ai.review.{}", selection.profile.label()),
+            config: AiModelConfig {
+                model: selection.model.clone(),
+                thinking: selection.thinking.clone(),
+                harness: selection.harness,
+            },
+            prompt,
+            cwd: cwd.to_path_buf(),
+            mode: AiRunMode::Captured,
+            permission: AiPermission::Plan,
+            timeout,
+            activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+            session_title: title.clone(),
+        };
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let result = self
+            .ai_runner()
+            .run_captured(&request, None, cancel_rx)
+            .await
+            .map(|run| run.transcript);
+        let usage = match title {
+            Some(title) => opencode_usage_for_title(title).await,
+            None => None,
+        };
+        (result, usage)
     }
 
     /// Scan the WHOLE diff once for missing test coverage with a single
@@ -3623,33 +3604,10 @@ impl DashboardService {
         }
         let prompt = build_review_coverage_prompt(files, context, tester_findings);
         let prompt_bytes = prompt.len();
-        let title = review_scan_title();
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode coverage scan timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_coverage_findings(&output, files) {
+        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_coverage_findings(&output, files) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -3659,7 +3617,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             "coverage".to_string(),
             prompt_bytes,
@@ -3697,33 +3654,10 @@ impl DashboardService {
         let tables_path = materialize_review_tables().await;
         let prompt = build_review_merged_prompt(files, context, tester_findings, &tables_path);
         let prompt_bytes = prompt.len();
-        let title = review_scan_title();
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode merged review scan timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_merged_findings(&output, files) {
+        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_merged_findings(&output, files) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -3733,7 +3667,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             "merged".to_string(),
             prompt_bytes,
@@ -3775,37 +3708,12 @@ impl DashboardService {
                 &selection,
             );
         }
-        let title = review_scan_title();
-        let mut run_args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &run_args_ref,
-                Some(Path::new(worktree_path)),
-            ),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "global gap audit timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_gap_audit_findings(&output, files) {
+        let (output, usage) = self
+            .run_review_prompt(Path::new(worktree_path), &selection, prompt)
+            .await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_gap_audit_findings(&output, files) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -3815,7 +3723,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             "gap-audit".to_string(),
             prompt_bytes,
@@ -4127,37 +4034,12 @@ impl DashboardService {
                 &selection,
             );
         }
-        let title = review_scan_title();
-        let mut run_args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &run_args_ref,
-                Some(Path::new(worktree_path)),
-            ),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode review reformat timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse(&output) {
+        let (output, usage) = self
+            .run_review_prompt(Path::new(worktree_path), &selection, prompt)
+            .await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse(&output) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -4167,7 +4049,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             scan,
             prompt_bytes,
@@ -4200,6 +4081,7 @@ impl DashboardService {
                     model_profile: selection.profile.label().to_string(),
                     model: selection.model.clone(),
                     thinking: selection.thinking.clone(),
+                    harness: selection.harness.wire_name().to_string(),
                     prompt_bytes,
                     usage: usage.unwrap_or_default(),
                     duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -4214,41 +4096,23 @@ impl DashboardService {
                 None,
             );
         }
-        let title = review_scan_title();
-        let mut args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        args.extend(run_variant_args(&selection.thinking));
-        let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let result = match time::timeout(
-            REVIEW_SUMMARY_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &args_ref,
-                Some(Path::new(worktree_path)),
-            ),
-        )
-        .await
-        {
-            Err(_) => Err(WisetreeError::other(
-                "review summary overview timed out after 30s",
-            )),
-            Ok(Err(err)) => Err(WisetreeError::other(err)),
-            Ok(Ok(output)) => {
+        let (output, usage) = self
+            .run_review_prompt_with_timeout(
+                Path::new(worktree_path),
+                &selection,
+                prompt,
+                REVIEW_SUMMARY_TIMEOUT,
+            )
+            .await;
+        let result = match output {
+            Err(err) => Err(err),
+            Ok(output) => {
                 validate_review_summary_overview(&output, group_findings_by_issue(posted).len())
                     .ok_or_else(|| {
                         WisetreeError::other("review summary overview was not concise prose")
                     })
             }
         };
-        let usage = opencode_usage_for_title(title).await;
         make_attempt(result, usage)
     }
 
@@ -4761,6 +4625,7 @@ impl DashboardService {
                     permission,
                     timeout: Duration::from_secs(1),
                     activity_limit: 1,
+                    session_title: None,
                 })
                 .is_err()
             {
@@ -4832,6 +4697,7 @@ impl DashboardService {
             permission: AiPermission::Plan,
             timeout: Duration::from_secs(1),
             activity_limit: 1,
+            session_title: None,
         })?;
         Ok(DevelopHandoff {
             command,
@@ -4877,6 +4743,7 @@ impl DashboardService {
             permission: AiPermission::Implement,
             timeout: Duration::from_secs(1),
             activity_limit: 1,
+            session_title: None,
         })?;
         Ok(DevelopHandoff {
             command,
@@ -8187,6 +8054,7 @@ fn review_scan_attempt(
             model_profile: selection.profile.label().to_string(),
             model: selection.model.clone(),
             thinking: selection.thinking.clone(),
+            harness: selection.harness.wire_name().to_string(),
             prompt_bytes,
             usage: usage.unwrap_or_default(),
             duration_ms,
@@ -8248,6 +8116,7 @@ fn review_verification_attempt(
             model_profile: selection.profile.label().to_string(),
             model: selection.model.clone(),
             thinking: selection.thinking.clone(),
+            harness: selection.harness.wire_name().to_string(),
             prompt_bytes,
             usage: usage.unwrap_or_default(),
             duration_ms,

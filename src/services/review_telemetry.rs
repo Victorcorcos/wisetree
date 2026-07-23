@@ -49,6 +49,8 @@ pub struct ReviewScanTelemetry {
     pub model: String,
     #[serde(default)]
     pub thinking: String,
+    #[serde(default)]
+    pub harness: String,
     pub prompt_bytes: usize,
     pub usage: ReviewTokenUsage,
     pub duration_ms: u64,
@@ -283,6 +285,7 @@ mod tests {
             model_profile: "balanced".to_string(),
             model: "openai/gpt-5.6-terra".to_string(),
             thinking: "medium".to_string(),
+            harness: "opencode".to_string(),
             prompt_bytes: 1200,
             usage: ReviewTokenUsage {
                 uncached_input: tokens.map(|usage| usage.0),
@@ -357,6 +360,7 @@ mod tests {
         assert!(json.contains("modelProfile"));
         assert!(json.contains("openai/gpt-5.6-terra"));
         assert!(json.contains("thinking"));
+        assert!(json.contains("harness"));
         assert!(json.contains("logicalTotal"));
     }
 
@@ -375,5 +379,6 @@ mod tests {
         assert!(telemetry.model_profile.is_empty());
         assert!(telemetry.model.is_empty());
         assert!(telemetry.thinking.is_empty());
+        assert!(telemetry.harness.is_empty());
     }
 }

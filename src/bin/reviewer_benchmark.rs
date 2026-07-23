@@ -70,6 +70,7 @@ struct Provenance {
     source_corpus_hash: String,
     review_input_hash: String,
     provider_model: String,
+    harness: String,
     thinking: String,
     tool_permissions: String,
     timeout_seconds: u64,
@@ -309,7 +310,7 @@ fn validate_provenance_parity(left: &Capture, right: &Capture) -> Result<()> {
         (None, None) => Ok(()),
         (Some(left), Some(right)) if left == right => Ok(()),
         (Some(_), Some(_)) => bail!(
-            "live captures must use identical workflow, skill, corpus, model, permissions, timeout, and environment provenance"
+            "live captures must use identical workflow, skill, corpus, harness, model, permissions, timeout, and environment provenance"
         ),
         _ => bail!("live captures must both include complete provenance"),
     }
@@ -674,7 +675,7 @@ mod tests {
     fn live_provenance_must_match_exactly() {
         let json = r#"{
           "workflowCommit":"abc","workflowTreeHash":"tree","skillHash":"skill","sourceCorpusHash":"source",
-          "reviewInputHash":"input","providerModel":"provider/model","thinking":"high",
+          "reviewInputHash":"input","providerModel":"provider/model","harness":"opencode","thinking":"high",
           "toolPermissions":"read-only","timeoutSeconds":240,"environmentVersion":"env"
         }"#;
         let provenance: Provenance = serde_json::from_str(json).unwrap();
@@ -684,6 +685,9 @@ mod tests {
         right.provenance = Some(serde_json::from_str(json).unwrap());
         assert!(validate_provenance_parity(&left, &right).is_ok());
         right.provenance.as_mut().unwrap().timeout_seconds = 241;
+        assert!(validate_provenance_parity(&left, &right).is_err());
+        right.provenance.as_mut().unwrap().timeout_seconds = 240;
+        right.provenance.as_mut().unwrap().harness = "codex".into();
         assert!(validate_provenance_parity(&left, &right).is_err());
     }
 }

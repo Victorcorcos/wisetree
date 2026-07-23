@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 struct Preregistration {
     baseline_model: String,
+    baseline_harness: String,
     baseline_thinking: String,
     minimum_repetitions: u32,
     bootstrap_resamples: usize,
@@ -86,6 +87,7 @@ struct Provenance {
     source_corpus_hash: String,
     review_input_hash: String,
     provider_model: String,
+    harness: String,
     thinking: String,
     tool_permissions: String,
     timeout_seconds: u64,
@@ -385,6 +387,7 @@ fn nightly_guard(
     }
     if review.model.as_deref() != Some(prereg.baseline_model.as_str())
         || review.thinking.as_deref() != Some(prereg.baseline_thinking.as_str())
+        || review.provenance.harness != prereg.baseline_harness
     {
         bail!("nightly provider/model or thinking changed; preregister a new baseline");
     }
@@ -667,6 +670,7 @@ fn validate_inputs(
     }
     if review.model.as_deref() != Some(prereg.baseline_model.as_str())
         || review.thinking.as_deref() != Some(prereg.baseline_thinking.as_str())
+        || review.provenance.harness != prereg.baseline_harness
     {
         bail!("provider/model or thinking changed; create a new preregistered baseline");
     }
@@ -1148,8 +1152,9 @@ fn gate(name: &str, observed: f64, required: f64, comparison: Comparison) -> Gat
 fn baseline_key(provenance: &Provenance) -> String {
     blake3::hash(
         format!(
-            "{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}",
             provenance.provider_model,
+            provenance.harness,
             provenance.thinking,
             provenance.environment_version,
             provenance.source_corpus_hash,
@@ -1246,6 +1251,7 @@ mod tests {
             .collect::<Vec<_>>();
         let prereg = Preregistration {
             baseline_model: "model".into(),
+            baseline_harness: "opencode".into(),
             baseline_thinking: "high".into(),
             minimum_repetitions: 10,
             bootstrap_resamples: 1000,
@@ -1286,6 +1292,7 @@ mod tests {
             source_corpus_hash: "corpus".into(),
             review_input_hash: "input".into(),
             provider_model: "provider/model".into(),
+            harness: "opencode".into(),
             thinking: "high".into(),
             tool_permissions: "read-only".into(),
             timeout_seconds: 240,

@@ -40,6 +40,9 @@ pub struct AiRunRequest {
     pub permission: AiPermission,
     pub timeout: Duration,
     pub activity_limit: usize,
+    /// Optional OpenCode session title used to correlate its own token
+    /// telemetry. Other harnesses must report usage themselves.
+    pub session_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +124,9 @@ impl AiRunner {
                 }
                 if !effort.is_empty() {
                     args.extend(["--variant".into(), effort.into()]);
+                }
+                if let Some(title) = &request.session_title {
+                    args.extend(["--title".into(), title.clone()]);
                 }
                 args
             }
@@ -444,6 +450,7 @@ mod tests {
             permission: AiPermission::Plan,
             timeout: Duration::from_secs(1),
             activity_limit: 2,
+            session_title: None,
         }
     }
 
@@ -478,6 +485,28 @@ mod tests {
             .args
             .windows(2)
             .any(|args| args == ["--sandbox", "read-only"]));
+    }
+
+    #[test]
+    fn session_titles_are_forwarded_only_to_opencode() {
+        let mut opencode = request(AiHarness::OpenCode, AiRunMode::Captured);
+        opencode.session_title = Some("review-123".into());
+        let command = AiRunner::default()
+            .with_binary(AiHarness::OpenCode, PathBuf::from("true"))
+            .command(&opencode)
+            .unwrap();
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["--title", "review-123"]));
+
+        let mut codex = request(AiHarness::Codex, AiRunMode::Captured);
+        codex.session_title = Some("review-123".into());
+        let command = AiRunner::default()
+            .with_binary(AiHarness::Codex, PathBuf::from("true"))
+            .command(&codex)
+            .unwrap();
+        assert!(!command.args.iter().any(|arg| arg == "--title"));
     }
 
     #[test]

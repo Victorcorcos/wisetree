@@ -3746,6 +3746,7 @@ mod tests {
             model_profile: "balanced".to_string(),
             model: "openai/gpt-5.6-terra".to_string(),
             thinking: "medium".to_string(),
+            harness: "opencode".to_string(),
             prompt_bytes: 1200,
             usage: crate::services::review_telemetry::ReviewTokenUsage {
                 uncached_input: Some(40_000),
