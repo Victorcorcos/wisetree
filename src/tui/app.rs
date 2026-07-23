@@ -6847,11 +6847,9 @@ impl App {
             Ok(success) => &success.worktree_path,
             Err(failure) => &failure.worktree_path,
         };
-        if self
-            .update_pr
-            .as_ref()
-            .is_none_or(|screen| screen.request().worktree_path != *event_worktree)
-        {
+        if self.update_pr.as_ref().map_or(true, |screen| {
+            screen.request().worktree_path != *event_worktree
+        }) {
             return;
         }
         // The "Update branch (locally)" flow reuses this screen in
