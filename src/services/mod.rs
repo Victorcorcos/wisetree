@@ -1,6 +1,7 @@
 //! Cross-cutting services (app state, update check, shell integration).
 
 pub mod ai_models;
+pub mod ai_run;
 pub mod ai_status;
 pub mod app_state;
 pub mod bugkill;
@@ -20,6 +21,7 @@ pub use ai_models::{
     fetch_claude_effort_levels, fetch_codex_reasoning_levels, parse_claude_effort_levels,
     parse_codex_bundled_models,
 };
+pub use ai_run::{AiCapturedRun, AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 pub use ai_status::{
     canonical_key, AiHarness, AiHarnessState, AiStatus, AiStatusIndex, AiStatusPaths,
     AiStatusReport, AiStatusService,

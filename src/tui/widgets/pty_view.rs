@@ -1,4 +1,4 @@
-//! Embedded PTY view that hosts a subprocess (opencode) inside a ratatui
+//! Embedded PTY view that hosts an AI CLI subprocess inside a ratatui
 //! panel. Spawns the command on a real PTY via `portable-pty`, pipes its
 //! raw output through a `vt100::Parser`, and blits the resulting screen
 //! cells into the panel area on each frame so the subprocess sees a
@@ -33,7 +33,7 @@ use vt100::{Color as VtColor, MouseProtocolEncoding, MouseProtocolMode, Parser};
 /// rather not have wrap awkwardly, so we start generous.
 const DEFAULT_ROWS: u16 = 40;
 const DEFAULT_COLS: u16 = 160;
-/// How many lines of scrollback the vt100 parser retains. opencode runs
+/// How many lines of scrollback the vt100 parser retains. AI CLI runs
 /// can emit thousands of formatted lines (Thinking blocks, diffs, tool
 /// output); 5000 rows gives the user plenty of history to scroll back
 /// through without ballooning memory.

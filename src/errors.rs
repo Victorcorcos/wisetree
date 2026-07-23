@@ -59,6 +59,13 @@ impl GitErrorCode {
 /// IO errors are wrapped on the way out.
 #[derive(Debug, Error)]
 pub enum WisetreeError {
+    #[error("AI {harness} for {slot}: {message}")]
+    Ai {
+        slot: String,
+        harness: String,
+        code: AiErrorCode,
+        message: String,
+    },
     #[error("{message}")]
     Git {
         message: String,
@@ -90,6 +97,19 @@ pub enum WisetreeError {
 }
 
 impl WisetreeError {
+    pub fn ai(
+        slot: impl Into<String>,
+        harness: impl Into<String>,
+        code: AiErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Ai {
+            slot: slot.into(),
+            harness: harness.into(),
+            code,
+            message: message.into(),
+        }
+    }
     pub fn git(message: impl Into<String>, code: GitErrorCode, git_output: Option<String>) -> Self {
         Self::Git {
             message: message.into(),
@@ -131,6 +151,23 @@ impl WisetreeError {
             _ => None,
         }
     }
+}
+
+/// Reason an AI command could not be prepared or completed. These values let
+/// callers distinguish remediation (install, login, select a model) without
+/// parsing a CLI's human-oriented stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiErrorCode {
+    MissingBinary,
+    MissingAuthentication,
+    UnavailableModel,
+    UnsupportedEffort,
+    UnsupportedFlag,
+    UnsupportedVersion,
+    TimedOut,
+    Cancelled,
+    Failed,
+    MissingOutput,
 }
 
 /// Convenience alias used throughout the crate.
@@ -200,6 +237,7 @@ pub fn handle_git_error(stderr: &str, operation: &str) -> WisetreeError {
 pub fn user_friendly_message(error: &WisetreeError) -> String {
     match error {
         WisetreeError::Git { code, message, .. } => code.user_message(message),
+        WisetreeError::Ai { message, .. } => message.clone(),
         WisetreeError::Validation { message, .. } => format!("Validation error: {message}"),
         WisetreeError::Config { message, .. } => format!("Configuration error: {message}"),
         WisetreeError::Io(err) => format!("Unexpected error: {err}"),

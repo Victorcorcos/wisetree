@@ -16,7 +16,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, MissedTickBehavior};
 
-use crate::config::schema::{normalize_dashboard_columns, AiModelConfig, DashboardConfig};
+use crate::config::schema::{
+    normalize_dashboard_columns, AiHarness, AiModelConfig, DashboardConfig,
+};
 use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
 use crate::files::{strip_ansi, ActivityKind};
@@ -38,6 +40,7 @@ use crate::services::reviewer_routing::{relationship_groups, ReviewRouteFile};
 use crate::services::reviewer_tests::{
     build_coverage_ledger, ReviewCoverageInput, ReviewCoverageLedger,
 };
+use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// `gh api graphql` may include the network round-trip — give it more headroom
@@ -1646,6 +1649,32 @@ impl DashboardService {
         self
     }
 
+    /// Builds a CLI invocation from the selected harness without changing the
+    /// dashboard status detector configuration. The legacy handoff fields keep
+    /// the current TUI/PTY plumbing stable while their values are now neutral.
+    fn ai_command(
+        &self,
+        slot: &str,
+        config: &AiModelConfig,
+        prompt: String,
+        cwd: PathBuf,
+        mode: AiRunMode,
+        permission: AiPermission,
+    ) -> Result<AiCommand> {
+        AiRunner::default()
+            .with_binary(AiHarness::OpenCode, self.opencode_binary.clone())
+            .command(&AiRunRequest {
+                slot: slot.to_string(),
+                config: config.clone(),
+                prompt,
+                cwd,
+                mode,
+                permission,
+                timeout: Duration::from_secs(0),
+                activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+            })
+    }
+
     /// Override the disk cache location. Pass `None` to disable disk
     /// persistence entirely (used by tests that must not touch `$HOME`).
     pub fn with_cache_path(mut self, path: Option<PathBuf>) -> Self {
@@ -2839,10 +2868,6 @@ impl DashboardService {
         history: Option<&str>,
     ) -> Result<FixVerdict> {
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.fix.plan.model.trim().to_string();
-        if model.is_empty() {
-            return Err(WisetreeError::other("ai.fix.plan.model is not configured."));
-        }
         let code = match &group.file {
             Some(file) => read_code_window(&cwd, file, group.line).await,
             None => String::new(),
@@ -2859,19 +2884,18 @@ impl DashboardService {
         // instead of showing a revised plan. Read-only forces a clean re-plan.
         // `opencode run` accepts `--variant <effort>`, so the plan phase honors
         // its configured thinking strength directly (unlike the TUI flows).
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
+        let command = self.ai_command(
+            "dashboard.ai.fix.plan",
+            &self.config.ai.fix.plan,
             prompt,
-            "-m".to_string(),
-            model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-        ];
-        run_args.extend(run_variant_args(&self.config.ai.fix.plan.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
+            cwd.clone(),
+            AiRunMode::Captured,
+            AiPermission::Plan,
+        )?;
+        let run_args_ref: Vec<&str> = command.args.iter().map(String::as_str).collect();
         let output = time::timeout(
             FIX_PLAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
+            run_command(&command.binary, &run_args_ref, Some(&cwd)),
         )
         .await
         .map_err(|_| WisetreeError::other("opencode planning timed out after 180s"))?
@@ -2894,26 +2918,21 @@ impl DashboardService {
         plan: &FixPlan,
     ) -> Result<FixApplyHandoff> {
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.fix.apply.model.trim().to_string();
-        if model.is_empty() {
-            return Err(WisetreeError::other(
-                "ai.fix.apply.model is not configured.",
-            ));
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
-        }
         let prompt = build_fix_apply_prompt(group, plan);
         // The apply phase runs in the opencode TUI (live edits in the AI
         // Activity panel), which takes no `--variant`; seed the reasoning
         // effort into `model.json` before spawning.
-        seed_opencode_tui_variant(&model, &self.config.ai.fix.apply.thinking);
-        let mut opencode_args: Vec<String> =
-            vec!["--prompt".to_string(), prompt, "-m".to_string(), model];
-        opencode_args.push(cwd.to_string_lossy().to_string());
+        let command = self.ai_command(
+            "dashboard.ai.fix.apply",
+            &self.config.ai.fix.apply,
+            prompt,
+            cwd.clone(),
+            AiRunMode::Interactive,
+            AiPermission::Implement,
+        )?;
         Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
+            opencode_binary: command.binary,
+            opencode_args: command.args,
             cwd,
         })
     }

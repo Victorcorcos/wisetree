@@ -1928,11 +1928,11 @@ impl SettingsScreen {
                     AiHarness::OpenCode
                 };
                 let ladder = self.ai_thinking_ladder(harness, &model);
-                let thinking = ladder
-                    .iter()
-                    .any(|level| level == &current.thinking)
-                    .then_some(current.thinking)
-                    .unwrap_or_default();
+                let thinking = if ladder.iter().any(|level| level == &current.thinking) {
+                    current.thinking
+                } else {
+                    Default::default()
+                };
                 (harness, thinking)
             }
             None => return,
@@ -3524,11 +3524,11 @@ impl SettingsScreen {
             .map(|i| accepted[(i + 1) % accepted.len()])
             .unwrap_or(AiHarness::OpenCode);
         let ladder = self.ai_thinking_ladder(next, &model);
-        let thinking = ladder
-            .iter()
-            .any(|level| level == &thinking)
-            .then_some(thinking)
-            .unwrap_or_default();
+        let thinking = if ladder.iter().any(|level| level == &thinking) {
+            thinking
+        } else {
+            Default::default()
+        };
         let Some(editor) = self.ai_settings_editor.as_mut() else {
             return;
         };
@@ -4695,13 +4695,11 @@ impl SettingsScreen {
                 ),
                 Span::styled("  ·  ", Style::default().fg(colors::MUTED)),
                 Span::styled(
-                    format!(
-                        "{}",
-                        reasoning_level_label(
-                            &self.ai_thinking_ladder(model.harness, model.model.trim()),
-                            &model.thinking,
-                        )
-                    ),
+                    reasoning_level_label(
+                        &self.ai_thinking_ladder(model.harness, model.model.trim()),
+                        &model.thinking,
+                    )
+                    .to_string(),
                     focused_ai_field_style(focus == AiSettingsField::Thinking),
                 ),
                 Span::styled("  ·  ", Style::default().fg(colors::MUTED)),
