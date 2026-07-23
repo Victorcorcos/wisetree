@@ -1138,7 +1138,15 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
         } else {
             m.thinking.clone()
         };
-        AiModelConfig { model, thinking }
+        AiModelConfig {
+            harness: if model.is_empty() {
+                crate::config::schema::AiHarness::OpenCode
+            } else {
+                m.harness
+            },
+            model,
+            thinking,
+        }
     };
     AiConfig {
         explain: clean(&ai.explain),

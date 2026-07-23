@@ -1632,10 +1632,12 @@ mod tests {
             plan: crate::config::schema::AiModelConfig {
                 model: "opencode/fix-plan".to_string(),
                 thinking: "max".to_string(),
+                harness: Default::default(),
             },
             apply: crate::config::schema::AiModelConfig {
                 model: "opencode/fix-apply".to_string(),
                 thinking: String::new(),
+                harness: Default::default(),
             },
         }
     }

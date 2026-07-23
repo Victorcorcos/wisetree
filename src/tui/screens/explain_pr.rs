@@ -1326,6 +1326,7 @@ mod tests {
         AiModelConfig {
             model: "opencode/explain-model".to_string(),
             thinking: "max".to_string(),
+            harness: Default::default(),
         }
     }
 

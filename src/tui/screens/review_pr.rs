@@ -2708,6 +2708,7 @@ mod tests {
         let model = AiModelConfig {
             model: "opencode/review-scan".to_string(),
             thinking: "max".to_string(),
+            harness: Default::default(),
         };
         AiReviewConfig {
             strong: model.clone(),

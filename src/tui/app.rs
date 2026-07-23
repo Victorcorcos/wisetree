@@ -10289,6 +10289,7 @@ mod tests {
         let model = crate::config::schema::AiModelConfig {
             model: "opencode/test".to_string(),
             thinking: "max".to_string(),
+            harness: Default::default(),
         };
         let ai = crate::config::schema::AiReviewConfig {
             strong: model.clone(),

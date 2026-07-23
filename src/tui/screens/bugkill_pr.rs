@@ -2205,14 +2205,17 @@ mod tests {
             investigate: AiModelConfig {
                 model: "strong/model".to_string(),
                 thinking: "xhigh".to_string(),
+                harness: Default::default(),
             },
             fix: AiModelConfig {
                 model: "fast/model".to_string(),
                 thinking: String::new(),
+                harness: Default::default(),
             },
             judge: AiModelConfig {
                 model: "tiny/model".to_string(),
                 thinking: "low".to_string(),
+                harness: Default::default(),
             },
         }
     }

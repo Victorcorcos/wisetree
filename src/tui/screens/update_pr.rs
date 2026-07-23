@@ -2519,6 +2519,7 @@ mod tests {
         AiModelConfig {
             model: "opencode/update-model".to_string(),
             thinking: String::new(),
+            harness: Default::default(),
         }
     }
 

@@ -2347,10 +2347,12 @@ mod tests {
             plan: AiModelConfig {
                 model: "openai/gpt-5.6-sol".to_string(),
                 thinking: "high".to_string(),
+                harness: Default::default(),
             },
             implement: AiModelConfig {
                 model: "openai/gpt-5.6-terra".to_string(),
                 thinking: "high".to_string(),
+                harness: Default::default(),
             },
         }
     }
