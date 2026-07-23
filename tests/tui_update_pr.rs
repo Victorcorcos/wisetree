@@ -420,11 +420,13 @@ async fn pipeline_hands_off_to_ui_when_conflicts_detected_and_opencode_available
             // mode that strips most of the Monokai theming.
             assert!(
                 !command.args.iter().any(|a| a == "run"),
-                "service must not use `opencode run`; the UI embeds opencode's real TUI: {:?}", command.args
+                "service must not use `opencode run`; the UI embeds opencode's real TUI: {:?}",
+                command.args
             );
             assert!(
                 !command.args.iter().any(|a| a == "--format"),
-                "service must not pass --format; the UI embeds opencode's real TUI: {:?}", command.args
+                "service must not pass --format; the UI embeds opencode's real TUI: {:?}",
+                command.args
             );
         }
         other => panic!("expected ConflictsHandedOffToUi, got {other:?}"),

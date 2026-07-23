@@ -47,10 +47,9 @@ use crate::services::{
     DashboardService, DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff,
     DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome,
     ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    JudgeResult, MultiSourceUpdateResult, OpencodeModel, OpencodeTurn, OpencodeTurnWatcher,
-    PrState, ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
-    ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdateSource,
+    JudgeResult, MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile,
+    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification,
+    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -96,6 +95,9 @@ use crate::worktree::service::{
 };
 use crate::worktree::WorktreeService;
 use crate::VERSION;
+
+#[cfg(test)]
+use crate::services::{OpencodeTurn, OpencodeTurnWatcher};
 
 const SETTINGS_PATH_COPIED_MESSAGE: &str =
     "Setting file copied to Clipboard, edit it with your favorite editor!";
@@ -528,10 +530,9 @@ pub struct App {
     next_develop_file_revision: u64,
     develop_write_in_flight: bool,
     pending_develop_write: Option<DevelopFileWrite>,
-    /// Watches opencode's database for the embedded investigation TUI's
-    /// turn to complete — the TUI never exits on its own, so this is what
-    /// advances the `Investigating` step. `Some` only while investigating.
-    bugkill_investigation: Option<OpencodeTurnWatcher>,
+    /// Watches the selected harness transcript for the embedded investigation
+    /// turn to complete. `Some` only while investigating.
+    bugkill_investigation: Option<AiTurnWatcher>,
     /// Same idea for the Develop screen's Planning + Implementing TUIs —
     /// advances the plan into review, and (on a Ralph Loop) closes one
     /// section's run and opens the next. `Some` only while one is live.
@@ -826,10 +827,8 @@ impl App {
                         .as_ref()
                         .is_some_and(|s| s.ai_active() && !s.ai_done() && !s.terminal_active());
                     if update_conflict_active {
-                        if let Some(turn) = self
-                            .update_conflict
-                            .as_mut()
-                        .and_then(AiTurnWatcher::poll)
+                        if let Some(turn) =
+                            self.update_conflict.as_mut().and_then(AiTurnWatcher::poll)
                         {
                             self.on_update_conflict_turn(turn);
                         }
@@ -933,26 +932,33 @@ impl App {
                             self.fix_apply_watch = None;
                         }
                     }
-                    // Same for the Bugkill PTYs. The Investigating TUI never
-                    // exits on its own, so completion comes from the turn
-                    // watcher polling opencode's database; an early PTY exit
-                    // there means the user quit opencode (or it crashed). A
-                    // Fixing exit means the attempt is over, so scan +
-                    // commit it now.
+                    // Same for the Bugkill PTYs. The investigation watcher
+                    // supplies the recovered harness transcript; a non-zero
+                    // fix exit is a failure, never a signal to commit.
                     let bugkill_exited = self
                         .bugkill_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step()));
                     match bugkill_exited {
-                        Some((true, screens::bugkill_pr::BugkillStep::Investigating)) => {
+                        Some((Some(_), screens::bugkill_pr::BugkillStep::Investigating)) => {
                             self.on_bugkill_investigation_pty_exited(&tx)
                         }
-                        Some((true, _)) => self.on_bugkill_fix_done(&tx),
-                        Some((false, screens::bugkill_pr::BugkillStep::Investigating)) => {
+                        Some((Some(0), screens::bugkill_pr::BugkillStep::Fixing)) => {
+                            self.on_bugkill_fix_done(&tx)
+                        }
+                        Some((Some(_), screens::bugkill_pr::BugkillStep::Fixing)) => {
+                            if let Some(screen) = self.bugkill_pr.as_mut() {
+                                screen.kill_pty();
+                                screen.set_error(
+                                    "AI CLI exited before applying the fix.".to_string(),
+                                );
+                            }
+                        }
+                        Some((None, screens::bugkill_pr::BugkillStep::Investigating)) => {
                             if let Some(turn) = self
                                 .bugkill_investigation
                                 .as_mut()
-                                .and_then(OpencodeTurnWatcher::poll)
+                                .and_then(AiTurnWatcher::poll)
                             {
                                 self.on_bugkill_turn(turn, &tx);
                             }
@@ -3861,7 +3867,8 @@ impl App {
         };
         match result {
             Ok(handoff) => {
-                self.bugkill_investigation = Some(OpencodeTurnWatcher::new(&handoff.command.cwd));
+                self.bugkill_investigation =
+                    Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                 screen.start_investigating(corrective);
                 screen.spawn_opencode_pty(
                     handoff.command.binary,
@@ -3876,17 +3883,15 @@ impl App {
 
     /// The turn watcher fired while `Investigating` — advance on Finished
     /// or Failed, keep waiting on Working.
-    fn on_bugkill_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn on_bugkill_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
-            OpencodeTurn::Working => {}
-            OpencodeTurn::Finished { transcript } => {
-                self.finish_bugkill_investigation(transcript, tx)
-            }
-            OpencodeTurn::Failed { message } => {
+            AiTurn::Working => {}
+            AiTurn::Finished { transcript } => self.finish_bugkill_investigation(transcript, tx),
+            AiTurn::Failed { message } => {
                 self.bugkill_investigation = None;
                 if let Some(screen) = self.bugkill_pr.as_mut() {
                     screen.kill_pty();
-                    screen.set_error(format!("opencode reported an error: {message}"));
+                    screen.set_error(format!("AI CLI reported an error: {message}"));
                 }
             }
         }
@@ -3929,16 +3934,15 @@ impl App {
         let turn = self
             .bugkill_investigation
             .as_mut()
-            .map(OpencodeTurnWatcher::check_now)
-            .unwrap_or(OpencodeTurn::Working);
+            .map(AiTurnWatcher::check_now)
+            .unwrap_or(AiTurn::Working);
         match turn {
-            OpencodeTurn::Working => {
+            AiTurn::Working => {
                 self.bugkill_investigation = None;
                 if let Some(screen) = self.bugkill_pr.as_mut() {
                     screen.kill_pty();
-                    screen.set_error(
-                        "opencode exited before the investigation finished.".to_string(),
-                    );
+                    screen
+                        .set_error("AI CLI exited before the investigation finished.".to_string());
                 }
             }
             turn => self.on_bugkill_turn(turn, tx),
@@ -3955,7 +3959,7 @@ impl App {
             return;
         };
         match watcher.check_now() {
-            OpencodeTurn::Working => {
+            AiTurn::Working => {
                 let transcript = watcher.transcript_now().unwrap_or_default();
                 if crate::services::parse_hypotheses(&transcript).is_some() {
                     self.finish_bugkill_investigation(transcript, tx);
@@ -5448,13 +5452,7 @@ impl App {
             ..
         }) = result
         {
-            self.start_local_conflict_resolution(
-                branch,
-                command,
-                harness,
-                model,
-                base_ref,
-            );
+            self.start_local_conflict_resolution(branch, command, harness, model, base_ref);
             return;
         }
         match result {
@@ -5468,11 +5466,10 @@ impl App {
                     "{branch}: {} conflict(s) need the `ai.update` model configured.",
                     conflicts.len()
                 )),
-            Ok(UpdateBranchOutcome::AiPreflightFailed { message }) => {
-                self.record_update_all_failure(format!(
+            Ok(UpdateBranchOutcome::AiPreflightFailed { message }) => self
+                .record_update_all_failure(format!(
                     "{branch}: Update AI preflight failed: {message}"
-                ))
-            }
+                )),
             Ok(UpdateBranchOutcome::FetchFailed(message)) => {
                 self.record_update_all_failure(format!("{branch}: git fetch failed: {message}"))
             }
@@ -5533,9 +5530,7 @@ impl App {
             },
             Err(UpdatePrFailure {
                 number, message, ..
-            }) => {
-                self.record_update_all_failure(format!("PR #{number}: {message}"))
-            }
+            }) => self.record_update_all_failure(format!("PR #{number}: {message}")),
         }
         self.dispatch_next_update_all_pr(tx);
     }
@@ -5558,7 +5553,8 @@ impl App {
             AiTurn::Finished { .. } => {
                 if let Some(screen) = self.update_pr.as_mut() {
                     screen.mark_ai_manual_backstop(
-                        "AI finished without transcript evidence; review and finalize manually.".to_string(),
+                        "AI finished without transcript evidence; review and finalize manually."
+                            .to_string(),
                     );
                 }
             }
@@ -6610,13 +6606,7 @@ impl App {
                 base_ref,
                 ..
             }) => {
-                self.start_local_conflict_resolution(
-                    branch,
-                    command,
-                    harness,
-                    model,
-                    base_ref,
-                );
+                self.start_local_conflict_resolution(branch, command, harness, model, base_ref);
             }
             // Every other outcome drops the loading splash and routes back
             // to the dashboard before toasting — the user must land on the
@@ -6880,9 +6870,7 @@ impl App {
         if let Ok(UpdatePrSuccess {
             outcome:
                 UpdatePullRequestOutcome::ConflictsHandedOffToUi {
-                    command,
-                    harness,
-                    ..
+                    command, harness, ..
                 },
             ..
         }) = &result
@@ -6933,6 +6921,7 @@ impl App {
                 number,
                 base_ref,
                 outcome,
+                ..
             }) => match outcome {
                 UpdatePullRequestOutcome::AlreadyUpToDate => {
                     self.show_toast(
