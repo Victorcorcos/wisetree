@@ -1,0 +1,518 @@
+//! Provider-neutral on-disk turn watchers for interactive AI harnesses.
+//!
+//! Watchers are created immediately before spawning a child. They select one
+//! post-spawn transcript for the requested worktree, then keep polling only
+//! that file so another terminal cannot take over an in-flight operation.
+
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+
+use serde_json::Value;
+
+use crate::config::schema::AiHarness;
+
+use super::ai_status::{canonical_key, AiStatusPaths};
+use super::{OpencodeTurn, OpencodeTurnWatcher};
+
+/// State of a watched interactive turn, independent of its provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiTurn {
+    Working,
+    Finished { transcript: String },
+    Failed { message: String },
+}
+
+const POLL_PERIOD: Duration = Duration::from_millis(1000);
+const MAX_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Watch the interactive turn for one configured provider.
+pub struct AiTurnWatcher(AiTurnWatcherKind);
+
+enum AiTurnWatcherKind {
+    OpenCode(OpencodeTurnWatcher),
+    Codex(JsonlTurnWatcher),
+    Claude(JsonlTurnWatcher),
+}
+
+impl AiTurnWatcher {
+    /// Create before spawning the interactive child.
+    pub fn new(harness: AiHarness, worktree: &Path) -> Self {
+        Self::with_paths(
+            harness,
+            worktree,
+            AiStatusPaths::detect(),
+            SystemTime::now(),
+        )
+    }
+
+    /// Test seam for hermetic state directories and a fixed spawn time.
+    pub fn with_paths(
+        harness: AiHarness,
+        worktree: &Path,
+        paths: AiStatusPaths,
+        since: SystemTime,
+    ) -> Self {
+        match harness {
+            AiHarness::OpenCode => Self(AiTurnWatcherKind::OpenCode(
+                OpencodeTurnWatcher::with_db_path(
+                    paths.opencode_data.map(|dir| dir.join("opencode.db")),
+                    worktree,
+                    since
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as i64)
+                        .unwrap_or(0),
+                ),
+            )),
+            AiHarness::Codex => Self(AiTurnWatcherKind::Codex(JsonlTurnWatcher::new(
+                JsonlHarness::Codex,
+                paths.codex_sessions,
+                worktree,
+                since,
+            ))),
+            AiHarness::ClaudeCode => Self(AiTurnWatcherKind::Claude(JsonlTurnWatcher::new(
+                JsonlHarness::Claude,
+                paths.claude_projects,
+                worktree,
+                since,
+            ))),
+        }
+    }
+
+    /// Poll at most once per second; use [`Self::check_now`] for exit and
+    /// manual-continuation edges.
+    pub fn poll(&mut self) -> Option<AiTurn> {
+        match &mut self.0 {
+            AiTurnWatcherKind::OpenCode(watcher) => watcher.poll().map(Into::into),
+            AiTurnWatcherKind::Codex(watcher) | AiTurnWatcherKind::Claude(watcher) => {
+                watcher.poll()
+            }
+        }
+    }
+
+    pub fn check_now(&mut self) -> AiTurn {
+        match &mut self.0 {
+            AiTurnWatcherKind::OpenCode(watcher) => watcher.check_now().into(),
+            AiTurnWatcherKind::Codex(watcher) | AiTurnWatcherKind::Claude(watcher) => {
+                watcher.check_now()
+            }
+        }
+    }
+
+    /// Returns the selected turn's available assistant text even while it is
+    /// still streaming, for manual continuation and PTY-exit recovery.
+    pub fn transcript_now(&mut self) -> Option<String> {
+        match &mut self.0 {
+            AiTurnWatcherKind::OpenCode(watcher) => watcher.transcript_now(),
+            AiTurnWatcherKind::Codex(watcher) | AiTurnWatcherKind::Claude(watcher) => {
+                watcher.transcript_now()
+            }
+        }
+    }
+}
+
+impl From<OpencodeTurn> for AiTurn {
+    fn from(turn: OpencodeTurn) -> Self {
+        match turn {
+            OpencodeTurn::Working => Self::Working,
+            OpencodeTurn::Finished { transcript } => Self::Finished { transcript },
+            OpencodeTurn::Failed { message } => Self::Failed { message },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JsonlHarness {
+    Codex,
+    Claude,
+}
+
+struct JsonlTurnWatcher {
+    harness: JsonlHarness,
+    root: Option<PathBuf>,
+    directory: PathBuf,
+    since: SystemTime,
+    /// File identity is the pin: we never rescan after this has been selected.
+    file: Option<PathBuf>,
+    last_poll: Option<Instant>,
+}
+
+impl JsonlTurnWatcher {
+    fn new(
+        harness: JsonlHarness,
+        root: Option<PathBuf>,
+        worktree: &Path,
+        since: SystemTime,
+    ) -> Self {
+        Self {
+            harness,
+            root,
+            directory: canonical_key(worktree),
+            since,
+            file: None,
+            last_poll: None,
+        }
+    }
+
+    fn poll(&mut self) -> Option<AiTurn> {
+        if self
+            .last_poll
+            .is_some_and(|last| last.elapsed() < POLL_PERIOD)
+        {
+            return None;
+        }
+        self.last_poll = Some(Instant::now());
+        Some(self.check_now())
+    }
+
+    fn check_now(&mut self) -> AiTurn {
+        let Some(file) = self.resolve_file() else {
+            return AiTurn::Working;
+        };
+        match read_jsonl_turn(self.harness, &file) {
+            Ok(Some(turn)) => turn,
+            // A writer can leave one incomplete/malformed final line. It is
+            // not a completion signal and must not block the render loop.
+            Ok(None) | Err(_) => AiTurn::Working,
+        }
+    }
+
+    fn transcript_now(&mut self) -> Option<String> {
+        let file = self.resolve_file()?;
+        read_jsonl_turn(self.harness, &file)
+            .ok()
+            .flatten()
+            .and_then(|turn| match turn {
+                AiTurn::Finished { transcript } => Some(transcript),
+                AiTurn::Working => read_assistant_text(self.harness, &file).ok(),
+                AiTurn::Failed { .. } => read_assistant_text(self.harness, &file).ok(),
+            })
+    }
+
+    fn resolve_file(&mut self) -> Option<PathBuf> {
+        if let Some(file) = &self.file {
+            return Some(file.clone());
+        }
+        let root = self.root.as_ref()?;
+        let candidates = match self.harness {
+            JsonlHarness::Codex => codex_files(root),
+            JsonlHarness::Claude => claude_files(root),
+        };
+        let mut selected = None;
+        for path in candidates {
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if modified < self.since || metadata.len() > MAX_TRANSCRIPT_BYTES {
+                continue;
+            }
+            let Ok(Some(cwd)) = read_cwd(self.harness, &path) else {
+                continue;
+            };
+            if canonical_key(Path::new(&cwd)) != self.directory {
+                continue;
+            }
+            if !matches!(selected.as_ref(), Some((_, previous)) if modified <= *previous) {
+                selected = Some((path, modified));
+            }
+        }
+        let (path, _) = selected?;
+        self.file = Some(path.clone());
+        Some(path)
+    }
+}
+
+fn codex_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(years) = fs::read_dir(root) else {
+        return files;
+    };
+    for year in years.flatten() {
+        let Ok(months) = fs::read_dir(year.path()) else {
+            continue;
+        };
+        for month in months.flatten() {
+            let Ok(days) = fs::read_dir(month.path()) else {
+                continue;
+            };
+            for day in days.flatten() {
+                let Ok(entries) = fs::read_dir(day.path()) else {
+                    continue;
+                };
+                files.extend(entries.flatten().filter_map(|entry| {
+                    let path = entry.path();
+                    (path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")).then_some(path)
+                }));
+            }
+        }
+    }
+    files
+}
+
+fn claude_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(projects) = fs::read_dir(root) else {
+        return files;
+    };
+    for project in projects.flatten() {
+        let Ok(entries) = fs::read_dir(project.path()) else {
+            continue;
+        };
+        files.extend(entries.flatten().filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")).then_some(path)
+        }));
+    }
+    files
+}
+
+fn read_jsonl_turn(harness: JsonlHarness, file: &Path) -> std::io::Result<Option<AiTurn>> {
+    let lines = json_lines(file)?;
+    let cwd = lines.iter().find_map(|line| cwd_from_line(harness, line));
+    let Some(_) = cwd else { return Ok(None) };
+    let turn = match harness {
+        JsonlHarness::Codex => codex_turn(&lines),
+        JsonlHarness::Claude => claude_turn(&lines),
+    };
+    Ok(Some(turn))
+}
+
+fn read_cwd(harness: JsonlHarness, file: &Path) -> std::io::Result<Option<String>> {
+    Ok(json_lines(file)?
+        .iter()
+        .find_map(|line| cwd_from_line(harness, line)))
+}
+
+fn read_assistant_text(harness: JsonlHarness, file: &Path) -> std::io::Result<String> {
+    let lines = json_lines(file)?;
+    Ok(match harness {
+        JsonlHarness::Codex => codex_text(&lines),
+        JsonlHarness::Claude => claude_text(&lines),
+    })
+}
+
+fn json_lines(file: &Path) -> std::io::Result<Vec<Value>> {
+    if fs::metadata(file)?.len() > MAX_TRANSCRIPT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "transcript exceeds turn watcher limit",
+        ));
+    }
+    let file = fs::File::open(file)?;
+    let mut lines = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if let Ok(value) = serde_json::from_str(&line) {
+            lines.push(value);
+        }
+    }
+    Ok(lines)
+}
+
+fn cwd_from_line(harness: JsonlHarness, line: &Value) -> Option<String> {
+    match harness {
+        JsonlHarness::Codex => line
+            .pointer("/payload/cwd")
+            .or_else(|| line.pointer("/payload/payload/cwd")),
+        JsonlHarness::Claude => line.get("cwd"),
+    }
+    .and_then(Value::as_str)
+    .filter(|cwd| !cwd.trim().is_empty())
+    .map(str::to_string)
+}
+
+fn codex_turn(lines: &[Value]) -> AiTurn {
+    let mut state = None;
+    for line in lines {
+        let kind = line.pointer("/payload/type").and_then(Value::as_str);
+        if line.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        state = match kind {
+            Some("task_started") | Some("turn_started") => Some(Ok(())),
+            Some("task_complete") | Some("turn_complete") => Some(Err(false)),
+            Some("turn_aborted") => Some(Err(true)),
+            Some("error") | Some("task_failed") => Some(Err(true)),
+            _ => state,
+        };
+    }
+    match state {
+        Some(Ok(())) | None => AiTurn::Working,
+        Some(Err(true)) => AiTurn::Failed {
+            message: "Codex aborted the turn.".to_string(),
+        },
+        Some(Err(false)) => AiTurn::Finished {
+            transcript: codex_text(lines),
+        },
+    }
+}
+
+fn codex_text(lines: &[Value]) -> String {
+    lines
+        .iter()
+        .filter_map(|line| {
+            (line.get("type").and_then(Value::as_str) == Some("response_item"))
+                .then(|| line.pointer("/payload"))
+                .flatten()
+                .filter(|payload| {
+                    payload.get("type").and_then(Value::as_str) == Some("message")
+                        && payload.get("role").and_then(Value::as_str) == Some("assistant")
+                })
+                .and_then(|payload| payload.get("content").and_then(Value::as_array))
+        })
+        .flatten()
+        .filter_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("output_text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn claude_turn(lines: &[Value]) -> AiTurn {
+    let mut state = None;
+    for line in lines {
+        if line.get("type").and_then(Value::as_str) == Some("user")
+            && line.get("promptId").is_some()
+        {
+            state = Some(Ok(()));
+        }
+        if line.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        match line.pointer("/message/stop_reason").and_then(Value::as_str) {
+            Some("tool_use") => state = Some(Ok(())),
+            Some("error") | Some("aborted") => state = Some(Err(true)),
+            Some(_) => state = Some(Err(false)),
+            None => {}
+        }
+    }
+    match state {
+        Some(Ok(())) | None => AiTurn::Working,
+        Some(Err(true)) => AiTurn::Failed {
+            message: "Claude Code aborted the turn.".to_string(),
+        },
+        Some(Err(false)) => AiTurn::Finished {
+            transcript: claude_text(lines),
+        },
+    }
+}
+
+fn claude_text(lines: &[Value]) -> String {
+    lines
+        .iter()
+        .filter(|line| line.get("type").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|line| line.pointer("/message/content").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn paths(tmp: &tempfile::TempDir) -> AiStatusPaths {
+        AiStatusPaths {
+            codex_sessions: Some(tmp.path().join("codex")),
+            claude_projects: Some(tmp.path().join("claude")),
+            ..Default::default()
+        }
+    }
+
+    fn write(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn codex_lifecycle_pins_one_post_spawn_file_and_recovers_partial_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        let file = tmp.path().join("codex/2026/01/01/ours.jsonl");
+        write(&file, &format!("{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"partial\"}}]}}}}", worktree.display()));
+        let since = SystemTime::now() - Duration::from_secs(1);
+        let mut watcher =
+            AiTurnWatcher::with_paths(AiHarness::Codex, &worktree, paths(&tmp), since);
+        assert_eq!(watcher.check_now(), AiTurn::Working);
+        assert_eq!(watcher.transcript_now().as_deref(), Some("partial"));
+        fs::write(
+            &file,
+            format!(
+                "{}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}",
+                fs::read_to_string(&file).unwrap()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            watcher.check_now(),
+            AiTurn::Finished {
+                transcript: "partial".into()
+            }
+        );
+    }
+
+    #[test]
+    fn codex_aborted_turn_fails_and_unrelated_file_cannot_replace_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        let ours = tmp.path().join("codex/2026/01/01/ours.jsonl");
+        write(&ours, &format!("{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}", worktree.display()));
+        let mut watcher = AiTurnWatcher::with_paths(
+            AiHarness::Codex,
+            &worktree,
+            paths(&tmp),
+            SystemTime::now() - Duration::from_secs(1),
+        );
+        assert_eq!(watcher.check_now(), AiTurn::Working);
+        write(&tmp.path().join("codex/2026/01/01/newer.jsonl"), &format!("{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}", worktree.display()));
+        assert_eq!(watcher.check_now(), AiTurn::Working);
+        fs::write(
+            &ours,
+            format!(
+                "{}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\"}}}}",
+                fs::read_to_string(&ours).unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(matches!(watcher.check_now(), AiTurn::Failed { .. }));
+    }
+
+    #[test]
+    fn claude_tool_use_waits_but_terminal_stop_returns_only_text_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        let file = tmp.path().join("claude/project/session.jsonl");
+        write(&file, &format!("{{\"type\":\"user\",\"promptId\":\"p\",\"cwd\":\"{}\"}}\n{{\"type\":\"assistant\",\"cwd\":\"{}\",\"message\":{{\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"text\",\"text\":\"calling tool\"}},{{\"type\":\"tool_use\"}}]}}}}", worktree.display(), worktree.display()));
+        let mut watcher = AiTurnWatcher::with_paths(
+            AiHarness::ClaudeCode,
+            &worktree,
+            paths(&tmp),
+            SystemTime::now() - Duration::from_secs(1),
+        );
+        assert_eq!(watcher.check_now(), AiTurn::Working);
+        fs::write(&file, format!("{}\n{{\"type\":\"assistant\",\"cwd\":\"{}\",\"message\":{{\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}", fs::read_to_string(&file).unwrap(), worktree.display())).unwrap();
+        assert_eq!(
+            watcher.check_now(),
+            AiTurn::Finished {
+                transcript: "calling tool\n\ndone".into()
+            }
+        );
+    }
+}

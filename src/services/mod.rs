@@ -3,6 +3,7 @@
 pub mod ai_models;
 pub mod ai_run;
 pub mod ai_status;
+pub mod ai_turn;
 pub mod app_state;
 pub mod bugkill;
 pub mod dashboard;
@@ -26,6 +27,7 @@ pub use ai_status::{
     canonical_key, AiHarness, AiHarnessState, AiStatus, AiStatusIndex, AiStatusPaths,
     AiStatusReport, AiStatusService,
 };
+pub use ai_turn::{AiTurn, AiTurnWatcher};
 pub use app_state::AppStateService;
 pub use bugkill::{
     compute_attempt_changes, normalize_hypotheses, parse_hypotheses, transcript_tail,
