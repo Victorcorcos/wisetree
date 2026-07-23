@@ -1,31 +1,56 @@
-# Codex CLI and Claude Code in Wisetree's AI Activity panel
+# Codex CLI and Claude Code as inner terminals in Wisetree
 
-## Conclusion
+## Goal
 
-Yes, this is viable to implement Codex CLU and Claude Code inner terminals (AI Activity) inside Wisetree, just like Opencode is currently being implemented right now.
+Let a developer choose **Codex CLI** or **Claude Code** — instead of OpenCode —
+as the embedded AI harness for each of Wisetree's twelve AI-assisted commands,
+running as live inner terminals in the AI Activity panel exactly the way
+OpenCode runs today: the real interactive TUI in the PTY, with Wisetree
+detecting turn completion and extracting the assistant transcript to advance the
+workflow.
 
-Both Codex CLI and Claude Code can be started in Wisetree's existing PTY with
-an initial prompt, an explicit model, and an explicit reasoning/thinking
+This document is the implementation guide. It is meant to be split into sections
+and handed to an AI, section by section, to plan and implement.
+
+## Summary
+
+This is viable. Codex CLI and Claude Code both start in Wisetree's existing PTY
+with an initial prompt, an explicit model, and an explicit reasoning/thinking
 level. The PTY layer is already generic enough to host either executable.
 
-The main work is not PTY compatibility. It is replacing the OpenCode-specific
-turn lifecycle:
+The real work is not PTY compatibility. It is generalizing the OpenCode-specific
+turn lifecycle into a harness-neutral one:
 
-- `Develop` starts an OpenCode TUI that stays open after its turn.
+- Today `Develop` (and the other interactive commands) start an OpenCode TUI
+  that stays open after its turn.
 - Wisetree detects completion and extracts the assistant transcript by reading
-  OpenCode's private SQLite database.
+  OpenCode's private SQLite database (`OpencodeTurnWatcher`).
 - The workflow parses that transcript, advances to the next state, and may kill
   the still-open TUI.
 
-For a production integration, the recommended approach is to run Codex and
-Claude in their documented one-shot modes (`codex exec` and `claude -p`) and
-add a provider-neutral run adapter. Process exit then supplies the completion
-signal, and documented output formats supply the transcript. This is more
-robust than creating two more watchers for private session-file formats.
+Codex and Claude expose the same lifecycle on disk, and Wisetree already parses
+both formats for the dashboard. The plan below reuses that parsing to build a
+`CodexTurnWatcher` and a `ClaudeTurnWatcher` modeled on `OpencodeTurnWatcher`,
+so the interactive inner terminal works for every harness.
+
+## Execution strategy per slot
+
+Two run modes are used, chosen by what the slot already is:
+
+- **Interactive (primary).** Render the real `codex` / `claude` TUI in the PTY
+  and auto-advance with a harness-specific turn watcher. Used for every slot
+  that is interactive under OpenCode today: `explain`, `fix.apply`, `update`,
+  `bugkill.investigate`, `bugkill.fix`, `develop.plan`, `develop.implement`.
+- **One-shot captured.** Run `codex exec` / `claude -p`, take completion from
+  process exit and the transcript from documented output. Used only for slots
+  that are already non-interactive captured runs under OpenCode: `fix.plan`,
+  `review.strong/balanced/utility`, `bugkill.judge`.
+
+This keeps the inner-terminal experience for interactive commands and uses the
+cleaner one-shot contract only where there was never an interactive UI to begin
+with.
 
 ## What Wisetree does today
-
-The relevant pieces are:
 
 - `src/tui/widgets/pty_view.rs:60` is a generic `portable-pty` host. It accepts
   an executable, argument vector, cwd, and environment; sets
@@ -38,21 +63,33 @@ The relevant pieces are:
 - `src/services/dashboard.rs:4789` and `:4840` seed OpenCode's private
   `model.json` because its TUI does not accept a thinking flag.
 - `src/services/opencode_turn.rs:1` polls `opencode.db` for completion and
-  reconstructs the clean assistant transcript because terminal capture is not
-  suitable for contract parsing.
+  reconstructs the clean assistant transcript, because terminal capture of a TUI
+  is escape-sequence soup and not suitable for contract parsing. It binds to one
+  worktree at spawn time, pins `since_ms` so a retry never latches onto the
+  previous run's session, and pins the resolved `session_id` so the user's own
+  unrelated session in the same cwd cannot hijack the watch
+  (`opencode_turn.rs:53`). It returns `Working | Finished { transcript } |
+  Failed { message }` (`opencode_turn.rs:40`).
 - `src/config/schema.rs:114` stores only `{ model, thinking }`, and its model
-  value is specifically an OpenCode `provider/model` identifier.
+  value is specifically an OpenCode `provider/model` identifier. The struct has
+  `#[serde(deny_unknown_fields)]`.
 
-The existing dashboard activity detectors are useful prior art:
+The existing dashboard activity detectors already parse the Codex and Claude
+turn lifecycles and are the foundation for the new watchers:
 
-- `src/services/ai_status/codex.rs:1` already reads Codex rollout JSONL and
-  understands turn start/complete/abort events.
-- `src/services/ai_status/claude.rs:1` already reads Claude project
-  transcripts and understands user/tool-use/end-turn state.
+- `src/services/ai_status/codex.rs:314` reads
+  `~/.codex/sessions/.../rollout-*.jsonl` and interprets the turn-lifecycle
+  events codex's `RolloutRecorder` writes verbatim — `task_started` /
+  `turn_started` (in flight) vs. `task_complete` / `turn_complete` /
+  `turn_aborted` (done). The last such marker in the file is the state.
+- `src/services/ai_status/claude.rs:1` reads
+  `~/.claude/projects/<slug>/*.jsonl` and keys on `message.stop_reason` — a
+  `user` prompt or assistant `stop_reason == tool_use` is in flight; any other
+  stop reason (`end_turn`, `stop_sequence`, `max_tokens`, …) is done.
 
-Those detectors make an interactive proof of concept easier, but they do not
-currently return a transcript tied unambiguously to the child Wisetree just
-started.
+These detectors currently reduce each cwd to a coarse `Running`/`Idle` for the
+dashboard and do not return a transcript. Section 4 explains what to add so the
+same parsing drives an embedded turn watcher.
 
 ## CLI capability comparison
 
@@ -93,11 +130,11 @@ Official references:
 
 ## Candidate invocations
 
-These are argument-vector examples, not shell strings. Wisetree should continue
-passing prompt text as one argument so backticks, quotes, `$()`, and newlines
-cannot be interpreted by a shell.
+These are argument-vector examples, not shell strings. Pass prompt text as one
+argument so backticks, quotes, `$()`, and newlines cannot be interpreted by a
+shell.
 
-### Codex interactive
+### Codex interactive (primary for interactive slots)
 
 Planning:
 
@@ -121,12 +158,11 @@ codex
   <prompt>
 ```
 
-This should render inside the current PTY. `--no-alt-screen` is also available
-if inline rendering behaves better inside the nested terminal. Like OpenCode,
-the interactive TUI remains open after a completed turn, so Wisetree would
-still need a Codex-specific completion/transcript watcher.
+Renders inside the current PTY. `--no-alt-screen` is available if inline
+rendering behaves better inside the nested terminal. The TUI stays open after a
+completed turn, so Wisetree advances via `CodexTurnWatcher` (section 4).
 
-### Codex recommended one-shot mode
+### Codex one-shot (for already-captured slots)
 
 ```text
 codex exec
@@ -139,22 +175,23 @@ codex exec
   <prompt>
 ```
 
-This is the cleanest mapping. JSONL provides activity events, the output file
-provides the exact final assistant message, and the exit status provides
-success/failure. Planning should use `read-only`; implementation needs
-`workspace-write`.
+JSONL provides activity events, the output file provides the exact final
+assistant message, and the exit status provides success/failure. Planning uses
+`read-only`; implementation needs `workspace-write`.
 
-The placement above matters. In Codex CLI 0.145.0,
-`codex exec --ask-for-approval never` is rejected because the flag is global
-and is not accepted in that post-subcommand position. The parser accepts
-`codex --ask-for-approval never exec ...`, but
-`--config approval_policy="never"` is accepted directly by `exec` and maps to
-the documented non-interactive configuration. It does not grant extra access:
-the sandbox still limits the run, and operations that need unavailable
-approval fail. Wisetree should not use
-`--dangerously-bypass-approvals-and-sandbox`.
+Flag placement matters. In Codex CLI 0.145.0,
+`codex exec --ask-for-approval never` is rejected because the flag is global and
+is not accepted in that post-subcommand position. Use
+`--config approval_policy="never"`, which `exec` accepts directly and which maps
+to the documented non-interactive configuration. It does not grant extra access:
+the sandbox still limits the run, and operations that need unavailable approval
+fail. Do not use `--dangerously-bypass-approvals-and-sandbox`.
 
-### Claude Code interactive
+`--output-last-message` and any `--json` capture must target a path unique per
+concurrent run — keyed by run/worktree id, never a fixed path or "newest file in
+cwd" — because Wisetree runs many worktree agents at once.
+
+### Claude Code interactive (primary for interactive slots)
 
 Planning:
 
@@ -176,12 +213,11 @@ claude
   <prompt>
 ```
 
-This also should render in the current PTY and lets the user answer permission
-prompts while the inner terminal is focused. As with interactive Codex and
-OpenCode, Wisetree needs a provider-specific watcher to know when the turn,
-rather than the process, has finished.
+Renders in the current PTY and lets the user answer permission prompts while the
+inner terminal is focused. Wisetree advances via `ClaudeTurnWatcher`
+(section 4).
 
-### Claude Code recommended one-shot planning
+### Claude Code one-shot planning (for already-captured slots)
 
 ```text
 claude
@@ -197,21 +233,21 @@ claude
   <prompt>
 ```
 
-`--permission-mode plan` is not the recommended one-shot planning policy.
-Although it is read-only, Claude can call `ExitPlanMode` when the plan is ready
-or `AskUserQuestion` while preparing it. Claude's hooks reference says both
-normally block under `-p` unless the caller implements an interaction hook.
-`dontAsk` plus an explicit read-only `--tools` list is a smaller, reliably
-non-interactive contract. The generated prompt should tell Claude to return
-the plan as its final response and not request interaction.
+Do not use `--permission-mode plan` for one-shot planning. Although it is
+read-only, Claude can call `ExitPlanMode` when the plan is ready or
+`AskUserQuestion` while preparing it, and both normally block under `-p` unless
+the caller implements an interaction hook. `dontAsk` plus an explicit read-only
+`--tools` list is a smaller, reliably non-interactive contract. The generated
+prompt should tell Claude to return the plan as its final response and not
+request interaction.
 
-If planning must use read-only shell commands such as `git diff`, add `Bash`
-to `--tools` only together with narrowly scoped `--allowedTools` rules. Do not
-allow arbitrary Bash merely to reproduce interactive plan mode.
+If planning must use read-only shell commands such as `git diff`, add `Bash` to
+`--tools` only together with narrowly scoped `--allowedTools` rules. Do not allow
+arbitrary Bash merely to reproduce interactive plan mode.
 `--disallowedTools mcp__*` is necessary because `--tools` restricts built-in
 tools but does not restrict MCP tools.
 
-### Claude Code recommended one-shot implementation
+### Claude Code one-shot implementation (for already-captured slots)
 
 ```text
 claude
@@ -228,31 +264,28 @@ claude
   <prompt>
 ```
 
-Here `Bash(<exact-check-command>)` is one argument containing a Claude
-permission rule, derived from the configured Develop check command. Add other
-rules only for commands Wisetree intentionally authorizes. `acceptEdits`
-allows file edits without prompting; unapproved commands can still be denied
-instead of silently broadening access. Wisetree should never substitute
-`--dangerously-skip-permissions`.
+`Bash(<exact-check-command>)` is one argument containing a Claude permission
+rule, derived from the configured check command. Add other rules only for
+commands Wisetree intentionally authorizes. `acceptEdits` allows file edits
+without prompting; unapproved commands can still be denied instead of silently
+broadening access. Never substitute `--dangerously-skip-permissions`.
 
 For both one-shot forms, the stream carries activity and ends with a `result`
-message, and the process exits after the turn. Unlike Codex, Claude does not
-document a final-message file option, so Wisetree must capture and parse the
-stream itself.
-
-Claude's docs also record important stream-version fixes: before 2.1.208 a
+message, and the process exits after the turn. Claude does not document a
+final-message file option, so Wisetree must capture and parse the stream itself.
+Streamed final output is reliable only on Claude Code 2.1.214+: before 2.1.208 a
 large piped response could omit the final `result`, and before 2.1.214 the
-short output-drain wait could truncate the end of a large response. The local
-2.1.198 binary accepts these flags but predates both fixes. Require Claude Code
-2.1.214 or newer for the streamed adapter, or temporarily use
-`--output-format json` without live token streaming during a spike.
+short output-drain wait could truncate the end of a large response. Treat
+**Claude Code 2.1.214+ as a hard prerequisite** for the streamed one-shot
+adapter and gate it in preflight; the alternative during a spike is
+`--output-format json` without live token streaming.
 
 ## Required design changes
 
 ### 1. Add harness to the persisted per-command configuration
 
-The proposed Settings shape is sound. Keep one canonical `provider/model`
-value in the configuration and add a typed harness:
+Keep one canonical `provider/model` value in the configuration and add a typed
+harness:
 
 ```json
 {
@@ -270,11 +303,12 @@ AiCommandHarness = Opencode | Codex | ClaudeCode
 
 The existing `services::ai_status::AiHarness` is related but not identical: it
 also represents Gemini and uses the status-report wire values `codex_cli` and
-`claude_code`. A separate three-value execution enum keeps the persisted
-command contract narrow. Suggested JSON values are `opencode`, `codex`, and
-`claudeCode`; the UI label for the last value can be `claude code`.
+`claude_code`. A separate three-value execution enum keeps the persisted command
+contract narrow. JSON values are `opencode`, `codex`, and `claudeCode`; the UI
+label for the last value is `claude code`.
 
-Add `#[serde(default)]` to `AiModelConfig.harness` and make
+`AiModelConfig` carries `#[serde(deny_unknown_fields)]`. Add
+`#[serde(default)] harness` (a known field, so this stays compatible) and make
 `AiCommandHarness::default()` return `Opencode`. That gives all of these cases
 the required behavior:
 
@@ -285,8 +319,11 @@ the required behavior:
   OpenCode;
 - newly saved values serialize the harness explicitly.
 
-The model stays canonical in storage because it is also what the existing
-model picker returns. Translate only at the launcher boundary:
+Serialization tests must assert that pre-existing configs with no `harness` key
+still deserialize, and that no other unknown key slips in.
+
+The model stays canonical in storage because it is also what the existing model
+picker returns. Translate only at the launcher boundary:
 
 | Harness | Accepted stored provider | CLI model argument |
 | --- | --- | --- |
@@ -295,8 +332,8 @@ model picker returns. Translate only at the launcher boundary:
 | Claude Code | Exactly `anthropic` | Strip `anthropic/` and pass the model ID |
 
 Do not infer provider from the model's marketing name. For example,
-`github-copilot/gpt-*` is not an `openai` provider under this rule and
-therefore offers only OpenCode.
+`github-copilot/gpt-*` is not an `openai` provider under this rule and therefore
+offers only OpenCode.
 
 The valid harness list for a row is consequently:
 
@@ -306,13 +343,13 @@ anthropic/* -> [opencode, claudeCode]
 everything  -> [opencode]
 ```
 
-If the model is changed and the current harness becomes incompatible, reset
-the harness to OpenCode and mark the row modified. A hand-edited configuration
-that explicitly combines an incompatible provider and harness should fail
-validation with the slot path and accepted choices; it must not silently run a
-different executable.
+If the model is changed and the current harness becomes incompatible, reset the
+harness to OpenCode and mark the row modified. A hand-edited configuration that
+explicitly combines an incompatible provider and harness must fail validation
+with the slot path and accepted choices; it must not silently run a different
+executable.
 
-### 2. Implement the proposed AI Models interaction
+### 2. Implement the AI Models interaction
 
 The screen is already `Settings -> Dashboard -> ai`, backed by
 `AiSettingsEditor`. Change the description to:
@@ -327,19 +364,19 @@ Render each non-empty row as three independently styled spans:
 openai/gpt-5.6-sol  ·  medium  ·  opencode
 ```
 
-Add a small field-focus value to the editor:
+Add a field-focus value to the editor:
 
 ```text
 AiSettingsField = Model | Thinking | Harness
 ```
 
-`AiSettingsSelection` should continue to own vertical location
-(`Rect(index)`, `FreeModels(index)`, or `Save`); `AiSettingsField` owns the
-horizontal focus only while a rectangle is selected. This is less invasive
-than multiplying every selection variant by three and preserves the existing
-scroll window, free-model row, and Save navigation.
+`AiSettingsSelection` continues to own vertical location (`Rect(index)`,
+`FreeModels(index)`, or `Save`); `AiSettingsField` owns the horizontal focus only
+while a rectangle is selected. This is less invasive than multiplying every
+selection variant by three and preserves the existing scroll window, free-model
+row, and Save navigation.
 
-Recommended keyboard contract:
+Keyboard contract:
 
 | Location | Key | Behavior |
 | --- | --- | --- |
@@ -351,8 +388,8 @@ Recommended keyboard contract:
 | Free-model row | Left/Right, Enter | Keep the existing chip-cycle and stage behavior |
 | Save | Enter | Persist the complete Dashboard configuration |
 
-Space on Model and Enter on Thinking/Harness should be inert. This keeps one
-obvious key for each action. The footer should say:
+Space on Model and Enter on Thinking/Harness are inert. This keeps one obvious
+key per action. Footer:
 
 ```text
 Up/Down move · Left/Right choose field · Space change value · Enter pick model/Save · Esc back
@@ -361,8 +398,16 @@ Up/Down move · Left/Right choose field · Space change value · Enter pick mode
 Today `render_ai_settings_rectangle` applies bold white styling to the whole
 line and dims only the thinking suffix. Change it to style the focused span
 white + bold and the other two spans muted/dim, leaving separators muted.
-Default focus when the page opens should be Model. The rectangle border and
-Saved/Modified colors can remain unchanged.
+Default focus when the page opens is Model. The rectangle border and
+Saved/Modified colors are unchanged.
+
+**Model-picker source.** The picker is fed by `opencode models` today. Define
+the model source per harness so a user selecting Codex/Claude picks a valid
+model: use `codex debug models --bundled` for Codex, and a curated or
+`--help`-derived list for Claude. If instead the picker keeps showing OpenCode's
+catalogue and only the harness column re-interprets an already-`openai/`- or
+`anthropic/`-prefixed model, state that explicitly and enforce the provider
+rules from section 1.
 
 The first-page AI summary used by Pull Request commands must also expose the
 choice. Extend the shared `PrConfirmView` table from:
@@ -383,65 +428,65 @@ Review, Update, Bugkill, and Develop. Add `harness` to `AiRoleRow` and pass it
 from each role's `AiModelConfig`; do not re-read a settings file in the widget.
 The screen already receives the resolved Dashboard configuration, which comes
 from project-local `.wisetree.json` when present and otherwise from the global
-settings file. Legacy entries have `Opencode` through the serde default, so
-that is what the new column displays.
+settings file. Legacy entries have `Opencode` through the serde default, so that
+is what the new column displays.
 
 Widen the centered table enough for the new fixed-width column and let Model
 remain the flexible/clipped column on narrow terminals. The table's height is
 unchanged, but its render tests and all `AiRoleRow::new` call sites must be
 updated.
 
-The current model picker also asks for a thinking variant after model
-selection. With inline Space handling, that second picker phase becomes
-duplicative and, for Codex/Claude, can use the wrong harness's variants.
-Simplify `AiModelPickerAction::Selected` to return the model only. On return:
+The model picker also asks for a thinking variant after model selection. With
+inline Space handling, that second picker phase becomes duplicative and, for
+Codex/Claude, can use the wrong harness's variants. Simplify
+`AiModelPickerAction::Selected` to return the model only. On return:
 
 - preserve the current thinking value if it is supported by the current
   harness/model pair;
 - otherwise reset thinking to Default;
-- reset an incompatible harness to OpenCode as described above.
+- reset an incompatible harness to OpenCode as described in section 1.
 
-The free OpenCode model chips need the same normalization because selecting an
+The free OpenCode model chips need the same normalization, because selecting an
 `opencode/*` chip while Codex or Claude is selected makes that harness invalid.
 
 Mouse support currently exists for the AI Save button but not individual
-command-row fields. Keyboard behavior is sufficient for this feature; if row
-mouse targets are added later, each span needs its own hit rectangle so a
-click selects the correct field rather than opening the model picker
-unconditionally.
+command-row fields. Keyboard behavior is sufficient; if row mouse targets are
+added later, each span needs its own hit rectangle so a click selects the correct
+field rather than opening the model picker unconditionally.
 
 ### 3. Make thinking choices harness-aware
 
 The current variant map is keyed only by `provider/model` and comes from
-`opencode models --verbose`. It cannot be reused as the source of truth for
-other harnesses. Resolve choices by `(harness, provider/model)`:
+`opencode models --verbose`. It cannot be the source of truth for other
+harnesses. Resolve choices by `(harness, provider/model)`:
 
 - OpenCode: keep the existing per-model variant map and generic fallback.
 - Codex: parse `codex debug models --bundled`, whose JSON includes each model
-  slug's `supported_reasoning_levels`. The installed 0.145.0 binary exposes
-  this command without making a paid model call.
+  slug's `supported_reasoning_levels`. The installed 0.145.0 binary exposes this
+  command without making a paid model call.
 - Claude Code: the CLI documents `--effort` and prints the levels supported by
-  that CLI version, but does not document an equivalent per-model catalogue.
-  Use the locally advertised levels as a best-effort list, retain Default, and
-  treat model-specific acceptance as a launch preflight. Do not hardcode an
+  that CLI version, but does not document an equivalent per-model catalogue. Use
+  the locally advertised levels as a best-effort list, retain Default, and treat
+  model-specific acceptance as a launch preflight. Do not hardcode an
   OpenCode-derived ladder as authoritative for Claude.
 
-For context, the generic Codex config reference lists
+The ladders genuinely differ: the generic Codex config reference lists
 `minimal|low|medium|high|xhigh`, while the installed Codex catalogue offers
-`low|medium|high|xhigh|max|ultra` for `gpt-5.6-sol`. Installed Claude Code
-2.1.198 advertises `low|medium|high|xhigh|max`; current Claude documentation
-also describes `ultracode` on newer versions and supported models. One shared
-ladder would therefore accept invalid combinations or hide valid ones.
+`low|medium|high|xhigh|max|ultra` for `gpt-5.6-sol`; installed Claude Code
+2.1.198 advertises `low|medium|high|xhigh|max`, and newer Claude versions add
+`ultracode` on supported models. One shared ladder would accept invalid
+combinations or hide valid ones.
 
 When Space changes the harness, immediately re-resolve the thinking list. Keep
-the current value if it remains valid; otherwise reset it to Default in the
-same row mutation. This prevents saving a thinking level that was valid for
-OpenCode but invalid for Codex or Claude.
+the current value if it remains valid; otherwise reset it to Default in the same
+row mutation. This prevents saving a thinking level that was valid for OpenCode
+but invalid for Codex or Claude.
 
-### 4. Add a provider-neutral run contract
+### 4. Provider-neutral run contract and turn watcher
 
-Replace `FixApplyHandoff { opencode_binary, opencode_args, cwd }` and
-`OpencodeTurnWatcher` at the workflow boundary with concepts such as:
+Generalize the workflow boundary. Replace
+`FixApplyHandoff { opencode_binary, opencode_args, cwd }` and the direct
+`OpencodeTurnWatcher` references with:
 
 ```text
 AiRunSpec {
@@ -449,41 +494,80 @@ AiRunSpec {
     binary,
     args,
     cwd,
-    output_mode,
+    output_mode,   // Interactive | OneShot { capture }
 }
 
 AiRunEvent = Activity | Finished { transcript } | Failed { message }
 ```
 
-OpenCode can initially keep its existing adapter. Codex and Claude adapters
-should use their documented one-shot output.
+Define a shared turn watcher with one implementation per harness, all returning
+the same enum `OpencodeTurn` already uses
+(`Working | Finished { transcript } | Failed { message }`):
+
+```text
+trait AiTurnWatcher {
+    fn poll(&mut self) -> AiTurn;   // Working | Finished { transcript } | Failed { message }
+}
+
+// implementations:
+OpencodeTurnWatcher   // existing: opencode.db
+CodexTurnWatcher      // new: ~/.codex/sessions/.../rollout-*.jsonl
+ClaudeTurnWatcher     // new: ~/.claude/projects/<slug>/*.jsonl
+```
+
+The new watchers reuse the lifecycle parsing already written and tested in
+`ai_status/codex.rs` and `ai_status/claude.rs`, plus two things those detectors
+do not do today:
+
+1. **Attribution, not just detection.** The detectors collapse each cwd to a
+   coarse `Running`/`Idle`, keeping only the newest-mtime session. A watcher
+   must mirror `OpencodeTurnWatcher`'s anti-hijack discipline: pin `since_ms` at
+   spawn so a retry never latches onto the previous run's session, and pin the
+   resolved session id/file so the user's own separate `codex`/`claude` session
+   in the same cwd cannot hijack the watch. Worktree cwds are unique, which
+   makes cwd a strong key, but "newest session in cwd" alone is the *Same-cwd
+   session races* risk below.
+2. **Transcript extraction.** The detectors return only `Running`/`Idle`;
+   workflows that parse a contract (`fix.plan`, `explain`, `bugkill.judge`, …)
+   need the assistant text. Extract it from the same files the detectors already
+   locate: for Codex the assistant `response_item` / `final_answer` message
+   parts, for Claude the assistant `message` content blocks. This is the
+   equivalent of `OpencodeTurn::Finished { transcript }`.
+
+Keep the existing manual "continue now" Enter fallback (`bugkill_pr.rs:846`) as
+the guaranteed backstop if a session file is missing or a CLI changes format.
+
+For the one-shot slots, the same `AiTurn` values come from process exit plus
+documented output (`--output-last-message` for Codex, the stream `result` for
+Claude) instead of a file watcher.
 
 ### 5. Route every configured AI phase through the selected harness
 
 The harness is stored on all twelve `AiModelConfig` leaves, not only Develop.
 The current execution paths are:
 
-| Settings slot | Current OpenCode behavior |
-| --- | --- |
-| `explain` | Interactive TUI + private-database turn watcher |
-| `fix.plan` | Captured `opencode run`, then parse structured text |
-| `fix.apply` | Interactive TUI + turn watcher |
-| `review.strong/balanced/utility` | Multiple captured `opencode run` calls |
-| `update` | Interactive TUI + turn watcher for PR and local-branch conflicts |
-| `bugkill.investigate` | Interactive TUI + turn watcher |
-| `bugkill.fix` | Interactive TUI + turn watcher |
-| `bugkill.judge` | Captured `opencode run` |
-| `develop.plan` | Interactive TUI + turn watcher |
-| `develop.implement` | Interactive TUI + turn watcher |
+| Settings slot | Current OpenCode behavior | New run mode |
+| --- | --- | --- |
+| `explain` | Interactive TUI + turn watcher | Interactive + turn watcher |
+| `fix.plan` | Captured `opencode run`, parse structured text | One-shot captured |
+| `fix.apply` | Interactive TUI + turn watcher | Interactive + turn watcher |
+| `review.strong/balanced/utility` | Multiple captured `opencode run` calls | One-shot captured |
+| `update` | Interactive TUI + turn watcher (PR and local-branch conflicts) | Interactive + turn watcher |
+| `bugkill.investigate` | Interactive TUI + turn watcher | Interactive + turn watcher |
+| `bugkill.fix` | Interactive TUI + turn watcher | Interactive + turn watcher |
+| `bugkill.judge` | Captured `opencode run` | One-shot captured |
+| `develop.plan` | Interactive TUI + turn watcher | Interactive + turn watcher |
+| `develop.implement` | Interactive TUI + turn watcher | Interactive + turn watcher |
 
 Every call site must request an `AiRunSpec` from a harness adapter rather than
 reading a global `opencode_binary`. In particular:
 
 - binary availability checks must inspect the selected slot's executable;
-- `FixApplyHandoff`, `ConflictsHandedOffToUi`, and similar outcomes must carry
-  a provider-neutral run specification;
-- the five `OpencodeTurnWatcher` fields in `App` must become run-owned
-  lifecycle/capture state for one-shot Codex and Claude runs;
+- `FixApplyHandoff`, `ConflictsHandedOffToUi`, and similar outcomes must carry a
+  provider-neutral run specification;
+- the five `OpencodeTurnWatcher` fields in `App` must become `AiTurnWatcher`
+  trait objects (or a harness-tagged enum) so the same App state serves any
+  harness;
 - screen methods and labels such as `spawn_opencode_pty`, `Focus opencode`, and
   `Launching opencode...` must use the selected harness display name;
 - `PrConfirmView` must add Harness as the last column after Role, Model, and
@@ -491,21 +575,21 @@ reading a global `opencode_binary`. In particular:
 - Review benchmark/capture provenance should include harness so results from
   different executables cannot be compared as if they were identical.
 
-This creates an important rollout rule: do not display Codex or Claude for a
-slot until that slot's complete execution path supports the adapter. If the
-first implementation covers only `develop.plan` and `develop.implement`, the
-harness list for the other ten slots must temporarily remain `[opencode]`.
+Rollout rule: do not display Codex or Claude for a slot until that slot's
+complete execution path supports the adapter. If the first implementation covers
+only `develop.plan` and `develop.implement`, the harness list for the other ten
+slots must temporarily remain `[opencode]`.
 
 The executable names are `opencode`, `codex`, and `claude`. Keep the product
-labels `OpenCode`, `Codex CLI`, and `Claude Code` separate from binary names.
-At launch, convert the stored canonical model as described above, build the
+labels `OpenCode`, `Codex CLI`, and `Claude Code` separate from binary names. At
+launch, convert the stored canonical model as described above, build the
 harness-specific arguments, and return an actionable error naming the missing
 binary, unsupported model, or unsupported effort.
 
 ### 6. Preserve the existing local/global save semantics
 
-No new persistence path is needed. For an AI-only edit, the existing flow
-already does what is required:
+No new persistence path is needed. For an AI-only edit, the existing flow already
+does what is required:
 
 1. AI Settings Save returns `SettingsAction::SaveDashboard`.
 2. `App::save_dashboard` writes the whole dashboard to the existing
@@ -513,39 +597,40 @@ already does what is required:
 3. If no local file exists, it writes `~/.wisetree/settings.json`.
 4. It reloads the active `ConfigService` and marks the Dashboard editor saved.
 
-Esc currently stages AI edits back into the Dashboard editor but does not
-write them. Preserve that behavior; only Enter on the AI page's Save button
-persists. Add tests for both target paths with a non-default harness, as the
-existing tests already cover the local/global routing for Dashboard settings.
+Esc currently stages AI edits back into the Dashboard editor but does not write
+them. Preserve that behavior; only Enter on the AI page's Save button persists.
+Add tests for both target paths with a non-default harness, as the existing tests
+already cover the local/global routing for Dashboard settings.
 
-One existing exception deserves a regression test: `App::save_dashboard`
-forces a project-local write when `wiseMerge` changed, even if no local file
-previously existed. If a user stages `wiseMerge`, enters AI Settings, and saves
-there, that special case currently wins over the global fallback. Either keep
-that established Dashboard behavior and document it, or ensure AI Settings
-Save cannot accidentally include an unrelated staged `wiseMerge` change. The
-harness field itself must not create a local file when none exists.
+One existing exception deserves a regression test: `App::save_dashboard` forces a
+project-local write when `wiseMerge` changed, even if no local file previously
+existed. If a user stages `wiseMerge`, enters AI Settings, and saves there, that
+special case currently wins over the global fallback. Either keep that
+established Dashboard behavior and document it, or ensure AI Settings Save cannot
+accidentally include an unrelated staged `wiseMerge` change. The harness field
+itself must not create a local file when none exists.
 
 ### 7. Capture output independently of terminal rendering
 
-`PtyView` currently sends bytes only to the `vt100` parser. Extend the reader
-to tee raw bytes/events to a bounded capture or channel.
+`PtyView` currently sends bytes only to the `vt100` parser. For one-shot slots,
+extend the reader to tee raw bytes/events to a bounded capture or channel.
 
-- Codex can render its normal progress in the panel and read the final message
-  from `--output-last-message`; alternatively, parse `--json`.
-- Claude stream-JSON should be parsed into a small provider-neutral activity
-  view rather than displayed as raw JSON lines.
+- Codex renders its normal progress in the panel and Wisetree reads the final
+  message from `--output-last-message` (or parses `--json`).
+- Claude stream-JSON is parsed into a small provider-neutral activity view rather
+  than displayed as raw JSON lines.
 - Keep a strict memory cap and retain only the final transcript plus a bounded
   activity tail.
+- Capture files/temp paths must be unique per concurrent run (section on Codex
+  one-shot above).
 
-This is the largest UI difference. Running the interactive TUIs gives the
-closest visual parity with OpenCode; running the supported one-shot modes gives
-the cleanest lifecycle and output contract.
+Interactive slots do not rely on this: they render the real TUI and take the
+transcript from the turn watcher (section 4), exactly like OpenCode today.
 
 ### 8. Separate planning and implementation permissions
 
-The current OpenCode `--agent plan` is semantically important, not just a UI
-choice.
+The OpenCode `--agent plan` is semantically important, not just a UI choice. Map
+it per harness and run mode:
 
 - Codex planning: `--sandbox read-only`.
 - Codex implementation: `--sandbox workspace-write`.
@@ -556,13 +641,13 @@ choice.
 - Claude implementation: `--permission-mode acceptEdits` with an explicit tool
   list and narrowly scoped `--allowedTools` rules for configured checks.
 
-Wisetree should show the effective permission policy on the confirmation page
-alongside harness, model, and thinking level.
+Show the effective permission policy on the confirmation page alongside harness,
+model, and thinking level.
 
-### 9. Add capability checks
+### 9. Capability and authentication preflight
 
-Checking only `<binary> --version` is not enough. Versions and entitlements can
-differ, and effort levels are model-dependent. Preflight should report:
+`<binary> --version` alone is not enough. Versions and entitlements differ, and
+effort levels are model-dependent. Preflight must report:
 
 - binary absent;
 - not authenticated;
@@ -570,14 +655,21 @@ differ, and effort levels are model-dependent. Preflight should report:
 - requested effort unsupported;
 - permission/output flag unsupported by the installed CLI version.
 
-The repository already has both binaries installed for a local spike:
-Codex CLI 0.145.0 and Claude Code 2.1.198. Their local `--help` output confirms
-the prompt/model/effort and structured-output flags described above. No paid
-model invocation was made during this investigation. Local parsing also
-confirmed that Codex rejects `--ask-for-approval` after `exec` and accepts
-`--config approval_policy="never"`. Claude 2.1.198 is adequate for argument
-construction tests, but should be upgraded before relying on streamed final
-output.
+Authentication and billing diverge by harness and this is a first-class concern
+for a tool that runs agents in parallel across many worktrees. The three CLIs
+authenticate differently (OpenCode config keys, Codex login, Claude
+subscription/OAuth), and a user may be logged into one but not another, or incur
+per-invocation metering that parallel fan-out multiplies. Surface an actionable
+"authenticate `<harness>` first" state distinct from "binary absent," and
+document the auth model per harness.
+
+Local baseline for development: Codex CLI 0.145.0 and Claude Code 2.1.198 are
+installed. Their `--help` output confirms the prompt/model/effort and
+structured-output flags above, and local parsing confirmed that Codex rejects
+`--ask-for-approval` after `exec` and accepts `--config approval_policy="never"`.
+Claude 2.1.198 is adequate for argument-construction tests but must be upgraded
+to 2.1.214+ before relying on streamed final output (see the Claude one-shot
+section).
 
 ### 10. Code areas and verification
 
@@ -585,19 +677,23 @@ The implementation is wider than the Settings row itself:
 
 - `src/config/schema.rs`: add `AiCommandHarness`, the defaulted field, legacy
   migration, validation, defaults, JSON Schema output, and serialization tests.
-  Every `AiModelConfig` struct literal in source/tests must either set harness
-  or use a constructor/default update.
+  Every `AiModelConfig` struct literal in source/tests must either set harness or
+  use a constructor/default update.
 - `src/tui/screens/settings.rs`: add horizontal field focus, Space cycling,
   provider filtering, harness-aware thinking lookup, per-span styling,
   normalization, help text, and local editor tests.
-- `src/tui/screens/ai_model_picker.rs` and
-  `src/services/opencode_models.rs`: make model selection independent of the
-  OpenCode-only variant phase, and introduce harness-aware capability sources.
-- `src/services/dashboard.rs`: replace hard-coded OpenCode binary gates,
-  argument construction, output parsing, handoff types, and messages with
-  adapters. Preserve the existing prompt builders and deterministic parsers.
-- `src/tui/app.rs`: resolve the correct binary, own structured child output,
-  and replace OpenCode-only watchers where one-shot mode is used.
+- `src/tui/screens/ai_model_picker.rs` and `src/services/opencode_models.rs`:
+  make model selection independent of the OpenCode-only variant phase, add the
+  per-harness model source, and introduce harness-aware capability sources.
+- `src/services/dashboard.rs`: replace hard-coded OpenCode binary gates, argument
+  construction, output parsing, handoff types, and messages with adapters.
+  Preserve the existing prompt builders and deterministic parsers.
+- `src/services/opencode_turn.rs` (or a new `ai_turn` module): extract the shared
+  `AiTurnWatcher` trait and add `CodexTurnWatcher` / `ClaudeTurnWatcher` reusing
+  `ai_status/{codex,claude}.rs` parsing, with attribution pinning and transcript
+  extraction.
+- `src/tui/app.rs`: resolve the correct binary, own structured child output for
+  one-shot slots, and generalize the watcher fields to the trait.
 - `src/tui/screens/{explain_pr,fix_pr,update_pr,review_pr,bugkill_pr,develop_pr}.rs`
   and `src/tui/widgets/pr_confirm.rs`: make activity labels and confirmation
   tables harness-aware without changing the workflow state machines.
@@ -616,67 +712,74 @@ Minimum verification matrix:
 - Save writes harness to local config when present and global config otherwise;
 - each adapter emits the exact argument vector for prompt, model, effort, cwd,
   permissions, and output mode without invoking a shell;
-- stub Codex/Claude processes exercise structured progress, final transcript,
-  non-zero exit, malformed output, timeout, and cancellation;
+- `CodexTurnWatcher` / `ClaudeTurnWatcher` classify a fixture session as
+  Working, then Finished with the right transcript, and ignore a same-cwd
+  session created before `since_ms` or with a different session id;
+- stub Codex/Claude one-shot processes exercise structured progress, final
+  transcript, non-zero exit, malformed output, timeout, and cancellation;
 - confirmation views show the selected harness for every role.
 
 `dashboard.aiStatus.enabledHarnesses` is a separate feature: it controls
-background detection of arbitrary external AI sessions. Selecting Codex or
-Claude for a command should not silently rewrite that monitoring preference.
-The embedded AI Activity panel must track its own child regardless of the
-background detector setting.
+background detection of arbitrary external AI sessions. Selecting Codex or Claude
+for a command must not silently rewrite that monitoring preference, and the
+embedded AI Activity panel must track its own child regardless of the background
+detector setting.
 
 ## Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Reading private session files | CLI updates can break completion or transcript parsing | Prefer documented one-shot output; keep existing detectors only for dashboard status |
-| Same-cwd session races | A watcher can attach to a user's unrelated session | Use child-owned stdout/session ID/output file, not "newest session in cwd" |
+| Reading private session files | CLI updates can break completion or transcript parsing | Reuse the existing dashboard parsing (already maintained for Codex/Claude); keep the manual "continue now" fallback; version-check in preflight |
+| Same-cwd session races | A watcher can attach to a user's unrelated session | Pin `since_ms` and the resolved session id/file, not "newest session in cwd" |
 | Model ID mismatch | Existing OpenCode values are invalid in Codex/Claude | Add `harness` and validate models per harness |
-| Effort mismatch | Levels vary by model and CLI version | Discover capabilities and allow "default" |
+| Effort mismatch | Levels vary by model and CLI version | Discover capabilities per harness and allow "default" |
 | Harness exposed before its slot is implemented | Settings saves Codex/Claude but runtime still launches or watches OpenCode | Gate each slot's harness choices on completed adapter coverage |
 | Model change leaves stale harness/effort | Saved combination is invalid at launch | Normalize both harness and thinking immediately after model or harness changes |
-| Unattended permission prompt | Run stalls or fails midway | Use explicit non-interactive policies; avoid Claude `plan` mode under `-p` unless an interaction hook handles `AskUserQuestion` and `ExitPlanMode` |
-| Truncated Claude stream | Older Claude versions can omit part or all of the final `result` | Require Claude Code 2.1.214+ for stream-JSON, or use single-result JSON during the spike |
+| Unattended permission prompt | Run stalls or fails midway | Use explicit permission policies; avoid Claude `plan` under `-p` unless an interaction hook handles `AskUserQuestion` and `ExitPlanMode` |
+| Truncated Claude stream | Older Claude versions can omit part or all of the final `result` | Require Claude Code 2.1.214+ for stream-JSON, or use single-result JSON during a spike |
 | Raw JSON in the PTY | Poor AI Activity UX | Parse structured streams into provider-neutral activity rows |
 | Nested TUI differences | Mouse, alternate screen, resize, or key handling may differ | Spike interactive rendering on macOS/Linux; test Codex with and without `--no-alt-screen` |
 | Authentication/subscription differences | Binary exists but cannot run the selected model | Add an auth/model preflight and actionable error text |
-| Instruction-file differences | Harnesses may load different project/user instructions | Keep workflow-critical constraints in the generated prompt and document harness-specific instruction loading |
+| Parallel-run output collisions | Concurrent one-shot runs clobber each other's capture files | Key temp files by run/worktree id |
+| Instruction-file differences | Harnesses load different project/user instructions (`AGENTS.md`, `CLAUDE.md`, OpenCode config) | Keep workflow-critical constraints in the generated prompt and document harness-specific instruction loading |
 
 ## Recommended rollout
 
-1. Add the defaulted harness schema, provider validation, model translation,
-   and Settings sub-focus/Space behavior. Keep every slot's visible harness
-   list at `[opencode]` until its runtime adapter is ready.
-2. Introduce `AiRunSpec` and structured run completion, then implement
-   `develop.plan` and `develop.implement` with `codex exec`. Enable Codex only
-   for those two OpenAI-backed slots.
-3. Add Claude Code 2.1.214+ stream parsing and explicit planning/implementation
-   permission policies. Enable it for those two slots only when their model
-   provider is Anthropic.
-4. Extend the same adapters to the captured-output phases first
-   (`fix.plan`, Review, `bugkill.judge`), then the remaining interactive
-   handoffs (Explain, Fix apply, Update, Bugkill).
+1. Add the defaulted harness schema, provider validation, model translation, and
+   Settings sub-focus/Space behavior. Keep every slot's visible harness list at
+   `[opencode]` until its runtime adapter is ready.
+2. Introduce `AiRunSpec`, the `AiTurnWatcher` trait, and `CodexTurnWatcher`.
+   Implement interactive `develop.plan` and `develop.implement` with Codex.
+   Enable Codex only for those two OpenAI-backed slots.
+3. Add `ClaudeTurnWatcher` and interactive Claude planning/implementation
+   permission policies. Enable Claude for those two slots when the model provider
+   is Anthropic. Require Claude Code 2.1.214+ where streamed one-shot output is
+   used.
+4. Extend the adapters to the one-shot captured phases (`fix.plan`, Review,
+   `bugkill.judge`), then the remaining interactive slots (Explain, Fix apply,
+   Update, Bugkill).
 5. Add Harness to confirmation tables and provenance, convert remaining
-   OpenCode-specific UI strings, and then enable all compatible choices.
-6. Keep interactive OpenCode behavior initially. Consider moving it to
-   `opencode run` later only if a single event-rendering UI across all
-   harnesses is worth the behavior change.
+   OpenCode-specific UI strings, and enable all compatible choices.
 
 ## Final assessment
 
-- **Can Codex CLI run in the inner PTY?** Yes.
-- **Can Claude Code run in the inner PTY?** Yes.
+- **Can Codex CLI run as an inner terminal in the PTY?** Yes.
+- **Can Claude Code run as an inner terminal in the PTY?** Yes.
 - **Can both receive prompt, model, and thinking/effort at launch?** Yes.
-- **Is this a command-line substitution only?** No. The current completion and
-  transcript path is OpenCode-specific.
-- **Will the proposed Settings interaction work?** Yes. It fits the existing
+- **Is this a command-line substitution only?** No. The completion and transcript
+  lifecycle is currently OpenCode-specific and must be generalized into
+  `AiTurnWatcher` with a Codex and a Claude implementation.
+- **Does the completion-detection logic already exist?** Yes. `ai_status/codex.rs`
+  and `ai_status/claude.rs` already parse both turn lifecycles for the dashboard;
+  the watchers reuse that parsing plus attribution pinning and transcript
+  extraction.
+- **Will the Settings interaction work?** Yes. It fits the existing
   `AiSettingsEditor` cleanly and the existing Save path already has the desired
   local/global behavior.
 - **Is it practical to implement?** Yes. Develop-only support is moderate;
-  correctly supporting the harness selector across all twelve slots is a
-  larger cross-cutting change because the current runtime and UI lifecycle are
+  supporting the harness selector across all twelve slots is a larger
+  cross-cutting change because the current runtime and UI lifecycle are
   OpenCode-specific.
-- **Best first target:** Codex one-shot mode on the Develop page, followed by
-  Claude one-shot mode once its structured stream and permission policy are
-  represented cleanly.
+- **Best first target:** interactive Codex on the Develop page via
+  `CodexTurnWatcher`, then interactive Claude once its watcher and permission
+  policies are in place.
