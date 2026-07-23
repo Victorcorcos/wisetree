@@ -450,7 +450,10 @@ impl BugkillPullRequestScreen {
         self.phase_message = if corrective {
             "Investigation output could not be parsed — retrying once...".to_string()
         } else {
-            "Investigating the bug with AI...".to_string()
+            format!(
+                "Investigating the bug with {}...",
+                self.ai.investigate.harness.display_name()
+            )
         };
         self.investigate_corrective = corrective;
         self.ai_done = false;
@@ -466,14 +469,19 @@ impl BugkillPullRequestScreen {
     /// Completion detection missed on a user-forced continue: tell the user
     /// the App is still watching for opencode to finish.
     pub fn note_investigation_waiting(&mut self) {
-        self.phase_message =
-            "opencode has not finished the investigation yet — still watching...".to_string();
+        self.phase_message = format!(
+            "{} has not finished the investigation yet — still watching...",
+            self.ai.investigate.harness.display_name()
+        );
     }
 
     /// Show the AI Activity panel; the App then spawns the PTY.
     pub fn start_fixing(&mut self) {
         self.step = BugkillStep::Fixing;
-        self.phase_message = "Applying the fix with opencode...".to_string();
+        self.phase_message = format!(
+            "Applying the fix with {}...",
+            self.ai.fix.harness.display_name()
+        );
         self.ai_done = false;
         self.pty = None;
         self.pty_focused = false;
@@ -1139,7 +1147,7 @@ impl BugkillPullRequestScreen {
             "The investigate AI explores the code read-only and ranks likely root causes \
              into `BUG_INVESTIGATION.md`.",
             "You pick one proposed fix from the ranked table.",
-            "The fix AI applies only that fix, live, in an embedded opencode terminal.",
+            "The fix AI applies only that fix, live, in an embedded selected-AI terminal.",
             "You confirm whether the bug is gone — Yes keeps the fix (committed on the \
              branch), No reverts it with git revert (history preserved) and returns you to \
              the table.",
@@ -1198,24 +1206,14 @@ impl BugkillPullRequestScreen {
     /// reasoning effort) each pipeline phase will spend before confirming.
     fn confirm_ai_roles(&self) -> Vec<AiRoleRow> {
         vec![
-            AiRoleRow::new(
+            AiRoleRow::from_config(
                 "investigate",
                 colors::BRAND,
-                self.ai.investigate.model.clone(),
-                self.ai.investigate.thinking.clone(),
+                &self.ai.investigate,
+                "Read-only",
             ),
-            AiRoleRow::new(
-                "fix",
-                colors::SUCCESS,
-                self.ai.fix.model.clone(),
-                self.ai.fix.thinking.clone(),
-            ),
-            AiRoleRow::new(
-                "judge",
-                colors::INFO,
-                self.ai.judge.model.clone(),
-                self.ai.judge.thinking.clone(),
-            ),
+            AiRoleRow::from_config("fix", colors::SUCCESS, &self.ai.fix, "Edit files"),
+            AiRoleRow::from_config("judge", colors::INFO, &self.ai.judge, "Read-only"),
         ]
     }
 
@@ -1620,9 +1618,15 @@ impl BugkillPullRequestScreen {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 if self.step == BugkillStep::Investigating {
-                    "Launching opencode to investigate the bug..."
+                    format!(
+                        "Launching {} to investigate the bug...",
+                        self.ai.investigate.harness.display_name()
+                    )
                 } else {
-                    "Launching opencode to apply the fix..."
+                    format!(
+                        "Launching {} to apply the fix...",
+                        self.ai.fix.harness.display_name()
+                    )
                 },
                 muted_dim(),
             ))),
@@ -1637,9 +1641,17 @@ impl BugkillPullRequestScreen {
             Span::styled("Focus: ".to_string(), muted_dim()),
             Span::styled(
                 if focused_inner {
-                    "Inner (opencode)"
+                    format!(
+                        "Inner ({})",
+                        match self.step {
+                            BugkillStep::Investigating => {
+                                self.ai.investigate.harness.display_name()
+                            }
+                            _ => self.ai.fix.harness.display_name(),
+                        }
+                    )
                 } else {
-                    "Outer (wisetree)"
+                    "Outer (Wisetree)".to_string()
                 }
                 .to_string(),
                 Style::default()
@@ -1654,11 +1666,18 @@ impl BugkillPullRequestScreen {
             Span::styled("Tab ".to_string(), Style::default().fg(colors::BRAND)),
             Span::styled(
                 if focused_inner {
-                    "Switch to Wisetree"
+                    "Switch to Wisetree".to_string()
                 } else {
-                    "Switch to opencode"
-                }
-                .to_string(),
+                    format!(
+                        "Switch to {}",
+                        match self.step {
+                            BugkillStep::Investigating => {
+                                self.ai.investigate.harness.display_name()
+                            }
+                            _ => self.ai.fix.harness.display_name(),
+                        }
+                    )
+                },
                 muted_dim(),
             ),
         ];
@@ -2539,12 +2558,12 @@ mod tests {
         assert!(s.wants_full_panel());
         let dump = render_dump(&mut s, 110, 30);
         assert!(
-            dump.contains("Investigating the bug with opencode..."),
+            dump.contains("Investigating the bug with OpenCode..."),
             "{dump}"
         );
         assert!(dump.contains("AI Activity"), "{dump}");
         assert!(
-            dump.contains("Launching opencode to investigate the bug..."),
+            dump.contains("Launching OpenCode to investigate the bug..."),
             "{dump}"
         );
         assert!(dump.contains("Cancel investigation"), "{dump}");
@@ -2596,7 +2615,7 @@ mod tests {
         s.note_investigation_waiting();
         let dump = render_dump(&mut s, 110, 30);
         assert!(
-            dump.contains("opencode has not finished the investigation yet"),
+            dump.contains("OpenCode has not finished the investigation yet"),
             "{dump}"
         );
     }

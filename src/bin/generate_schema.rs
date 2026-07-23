@@ -8,6 +8,60 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 fn build_schema() -> Value {
+    let ai_leaf = |model: &str, thinking: &str| {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "default": { "model": model, "thinking": thinking, "harness": "opencode" },
+            "properties": {
+                "model": { "type": "string", "default": model },
+                "thinking": { "type": "string", "default": thinking },
+                "harness": {
+                    "type": "string",
+                    "enum": ["opencode", "codex", "claudeCode"],
+                    "default": "opencode"
+                }
+            }
+        })
+    };
+    let ai = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "explain": ai_leaf("opencode/deepseek-v4-flash-free", "max"),
+            "fix": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "plan": ai_leaf("openai/gpt-5.6-sol", "medium"),
+                    "apply": ai_leaf("openai/gpt-5.6-terra", "medium")
+                }
+            },
+            "review": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "strong": ai_leaf("openai/gpt-5.6-sol", "medium"),
+                    "balanced": ai_leaf("openai/gpt-5.6-terra", "medium"),
+                    "utility": ai_leaf("openai/gpt-5.6-luna", "low")
+                }
+            },
+            "update": ai_leaf("openai/gpt-5.6-terra", "medium"),
+            "bugkill": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "investigate": ai_leaf("openai/gpt-5.6-sol", "medium"),
+                    "fix": ai_leaf("openai/gpt-5.6-terra", "high"),
+                    "judge": ai_leaf("openai/gpt-5.6-terra", "medium")
+                }
+            },
+            "develop": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "plan": ai_leaf("openai/gpt-5.6-sol", "high"),
+                    "implement": ai_leaf("openai/gpt-5.6-terra", "medium")
+                }
+            }
+        }
+    });
     json!({
         "$schema": "http://json-schema.org/draft-7/schema#",
         "description": "Configuration schema for Wisetree - Git worktree management CLI",
@@ -68,6 +122,42 @@ fn build_schema() -> Value {
                 "description": "Also delete the associated git branch when deleting a worktree",
                 "default": false,
                 "type": "boolean"
+            },
+            "dashboard": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "refreshIntervalMs": { "type": "integer", "default": 5000 },
+                    "showPullRequests": { "type": "boolean", "default": false },
+                    "wiseMerge": { "type": "boolean", "default": false },
+                    "columns": { "type": "array", "items": { "type": "string" } },
+                    "ai": ai,
+                    "aiStatus": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {
+                            "enabledHarnesses": { "type": "array", "items": { "type": "string", "enum": ["claude_code", "opencode", "codex_cli", "gemini_cli"] }, "default": ["claude_code", "opencode", "codex_cli", "gemini_cli"] },
+                            "activeWindowMs": { "type": "integer", "default": 10000 }
+                        }
+                    },
+                    "develop": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": { "checkCommand": { "type": "string", "default": "" } }
+                    },
+                    "notifications": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {
+                            "aiStatusOk": { "type": "boolean", "default": false },
+                            "prChecksOk": { "type": "boolean", "default": false }
+                        }
+                    }
+                }
+            },
+            "notifications": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "aiStatusOk": { "type": "boolean", "default": false },
+                    "prChecksOk": { "type": "boolean", "default": false }
+                }
             }
         },
         "$id": "https://raw.githubusercontent.com/victorcorcos/wisetree/main/schema.json",

@@ -263,7 +263,10 @@ impl ExplainPullRequestScreen {
         match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
             Ok(pty) => self.pty = Some(pty),
             Err(err) => {
-                self.set_error(format!("Could not spawn opencode in PTY: {err}"));
+                self.set_error(format!(
+                    "Could not spawn {} in PTY: {err}",
+                    self.ai.harness.display_name()
+                ));
             }
         }
     }
@@ -814,11 +817,11 @@ impl ExplainPullRequestScreen {
             .title_color(colors::BRAND)
             .block(build_detail_lines(&self.request))
             .steps(&build_steps(&self.request))
-            .ai_roles(vec![AiRoleRow::new(
+            .ai_roles(vec![AiRoleRow::from_config(
                 "explain",
                 colors::BRAND,
-                self.ai.model.clone(),
-                self.ai.thinking.clone(),
+                &self.ai,
+                "Edit files",
             )])
             .modal(self.confirm.as_ref())
     }

@@ -469,8 +469,10 @@ impl DevelopPullRequestScreen {
     /// Completion detection missed on a user-forced continue: tell the user
     /// the App is still watching for opencode to finish.
     pub fn note_planning_waiting(&mut self) {
-        self.phase_message =
-            "opencode has not finished the plan yet — still watching...".to_string();
+        self.phase_message = format!(
+            "{} has not finished the plan yet — still watching...",
+            self.ai.plan.harness.display_name()
+        );
     }
 
     /// Enter the plan-review question (Yes / No) over the current plan.
@@ -1261,17 +1263,12 @@ impl DevelopPullRequestScreen {
     /// reasoning effort) each phase will spend before confirming.
     fn confirm_ai_roles(&self) -> Vec<AiRoleRow> {
         vec![
-            AiRoleRow::new(
-                "plan",
-                colors::ORANGE,
-                self.ai.plan.model.clone(),
-                self.ai.plan.thinking.clone(),
-            ),
-            AiRoleRow::new(
+            AiRoleRow::from_config("plan", colors::ORANGE, &self.ai.plan, "Read-only"),
+            AiRoleRow::from_config(
                 "implement",
                 colors::SUCCESS,
-                self.ai.implement.model.clone(),
-                self.ai.implement.thinking.clone(),
+                &self.ai.implement,
+                "Edit files",
             ),
         ]
     }

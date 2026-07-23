@@ -28,3 +28,12 @@ fn loading_states_are_distinct() {
         assert!(seen.insert(s), "duplicate loading message: {s}");
     }
 }
+
+#[test]
+fn harness_display_names_are_user_facing() {
+    use wisetree::config::schema::AiHarness;
+
+    assert_eq!(AiHarness::OpenCode.display_name(), "OpenCode");
+    assert_eq!(AiHarness::Codex.display_name(), "Codex CLI");
+    assert_eq!(AiHarness::ClaudeCode.display_name(), "Claude Code");
+}

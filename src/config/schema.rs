@@ -139,6 +139,14 @@ impl AiHarness {
             Self::ClaudeCode => "claudeCode",
         }
     }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::OpenCode => "OpenCode",
+            Self::Codex => "Codex CLI",
+            Self::ClaudeCode => "Claude Code",
+        }
+    }
 }
 
 /// Model + thinking strength for a single AI-assisted step. The leaf of the

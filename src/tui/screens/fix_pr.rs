@@ -381,7 +381,10 @@ impl FixPullRequestScreen {
     /// kicks off `prepare_apply` and calls `spawn_opencode_pty`.
     pub fn start_applying(&mut self) {
         self.step = FixStep::Applying;
-        self.phase_message = "Applying the fix with opencode...".to_string();
+        self.phase_message = format!(
+            "Applying the fix with {}...",
+            self.ai.apply.harness.display_name()
+        );
         self.ai_done = false;
         self.pty = None;
         self.pty_focused = false;
@@ -399,7 +402,10 @@ impl FixPullRequestScreen {
     ) {
         match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
             Ok(pty) => self.pty = Some(pty),
-            Err(err) => self.set_error(format!("Could not spawn opencode in PTY: {err}")),
+            Err(err) => self.set_error(format!(
+                "Could not spawn {} in PTY: {err}",
+                self.ai.apply.harness.display_name()
+            )),
         }
     }
 
@@ -883,7 +889,7 @@ impl FixPullRequestScreen {
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
         let description = if self.autonomous {
-            "wisetree approves each fix and commits it when opencode finishes — no prompts"
+            "wisetree approves each fix and commits it when the selected AI finishes — no prompts"
         } else {
             "you choose Apply / Other / Skip per comment and finalize each fix with Enter"
         };
@@ -895,18 +901,8 @@ impl FixPullRequestScreen {
         .block(build_detail_lines(&self.request))
         .steps(&FIX_STEPS)
         .ai_roles(vec![
-            AiRoleRow::new(
-                "plan",
-                colors::BRAND,
-                self.ai.plan.model.clone(),
-                self.ai.plan.thinking.clone(),
-            ),
-            AiRoleRow::new(
-                "apply",
-                colors::SUCCESS,
-                self.ai.apply.model.clone(),
-                self.ai.apply.thinking.clone(),
-            ),
+            AiRoleRow::from_config("plan", colors::BRAND, &self.ai.plan, "Read-only"),
+            AiRoleRow::from_config("apply", colors::SUCCESS, &self.ai.apply, "Edit files"),
         ])
         .options(Some(
             OptionsGroup::new(vec![OptionsGroupItem::new(

@@ -4,10 +4,466 @@
   "additionalProperties": false,
   "description": "Configuration schema for Wisetree - Git worktree management CLI",
   "properties": {
+    "dashboard": {
+      "additionalProperties": false,
+      "properties": {
+        "ai": {
+          "additionalProperties": false,
+          "properties": {
+            "bugkill": {
+              "additionalProperties": false,
+              "properties": {
+                "fix": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-terra",
+                    "thinking": "high"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-terra",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "high",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "investigate": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-sol",
+                    "thinking": "medium"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-sol",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "medium",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "judge": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-terra",
+                    "thinking": "medium"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-terra",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "medium",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "develop": {
+              "additionalProperties": false,
+              "properties": {
+                "implement": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-terra",
+                    "thinking": "medium"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-terra",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "medium",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "plan": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-sol",
+                    "thinking": "high"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-sol",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "high",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "explain": {
+              "additionalProperties": false,
+              "default": {
+                "harness": "opencode",
+                "model": "opencode/deepseek-v4-flash-free",
+                "thinking": "max"
+              },
+              "properties": {
+                "harness": {
+                  "default": "opencode",
+                  "enum": [
+                    "opencode",
+                    "codex",
+                    "claudeCode"
+                  ],
+                  "type": "string"
+                },
+                "model": {
+                  "default": "opencode/deepseek-v4-flash-free",
+                  "type": "string"
+                },
+                "thinking": {
+                  "default": "max",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "fix": {
+              "additionalProperties": false,
+              "properties": {
+                "apply": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-terra",
+                    "thinking": "medium"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-terra",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "medium",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "plan": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-sol",
+                    "thinking": "medium"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-sol",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "medium",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "review": {
+              "additionalProperties": false,
+              "properties": {
+                "balanced": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-terra",
+                    "thinking": "medium"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-terra",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "medium",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "strong": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-sol",
+                    "thinking": "medium"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-sol",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "medium",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "utility": {
+                  "additionalProperties": false,
+                  "default": {
+                    "harness": "opencode",
+                    "model": "openai/gpt-5.6-luna",
+                    "thinking": "low"
+                  },
+                  "properties": {
+                    "harness": {
+                      "default": "opencode",
+                      "enum": [
+                        "opencode",
+                        "codex",
+                        "claudeCode"
+                      ],
+                      "type": "string"
+                    },
+                    "model": {
+                      "default": "openai/gpt-5.6-luna",
+                      "type": "string"
+                    },
+                    "thinking": {
+                      "default": "low",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "update": {
+              "additionalProperties": false,
+              "default": {
+                "harness": "opencode",
+                "model": "openai/gpt-5.6-terra",
+                "thinking": "medium"
+              },
+              "properties": {
+                "harness": {
+                  "default": "opencode",
+                  "enum": [
+                    "opencode",
+                    "codex",
+                    "claudeCode"
+                  ],
+                  "type": "string"
+                },
+                "model": {
+                  "default": "openai/gpt-5.6-terra",
+                  "type": "string"
+                },
+                "thinking": {
+                  "default": "medium",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
+        "aiStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "activeWindowMs": {
+              "default": 10000,
+              "type": "integer"
+            },
+            "enabledHarnesses": {
+              "default": [
+                "claude_code",
+                "opencode",
+                "codex_cli",
+                "gemini_cli"
+              ],
+              "items": {
+                "enum": [
+                  "claude_code",
+                  "opencode",
+                  "codex_cli",
+                  "gemini_cli"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "develop": {
+          "additionalProperties": false,
+          "properties": {
+            "checkCommand": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "notifications": {
+          "additionalProperties": false,
+          "properties": {
+            "aiStatusOk": {
+              "default": false,
+              "type": "boolean"
+            },
+            "prChecksOk": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "refreshIntervalMs": {
+          "default": 5000,
+          "type": "integer"
+        },
+        "showPullRequests": {
+          "default": false,
+          "type": "boolean"
+        },
+        "wiseMerge": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "deleteBranchWithWorktree": {
       "default": false,
       "description": "Also delete the associated git branch when deleting a worktree",
       "type": "boolean"
+    },
+    "notifications": {
+      "additionalProperties": false,
+      "properties": {
+        "aiStatusOk": {
+          "default": false,
+          "type": "boolean"
+        },
+        "prChecksOk": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
     },
     "postCreateCmd": {
       "default": [],

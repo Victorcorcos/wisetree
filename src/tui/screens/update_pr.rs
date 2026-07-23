@@ -398,7 +398,10 @@ impl UpdatePullRequestScreen {
             Err(err) => {
                 self.append_ai_line(AiActivityEvent::Notice {
                     severity: AiActivitySeverity::Error,
-                    message: format!("Could not spawn opencode in PTY: {err}"),
+                    message: format!(
+                        "Could not spawn {} in PTY: {err}",
+                        self.ai.harness.display_name()
+                    ),
                 });
                 // No PTY → the AI is effectively done; surface
                 // Complete/Cancel so the user can recover.
@@ -1150,11 +1153,11 @@ impl UpdatePullRequestScreen {
         let ai_roles = if self.push_only {
             Vec::new()
         } else {
-            vec![AiRoleRow::new(
+            vec![AiRoleRow::from_config(
                 "update",
                 colors::INFO,
-                self.ai.model.clone(),
-                self.ai.thinking.clone(),
+                &self.ai,
+                "Edit files",
             )]
         };
         let mut view = PrConfirmView::new(format!(

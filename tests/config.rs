@@ -345,6 +345,33 @@ fn invalid_ai_harness_and_unknown_slot_key_are_rejected() {
 }
 
 #[test]
+fn checked_in_schema_covers_all_nested_ai_slots_and_harnesses() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../schema.json")).unwrap();
+    let ai = &schema["properties"]["dashboard"]["properties"]["ai"];
+    for slot in [
+        &ai["properties"]["explain"],
+        &ai["properties"]["fix"]["properties"]["plan"],
+        &ai["properties"]["fix"]["properties"]["apply"],
+        &ai["properties"]["review"]["properties"]["strong"],
+        &ai["properties"]["review"]["properties"]["balanced"],
+        &ai["properties"]["review"]["properties"]["utility"],
+        &ai["properties"]["update"],
+        &ai["properties"]["bugkill"]["properties"]["investigate"],
+        &ai["properties"]["bugkill"]["properties"]["fix"],
+        &ai["properties"]["bugkill"]["properties"]["judge"],
+        &ai["properties"]["develop"]["properties"]["plan"],
+        &ai["properties"]["develop"]["properties"]["implement"],
+    ] {
+        assert_eq!(slot["additionalProperties"], false);
+        assert_eq!(
+            slot["properties"]["harness"]["enum"],
+            serde_json::json!(["opencode", "codex", "claudeCode"])
+        );
+        assert!(slot["default"].is_object());
+    }
+}
+
+#[test]
 fn notifications_default_to_disabled_when_omitted() {
     let raw = r#"{
   "dashboard": {

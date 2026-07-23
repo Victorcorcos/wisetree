@@ -13,8 +13,8 @@
 //!   1. …
 //!   2. …
 //!
-//! Role         Model      Thinking   ← centered "which AIs run" table
-//! explain       deepseek-v4-flash-free    max
+//! Role         Model      Thinking   Harness       Permission
+//! explain      deepseek-v4-flash-free  max        OpenCode      Read-only
 //!
 //! ┌──────── Are you sure ────────┐   ← ConfirmationModal (Yes / No)
 //! └──────────────────────────────┘
@@ -35,6 +35,7 @@ use ratatui::Frame;
 
 use super::confirmation_modal::ConfirmationModal;
 use super::options_group::OptionsGroup;
+use crate::config::schema::AiModelConfig;
 use crate::messages::colors;
 
 /// Rows reserved for the `ConfirmationModal` slot. Matches the footprint the
@@ -58,20 +59,24 @@ pub struct AiRoleRow {
     role_color: Color,
     model: String,
     thinking: String,
+    harness: String,
+    permission: String,
 }
 
 impl AiRoleRow {
-    pub fn new(
+    pub fn from_config(
         role: impl Into<String>,
         role_color: Color,
-        model: impl Into<String>,
-        thinking: impl Into<String>,
+        config: &AiModelConfig,
+        permission: impl Into<String>,
     ) -> Self {
         Self {
             role: role.into(),
             role_color,
-            model: model.into(),
-            thinking: thinking.into(),
+            model: config.model.clone(),
+            thinking: config.thinking.clone(),
+            harness: config.harness.display_name().to_string(),
+            permission: permission.into(),
         }
     }
 }
@@ -380,6 +385,8 @@ impl<'a> PrConfirmView<'a> {
             TableCell::from("Role"),
             TableCell::from("Model"),
             TableCell::from("Thinking"),
+            TableCell::from("Harness"),
+            TableCell::from("Permission"),
         ])
         .style(
             Style::default()
@@ -401,11 +408,14 @@ impl<'a> PrConfirmView<'a> {
                     TableCell::from(role.model.clone())
                         .style(Style::default().fg(colors::GRAY_LIGHT)),
                     TableCell::from(thinking).style(Style::default().fg(colors::EMPHASIS)),
+                    TableCell::from(role.harness.clone()).style(Style::default().fg(colors::INFO)),
+                    TableCell::from(role.permission.clone())
+                        .style(Style::default().fg(colors::EMPHASIS)),
                 ])
             })
             .collect();
 
-        let table_width = area.width.min(62);
+        let table_width = area.width;
         let table_area = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -418,9 +428,11 @@ impl<'a> PrConfirmView<'a> {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(12),
-                Constraint::Min(24),
                 Constraint::Length(10),
+                Constraint::Min(8),
+                Constraint::Length(9),
+                Constraint::Length(12),
+                Constraint::Length(11),
             ],
         )
         .header(header)
@@ -468,11 +480,15 @@ mod tests {
         let view = PrConfirmView::new("Do the thing?")
             .block(details)
             .steps(&["`git fetch`", "`git merge base`"])
-            .ai_roles(vec![AiRoleRow::new(
+            .ai_roles(vec![AiRoleRow::from_config(
                 "resolve",
                 colors::INFO,
-                "glm/model",
-                "",
+                &AiModelConfig {
+                    model: "glm/model".to_string(),
+                    thinking: String::new(),
+                    harness: Default::default(),
+                },
+                "Edit files",
             )]);
         let out = dump(&view, 90, 24);
         assert!(out.contains("Do the thing?"), "{out}");
@@ -483,8 +499,12 @@ mod tests {
         assert!(out.contains("Role"), "{out}");
         assert!(out.contains("Model"), "{out}");
         assert!(out.contains("Thinking"), "{out}");
+        assert!(out.contains("Harness"), "{out}");
+        assert!(out.contains("Permission"), "{out}");
         assert!(out.contains("resolve"), "{out}");
         assert!(out.contains("glm/model"), "{out}");
+        assert!(out.contains("OpenCode"), "{out}");
+        assert!(out.contains("Edit files"), "{out}");
         // Empty thinking renders as "default".
         assert!(out.contains("default"), "{out}");
     }
@@ -506,8 +526,35 @@ mod tests {
         let view = PrConfirmView::new("t")
             .block(vec![Line::from("a"), Line::from("b")]) // 2 rows + 1 blank
             .steps(&["one", "two"]) // header + 2 = 3 rows + 1 blank
-            .ai_roles(vec![AiRoleRow::new("r", colors::INFO, "m", "")]); // 1 blank + (1 header + 1 row)
-                                                                         // title(1) + blank(1)+details(2) + blank(1)+steps(3) + blank(1)+table(2)
+            .ai_roles(vec![AiRoleRow::from_config(
+                "r",
+                colors::INFO,
+                &AiModelConfig {
+                    model: "m".to_string(),
+                    thinking: String::new(),
+                    harness: Default::default(),
+                },
+                "Read-only",
+            )]); // 1 blank + (1 header + 1 row)
+                 // title(1) + blank(1)+details(2) + blank(1)+steps(3) + blank(1)+table(2)
         assert_eq!(view.content_height(), 1 + 1 + 2 + 1 + 3 + 1 + 2);
+    }
+
+    #[test]
+    fn clips_the_model_before_hiding_harness_or_permission_on_narrow_terminals() {
+        let view = PrConfirmView::new("Confirm?").ai_roles(vec![AiRoleRow::from_config(
+            "implement",
+            colors::SUCCESS,
+            &AiModelConfig {
+                model: "anthropic/a-very-long-model-name".to_string(),
+                thinking: "high".to_string(),
+                harness: crate::config::schema::AiHarness::ClaudeCode,
+            },
+            "Edit files",
+        )]);
+        let out = dump(&view, 58, 8);
+        assert!(out.contains("Harness"), "{out}");
+        assert!(out.contains("Claude Code"), "{out}");
+        assert!(out.contains("Edit files"), "{out}");
     }
 }
