@@ -128,6 +128,10 @@ pub struct UpdatePullRequestScreen {
     /// `true` once opencode has exited and the user is being asked to
     /// decide on Complete or Cancel.
     ai_done: bool,
+    /// True only when the selected harness watcher observed a successful turn
+    /// with transcript evidence. Update All requires this before auto-commit.
+    ai_verified: bool,
+    ai_failed: bool,
     /// Currently focused button in the Complete/Cancel pair.
     ai_button: AiButton,
     /// Embedded opencode subprocess + vt100 emulator. `Some` once the
@@ -209,6 +213,8 @@ impl UpdatePullRequestScreen {
             ai_log: Vec::new(),
             ai_active: false,
             ai_done: false,
+            ai_verified: false,
+            ai_failed: false,
             ai_button: AiButton::Complete,
             pty: None,
             pty_focused: false,
@@ -321,6 +327,8 @@ impl UpdatePullRequestScreen {
         self.ai_scroll = 0;
         self.ai_active = false;
         self.ai_done = false;
+        self.ai_verified = false;
+        self.ai_failed = false;
         self.ai_button = AiButton::Complete;
         self.pty = None;
         self.pty_focused = false;
@@ -412,6 +420,9 @@ impl UpdatePullRequestScreen {
             pty.resize(rows, cols);
         }
         if pty.poll_exited() {
+            if self.ai_done || self.ai_failed {
+                return false;
+            }
             // Commit+push shell finished — record the exit code and flip
             // into the done summary view.
             if matches!(self.step, UpdateStep::CommitPush) {
@@ -427,7 +438,13 @@ impl UpdatePullRequestScreen {
                 self.pty_focused = false;
                 return true;
             }
-            self.mark_ai_done();
+            if pty.exit_code() == Some(0) {
+                // A clean child exit is enough for a human to review the
+                // merge, but not enough evidence for an unattended batch.
+                self.mark_ai_done();
+            } else {
+                self.mark_ai_failed("AI CLI exited before resolving the merge.".to_string());
+            }
             return true;
         }
         false
@@ -457,6 +474,28 @@ impl UpdatePullRequestScreen {
         self.ai_button = AiButton::Complete;
     }
 
+    pub fn mark_ai_done_verified(&mut self) {
+        self.mark_ai_done();
+        self.ai_verified = true;
+    }
+
+    pub fn mark_ai_manual_backstop(&mut self, message: String) {
+        self.append_ai_line(AiActivityEvent::Notice {
+            severity: AiActivitySeverity::Warning,
+            message,
+        });
+        self.mark_ai_done();
+    }
+
+    pub fn mark_ai_failed(&mut self, message: String) {
+        self.ai_verified = false;
+        self.ai_failed = true;
+        self.append_ai_line(AiActivityEvent::Notice {
+            severity: AiActivitySeverity::Error,
+            message,
+        });
+    }
+
     pub fn ai_active(&self) -> bool {
         self.ai_active
     }
@@ -478,6 +517,10 @@ impl UpdatePullRequestScreen {
     /// know when to auto-commit and advance.
     pub fn ai_done(&self) -> bool {
         self.ai_done
+    }
+
+    pub fn ai_verified(&self) -> bool {
+        self.ai_verified
     }
 
     #[cfg(test)]

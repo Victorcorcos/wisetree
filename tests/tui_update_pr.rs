@@ -343,10 +343,10 @@ async fn pipeline_returns_ai_unavailable_when_opencode_binary_is_missing() {
         .expect("update should succeed");
 
     match outcome {
-        UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
+        UpdatePullRequestOutcome::AiPreflightFailed { message } => {
             assert!(
-                conflicts.iter().any(|f| f == "README.md"),
-                "expected README.md among {conflicts:?}"
+                message.contains("CLI binary is not available"),
+                "expected selected-slot binary failure, got: {message}"
             );
         }
         other => panic!("expected AiUnavailable, got {other:?}"),
@@ -384,17 +384,17 @@ async fn pipeline_hands_off_to_ui_when_conflicts_detected_and_opencode_available
 
     match outcome {
         UpdatePullRequestOutcome::ConflictsHandedOffToUi {
-            opencode_binary,
-            opencode_args,
-            cwd,
+            command,
+            harness,
             model,
             base_ref,
             conflicts,
         } => {
-            assert_eq!(opencode_binary, stub);
+            assert_eq!(command.binary, stub);
+            assert_eq!(harness, wisetree::config::schema::AiHarness::OpenCode);
             assert_eq!(base_ref, "origin/main");
             assert_eq!(model, "anthropic/claude-sonnet-4-5");
-            assert_eq!(cwd, fx.src);
+            assert_eq!(command.cwd, fx.src);
             assert!(
                 conflicts.iter().any(|f| f == "README.md"),
                 "expected README.md among {conflicts:?}"
@@ -404,27 +404,27 @@ async fn pipeline_hands_off_to_ui_when_conflicts_detected_and_opencode_available
             // renders the full Monokai-themed TUI (formatted Thinking
             // blocks, colored tool calls, syntax-highlighted diffs)
             // instead of `opencode run`'s plain CLI transcript.
-            assert_eq!(opencode_args[0], "--prompt");
+            assert_eq!(command.args[0], "--prompt");
             assert!(
-                !opencode_args[1].is_empty(),
+                !command.args[1].is_empty(),
                 "merger prompt should follow --prompt"
             );
-            assert_eq!(opencode_args[2], "-m");
-            assert_eq!(opencode_args[3], "anthropic/claude-sonnet-4-5");
+            assert_eq!(command.args[2], "-m");
+            assert_eq!(command.args[3], "anthropic/claude-sonnet-4-5");
             assert!(
-                opencode_args[4].contains(fx.src.to_str().unwrap()),
+                command.args[4].contains(fx.src.to_str().unwrap()),
                 "expected cwd positional in args, got {:?}",
-                opencode_args
+                command.args
             );
             // We must NOT invoke `opencode run` — that's the plain CLI
             // mode that strips most of the Monokai theming.
             assert!(
-                !opencode_args.iter().any(|a| a == "run"),
-                "service must not use `opencode run`; the UI embeds opencode's real TUI: {opencode_args:?}"
+                !command.args.iter().any(|a| a == "run"),
+                "service must not use `opencode run`; the UI embeds opencode's real TUI: {:?}", command.args
             );
             assert!(
-                !opencode_args.iter().any(|a| a == "--format"),
-                "service must not pass --format; the UI embeds opencode's real TUI: {opencode_args:?}"
+                !command.args.iter().any(|a| a == "--format"),
+                "service must not pass --format; the UI embeds opencode's real TUI: {:?}", command.args
             );
         }
         other => panic!("expected ConflictsHandedOffToUi, got {other:?}"),
@@ -458,9 +458,9 @@ async fn pipeline_hands_off_non_autonomous_prompt_instructs_ai_to_ask() {
         .expect("update should succeed");
 
     match outcome {
-        UpdatePullRequestOutcome::ConflictsHandedOffToUi { opencode_args, .. } => {
-            assert_eq!(opencode_args[0], "--prompt");
-            let prompt = &opencode_args[1];
+        UpdatePullRequestOutcome::ConflictsHandedOffToUi { command, .. } => {
+            assert_eq!(command.args[0], "--prompt");
+            let prompt = &command.args[1];
             assert!(
                 prompt.contains("Clarification mode"),
                 "non-autonomous prompt should mention Clarification mode, got:\n{prompt}"
@@ -626,31 +626,31 @@ async fn update_branch_hands_off_to_ui_when_conflicts_detected_and_opencode_avai
 
     match outcome {
         UpdateBranchOutcome::ConflictsHandedOffToUi {
-            opencode_binary,
-            opencode_args,
-            cwd,
+            command,
+            harness,
             model,
             base_ref,
             conflicts,
         } => {
-            assert_eq!(opencode_binary, stub);
+            assert_eq!(command.binary, stub);
+            assert_eq!(harness, wisetree::config::schema::AiHarness::OpenCode);
             assert_eq!(base_ref, "origin/main");
             assert_eq!(model, "anthropic/claude-sonnet-4-5");
-            assert_eq!(cwd, fx.src);
+            assert_eq!(command.cwd, fx.src);
             assert!(
                 conflicts.iter().any(|f| f == "README.md"),
                 "expected README.md among {conflicts:?}"
             );
             // Same default-TUI invocation as the PR flow: `--prompt
             // <prompt> -m <model> <cwd>`.
-            assert_eq!(opencode_args[0], "--prompt");
+            assert_eq!(command.args[0], "--prompt");
             assert!(
-                !opencode_args[1].is_empty(),
+                !command.args[1].is_empty(),
                 "merger prompt should follow --prompt"
             );
-            assert_eq!(opencode_args[2], "-m");
-            assert_eq!(opencode_args[3], "anthropic/claude-sonnet-4-5");
-            assert!(opencode_args[4].contains(fx.src.to_str().unwrap()));
+            assert_eq!(command.args[2], "-m");
+            assert_eq!(command.args[3], "anthropic/claude-sonnet-4-5");
+            assert!(command.args[4].contains(fx.src.to_str().unwrap()));
         }
         other => panic!("expected ConflictsHandedOffToUi, got {other:?}"),
     }
@@ -709,10 +709,10 @@ async fn update_branch_returns_ai_unavailable_when_opencode_binary_is_missing() 
         .expect("update_branch should succeed");
 
     match outcome {
-        UpdateBranchOutcome::AiUnavailable { conflicts } => {
+        UpdateBranchOutcome::AiPreflightFailed { message } => {
             assert!(
-                conflicts.iter().any(|f| f == "README.md"),
-                "expected README.md among {conflicts:?}"
+                message.contains("CLI binary is not available"),
+                "expected selected-slot binary failure, got: {message}"
             );
         }
         other => panic!("expected AiUnavailable, got {other:?}"),

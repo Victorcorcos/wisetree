@@ -471,16 +471,15 @@ pub enum UpdatePullRequestOutcome {
     /// re-push) sent `git push origin HEAD` and it succeeded. No merge was
     /// attempted — the branch was already ahead-but-not-behind.
     Pushed,
-    /// Conflicts were detected, `ai.model` is set, opencode is on PATH, and
+    /// Conflicts were detected, `ai.update` passed preflight, and the merge is
     /// the merge is paused mid-flight (index has conflict markers). The
     /// UI takes over from here: it spawns opencode inside an embedded
     /// PTY so the user sees the real opencode TUI in the AI Activity
     /// panel. Once opencode exits, the screen surfaces Complete/Cancel
     /// which dispatches `commit_and_push_ai_merge` or `abort_ai_merge`.
     ConflictsHandedOffToUi {
-        opencode_binary: PathBuf,
-        opencode_args: Vec<String>,
-        cwd: PathBuf,
+        command: AiCommand,
+        harness: AiHarness,
         model: String,
         base_ref: String,
         conflicts: Vec<String>,
@@ -490,10 +489,9 @@ pub enum UpdatePullRequestOutcome {
     /// the worktree is clean again. The list of conflicted files is
     /// included so the toast can show how many files need attention.
     ConflictsRequireAi { conflicts: Vec<String> },
-    /// Conflicts were detected, `ai.model` is set, but the `opencode` binary
-    /// is not on PATH. The merge has been aborted; the worktree is clean
-    /// again.
-    AiUnavailable { conflicts: Vec<String> },
+    /// The selected `ai.update` harness could not be used. This is reported
+    /// before fetch/merge where possible, so the repository is untouched.
+    AiPreflightFailed { message: String },
     /// Commit + push after AI resolution succeeded. Returned by
     /// `commit_and_push_ai_merge`.
     MergedWithAiResolution,
@@ -545,15 +543,14 @@ pub enum UpdateBranchOutcome {
     /// not a merge conflict — there are no markers and nothing for opencode
     /// to resolve — so the UI just tells the user to commit or stash first.
     WorkingTreeDirty { files: Vec<String> },
-    /// Merge conflicts were detected, `ai.model` is set, and `opencode` is on
-    /// PATH. The merge is left mid-flight (conflict markers in the index)
+    /// Merge conflicts were detected and `ai.update` passed preflight. The
+    /// merge is left mid-flight (conflict markers in the index)
     /// and the UI takes over: it spawns opencode inside an embedded PTY to
     /// resolve the conflicts, then commits the result locally (no push).
     /// Mirrors `UpdatePullRequestOutcome::ConflictsHandedOffToUi`.
     ConflictsHandedOffToUi {
-        opencode_binary: PathBuf,
-        opencode_args: Vec<String>,
-        cwd: PathBuf,
+        command: AiCommand,
+        harness: AiHarness,
         model: String,
         base_ref: String,
         conflicts: Vec<String>,
@@ -562,10 +559,9 @@ pub enum UpdateBranchOutcome {
     /// aborted and the UI prompts the user to configure `ai.model` or resolve
     /// the conflicts manually.
     ConflictsRequireAi { conflicts: Vec<String> },
-    /// Merge conflicts were detected and `ai.model` is set, but the `opencode`
-    /// binary is not on PATH — the merge is aborted and the UI prompts the
-    /// user to install opencode.
-    AiUnavailable { conflicts: Vec<String> },
+    /// The selected `ai.update` harness could not be used. This is reported
+    /// before fetch/merge where possible, so the repository is untouched.
+    AiPreflightFailed { message: String },
 }
 
 /// Result of the read-only preparation phase of the "Explain Pull Request"
@@ -2190,6 +2186,27 @@ impl DashboardService {
             }
         };
 
+        // Validate the exact configured Update slot before fetch/merge can
+        // alter refs or the index. A later command is rebuilt with the real
+        // conflict list, but its capability has already been checked here.
+        if !self.config.ai.update.model.trim().is_empty() {
+            if let Err(error) = self
+                .ai_command(
+                    "dashboard.ai.update",
+                    &self.config.ai.update,
+                    "Resolve merge conflicts in this worktree when needed.".to_string(),
+                    cwd.clone(),
+                    AiRunMode::Interactive,
+                    AiPermission::Implement,
+                )
+                .await
+            {
+                return Ok(UpdatePullRequestOutcome::AiPreflightFailed {
+                    message: crate::errors::user_friendly_message(&error),
+                });
+            }
+        }
+
         // 1. fetch
         send_phase(UpdatePhase::Fetching);
         let fetch = with_timeout(
@@ -2267,12 +2284,33 @@ impl DashboardService {
                 count: conflicts.len(),
             });
 
-            // Bail early if opencode isn't on PATH so the user sees the
-            // dedicated "install opencode" toast instead of a spawn
-            // error from the PTY widget.
-            if !binary_available(&self.opencode_binary) {
+            let prompt = build_merge_prompt(base_ref, &conflicts, autonomous);
+            let command = match self
+                .ai_command(
+                    "dashboard.ai.update",
+                    &self.config.ai.update,
+                    prompt,
+                    cwd.clone(),
+                    AiRunMode::Interactive,
+                    AiPermission::Implement,
+                )
+                .await
+            {
+                Ok(command) => command,
+                Err(error) => {
+                    // A capability can disappear between preflight and this
+                    // handoff. Never leave that failure as a paused merge.
+                    let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                    return Ok(UpdatePullRequestOutcome::AiPreflightFailed {
+                        message: crate::errors::user_friendly_message(&error),
+                    });
+                }
+            };
+            if command.args.is_empty() {
                 let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
-                return Ok(UpdatePullRequestOutcome::AiUnavailable { conflicts });
+                return Ok(UpdatePullRequestOutcome::AiPreflightFailed {
+                    message: "The selected Update AI command is empty.".to_string(),
+                });
             }
 
             send_phase(UpdatePhase::AiResolving {
@@ -2285,37 +2323,13 @@ impl DashboardService {
                 },
             );
 
-            // Build the command the UI will spawn inside its embedded
-            // PTY. Invoke opencode's *default* TUI subcommand (no
-            // explicit subcommand → `opencode [project]` starts the
-            // full TUI) with `--prompt <prompt>` so the merger prompt
-            // is auto-sent on launch and `-m <model>` so the user's
-            // configured model is honored. `opencode run` would also
-            // work, but its output is the plain CLI transcript — only
-            // the TUI renders the full Monokai theme (orange Thinking
-            // headers, colored tool calls, syntax-highlighted diffs)
-            // the user expects to see inside the AI Activity panel. The
-            // TUI has no `--variant` flag, so the configured reasoning
-            // effort is seeded into opencode's `model.json` instead (see
-            // `seed_opencode_tui_variant`).
-            seed_opencode_tui_variant(&model, &self.config.ai.update.thinking);
-            let prompt = build_merge_prompt(base_ref, &conflicts, autonomous);
-            let mut opencode_args: Vec<String> = vec![
-                "--prompt".to_string(),
-                prompt,
-                "-m".to_string(),
-                model.clone(),
-            ];
-            opencode_args.push(cwd.to_string_lossy().to_string());
-
             // Hand control to the UI. The merge is still mid-flight on
             // disk (conflict markers in the index); the screen owns the
             // PTY lifecycle from here, and the user finishes the flow
             // via `commit_and_push_ai_merge` or `abort_ai_merge`.
             return Ok(UpdatePullRequestOutcome::ConflictsHandedOffToUi {
-                opencode_binary: self.opencode_binary.clone(),
-                opencode_args,
-                cwd: cwd.clone(),
+                command,
+                harness: self.config.ai.update.harness,
                 model,
                 base_ref: base_ref.to_string(),
                 conflicts,
@@ -2373,6 +2387,24 @@ impl DashboardService {
     /// mother or derived — pulling its base branch in without pushing.
     pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
         let cwd = PathBuf::from(worktree_path);
+
+        if !self.config.ai.update.model.trim().is_empty() {
+            if let Err(error) = self
+                .ai_command(
+                    "dashboard.ai.update",
+                    &self.config.ai.update,
+                    "Resolve merge conflicts in this worktree when needed.".to_string(),
+                    cwd.clone(),
+                    AiRunMode::Interactive,
+                    AiPermission::Implement,
+                )
+                .await
+            {
+                return Ok(UpdateBranchOutcome::AiPreflightFailed {
+                    message: crate::errors::user_friendly_message(&error),
+                });
+            }
+        }
 
         // Pre-flight: a dirty working tree makes `git merge` refuse before it
         // even starts ("Your local changes ... would be overwritten by
@@ -2432,34 +2464,34 @@ impl DashboardService {
             return Ok(UpdateBranchOutcome::ConflictsRequireAi { conflicts });
         }
 
-        // Bail early if opencode isn't on PATH so the user sees the
-        // dedicated "install opencode" toast instead of a spawn error.
-        if !binary_available(&self.opencode_binary) {
-            let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
-            return Ok(UpdateBranchOutcome::AiUnavailable { conflicts });
-        }
-
         // Hand control to the UI. The merge is still mid-flight on disk
         // (conflict markers in the index); the screen owns the opencode
         // PTY lifecycle from here and commits the result locally (no push)
         // via the same machinery as the Update Pull Request flow.
-        // The TUI takes no `--variant`; seed the reasoning effort into
-        // opencode's `model.json` so it opens at the configured strength.
-        seed_opencode_tui_variant(&model, &self.config.ai.update.thinking);
         // The local "Update branch" flow skips the confirm screen, so it
         // cannot expose the autonomous toggle; default to autonomous mode.
-        let prompt = build_merge_prompt(&base_ref, &conflicts, true);
-        let mut opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
-            prompt,
-            "-m".to_string(),
-            model.clone(),
-        ];
-        opencode_args.push(cwd.to_string_lossy().to_string());
+        let command = match self
+            .ai_command(
+                "dashboard.ai.update",
+                &self.config.ai.update,
+                build_merge_prompt(&base_ref, &conflicts, true),
+                cwd.clone(),
+                AiRunMode::Interactive,
+                AiPermission::Implement,
+            )
+            .await
+        {
+            Ok(command) => command,
+            Err(error) => {
+                let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                return Ok(UpdateBranchOutcome::AiPreflightFailed {
+                    message: crate::errors::user_friendly_message(&error),
+                });
+            }
+        };
         Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
-            cwd: cwd.clone(),
+            command,
+            harness: self.config.ai.update.harness,
             model,
             base_ref,
             conflicts,

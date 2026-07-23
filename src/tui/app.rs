@@ -384,12 +384,14 @@ struct MergeExecution {
 
 struct UpdatePrSuccess {
     number: u64,
+    worktree_path: String,
     base_ref: String,
     outcome: crate::services::UpdatePullRequestOutcome,
 }
 
 struct UpdatePrFailure {
     number: u64,
+    worktree_path: String,
     message: String,
 }
 
@@ -546,7 +548,7 @@ pub struct App {
     /// Same idea for Update PR's (and "Update branch (locally)"'s) conflict-
     /// resolution TUI — marks the AI done automatically once opencode
     /// finishes. `Some` only while that AI is actively streaming.
-    update_conflict: Option<OpencodeTurnWatcher>,
+    update_conflict: Option<AiTurnWatcher>,
     update_branch: Option<UpdateBranchScreen>,
     /// Fullscreen "Select AI provider/model" picker. Spawned as a modal on
     /// top of the Settings screen — when active the Settings state is
@@ -827,7 +829,7 @@ impl App {
                         if let Some(turn) = self
                             .update_conflict
                             .as_mut()
-                            .and_then(OpencodeTurnWatcher::poll)
+                        .and_then(AiTurnWatcher::poll)
                         {
                             self.on_update_conflict_turn(turn);
                         }
@@ -5439,9 +5441,8 @@ impl App {
             .map(|s| s.branch().to_string())
             .unwrap_or_default();
         if let Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
-            opencode_binary,
-            opencode_args,
-            cwd,
+            command,
+            harness,
             model,
             base_ref,
             ..
@@ -5449,9 +5450,8 @@ impl App {
         {
             self.start_local_conflict_resolution(
                 branch,
-                opencode_binary,
-                opencode_args,
-                cwd,
+                command,
+                harness,
                 model,
                 base_ref,
             );
@@ -5468,10 +5468,9 @@ impl App {
                     "{branch}: {} conflict(s) need the `ai.update` model configured.",
                     conflicts.len()
                 )),
-            Ok(UpdateBranchOutcome::AiUnavailable { conflicts }) => {
+            Ok(UpdateBranchOutcome::AiPreflightFailed { message }) => {
                 self.record_update_all_failure(format!(
-                    "{branch}: {} conflict(s) but opencode is not on PATH.",
-                    conflicts.len()
+                    "{branch}: Update AI preflight failed: {message}"
                 ))
             }
             Ok(UpdateBranchOutcome::FetchFailed(message)) => {
@@ -5512,10 +5511,9 @@ impl App {
                         "PR #{number}: {} conflict(s) need the `ai.update` model configured.",
                         conflicts.len()
                     )),
-                UpdatePullRequestOutcome::AiUnavailable { conflicts } => self
+                UpdatePullRequestOutcome::AiPreflightFailed { message } => self
                     .record_update_all_failure(format!(
-                        "PR #{number}: {} conflict(s) but opencode is not on PATH.",
-                        conflicts.len()
+                        "PR #{number}: Update AI preflight failed: {message}"
                     )),
                 UpdatePullRequestOutcome::FetchFailed(message) => self.record_update_all_failure(
                     format!("PR #{number}: git fetch failed: {message}"),
@@ -5533,7 +5531,9 @@ impl App {
                 | UpdatePullRequestOutcome::AbortFailed(_) => self
                     .record_update_all_failure(format!("PR #{number}: update did not complete.")),
             },
-            Err(UpdatePrFailure { number, message }) => {
+            Err(UpdatePrFailure {
+                number, message, ..
+            }) => {
                 self.record_update_all_failure(format!("PR #{number}: {message}"))
             }
         }
@@ -5544,17 +5544,31 @@ impl App {
     /// done automatically, exactly like the manual "Merge finalized?"
     /// confirm or a PTY exit would, so the Complete/Cancel buttons appear
     /// without the user needing to tell wisetree opencode is finished.
-    /// Success and failure aren't distinguished here (same as PTY exit
-    /// today): the human reviews the AI Activity panel and decides via
-    /// Complete/Cancel either way.
-    fn on_update_conflict_turn(&mut self, turn: OpencodeTurn) {
-        if matches!(turn, OpencodeTurn::Working) {
-            return;
+    /// Only a completed provider turn with transcript evidence may unlock the
+    /// unattended batch commit. Failed or uncorrelated turns remain a manual
+    /// recovery path and must never be interpreted as resolved conflicts.
+    fn on_update_conflict_turn(&mut self, turn: AiTurn) {
+        match turn {
+            AiTurn::Working => return,
+            AiTurn::Finished { transcript } if !transcript.trim().is_empty() => {
+                if let Some(screen) = self.update_pr.as_mut() {
+                    screen.mark_ai_done_verified();
+                }
+            }
+            AiTurn::Finished { .. } => {
+                if let Some(screen) = self.update_pr.as_mut() {
+                    screen.mark_ai_manual_backstop(
+                        "AI finished without transcript evidence; review and finalize manually.".to_string(),
+                    );
+                }
+            }
+            AiTurn::Failed { message } => {
+                if let Some(screen) = self.update_pr.as_mut() {
+                    screen.mark_ai_failed(format!("AI conflict resolution failed: {message}"));
+                }
+            }
         }
         self.update_conflict = None;
-        if let Some(screen) = self.update_pr.as_mut() {
-            screen.mark_ai_done();
-        }
     }
 
     /// Called every tick while a batch is active. Drives the conflict-
@@ -5568,7 +5582,7 @@ impl App {
             return;
         };
         let step = screen.step();
-        let opencode_finished = screen.ai_active() && screen.ai_done();
+        let opencode_finished = screen.ai_active() && screen.ai_done() && screen.ai_verified();
         let commit_done = screen.commit_push_done();
         let commit_ok = screen.commit_push_succeeded();
         let branch = screen.request().branch.clone();
@@ -6590,18 +6604,16 @@ impl App {
             // disk (conflict markers in the index); the screen owns the
             // PTY from here and commits the result locally (no push).
             Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
-                opencode_binary,
-                opencode_args,
-                cwd,
+                command,
+                harness,
                 model,
                 base_ref,
                 ..
             }) => {
                 self.start_local_conflict_resolution(
                     branch,
-                    opencode_binary,
-                    opencode_args,
-                    cwd,
+                    command,
+                    harness,
                     model,
                     base_ref,
                 );
@@ -6627,9 +6639,8 @@ impl App {
     fn start_local_conflict_resolution(
         &mut self,
         branch: String,
-        opencode_binary: PathBuf,
-        opencode_args: Vec<String>,
-        cwd: PathBuf,
+        command: crate::services::AiCommand,
+        harness: AiHarness,
         model: String,
         base_ref: String,
     ) {
@@ -6638,7 +6649,7 @@ impl App {
             title: String::new(),
             url: String::new(),
             branch,
-            worktree_path: cwd.to_string_lossy().to_string(),
+            worktree_path: command.cwd.to_string_lossy().to_string(),
             ahead: 0,
             behind: 0,
             base_ref: Some(base_ref),
@@ -6650,14 +6661,14 @@ impl App {
         let ai = self.current_dashboard_config().ai.update.clone();
         let mut screen = UpdatePullRequestScreen::new_local_conflict(request, ai);
         screen.set_phase_message(format!("{model} is resolving conflicts..."));
-        // Launch opencode through the user's login shell so it runs with the
+        // Launch the selected harness through the user's login shell so it runs with the
         // same profile-sourced environment as a freshly opened terminal
         // (matching the Update Pull Request flow).
-        let (shell, wrapped_args) = login_shell_command(&opencode_binary, &opencode_args);
+        let (shell, wrapped_args) = login_shell_command(&command.binary, &command.args);
         // Watcher must exist before the spawn so its start timestamp
         // precedes the session row opencode creates.
-        self.update_conflict = Some(OpencodeTurnWatcher::new(&cwd));
-        screen.spawn_opencode_pty(shell, wrapped_args, cwd, Vec::new());
+        self.update_conflict = Some(AiTurnWatcher::new(harness, &command.cwd));
+        screen.spawn_opencode_pty(shell, wrapped_args, command.cwd, Vec::new());
         self.update_branch = None;
         self.update_pr = Some(screen);
         self.screen = Screen::UpdatePullRequest;
@@ -6704,13 +6715,9 @@ impl App {
                  model so we can solve conflicts + merge via AI."
                     .to_string(),
             ),
-            Ok(UpdateBranchOutcome::AiUnavailable { conflicts }) => self.show_toast(
+            Ok(UpdateBranchOutcome::AiPreflightFailed { message }) => self.show_toast(
                 ToastVariant::Error,
-                format!(
-                    "Merge has {} conflicted file(s). `opencode` CLI is not on PATH — \
-                     install it from https://opencode.ai then retry.",
-                    conflicts.len()
-                ),
+                format!("Update AI preflight failed: {message}"),
             ),
             // Handled by `apply_update_branch_finished` before reaching the
             // toast path (it mounts the resolution screen instead).
@@ -6846,6 +6853,17 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         use crate::services::UpdatePullRequestOutcome;
+        let event_worktree = match &result {
+            Ok(success) => &success.worktree_path,
+            Err(failure) => &failure.worktree_path,
+        };
+        if self
+            .update_pr
+            .as_ref()
+            .is_none_or(|screen| screen.request().worktree_path != *event_worktree)
+        {
+            return;
+        }
         // The "Update branch (locally)" flow reuses this screen in
         // `local_only` mode (no PR); its toasts must not mention a PR.
         let local_only = self
@@ -6862,9 +6880,8 @@ impl App {
         if let Ok(UpdatePrSuccess {
             outcome:
                 UpdatePullRequestOutcome::ConflictsHandedOffToUi {
-                    opencode_binary,
-                    opencode_args,
-                    cwd,
+                    command,
+                    harness,
                     ..
                 },
             ..
@@ -6874,11 +6891,11 @@ impl App {
                 // Launch opencode *through* the user's login shell so it runs
                 // with the same profile-sourced environment as a freshly
                 // opened terminal (matching the recovery shell below).
-                let (shell, wrapped_args) = login_shell_command(opencode_binary, opencode_args);
+                let (shell, wrapped_args) = login_shell_command(&command.binary, &command.args);
                 // Watcher must exist before the spawn so its start timestamp
                 // precedes the session row opencode creates.
-                self.update_conflict = Some(OpencodeTurnWatcher::new(cwd));
-                screen.spawn_opencode_pty(shell, wrapped_args, cwd.clone(), Vec::new());
+                self.update_conflict = Some(AiTurnWatcher::new(*harness, &command.cwd));
+                screen.spawn_opencode_pty(shell, wrapped_args, command.cwd.clone(), Vec::new());
                 return;
             }
         }
@@ -6966,16 +6983,10 @@ impl App {
                             .to_string(),
                     );
                 }
-                UpdatePullRequestOutcome::AiUnavailable { conflicts } => {
-                    let count = conflicts.len();
+                UpdatePullRequestOutcome::AiPreflightFailed { message } => {
                     self.show_toast(
                         ToastVariant::Error,
-                        format!(
-                            "Merge has {count} conflicted file(s). \
-                             `opencode` CLI is not on PATH — install it from \
-                             https://opencode.ai then retry. \
-                             Pull Request #{number} was NOT updated."
-                        ),
+                        format!("Update AI preflight failed for Pull Request #{number}: {message}"),
                     );
                 }
                 UpdatePullRequestOutcome::FetchFailed(detail) => {
@@ -9854,9 +9865,11 @@ fn kick_off_abort_ai_merge(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let number = request.number;
+    let worktree_path = request.worktree_path.clone();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
             number,
+            worktree_path,
             message: "Could not resolve git root for abort.".to_string(),
         })));
         return;
@@ -9871,11 +9884,13 @@ fn kick_off_abort_ai_merge(
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
+                worktree_path: request.worktree_path.clone(),
                 base_ref,
                 outcome,
             }),
             Err(err) => Err(UpdatePrFailure {
                 number,
+                worktree_path: request.worktree_path.clone(),
                 message: user_friendly_message(&err),
             }),
         };
@@ -9890,9 +9905,11 @@ fn kick_off_update_pull_request(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let number = request.number;
+    let worktree_path = request.worktree_path.clone();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
             number,
+            worktree_path,
             message: "Could not resolve git root for update.".to_string(),
         })));
         return;
@@ -9916,6 +9933,7 @@ fn kick_off_update_pull_request(
                     None => {
                         let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
                             number,
+                            worktree_path: request.worktree_path.clone(),
                             message: "No base ref reachable (looked for upstream/main, \
                                       upstream/master, origin/main, origin/master)."
                                 .to_string(),
@@ -9958,11 +9976,13 @@ fn kick_off_update_pull_request(
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
+                worktree_path: request.worktree_path.clone(),
                 base_ref,
                 outcome,
             }),
             Err(err) => Err(UpdatePrFailure {
                 number,
+                worktree_path: request.worktree_path.clone(),
                 message: user_friendly_message(&err),
             }),
         };
@@ -9982,9 +10002,11 @@ fn kick_off_push_pull_request(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let number = request.number;
+    let worktree_path = request.worktree_path.clone();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::UpdatePrFinished(Err(UpdatePrFailure {
             number,
+            worktree_path,
             message: "Could not resolve git root for push.".to_string(),
         })));
         return;
@@ -9997,12 +10019,14 @@ fn kick_off_push_pull_request(
         let event = match result {
             Ok(outcome) => Ok(UpdatePrSuccess {
                 number,
+                worktree_path: request.worktree_path.clone(),
                 // A push has no base ref; the `Pushed` toast doesn't use it.
                 base_ref: String::new(),
                 outcome,
             }),
             Err(err) => Err(UpdatePrFailure {
                 number,
+                worktree_path: request.worktree_path.clone(),
                 message: user_friendly_message(&err),
             }),
         };
