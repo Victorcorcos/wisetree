@@ -513,6 +513,13 @@ pub struct App {
     /// turn to complete — the TUI never exits on its own, so this is what
     /// advances the `Investigating` step. `Some` only while investigating.
     bugkill_investigation: Option<OpencodeTurnWatcher>,
+    /// Watches the Fixing TUI's opencode session. Unlike the investigation
+    /// watcher this one does not auto-advance the step (the user finalizes a
+    /// fix with Enter or by quitting opencode); it exists purely so a PTY
+    /// exit can be told apart from a genuinely finished fix turn — an
+    /// interrupted / early-quit opencode must not commit a half-applied fix.
+    /// `Some` only while fixing.
+    bugkill_fixing: Option<OpencodeTurnWatcher>,
     /// Same idea for the Develop screen's Planning + Implementing TUIs —
     /// advances the plan into review, and (on a Ralph Loop) closes one
     /// section's run and opens the next. `Some` only while one is live.
@@ -677,6 +684,7 @@ impl App {
             develop_write_in_flight: false,
             pending_develop_write: None,
             bugkill_investigation: None,
+            bugkill_fixing: None,
             develop_watch: None,
             explain_draft: None,
             fix_apply_watch: None,
@@ -818,21 +826,19 @@ impl App {
                     if self.update_all.is_some() {
                         self.on_update_all_tick(&tx);
                     }
-                    // Same for the Explain PR PTY — but here a child exit means
-                    // opencode finished drafting `pull_request.md`, so read
-                    // the file and flip the screen into Review. The Explaining
-                    // TUI also never exits on its own, so the turn watcher is
-                    // the primary completion signal; PTY exit remains a
-                    // fallback for a user who quits opencode manually.
+                    // Same for the Explain PR PTY. The Explaining TUI never
+                    // exits on its own, so the turn watcher is the primary
+                    // completion signal; a PTY exit is only the fallback for a
+                    // user who quits opencode manually. That exit is *not*
+                    // trusted as "done" — `on_explain_pty_exited` re-checks the
+                    // database so an interrupted / early-quit opencode can't be
+                    // mistaken for a finished draft.
                     let explain_status = self
                         .explain_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.is_explaining()));
                     match explain_status {
-                        Some((true, _)) => {
-                            self.explain_draft = None;
-                            self.on_explain_ready_to_review(&tx);
-                        }
+                        Some((true, _)) => self.on_explain_pty_exited(&tx),
                         Some((false, true)) => {
                             if let Some(turn) = self
                                 .explain_draft
@@ -847,18 +853,19 @@ impl App {
                         }
                     }
                     // Same for the Fix PR apply PTY. In autonomous mode a
-                    // finished opencode turn (detected via the database) or a
-                    // PTY exit commits the fix automatically; in manual mode
-                    // the user finalizes with Enter, so PTY exit is ignored.
+                    // finished opencode turn (detected via the database)
+                    // commits the fix automatically; in manual mode the user
+                    // finalizes with Enter, so PTY exit is ignored. A PTY exit
+                    // in autonomous mode is *not* trusted as "done" —
+                    // `on_fix_apply_pty_exited` re-checks the database so an
+                    // interrupted / early-quit opencode can't be mistaken for
+                    // a successfully applied fix.
                     let fix_status = self
                         .fix_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()));
                     match fix_status {
-                        Some((true, FixStep::Applying, true)) => {
-                            self.fix_apply_watch = None;
-                            self.on_fix_apply_done(&tx);
-                        }
+                        Some((true, FixStep::Applying, true)) => self.on_fix_apply_pty_exited(&tx),
                         Some((false, FixStep::Applying, true)) => {
                             if let Some(turn) = self
                                 .fix_apply_watch
@@ -876,8 +883,10 @@ impl App {
                     // exits on its own, so completion comes from the turn
                     // watcher polling opencode's database; an early PTY exit
                     // there means the user quit opencode (or it crashed). A
-                    // Fixing exit means the attempt is over, so scan +
-                    // commit it now.
+                    // Fixing exit is likewise not trusted as "done" —
+                    // `on_bugkill_fix_pty_exited` re-checks the database so an
+                    // interrupted / early-quit opencode can't commit a
+                    // half-applied fix.
                     let bugkill_exited = self
                         .bugkill_pr
                         .as_mut()
@@ -886,7 +895,7 @@ impl App {
                         Some((true, screens::bugkill_pr::BugkillStep::Investigating)) => {
                             self.on_bugkill_investigation_pty_exited(&tx)
                         }
-                        Some((true, _)) => self.on_bugkill_fix_done(&tx),
+                        Some((true, _)) => self.on_bugkill_fix_pty_exited(&tx),
                         Some((false, screens::bugkill_pr::BugkillStep::Investigating)) => {
                             if let Some(turn) = self
                                 .bugkill_investigation
@@ -2456,6 +2465,30 @@ impl App {
     /// opencode finished drafting: read `pull_request.md` from the worktree,
     /// parse the title + body, and move the screen into Review. A missing or
     /// empty file surfaces an error (the AI likely didn't finish).
+    /// The Explaining TUI exited before the watcher auto-advanced (the user
+    /// quit opencode, it crashed, or an Esc-interrupt left the turn
+    /// unfinished). Consult the database once: a genuinely finished turn
+    /// advances to Review; anything else is an early exit, surfaced as an
+    /// error rather than silently judged "done". Mirrors Development /
+    /// Bugkill Investigating so an interrupt can't be mistaken for completion.
+    fn on_explain_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = self
+            .explain_draft
+            .as_mut()
+            .map(OpencodeTurnWatcher::check_now)
+            .unwrap_or(OpencodeTurn::Working);
+        match turn {
+            OpencodeTurn::Working => {
+                self.explain_draft = None;
+                if let Some(screen) = self.explain_pr.as_mut() {
+                    screen
+                        .set_error("opencode exited before the explanation finished.".to_string());
+                }
+            }
+            turn => self.on_explain_turn(turn, tx),
+        }
+    }
+
     fn on_explain_ready_to_review(&mut self, _tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(screen) = self.explain_pr.as_mut() else {
             return;
@@ -2680,6 +2713,32 @@ impl App {
             },
             tx.clone(),
         );
+    }
+
+    /// Autonomous Fix apply TUI exited before the watcher saw a completed
+    /// turn (the user quit opencode, it crashed, or an Esc-interrupt left the
+    /// turn unfinished). Consult the database once: a genuinely finished turn
+    /// commits + replies; an early exit is recorded as a failed attempt and
+    /// the loop advances, rather than silently committing an unfinished fix.
+    /// Mirrors Development / Bugkill Investigating.
+    fn on_fix_apply_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = self
+            .fix_apply_watch
+            .as_mut()
+            .map(OpencodeTurnWatcher::check_now)
+            .unwrap_or(OpencodeTurn::Working);
+        match turn {
+            OpencodeTurn::Working => {
+                self.fix_apply_watch = None;
+                if let Some(screen) = self.fix_pr.as_mut() {
+                    screen.record_outcome(FixRowOutcome::Failed(
+                        "opencode exited before the fix was applied.".to_string(),
+                    ));
+                }
+                self.advance_fix(tx);
+            }
+            turn => self.on_fix_turn(turn, tx),
+        }
     }
 
     /// Autonomous Fix apply: opencode's turn finished (or errored) in the
@@ -3408,6 +3467,7 @@ impl App {
                     .take()
                     .map(|s| s.request().worktree_path.clone());
                 self.bugkill_investigation = None;
+                self.bugkill_fixing = None;
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             BugkillAction::Confirmed => {
@@ -3481,6 +3541,7 @@ impl App {
                 let worktree_path = screen.request().worktree_path.clone();
                 screen.kill_pty();
                 screen.start_working("Rolling back the attempt...", true);
+                self.bugkill_fixing = None;
                 kick_off_bugkill_abort(
                     self.git_root.clone(),
                     self.current_dashboard_config(),
@@ -3549,6 +3610,7 @@ impl App {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         self.bugkill_investigation = None;
+        self.bugkill_fixing = None;
         let Some(screen) = self.bugkill_pr.as_mut() else {
             return;
         };
@@ -3603,7 +3665,49 @@ impl App {
 
     /// opencode finished (exited or the user confirmed): scan the worktree
     /// against the pre-attempt snapshot and commit (or amend) the attempt.
+    /// The Fixing TUI exited. Like Development / Bugkill Investigating, a bare
+    /// PTY exit is not trusted as "the fix is done" — consult the database
+    /// once. A genuinely finished turn scans + commits the attempt; an early
+    /// exit (opencode quit mid-turn, crashed, or was Esc-interrupted) surfaces
+    /// an error instead of committing a half-applied fix.
+    fn on_bugkill_fix_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let turn = self
+            .bugkill_fixing
+            .as_mut()
+            .map(OpencodeTurnWatcher::check_now)
+            .unwrap_or(OpencodeTurn::Working);
+        match turn {
+            OpencodeTurn::Working => {
+                self.bugkill_fixing = None;
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error("opencode exited before the fix finished.".to_string());
+                }
+            }
+            turn => self.on_bugkill_fix_turn(turn, tx),
+        }
+    }
+
+    /// Classify a completed Fixing turn read from the database: a finished
+    /// turn scans + commits the attempt; a failed turn surfaces the error.
+    fn on_bugkill_fix_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match turn {
+            OpencodeTurn::Working => {}
+            OpencodeTurn::Finished { .. } => self.on_bugkill_fix_done(tx),
+            OpencodeTurn::Failed { message } => {
+                self.bugkill_fixing = None;
+                if let Some(screen) = self.bugkill_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_error(format!("opencode reported an error: {message}"));
+                }
+            }
+        }
+    }
+
     fn on_bugkill_fix_done(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Whether reached by a finished turn, a manual "fix finished" confirm,
+        // or a PTY exit, the fixing watcher has done its job — drop it.
+        self.bugkill_fixing = None;
         let Some(screen) = self.bugkill_pr.as_mut() else {
             return;
         };
@@ -3903,12 +4007,16 @@ impl App {
         row_index: usize,
         result: Result<Box<(BugkillSnapshot, FixApplyHandoff)>, String>,
     ) {
-        let Some(screen) = self.bugkill_pr.as_mut() else {
-            return;
-        };
         match result {
             Ok(payload) => {
                 let (snapshot, handoff) = *payload;
+                // Bind the watcher to the session opencode is about to create
+                // *before* spawning, so its start timestamp precedes the
+                // session row (see `OpencodeTurnWatcher::new`).
+                self.bugkill_fixing = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                let Some(screen) = self.bugkill_pr.as_mut() else {
+                    return;
+                };
                 screen.begin_attempt(row_index, snapshot);
                 screen.start_fixing();
                 screen.spawn_opencode_pty(
@@ -12166,6 +12274,79 @@ mod tests {
             !rows.last().unwrap().trim().is_empty(),
             "Fill Opening must occupy the full bottom panel so streaming output stays framed:\n{dump}"
         );
+    }
+
+    #[test]
+    fn explain_pty_exit_without_finished_turn_errors_instead_of_reviewing() {
+        // Mirrors Development / Bugkill Investigating: a PTY exit that is not
+        // backed by a completed turn on disk (opencode quit early or was
+        // Esc-interrupted) must NOT be judged as a finished draft. With no
+        // watcher, `check_now` reports Working, so the screen surfaces an
+        // error rather than silently advancing to Review.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = initialized_menu_app();
+        app.screen = Screen::ExplainPullRequest;
+        app.explain_pr = Some(ExplainPullRequestScreen::new(
+            ExplainPullRequestRequest {
+                branch: "feature/explain".into(),
+                worktree_path: "/tmp/repo/feature/explain".into(),
+                base_ref: Some("upstream/main".into()),
+                pr_base_ref: None,
+                number: None,
+                title: None,
+                url: None,
+                existing_labels: Vec::new(),
+            },
+            crate::config::schema::AiModelConfig::default(),
+        ));
+        app.explain_pr.as_mut().unwrap().start_explaining();
+        // No `explain_draft` watcher present → early exit path.
+        app.explain_draft = None;
+
+        app.on_explain_pty_exited(&tx);
+
+        let screen = app.explain_pr.as_ref().unwrap();
+        assert_ne!(
+            screen.step(),
+            ExplainStep::Review,
+            "an unfinished opencode exit must not advance to Review"
+        );
+        assert_eq!(
+            screen.error(),
+            Some("opencode exited before the explanation finished.")
+        );
+    }
+
+    #[test]
+    fn bugkill_fix_pty_exit_without_finished_turn_errors_instead_of_committing() {
+        // The Fixing TUI exiting is not proof the fix is done: with no
+        // completed turn on disk (opencode quit early or was Esc-interrupted)
+        // the guard must surface an error instead of scanning + committing a
+        // half-applied fix. No watcher present → `check_now` reports Working.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = initialized_menu_app();
+        app.screen = Screen::BugkillPullRequest;
+        app.bugkill_pr = Some(BugkillPullRequestScreen::new(
+            BugkillRequest {
+                branch: "fix/save-crash".into(),
+                worktree_path: "/tmp/repo-save".into(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiBugkillConfig::default(),
+        ));
+        app.bugkill_pr.as_mut().unwrap().start_fixing();
+        app.bugkill_fixing = None;
+
+        app.on_bugkill_fix_pty_exited(&tx);
+
+        let screen = app.bugkill_pr.as_ref().unwrap();
+        assert_eq!(
+            screen.error(),
+            Some("opencode exited before the fix finished.")
+        );
+        // No commit/scan work was kicked off (that path emits AppEvents).
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
