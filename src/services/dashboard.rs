@@ -578,9 +578,8 @@ pub enum ExplainPreparation {
     /// The UI owns the PTY lifecycle from here; once opencode finishes the
     /// screen reads `pull_request.md` and offers to open/update the PR.
     HandedOffToUi {
-        opencode_binary: PathBuf,
-        opencode_args: Vec<String>,
-        cwd: PathBuf,
+        command: AiCommand,
+        harness: AiHarness,
         model: String,
     },
     /// No commits ahead of the base ref → there is nothing to describe.
@@ -753,9 +752,8 @@ pub enum FixVerdict {
 /// [`ExplainPreparation::HandedOffToUi`]. The UI owns the PTY from here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixApplyHandoff {
-    pub opencode_binary: PathBuf,
-    pub opencode_args: Vec<String>,
-    pub cwd: PathBuf,
+    pub command: AiCommand,
+    pub harness: AiHarness,
 }
 
 /// Spawn parameters for a Develop phase. Unlike older live workflows, Develop
@@ -1660,7 +1658,11 @@ impl DashboardService {
     /// Builds a CLI invocation from the selected harness without changing the
     /// dashboard status detector configuration. The legacy handoff fields keep
     /// the current TUI/PTY plumbing stable while their values are now neutral.
-    fn ai_command(
+    fn ai_runner(&self) -> AiRunner {
+        AiRunner::default().with_binary(AiHarness::OpenCode, self.opencode_binary.clone())
+    }
+
+    async fn ai_command(
         &self,
         slot: &str,
         config: &AiModelConfig,
@@ -1669,9 +1671,8 @@ impl DashboardService {
         mode: AiRunMode,
         permission: AiPermission,
     ) -> Result<AiCommand> {
-        AiRunner::default()
-            .with_binary(AiHarness::OpenCode, self.opencode_binary.clone())
-            .command(&AiRunRequest {
+        self.ai_runner()
+            .preflight(&AiRunRequest {
                 slot: slot.to_string(),
                 config: config.clone(),
                 prompt,
@@ -1681,6 +1682,7 @@ impl DashboardService {
                 timeout: Duration::from_secs(0),
                 activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
             })
+            .await
     }
 
     /// Override the disk cache location. Pass `None` to disable disk
@@ -2563,33 +2565,25 @@ impl DashboardService {
         if model.is_empty() {
             return Ok(ExplainPreparation::AiNotConfigured);
         }
-        if !binary_available(&self.opencode_binary) {
-            return Ok(ExplainPreparation::AiUnavailable);
-        }
-
         let ticket = extract_ticket(branch).unwrap_or_default();
         let template = read_pr_template(&cwd).await;
         let prompt =
             build_explain_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
 
-        // Invoke opencode's default TUI (no subcommand) with `--prompt` so
-        // the explainer instructions auto-send on launch and `-m <model>` so
-        // the user's configured model is honored — mirrors the merge flow.
-        // The TUI takes no `--variant`, so the reasoning effort is seeded into
-        // opencode's `model.json` first (see `seed_opencode_tui_variant`).
-        seed_opencode_tui_variant(&model, &self.config.ai.explain.thinking);
-        let mut opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
-            prompt,
-            "-m".to_string(),
-            model.clone(),
-        ];
-        opencode_args.push(cwd.to_string_lossy().to_string());
+        let command = self
+            .ai_command(
+                "dashboard.ai.explain",
+                &self.config.ai.explain,
+                prompt,
+                cwd,
+                AiRunMode::Interactive,
+                AiPermission::Implement,
+            )
+            .await?;
 
         Ok(ExplainPreparation::HandedOffToUi {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
-            cwd,
+            command,
+            harness: self.config.ai.explain.harness,
             model,
         })
     }
@@ -2881,33 +2875,22 @@ impl DashboardService {
             None => String::new(),
         };
         let prompt = build_fix_plan_prompt(group, &code, feedback, previous_plan, history);
-        // `opencode run` is the captured/non-interactive transcript mode — no
-        // inner TUI; we parse its stdout. `-m` honors the configured model.
-        // `--agent plan` pins it to opencode's read-only Plan agent (write /
-        // edit / patch tools disabled), so this phase can ONLY think and emit a
-        // verdict — it cannot touch files. This matters most on the "Other"
-        // re-plan: the user's feedback reads like a direct instruction, and the
-        // default (build) agent would act on it — editing the file and skipping
-        // the verdict — which made "Other" silently apply a change and advance
-        // instead of showing a revised plan. Read-only forces a clean re-plan.
-        // `opencode run` accepts `--variant <effort>`, so the plan phase honors
-        // its configured thinking strength directly (unlike the TUI flows).
-        let command = self.ai_command(
-            "dashboard.ai.fix.plan",
-            &self.config.ai.fix.plan,
+        let request = AiRunRequest {
+            slot: "dashboard.ai.fix.plan".to_string(),
+            config: self.config.ai.fix.plan.clone(),
             prompt,
-            cwd.clone(),
-            AiRunMode::Captured,
-            AiPermission::Plan,
-        )?;
-        let run_args_ref: Vec<&str> = command.args.iter().map(String::as_str).collect();
-        let output = time::timeout(
-            FIX_PLAN_TIMEOUT,
-            run_command(&command.binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("opencode planning timed out after 180s"))?
-        .map_err(WisetreeError::other)?;
+            cwd,
+            mode: AiRunMode::Captured,
+            permission: AiPermission::Plan,
+            timeout: FIX_PLAN_TIMEOUT,
+            activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+        };
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let output = self
+            .ai_runner()
+            .run_captured(&request, None, cancel_rx)
+            .await?
+            .transcript;
 
         parse_fix_verdict(&output).ok_or_else(|| {
             WisetreeError::other("could not parse a verdict from the planning AI output.")
@@ -2927,9 +2910,6 @@ impl DashboardService {
     ) -> Result<FixApplyHandoff> {
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_fix_apply_prompt(group, plan);
-        // The apply phase runs in the opencode TUI (live edits in the AI
-        // Activity panel), which takes no `--variant`; seed the reasoning
-        // effort into `model.json` before spawning.
         let command = self.ai_command(
             "dashboard.ai.fix.apply",
             &self.config.ai.fix.apply,
@@ -2937,11 +2917,11 @@ impl DashboardService {
             cwd.clone(),
             AiRunMode::Interactive,
             AiPermission::Implement,
-        )?;
+        )
+        .await?;
         Ok(FixApplyHandoff {
-            opencode_binary: command.binary,
-            opencode_args: command.args,
-            cwd,
+            command,
+            harness: self.config.ai.fix.apply.harness,
         })
     }
 
@@ -4483,9 +4463,12 @@ impl DashboardService {
             cwd.to_string_lossy().to_string(),
         ];
         Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
-            cwd,
+            command: AiCommand {
+                binary: self.opencode_binary.clone(),
+                args: opencode_args,
+                cwd,
+            },
+            harness: AiHarness::OpenCode,
         })
     }
 
@@ -4518,9 +4501,12 @@ impl DashboardService {
             vec!["--prompt".to_string(), prompt, "-m".to_string(), model];
         opencode_args.push(cwd.to_string_lossy().to_string());
         Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
-            cwd,
+            command: AiCommand {
+                binary: self.opencode_binary.clone(),
+                args: opencode_args,
+                cwd,
+            },
+            harness: AiHarness::OpenCode,
         })
     }
 

@@ -288,6 +288,10 @@ impl ExplainPullRequestScreen {
         false
     }
 
+    pub fn pty_exit_code(&self) -> Option<i32> {
+        self.pty.as_ref().and_then(PtyView::exit_code)
+    }
+
     /// Transition into the Review step with the parsed draft. Drops the PTY
     /// (killing opencode if it is still alive after a finalize-confirm).
     pub fn enter_review(&mut self, title: String, body: String, labels: Vec<String>) {
@@ -922,7 +926,7 @@ impl ExplainPullRequestScreen {
         // us to the error view). Show a placeholder + any structured events.
         let lines: Vec<Line<'static>> = if self.ai_log.is_empty() {
             vec![Line::from(Span::styled(
-                "Preparing the diff and launching opencode...",
+                "Preparing the diff and launching the configured AI...",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),
@@ -950,7 +954,7 @@ impl ExplainPullRequestScreen {
 
         let focused_inner = self.pty.is_some() && self.pty_focused;
         let focus_label = if focused_inner {
-            "Inner (opencode)"
+            "Inner (AI CLI)"
         } else {
             "Outer (wisetree)"
         };
@@ -974,7 +978,7 @@ impl ExplainPullRequestScreen {
             if focused_inner {
                 "Switch to Wisetree"
             } else {
-                "Switch to opencode"
+                "Switch to AI CLI"
             }
             .to_string(),
             muted,
@@ -1156,7 +1160,7 @@ fn build_confirm(request: &ExplainPullRequestRequest) -> ConfirmationModal {
 fn build_finalize_modal() -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title("Draft ready?")
-        .with_subtitle("Has opencode finished writing pull_request.md?")
+        .with_subtitle("Has the AI CLI finished writing pull_request.md?")
         .with_confirm_text("Yes")
         .with_cancel_text("No")
         .with_color("#eada61")
@@ -1268,7 +1272,7 @@ fn build_steps(request: &ExplainPullRequestRequest) -> Vec<String> {
     };
     vec![
         "Gather commit log + diff vs base ref".to_string(),
-        "Opencode drafts `pull_request.md` (title + description)".to_string(),
+        "Configured AI drafts `pull_request.md` (title + description)".to_string(),
         "You review the draft, then Open/Update or Finish".to_string(),
         submit_step,
     ]

@@ -162,11 +162,15 @@ enum AppEvent {
     UpdateBranchFinished(Result<UpdateBranchOutcome, String>),
     /// Base ref resolved for the "Explain Pull Request" flow.
     ExplainPrBaseRefResolved {
+        operation_id: u64,
         base_ref: Option<String>,
     },
     /// Read-only preparation finished — either the opencode spawn params
     /// (`HandedOffToUi`) or a terminal non-handoff variant.
-    ExplainPrPrepared(Result<Box<ExplainPreparation>, String>),
+    ExplainPrPrepared {
+        operation_id: u64,
+        result: Result<Box<ExplainPreparation>, String>,
+    },
     /// The drafted PR was submitted (created or updated).
     ExplainPrSubmitted(Result<ExplainSubmitOutcome, String>),
     /// A line of terminal output from the git push / gh pr create pipeline.
@@ -183,6 +187,7 @@ enum AppEvent {
     /// always returns to the Decision screen with a revised plan rather than
     /// acting on a `reply` / `praise` verdict and skipping the user's approval.
     FixPrPlanned {
+        operation_id: u64,
         index: usize,
         is_replan: bool,
         result: Result<FixVerdict, String>,
@@ -507,6 +512,10 @@ pub struct App {
     update_pr: Option<UpdatePullRequestScreen>,
     explain_pr: Option<ExplainPullRequestScreen>,
     fix_pr: Option<FixPullRequestScreen>,
+    next_explain_operation_id: u64,
+    active_explain_operation_id: Option<u64>,
+    next_fix_operation_id: u64,
+    active_fix_operation_id: Option<u64>,
     review_pr: Option<ReviewPullRequestScreen>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
     develop_pr: Option<DevelopPullRequestScreen>,
@@ -528,12 +537,12 @@ pub struct App {
     /// Same idea for the Explain screen's drafting TUI — advances straight
     /// to Review once opencode finishes writing `pull_request.md`. `Some`
     /// only while the `Explaining` step is active.
-    explain_draft: Option<OpencodeTurnWatcher>,
+    explain_draft: Option<AiTurnWatcher>,
     /// Same idea for the Fix screen's apply TUI in Autonomous mode — commits
     /// each fix + replies the moment opencode's turn finishes, so the user
     /// never has to press Enter. `Some` only while an autonomous `Applying`
     /// step is live.
-    fix_apply_watch: Option<OpencodeTurnWatcher>,
+    fix_apply_watch: Option<AiTurnWatcher>,
     /// Same idea for Update PR's (and "Update branch (locally)"'s) conflict-
     /// resolution TUI — marks the AI done automatically once opencode
     /// finishes. `Some` only while that AI is actively streaming.
@@ -674,6 +683,10 @@ impl App {
             update_pr: None,
             explain_pr: None,
             fix_pr: None,
+            next_explain_operation_id: 0,
+            active_explain_operation_id: None,
+            next_fix_operation_id: 0,
+            active_fix_operation_id: None,
             review_pr: None,
             bugkill_pr: None,
             develop_pr: None,
@@ -837,15 +850,25 @@ impl App {
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.is_explaining()));
                     match explain_status {
-                        Some((true, _)) => {
+                        Some((true, _)) if self
+                            .explain_pr
+                            .as_ref()
+                            .and_then(|screen| screen.pty_exit_code())
+                            == Some(0) => {
                             self.explain_draft = None;
                             self.on_explain_ready_to_review(&tx);
+                        }
+                        Some((true, _)) => {
+                            self.explain_draft = None;
+                            if let Some(screen) = self.explain_pr.as_mut() {
+                                screen.set_error("AI CLI exited before the PR draft was finished.".to_string());
+                            }
                         }
                         Some((false, true)) => {
                             if let Some(turn) = self
                                 .explain_draft
                                 .as_mut()
-                                .and_then(OpencodeTurnWatcher::poll)
+                                .and_then(AiTurnWatcher::poll)
                             {
                                 self.on_explain_turn(turn, &tx);
                             }
@@ -863,15 +886,39 @@ impl App {
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()));
                     match fix_status {
-                        Some((true, FixStep::Applying, true)) => {
+                        Some((true, FixStep::Applying, true)) if self
+                            .fix_pr
+                            .as_ref()
+                            .and_then(|screen| screen.pty_exit_code())
+                            == Some(0) => {
                             self.fix_apply_watch = None;
                             self.on_fix_apply_done(&tx);
+                        }
+                        Some((true, FixStep::Applying, true)) => {
+                            self.fix_apply_watch = None;
+                            if let Some(screen) = self.fix_pr.as_mut() {
+                                screen.record_outcome(FixRowOutcome::Failed(
+                                    "AI CLI exited before applying the fix.".to_string(),
+                                ));
+                            }
+                            self.advance_fix(&tx);
+                        }
+                        Some((true, FixStep::Applying, false))
+                            if self
+                                .fix_pr
+                                .as_ref()
+                                .and_then(|screen| screen.pty_exit_code())
+                                != Some(0) =>
+                        {
+                            if let Some(screen) = self.fix_pr.as_mut() {
+                                screen.set_error("AI CLI exited before applying the fix.".to_string());
+                            }
                         }
                         Some((false, FixStep::Applying, true)) => {
                             if let Some(turn) = self
                                 .fix_apply_watch
                                 .as_mut()
-                                .and_then(OpencodeTurnWatcher::poll)
+                                .and_then(AiTurnWatcher::poll)
                             {
                                 self.on_fix_turn(turn, &tx);
                             }
@@ -2389,6 +2436,8 @@ impl App {
         match action {
             ExplainAction::Continue => {}
             ExplainAction::Cancelled => {
+                self.active_explain_operation_id = None;
+                self.explain_draft = None;
                 let worktree_path = self
                     .explain_pr
                     .take()
@@ -2401,10 +2450,12 @@ impl App {
                 };
                 let request = screen.request().clone();
                 screen.start_explaining();
+                let operation_id = self.active_explain_operation_id.unwrap_or_default();
                 kick_off_prepare_explain(
                     self.git_root.clone(),
                     self.current_dashboard_config(),
                     request,
+                    operation_id,
                     tx.clone(),
                 );
             }
@@ -2439,6 +2490,8 @@ impl App {
                 );
             }
             ExplainAction::Finish => {
+                self.active_explain_operation_id = None;
+                self.explain_draft = None;
                 self.show_toast(
                     ToastVariant::Info,
                     "Draft saved to pull_request.md — no pull request was opened.".to_string(),
@@ -2447,6 +2500,8 @@ impl App {
                 self.enter_screen(Screen::Dashboard, tx);
             }
             ExplainAction::Done => {
+                self.active_explain_operation_id = None;
+                self.explain_draft = None;
                 self.explain_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
@@ -2482,14 +2537,14 @@ impl App {
     /// Clears the watcher immediately on a terminal outcome — `set_error`
     /// does not change the screen's step, so the tick loop's `is_explaining`
     /// gate alone would keep re-polling (and re-erroring) every second.
-    fn on_explain_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn on_explain_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
-            OpencodeTurn::Working => {}
-            OpencodeTurn::Finished { .. } => {
+            AiTurn::Working => {}
+            AiTurn::Finished { .. } => {
                 self.explain_draft = None;
                 self.on_explain_ready_to_review(tx);
             }
-            OpencodeTurn::Failed { message } => {
+            AiTurn::Failed { message } => {
                 self.explain_draft = None;
                 if let Some(screen) = self.explain_pr.as_mut() {
                     screen.set_error(format!("AI CLI reported an error: {message}"));
@@ -2508,6 +2563,8 @@ impl App {
         // Lands on the Confirm step immediately — no base ref to resolve. The
         // prepare pipeline only runs once the user confirms.
         let ai = self.current_dashboard_config().ai.fix.clone();
+        self.next_fix_operation_id = self.next_fix_operation_id.wrapping_add(1);
+        self.active_fix_operation_id = Some(self.next_fix_operation_id);
         self.fix_pr = Some(FixPullRequestScreen::new(request, ai));
         self.screen = Screen::FixPullRequest;
     }
@@ -2527,6 +2584,8 @@ impl App {
         match action {
             FixAction::Continue => {}
             FixAction::Cancelled => {
+                self.active_fix_operation_id = None;
+                self.fix_apply_watch = None;
                 let worktree_path = self
                     .fix_pr
                     .take()
@@ -2588,6 +2647,8 @@ impl App {
             }
             FixAction::ApplyReady => self.on_fix_apply_done(tx),
             FixAction::Done => {
+                self.active_fix_operation_id = None;
+                self.fix_apply_watch = None;
                 self.fix_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
             }
@@ -2611,6 +2672,7 @@ impl App {
         let total = screen.groups_len();
         let worktree_path = screen.request().worktree_path.clone();
         let history = screen.history_text();
+        let operation_id = self.active_fix_operation_id.unwrap_or_default();
         screen.start_planning(index + 1, total);
         kick_off_plan_comment(
             self.git_root.clone(),
@@ -2622,6 +2684,7 @@ impl App {
                 previous_plan,
                 history,
                 index,
+                operation_id,
             },
             tx.clone(),
         );
@@ -2685,18 +2748,18 @@ impl App {
     /// Autonomous Fix apply: opencode's turn finished (or errored) in the
     /// database. A finished turn commits + replies; a failed turn records the
     /// error as a Failed row and advances to the next comment.
-    fn on_fix_turn(&mut self, turn: OpencodeTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn on_fix_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
-            OpencodeTurn::Working => {}
-            OpencodeTurn::Finished { .. } => {
+            AiTurn::Working => {}
+            AiTurn::Finished { .. } => {
                 self.fix_apply_watch = None;
                 self.on_fix_apply_done(tx);
             }
-            OpencodeTurn::Failed { message } => {
+            AiTurn::Failed { message } => {
                 self.fix_apply_watch = None;
                 if let Some(screen) = self.fix_pr.as_mut() {
                     screen.record_outcome(FixRowOutcome::Failed(format!(
-                        "opencode reported an error: {}",
+                        "AI CLI reported an error: {}",
                         truncate_error(&message)
                     )));
                 }
@@ -3792,12 +3855,12 @@ impl App {
         };
         match result {
             Ok(handoff) => {
-                self.bugkill_investigation = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                self.bugkill_investigation = Some(OpencodeTurnWatcher::new(&handoff.command.cwd));
                 screen.start_investigating(corrective);
                 screen.spawn_opencode_pty(
-                    handoff.opencode_binary,
-                    handoff.opencode_args,
-                    handoff.cwd,
+                    handoff.command.binary,
+                    handoff.command.args,
+                    handoff.command.cwd,
                     Vec::new(),
                 );
             }
@@ -3912,9 +3975,9 @@ impl App {
                 screen.begin_attempt(row_index, snapshot);
                 screen.start_fixing();
                 screen.spawn_opencode_pty(
-                    handoff.opencode_binary,
-                    handoff.opencode_args,
-                    handoff.cwd,
+                    handoff.command.binary,
+                    handoff.command.args,
+                    handoff.command.cwd,
                     Vec::new(),
                 );
             }
@@ -5016,12 +5079,13 @@ impl App {
                     // finished turn commits the fix automatically; manual mode
                     // waits for the user's Enter + finalize confirm instead.
                     if s.autonomous() {
-                        self.fix_apply_watch = Some(OpencodeTurnWatcher::new(&handoff.cwd));
+                        self.fix_apply_watch =
+                            Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                     }
                     s.spawn_opencode_pty(
-                        handoff.opencode_binary,
-                        handoff.opencode_args,
-                        handoff.cwd,
+                        handoff.command.binary,
+                        handoff.command.args,
+                        handoff.command.cwd,
                         Vec::new(),
                     );
                 }
@@ -5635,11 +5699,14 @@ impl App {
         let worktree_path = request.worktree_path.clone();
         let pr_base_ref = request.pr_base_ref.clone();
         let ai = self.current_dashboard_config().ai.explain.clone();
+        self.next_explain_operation_id = self.next_explain_operation_id.wrapping_add(1);
+        let operation_id = self.next_explain_operation_id;
+        self.active_explain_operation_id = Some(operation_id);
         // Mount with `base_ref = None` so the confirm panel renders straight
         // away; the resolver populates the field in the background.
         self.explain_pr = Some(ExplainPullRequestScreen::new(request, ai));
         self.screen = Screen::ExplainPullRequest;
-        kick_off_resolve_explain_base_ref(worktree_path, pr_base_ref, tx.clone());
+        kick_off_resolve_explain_base_ref(worktree_path, pr_base_ref, operation_id, tx.clone());
     }
     /// Mount the push-only confirmation screen. A push needs no base ref,
     /// so — unlike `start_update_pr_flow` — there's no resolver kick-off;
@@ -6310,10 +6377,22 @@ impl App {
             }
             AppEvent::UpdatePrFinished(result) => self.apply_update_pr_finished(result, tx),
             AppEvent::UpdateBranchFinished(result) => self.apply_update_branch_finished(result, tx),
-            AppEvent::ExplainPrBaseRefResolved { base_ref } => {
-                self.apply_explain_pr_base_ref(base_ref);
+            AppEvent::ExplainPrBaseRefResolved {
+                operation_id,
+                base_ref,
+            } => {
+                if self.active_explain_operation_id == Some(operation_id) {
+                    self.apply_explain_pr_base_ref(base_ref);
+                }
             }
-            AppEvent::ExplainPrPrepared(result) => self.apply_explain_pr_prepared(result, tx),
+            AppEvent::ExplainPrPrepared {
+                operation_id,
+                result,
+            } => {
+                if self.active_explain_operation_id == Some(operation_id) {
+                    self.apply_explain_pr_prepared(result, tx);
+                }
+            }
             AppEvent::ExplainPrSubmitted(result) => self.apply_explain_pr_submitted(result, tx),
             AppEvent::ExplainPrActivity { text, kind } => {
                 if let Some(screen) = self.explain_pr.as_mut() {
@@ -6322,10 +6401,15 @@ impl App {
             }
             AppEvent::FixPrPrepared(result) => self.apply_fix_pr_prepared(result, tx),
             AppEvent::FixPrPlanned {
+                operation_id,
                 index,
                 is_replan,
                 result,
-            } => self.apply_fix_pr_planned(index, is_replan, result, tx),
+            } => {
+                if self.active_fix_operation_id == Some(operation_id) {
+                    self.apply_fix_pr_planned(index, is_replan, result, tx);
+                }
+            }
             AppEvent::FixPrReplied { index, result } => {
                 self.apply_fix_pr_replied(index, result, tx)
             }
@@ -6972,17 +7056,17 @@ impl App {
         }
         match result {
             Ok(prep) => match *prep {
-                ExplainPreparation::HandedOffToUi {
-                    opencode_binary,
-                    opencode_args,
-                    cwd,
-                    ..
-                } => {
+                ExplainPreparation::HandedOffToUi { command, harness, .. } => {
                     if let Some(screen) = self.explain_pr.as_mut() {
                         // Watcher must exist before the spawn so its start
                         // timestamp precedes the session row opencode creates.
-                        self.explain_draft = Some(OpencodeTurnWatcher::new(&cwd));
-                        screen.spawn_opencode_pty(opencode_binary, opencode_args, cwd, Vec::new());
+                        self.explain_draft = Some(AiTurnWatcher::new(harness, &command.cwd));
+                        screen.spawn_opencode_pty(
+                            command.binary,
+                            command.args,
+                            command.cwd,
+                            Vec::new(),
+                        );
                     }
                 }
                 ExplainPreparation::NothingToDescribe => {
@@ -7005,8 +7089,7 @@ impl App {
                 ExplainPreparation::AiUnavailable => {
                     self.show_toast(
                         ToastVariant::Error,
-                        "`opencode` CLI is not on PATH — install it from \
-                         https://opencode.ai then retry."
+                        "The configured AI CLI is not on PATH. Install it, then retry."
                             .to_string(),
                     );
                     self.explain_pr = None;
@@ -8496,6 +8579,7 @@ fn kick_off_resolve_base_ref(
 fn kick_off_resolve_explain_base_ref(
     worktree_path: String,
     pr_base_ref: Option<String>,
+    operation_id: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
@@ -8504,7 +8588,10 @@ fn kick_off_resolve_explain_base_ref(
             pr_base_ref.as_deref(),
         )
         .await;
-        let _ = tx.send(AppEvent::ExplainPrBaseRefResolved { base_ref });
+        let _ = tx.send(AppEvent::ExplainPrBaseRefResolved {
+            operation_id,
+            base_ref,
+        });
     });
 }
 
@@ -8512,21 +8599,28 @@ fn kick_off_prepare_explain(
     git_root: Option<String>,
     config: DashboardConfig,
     request: ExplainPullRequestRequest,
+    operation_id: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
-        let _ = tx.send(AppEvent::ExplainPrPrepared(Err(
+        let _ = tx.send(AppEvent::ExplainPrPrepared {
+            operation_id,
+            result: Err(
             "Could not resolve git root for the PR draft.".to_string(),
-        )));
+            ),
+        });
         return;
     };
     tokio::spawn(async move {
         // `base_ref` is populated by the resolver before the user can
         // confirm; guard anyway so a race can't blow up the worker.
         let Some(base_ref) = request.base_ref.clone() else {
-            let _ = tx.send(AppEvent::ExplainPrPrepared(Err(
+            let _ = tx.send(AppEvent::ExplainPrPrepared {
+                operation_id,
+                result: Err(
                 "Base ref was not resolved before confirmation.".to_string(),
-            )));
+                ),
+            });
             return;
         };
         let service = DashboardService::new(root, config);
@@ -8537,7 +8631,10 @@ fn kick_off_prepare_explain(
             Ok(prep) => Ok(Box::new(prep)),
             Err(err) => Err(user_friendly_message(&err)),
         };
-        let _ = tx.send(AppEvent::ExplainPrPrepared(event));
+        let _ = tx.send(AppEvent::ExplainPrPrepared {
+            operation_id,
+            result: event,
+        });
     });
 }
 
@@ -8592,6 +8689,7 @@ struct FixPlanRequest {
     /// model can interpret a comment that refers back to them.
     history: Option<String>,
     index: usize,
+    operation_id: u64,
 }
 
 /// Inputs for building the live-apply spawn parameters.
@@ -8656,11 +8754,13 @@ fn kick_off_plan_comment(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let index = req.index;
+    let operation_id = req.operation_id;
     // The "Other" path supplies feedback; that's what makes this a re-plan that
     // must round-trip back to the Decision screen rather than auto-resolve.
     let is_replan = req.feedback.is_some();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::FixPrPlanned {
+            operation_id,
             index,
             is_replan,
             result: Err("Could not resolve git root.".to_string()),
@@ -8680,6 +8780,7 @@ fn kick_off_plan_comment(
             .await
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::FixPrPlanned {
+            operation_id,
             index,
             is_replan,
             result,

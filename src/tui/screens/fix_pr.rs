@@ -422,6 +422,10 @@ impl FixPullRequestScreen {
         false
     }
 
+    pub fn pty_exit_code(&self) -> Option<i32> {
+        self.pty.as_ref().and_then(PtyView::exit_code)
+    }
+
     /// Record a per-group outcome as a colored summary-table row.
     pub fn record_outcome(&mut self, outcome: FixRowOutcome) {
         let n = self.current + 1;
@@ -1155,7 +1159,7 @@ impl FixPullRequestScreen {
         // there is no structured fallback log to show — just a placeholder.
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Launching opencode to apply the fix...",
+                "Launching the configured AI to apply the fix...",
                 muted_dim(),
             ))),
             inner,
@@ -1169,7 +1173,7 @@ impl FixPullRequestScreen {
             Span::styled("Focus: ".to_string(), muted_dim()),
             Span::styled(
                 if focused_inner {
-                    "Inner (opencode)"
+                    "Inner (AI CLI)"
                 } else {
                     "Outer (wisetree)"
                 }
@@ -1188,7 +1192,7 @@ impl FixPullRequestScreen {
                 if focused_inner {
                     "Switch to Wisetree"
                 } else {
-                    "Switch to opencode"
+                    "Switch to AI CLI"
                 }
                 .to_string(),
                 muted_dim(),
@@ -1293,7 +1297,7 @@ fn build_confirm(request: &FixPullRequestRequest) -> ConfirmationModal {
 fn build_finalize_modal() -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title("Fix applied?")
-        .with_subtitle("Has opencode finished editing the file(s)?")
+        .with_subtitle("Has the AI CLI finished editing the file(s)?")
         .with_confirm_text("Yes")
         .with_cancel_text("No")
         .with_color_value(colors::WARNING)
