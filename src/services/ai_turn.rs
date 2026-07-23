@@ -335,7 +335,15 @@ fn codex_turn(lines: &[Value]) -> AiTurn {
         state = match kind {
             Some("task_started") | Some("turn_started") => Some(Ok(())),
             Some("task_complete") | Some("turn_complete") => Some(Err(false)),
-            Some("turn_aborted") => Some(Err(true)),
+            // An Esc-interrupt in the interactive TUI emits `turn_aborted`.
+            // That is the user stopping to redirect, not a finished or failed
+            // turn — keep it `Working` so a follow-up prompt (which writes a
+            // fresh `task_started`) resumes the same session instead of the
+            // watcher tearing it down. Mirrors Claude Code, whose interrupts
+            // likewise leave the turn `Working`. A genuine failure still
+            // arrives as `error`/`task_failed` below. An early quit with no
+            // resume is caught by the PTY-exit handlers, not here.
+            Some("turn_aborted") => Some(Ok(())),
             Some("error") | Some("task_failed") => Some(Err(true)),
             _ => state,
         };
@@ -467,7 +475,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_aborted_turn_fails_and_unrelated_file_cannot_replace_pin() {
+    fn codex_esc_abort_stays_working_and_a_followup_prompt_resumes_the_same_session() {
+        // An Esc-interrupt (turn_aborted) is the user redirecting, not a
+        // finished/failed turn: the watcher must stay Working so a follow-up
+        // prompt continues the session instead of being torn down. A genuine
+        // failure (task_failed) is still reported as Failed. Also guards the
+        // pin: an unrelated newer file cannot hijack the in-flight turn.
         let tmp = tempfile::tempdir().unwrap();
         let worktree = tmp.path().join("worktree");
         fs::create_dir(&worktree).unwrap();
@@ -482,6 +495,7 @@ mod tests {
         assert_eq!(watcher.check_now(), AiTurn::Working);
         write(&tmp.path().join("codex/2026/01/01/newer.jsonl"), &format!("{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}", worktree.display()));
         assert_eq!(watcher.check_now(), AiTurn::Working);
+        // Esc pressed → turn_aborted. Still Working, not Failed.
         fs::write(
             &ours,
             format!(
@@ -490,6 +504,44 @@ mod tests {
             ),
         )
         .unwrap();
+        assert_eq!(watcher.check_now(), AiTurn::Working);
+        // A follow-up prompt writes a fresh task_started → keeps working.
+        fs::write(
+            &ours,
+            format!(
+                "{}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}",
+                fs::read_to_string(&ours).unwrap()
+            ),
+        )
+        .unwrap();
+        assert_eq!(watcher.check_now(), AiTurn::Working);
+        // That resumed turn genuinely completing is still detected as Finished.
+        fs::write(
+            &ours,
+            format!(
+                "{}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}",
+                fs::read_to_string(&ours).unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(matches!(watcher.check_now(), AiTurn::Finished { .. }));
+    }
+
+    #[test]
+    fn codex_genuine_failure_is_still_reported() {
+        // The abort → Working change must not mask real failures: an
+        // `error`/`task_failed` event still surfaces as Failed.
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        let file = tmp.path().join("codex/2026/01/01/ours.jsonl");
+        write(&file, &format!("{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_failed\"}}}}", worktree.display()));
+        let mut watcher = AiTurnWatcher::with_paths(
+            AiHarness::Codex,
+            &worktree,
+            paths(&tmp),
+            SystemTime::now() - Duration::from_secs(1),
+        );
         assert!(matches!(watcher.check_now(), AiTurn::Failed { .. }));
     }
 
