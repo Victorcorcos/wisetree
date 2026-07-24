@@ -43,10 +43,28 @@ const SCROLLBACK_ROWS: usize = 5000;
 const PAGE_UP: &[u8] = b"\x1b[5~";
 const PAGE_DOWN: &[u8] = b"\x1b[6~";
 
+/// Reply to an `OSC 10` (query default foreground) request: a light gray,
+/// matching a dark terminal theme. Terminated with ST (`ESC \`).
+const OSC10_FG_REPLY: &[u8] = b"\x1b]10;rgb:c7c7/c7c7/c7c7\x1b\\";
+/// Reply to an `OSC 11` (query default background) request: a dark charcoal.
+///
+/// Codex (unlike claude) refuses to paint its themed message blocks until it
+/// learns the terminal background this way — with no reply it downgrades to a
+/// flat, block-less theme. Reporting a dark background unlocks the same
+/// rendering it shows in a standalone dark terminal. (A light-terminal user
+/// would want a light value here; the reply is assembled in
+/// [`terminal_query_reply`]. A future improvement could relay the host
+/// terminal's actual background instead of this fixed dark default.)
+const OSC11_BG_REPLY: &[u8] = b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\";
+
 pub struct PtyView {
     parser: Arc<Mutex<Parser>>,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Shared with the reader thread so it can answer terminal capability
+    /// queries (OSC 10/11) the instant the child asks, exactly like a real
+    /// terminal — the master exposes only a single writer, so both the host
+    /// (`send_input`) and the reader thread go through this one handle.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     reader_handle: Option<JoinHandle<()>>,
     done: Arc<AtomicBool>,
@@ -107,10 +125,10 @@ impl PtyView {
             .master
             .try_clone_reader()
             .map_err(|err| std::io::Error::other(format!("clone reader: {err}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|err| std::io::Error::other(format!("take writer: {err}")))?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer().map_err(|err| {
+                std::io::Error::other(format!("take writer: {err}"))
+            })?));
 
         let parser = Arc::new(Mutex::new(Parser::new(
             DEFAULT_ROWS,
@@ -122,6 +140,7 @@ impl PtyView {
 
         let reader_parser = Arc::clone(&parser);
         let reader_done = Arc::clone(&done);
+        let reader_writer = Arc::clone(&writer);
         let reader_handle = thread::Builder::new()
             .name("wisetree-pty-reader".into())
             .spawn(move || {
@@ -133,6 +152,15 @@ impl PtyView {
                         Ok(n) => {
                             if let Ok(mut parser) = reader_parser.lock() {
                                 parser.process(&buf[..n]);
+                            }
+                            // Answer terminal capability queries the way a real
+                            // terminal would. Codex refuses to paint its themed
+                            // blocks until it learns the background via OSC 11.
+                            if let Some(reply) = terminal_query_reply(&buf[..n]) {
+                                if let Ok(mut writer) = reader_writer.lock() {
+                                    let _ = writer.write_all(&reply);
+                                    let _ = writer.flush();
+                                }
                             }
                         }
                         Err(err) => {
@@ -207,8 +235,10 @@ impl PtyView {
     }
 
     pub fn send_input(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+        }
     }
 
     /// Forward a host mouse event to the child, encoded per the mouse
@@ -436,6 +466,30 @@ impl Drop for PtyView {
             }
         }
     }
+}
+
+/// Build the reply a real terminal would send for any capability query found
+/// in `chunk`, or `None` if there are none. We answer only the two queries an
+/// inline harness needs to theme itself — `OSC 10` (default foreground) and
+/// `OSC 11` (default background). We deliberately do **not** answer device
+/// attributes / cursor-position / kitty-keyboard probes: they're unnecessary
+/// for styling and a wrong answer risks changing input handling.
+///
+/// The query byte strings are tiny and codex emits them together in its opening
+/// burst, so a per-read scan (rather than a reassembling buffer) reliably
+/// catches them; a query split across two reads would simply go unanswered.
+fn terminal_query_reply(chunk: &[u8]) -> Option<Vec<u8>> {
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    let mut reply = Vec::new();
+    if contains(chunk, b"\x1b]10;?") {
+        reply.extend_from_slice(OSC10_FG_REPLY);
+    }
+    if contains(chunk, b"\x1b]11;?") {
+        reply.extend_from_slice(OSC11_BG_REPLY);
+    }
+    (!reply.is_empty()).then_some(reply)
 }
 
 /// Encode a mouse event as an xterm mouse report for the child terminal.
@@ -829,6 +883,61 @@ mod tests {
             }
         }
         s.trim_end().to_string()
+    }
+
+    #[test]
+    fn terminal_query_reply_answers_only_osc_10_and_11() {
+        // No query -> nothing to send.
+        assert!(terminal_query_reply(b"just some normal output\r\n").is_none());
+
+        // OSC 10 + OSC 11 back-to-back (codex's opening burst) -> both replies,
+        // foreground before background, each ST-terminated.
+        let reply =
+            terminal_query_reply(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?2004h").expect("reply");
+        assert_eq!(reply, [OSC10_FG_REPLY, OSC11_BG_REPLY].concat());
+
+        // Background query alone -> only the OSC 11 reply (the one that unlocks
+        // codex's themed blocks).
+        assert_eq!(
+            terminal_query_reply(b"\x1b]11;?\x07").as_deref(),
+            Some(OSC11_BG_REPLY)
+        );
+
+        // We must not answer device-attributes / cursor-position probes.
+        assert!(terminal_query_reply(b"\x1b[c\x1b[6n").is_none());
+    }
+
+    #[test]
+    fn spawned_child_gets_its_background_query_answered() {
+        // End-to-end: a child that emits the OSC 11 query must receive our
+        // reply on its stdin — the mechanism codex relies on to theme itself.
+        let Some(sh) = resolve_on_path("sh") else {
+            return;
+        };
+        // Emit the bg query, then echo whatever arrives on stdin so the test can
+        // observe the reply the reader thread wrote back.
+        let script = "printf '\\033]11;?\\033\\\\'; head -c 32";
+        let pty = PtyView::spawn(&sh, &["-c".to_string(), script.to_string()], None, &[])
+            .expect("spawn sh");
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let mut saw_reply = false;
+        while Instant::now() < deadline {
+            let text = {
+                let parser = pty.parser.lock().unwrap();
+                parser.screen().contents()
+            };
+            // The child echoes our reply; its distinctive payload is the rgb spec.
+            if text.contains("rgb:1e1e") {
+                saw_reply = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            saw_reply,
+            "the reader thread must answer the child's OSC 11 background query"
+        );
     }
 
     #[test]
