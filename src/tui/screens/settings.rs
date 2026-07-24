@@ -3219,6 +3219,10 @@ impl SettingsScreen {
                 self.ai_settings_step_down();
                 SettingsAction::Continue
             }
+            KeyCode::Tab => {
+                self.ai_settings_cycle_zone();
+                SettingsAction::Continue
+            }
             KeyCode::Left | KeyCode::Char('h') => {
                 if !self.ai_settings_move_field(false) {
                     self.ai_settings_cycle_chip(false);
@@ -3425,6 +3429,31 @@ impl SettingsScreen {
             AiSettingsSelection::Rect(_) => AiSettingsSelection::Save,
             AiSettingsSelection::FreeModels(_) => AiSettingsSelection::Save,
             AiSettingsSelection::Save => AiSettingsSelection::Save,
+        };
+    }
+
+    /// Tab cycles focus circularly between the three zones: the AI section
+    /// slots → the shared free-model chip row → the Save button → back to the
+    /// slots. Leaving a slot records it as `last_rect`, so the chip row keeps
+    /// targeting that section (its ✎﹏ marker persists) and returning from Save
+    /// lands the cursor back on it. The chip row is skipped when no free models
+    /// are cached.
+    fn ai_settings_cycle_zone(&mut self) {
+        let has_chips = self.free_models_list().is_some();
+        let Some(editor) = self.ai_settings_editor.as_mut() else {
+            return;
+        };
+        editor.selection = match editor.selection {
+            AiSettingsSelection::Rect(i) => {
+                editor.last_rect = i;
+                if has_chips {
+                    AiSettingsSelection::FreeModels(0)
+                } else {
+                    AiSettingsSelection::Save
+                }
+            }
+            AiSettingsSelection::FreeModels(_) => AiSettingsSelection::Save,
+            AiSettingsSelection::Save => AiSettingsSelection::Rect(editor.last_rect),
         };
     }
 
@@ -4653,11 +4682,11 @@ impl SettingsScreen {
 
         let on_chips = matches!(editor.selection, AiSettingsSelection::FreeModels(_));
         let hint = if on_chips {
-            "← → cycle chips • Enter stages • ↑↓ leave row • Esc back to Dashboard"
+            "← → cycle chips • Enter stages into ✎﹏ command • Tab next zone • Esc back to Dashboard"
         } else if is_scrollable {
-            "▲/▼ scroll • ← → choose field • Space change value • Enter pick model/Save • Esc back"
+            "▲/▼ scroll • ← → choose field • Space change value • Tab cycle zones • Enter pick model/Save • Esc back"
         } else {
-            "↑↓ move • ← → choose field • Space change value • Enter pick model/Save • Esc back"
+            "↑↓ move • ← → choose field • Space change value • Tab cycle zones • Enter pick model/Save • Esc back"
         };
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
     }
@@ -4677,6 +4706,11 @@ impl SettingsScreen {
         let model = slot.get(&editor.ai);
         let status = editor.statuses[idx];
         let is_selected = matches!(editor.selection, AiSettingsSelection::Rect(j) if j == idx);
+        // Keep the ✎﹏ marker on the section the chip row targets, so picking a
+        // free model there is clearly bound to this command.
+        let is_target = is_selected
+            || (matches!(editor.selection, AiSettingsSelection::FreeModels(_))
+                && editor.last_rect == idx);
         let border_color = match status {
             DashboardRectStatus::Unchanged => colors::WHITE,
             DashboardRectStatus::Editing => colors::WARNING,
@@ -4724,7 +4758,7 @@ impl SettingsScreen {
         };
         inner_line.style = content_style;
 
-        let title_line = if is_selected {
+        let title_line = if is_target {
             Line::from(vec![
                 Span::styled(
                     POST_CMD_SELECTION_MARKER,
@@ -6409,6 +6443,66 @@ mod tests {
             editor.selection,
             AiSettingsSelection::FreeModels(_)
         ));
+    }
+
+    #[test]
+    fn tab_cycles_slots_chips_save_circularly_keeping_target_section() {
+        let mut screen = ai_settings_screen(vec!["a/x".to_string(), "b/y".to_string()]);
+        focus_ai_slot(&mut screen, 2);
+        // Slot → chip row, keeping the focused section as the chip-row target.
+        let _ = screen.handle_ai_settings(key(KeyCode::Tab));
+        {
+            let editor = screen.ai_settings_editor.as_ref().unwrap();
+            assert!(matches!(
+                editor.selection,
+                AiSettingsSelection::FreeModels(_)
+            ));
+            assert_eq!(editor.last_rect, 2);
+        }
+        // Chip row → Save.
+        let _ = screen.handle_ai_settings(key(KeyCode::Tab));
+        assert_eq!(
+            screen.ai_settings_editor.as_ref().unwrap().selection,
+            AiSettingsSelection::Save
+        );
+        // Save → back to the originally focused slot (cursor maintained).
+        let _ = screen.handle_ai_settings(key(KeyCode::Tab));
+        assert_eq!(
+            screen.ai_settings_editor.as_ref().unwrap().selection,
+            AiSettingsSelection::Rect(2)
+        );
+    }
+
+    #[test]
+    fn tab_skips_chip_row_when_no_free_models() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 1);
+        // With no chips, Tab goes slot → Save directly.
+        let _ = screen.handle_ai_settings(key(KeyCode::Tab));
+        assert_eq!(
+            screen.ai_settings_editor.as_ref().unwrap().selection,
+            AiSettingsSelection::Save
+        );
+        // Save → back to the focused slot.
+        let _ = screen.handle_ai_settings(key(KeyCode::Tab));
+        assert_eq!(
+            screen.ai_settings_editor.as_ref().unwrap().selection,
+            AiSettingsSelection::Rect(1)
+        );
+    }
+
+    #[test]
+    fn tab_to_chip_row_then_enter_applies_to_focused_section() {
+        let mut screen = ai_settings_screen(vec!["free/one".to_string(), "free/two".to_string()]);
+        // Focus a non-last section, then Tab into the chip row.
+        focus_ai_slot(&mut screen, 3);
+        let _ = screen.handle_ai_settings(key(KeyCode::Tab));
+        // Pick the second chip and stage it.
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Enter));
+        // The model landed on the section we tabbed away from, not the last one.
+        let editor = screen.ai_settings_editor.as_ref().unwrap();
+        assert_eq!(AiSettingsEditor::slot(3).get(&editor.ai).model, "free/two");
     }
 
     #[test]
