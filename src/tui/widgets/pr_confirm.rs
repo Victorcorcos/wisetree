@@ -394,20 +394,28 @@ impl<'a> PrConfirmView<'a> {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let rows: Vec<Row> = self
+        let thinkings: Vec<String> = self
             .ai_roles
             .iter()
             .map(|role| {
-                let thinking = if role.thinking.trim().is_empty() {
+                if role.thinking.trim().is_empty() {
                     "default".to_string()
                 } else {
                     role.thinking.clone()
-                };
+                }
+            })
+            .collect();
+
+        let rows: Vec<Row> = self
+            .ai_roles
+            .iter()
+            .zip(thinkings.iter())
+            .map(|(role, thinking)| {
                 Row::new(vec![
                     TableCell::from(role.role.clone()).style(Style::default().fg(role.role_color)),
                     TableCell::from(role.model.clone())
                         .style(Style::default().fg(colors::GRAY_LIGHT)),
-                    TableCell::from(thinking).style(Style::default().fg(colors::EMPHASIS)),
+                    TableCell::from(thinking.clone()).style(Style::default().fg(colors::EMPHASIS)),
                     TableCell::from(role.harness.clone()).style(Style::default().fg(colors::INFO)),
                     TableCell::from(role.permission.clone())
                         .style(Style::default().fg(colors::EMPHASIS)),
@@ -415,11 +423,60 @@ impl<'a> PrConfirmView<'a> {
             })
             .collect();
 
-        let table_width = area.width;
+        // Size each column to its widest cell (header included) instead of
+        // letting Model expand to fill the panel — that's what stranded
+        // Thinking/Harness/Permission on the far right of a wide screen.
+        let col_width = |header: &str, values: &[String]| -> u16 {
+            values
+                .iter()
+                .map(|v| v.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(header.chars().count()) as u16
+        };
+        let role_w = col_width(
+            "Role",
+            &self
+                .ai_roles
+                .iter()
+                .map(|r| r.role.clone())
+                .collect::<Vec<_>>(),
+        );
+        let model_w = col_width(
+            "Model",
+            &self
+                .ai_roles
+                .iter()
+                .map(|r| r.model.clone())
+                .collect::<Vec<_>>(),
+        );
+        let thinking_w = col_width("Thinking", &thinkings);
+        let harness_w = col_width(
+            "Harness",
+            &self
+                .ai_roles
+                .iter()
+                .map(|r| r.harness.clone())
+                .collect::<Vec<_>>(),
+        );
+        let permission_w = col_width(
+            "Permission",
+            &self
+                .ai_roles
+                .iter()
+                .map(|r| r.permission.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        const COLUMN_SPACING: u16 = 2;
+        let content_width =
+            role_w + model_w + thinking_w + harness_w + permission_w + COLUMN_SPACING * 4;
+        let table_width = content_width.min(area.width);
+        let left_pad = area.width.saturating_sub(table_width) / 2;
         let table_area = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(area.width.saturating_sub(table_width) / 2),
+                Constraint::Length(left_pad),
                 Constraint::Length(table_width),
                 Constraint::Min(0),
             ])
@@ -428,15 +485,15 @@ impl<'a> PrConfirmView<'a> {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(10),
-                Constraint::Min(8),
-                Constraint::Length(9),
-                Constraint::Length(12),
-                Constraint::Length(11),
+                Constraint::Length(role_w),
+                Constraint::Length(model_w),
+                Constraint::Length(thinking_w),
+                Constraint::Length(harness_w),
+                Constraint::Length(permission_w),
             ],
         )
         .header(header)
-        .column_spacing(2);
+        .column_spacing(COLUMN_SPACING);
         frame.render_widget(table, table_area);
     }
 }
