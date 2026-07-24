@@ -54,11 +54,6 @@ use crate::tui::widgets::{
     Status, StatusIndicator, SummaryRow,
 };
 
-/// CSI sequences forwarded to opencode for page scrolling while it owns the
-/// alternate screen (its scrollback is unreachable from vt100).
-const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
-const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BugkillStep {
     Confirm,
@@ -650,12 +645,12 @@ impl BugkillPullRequestScreen {
 
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
         match self.step {
-            // Both live steps embed the opencode TUI on its alternate
-            // screen, whose scrollback is unreachable from vt100 — forward
-            // page keys to the child instead.
+            // Both live steps embed an AI TUI. Alt-screen children (opencode)
+            // own their scroll region, so `wheel_up` sends them a page key;
+            // inline children (codex, claude) scroll the vt100 buffer instead.
             BugkillStep::Fixing | BugkillStep::Investigating => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_UP);
+                    pty.wheel_up(lines);
                 }
                 true
             }
@@ -671,7 +666,7 @@ impl BugkillPullRequestScreen {
         match self.step {
             BugkillStep::Fixing | BugkillStep::Investigating => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_DOWN);
+                    pty.wheel_down(lines);
                 }
                 true
             }

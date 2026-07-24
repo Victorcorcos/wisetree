@@ -45,11 +45,6 @@ use crate::tui::widgets::{
     PtyView, Status, StatusIndicator, SummaryRow,
 };
 
-/// CSI sequences forwarded to opencode for page scrolling while it owns the
-/// alternate screen (its scrollback is unreachable from vt100).
-const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
-const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixStep {
     Confirm,
@@ -538,7 +533,7 @@ impl FixPullRequestScreen {
         match self.step {
             FixStep::Applying => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_UP);
+                    pty.wheel_up(lines);
                 }
                 true
             }
@@ -554,7 +549,7 @@ impl FixPullRequestScreen {
         match self.step {
             FixStep::Applying => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_DOWN);
+                    pty.wheel_down(lines);
                 }
                 true
             }

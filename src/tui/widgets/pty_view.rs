@@ -38,6 +38,10 @@ const DEFAULT_COLS: u16 = 160;
 /// output); 5000 rows gives the user plenty of history to scroll back
 /// through without ballooning memory.
 const SCROLLBACK_ROWS: usize = 5000;
+/// `PageUp` / `PageDown` key reports, sent to alt-screen children that own
+/// their own scroll region (see [`PtyView::wheel_up`]).
+const PAGE_UP: &[u8] = b"\x1b[5~";
+const PAGE_DOWN: &[u8] = b"\x1b[6~";
 
 pub struct PtyView {
     parser: Arc<Mutex<Parser>>,
@@ -254,6 +258,41 @@ impl PtyView {
         // this mode doesn't report (e.g. a bare move under button-motion mode),
         // the host must not also act on it.
         true
+    }
+
+    /// Whether the child has enabled any mouse-tracking mode. Alt-screen
+    /// TUIs (opencode) turn tracking on and own the wheel — the host forwards
+    /// wheel events to them as SGR reports. Inline-rendering harnesses (codex,
+    /// claude) never enable tracking and instead scroll through the terminal's
+    /// scrollback, so the host must drive the vt100 buffer itself.
+    pub fn tracks_mouse(&self) -> bool {
+        self.parser
+            .lock()
+            .map(|p| p.screen().mouse_protocol_mode() != MouseProtocolMode::None)
+            .unwrap_or(false)
+    }
+
+    /// One wheel tick / scroll key toward older output. Alt-screen TUIs that
+    /// track the mouse (opencode) manage their own scroll region, so we send
+    /// them a `PageUp` key; inline harnesses (codex, claude) never enter the
+    /// alt screen and scroll by moving through the vt100 scrollback buffer.
+    pub fn wheel_up(&mut self, lines: u16) {
+        if self.tracks_mouse() {
+            self.send_input(PAGE_UP);
+        } else {
+            self.scroll_up(lines);
+        }
+    }
+
+    /// One wheel tick / scroll key toward the live tail. See [`wheel_up`].
+    ///
+    /// [`wheel_up`]: Self::wheel_up
+    pub fn wheel_down(&mut self, lines: u16) {
+        if self.tracks_mouse() {
+            self.send_input(PAGE_DOWN);
+        } else {
+            self.scroll_down(lines);
+        }
     }
 
     /// Total scrollback rows currently retained by the vt100 parser.
@@ -745,5 +784,68 @@ mod tests {
         // scrollback_len matches what vt100 actually retains; for a
         // single-line echo this is 0, but the accessor must still work.
         let _ = pty.scrollback_len();
+    }
+
+    #[test]
+    fn wheel_scrolls_the_vt100_buffer_for_an_inline_child() {
+        // codex and claude render inline and never enable mouse tracking, so a
+        // wheel tick must move the vt100 scrollback — sending them a page key
+        // (as we do for alt-screen children) would do nothing.
+        let Some(sh) = resolve_on_path("sh") else {
+            return; // no POSIX shell — skip rather than fail on odd hosts.
+        };
+        let mut pty = PtyView::spawn(
+            &sh,
+            &["-c".to_string(), "seq 1 200; sleep 2".to_string()],
+            None,
+            &[],
+        )
+        .expect("spawn sh");
+
+        // Wait for enough output to build scrollback (200 lines > the grid).
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline && pty.scrollback_len() == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pty.scrollback_len() > 0, "child produced no scrollback");
+        assert!(!pty.tracks_mouse());
+
+        assert_eq!(pty.scrollback_offset(), 0);
+        pty.wheel_up(5);
+        assert_eq!(pty.scrollback_offset(), 5, "inline child must scroll vt100");
+        pty.wheel_down(3);
+        assert_eq!(pty.scrollback_offset(), 2);
+    }
+
+    #[test]
+    fn wheel_leaves_the_vt100_buffer_alone_for_a_tracking_child() {
+        // An alt-screen child (opencode) owns its own scroll region, so
+        // wheel_up sends it a page key and must not move the host's buffer.
+        let Some(sh) = resolve_on_path("sh") else {
+            return;
+        };
+        let mut pty = PtyView::spawn(
+            &sh,
+            &[
+                "-c".to_string(),
+                "seq 1 200; printf '\\033[?1003h\\033[?1006h'; sleep 2".to_string(),
+            ],
+            None,
+            &[],
+        )
+        .expect("spawn sh");
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline && !pty.tracks_mouse() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pty.tracks_mouse(), "child never enabled tracking");
+
+        pty.wheel_up(5);
+        assert_eq!(
+            pty.scrollback_offset(),
+            0,
+            "a tracking child owns its scroll; the host buffer must not move"
+        );
     }
 }

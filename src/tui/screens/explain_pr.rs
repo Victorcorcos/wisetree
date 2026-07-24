@@ -54,11 +54,6 @@ const EXPLAIN_PREPARING_MESSAGE: &str = "Gathering diff and preparing prompt..."
 /// view is the PTY embed). Matches the Update PR screen.
 const AI_LOG_MAX_LINES: usize = 1024;
 
-/// CSI sequences forwarded to opencode for page scrolling while it owns the
-/// alternate screen (its own scrollback is unreachable from vt100).
-const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
-const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExplainStep {
     Loading,
@@ -445,7 +440,7 @@ impl ExplainPullRequestScreen {
             return false;
         }
         if let Some(pty) = self.pty.as_mut() {
-            pty.send_input(PTY_PAGE_UP);
+            pty.wheel_up(lines);
         } else {
             self.ai_scroll = self.ai_scroll.saturating_add(lines);
         }
@@ -461,7 +456,7 @@ impl ExplainPullRequestScreen {
             return false;
         }
         if let Some(pty) = self.pty.as_mut() {
-            pty.send_input(PTY_PAGE_DOWN);
+            pty.wheel_down(lines);
         } else {
             self.ai_scroll = self.ai_scroll.saturating_sub(lines);
         }

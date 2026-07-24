@@ -678,7 +678,7 @@ impl DevelopPullRequestScreen {
         match self.step {
             DevelopStep::Planning | DevelopStep::Implementing => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_UP);
+                    pty.wheel_up(lines);
                 }
                 true
             }
@@ -698,7 +698,7 @@ impl DevelopPullRequestScreen {
         match self.step {
             DevelopStep::Planning | DevelopStep::Implementing => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_DOWN);
+                    pty.wheel_down(lines);
                 }
                 true
             }

@@ -51,13 +51,6 @@ const UPDATE_PUSH_FAILED_MESSAGE: &str =
 /// activity panel, so anything older is pure memory pressure.
 const AI_LOG_MAX_LINES: usize = 1024;
 
-/// CSI sequences for PageUp / PageDown forwarded to the embedded opencode
-/// process. Mouse wheel + arrow keys both synthesize these so the user
-/// scrolls opencode's own message buffer (vt100's alt-screen scrollback
-/// is unusable while opencode owns the alternate grid).
-const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
-const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateStep {
     Loading,
@@ -725,17 +718,12 @@ impl UpdatePullRequestScreen {
         if !scrollable {
             return false;
         }
-        // The commit+push shell and the terminal-recovery shell both run on
-        // the main vt100 screen (not alt-screen), so scroll the vt100 buffer
-        // directly. The opencode PTY uses alt-screen, so we forward PageUp as
-        // a keystroke and opencode handles its own scroll.
-        let use_direct_scroll = self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
+        // `wheel_up` scrolls the vt100 buffer directly for main-screen children
+        // (the commit+push shell, the terminal-recovery shell, and the inline
+        // codex/claude harnesses) and forwards a page key only to alt-screen
+        // children that own their scroll region (opencode).
         if let Some(pty) = self.pty.as_mut() {
-            if use_direct_scroll {
-                pty.scroll_up(lines);
-            } else {
-                pty.send_input(PTY_PAGE_UP);
-            }
+            pty.wheel_up(lines);
         } else if matches!(self.step, UpdateStep::Updating) {
             self.ai_scroll = self.ai_scroll.saturating_add(lines);
         }
@@ -751,13 +739,8 @@ impl UpdatePullRequestScreen {
         if !scrollable {
             return false;
         }
-        let use_direct_scroll = self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
         if let Some(pty) = self.pty.as_mut() {
-            if use_direct_scroll {
-                pty.scroll_down(lines);
-            } else {
-                pty.send_input(PTY_PAGE_DOWN);
-            }
+            pty.wheel_down(lines);
         } else if matches!(self.step, UpdateStep::Updating) {
             self.ai_scroll = self.ai_scroll.saturating_sub(lines);
         }
