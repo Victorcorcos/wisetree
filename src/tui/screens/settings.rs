@@ -116,6 +116,8 @@ pub enum SettingsAction {
     CopySettings(CopyDirection),
     /// Navigate to the SetupProject screen to bootstrap a project config.
     OpenSetupProject,
+    /// Show an informational toast (e.g. explaining why a harness is locked).
+    ShowToast(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1255,10 +1257,6 @@ impl AiSlot {
         }
     }
 
-    fn supports_harness(self, harness: AiHarness) -> bool {
-        matches!(self, Self::DevelopPlan | Self::DevelopImplement) || harness == AiHarness::OpenCode
-    }
-
     fn get(self, ai: &AiConfig) -> &AiModelConfig {
         match self {
             AiSlot::Explain => &ai.explain,
@@ -1926,10 +1924,7 @@ impl SettingsScreen {
         let (harness, thinking) = match self.ai_settings_editor.as_ref() {
             Some(editor) => {
                 let current = editor.focused_model();
-                let slot = AiSettingsEditor::slot(editor.target_idx());
-                let harness = if slot.supports_harness(current.harness)
-                    && AiHarness::accepted_for_model(&model).contains(&current.harness)
-                {
+                let harness = if AiHarness::accepted_for_model(&model).contains(&current.harness) {
                     current.harness
                 } else {
                     AiHarness::OpenCode
@@ -3254,7 +3249,9 @@ impl SettingsScreen {
                         self.ai_settings_cycle_thinking();
                     }
                     AiSettingsSelection::Rect(_) if editor.field == AiSettingsField::Harness => {
-                        self.ai_settings_cycle_harness();
+                        if let Some(toast) = self.ai_settings_cycle_harness() {
+                            return toast;
+                        }
                     }
                     _ => {}
                 }
@@ -3508,13 +3505,16 @@ impl SettingsScreen {
         }
     }
 
-    fn ai_settings_cycle_harness(&mut self) {
+    /// Cycles the focused slot's harness to the next value its model's
+    /// provider supports (`openai/*` → opencode/codex, `anthropic/*` →
+    /// opencode/claude-code, anything else → opencode only). Returns a toast
+    /// action when the provider doesn't support any alternative, so the
+    /// no-op is explained instead of silently doing nothing.
+    fn ai_settings_cycle_harness(&mut self) -> Option<SettingsAction> {
         let (idx, model, harness, thinking) = {
-            let Some(editor) = self.ai_settings_editor.as_ref() else {
-                return;
-            };
+            let editor = self.ai_settings_editor.as_ref()?;
             let AiSettingsSelection::Rect(idx) = editor.selection else {
-                return;
+                return None;
             };
             let current = AiSettingsEditor::slot(idx).get(&editor.ai);
             (
@@ -3524,11 +3524,14 @@ impl SettingsScreen {
                 current.thinking.clone(),
             )
         };
-        let accepted = AiHarness::accepted_for_model(&model)
-            .iter()
-            .copied()
-            .filter(|candidate| AiSettingsEditor::slot(idx).supports_harness(*candidate))
-            .collect::<Vec<_>>();
+        let accepted = AiHarness::accepted_for_model(&model);
+        if accepted.len() <= 1 {
+            return Some(SettingsAction::ShowToast(
+                "Codex needs an openai/* model and Claude Code needs an anthropic/* model — \
+                 staying on opencode."
+                    .to_string(),
+            ));
+        }
         let next = accepted
             .iter()
             .position(|candidate| *candidate == harness)
@@ -3540,15 +3543,14 @@ impl SettingsScreen {
         } else {
             Default::default()
         };
-        let Some(editor) = self.ai_settings_editor.as_mut() else {
-            return;
-        };
+        let editor = self.ai_settings_editor.as_mut()?;
         let target = AiSettingsEditor::slot(idx).get_mut(&mut editor.ai);
         if target.harness != next || target.thinking != thinking {
             target.harness = next;
             target.thinking = thinking;
             editor.statuses[idx] = DashboardRectStatus::Modified;
         }
+        None
     }
 
     /// Stage the chip-row cursor's pair into the targeted slot without saving —
@@ -6248,13 +6250,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_develop_slots_enable_codex_and_claude() {
-        for slot in AiSlot::ALL {
-            let expected = matches!(slot, AiSlot::DevelopPlan | AiSlot::DevelopImplement);
-            assert_eq!(slot.supports_harness(AiHarness::Codex), expected);
-            assert_eq!(slot.supports_harness(AiHarness::ClaudeCode), expected);
-            assert!(slot.supports_harness(AiHarness::OpenCode));
-        }
+    fn harness_availability_is_provider_based_not_slot_based() {
+        assert!(AiHarness::accepted_for_model("openai/gpt-5.6-sol").contains(&AiHarness::Codex));
+        assert!(AiHarness::accepted_for_model("anthropic/claude-sonnet-4-5")
+            .contains(&AiHarness::ClaudeCode));
+        assert_eq!(
+            AiHarness::accepted_for_model("mistral/large"),
+            &[AiHarness::OpenCode]
+        );
     }
     use crate::config::schema::{AiStatusConfig, WorktreeConfig};
     use ratatui::backend::TestBackend;

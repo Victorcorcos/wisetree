@@ -1979,6 +1979,9 @@ impl App {
                     SettingsAction::OpenSetupProject => {
                         self.enter_screen(Screen::SetupProject, tx);
                     }
+                    SettingsAction::ShowToast(message) => {
+                        self.show_toast(ToastVariant::Info, message);
+                    }
                 }
             }
             Screen::Setup => {
@@ -6161,6 +6164,9 @@ impl App {
             }
             SettingsAction::OpenSetupProject => {
                 self.enter_screen(Screen::SetupProject, tx);
+            }
+            SettingsAction::ShowToast(message) => {
+                self.show_toast(ToastVariant::Info, message);
             }
         }
     }
