@@ -4878,22 +4878,12 @@ impl SettingsScreen {
             // show a compact "configured / total" summary rather than a single
             // model value (per-command models live on the sub-screen).
             let leaves = ai_slot_models(&editor.ai);
-            let configured_models: Vec<&str> = leaves
-                .iter()
-                .map(|m| m.model.trim())
-                .filter(|m| !m.is_empty())
-                .collect();
-            let configured = configured_models.len();
-            let summary = if configured_models.is_empty() {
-                format!("{configured}/{} AI commands configured", leaves.len())
-            } else {
-                format!(
-                    "{configured}/{} AI commands configured: {}",
-                    leaves.len(),
-                    configured_models.join(", ")
-                )
-            };
-            Line::from(Span::styled(summary, Style::default().fg(colors::MUTED)))
+            let configured = leaves.iter().filter(|m| !m.model.trim().is_empty()).count();
+            let summary = format!(
+                "{configured}/{} AI commands have a model assigned — press Enter to edit",
+                leaves.len()
+            );
+            Line::from(Span::raw(summary))
         } else if value.is_empty() {
             let placeholder = Style::default()
                 .fg(colors::MUTED)
