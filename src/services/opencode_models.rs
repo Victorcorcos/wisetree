@@ -120,6 +120,16 @@ fn flatten_providers(
     out
 }
 
+/// How many times to re-run `opencode models opencode` when it fails with a
+/// transient SQLite "database is locked" error, and how long to wait between
+/// attempts. opencode keeps a large WAL-mode `opencode.db`; when another
+/// opencode process (an embedded session, or our own concurrent `models
+/// --verbose` fetch) holds the write lock, the bare list call loses the race.
+/// The lock clears in milliseconds, so a few short-backoff retries recover it
+/// without the picker permanently disabling itself on a retryable error.
+const OPENCODE_LOCK_RETRIES: usize = 4;
+const OPENCODE_LOCK_BACKOFF: Duration = Duration::from_millis(200);
+
 /// Ask the locally installed `opencode` binary for the models its
 /// `opencode/*` provider can actually serve right now. This is more
 /// authoritative than `models.dev/api.json` for the free-model picker:
@@ -127,7 +137,27 @@ fn flatten_providers(
 /// only forwards the small subset its servers currently route — calling
 /// any other "free" model fails with `Model not found: ...`. Each line
 /// of stdout is one `provider/model` pair.
+///
+/// Retries on a transient "database is locked" error (see
+/// [`OPENCODE_LOCK_RETRIES`]); any other failure is returned immediately.
 pub async fn fetch_free_opencode_models(binary: &Path) -> Result<Vec<String>, String> {
+    let mut last_err = String::new();
+    for attempt in 0..=OPENCODE_LOCK_RETRIES {
+        match fetch_free_opencode_models_once(binary).await {
+            Ok(models) => return Ok(models),
+            Err(err) if is_db_lock_error(&err) && attempt < OPENCODE_LOCK_RETRIES => {
+                last_err = err;
+                tokio::time::sleep(OPENCODE_LOCK_BACKOFF).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err)
+}
+
+/// One `opencode models opencode` invocation. Split out so the retry loop in
+/// [`fetch_free_opencode_models`] stays legible.
+async fn fetch_free_opencode_models_once(binary: &Path) -> Result<Vec<String>, String> {
     let mut cmd = Command::new(binary);
     cmd.arg("models")
         .arg("opencode")
@@ -143,6 +173,14 @@ pub async fn fetch_free_opencode_models(binary: &Path) -> Result<Vec<String>, St
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(parse_opencode_models_output(&stdout))
+}
+
+/// `true` when a sanitized CLI error is opencode's transient SQLite
+/// write-contention failure ("database is locked"), which clears on its own
+/// and is worth retrying. Case-insensitive so a capitalization change upstream
+/// doesn't silently defeat the retry.
+fn is_db_lock_error(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("database is locked")
 }
 
 /// Flatten a CLI's stderr into a single clean line for the one-line chip-row
@@ -514,6 +552,20 @@ prov/good
             sanitize_cli_error("   \n\t "),
             "opencode models exited non-zero"
         );
+    }
+
+    #[test]
+    fn is_db_lock_error_matches_sanitized_lock_message() {
+        // The retry loop keys off the sanitized (folded, single-line) form.
+        assert!(is_db_lock_error(&sanitize_cli_error(
+            "Unexpected error\ndatabase is locked"
+        )));
+        assert!(is_db_lock_error("SqliteError: database is locked"));
+        // Case-insensitive so an upstream capitalization tweak still retries.
+        assert!(is_db_lock_error("Database Is Locked"));
+        // Unrelated failures must not trigger a retry.
+        assert!(!is_db_lock_error("Model not found: opencode/foo"));
+        assert!(!is_db_lock_error("spawn opencode: No such file or directory"));
     }
 
     #[test]
