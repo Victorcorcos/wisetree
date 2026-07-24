@@ -864,14 +864,12 @@ mod tests {
     #[test]
     fn send_mouse_never_forwards_raw_wheel_to_an_inline_harness() {
         // Reproduces the codex bug: an inline harness (renders_inline = true)
-        // that enables a mouse mode — codex does this, and even flips into a
-        // transient alt-screen pager while paging through history — must NOT
-        // receive a raw SGR wheel report. Codex doesn't decode wheel reports,
-        // so they were echoed back as literal `[<64;...M` text and the leading
-        // ESC read as an interrupt keystroke. `send_mouse` must decline the
-        // wheel (false) so the caller's wheel_up/wheel_down fallback runs — and
-        // it must do so purely from the harness flag, regardless of the child's
-        // live mouse/alt-screen state.
+        // that enters an alternate screen and enables mouse tracking must NOT
+        // receive a raw SGR wheel report. Codex doesn't decode those reports,
+        // so a forwarded one can be echoed as literal `[<64;...M` text and its
+        // leading ESC read as an interrupt keystroke. `send_mouse` must decline
+        // the wheel (false) so the caller's wheel_up/wheel_down fallback runs —
+        // purely from the harness flag, regardless of the child's live modes.
         let Some(sh) = resolve_on_path("sh") else {
             return;
         };
@@ -879,7 +877,7 @@ mod tests {
             &sh,
             &[
                 "-c".to_string(),
-                "printf '\\033[?1000h'; sleep 2".to_string(),
+                "printf '\\033[?1049h\\033[?1000h\\033[?1006h'; sleep 2".to_string(),
             ],
             None,
             &[],
@@ -904,6 +902,13 @@ mod tests {
         }
         assert!(enabled, "child never enabled mouse tracking");
         assert!(
+            pty.parser
+                .lock()
+                .map(|p| p.screen().alternate_screen())
+                .unwrap_or(false),
+            "regression child must exercise the alternate-screen state"
+        );
+        assert!(
             !pty.send_mouse(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE),
             "wheel events must not be forwarded raw to an inline harness"
         );
@@ -911,7 +916,7 @@ mod tests {
             !pty.send_mouse(MouseEventKind::ScrollDown, 0, 0, KeyModifiers::NONE),
             "wheel events must not be forwarded raw to an inline harness"
         );
-        // A non-wheel event (a click) must still forward — codex uses those.
+        // A non-wheel event must still forward to a tracking inline child.
         assert!(
             pty.send_mouse(
                 MouseEventKind::Down(MouseButton::Left),

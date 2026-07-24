@@ -136,7 +136,19 @@ impl AiRunner {
                 args
             }
             (AiHarness::Codex, AiRunMode::Interactive) => {
-                let mut args = vec!["--model".into(), model, request.prompt.clone()];
+                // Wisetree embeds Codex inside its own terminal emulator and
+                // owns the transcript scrollback. Codex defaults to its
+                // alternate screen (`tui.alternate_screen = "auto"`), whose
+                // alternate-scroll mode changes how wheel input is delivered.
+                // Force the supported inline mode so wheel events always move
+                // Wisetree's vt100 scrollback and can never reach Codex as raw
+                // SGR mouse reports (whose leading ESC interrupts the turn).
+                let mut args = vec![
+                    "--no-alt-screen".into(),
+                    "--model".into(),
+                    model,
+                    request.prompt.clone(),
+                ];
                 if request.permission == AiPermission::Plan {
                     args.extend(["--sandbox".into(), "read-only".into()]);
                 } else {
@@ -641,6 +653,25 @@ mod tests {
             .args
             .windows(2)
             .any(|args| args == ["--ask-for-approval", "never"]));
+    }
+
+    #[test]
+    fn interactive_codex_forces_inline_mode_for_embedded_scrollback() {
+        let runner = AiRunner::default().with_binary(AiHarness::Codex, PathBuf::from("true"));
+
+        let interactive = request(AiHarness::Codex, AiRunMode::Interactive);
+        let command = runner.command(&interactive).unwrap();
+        assert!(
+            command.args.iter().any(|arg| arg == "--no-alt-screen"),
+            "embedded Codex must stay inline so Wisetree owns wheel scrolling"
+        );
+
+        let captured = request(AiHarness::Codex, AiRunMode::Captured);
+        let command = runner.command(&captured).unwrap();
+        assert!(
+            !command.args.iter().any(|arg| arg == "--no-alt-screen"),
+            "codex exec has no TUI and must not receive TUI-only flags"
+        );
     }
 
     #[test]

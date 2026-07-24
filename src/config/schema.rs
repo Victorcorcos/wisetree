@@ -150,10 +150,11 @@ impl AiHarness {
 
     /// Whether the harness renders its transcript *inline* (like a normal
     /// terminal program) rather than driving a full-screen, mouse-tracking
-    /// TUI. Codex and Claude Code paint inline and commit history to the
-    /// terminal's scrollback, so wisetree owns scrolling for them (via the
-    /// vt100 buffer) and must never forward raw wheel reports — those get
-    /// echoed back as literal text and the leading ESC reads as an interrupt.
+    /// TUI. Wisetree launches Codex with `--no-alt-screen`, while Claude Code
+    /// paints inline itself; both commit history to the terminal's scrollback,
+    /// so wisetree owns scrolling for them (via the vt100 buffer) and must
+    /// never forward raw wheel reports — those get echoed back as literal text
+    /// and the leading ESC reads as an interrupt.
     /// OpenCode drives an alt-screen TUI (opentui) that manages its own scroll
     /// region and expects the wheel reports, so it is *not* inline.
     ///
