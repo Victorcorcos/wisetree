@@ -976,11 +976,11 @@ pub enum DashboardField {
 
 impl DashboardField {
     pub const ALL: [DashboardField; 5] = [
+        DashboardField::Ai,
         DashboardField::RefreshIntervalMs,
         DashboardField::ShowPullRequests,
         DashboardField::WiseMerge,
         DashboardField::Columns,
-        DashboardField::Ai,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1055,14 +1055,14 @@ pub struct DashboardEditor {
 impl DashboardEditor {
     pub fn new(config: &DashboardConfig) -> Self {
         let values = vec![
-            config.refresh_interval_ms.to_string(),
-            config.show_pull_requests.to_string(),
-            config.wise_merge.to_string(),
-            config.columns.join(", "),
             // The `ai` rectangle no longer holds a single model — it opens the
             // AI Settings sub-screen — so its value slot stays empty and the
             // renderer shows a per-command summary derived from `ai` instead.
             String::new(),
+            config.refresh_interval_ms.to_string(),
+            config.show_pull_requests.to_string(),
+            config.wise_merge.to_string(),
+            config.columns.join(", "),
         ];
         let statuses = vec![DashboardRectStatus::Saved; values.len()];
         Self {
@@ -1093,23 +1093,23 @@ impl DashboardEditor {
             clamp_dashboard_refresh_interval, default_refresh_ms, normalize_dashboard_columns,
         };
 
-        let refresh_interval_ms = self.values[0]
+        let refresh_interval_ms = self.values[1]
             .trim()
             .parse::<u64>()
             .map(clamp_dashboard_refresh_interval)
             .unwrap_or_else(|_| default_refresh_ms());
 
         let show_pull_requests = matches!(
-            self.values[1].trim().to_ascii_lowercase().as_str(),
-            "true" | "yes" | "1" | "on"
-        );
-
-        let wise_merge = matches!(
             self.values[2].trim().to_ascii_lowercase().as_str(),
             "true" | "yes" | "1" | "on"
         );
 
-        let raw_columns: Vec<String> = self.values[3]
+        let wise_merge = matches!(
+            self.values[3].trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "on"
+        );
+
+        let raw_columns: Vec<String> = self.values[4]
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -6259,6 +6259,12 @@ mod tests {
             &[AiHarness::OpenCode]
         );
     }
+
+    #[test]
+    fn dashboard_fields_start_with_ai() {
+        assert_eq!(DashboardField::ALL[0], DashboardField::Ai);
+    }
+
     use crate::config::schema::{AiStatusConfig, WorktreeConfig};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
