@@ -4702,7 +4702,7 @@ impl SettingsScreen {
             Line::from(vec![
                 Span::styled(
                     model.model.clone(),
-                    focused_ai_field_style(focus == AiSettingsField::Model),
+                    focused_ai_field_style(is_selected && focus == AiSettingsField::Model),
                 ),
                 Span::styled("  ·  ", Style::default().fg(colors::MUTED)),
                 Span::styled(
@@ -4711,12 +4711,12 @@ impl SettingsScreen {
                         &model.thinking,
                     )
                     .to_string(),
-                    focused_ai_field_style(focus == AiSettingsField::Thinking),
+                    focused_ai_field_style(is_selected && focus == AiSettingsField::Thinking),
                 ),
                 Span::styled("  ·  ", Style::default().fg(colors::MUTED)),
                 Span::styled(
                     ai_harness_label(model.harness),
-                    focused_ai_field_style(focus == AiSettingsField::Harness),
+                    focused_ai_field_style(is_selected && focus == AiSettingsField::Harness),
                 ),
             ])
         };
