@@ -565,7 +565,9 @@ prov/good
         assert!(is_db_lock_error("Database Is Locked"));
         // Unrelated failures must not trigger a retry.
         assert!(!is_db_lock_error("Model not found: opencode/foo"));
-        assert!(!is_db_lock_error("spawn opencode: No such file or directory"));
+        assert!(!is_db_lock_error(
+            "spawn opencode: No such file or directory"
+        ));
     }
 
     #[test]
