@@ -252,7 +252,12 @@ impl PtyView {
     /// running its own text-selection / scrollback handling. Returns `false`
     /// when the child has no mouse mode active, so the host keeps its native
     /// wheel + selection behavior (e.g. a plain recovery shell that never
-    /// enabled mouse reporting).
+    /// enabled mouse reporting). Also returns `false` for wheel events aimed
+    /// at a non-alt-screen child (codex, claude) even if it happens to have a
+    /// mouse mode active, since those harnesses scroll through committed
+    /// history rather than a mouse-driven scroll region and don't understand
+    /// wheel reports — the caller's `wheel_up`/`wheel_down` fallback handles
+    /// scrolling for them instead.
     pub fn send_mouse(
         &mut self,
         kind: MouseEventKind,
@@ -260,17 +265,37 @@ impl PtyView {
         abs_row: u16,
         modifiers: KeyModifiers,
     ) -> bool {
-        let (mode, encoding) = match self.parser.lock() {
+        let (mode, encoding, alternate_screen) = match self.parser.lock() {
             Ok(parser) => {
                 let screen = parser.screen();
                 (
                     screen.mouse_protocol_mode(),
                     screen.mouse_protocol_encoding(),
+                    screen.alternate_screen(),
                 )
             }
             Err(_) => return false,
         };
         if mode == MouseProtocolMode::None {
+            return false;
+        }
+        // Inline harnesses (codex, claude) render without an alt screen and
+        // scroll through committed history rather than a mouse-driven scroll
+        // region. Some of them still enable a mouse-tracking mode (e.g. to
+        // support click-to-position in their composer) without understanding
+        // wheel reports — forwarding one raw gets echoed back as literal text
+        // and can even read as an interrupt keystroke. Let the caller's
+        // PageUp/PageDown-or-local-scrollback fallback (`wheel_up`/
+        // `wheel_down`) handle wheel events for these instead.
+        if !alternate_screen
+            && matches!(
+                kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+        {
             return false;
         }
         let area = self.last_area.get();
@@ -817,6 +842,61 @@ mod tests {
                 KeyModifiers::NONE
             ),
             "a tracking child must consume the mouse event"
+        );
+    }
+
+    #[test]
+    fn send_mouse_never_forwards_raw_wheel_to_a_non_alt_screen_tracker() {
+        // Reproduces the codex bug: an inline (non-alt-screen) harness that
+        // enables a mouse mode (e.g. for click-to-position in its composer)
+        // must NOT receive a raw SGR wheel report — codex doesn't decode
+        // those, so they were echoed back as literal `[<64;...M` text and
+        // even read as an interrupt keystroke. `send_mouse` must decline the
+        // event (false) so the caller's wheel_up/wheel_down fallback runs.
+        let Some(sh) = resolve_on_path("sh") else {
+            return;
+        };
+        let mut pty = PtyView::spawn(
+            &sh,
+            &[
+                "-c".to_string(),
+                "printf '\\033[?1000h'; sleep 2".to_string(),
+            ],
+            None,
+            &[],
+        )
+        .expect("spawn sh");
+        pty.last_area.set(Rect::new(0, 0, 80, 24));
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let mut enabled = false;
+        while Instant::now() < deadline {
+            if pty
+                .parser
+                .lock()
+                .map(|p| p.screen().mouse_protocol_mode() != MouseProtocolMode::None)
+                .unwrap_or(false)
+            {
+                enabled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(enabled, "child never enabled mouse tracking");
+        assert!(
+            pty.parser
+                .lock()
+                .map(|p| !p.screen().alternate_screen())
+                .unwrap_or(false),
+            "sh never enters the alternate screen"
+        );
+        assert!(
+            !pty.send_mouse(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE),
+            "wheel events must not be forwarded raw to a non-alt-screen tracker"
+        );
+        assert!(
+            !pty.send_mouse(MouseEventKind::ScrollDown, 0, 0, KeyModifiers::NONE),
+            "wheel events must not be forwarded raw to a non-alt-screen tracker"
         );
     }
 
