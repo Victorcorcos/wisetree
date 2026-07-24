@@ -395,7 +395,13 @@ impl FixPullRequestScreen {
         cwd: PathBuf,
         env: Vec<(String, String)>,
     ) {
-        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+        match PtyView::spawn(
+            &binary,
+            &args,
+            Some(&cwd),
+            &env,
+            self.ai.apply.harness.renders_inline(),
+        ) {
             Ok(pty) => self.pty = Some(pty),
             Err(err) => self.set_error(format!(
                 "Could not spawn {} in PTY: {err}",

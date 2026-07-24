@@ -354,7 +354,8 @@ impl UpdatePullRequestScreen {
         self.terminal_error = error;
         self.pty_focused = false;
         self.phase_message = UPDATE_PUSH_FAILED_MESSAGE.to_string();
-        match PtyView::spawn(&shell, &args, Some(&cwd), &[]) {
+        // A plain recovery shell renders inline; wisetree owns its scrollback.
+        match PtyView::spawn(&shell, &args, Some(&cwd), &[], true) {
             Ok(mut pty) => {
                 // Reproduce the failing push in the panel so the user lands
                 // on the real error, then leaves them at a live prompt.
@@ -384,7 +385,13 @@ impl UpdatePullRequestScreen {
         cwd: PathBuf,
         env: Vec<(String, String)>,
     ) {
-        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+        match PtyView::spawn(
+            &binary,
+            &args,
+            Some(&cwd),
+            &env,
+            self.ai.harness.renders_inline(),
+        ) {
             Ok(pty) => {
                 self.pty = Some(pty);
             }
@@ -587,7 +594,8 @@ impl UpdatePullRequestScreen {
         // `App` does not try to abort a merge that is already committed.
         self.ai_active = false;
         self.pty_focused = false;
-        match PtyView::spawn(&shell, &shell_args, Some(&cwd), &env) {
+        // A plain commit/push shell renders inline; wisetree owns its scrollback.
+        match PtyView::spawn(&shell, &shell_args, Some(&cwd), &env, true) {
             Ok(pty) => {
                 self.pty = Some(pty);
             }

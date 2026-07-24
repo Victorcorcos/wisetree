@@ -495,7 +495,13 @@ impl BugkillPullRequestScreen {
         cwd: PathBuf,
         env: Vec<(String, String)>,
     ) {
-        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+        // The live step decides which harness slot is running, and thus whether
+        // wisetree owns scrolling (codex/claude) or the child does (opencode).
+        let harness = match self.step {
+            BugkillStep::Fixing => self.ai.fix.harness,
+            _ => self.ai.investigate.harness,
+        };
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env, harness.renders_inline()) {
             Ok(pty) => self.pty = Some(pty),
             Err(err) => self.set_error(format!("Could not spawn AI CLI in PTY: {err}")),
         }

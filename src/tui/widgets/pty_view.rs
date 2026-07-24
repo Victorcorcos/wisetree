@@ -76,6 +76,14 @@ pub struct PtyView {
     /// absolute host mouse coordinates into the child's cell grid when
     /// forwarding mouse reports.
     last_area: Cell<Rect>,
+    /// Whether the child renders its transcript inline (codex, claude, a plain
+    /// shell) rather than driving an alt-screen, mouse-tracking TUI (opencode).
+    /// For inline children wisetree owns scrolling through the vt100 buffer and
+    /// must never forward raw wheel reports — they'd be echoed as literal text
+    /// and the leading ESC read as an interrupt. See [`AiHarness::renders_inline`].
+    ///
+    /// [`AiHarness::renders_inline`]: crate::config::schema::AiHarness::renders_inline
+    renders_inline: bool,
 }
 
 impl PtyView {
@@ -84,6 +92,7 @@ impl PtyView {
         args: &[String],
         cwd: Option<&Path>,
         env: &[(String, String)],
+        renders_inline: bool,
     ) -> std::io::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -185,6 +194,7 @@ impl PtyView {
             exit_status,
             last_size: (DEFAULT_ROWS, DEFAULT_COLS),
             last_area: Cell::new(Rect::default()),
+            renders_inline,
         })
     }
 
@@ -252,12 +262,12 @@ impl PtyView {
     /// running its own text-selection / scrollback handling. Returns `false`
     /// when the child has no mouse mode active, so the host keeps its native
     /// wheel + selection behavior (e.g. a plain recovery shell that never
-    /// enabled mouse reporting). Also returns `false` for wheel events aimed
-    /// at a non-alt-screen child (codex, claude) even if it happens to have a
-    /// mouse mode active, since those harnesses scroll through committed
-    /// history rather than a mouse-driven scroll region and don't understand
-    /// wheel reports — the caller's `wheel_up`/`wheel_down` fallback handles
-    /// scrolling for them instead.
+    /// enabled mouse reporting). Also returns `false` for wheel events aimed at
+    /// an inline harness (codex, claude — see [`renders_inline`]), so the
+    /// caller's `wheel_up`/`wheel_down` fallback drives the vt100 scrollback
+    /// instead of us injecting a wheel report the harness can't decode.
+    ///
+    /// [`renders_inline`]: crate::config::schema::AiHarness::renders_inline
     pub fn send_mouse(
         &mut self,
         kind: MouseEventKind,
@@ -265,29 +275,17 @@ impl PtyView {
         abs_row: u16,
         modifiers: KeyModifiers,
     ) -> bool {
-        let (mode, encoding, alternate_screen) = match self.parser.lock() {
-            Ok(parser) => {
-                let screen = parser.screen();
-                (
-                    screen.mouse_protocol_mode(),
-                    screen.mouse_protocol_encoding(),
-                    screen.alternate_screen(),
-                )
-            }
-            Err(_) => return false,
-        };
-        if mode == MouseProtocolMode::None {
-            return false;
-        }
-        // Inline harnesses (codex, claude) render without an alt screen and
-        // scroll through committed history rather than a mouse-driven scroll
-        // region. Some of them still enable a mouse-tracking mode (e.g. to
-        // support click-to-position in their composer) without understanding
+        // Inline harnesses (codex, claude) scroll through committed history,
+        // and wisetree owns that scrolling via the vt100 buffer. They may still
+        // enable a mouse mode (click-to-position in their composer, or a
+        // transient alt-screen pager while paging back), but they don't decode
         // wheel reports — forwarding one raw gets echoed back as literal text
-        // and can even read as an interrupt keystroke. Let the caller's
-        // PageUp/PageDown-or-local-scrollback fallback (`wheel_up`/
-        // `wheel_down`) handle wheel events for these instead.
-        if !alternate_screen
+        // and the leading ESC reads as an interrupt keystroke. Decline the
+        // wheel here so the caller's `wheel_up`/`wheel_down` fallback drives the
+        // vt100 scrollback instead. This is keyed off the harness identity, not
+        // the child's runtime alt-screen/mouse state, because codex flips both
+        // mid-scroll.
+        if self.renders_inline
             && matches!(
                 kind,
                 MouseEventKind::ScrollUp
@@ -296,6 +294,19 @@ impl PtyView {
                     | MouseEventKind::ScrollRight
             )
         {
+            return false;
+        }
+        let (mode, encoding) = match self.parser.lock() {
+            Ok(parser) => {
+                let screen = parser.screen();
+                (
+                    screen.mouse_protocol_mode(),
+                    screen.mouse_protocol_encoding(),
+                )
+            }
+            Err(_) => return false,
+        };
+        if mode == MouseProtocolMode::None {
             return false;
         }
         let area = self.last_area.get();
@@ -327,15 +338,16 @@ impl PtyView {
             .unwrap_or(false)
     }
 
-    /// One wheel tick / scroll key toward older output. Alt-screen TUIs that
-    /// track the mouse (opencode) manage their own scroll region, so we send
-    /// them a `PageUp` key; inline harnesses (codex, claude) never enter the
-    /// alt screen and scroll by moving through the vt100 scrollback buffer.
+    /// One wheel tick / scroll key toward older output. Alt-screen TUIs
+    /// (opencode) manage their own scroll region, so we send them a `PageUp`
+    /// key; inline harnesses (codex, claude) scroll by moving through the vt100
+    /// scrollback buffer. Keyed off harness identity rather than the child's
+    /// live mouse-tracking state, which codex toggles mid-scroll.
     pub fn wheel_up(&mut self, lines: u16) {
-        if self.tracks_mouse() {
-            self.send_input(PAGE_UP);
-        } else {
+        if self.renders_inline {
             self.scroll_up(lines);
+        } else {
+            self.send_input(PAGE_UP);
         }
     }
 
@@ -343,10 +355,10 @@ impl PtyView {
     ///
     /// [`wheel_up`]: Self::wheel_up
     pub fn wheel_down(&mut self, lines: u16) {
-        if self.tracks_mouse() {
-            self.send_input(PAGE_DOWN);
-        } else {
+        if self.renders_inline {
             self.scroll_down(lines);
+        } else {
+            self.send_input(PAGE_DOWN);
         }
     }
 
@@ -652,7 +664,8 @@ mod tests {
     }
 
     fn spawn_echo() -> PtyView {
-        PtyView::spawn(&echo_binary(), &["hello".to_string()], None, &[]).expect("spawn echo")
+        // A plain inline program: wisetree owns its scrollback.
+        PtyView::spawn(&echo_binary(), &["hello".to_string()], None, &[], true).expect("spawn echo")
     }
 
     fn wait_for_exit(pty: &mut PtyView) {
@@ -805,6 +818,8 @@ mod tests {
         let Some(sh) = resolve_on_path("sh") else {
             return; // no POSIX shell — skip rather than fail on odd hosts.
         };
+        // Modeled on opencode: an alt-screen TUI that owns its scroll region,
+        // so it is *not* an inline harness (renders_inline = false).
         let mut pty = PtyView::spawn(
             &sh,
             &[
@@ -813,6 +828,7 @@ mod tests {
             ],
             None,
             &[],
+            false,
         )
         .expect("spawn sh");
         // Pretend the panel was rendered so coordinate translation has an area.
@@ -846,13 +862,16 @@ mod tests {
     }
 
     #[test]
-    fn send_mouse_never_forwards_raw_wheel_to_a_non_alt_screen_tracker() {
-        // Reproduces the codex bug: an inline (non-alt-screen) harness that
-        // enables a mouse mode (e.g. for click-to-position in its composer)
-        // must NOT receive a raw SGR wheel report — codex doesn't decode
-        // those, so they were echoed back as literal `[<64;...M` text and
-        // even read as an interrupt keystroke. `send_mouse` must decline the
-        // event (false) so the caller's wheel_up/wheel_down fallback runs.
+    fn send_mouse_never_forwards_raw_wheel_to_an_inline_harness() {
+        // Reproduces the codex bug: an inline harness (renders_inline = true)
+        // that enables a mouse mode — codex does this, and even flips into a
+        // transient alt-screen pager while paging through history — must NOT
+        // receive a raw SGR wheel report. Codex doesn't decode wheel reports,
+        // so they were echoed back as literal `[<64;...M` text and the leading
+        // ESC read as an interrupt keystroke. `send_mouse` must decline the
+        // wheel (false) so the caller's wheel_up/wheel_down fallback runs — and
+        // it must do so purely from the harness flag, regardless of the child's
+        // live mouse/alt-screen state.
         let Some(sh) = resolve_on_path("sh") else {
             return;
         };
@@ -864,6 +883,7 @@ mod tests {
             ],
             None,
             &[],
+            true,
         )
         .expect("spawn sh");
         pty.last_area.set(Rect::new(0, 0, 80, 24));
@@ -884,19 +904,22 @@ mod tests {
         }
         assert!(enabled, "child never enabled mouse tracking");
         assert!(
-            pty.parser
-                .lock()
-                .map(|p| !p.screen().alternate_screen())
-                .unwrap_or(false),
-            "sh never enters the alternate screen"
-        );
-        assert!(
             !pty.send_mouse(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE),
-            "wheel events must not be forwarded raw to a non-alt-screen tracker"
+            "wheel events must not be forwarded raw to an inline harness"
         );
         assert!(
             !pty.send_mouse(MouseEventKind::ScrollDown, 0, 0, KeyModifiers::NONE),
-            "wheel events must not be forwarded raw to a non-alt-screen tracker"
+            "wheel events must not be forwarded raw to an inline harness"
+        );
+        // A non-wheel event (a click) must still forward — codex uses those.
+        assert!(
+            pty.send_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE
+            ),
+            "non-wheel events must still forward to a tracking inline harness"
         );
     }
 
@@ -933,6 +956,7 @@ mod tests {
             &["-c".to_string(), "seq 1 200; sleep 2".to_string()],
             None,
             &[],
+            true,
         )
         .expect("spawn sh");
 
@@ -997,8 +1021,14 @@ mod tests {
         // Emit the bg query, then echo whatever arrives on stdin so the test can
         // observe the reply the reader thread wrote back.
         let script = "printf '\\033]11;?\\033\\\\'; head -c 32";
-        let pty = PtyView::spawn(&sh, &["-c".to_string(), script.to_string()], None, &[])
-            .expect("spawn sh");
+        let pty = PtyView::spawn(
+            &sh,
+            &["-c".to_string(), script.to_string()],
+            None,
+            &[],
+            true,
+        )
+        .expect("spawn sh");
 
         let deadline = Instant::now() + Duration::from_millis(2000);
         let mut saw_reply = false;
@@ -1038,8 +1068,14 @@ mod tests {
         let script = "printf '\\033[1;20r\\033[20;1H'; \
                       for i in $(seq 1 100); do printf 'line%d\\r\\n' \"$i\"; done; \
                       sleep 2";
-        let mut pty = PtyView::spawn(&sh, &["-c".to_string(), script.to_string()], None, &[])
-            .expect("spawn sh");
+        let mut pty = PtyView::spawn(
+            &sh,
+            &["-c".to_string(), script.to_string()],
+            None,
+            &[],
+            true,
+        )
+        .expect("spawn sh");
 
         let deadline = Instant::now() + Duration::from_millis(2000);
         while Instant::now() < deadline && pty.scrollback_len() == 0 {
@@ -1079,6 +1115,9 @@ mod tests {
         let Some(sh) = resolve_on_path("sh") else {
             return;
         };
+        // Modeled on opencode: an alt-screen TUI that owns its scroll region
+        // (renders_inline = false), so wheel_up must send a page key rather
+        // than moving the host's vt100 buffer.
         let mut pty = PtyView::spawn(
             &sh,
             &[
@@ -1087,6 +1126,7 @@ mod tests {
             ],
             None,
             &[],
+            false,
         )
         .expect("spawn sh");
 
