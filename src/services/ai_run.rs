@@ -140,7 +140,15 @@ impl AiRunner {
                 if request.permission == AiPermission::Plan {
                     args.extend(["--sandbox".into(), "read-only".into()]);
                 } else {
-                    args.push("--full-auto".into());
+                    // The interactive `codex` root command has no `--full-auto`
+                    // flag (removed upstream); autonomy is `workspace-write`
+                    // plus never prompting for approval.
+                    args.extend([
+                        "--sandbox".into(),
+                        "workspace-write".into(),
+                        "--ask-for-approval".into(),
+                        "never".into(),
+                    ]);
                 }
                 if !effort.is_empty() {
                     args.extend([
@@ -160,7 +168,10 @@ impl AiRunner {
                 if request.permission == AiPermission::Plan {
                     args.extend(["--sandbox".into(), "read-only".into()]);
                 } else {
-                    args.push("--full-auto".into());
+                    // `codex exec` runs non-interactively (never prompts), so
+                    // `workspace-write` alone is the autonomy policy; it has no
+                    // `--full-auto` / `--ask-for-approval` flag.
+                    args.extend(["--sandbox".into(), "workspace-write".into()]);
                 }
                 if !effort.is_empty() {
                     args.extend([
@@ -596,6 +607,40 @@ mod tests {
             .args
             .windows(2)
             .any(|args| args == ["--sandbox", "read-only"]));
+    }
+
+    #[test]
+    fn codex_implement_uses_valid_autonomy_flags_not_full_auto() {
+        // codex-cli removed `--full-auto`; passing it makes codex exit
+        // immediately with "unexpected argument", which the PR commands
+        // surfaced as "AI exited before finishing". Autonomy is expressed via
+        // `--sandbox workspace-write` (plus `--ask-for-approval never` for the
+        // interactive TUI, which — unlike `exec` — can prompt).
+        let runner = AiRunner::default().with_binary(AiHarness::Codex, PathBuf::from("true"));
+        for mode in [AiRunMode::Interactive, AiRunMode::Captured] {
+            let mut req = request(AiHarness::Codex, mode);
+            req.permission = AiPermission::Implement;
+            let command = runner.command(&req).unwrap();
+            assert!(
+                !command.args.iter().any(|arg| arg == "--full-auto"),
+                "codex {mode:?} must not pass the removed --full-auto flag"
+            );
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--sandbox", "workspace-write"]),
+                "codex {mode:?} Implement should run under workspace-write"
+            );
+        }
+
+        let mut interactive = request(AiHarness::Codex, AiRunMode::Interactive);
+        interactive.permission = AiPermission::Implement;
+        let command = runner.command(&interactive).unwrap();
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["--ask-for-approval", "never"]));
     }
 
     #[test]

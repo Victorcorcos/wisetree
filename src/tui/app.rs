@@ -2504,8 +2504,9 @@ impl App {
             AiTurn::Working => {
                 self.explain_draft = None;
                 if let Some(screen) = self.explain_pr.as_mut() {
-                    screen
-                        .set_error("opencode exited before the explanation finished.".to_string());
+                    screen.set_error(
+                        "The AI CLI exited before the explanation finished.".to_string(),
+                    );
                 }
             }
             turn => self.on_explain_turn(turn, tx),
@@ -2521,12 +2522,12 @@ impl App {
             Ok(content) => match parse_pull_request_md(&content) {
                 Some((title, body, labels)) => screen.enter_review(title, body, labels),
                 None => screen.set_error(
-                    "pull_request.md has no title line yet — let opencode finish, then retry."
+                    "pull_request.md has no title line yet — let the AI CLI finish, then retry."
                         .to_string(),
                 ),
             },
             Err(_) => screen.set_error(format!(
-                "pull_request.md not found at {}. Wait for opencode to write it before confirming.",
+                "pull_request.md not found at {}. Wait for the AI CLI to write it before confirming.",
                 path.display()
             )),
         }
@@ -12413,7 +12414,7 @@ mod tests {
         );
         assert_eq!(
             screen.error(),
-            Some("opencode exited before the explanation finished.")
+            Some("The AI CLI exited before the explanation finished.")
         );
     }
 
