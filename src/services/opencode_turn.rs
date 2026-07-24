@@ -111,8 +111,19 @@ impl OpencodeTurnWatcher {
         if message.role != "assistant" || message.summary || message.completed.is_none() {
             return OpencodeTurn::Working;
         }
-        if let Some(message) = message.error {
-            return OpencodeTurn::Failed { message };
+        if let Some(error) = message.error {
+            // opencode stamps `time.completed` even on abort (its
+            // `SessionProcessor.cleanup` runs on success, error, and abort
+            // alike) and tags a user Esc-interrupt as `MessageAbortedError`.
+            // That is the user interrupting to redirect, not a finished or
+            // failed turn — keep it `Working` so a follow-up prompt continues
+            // the same session, mirroring Codex `turn_aborted` and Claude Code
+            // interrupts. A genuine provider/model error (a different
+            // `error.name`) still ends the turn as `Failed`.
+            if is_abort_error(message.error_name.as_deref()) {
+                return OpencodeTurn::Working;
+            }
+            return OpencodeTurn::Failed { message: error };
         }
         OpencodeTurn::Finished {
             transcript: transcript(&conn, &session_id).unwrap_or_default(),
@@ -166,11 +177,22 @@ impl OpencodeTurnWatcher {
     }
 }
 
+/// Whether an `error.name` denotes a user-initiated abort (Esc-interrupt /
+/// Ctrl-C) rather than a real failure. opencode names these `MessageAbortedError`;
+/// matching on the `Abort` stem also covers the shorter `AbortedError` variant.
+fn is_abort_error(error_name: Option<&str>) -> bool {
+    error_name.is_some_and(|name| name.contains("Abort"))
+}
+
 struct MessageMarker {
     role: String,
     summary: bool,
     completed: Option<i64>,
     error: Option<String>,
+    /// The raw `error.name` (e.g. `MessageAbortedError`), kept separately from
+    /// the display `error` so [`is_abort_error`] can tell a user Esc-interrupt
+    /// apart from a genuine provider/model failure.
+    error_name: Option<String>,
 }
 
 fn latest_message(conn: &Connection, session_id: &str) -> Option<MessageMarker> {
@@ -180,7 +202,8 @@ fn latest_message(conn: &Connection, session_id: &str) -> Option<MessageMarker> 
                     coalesce(json_extract(data, '$.summary'), 0), \
                     json_extract(data, '$.time.completed'), \
                     coalesce(json_extract(data, '$.error.data.message'), \
-                             json_extract(data, '$.error.name')) \
+                             json_extract(data, '$.error.name')), \
+                    json_extract(data, '$.error.name') \
              from message \
              where session_id = ?1 \
              order by time_created desc, id desc \
@@ -193,6 +216,7 @@ fn latest_message(conn: &Connection, session_id: &str) -> Option<MessageMarker> 
             summary: row.get::<_, i64>(1)? != 0,
             completed: row.get(2)?,
             error: row.get(3)?,
+            error_name: row.get(4)?,
         })
     })
     .optional()
@@ -504,14 +528,50 @@ mod tests {
         f.conn
             .execute(
                 "update message set data = ?1 where id = 'msg_asst'",
-                params![r#"{"role":"assistant","time":{"created":2200,"completed":9000},"error":{"name":"AbortedError"}}"#],
+                params![r#"{"role":"assistant","time":{"created":2200,"completed":9000},"error":{"name":"UnknownError"}}"#],
             )
             .unwrap();
         let mut w = watcher(&f, 1_000);
         assert_eq!(
             w.check_now(),
             OpencodeTurn::Failed {
-                message: "AbortedError".to_string()
+                message: "UnknownError".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn esc_interrupt_abort_stays_working_not_failed() {
+        // opencode stamps `time.completed` even on abort and tags a user
+        // Esc-interrupt as `MessageAbortedError`. That is the user
+        // interrupting to redirect, not a finished/failed turn: the watcher
+        // must report Working so a follow-up prompt resumes the same session
+        // (mirrors Codex `turn_aborted` and Claude Code interrupts) — and it
+        // must never be mistaken for a green Finished.
+        let f = fixture();
+        insert_session(&f.conn, "ses_1", &f.worktree, 2_000);
+        insert_message(
+            &f.conn,
+            "msg_asst",
+            "ses_1",
+            2_200,
+            r#"{"role":"assistant","time":{"created":2200,"completed":9000},"error":{"name":"MessageAbortedError","data":{"message":"Aborted"}}}"#,
+        );
+        let mut w = watcher(&f, 1_000);
+        assert_eq!(w.check_now(), OpencodeTurn::Working);
+
+        // A genuine provider error at the same point is still Failed.
+        f.conn
+            .execute(
+                "update message set data = ?1 where id = 'msg_asst'",
+                params![r#"{"role":"assistant","time":{"created":2200,"completed":9000},"error":{"name":"ProviderError","data":{"message":"model unavailable"}}}"#],
+            )
+            .unwrap();
+        let mut w = watcher(&f, 1_000);
+        assert_eq!(
+            w.check_now(),
+            OpencodeTurn::Failed {
+                message: "model unavailable".to_string()
             }
         );
     }
