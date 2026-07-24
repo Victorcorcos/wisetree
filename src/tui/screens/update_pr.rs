@@ -384,14 +384,9 @@ impl UpdatePullRequestScreen {
         args: Vec<String>,
         cwd: PathBuf,
         env: Vec<(String, String)>,
+        renders_inline: bool,
     ) {
-        match PtyView::spawn(
-            &binary,
-            &args,
-            Some(&cwd),
-            &env,
-            self.ai.harness.renders_inline(),
-        ) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env, renders_inline) {
             Ok(pty) => {
                 self.pty = Some(pty);
             }

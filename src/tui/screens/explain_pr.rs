@@ -248,20 +248,23 @@ impl ExplainPullRequestScreen {
     /// Spawn the opencode subprocess inside the embedded PTY. Failure to
     /// spawn surfaces as an error Notice and flips straight to ReadyToReview
     /// handling by the App (via `set_error`).
+    ///
+    /// `renders_inline` is the *resolved* harness's behavior (see
+    /// [`AiHarness::renders_inline`]), passed by the App from the preparation
+    /// handoff rather than read from `self.ai.harness` — the two can diverge
+    /// (fallback resolution), and getting this wrong re-introduces the codex
+    /// wheel-interrupt bug.
+    ///
+    /// [`AiHarness::renders_inline`]: crate::config::schema::AiHarness::renders_inline
     pub fn spawn_opencode_pty(
         &mut self,
         binary: PathBuf,
         args: Vec<String>,
         cwd: PathBuf,
         env: Vec<(String, String)>,
+        renders_inline: bool,
     ) {
-        match PtyView::spawn(
-            &binary,
-            &args,
-            Some(&cwd),
-            &env,
-            self.ai.harness.renders_inline(),
-        ) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env, renders_inline) {
             Ok(pty) => self.pty = Some(pty),
             Err(err) => {
                 self.set_error(format!(
@@ -1518,6 +1521,7 @@ mod tests {
             vec!["5".to_string()],
             std::env::temp_dir(),
             Vec::new(),
+            true,
         );
         assert!(screen.has_pty(), "PTY is live while opencode runs");
 

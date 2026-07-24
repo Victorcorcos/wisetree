@@ -3940,11 +3940,13 @@ impl App {
                 self.bugkill_investigation =
                     Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                 screen.start_investigating(corrective);
+                let renders_inline = handoff.harness.renders_inline();
                 screen.spawn_opencode_pty(
                     handoff.command.binary,
                     handoff.command.args,
                     handoff.command.cwd,
                     Vec::new(),
+                    renders_inline,
                 );
             }
             Err(message) => screen.set_error(message),
@@ -4054,6 +4056,7 @@ impl App {
                 // session row.
                 self.bugkill_fixing =
                     Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
+                let renders_inline = handoff.harness.renders_inline();
                 let Some(screen) = self.bugkill_pr.as_mut() else {
                     return;
                 };
@@ -4064,6 +4067,7 @@ impl App {
                     handoff.command.args,
                     handoff.command.cwd,
                     Vec::new(),
+                    renders_inline,
                 );
             }
             Err(message) => {
@@ -4890,11 +4894,13 @@ impl App {
                 self.develop_watch =
                     Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                 screen.start_planning(corrective);
+                let renders_inline = handoff.harness.renders_inline();
                 screen.spawn_opencode_pty(
                     handoff.command.binary,
                     handoff.command.args,
                     handoff.command.cwd,
                     Vec::new(),
+                    renders_inline,
                 );
             }
             Err(message) => screen.set_error(message),
@@ -4923,11 +4929,13 @@ impl App {
                 self.develop_watch =
                     Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                 screen.begin_implement_run(section);
+                let renders_inline = handoff.harness.renders_inline();
                 screen.spawn_opencode_pty(
                     handoff.command.binary,
                     handoff.command.args,
                     handoff.command.cwd,
                     Vec::new(),
+                    renders_inline,
                 );
             }
             Err(message) => screen.set_error(message),
@@ -5172,6 +5180,7 @@ impl App {
                         handoff.command.args,
                         handoff.command.cwd,
                         Vec::new(),
+                        handoff.harness.renders_inline(),
                     );
                 }
             }
@@ -6736,7 +6745,13 @@ impl App {
         // Watcher must exist before the spawn so its start timestamp
         // precedes the session row opencode creates.
         self.update_conflict = Some(AiTurnWatcher::new(harness, &command.cwd));
-        screen.spawn_opencode_pty(shell, wrapped_args, command.cwd, Vec::new());
+        screen.spawn_opencode_pty(
+            shell,
+            wrapped_args,
+            command.cwd,
+            Vec::new(),
+            harness.renders_inline(),
+        );
         self.update_branch = None;
         self.update_pr = Some(screen);
         self.screen = Screen::UpdatePullRequest;
@@ -6959,7 +6974,13 @@ impl App {
                 // Watcher must exist before the spawn so its start timestamp
                 // precedes the session row opencode creates.
                 self.update_conflict = Some(AiTurnWatcher::new(*harness, &command.cwd));
-                screen.spawn_opencode_pty(shell, wrapped_args, command.cwd.clone(), Vec::new());
+                screen.spawn_opencode_pty(
+                    shell,
+                    wrapped_args,
+                    command.cwd.clone(),
+                    Vec::new(),
+                    harness.renders_inline(),
+                );
                 return;
             }
         }
@@ -7148,6 +7169,7 @@ impl App {
                             command.args,
                             command.cwd,
                             Vec::new(),
+                            harness.renders_inline(),
                         );
                     }
                 }
