@@ -805,6 +805,15 @@ impl App {
             }
             self.pty_was_active = pty_active;
 
+            // While a PTY is live, sample the vt100 grid at ~60fps so an inline
+            // harness (codex/claude) whose spinner and token stream redraw fast
+            // don't look choppy; drop back to 50ms when idle to spare the CPU.
+            events.set_tick_rate(if pty_active {
+                Duration::from_millis(16)
+            } else {
+                Duration::from_millis(50)
+            });
+
             let completed = terminal.draw(|frame| self.draw(frame))?;
             self.last_rendered_buffer = Some(completed.buffer.clone());
 

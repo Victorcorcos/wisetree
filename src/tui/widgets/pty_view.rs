@@ -817,6 +817,72 @@ mod tests {
         assert_eq!(pty.scrollback_offset(), 2);
     }
 
+    /// Read the visible grid row `row` as a trimmed string (respects the
+    /// current scrollback offset, since `cell` composites scrollback + screen).
+    fn visible_row_text(pty: &PtyView, row: u16, cols: u16) -> String {
+        let parser = pty.parser.lock().unwrap();
+        let screen = parser.screen();
+        let mut s = String::new();
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                s.push_str(&cell.contents());
+            }
+        }
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn inline_child_scroll_region_history_reaches_scrollback() {
+        // The crux of the codex/claude embed: they commit transcript lines by
+        // scrolling *within a top-anchored DECSTBM scroll region* (reserving a
+        // bottom composer), never entering the alt screen. Stock vt100 discards
+        // rows scrolled out of an active region, so their history never reached
+        // scrollback and the panel couldn't scroll back. The vendored patch
+        // captures top-anchored regions — this test would see `scrollback_len`
+        // stuck at 0 without it.
+        let Some(sh) = resolve_on_path("sh") else {
+            return; // no POSIX shell — skip rather than fail on odd hosts.
+        };
+        // Set a scroll region of rows 1..20 (top-anchored, bottom composer
+        // reserved), park the cursor at its bottom, then emit 100 lines so the
+        // region scrolls ~80 times. Mirrors how codex commits its transcript.
+        let script = "printf '\\033[1;20r\\033[20;1H'; \
+                      for i in $(seq 1 100); do printf 'line%d\\r\\n' \"$i\"; done; \
+                      sleep 2";
+        let mut pty = PtyView::spawn(&sh, &["-c".to_string(), script.to_string()], None, &[])
+            .expect("spawn sh");
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline && pty.scrollback_len() == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pty.scrollback_len() > 0,
+            "top-anchored scroll-region history must land in scrollback (patch A)"
+        );
+        assert!(
+            !pty.tracks_mouse(),
+            "an inline child never tracks the mouse"
+        );
+
+        // Scroll all the way back; an early committed line must be visible in
+        // the composited viewport (patch B path — `cell` reads scrollback).
+        pty.scroll_to_top();
+        assert!(
+            pty.scrollback_offset() > 0,
+            "scroll_to_top must move offset"
+        );
+        let (rows, cols) = pty.last_size;
+        // The cursor started at the bottom of the region, so the first rows to
+        // scroll into history are blank; the committed `lineN` rows follow.
+        // Scan the whole composited viewport for one.
+        let visible: Vec<String> = (0..rows).map(|r| visible_row_text(&pty, r, cols)).collect();
+        assert!(
+            visible.iter().any(|line| line.starts_with("line")),
+            "an early transcript line must be reachable in scrollback, got {visible:?}"
+        );
+    }
+
     #[test]
     fn wheel_leaves_the_vt100_buffer_alone_for_a_tracking_child() {
         // An alt-screen child (opencode) owns its own scroll region, so

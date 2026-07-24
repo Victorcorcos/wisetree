@@ -1,7 +1,9 @@
 //! Keyboard / tick event abstraction over `crossterm::event`.
 //!
 //! The event loop drives both rendering (via periodic `Tick`) and input.
-//! `tick_rate` defaults to 100ms so the spinner widgets get a natural cadence.
+//! The app runs it at 50ms idle so spinner widgets get a natural cadence, and
+//! temporarily raises it (see [`EventLoop::set_tick_rate`]) while an embedded
+//! PTY is live to keep an inline harness's animation smooth.
 //!
 //! ## Spin guard
 //!
@@ -52,6 +54,15 @@ impl EventLoop {
             last_tick: Instant::now(),
             spin_guard: SpinGuard::new(),
         }
+    }
+
+    /// Adjust the tick cadence in-flight. Used to run the render loop faster
+    /// while an embedded PTY is live so an inline harness (codex/claude) whose
+    /// spinner + token stream redraw quickly gets sampled smoothly, then fall
+    /// back to the idle rate to spare the CPU. `last_tick` is untouched, so the
+    /// next `next_event` simply recomputes its timeout against the new rate.
+    pub fn set_tick_rate(&mut self, tick_rate: Duration) {
+        self.tick_rate = tick_rate;
     }
 
     /// Block until either an event is available or the tick deadline is hit.
