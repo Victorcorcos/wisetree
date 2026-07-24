@@ -471,7 +471,14 @@ async fn bugkill_uses_each_configured_harness_for_investigation_and_fix() {
                     .args
                     .windows(2)
                     .any(|args| args == ["--sandbox", "read-only"]));
-                assert!(fix.command.args.iter().any(|arg| arg == "--full-auto"));
+                // codex-cli removed `--full-auto`; autonomy for the fix step
+                // is expressed via `--sandbox workspace-write` instead.
+                assert!(!fix.command.args.iter().any(|arg| arg == "--full-auto"));
+                assert!(fix
+                    .command
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--sandbox", "workspace-write"]));
             }
             AiHarness::ClaudeCode => {
                 assert!(investigate

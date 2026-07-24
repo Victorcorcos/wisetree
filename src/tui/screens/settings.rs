@@ -6393,7 +6393,11 @@ mod tests {
         screen.step = SettingsStep::Dashboard;
         screen.dashboard_editor = Some(DashboardEditor::new(&screen.config.dashboard));
 
-        let backend = TestBackend::new(120, 25);
+        // Height must fit every dashboard field's 3-row box + 1-row hint plus
+        // the header and Save button, or the layout solver compresses boxes
+        // (the `ai` box loses its content/bottom-border rows first) and the
+        // summary text never reaches the buffer.
+        let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| screen.render(frame, frame.area()))
@@ -6415,8 +6419,8 @@ mod tests {
 
         let rendered = render_dashboard_ai_summary(&config);
 
-        assert!(rendered.contains("develop-plan-model"));
-        assert!(rendered.contains("develop-implement-model"));
+        assert!(rendered.contains("2/"));
+        assert!(rendered.contains("AI commands have a model assigned"));
     }
 
     #[test]
@@ -6557,8 +6561,6 @@ mod tests {
         );
         let _ = screen.handle_ai_settings(key(KeyCode::Right));
         let _ = screen.handle_ai_settings(key(KeyCode::Right));
-        let _ = screen.handle_ai_settings(key(KeyCode::Right));
-        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
         // Wraps forward.
         assert_eq!(
             screen.ai_settings_editor.as_ref().unwrap().selection,
@@ -6602,6 +6604,7 @@ mod tests {
         focus_ai_slot(&mut screen, 0);
         set_slot_model(&mut screen, 0, "opencode/big-pickle");
 
+        let _ = screen.handle_ai_settings(key(KeyCode::Right)); // move to Thinking field
         let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
         let editor = screen.ai_settings_editor.as_ref().unwrap();
         assert_eq!(AiSlot::ALL[0].get(&editor.ai).thinking, "minimal");

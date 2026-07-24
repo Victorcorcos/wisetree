@@ -4441,7 +4441,10 @@ impl DashboardService {
         }
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_bug_judge_prompt(row, user_text);
-        let (_, cancel) = oneshot::channel();
+        // Keep the sender alive for the run's duration — `let (_, cancel) = ...`
+        // drops it immediately, which resolves `cancel` as closed right away
+        // and spuriously races the captured run into `AiErrorCode::Cancelled`.
+        let (_cancel_tx, cancel) = oneshot::channel();
         let run = self
             .ai_runner()
             .run_captured(
