@@ -20,7 +20,7 @@
 //!   turn → [`OpencodeTurn::Working`]
 //! - assistant `summary` message (auto-compaction in flight) → `Working`
 //! - assistant with `time.completed` + `error` → [`OpencodeTurn::Failed`]
-//! - assistant with `time.completed` → [`OpencodeTurn::Finished`], carrying
+//! - assistant with `time.completed` + terminal `finish` → [`OpencodeTurn::Finished`], carrying
 //!   the transcript (the session's assistant `text` parts, in order) — the
 //!   PTY capture of a TUI is escape-sequence soup, so the database is also
 //!   the transcript source.
@@ -125,6 +125,13 @@ impl OpencodeTurnWatcher {
             }
             return OpencodeTurn::Failed { message: error };
         }
+        if message
+            .finish
+            .as_deref()
+            .map_or(true, |finish| finish == "tool-calls")
+        {
+            return OpencodeTurn::Working;
+        }
         OpencodeTurn::Finished {
             transcript: transcript(&conn, &session_id).unwrap_or_default(),
         }
@@ -193,6 +200,9 @@ struct MessageMarker {
     /// the display `error` so [`is_abort_error`] can tell a user Esc-interrupt
     /// apart from a genuine provider/model failure.
     error_name: Option<String>,
+    /// OpenCode's per-step finish reason. `tool-calls` continues the loop;
+    /// terminal values such as `stop` finish the user turn.
+    finish: Option<String>,
 }
 
 fn latest_message(conn: &Connection, session_id: &str) -> Option<MessageMarker> {
@@ -203,7 +213,8 @@ fn latest_message(conn: &Connection, session_id: &str) -> Option<MessageMarker> 
                     json_extract(data, '$.time.completed'), \
                     coalesce(json_extract(data, '$.error.data.message'), \
                              json_extract(data, '$.error.name')), \
-                    json_extract(data, '$.error.name') \
+                    json_extract(data, '$.error.name'), \
+                    json_extract(data, '$.finish') \
              from message \
              where session_id = ?1 \
              order by time_created desc, id desc \
@@ -217,6 +228,7 @@ fn latest_message(conn: &Connection, session_id: &str) -> Option<MessageMarker> 
             completed: row.get(2)?,
             error: row.get(3)?,
             error_name: row.get(4)?,
+            finish: row.get(5)?,
         })
     })
     .optional()
@@ -460,7 +472,7 @@ mod tests {
             "msg_asst",
             "ses_1",
             2_200,
-            r#"{"role":"assistant","time":{"created":2200,"completed":9000}}"#,
+            r#"{"role":"assistant","finish":"stop","time":{"created":2200,"completed":9000}}"#,
         );
         insert_part(
             &f.conn,
@@ -514,13 +526,13 @@ mod tests {
             "msg_asst",
             "ses_1",
             2_200,
-            r#"{"role":"assistant","time":{"created":2200,"completed":9000},"error":{"name":"ProviderError","data":{"message":"model unavailable"}}}"#,
+            r#"{"role":"assistant","time":{"created":2200,"completed":9000},"error":{"name":"APIError","data":{"message":"Insufficient balance"}}}"#,
         );
         let mut w = watcher(&f, 1_000);
         assert_eq!(
             w.check_now(),
             OpencodeTurn::Failed {
-                message: "model unavailable".to_string()
+                message: "Insufficient balance".to_string()
             }
         );
 
@@ -536,6 +548,50 @@ mod tests {
             w.check_now(),
             OpencodeTurn::Failed {
                 message: "UnknownError".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn completed_tool_call_step_waits_for_the_terminal_assistant_message() {
+        let f = fixture();
+        insert_session(&f.conn, "ses_1", &f.worktree, 2_000);
+        insert_message(
+            &f.conn,
+            "msg_tool",
+            "ses_1",
+            2_200,
+            r#"{"role":"assistant","finish":"tool-calls","time":{"created":2200,"completed":2300}}"#,
+        );
+        insert_part(
+            &f.conn,
+            "prt_tool",
+            "msg_tool",
+            "ses_1",
+            r#"{"type":"text","text":"Calling a tool"}"#,
+        );
+        let mut w = watcher(&f, 1_000);
+        assert_eq!(w.check_now(), OpencodeTurn::Working);
+
+        insert_message(
+            &f.conn,
+            "msg_stop",
+            "ses_1",
+            2_400,
+            r#"{"role":"assistant","finish":"stop","time":{"created":2400,"completed":2500}}"#,
+        );
+        insert_part(
+            &f.conn,
+            "prt_stop",
+            "msg_stop",
+            "ses_1",
+            r#"{"type":"text","text":"Final answer"}"#,
+        );
+
+        assert_eq!(
+            w.check_now(),
+            OpencodeTurn::Finished {
+                transcript: "Calling a tool\n\nFinal answer".to_string()
             }
         );
     }

@@ -131,6 +131,8 @@ pub enum DevelopAction {
     /// Enter during `Planning`, confirmed: the user says opencode is done
     /// even though the automatic detection has not fired.
     ForcePlanDone,
+    /// Retry a failed planning run without discarding its task or revision.
+    RetryPlanning,
     /// PlanReview: Yes — start the implementation.
     PlanApproved,
     /// PlanReview → Feedback submitted: revise the plan with this input.
@@ -381,6 +383,13 @@ impl DevelopPullRequestScreen {
         self.pty = None;
     }
 
+    pub fn set_planning_error(&mut self, message: String, corrective: bool) {
+        self.step_before_error = Some(DevelopStep::Planning);
+        self.plan_corrective = corrective;
+        self.error = Some(message);
+        self.pty = None;
+    }
+
     /// Confirm accepted (or Start fresh) → the multiline task page.
     pub fn show_describe(&mut self) {
         self.confirm = None;
@@ -621,6 +630,10 @@ impl DevelopPullRequestScreen {
     ) {
         match PtyView::spawn(&binary, &args, Some(&cwd), &env, renders_inline) {
             Ok(pty) => self.pty = Some(pty),
+            Err(err) if self.step == DevelopStep::Planning => self.set_planning_error(
+                format!("Could not spawn AI CLI in PTY: {err}"),
+                self.plan_corrective,
+            ),
             Err(err) => self.set_error(format!("Could not spawn AI CLI in PTY: {err}")),
         }
     }
@@ -717,6 +730,17 @@ impl DevelopPullRequestScreen {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DevelopAction {
         if self.error.is_some() {
+            if self.step_before_error == Some(DevelopStep::Planning) {
+                return match key.code {
+                    KeyCode::Enter | KeyCode::Char('r') => {
+                        self.error = None;
+                        self.step_before_error = None;
+                        DevelopAction::RetryPlanning
+                    }
+                    KeyCode::Esc => DevelopAction::Cancelled,
+                    _ => DevelopAction::Continue,
+                };
+            }
             return DevelopAction::Cancelled;
         }
         match self.step {
@@ -1111,6 +1135,7 @@ impl DevelopPullRequestScreen {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         if let Some(err) = self.error.as_deref() {
+            let recoverable = self.step_before_error == Some(DevelopStep::Planning);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(2), Constraint::Length(1)])
@@ -1124,7 +1149,12 @@ impl DevelopPullRequestScreen {
                 chunks[0],
             );
             frame.render_widget(
-                Paragraph::new("Press any key to return to dashboard...").style(muted_dim()),
+                Paragraph::new(if recoverable {
+                    "Enter/r Retry planning · Esc Cancel"
+                } else {
+                    "Press any key to return to dashboard..."
+                })
+                .style(muted_dim()),
                 chunks[1],
             );
             return;
@@ -2609,6 +2639,36 @@ mod tests {
             dump.contains("Plan output could not be parsed — retrying once..."),
             "{dump}"
         );
+    }
+
+    #[test]
+    fn planning_errors_offer_retry_without_discarding_state() {
+        let mut s = screen();
+        s.set_task_description("add csv".to_string());
+        s.start_planning(true);
+        s.set_planning_error("weekly limit reached".to_string(), true);
+
+        let dump = render_dump(&mut s, 110, 30);
+        assert!(dump.contains("weekly limit reached"), "{dump}");
+        assert!(
+            dump.contains("Enter/r Retry planning · Esc Cancel"),
+            "{dump}"
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('x'))),
+            DevelopAction::Continue
+        );
+        assert_eq!(s.error(), Some("weekly limit reached"));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            DevelopAction::RetryPlanning
+        );
+        assert_eq!(s.error(), None);
+        assert_eq!(s.task_description(), "add csv");
+        assert!(s.plan_corrective());
+
+        s.set_planning_error("still limited".to_string(), true);
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
     }
 
     #[test]

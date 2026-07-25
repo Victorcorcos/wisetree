@@ -959,8 +959,9 @@ impl App {
                             self.develop_watch = None;
                             if let Some(screen) = self.develop_pr.as_mut() {
                                 screen.kill_pty();
-                                screen.set_error(
+                                screen.set_planning_error(
                                     "AI CLI exited before the plan was finished.".to_string(),
+                                    screen.plan_corrective(),
                                 );
                             }
                         }
@@ -4308,6 +4309,13 @@ impl App {
                 }
             }
             DevelopAction::ForcePlanDone => self.force_develop_plan_done(tx),
+            DevelopAction::RetryPlanning => {
+                let corrective = self
+                    .develop_pr
+                    .as_ref()
+                    .is_some_and(DevelopPullRequestScreen::plan_corrective);
+                self.start_develop_planning(corrective, tx);
+            }
             DevelopAction::PlanApproved => self.start_develop_implement_run(tx),
             DevelopAction::PlanRejected(_) => {
                 // The screen already stashed the rejected plan + feedback in
@@ -4451,11 +4459,21 @@ impl App {
             (Some(DevelopStep::Implementing), AiTurn::Finished { transcript }) => {
                 self.on_develop_implement_done(transcript, tx)
             }
+            (Some(DevelopStep::Planning), AiTurn::Failed { message }) => {
+                self.develop_watch = None;
+                if let Some(screen) = self.develop_pr.as_mut() {
+                    screen.kill_pty();
+                    screen.set_planning_error(
+                        format!("AI CLI reported an error: {message}"),
+                        screen.plan_corrective(),
+                    );
+                }
+            }
             (_, AiTurn::Failed { message }) => {
                 self.develop_watch = None;
                 if let Some(screen) = self.develop_pr.as_mut() {
                     screen.kill_pty();
-                    screen.set_error(format!("opencode reported an error: {message}"));
+                    screen.set_error(format!("AI CLI reported an error: {message}"));
                 }
             }
             _ => {}
@@ -4481,10 +4499,13 @@ impl App {
                 }
             }
             None if !corrective => self.start_develop_planning(true, tx),
-            None => screen.set_error(format!(
-                "could not parse the plan from the planning output. Raw tail:\n{}",
-                crate::services::transcript_tail(&transcript)
-            )),
+            None => screen.set_planning_error(
+                format!(
+                    "could not parse the plan from the planning output. Raw tail:\n{}",
+                    crate::services::transcript_tail(&transcript)
+                ),
+                true,
+            ),
         }
     }
 
@@ -4502,7 +4523,10 @@ impl App {
                 self.develop_watch = None;
                 if let Some(screen) = self.develop_pr.as_mut() {
                     screen.kill_pty();
-                    screen.set_error("AI CLI exited before the plan was finished.".to_string());
+                    screen.set_planning_error(
+                        "AI CLI exited before the plan was finished.".to_string(),
+                        screen.plan_corrective(),
+                    );
                 }
             }
             turn => self.on_develop_turn(turn, tx),
@@ -4573,7 +4597,10 @@ impl App {
                 self.develop_watch = None;
                 if let Some(screen) = self.develop_pr.as_mut() {
                     screen.kill_pty();
-                    screen.set_error(format!("AI CLI reported an error: {message}"));
+                    screen.set_planning_error(
+                        format!("AI CLI reported an error: {message}"),
+                        screen.plan_corrective(),
+                    );
                 }
             }
         }
@@ -4903,7 +4930,7 @@ impl App {
                     renders_inline,
                 );
             }
-            Err(message) => screen.set_error(message),
+            Err(message) => screen.set_planning_error(message, corrective),
         }
     }
 
@@ -13946,6 +13973,59 @@ mod tests {
     }
 
     #[test]
+    fn planning_ai_limit_failure_waits_for_an_explicit_retry() {
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                app.on_develop_turn(
+                    AiTurn::Failed {
+                        message: "You've hit your weekly limit · resets 6am".to_string(),
+                    },
+                    &tx,
+                );
+
+                let screen = app.develop_pr.as_ref().unwrap();
+                assert!(screen.error().is_some_and(
+                    |error| error.contains("You've hit your weekly limit · resets 6am")
+                ));
+                assert!(
+                    rx.try_recv().is_err(),
+                    "failure must not spend another call"
+                );
+
+                let action =
+                    app.develop_pr
+                        .as_mut()
+                        .unwrap()
+                        .handle_key(crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Enter,
+                            crossterm::event::KeyModifiers::NONE,
+                        ));
+                app.apply_develop_action(action, &tx);
+
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("manual retry should prepare a new plan")
+                    .expect("channel should stay open");
+                assert!(matches!(
+                    event,
+                    AppEvent::DevelopPlanReady {
+                        operation_id: 1,
+                        corrective: false,
+                        ..
+                    }
+                ));
+            });
+        });
+    }
+
+    #[test]
     fn second_invalid_develop_plan_surfaces_tail_without_retrying() {
         with_home(|home| {
             let repo = develop_repo(home);
@@ -13970,6 +14050,18 @@ mod tests {
                     .error()
                     .is_some_and(|error| error.contains("terminal transcript tail")));
                 assert!(rx.try_recv().is_err());
+
+                let action =
+                    app.develop_pr
+                        .as_mut()
+                        .unwrap()
+                        .handle_key(crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Enter,
+                            crossterm::event::KeyModifiers::NONE,
+                        ));
+                assert_eq!(action, DevelopAction::RetryPlanning);
+                app.apply_develop_action(action, &tx);
+                assert_corrective_plan_requested(&mut rx).await;
             });
         });
     }
