@@ -54,11 +54,6 @@ const EXPLAIN_PREPARING_MESSAGE: &str = "Gathering diff and preparing prompt..."
 /// view is the PTY embed). Matches the Update PR screen.
 const AI_LOG_MAX_LINES: usize = 1024;
 
-/// CSI sequences forwarded to opencode for page scrolling while it owns the
-/// alternate screen (its own scrollback is unreachable from vt100).
-const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
-const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExplainStep {
     Loading,
@@ -253,17 +248,29 @@ impl ExplainPullRequestScreen {
     /// Spawn the opencode subprocess inside the embedded PTY. Failure to
     /// spawn surfaces as an error Notice and flips straight to ReadyToReview
     /// handling by the App (via `set_error`).
+    ///
+    /// `renders_inline` is the *resolved* harness's behavior (see
+    /// [`AiHarness::renders_inline`]), passed by the App from the preparation
+    /// handoff rather than read from `self.ai.harness` — the two can diverge
+    /// (fallback resolution), and getting this wrong re-introduces the codex
+    /// wheel-interrupt bug.
+    ///
+    /// [`AiHarness::renders_inline`]: crate::config::schema::AiHarness::renders_inline
     pub fn spawn_opencode_pty(
         &mut self,
         binary: PathBuf,
         args: Vec<String>,
         cwd: PathBuf,
         env: Vec<(String, String)>,
+        renders_inline: bool,
     ) {
-        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env, renders_inline) {
             Ok(pty) => self.pty = Some(pty),
             Err(err) => {
-                self.set_error(format!("Could not spawn opencode in PTY: {err}"));
+                self.set_error(format!(
+                    "Could not spawn {} in PTY: {err}",
+                    self.ai.harness.display_name()
+                ));
             }
         }
     }
@@ -286,6 +293,10 @@ impl ExplainPullRequestScreen {
             return true;
         }
         false
+    }
+
+    pub fn pty_exit_code(&self) -> Option<i32> {
+        self.pty.as_ref().and_then(PtyView::exit_code)
     }
 
     /// Transition into the Review step with the parsed draft. Drops the PTY
@@ -438,7 +449,7 @@ impl ExplainPullRequestScreen {
             return false;
         }
         if let Some(pty) = self.pty.as_mut() {
-            pty.send_input(PTY_PAGE_UP);
+            pty.wheel_up(lines);
         } else {
             self.ai_scroll = self.ai_scroll.saturating_add(lines);
         }
@@ -454,7 +465,7 @@ impl ExplainPullRequestScreen {
             return false;
         }
         if let Some(pty) = self.pty.as_mut() {
-            pty.send_input(PTY_PAGE_DOWN);
+            pty.wheel_down(lines);
         } else {
             self.ai_scroll = self.ai_scroll.saturating_sub(lines);
         }
@@ -810,11 +821,11 @@ impl ExplainPullRequestScreen {
             .title_color(colors::BRAND)
             .block(build_detail_lines(&self.request))
             .steps(&build_steps(&self.request))
-            .ai_roles(vec![AiRoleRow::new(
+            .ai_roles(vec![AiRoleRow::from_config(
                 "explain",
                 colors::BRAND,
-                self.ai.model.clone(),
-                self.ai.thinking.clone(),
+                &self.ai,
+                "Edit files",
             )])
             .modal(self.confirm.as_ref())
     }
@@ -922,7 +933,7 @@ impl ExplainPullRequestScreen {
         // us to the error view). Show a placeholder + any structured events.
         let lines: Vec<Line<'static>> = if self.ai_log.is_empty() {
             vec![Line::from(Span::styled(
-                "Preparing the diff and launching opencode...",
+                "Preparing the diff and launching the configured AI...",
                 Style::default()
                     .fg(colors::MUTED)
                     .add_modifier(Modifier::DIM),
@@ -950,7 +961,7 @@ impl ExplainPullRequestScreen {
 
         let focused_inner = self.pty.is_some() && self.pty_focused;
         let focus_label = if focused_inner {
-            "Inner (opencode)"
+            "Inner (AI CLI)"
         } else {
             "Outer (wisetree)"
         };
@@ -974,7 +985,7 @@ impl ExplainPullRequestScreen {
             if focused_inner {
                 "Switch to Wisetree"
             } else {
-                "Switch to opencode"
+                "Switch to AI CLI"
             }
             .to_string(),
             muted,
@@ -1156,7 +1167,7 @@ fn build_confirm(request: &ExplainPullRequestRequest) -> ConfirmationModal {
 fn build_finalize_modal() -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title("Draft ready?")
-        .with_subtitle("Has opencode finished writing pull_request.md?")
+        .with_subtitle("Has the AI CLI finished writing pull_request.md?")
         .with_confirm_text("Yes")
         .with_cancel_text("No")
         .with_color("#eada61")
@@ -1268,7 +1279,7 @@ fn build_steps(request: &ExplainPullRequestRequest) -> Vec<String> {
     };
     vec![
         "Gather commit log + diff vs base ref".to_string(),
-        "Opencode drafts `pull_request.md` (title + description)".to_string(),
+        "Configured AI drafts `pull_request.md` (title + description)".to_string(),
         "You review the draft, then Open/Update or Finish".to_string(),
         submit_step,
     ]
@@ -1326,6 +1337,7 @@ mod tests {
         AiModelConfig {
             model: "opencode/explain-model".to_string(),
             thinking: "max".to_string(),
+            harness: Default::default(),
         }
     }
 
@@ -1509,6 +1521,7 @@ mod tests {
             vec!["5".to_string()],
             std::env::temp_dir(),
             Vec::new(),
+            true,
         );
         assert!(screen.has_pty(), "PTY is live while opencode runs");
 

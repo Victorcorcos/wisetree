@@ -8,11 +8,10 @@
 //!   (no parseable `BUG_INVESTIGATION.md`, or Start fresh / Overwrite).
 //! - `Working`     : quiet spinner covering every captured / deterministic
 //!   phase (preflight, snapshots, commit, revert, judge).
-//! - `Investigating`: the embedded opencode **TUI** (AI Activity panel,
-//!   read-only Plan agent) showing the investigation live. The TUI never
-//!   exits on its own, so the App watches opencode's database with an
-//!   `OpencodeTurnWatcher` and advances automatically when the turn
-//!   completes, reading the transcript from that database too.
+//! - `Investigating`: the embedded configured AI harness (AI Activity panel,
+//!   read-only Plan agent) showing the investigation live. The App watches
+//!   the selected harness transcript and advances automatically when the turn
+//!   completes.
 //! - `ResumePrompt`: native buttons for the three preflight prompts —
 //!   leftover-attempt recovery, Resume / Start fresh, Overwrite / Cancel.
 //! - `Select`      : the ranked-causes table + detail panel; ↑/↓ skip
@@ -54,11 +53,6 @@ use crate::tui::widgets::{
     ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView,
     Status, StatusIndicator, SummaryRow,
 };
-
-/// CSI sequences forwarded to opencode for page scrolling while it owns the
-/// alternate screen (its scrollback is unreachable from vt100).
-const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
-const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BugkillStep {
@@ -447,15 +441,17 @@ impl BugkillPullRequestScreen {
         self.pre_snapshot = Some(snapshot);
     }
 
-    /// Show the AI Activity panel for the live investigation; the App then
-    /// spawns the captured `opencode run` PTY. `corrective` marks the
+    /// Show the AI Activity panel for the live investigation. `corrective` marks the
     /// single stricter-contract retry after a parse failure.
     pub fn start_investigating(&mut self, corrective: bool) {
         self.step = BugkillStep::Investigating;
         self.phase_message = if corrective {
             "Investigation output could not be parsed — retrying once...".to_string()
         } else {
-            "Investigating the bug with opencode...".to_string()
+            format!(
+                "Investigating the bug with {}...",
+                self.ai.investigate.harness.display_name()
+            )
         };
         self.investigate_corrective = corrective;
         self.ai_done = false;
@@ -471,21 +467,26 @@ impl BugkillPullRequestScreen {
     /// Completion detection missed on a user-forced continue: tell the user
     /// the App is still watching for opencode to finish.
     pub fn note_investigation_waiting(&mut self) {
-        self.phase_message =
-            "opencode has not finished the investigation yet — still watching...".to_string();
+        self.phase_message = format!(
+            "{} has not finished the investigation yet — still watching...",
+            self.ai.investigate.harness.display_name()
+        );
     }
 
     /// Show the AI Activity panel; the App then spawns the PTY.
     pub fn start_fixing(&mut self) {
         self.step = BugkillStep::Fixing;
-        self.phase_message = "Applying the fix with opencode...".to_string();
+        self.phase_message = format!(
+            "Applying the fix with {}...",
+            self.ai.fix.harness.display_name()
+        );
         self.ai_done = false;
         self.pty = None;
         self.pty_focused = false;
         self.finalize_confirm = None;
     }
 
-    /// Spawn opencode inside the embedded PTY. A spawn failure surfaces as
+    /// Spawn the selected AI harness inside the embedded PTY. A spawn failure surfaces as
     /// an error notice.
     pub fn spawn_opencode_pty(
         &mut self,
@@ -493,31 +494,30 @@ impl BugkillPullRequestScreen {
         args: Vec<String>,
         cwd: PathBuf,
         env: Vec<(String, String)>,
+        renders_inline: bool,
     ) {
-        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env, renders_inline) {
             Ok(pty) => self.pty = Some(pty),
-            Err(err) => self.set_error(format!("Could not spawn opencode in PTY: {err}")),
+            Err(err) => self.set_error(format!("Could not spawn AI CLI in PTY: {err}")),
         }
     }
 
-    /// Poll the embedded PTY for child exit and resize it. Returns `true`
-    /// exactly once — on the tick opencode exits — so the App can scan +
-    /// commit the attempt.
-    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> bool {
-        let Some(pty) = self.pty.as_mut() else {
-            return false;
-        };
+    /// Poll the embedded PTY for child exit and resize it. Returns its exit
+    /// code exactly once so callers only scan and commit successful fixes.
+    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> Option<i32> {
+        let pty = self.pty.as_mut()?;
         if let Some((rows, cols)) = panel_inner {
             pty.resize(rows, cols);
         }
         if pty.poll_exited() {
             if self.ai_done {
-                return false;
+                return None;
             }
             self.ai_done = true;
-            return true;
+            // An unavailable status is not evidence of a successful fix.
+            return Some(pty.exit_code().unwrap_or(-1));
         }
-        false
+        None
     }
 
     /// Tear the PTY down (Esc-abort path).
@@ -646,12 +646,12 @@ impl BugkillPullRequestScreen {
 
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
         match self.step {
-            // Both live steps embed the opencode TUI on its alternate
-            // screen, whose scrollback is unreachable from vt100 — forward
-            // page keys to the child instead.
+            // Both live steps embed an AI TUI. Alt-screen children (opencode)
+            // own their scroll region, so `wheel_up` sends them a page key;
+            // inline children (codex, claude) scroll the vt100 buffer instead.
             BugkillStep::Fixing | BugkillStep::Investigating => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_UP);
+                    pty.wheel_up(lines);
                 }
                 true
             }
@@ -667,7 +667,7 @@ impl BugkillPullRequestScreen {
         match self.step {
             BugkillStep::Fixing | BugkillStep::Investigating => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_DOWN);
+                    pty.wheel_down(lines);
                 }
                 true
             }
@@ -1146,7 +1146,7 @@ impl BugkillPullRequestScreen {
             "The investigate AI explores the code read-only and ranks likely root causes \
              into `BUG_INVESTIGATION.md`.",
             "You pick one proposed fix from the ranked table.",
-            "The fix AI applies only that fix, live, in an embedded opencode terminal.",
+            "The fix AI applies only that fix, live, in an embedded selected-AI terminal.",
             "You confirm whether the bug is gone — Yes keeps the fix (committed on the \
              branch), No reverts it with git revert (history preserved) and returns you to \
              the table.",
@@ -1205,24 +1205,14 @@ impl BugkillPullRequestScreen {
     /// reasoning effort) each pipeline phase will spend before confirming.
     fn confirm_ai_roles(&self) -> Vec<AiRoleRow> {
         vec![
-            AiRoleRow::new(
+            AiRoleRow::from_config(
                 "investigate",
                 colors::BRAND,
-                self.ai.investigate.model.clone(),
-                self.ai.investigate.thinking.clone(),
+                &self.ai.investigate,
+                "Read-only",
             ),
-            AiRoleRow::new(
-                "fix",
-                colors::SUCCESS,
-                self.ai.fix.model.clone(),
-                self.ai.fix.thinking.clone(),
-            ),
-            AiRoleRow::new(
-                "judge",
-                colors::INFO,
-                self.ai.judge.model.clone(),
-                self.ai.judge.thinking.clone(),
-            ),
+            AiRoleRow::from_config("fix", colors::SUCCESS, &self.ai.fix, "Edit files"),
+            AiRoleRow::from_config("judge", colors::INFO, &self.ai.judge, "Read-only"),
         ]
     }
 
@@ -1627,9 +1617,15 @@ impl BugkillPullRequestScreen {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 if self.step == BugkillStep::Investigating {
-                    "Launching opencode to investigate the bug..."
+                    format!(
+                        "Launching {} to investigate the bug...",
+                        self.ai.investigate.harness.display_name()
+                    )
                 } else {
-                    "Launching opencode to apply the fix..."
+                    format!(
+                        "Launching {} to apply the fix...",
+                        self.ai.fix.harness.display_name()
+                    )
                 },
                 muted_dim(),
             ))),
@@ -1644,9 +1640,17 @@ impl BugkillPullRequestScreen {
             Span::styled("Focus: ".to_string(), muted_dim()),
             Span::styled(
                 if focused_inner {
-                    "Inner (opencode)"
+                    format!(
+                        "Inner ({})",
+                        match self.step {
+                            BugkillStep::Investigating => {
+                                self.ai.investigate.harness.display_name()
+                            }
+                            _ => self.ai.fix.harness.display_name(),
+                        }
+                    )
                 } else {
-                    "Outer (wisetree)"
+                    "Outer (Wisetree)".to_string()
                 }
                 .to_string(),
                 Style::default()
@@ -1661,11 +1665,18 @@ impl BugkillPullRequestScreen {
             Span::styled("Tab ".to_string(), Style::default().fg(colors::BRAND)),
             Span::styled(
                 if focused_inner {
-                    "Switch to Wisetree"
+                    "Switch to Wisetree".to_string()
                 } else {
-                    "Switch to opencode"
-                }
-                .to_string(),
+                    format!(
+                        "Switch to {}",
+                        match self.step {
+                            BugkillStep::Investigating => {
+                                self.ai.investigate.harness.display_name()
+                            }
+                            _ => self.ai.fix.harness.display_name(),
+                        }
+                    )
+                },
                 muted_dim(),
             ),
         ];
@@ -2208,14 +2219,17 @@ mod tests {
             investigate: AiModelConfig {
                 model: "strong/model".to_string(),
                 thinking: "xhigh".to_string(),
+                harness: Default::default(),
             },
             fix: AiModelConfig {
                 model: "fast/model".to_string(),
                 thinking: String::new(),
+                harness: Default::default(),
             },
             judge: AiModelConfig {
                 model: "tiny/model".to_string(),
                 thinking: "low".to_string(),
+                harness: Default::default(),
             },
         }
     }
@@ -2543,12 +2557,12 @@ mod tests {
         assert!(s.wants_full_panel());
         let dump = render_dump(&mut s, 110, 30);
         assert!(
-            dump.contains("Investigating the bug with opencode..."),
+            dump.contains("Investigating the bug with OpenCode..."),
             "{dump}"
         );
         assert!(dump.contains("AI Activity"), "{dump}");
         assert!(
-            dump.contains("Launching opencode to investigate the bug..."),
+            dump.contains("Launching OpenCode to investigate the bug..."),
             "{dump}"
         );
         assert!(dump.contains("Cancel investigation"), "{dump}");
@@ -2600,7 +2614,7 @@ mod tests {
         s.note_investigation_waiting();
         let dump = render_dump(&mut s, 110, 30);
         assert!(
-            dump.contains("opencode has not finished the investigation yet"),
+            dump.contains("OpenCode has not finished the investigation yet"),
             "{dump}"
         );
     }

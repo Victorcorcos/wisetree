@@ -16,7 +16,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, MissedTickBehavior};
 
-use crate::config::schema::{normalize_dashboard_columns, AiModelConfig, DashboardConfig};
+use crate::config::schema::{
+    normalize_dashboard_columns, AiHarness, AiModelConfig, DashboardConfig,
+};
 use crate::constants::dashboard_pr_cache_file;
 use crate::errors::{handle_git_error, Result, WisetreeError};
 use crate::files::{strip_ansi, ActivityKind};
@@ -38,6 +40,7 @@ use crate::services::reviewer_routing::{relationship_groups, ReviewRouteFile};
 use crate::services::reviewer_tests::{
     build_coverage_ledger, ReviewCoverageInput, ReviewCoverageLedger,
 };
+use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// `gh api graphql` may include the network round-trip — give it more headroom
@@ -468,16 +471,15 @@ pub enum UpdatePullRequestOutcome {
     /// re-push) sent `git push origin HEAD` and it succeeded. No merge was
     /// attempted — the branch was already ahead-but-not-behind.
     Pushed,
-    /// Conflicts were detected, `ai.model` is set, opencode is on PATH, and
+    /// Conflicts were detected, `ai.update` passed preflight, and the merge is
     /// the merge is paused mid-flight (index has conflict markers). The
     /// UI takes over from here: it spawns opencode inside an embedded
     /// PTY so the user sees the real opencode TUI in the AI Activity
     /// panel. Once opencode exits, the screen surfaces Complete/Cancel
     /// which dispatches `commit_and_push_ai_merge` or `abort_ai_merge`.
     ConflictsHandedOffToUi {
-        opencode_binary: PathBuf,
-        opencode_args: Vec<String>,
-        cwd: PathBuf,
+        command: AiCommand,
+        harness: AiHarness,
         model: String,
         base_ref: String,
         conflicts: Vec<String>,
@@ -487,10 +489,9 @@ pub enum UpdatePullRequestOutcome {
     /// the worktree is clean again. The list of conflicted files is
     /// included so the toast can show how many files need attention.
     ConflictsRequireAi { conflicts: Vec<String> },
-    /// Conflicts were detected, `ai.model` is set, but the `opencode` binary
-    /// is not on PATH. The merge has been aborted; the worktree is clean
-    /// again.
-    AiUnavailable { conflicts: Vec<String> },
+    /// The selected `ai.update` harness could not be used. This is reported
+    /// before fetch/merge where possible, so the repository is untouched.
+    AiPreflightFailed { message: String },
     /// Commit + push after AI resolution succeeded. Returned by
     /// `commit_and_push_ai_merge`.
     MergedWithAiResolution,
@@ -542,15 +543,14 @@ pub enum UpdateBranchOutcome {
     /// not a merge conflict — there are no markers and nothing for opencode
     /// to resolve — so the UI just tells the user to commit or stash first.
     WorkingTreeDirty { files: Vec<String> },
-    /// Merge conflicts were detected, `ai.model` is set, and `opencode` is on
-    /// PATH. The merge is left mid-flight (conflict markers in the index)
+    /// Merge conflicts were detected and `ai.update` passed preflight. The
+    /// merge is left mid-flight (conflict markers in the index)
     /// and the UI takes over: it spawns opencode inside an embedded PTY to
     /// resolve the conflicts, then commits the result locally (no push).
     /// Mirrors `UpdatePullRequestOutcome::ConflictsHandedOffToUi`.
     ConflictsHandedOffToUi {
-        opencode_binary: PathBuf,
-        opencode_args: Vec<String>,
-        cwd: PathBuf,
+        command: AiCommand,
+        harness: AiHarness,
         model: String,
         base_ref: String,
         conflicts: Vec<String>,
@@ -559,10 +559,9 @@ pub enum UpdateBranchOutcome {
     /// aborted and the UI prompts the user to configure `ai.model` or resolve
     /// the conflicts manually.
     ConflictsRequireAi { conflicts: Vec<String> },
-    /// Merge conflicts were detected and `ai.model` is set, but the `opencode`
-    /// binary is not on PATH — the merge is aborted and the UI prompts the
-    /// user to install opencode.
-    AiUnavailable { conflicts: Vec<String> },
+    /// The selected `ai.update` harness could not be used. This is reported
+    /// before fetch/merge where possible, so the repository is untouched.
+    AiPreflightFailed { message: String },
 }
 
 /// Result of the read-only preparation phase of the "Explain Pull Request"
@@ -575,9 +574,8 @@ pub enum ExplainPreparation {
     /// The UI owns the PTY lifecycle from here; once opencode finishes the
     /// screen reads `pull_request.md` and offers to open/update the PR.
     HandedOffToUi {
-        opencode_binary: PathBuf,
-        opencode_args: Vec<String>,
-        cwd: PathBuf,
+        command: AiCommand,
+        harness: AiHarness,
         model: String,
     },
     /// No commits ahead of the base ref → there is nothing to describe.
@@ -750,9 +748,16 @@ pub enum FixVerdict {
 /// [`ExplainPreparation::HandedOffToUi`]. The UI owns the PTY from here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixApplyHandoff {
-    pub opencode_binary: PathBuf,
-    pub opencode_args: Vec<String>,
-    pub cwd: PathBuf,
+    pub command: AiCommand,
+    pub harness: AiHarness,
+}
+
+/// Spawn parameters for a Develop phase. Unlike older live workflows, Develop
+/// can use any configured harness, so the watcher must retain its identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevelopHandoff {
+    pub command: AiCommand,
+    pub harness: AiHarness,
 }
 
 /// Result of the post-apply [`DashboardService::commit_and_reply`] step.
@@ -868,6 +873,7 @@ struct ReviewModelSelection {
     profile: ReviewModelProfile,
     model: String,
     thinking: String,
+    harness: AiHarness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1572,6 +1578,8 @@ pub struct DashboardService {
     /// Path to the `opencode` binary. Production points at the resolved
     /// name on PATH; tests can swap in a deterministic local stub.
     opencode_binary: PathBuf,
+    codex_binary: PathBuf,
+    claude_binary: PathBuf,
     cache_path: Option<PathBuf>,
     pr_state: Arc<Mutex<PrCacheState>>,
     ai_status: AiStatusService,
@@ -1600,6 +1608,8 @@ impl DashboardService {
             git_binary,
             gh_binary,
             opencode_binary: PathBuf::from(crate::constants::OPENCODE_CLI_BINARY),
+            codex_binary: PathBuf::from("codex"),
+            claude_binary: PathBuf::from("claude"),
             cache_path: Some(dashboard_pr_cache_file()),
             pr_state: Arc::new(Mutex::new(PrCacheState::default())),
             ai_status,
@@ -1644,6 +1654,51 @@ impl DashboardService {
     pub fn with_opencode_binary(mut self, opencode_binary: PathBuf) -> Self {
         self.opencode_binary = opencode_binary;
         self
+    }
+
+    /// Override one configured AI harness binary. This keeps provider-specific
+    /// execution testable without changing the persisted harness selection.
+    pub fn with_ai_binary(mut self, harness: AiHarness, binary: PathBuf) -> Self {
+        match harness {
+            AiHarness::OpenCode => self.opencode_binary = binary,
+            AiHarness::Codex => self.codex_binary = binary,
+            AiHarness::ClaudeCode => self.claude_binary = binary,
+        }
+        self
+    }
+
+    /// Builds a CLI invocation from the selected harness without changing the
+    /// dashboard status detector configuration. The legacy handoff fields keep
+    /// the current TUI/PTY plumbing stable while their values are now neutral.
+    fn ai_runner(&self) -> AiRunner {
+        AiRunner::default()
+            .with_binary(AiHarness::OpenCode, self.opencode_binary.clone())
+            .with_binary(AiHarness::Codex, self.codex_binary.clone())
+            .with_binary(AiHarness::ClaudeCode, self.claude_binary.clone())
+    }
+
+    async fn ai_command(
+        &self,
+        slot: &str,
+        config: &AiModelConfig,
+        prompt: String,
+        cwd: PathBuf,
+        mode: AiRunMode,
+        permission: AiPermission,
+    ) -> Result<AiCommand> {
+        self.ai_runner()
+            .preflight(&AiRunRequest {
+                slot: slot.to_string(),
+                config: config.clone(),
+                prompt,
+                cwd,
+                mode,
+                permission,
+                timeout: Duration::from_secs(0),
+                activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+                session_title: None,
+            })
+            .await
     }
 
     /// Override the disk cache location. Pass `None` to disable disk
@@ -2149,6 +2204,27 @@ impl DashboardService {
             }
         };
 
+        // Validate the exact configured Update slot before fetch/merge can
+        // alter refs or the index. A later command is rebuilt with the real
+        // conflict list, but its capability has already been checked here.
+        if !self.config.ai.update.model.trim().is_empty() {
+            if let Err(error) = self
+                .ai_command(
+                    "dashboard.ai.update",
+                    &self.config.ai.update,
+                    "Resolve merge conflicts in this worktree when needed.".to_string(),
+                    cwd.clone(),
+                    AiRunMode::Interactive,
+                    AiPermission::Implement,
+                )
+                .await
+            {
+                return Ok(UpdatePullRequestOutcome::AiPreflightFailed {
+                    message: crate::errors::user_friendly_message(&error),
+                });
+            }
+        }
+
         // 1. fetch
         send_phase(UpdatePhase::Fetching);
         let fetch = with_timeout(
@@ -2226,12 +2302,33 @@ impl DashboardService {
                 count: conflicts.len(),
             });
 
-            // Bail early if opencode isn't on PATH so the user sees the
-            // dedicated "install opencode" toast instead of a spawn
-            // error from the PTY widget.
-            if !binary_available(&self.opencode_binary) {
+            let prompt = build_merge_prompt(base_ref, &conflicts, autonomous);
+            let command = match self
+                .ai_command(
+                    "dashboard.ai.update",
+                    &self.config.ai.update,
+                    prompt,
+                    cwd.clone(),
+                    AiRunMode::Interactive,
+                    AiPermission::Implement,
+                )
+                .await
+            {
+                Ok(command) => command,
+                Err(error) => {
+                    // A capability can disappear between preflight and this
+                    // handoff. Never leave that failure as a paused merge.
+                    let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                    return Ok(UpdatePullRequestOutcome::AiPreflightFailed {
+                        message: crate::errors::user_friendly_message(&error),
+                    });
+                }
+            };
+            if command.args.is_empty() {
                 let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
-                return Ok(UpdatePullRequestOutcome::AiUnavailable { conflicts });
+                return Ok(UpdatePullRequestOutcome::AiPreflightFailed {
+                    message: "The selected Update AI command is empty.".to_string(),
+                });
             }
 
             send_phase(UpdatePhase::AiResolving {
@@ -2244,37 +2341,13 @@ impl DashboardService {
                 },
             );
 
-            // Build the command the UI will spawn inside its embedded
-            // PTY. Invoke opencode's *default* TUI subcommand (no
-            // explicit subcommand → `opencode [project]` starts the
-            // full TUI) with `--prompt <prompt>` so the merger prompt
-            // is auto-sent on launch and `-m <model>` so the user's
-            // configured model is honored. `opencode run` would also
-            // work, but its output is the plain CLI transcript — only
-            // the TUI renders the full Monokai theme (orange Thinking
-            // headers, colored tool calls, syntax-highlighted diffs)
-            // the user expects to see inside the AI Activity panel. The
-            // TUI has no `--variant` flag, so the configured reasoning
-            // effort is seeded into opencode's `model.json` instead (see
-            // `seed_opencode_tui_variant`).
-            seed_opencode_tui_variant(&model, &self.config.ai.update.thinking);
-            let prompt = build_merge_prompt(base_ref, &conflicts, autonomous);
-            let mut opencode_args: Vec<String> = vec![
-                "--prompt".to_string(),
-                prompt,
-                "-m".to_string(),
-                model.clone(),
-            ];
-            opencode_args.push(cwd.to_string_lossy().to_string());
-
             // Hand control to the UI. The merge is still mid-flight on
             // disk (conflict markers in the index); the screen owns the
             // PTY lifecycle from here, and the user finishes the flow
             // via `commit_and_push_ai_merge` or `abort_ai_merge`.
             return Ok(UpdatePullRequestOutcome::ConflictsHandedOffToUi {
-                opencode_binary: self.opencode_binary.clone(),
-                opencode_args,
-                cwd: cwd.clone(),
+                command,
+                harness: self.config.ai.update.harness,
                 model,
                 base_ref: base_ref.to_string(),
                 conflicts,
@@ -2332,6 +2405,24 @@ impl DashboardService {
     /// mother or derived — pulling its base branch in without pushing.
     pub async fn update_branch(&self, worktree_path: &str) -> Result<UpdateBranchOutcome> {
         let cwd = PathBuf::from(worktree_path);
+
+        if !self.config.ai.update.model.trim().is_empty() {
+            if let Err(error) = self
+                .ai_command(
+                    "dashboard.ai.update",
+                    &self.config.ai.update,
+                    "Resolve merge conflicts in this worktree when needed.".to_string(),
+                    cwd.clone(),
+                    AiRunMode::Interactive,
+                    AiPermission::Implement,
+                )
+                .await
+            {
+                return Ok(UpdateBranchOutcome::AiPreflightFailed {
+                    message: crate::errors::user_friendly_message(&error),
+                });
+            }
+        }
 
         // Pre-flight: a dirty working tree makes `git merge` refuse before it
         // even starts ("Your local changes ... would be overwritten by
@@ -2391,34 +2482,34 @@ impl DashboardService {
             return Ok(UpdateBranchOutcome::ConflictsRequireAi { conflicts });
         }
 
-        // Bail early if opencode isn't on PATH so the user sees the
-        // dedicated "install opencode" toast instead of a spawn error.
-        if !binary_available(&self.opencode_binary) {
-            let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
-            return Ok(UpdateBranchOutcome::AiUnavailable { conflicts });
-        }
-
         // Hand control to the UI. The merge is still mid-flight on disk
         // (conflict markers in the index); the screen owns the opencode
         // PTY lifecycle from here and commits the result locally (no push)
         // via the same machinery as the Update Pull Request flow.
-        // The TUI takes no `--variant`; seed the reasoning effort into
-        // opencode's `model.json` so it opens at the configured strength.
-        seed_opencode_tui_variant(&model, &self.config.ai.update.thinking);
         // The local "Update branch" flow skips the confirm screen, so it
         // cannot expose the autonomous toggle; default to autonomous mode.
-        let prompt = build_merge_prompt(&base_ref, &conflicts, true);
-        let mut opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
-            prompt,
-            "-m".to_string(),
-            model.clone(),
-        ];
-        opencode_args.push(cwd.to_string_lossy().to_string());
+        let command = match self
+            .ai_command(
+                "dashboard.ai.update",
+                &self.config.ai.update,
+                build_merge_prompt(&base_ref, &conflicts, true),
+                cwd.clone(),
+                AiRunMode::Interactive,
+                AiPermission::Implement,
+            )
+            .await
+        {
+            Ok(command) => command,
+            Err(error) => {
+                let _ = run_command(&self.git_binary, &["merge", "--abort"], Some(&cwd)).await;
+                return Ok(UpdateBranchOutcome::AiPreflightFailed {
+                    message: crate::errors::user_friendly_message(&error),
+                });
+            }
+        };
         Ok(UpdateBranchOutcome::ConflictsHandedOffToUi {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
-            cwd: cwd.clone(),
+            command,
+            harness: self.config.ai.update.harness,
             model,
             base_ref,
             conflicts,
@@ -2526,33 +2617,25 @@ impl DashboardService {
         if model.is_empty() {
             return Ok(ExplainPreparation::AiNotConfigured);
         }
-        if !binary_available(&self.opencode_binary) {
-            return Ok(ExplainPreparation::AiUnavailable);
-        }
-
         let ticket = extract_ticket(branch).unwrap_or_default();
         let template = read_pr_template(&cwd).await;
         let prompt =
             build_explain_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
 
-        // Invoke opencode's default TUI (no subcommand) with `--prompt` so
-        // the explainer instructions auto-send on launch and `-m <model>` so
-        // the user's configured model is honored — mirrors the merge flow.
-        // The TUI takes no `--variant`, so the reasoning effort is seeded into
-        // opencode's `model.json` first (see `seed_opencode_tui_variant`).
-        seed_opencode_tui_variant(&model, &self.config.ai.explain.thinking);
-        let mut opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
-            prompt,
-            "-m".to_string(),
-            model.clone(),
-        ];
-        opencode_args.push(cwd.to_string_lossy().to_string());
+        let command = self
+            .ai_command(
+                "dashboard.ai.explain",
+                &self.config.ai.explain,
+                prompt,
+                cwd,
+                AiRunMode::Interactive,
+                AiPermission::Implement,
+            )
+            .await?;
 
         Ok(ExplainPreparation::HandedOffToUi {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
-            cwd,
+            command,
+            harness: self.config.ai.explain.harness,
             model,
         })
     }
@@ -2839,43 +2922,28 @@ impl DashboardService {
         history: Option<&str>,
     ) -> Result<FixVerdict> {
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.fix.plan.model.trim().to_string();
-        if model.is_empty() {
-            return Err(WisetreeError::other("ai.fix.plan.model is not configured."));
-        }
         let code = match &group.file {
             Some(file) => read_code_window(&cwd, file, group.line).await,
             None => String::new(),
         };
         let prompt = build_fix_plan_prompt(group, &code, feedback, previous_plan, history);
-        // `opencode run` is the captured/non-interactive transcript mode — no
-        // inner TUI; we parse its stdout. `-m` honors the configured model.
-        // `--agent plan` pins it to opencode's read-only Plan agent (write /
-        // edit / patch tools disabled), so this phase can ONLY think and emit a
-        // verdict — it cannot touch files. This matters most on the "Other"
-        // re-plan: the user's feedback reads like a direct instruction, and the
-        // default (build) agent would act on it — editing the file and skipping
-        // the verdict — which made "Other" silently apply a change and advance
-        // instead of showing a revised plan. Read-only forces a clean re-plan.
-        // `opencode run` accepts `--variant <effort>`, so the plan phase honors
-        // its configured thinking strength directly (unlike the TUI flows).
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
+        let request = AiRunRequest {
+            slot: "dashboard.ai.fix.plan".to_string(),
+            config: self.config.ai.fix.plan.clone(),
             prompt,
-            "-m".to_string(),
-            model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-        ];
-        run_args.extend(run_variant_args(&self.config.ai.fix.plan.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let output = time::timeout(
-            FIX_PLAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("opencode planning timed out after 180s"))?
-        .map_err(WisetreeError::other)?;
+            cwd,
+            mode: AiRunMode::Captured,
+            permission: AiPermission::Plan,
+            timeout: FIX_PLAN_TIMEOUT,
+            activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+            session_title: None,
+        };
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let output = self
+            .ai_runner()
+            .run_captured(&request, None, cancel_rx)
+            .await?
+            .transcript;
 
         parse_fix_verdict(&output).ok_or_else(|| {
             WisetreeError::other("could not parse a verdict from the planning AI output.")
@@ -2894,27 +2962,20 @@ impl DashboardService {
         plan: &FixPlan,
     ) -> Result<FixApplyHandoff> {
         let cwd = PathBuf::from(worktree_path);
-        let model = self.config.ai.fix.apply.model.trim().to_string();
-        if model.is_empty() {
-            return Err(WisetreeError::other(
-                "ai.fix.apply.model is not configured.",
-            ));
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
-        }
         let prompt = build_fix_apply_prompt(group, plan);
-        // The apply phase runs in the opencode TUI (live edits in the AI
-        // Activity panel), which takes no `--variant`; seed the reasoning
-        // effort into `model.json` before spawning.
-        seed_opencode_tui_variant(&model, &self.config.ai.fix.apply.thinking);
-        let mut opencode_args: Vec<String> =
-            vec!["--prompt".to_string(), prompt, "-m".to_string(), model];
-        opencode_args.push(cwd.to_string_lossy().to_string());
+        let command = self
+            .ai_command(
+                "dashboard.ai.fix.apply",
+                &self.config.ai.fix.apply,
+                prompt,
+                cwd.clone(),
+                AiRunMode::Interactive,
+                AiPermission::Implement,
+            )
+            .await?;
         Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
-            cwd,
+            command,
+            harness: self.config.ai.fix.apply.harness,
         })
     }
 
@@ -3113,6 +3174,7 @@ impl DashboardService {
             profile,
             model: config.model.trim().to_string(),
             thinking: config.thinking.clone(),
+            harness: config.harness,
         }
     }
 
@@ -3129,9 +3191,6 @@ impl DashboardService {
         }
         if !self.config.ai.review.has_discovery_models() {
             return Ok(ReviewPreparation::AiNotConfigured);
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Ok(ReviewPreparation::AiUnavailable);
         }
         let cwd = PathBuf::from(worktree_path);
 
@@ -3374,33 +3433,10 @@ impl DashboardService {
             &group.relationship_summary,
         );
         let prompt_bytes = prompt.len();
-        let title = review_scan_title();
-        let mut run_args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode review group timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_multi_file_findings(&output, &group.files, None) {
+        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_multi_file_findings(&output, &group.files, None) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -3410,7 +3446,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             scan,
             prompt_bytes,
@@ -3491,35 +3526,14 @@ impl DashboardService {
                 &selection,
             );
         }
-        let title = review_scan_title();
-        let mut run_args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let result = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &run_args_ref,
-                Some(Path::new(worktree_path)),
-            ),
-        )
-        .await
-        {
-            Err(_) => Err(WisetreeError::other("review verifier timed out after 240s")),
-            Ok(Err(err)) => Err(WisetreeError::other(err)),
-            Ok(Ok(output)) => parse_review_verification(&output, file)
+        let (output, usage) = self
+            .run_review_prompt(Path::new(worktree_path), &selection, prompt)
+            .await;
+        let result = match output {
+            Err(err) => Err(err),
+            Ok(output) => parse_review_verification(&output, file)
                 .ok_or_else(|| WisetreeError::other("could not parse the review verifier output")),
         };
-        let usage = opencode_usage_for_title(title).await;
         review_verification_attempt(scan, prompt_bytes, started, usage, result, &selection)
     }
 
@@ -3533,33 +3547,10 @@ impl DashboardService {
         selection: ReviewModelSelection,
     ) -> ReviewScanAttempt {
         let prompt_bytes = prompt.len();
-        let title = review_scan_title();
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode review scan timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_review_findings(
+        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_review_findings(
                 &output,
                 &file.path,
                 &file.commentable_lines,
@@ -3574,7 +3565,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             scan,
             prompt_bytes,
@@ -3584,6 +3574,55 @@ impl DashboardService {
             raw_output,
             &selection,
         )
+    }
+
+    /// Runs exactly the configured review harness under its read-only policy.
+    /// OpenCode usage is correlated with its session title; other harnesses do
+    /// not borrow OpenCode's storage and therefore remain explicitly unknown.
+    async fn run_review_prompt(
+        &self,
+        cwd: &Path,
+        selection: &ReviewModelSelection,
+        prompt: String,
+    ) -> (Result<String>, Option<ReviewTokenUsage>) {
+        self.run_review_prompt_with_timeout(cwd, selection, prompt, REVIEW_SCAN_TIMEOUT)
+            .await
+    }
+
+    async fn run_review_prompt_with_timeout(
+        &self,
+        cwd: &Path,
+        selection: &ReviewModelSelection,
+        prompt: String,
+        timeout: Duration,
+    ) -> (Result<String>, Option<ReviewTokenUsage>) {
+        let title = (selection.harness == AiHarness::OpenCode).then(review_scan_title);
+        let request = AiRunRequest {
+            slot: format!("dashboard.ai.review.{}", selection.profile.label()),
+            config: AiModelConfig {
+                model: selection.model.clone(),
+                thinking: selection.thinking.clone(),
+                harness: selection.harness,
+            },
+            prompt,
+            cwd: cwd.to_path_buf(),
+            mode: AiRunMode::Captured,
+            permission: AiPermission::Plan,
+            timeout,
+            activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+            session_title: title.clone(),
+        };
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let result = self
+            .ai_runner()
+            .run_captured(&request, None, cancel_rx)
+            .await
+            .map(|run| run.transcript);
+        let usage = match title {
+            Some(title) => opencode_usage_for_title(title).await,
+            None => None,
+        };
+        (result, usage)
     }
 
     /// Scan the WHOLE diff once for missing test coverage with a single
@@ -3615,33 +3654,10 @@ impl DashboardService {
         }
         let prompt = build_review_coverage_prompt(files, context, tester_findings);
         let prompt_bytes = prompt.len();
-        let title = review_scan_title();
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode coverage scan timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_coverage_findings(&output, files) {
+        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_coverage_findings(&output, files) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -3651,7 +3667,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             "coverage".to_string(),
             prompt_bytes,
@@ -3689,33 +3704,10 @@ impl DashboardService {
         let tables_path = materialize_review_tables().await;
         let prompt = build_review_merged_prompt(files, context, tester_findings, &tables_path);
         let prompt_bytes = prompt.len();
-        let title = review_scan_title();
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode merged review scan timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_merged_findings(&output, files) {
+        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_merged_findings(&output, files) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -3725,7 +3717,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             "merged".to_string(),
             prompt_bytes,
@@ -3767,37 +3758,12 @@ impl DashboardService {
                 &selection,
             );
         }
-        let title = review_scan_title();
-        let mut run_args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref = run_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &run_args_ref,
-                Some(Path::new(worktree_path)),
-            ),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "global gap audit timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse_gap_audit_findings(&output, files) {
+        let (output, usage) = self
+            .run_review_prompt(Path::new(worktree_path), &selection, prompt)
+            .await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_gap_audit_findings(&output, files) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -3807,7 +3773,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             "gap-audit".to_string(),
             prompt_bytes,
@@ -4119,37 +4084,12 @@ impl DashboardService {
                 &selection,
             );
         }
-        let title = review_scan_title();
-        let mut run_args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        run_args.extend(run_variant_args(&selection.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let (result, raw_output) = match time::timeout(
-            REVIEW_SCAN_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &run_args_ref,
-                Some(Path::new(worktree_path)),
-            ),
-        )
-        .await
-        {
-            Err(_) => (
-                Err(WisetreeError::other(
-                    "opencode review reformat timed out after 240s",
-                )),
-                None,
-            ),
-            Ok(Err(err)) => (Err(WisetreeError::other(err)), None),
-            Ok(Ok(output)) => match parse(&output) {
+        let (output, usage) = self
+            .run_review_prompt(Path::new(worktree_path), &selection, prompt)
+            .await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse(&output) {
                 Some(findings) => (Ok(findings), None),
                 None => (
                     Err(WisetreeError::other(
@@ -4159,7 +4099,6 @@ impl DashboardService {
                 ),
             },
         };
-        let usage = opencode_usage_for_title(title).await;
         review_scan_attempt(
             scan,
             prompt_bytes,
@@ -4192,6 +4131,7 @@ impl DashboardService {
                     model_profile: selection.profile.label().to_string(),
                     model: selection.model.clone(),
                     thinking: selection.thinking.clone(),
+                    harness: selection.harness.wire_name().to_string(),
                     prompt_bytes,
                     usage: usage.unwrap_or_default(),
                     duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -4206,41 +4146,23 @@ impl DashboardService {
                 None,
             );
         }
-        let title = review_scan_title();
-        let mut args = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            selection.model.clone(),
-            "--agent".to_string(),
-            "plan".to_string(),
-            "--title".to_string(),
-            title.clone(),
-        ];
-        args.extend(run_variant_args(&selection.thinking));
-        let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let result = match time::timeout(
-            REVIEW_SUMMARY_TIMEOUT,
-            run_command(
-                &self.opencode_binary,
-                &args_ref,
-                Some(Path::new(worktree_path)),
-            ),
-        )
-        .await
-        {
-            Err(_) => Err(WisetreeError::other(
-                "review summary overview timed out after 30s",
-            )),
-            Ok(Err(err)) => Err(WisetreeError::other(err)),
-            Ok(Ok(output)) => {
+        let (output, usage) = self
+            .run_review_prompt_with_timeout(
+                Path::new(worktree_path),
+                &selection,
+                prompt,
+                REVIEW_SUMMARY_TIMEOUT,
+            )
+            .await;
+        let result = match output {
+            Err(err) => Err(err),
+            Ok(output) => {
                 validate_review_summary_overview(&output, group_findings_by_issue(posted).len())
                     .ok_or_else(|| {
                         WisetreeError::other("review summary overview was not concise prose")
                     })
             }
         };
-        let usage = opencode_usage_for_title(title).await;
         make_attempt(result, usage)
     }
 
@@ -4344,17 +4266,31 @@ impl DashboardService {
     // scans, commits, reverts, cleanup — is deterministic git work below.
     // No `gh`, no pushes anywhere in this pipeline.
 
-    /// Deterministic Bugkill pre-flight: model + opencode gates, the
+    /// Deterministic Bugkill pre-flight: investigation harness gate, the
     /// clean-tree gate, the untracked baseline snapshot, base-ref
     /// resolution, and detection of a resumable `BUG_INVESTIGATION.md`.
     pub async fn bugkill_preflight(&self, worktree_path: &str) -> Result<BugkillPreflightOutcome> {
         if self.config.ai.bugkill.investigate.model.trim().is_empty() {
             return Ok(BugkillPreflightOutcome::AiNotConfigured);
         }
-        if !binary_available(&self.opencode_binary) {
+        let cwd = PathBuf::from(worktree_path);
+        if self
+            .ai_runner()
+            .command(&AiRunRequest {
+                slot: "dashboard.ai.bugkill.investigate".to_string(),
+                config: self.config.ai.bugkill.investigate.clone(),
+                prompt: String::new(),
+                cwd: cwd.clone(),
+                mode: AiRunMode::Interactive,
+                permission: AiPermission::Plan,
+                timeout: Duration::from_secs(1),
+                activity_limit: 1,
+                session_title: None,
+            })
+            .is_err()
+        {
             return Ok(BugkillPreflightOutcome::AiUnavailable);
         }
-        let cwd = PathBuf::from(worktree_path);
         let status = self.bugkill_git_status(&cwd).await?;
 
         let investigation = tokio::fs::read_to_string(cwd.join(INVESTIGATION_FILE))
@@ -4411,13 +4347,9 @@ impl DashboardService {
         })))
     }
 
-    /// Build the spawn parameters for the live investigation: the full
-    /// opencode **TUI** pinned to the read-only Plan agent, embedded in the
-    /// AI Activity panel so the user watches opencode's own rendering. The
-    /// TUI never exits on its own — the App detects completion through an
-    /// `OpencodeTurnWatcher` and reads the transcript from opencode's
-    /// database. `corrective` appends the stricter-contract suffix used on
-    /// the single retry after a parse failure.
+    /// Build the spawn parameters for the configured live, read-only
+    /// investigation harness. `corrective` appends the stricter-contract
+    /// suffix used on the single retry after a parse failure.
     pub fn prepare_bugkill_investigate(
         &self,
         worktree_path: &str,
@@ -4426,14 +4358,10 @@ impl DashboardService {
         corrective: bool,
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.investigate;
-        let model = slot.model.trim().to_string();
-        if model.is_empty() {
+        if slot.model.trim().is_empty() {
             return Err(WisetreeError::other(
                 "ai.bugkill.investigate model is not configured.",
             ));
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let cwd = PathBuf::from(worktree_path);
         let mut prompt = build_bug_investigate_prompt(bug_description, base_ref);
@@ -4443,22 +4371,20 @@ impl DashboardService {
                  delimited block, exactly as specified."
             );
         }
-        // The opencode TUI takes no `--variant`; it honors reasoning effort
-        // solely via the persisted `model.json`, so seed it before spawning.
-        seed_opencode_tui_variant(&model, &slot.thinking);
-        let opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
+        let command = self.ai_runner().command(&AiRunRequest {
+            slot: "dashboard.ai.bugkill.investigate".to_string(),
+            config: slot.clone(),
             prompt,
-            "-m".to_string(),
-            model,
-            "--agent".to_string(),
-            "plan".to_string(),
-            cwd.to_string_lossy().to_string(),
-        ];
-        Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
             cwd,
+            mode: AiRunMode::Interactive,
+            permission: AiPermission::Plan,
+            timeout: Duration::from_secs(1),
+            activity_limit: 1,
+            session_title: None,
+        })?;
+        Ok(FixApplyHandoff {
+            command,
+            harness: slot.harness,
         })
     }
 
@@ -4473,34 +4399,34 @@ impl DashboardService {
         feedback: Option<&str>,
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.fix;
-        let model = slot.model.trim().to_string();
-        if model.is_empty() {
+        if slot.model.trim().is_empty() {
             return Err(WisetreeError::other(
                 "ai.bugkill.fix model is not configured.",
             ));
         }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
-        }
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_bug_fix_prompt(bug_description, row, feedback);
-        // The opencode TUI takes no `--variant`; it honors reasoning effort
-        // solely via the persisted `model.json`, so seed it before spawning.
-        seed_opencode_tui_variant(&model, &slot.thinking);
-        let mut opencode_args: Vec<String> =
-            vec!["--prompt".to_string(), prompt, "-m".to_string(), model];
-        opencode_args.push(cwd.to_string_lossy().to_string());
-        Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
+        let command = self.ai_runner().command(&AiRunRequest {
+            slot: "dashboard.ai.bugkill.fix".to_string(),
+            config: slot.clone(),
+            prompt,
             cwd,
+            mode: AiRunMode::Interactive,
+            permission: AiPermission::Implement,
+            timeout: Duration::from_secs(1),
+            activity_limit: 1,
+            session_title: None,
+        })?;
+        Ok(FixApplyHandoff {
+            command,
+            harness: slot.harness,
         })
     }
 
-    /// Classify the user's freeform "Other" answer as fixed / not fixed /
-    /// unclear with one tiny captured call. A parse failure — or a failed
-    /// call — is treated as `Unclear`, never as an error screen: the user
-    /// still owes a Yes/No and loses nothing.
+    /// Classify the user's freeform "Other" answer with the configured
+    /// read-only one-shot harness. Malformed output is unclear; execution
+    /// failures are preserved so the user can address authentication or launch
+    /// problems instead of receiving a misleading verdict.
     pub async fn bugkill_judge(
         &self,
         worktree_path: &str,
@@ -4508,40 +4434,41 @@ impl DashboardService {
         user_text: &str,
     ) -> Result<BugkillVerdict> {
         let slot = &self.config.ai.bugkill.judge;
-        let model = slot.model.trim().to_string();
-        if model.is_empty() {
+        if slot.model.trim().is_empty() {
             return Err(WisetreeError::other(
                 "ai.bugkill.judge model is not configured.",
             ));
         }
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_bug_judge_prompt(row, user_text);
-        let mut run_args: Vec<String> = vec![
-            "run".to_string(),
-            prompt,
-            "-m".to_string(),
-            model,
-            "--agent".to_string(),
-            "plan".to_string(),
-        ];
-        run_args.extend(run_variant_args(&slot.thinking));
-        let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-        let transcript = time::timeout(
-            BUGKILL_JUDGE_TIMEOUT,
-            run_command(&self.opencode_binary, &run_args_ref, Some(&cwd)),
-        )
-        .await
-        .unwrap_or_else(|_| Err("the judge call timed out".to_string()));
-        Ok(match transcript {
-            Ok(output) => parse_judge_verdict(&output).unwrap_or(BugkillVerdict {
+        // Keep the sender alive for the run's duration — `let (_, cancel) = ...`
+        // drops it immediately, which resolves `cancel` as closed right away
+        // and spuriously races the captured run into `AiErrorCode::Cancelled`.
+        let (_cancel_tx, cancel) = oneshot::channel();
+        let run = self
+            .ai_runner()
+            .run_captured(
+                &AiRunRequest {
+                    slot: "dashboard.ai.bugkill.judge".to_string(),
+                    config: slot.clone(),
+                    prompt,
+                    cwd,
+                    mode: AiRunMode::Captured,
+                    permission: AiPermission::Plan,
+                    timeout: BUGKILL_JUDGE_TIMEOUT,
+                    activity_limit: 1,
+                    session_title: None,
+                },
+                None,
+                cancel,
+            )
+            .await?;
+        Ok(
+            parse_judge_verdict(&run.transcript).unwrap_or(BugkillVerdict {
                 result: JudgeResult::Unclear,
                 reason: String::new(),
             }),
-            Err(_) => BugkillVerdict {
-                result: JudgeResult::Unclear,
-                reason: "The judge call failed — please answer Yes or No.".to_string(),
-            },
-        })
+        )
     }
 
     /// Fresh tracked/untracked snapshot of the worktree, with content hashes
@@ -4715,7 +4642,7 @@ impl DashboardService {
     // gates, PLAN.md rendering/parsing, progress tracking, the approval
     // loop — is deterministic Rust. The AI never reads or writes PLAN.md.
 
-    /// Deterministic Develop pre-flight: model + opencode gates, base-ref
+    /// Deterministic Develop pre-flight: model + harness gates, base-ref
     /// resolution, and detection of a resumable `PLAN.md`.
     pub async fn develop_preflight(&self, worktree_path: &str) -> Result<DevelopPreflightOutcome> {
         if self.config.ai.develop.plan.model.trim().is_empty()
@@ -4723,10 +4650,37 @@ impl DashboardService {
         {
             return Ok(DevelopPreflightOutcome::AiNotConfigured);
         }
-        if !binary_available(&self.opencode_binary) {
-            return Ok(DevelopPreflightOutcome::AiUnavailable);
-        }
         let cwd = PathBuf::from(worktree_path);
+        let runner = self.develop_runner();
+        for (slot, config, permission) in [
+            (
+                "dashboard.ai.develop.plan",
+                &self.config.ai.develop.plan,
+                AiPermission::Plan,
+            ),
+            (
+                "dashboard.ai.develop.implement",
+                &self.config.ai.develop.implement,
+                AiPermission::Implement,
+            ),
+        ] {
+            if runner
+                .command(&AiRunRequest {
+                    slot: slot.to_string(),
+                    config: config.clone(),
+                    prompt: String::new(),
+                    cwd: cwd.clone(),
+                    mode: AiRunMode::Interactive,
+                    permission,
+                    timeout: Duration::from_secs(1),
+                    activity_limit: 1,
+                    session_title: None,
+                })
+                .is_err()
+            {
+                return Ok(DevelopPreflightOutcome::AiUnavailable);
+            }
+        }
         let status = self
             .develop_git(&cwd, &["status", "--porcelain", "--untracked-files=all"])
             .await
@@ -4766,16 +4720,13 @@ impl DashboardService {
         previous_plan: Option<&str>,
         feedback: Option<&str>,
         corrective: bool,
-    ) -> Result<FixApplyHandoff> {
+    ) -> Result<DevelopHandoff> {
         let slot = &self.config.ai.develop.plan;
         let model = slot.model.trim().to_string();
         if model.is_empty() {
             return Err(WisetreeError::other(
                 "ai.develop.plan model is not configured.",
             ));
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let cwd = PathBuf::from(worktree_path);
         let mut prompt =
@@ -4786,22 +4737,20 @@ impl DashboardService {
                  delimited blocks, exactly as specified."
             );
         }
-        // The opencode TUI takes no `--variant`; it honors reasoning effort
-        // solely via the persisted `model.json`, so seed it before spawning.
-        seed_opencode_tui_variant(&model, &slot.thinking);
-        let opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
+        let command = self.develop_runner().command(&AiRunRequest {
+            slot: "dashboard.ai.develop.plan".to_string(),
+            config: slot.clone(),
             prompt,
-            "-m".to_string(),
-            model,
-            "--agent".to_string(),
-            "plan".to_string(),
-            cwd.to_string_lossy().to_string(),
-        ];
-        Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
             cwd,
+            mode: AiRunMode::Interactive,
+            permission: AiPermission::Plan,
+            timeout: Duration::from_secs(1),
+            activity_limit: 1,
+            session_title: None,
+        })?;
+        Ok(DevelopHandoff {
+            command,
+            harness: slot.harness,
         })
     }
 
@@ -4818,16 +4767,13 @@ impl DashboardService {
         sections: &str,
         outline: &str,
         check_failure: Option<&str>,
-    ) -> Result<FixApplyHandoff> {
+    ) -> Result<DevelopHandoff> {
         let slot = &self.config.ai.develop.implement;
         let model = slot.model.trim().to_string();
         if model.is_empty() {
             return Err(WisetreeError::other(
                 "ai.develop.implement model is not configured.",
             ));
-        }
-        if !binary_available(&self.opencode_binary) {
-            return Err(WisetreeError::other("opencode CLI is not on PATH."));
         }
         let cwd = PathBuf::from(worktree_path);
         let prompt = build_develop_implement_prompt(
@@ -4837,21 +4783,25 @@ impl DashboardService {
             self.config.develop.check_command.trim(),
             check_failure,
         );
-        // The opencode TUI takes no `--variant`; it honors reasoning effort
-        // solely via the persisted `model.json`, so seed it before spawning.
-        seed_opencode_tui_variant(&model, &slot.thinking);
-        let opencode_args: Vec<String> = vec![
-            "--prompt".to_string(),
+        let command = self.develop_runner().command(&AiRunRequest {
+            slot: "dashboard.ai.develop.implement".to_string(),
+            config: slot.clone(),
             prompt,
-            "-m".to_string(),
-            model,
-            cwd.to_string_lossy().to_string(),
-        ];
-        Ok(FixApplyHandoff {
-            opencode_binary: self.opencode_binary.clone(),
-            opencode_args,
             cwd,
+            mode: AiRunMode::Interactive,
+            permission: AiPermission::Implement,
+            timeout: Duration::from_secs(1),
+            activity_limit: 1,
+            session_title: None,
+        })?;
+        Ok(DevelopHandoff {
+            command,
+            harness: slot.harness,
         })
+    }
+
+    fn develop_runner(&self) -> AiRunner {
+        self.ai_runner()
     }
 
     /// Run the configured check command (Ralph-canon backpressure) in the
@@ -5577,122 +5527,6 @@ fn binary_available(binary: &Path) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-}
-
-/// `--variant <thinking>` for a non-interactive `opencode run` call (always
-/// supported there). Empty thinking (the persisted "Default") yields no args.
-fn run_variant_args(thinking: &str) -> Vec<String> {
-    let thinking = thinking.trim();
-    if thinking.is_empty() {
-        Vec::new()
-    } else {
-        vec!["--variant".to_string(), thinking.to_string()]
-    }
-}
-
-/// opencode's sentinel value for "no reasoning override" in `model.json`. The
-/// TUI persists this (not the empty string) when a model is cycled back to no
-/// variant, and treats it as "no override" because it's never a real variant
-/// name (which are reasoning efforts like `high`/`max`).
-const OPENCODE_NO_VARIANT: &str = "default";
-
-/// Persist the configured reasoning effort for `model` into opencode's
-/// `model.json` so the **TUI** opens at that thinking strength.
-///
-/// opencode's interactive TUI (`opencode [project]`) exposes no `--variant`
-/// flag — through at least 1.17.x it resolves a model's reasoning effort
-/// *solely* from its persisted state file (the "saved preference" the user
-/// otherwise cycles with ctrl+t), keyed by `provider/model`. Only `opencode
-/// run` takes `--variant` (see [`run_variant_args`]). So to launch a TUI flow
-/// at the user's configured strength we seed that exact entry here first.
-///
-/// Best-effort: any IO/JSON error is swallowed so a read-only or absent state
-/// dir never blocks the AI flow — it just launches without the seeded effort,
-/// exactly as before this seeding existed.
-fn seed_opencode_tui_variant(model: &str, thinking: &str) {
-    seed_opencode_tui_variant_at(
-        &crate::constants::opencode_model_state_file(),
-        model,
-        thinking,
-    );
-}
-
-/// [`seed_opencode_tui_variant`] against an explicit state-file path, so tests
-/// can target a tempdir instead of the developer's real `$XDG_STATE_HOME`.
-fn seed_opencode_tui_variant_at(path: &Path, model: &str, thinking: &str) {
-    let model = model.trim();
-    if model.is_empty() {
-        return;
-    }
-    let current = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let next = merged_variant_state(current, model, thinking);
-    let _ = write_json_atomic(path, &next);
-}
-
-/// Pure merge: take the current `model.json` value (or `None`) and return it
-/// with `variant[model]` set to the resolved effort, preserving every other
-/// field (`recent`, `favorite`, other models' variants). An empty `thinking`
-/// (the persisted "Default") writes [`OPENCODE_NO_VARIANT`], which clears any
-/// stale effort a prior session left for this model. Factored out so the merge
-/// is unit-testable without touching the filesystem.
-fn merged_variant_state(
-    current: Option<serde_json::Value>,
-    model: &str,
-    thinking: &str,
-) -> serde_json::Value {
-    let effort = {
-        let t = thinking.trim();
-        if t.is_empty() {
-            OPENCODE_NO_VARIANT
-        } else {
-            t
-        }
-    };
-
-    let mut root = current
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    // Safe: `root` is guaranteed to be an object by the filter/fallback above.
-    let obj = root.as_object_mut().expect("root is a json object");
-    let variant = obj
-        .entry("variant")
-        .or_insert_with(|| serde_json::json!({}));
-    if !variant.is_object() {
-        *variant = serde_json::json!({});
-    }
-    variant
-        .as_object_mut()
-        .expect("variant is a json object")
-        .insert(
-            model.to_string(),
-            serde_json::Value::String(effort.to_string()),
-        );
-    root
-}
-
-/// Atomically write `value` as JSON to `path` — write a sibling temp file then
-/// rename over the target — so a concurrent opencode reader never observes a
-/// half-written file (mirrors opencode's own `writeJsonAtomic`). Parent dirs
-/// are created as needed.
-fn write_json_atomic(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec(value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    // pid-suffixed sibling so two wisetree processes can't collide on the temp.
-    let tmp = path.with_file_name(format!(
-        ".{}.wisetree.{}.tmp",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "model.json".to_string()),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 fn is_rate_limit_error(err: &str) -> bool {
@@ -8153,6 +7987,7 @@ fn review_scan_attempt(
             model_profile: selection.profile.label().to_string(),
             model: selection.model.clone(),
             thinking: selection.thinking.clone(),
+            harness: selection.harness.wire_name().to_string(),
             prompt_bytes,
             usage: usage.unwrap_or_default(),
             duration_ms,
@@ -8214,6 +8049,7 @@ fn review_verification_attempt(
             model_profile: selection.profile.label().to_string(),
             model: selection.model.clone(),
             thinking: selection.thinking.clone(),
+            harness: selection.harness.wire_name().to_string(),
             prompt_bytes,
             usage: usage.unwrap_or_default(),
             duration_ms,
@@ -14694,110 +14530,6 @@ so the intent reads clearly.
     }
 
     #[test]
-    fn run_variant_args_emits_flag_only_for_a_set_thinking() {
-        // `opencode run` always accepts `--variant`, so the plan phase passes
-        // the configured reasoning effort through. Empty (Default) → no flag.
-        assert!(run_variant_args("").is_empty());
-        assert!(run_variant_args("   ").is_empty());
-        assert_eq!(run_variant_args("high"), vec!["--variant", "high"]);
-        assert_eq!(run_variant_args("  max "), vec!["--variant", "max"]);
-    }
-
-    #[test]
-    fn merged_variant_state_seeds_variant_into_empty_state() {
-        // No prior model.json → a fresh object carrying just the seeded effort.
-        let next = merged_variant_state(None, "openai/gpt-5.4", "high");
-        assert_eq!(next["variant"]["openai/gpt-5.4"], serde_json::json!("high"));
-    }
-
-    #[test]
-    fn merged_variant_state_preserves_other_fields_and_overwrites_same_model() {
-        // A realistic model.json: recent/favorite and other models' variants
-        // must survive untouched; only the target model's effort changes.
-        let current = serde_json::json!({
-            "recent": [{ "providerID": "openai", "modelID": "gpt-5.4" }],
-            "favorite": [],
-            "variant": {
-                "openai/gpt-5.5": "low",
-                "openai/gpt-5.4": "medium"
-            }
-        });
-        let next = merged_variant_state(Some(current), "openai/gpt-5.4", "high");
-        assert_eq!(
-            next["recent"],
-            serde_json::json!([{ "providerID": "openai", "modelID": "gpt-5.4" }])
-        );
-        assert_eq!(next["favorite"], serde_json::json!([]));
-        // Untouched sibling variant.
-        assert_eq!(next["variant"]["openai/gpt-5.5"], serde_json::json!("low"));
-        // Target model overwritten medium → high.
-        assert_eq!(next["variant"]["openai/gpt-5.4"], serde_json::json!("high"));
-    }
-
-    #[test]
-    fn merged_variant_state_writes_default_sentinel_for_blank_thinking() {
-        // Empty thinking (the persisted "Default") must clear any stale effort
-        // by writing opencode's "default" sentinel, not the empty string.
-        let current = serde_json::json!({ "variant": { "openai/gpt-5.4": "max" } });
-        for blank in ["", "   "] {
-            let next = merged_variant_state(Some(current.clone()), "openai/gpt-5.4", blank);
-            assert_eq!(
-                next["variant"]["openai/gpt-5.4"],
-                serde_json::json!("default")
-            );
-        }
-    }
-
-    #[test]
-    fn merged_variant_state_recovers_from_a_non_object_variant_field() {
-        // A corrupt/unexpected `variant` (here an array) is replaced with a
-        // fresh object rather than panicking or dropping the seed.
-        let current = serde_json::json!({ "variant": [1, 2, 3] });
-        let next = merged_variant_state(Some(current), "openai/gpt-5.4", "high");
-        assert_eq!(next["variant"]["openai/gpt-5.4"], serde_json::json!("high"));
-    }
-
-    #[test]
-    fn seed_opencode_tui_variant_at_round_trips_through_disk() {
-        // End-to-end against a tempdir: the seeded effort lands in model.json
-        // and a subsequent seed of a different model is merged in, not clobbered.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("opencode").join("model.json");
-
-        seed_opencode_tui_variant_at(&path, "openai/gpt-5.4", "high");
-        let first: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).expect("read seeded file"))
-                .expect("valid json");
-        assert_eq!(
-            first["variant"]["openai/gpt-5.4"],
-            serde_json::json!("high")
-        );
-
-        seed_opencode_tui_variant_at(&path, "opencode/glm-5.2", "max");
-        let second: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).expect("read seeded file"))
-                .expect("valid json");
-        // Both entries coexist after the second seed.
-        assert_eq!(
-            second["variant"]["openai/gpt-5.4"],
-            serde_json::json!("high")
-        );
-        assert_eq!(
-            second["variant"]["opencode/glm-5.2"],
-            serde_json::json!("max")
-        );
-    }
-
-    #[test]
-    fn seed_opencode_tui_variant_at_is_a_noop_for_blank_model() {
-        // A blank model id must never create or touch the state file.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("opencode").join("model.json");
-        seed_opencode_tui_variant_at(&path, "   ", "high");
-        assert!(!path.exists());
-    }
-
-    #[test]
     fn build_merge_prompt_substitutes_base_ref_and_conflicts() {
         let prompt = build_merge_prompt(
             "upstream/main",
@@ -15125,24 +14857,22 @@ so the intent reads clearly.
             )
             .unwrap();
 
-        assert_eq!(handoff.opencode_binary, service.opencode_binary);
-        assert_eq!(handoff.cwd, worktree.path());
+        assert_eq!(handoff.command.binary, service.opencode_binary);
+        assert_eq!(handoff.command.cwd, worktree.path());
         assert_eq!(
-            handoff.opencode_args[2..6],
+            handoff.command.args[2..6],
             ["-m", "test-model", "--agent", "plan"]
         );
         assert!(handoff
-            .opencode_args
+            .command
+            .args
             .get(1)
             .unwrap()
             .contains("Add dashboard filtering"));
-        assert!(handoff
-            .opencode_args
-            .get(1)
-            .unwrap()
-            .contains("origin/main"));
+        assert!(handoff.command.args.get(1).unwrap().contains("origin/main"));
         assert!(!handoff
-            .opencode_args
+            .command
+            .args
             .get(1)
             .unwrap()
             .contains("Your previous output could not be parsed"));
@@ -15163,7 +14893,7 @@ so the intent reads clearly.
             )
             .unwrap();
 
-        assert!(handoff.opencode_args.get(1).unwrap().ends_with(
+        assert!(handoff.command.args.get(1).unwrap().ends_with(
             "Your previous output could not be parsed. Reply with ONLY the \
              delimited blocks, exactly as specified."
         ));
@@ -15207,7 +14937,9 @@ so the intent reads clearly.
             )
             .unwrap_err();
 
-        assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
+        assert!(error
+            .to_string()
+            .contains("CLI binary is not available on PATH"));
     }
 
     #[test]
@@ -15226,19 +14958,21 @@ so the intent reads clearly.
             )
             .unwrap();
 
-        assert_eq!(handoff.opencode_binary, service.opencode_binary);
-        assert_eq!(handoff.cwd, worktree.path());
+        assert_eq!(handoff.command.binary, service.opencode_binary);
+        assert_eq!(handoff.command.cwd, worktree.path());
         assert_eq!(
-            handoff.opencode_args[handoff
-                .opencode_args
+            handoff.command.args[handoff
+                .command
+                .args
                 .iter()
                 .position(|arg| arg == "-m")
                 .unwrap()
                 + 1],
             "provider/model"
         );
-        let prompt = &handoff.opencode_args[handoff
-            .opencode_args
+        let prompt = &handoff.command.args[handoff
+            .command
+            .args
             .iter()
             .position(|arg| arg == "--prompt")
             .unwrap()
@@ -15286,7 +15020,9 @@ so the intent reads clearly.
             )
             .unwrap_err();
 
-        assert_eq!(error.to_string(), "opencode CLI is not on PATH.");
+        assert!(error
+            .to_string()
+            .contains("CLI binary is not available on PATH"));
     }
 
     #[tokio::test]

@@ -44,6 +44,12 @@ pub const ERROR_BRANCH_EXISTS: &str = "Branch already exists.";
 pub const ERROR_WORKTREE_EXISTS: &str = "Worktree already exists.";
 pub const ERROR_WORKTREE_HAS_CHANGES: &str = "Worktree has uncommitted changes.";
 pub const ERROR_OPERATION_FAILED: &str = "Operation failed. Please try again.";
+pub const ERROR_AI_BINARY_MISSING: &str = "The selected AI CLI is not installed.";
+pub const ERROR_AI_AUTH_MISSING: &str = "The selected AI CLI is not authenticated.";
+pub const ERROR_AI_MODEL_UNAVAILABLE: &str = "The selected AI model is unavailable.";
+pub const ERROR_AI_EFFORT_UNSUPPORTED: &str = "The selected AI effort is not supported.";
+pub const ERROR_AI_FLAGS_UNSUPPORTED: &str =
+    "The selected AI CLI does not support the required flags.";
 
 // Git errors
 pub const GIT_ERROR_FETCH: &str = "Failed to fetch git information.";

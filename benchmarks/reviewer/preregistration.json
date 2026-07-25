@@ -3,6 +3,7 @@
   "lockedAt": "2026-07-19T00:00:00Z",
   "analysis": "paired case-by-repetition bootstrap, 10000 resamples, deterministic seed 20260719, percentile 95% confidence intervals",
   "baselineModel": "openai/gpt-5.6-terra",
+  "baselineHarness": "opencode",
   "baselineThinking": "high",
   "minimumRepetitions": 10,
   "bootstrapResamples": 10000,

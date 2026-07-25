@@ -97,6 +97,13 @@ impl ConfigService {
             .or_else(|| self.config_path.clone())
             .ok_or_else(|| WisetreeError::config("No config path available for saving", None))?;
 
+        config.validate_ai_harnesses().map_err(|message| {
+            WisetreeError::config(
+                format!("Invalid configuration for {}: {message}", target.display()),
+                Some(target.clone()),
+            )
+        })?;
+
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -168,6 +175,13 @@ impl ConfigService {
         let mut parsed: WorktreeConfig = serde_json::from_str(&raw).map_err(|e| {
             WisetreeError::config(
                 format!("Invalid configuration in {}: {e}", path.display()),
+                Some(path.clone()),
+            )
+        })?;
+
+        parsed.validate_ai_harnesses().map_err(|message| {
+            WisetreeError::config(
+                format!("Invalid configuration in {}: {message}", path.display()),
                 Some(path.clone()),
             )
         })?;

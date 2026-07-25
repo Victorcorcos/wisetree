@@ -51,13 +51,6 @@ const UPDATE_PUSH_FAILED_MESSAGE: &str =
 /// activity panel, so anything older is pure memory pressure.
 const AI_LOG_MAX_LINES: usize = 1024;
 
-/// CSI sequences for PageUp / PageDown forwarded to the embedded opencode
-/// process. Mouse wheel + arrow keys both synthesize these so the user
-/// scrolls opencode's own message buffer (vt100's alt-screen scrollback
-/// is unusable while opencode owns the alternate grid).
-const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
-const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateStep {
     Loading,
@@ -128,6 +121,10 @@ pub struct UpdatePullRequestScreen {
     /// `true` once opencode has exited and the user is being asked to
     /// decide on Complete or Cancel.
     ai_done: bool,
+    /// True only when the selected harness watcher observed a successful turn
+    /// with transcript evidence. Update All requires this before auto-commit.
+    ai_verified: bool,
+    ai_failed: bool,
     /// Currently focused button in the Complete/Cancel pair.
     ai_button: AiButton,
     /// Embedded opencode subprocess + vt100 emulator. `Some` once the
@@ -209,6 +206,8 @@ impl UpdatePullRequestScreen {
             ai_log: Vec::new(),
             ai_active: false,
             ai_done: false,
+            ai_verified: false,
+            ai_failed: false,
             ai_button: AiButton::Complete,
             pty: None,
             pty_focused: false,
@@ -321,6 +320,8 @@ impl UpdatePullRequestScreen {
         self.ai_scroll = 0;
         self.ai_active = false;
         self.ai_done = false;
+        self.ai_verified = false;
+        self.ai_failed = false;
         self.ai_button = AiButton::Complete;
         self.pty = None;
         self.pty_focused = false;
@@ -353,7 +354,8 @@ impl UpdatePullRequestScreen {
         self.terminal_error = error;
         self.pty_focused = false;
         self.phase_message = UPDATE_PUSH_FAILED_MESSAGE.to_string();
-        match PtyView::spawn(&shell, &args, Some(&cwd), &[]) {
+        // A plain recovery shell renders inline; wisetree owns its scrollback.
+        match PtyView::spawn(&shell, &args, Some(&cwd), &[], true) {
             Ok(mut pty) => {
                 // Reproduce the failing push in the panel so the user lands
                 // on the real error, then leaves them at a live prompt.
@@ -382,15 +384,19 @@ impl UpdatePullRequestScreen {
         args: Vec<String>,
         cwd: PathBuf,
         env: Vec<(String, String)>,
+        renders_inline: bool,
     ) {
-        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env, renders_inline) {
             Ok(pty) => {
                 self.pty = Some(pty);
             }
             Err(err) => {
                 self.append_ai_line(AiActivityEvent::Notice {
                     severity: AiActivitySeverity::Error,
-                    message: format!("Could not spawn opencode in PTY: {err}"),
+                    message: format!(
+                        "Could not spawn {} in PTY: {err}",
+                        self.ai.harness.display_name()
+                    ),
                 });
                 // No PTY → the AI is effectively done; surface
                 // Complete/Cancel so the user can recover.
@@ -412,6 +418,9 @@ impl UpdatePullRequestScreen {
             pty.resize(rows, cols);
         }
         if pty.poll_exited() {
+            if self.ai_done || self.ai_failed {
+                return false;
+            }
             // Commit+push shell finished — record the exit code and flip
             // into the done summary view.
             if matches!(self.step, UpdateStep::CommitPush) {
@@ -427,7 +436,13 @@ impl UpdatePullRequestScreen {
                 self.pty_focused = false;
                 return true;
             }
-            self.mark_ai_done();
+            if pty.exit_code() == Some(0) {
+                // A clean child exit is enough for a human to review the
+                // merge, but not enough evidence for an unattended batch.
+                self.mark_ai_done();
+            } else {
+                self.mark_ai_failed("AI CLI exited before resolving the merge.".to_string());
+            }
             return true;
         }
         false
@@ -457,6 +472,28 @@ impl UpdatePullRequestScreen {
         self.ai_button = AiButton::Complete;
     }
 
+    pub fn mark_ai_done_verified(&mut self) {
+        self.mark_ai_done();
+        self.ai_verified = true;
+    }
+
+    pub fn mark_ai_manual_backstop(&mut self, message: String) {
+        self.append_ai_line(AiActivityEvent::Notice {
+            severity: AiActivitySeverity::Warning,
+            message,
+        });
+        self.mark_ai_done();
+    }
+
+    pub fn mark_ai_failed(&mut self, message: String) {
+        self.ai_verified = false;
+        self.ai_failed = true;
+        self.append_ai_line(AiActivityEvent::Notice {
+            severity: AiActivitySeverity::Error,
+            message,
+        });
+    }
+
     pub fn ai_active(&self) -> bool {
         self.ai_active
     }
@@ -478,6 +515,10 @@ impl UpdatePullRequestScreen {
     /// know when to auto-commit and advance.
     pub fn ai_done(&self) -> bool {
         self.ai_done
+    }
+
+    pub fn ai_verified(&self) -> bool {
+        self.ai_verified
     }
 
     #[cfg(test)]
@@ -548,7 +589,8 @@ impl UpdatePullRequestScreen {
         // `App` does not try to abort a merge that is already committed.
         self.ai_active = false;
         self.pty_focused = false;
-        match PtyView::spawn(&shell, &shell_args, Some(&cwd), &env) {
+        // A plain commit/push shell renders inline; wisetree owns its scrollback.
+        match PtyView::spawn(&shell, &shell_args, Some(&cwd), &env, true) {
             Ok(pty) => {
                 self.pty = Some(pty);
             }
@@ -679,17 +721,12 @@ impl UpdatePullRequestScreen {
         if !scrollable {
             return false;
         }
-        // The commit+push shell and the terminal-recovery shell both run on
-        // the main vt100 screen (not alt-screen), so scroll the vt100 buffer
-        // directly. The opencode PTY uses alt-screen, so we forward PageUp as
-        // a keystroke and opencode handles its own scroll.
-        let use_direct_scroll = self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
+        // `wheel_up` scrolls the vt100 buffer directly for main-screen children
+        // (the commit+push shell, the terminal-recovery shell, and the inline
+        // codex/claude harnesses) and forwards a page key only to alt-screen
+        // children that own their scroll region (opencode).
         if let Some(pty) = self.pty.as_mut() {
-            if use_direct_scroll {
-                pty.scroll_up(lines);
-            } else {
-                pty.send_input(PTY_PAGE_UP);
-            }
+            pty.wheel_up(lines);
         } else if matches!(self.step, UpdateStep::Updating) {
             self.ai_scroll = self.ai_scroll.saturating_add(lines);
         }
@@ -705,13 +742,8 @@ impl UpdatePullRequestScreen {
         if !scrollable {
             return false;
         }
-        let use_direct_scroll = self.terminal_active || matches!(self.step, UpdateStep::CommitPush);
         if let Some(pty) = self.pty.as_mut() {
-            if use_direct_scroll {
-                pty.scroll_down(lines);
-            } else {
-                pty.send_input(PTY_PAGE_DOWN);
-            }
+            pty.wheel_down(lines);
         } else if matches!(self.step, UpdateStep::Updating) {
             self.ai_scroll = self.ai_scroll.saturating_sub(lines);
         }
@@ -1107,11 +1139,11 @@ impl UpdatePullRequestScreen {
         let ai_roles = if self.push_only {
             Vec::new()
         } else {
-            vec![AiRoleRow::new(
+            vec![AiRoleRow::from_config(
                 "update",
                 colors::INFO,
-                self.ai.model.clone(),
-                self.ai.thinking.clone(),
+                &self.ai,
+                "Edit files",
             )]
         };
         let mut view = PrConfirmView::new(format!(
@@ -2519,6 +2551,7 @@ mod tests {
         AiModelConfig {
             model: "opencode/update-model".to_string(),
             thinking: String::new(),
+            harness: Default::default(),
         }
     }
 

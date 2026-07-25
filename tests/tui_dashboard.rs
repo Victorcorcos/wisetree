@@ -1326,8 +1326,9 @@ fn bulk_delete_drafted_targets_only_draft_pr_rows() {
         row_with_pr_state("/tmp/repo-open", "open", false, PrState::Open),
     ]);
 
-    // Tab moves focus from the table onto the buttons (landing on the first,
-    // Merged); Right then steps Merged → Closed → Drafted.
+    // Tab cycles table → Update → Delete; two presses land on the first
+    // Delete button (Merged), then Right steps Merged → Closed → Drafted.
+    screen.handle_key(key(KeyCode::Tab));
     screen.handle_key(key(KeyCode::Tab));
     screen.handle_key(key(KeyCode::Right));
     screen.handle_key(key(KeyCode::Right));

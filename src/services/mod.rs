@@ -1,6 +1,9 @@
 //! Cross-cutting services (app state, update check, shell integration).
 
+pub mod ai_models;
+pub mod ai_run;
 pub mod ai_status;
+pub mod ai_turn;
 pub mod app_state;
 pub mod bugkill;
 pub mod dashboard;
@@ -15,10 +18,16 @@ pub(crate) mod reviewer_tests;
 pub mod shell_integration;
 pub mod update;
 
+pub use ai_models::{
+    fetch_claude_effort_levels, fetch_codex_reasoning_levels, parse_claude_effort_levels,
+    parse_codex_bundled_models,
+};
+pub use ai_run::{AiCapturedRun, AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 pub use ai_status::{
     canonical_key, AiHarness, AiHarnessState, AiStatus, AiStatusIndex, AiStatusPaths,
     AiStatusReport, AiStatusService,
 };
+pub use ai_turn::{AiTurn, AiTurnWatcher};
 pub use app_state::AppStateService;
 pub use bugkill::{
     compute_attempt_changes, normalize_hypotheses, parse_hypotheses, transcript_tail,
@@ -31,7 +40,7 @@ pub use dashboard::{
     resolve_dashboard_columns, split_duplicate_findings, BugkillPreflight, BugkillPreflightOutcome,
     BugkillResumeState, BugkillSnapshot, BugkillUnverdicted, CheckStatus, CommentGroup,
     CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, DashboardService,
-    DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopPreflight,
+    DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff, DevelopPreflight,
     DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome,
     ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
     MergeStatus, PrState, PullRequest, PullRequestDetails, ReviewBenchmarkOutcome, ReviewComment,

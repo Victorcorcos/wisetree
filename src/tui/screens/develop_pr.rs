@@ -455,9 +455,9 @@ impl DevelopPullRequestScreen {
         self.phase_message = if corrective {
             "Plan output could not be parsed — retrying once...".to_string()
         } else if self.revision.is_some() {
-            "Revising the plan with opencode...".to_string()
+            "Revising the plan with the selected AI...".to_string()
         } else {
-            "Planning the task with opencode...".to_string()
+            "Planning the task with the selected AI...".to_string()
         };
         self.plan_corrective = corrective;
         self.ai_done = false;
@@ -469,8 +469,10 @@ impl DevelopPullRequestScreen {
     /// Completion detection missed on a user-forced continue: tell the user
     /// the App is still watching for opencode to finish.
     pub fn note_planning_waiting(&mut self) {
-        self.phase_message =
-            "opencode has not finished the plan yet — still watching...".to_string();
+        self.phase_message = format!(
+            "{} has not finished the plan yet — still watching...",
+            self.ai.plan.harness.display_name()
+        );
     }
 
     /// Enter the plan-review question (Yes / No) over the current plan.
@@ -607,7 +609,7 @@ impl DevelopPullRequestScreen {
         self.commit_count
     }
 
-    /// Spawn opencode inside the embedded PTY. A spawn failure surfaces as
+    /// Spawn the selected AI harness inside the embedded PTY. A spawn failure surfaces as
     /// an error notice.
     pub fn spawn_opencode_pty(
         &mut self,
@@ -615,10 +617,11 @@ impl DevelopPullRequestScreen {
         args: Vec<String>,
         cwd: PathBuf,
         env: Vec<(String, String)>,
+        renders_inline: bool,
     ) {
-        match PtyView::spawn(&binary, &args, Some(&cwd), &env) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &env, renders_inline) {
             Ok(pty) => self.pty = Some(pty),
-            Err(err) => self.set_error(format!("Could not spawn opencode in PTY: {err}")),
+            Err(err) => self.set_error(format!("Could not spawn AI CLI in PTY: {err}")),
         }
     }
 
@@ -676,7 +679,7 @@ impl DevelopPullRequestScreen {
         match self.step {
             DevelopStep::Planning | DevelopStep::Implementing => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_UP);
+                    pty.wheel_up(lines);
                 }
                 true
             }
@@ -696,7 +699,7 @@ impl DevelopPullRequestScreen {
         match self.step {
             DevelopStep::Planning | DevelopStep::Implementing => {
                 if let Some(pty) = self.pty.as_mut() {
-                    pty.send_input(PTY_PAGE_DOWN);
+                    pty.wheel_down(lines);
                 }
                 true
             }
@@ -1151,9 +1154,9 @@ impl DevelopPullRequestScreen {
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
         let ralph_note = if self.ralph {
-            "each section gets its own fresh opencode run"
+            "each section gets its own fresh AI run"
         } else {
-            "one single opencode run implements the whole plan"
+            "one single AI run implements the whole plan"
         };
         let check_note = if self.check_command.is_some() {
             "wisetree runs the configured check after each section; a failure lets you fix \
@@ -1169,7 +1172,7 @@ impl DevelopPullRequestScreen {
                 .to_string(),
             "You approve the plan — or answer No with feedback until it's right.".to_string(),
             format!(
-                "The implement AI builds every section in an embedded opencode terminal — \
+                "The implement AI builds every section in an embedded AI terminal — \
                  {ralph_note}."
             ),
             check_note.to_string(),
@@ -1192,7 +1195,7 @@ impl DevelopPullRequestScreen {
             OptionsGroupItem::new(
                 self.ralph,
                 "Ralph Loop",
-                "a fresh opencode terminal per section: cheaper (small context each run) and more \
+                "a fresh AI terminal per section: cheaper (small context each run) and more \
                  reliable.",
             ),
             OptionsGroupItem::new(
@@ -1261,17 +1264,12 @@ impl DevelopPullRequestScreen {
     /// reasoning effort) each phase will spend before confirming.
     fn confirm_ai_roles(&self) -> Vec<AiRoleRow> {
         vec![
-            AiRoleRow::new(
-                "plan",
-                colors::ORANGE,
-                self.ai.plan.model.clone(),
-                self.ai.plan.thinking.clone(),
-            ),
-            AiRoleRow::new(
+            AiRoleRow::from_config("plan", colors::ORANGE, &self.ai.plan, "Read-only"),
+            AiRoleRow::from_config(
                 "implement",
                 colors::SUCCESS,
-                self.ai.implement.model.clone(),
-                self.ai.implement.thinking.clone(),
+                &self.ai.implement,
+                "Edit files",
             ),
         ]
     }
@@ -1405,7 +1403,7 @@ impl DevelopPullRequestScreen {
         let separator = Span::styled("  ·  ".to_string(), muted_dim());
         let spans: Vec<Span<'static>> = vec![
             Span::styled("Tab ".to_string(), Style::default().fg(colors::BRAND)),
-            Span::styled("Focus opencode".to_string(), muted_dim()),
+            Span::styled("Focus AI".to_string(), muted_dim()),
             separator.clone(),
             Span::styled("PgUp/PgDn ".to_string(), Style::default().fg(colors::BRAND)),
             Span::styled("Scroll".to_string(), muted_dim()),
@@ -1745,9 +1743,9 @@ impl DevelopPullRequestScreen {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 if self.step == DevelopStep::Planning {
-                    "Launching opencode to plan the task..."
+                    "Launching the selected AI to plan the task..."
                 } else {
-                    "Launching opencode to implement the plan..."
+                    "Launching the selected AI to implement the plan..."
                 },
                 muted_dim(),
             ))),
@@ -1762,7 +1760,7 @@ impl DevelopPullRequestScreen {
             Span::styled("Focus: ".to_string(), muted_dim()),
             Span::styled(
                 if focused_inner {
-                    "Inner (opencode)"
+                    "Inner (AI)"
                 } else {
                     "Outer (wisetree)"
                 }
@@ -1781,7 +1779,7 @@ impl DevelopPullRequestScreen {
                 if focused_inner {
                     "Switch to Wisetree"
                 } else {
-                    "Switch to opencode"
+                    "Switch to AI"
                 }
                 .to_string(),
                 muted_dim(),
@@ -2347,10 +2345,12 @@ mod tests {
             plan: AiModelConfig {
                 model: "openai/gpt-5.6-sol".to_string(),
                 thinking: "high".to_string(),
+                harness: Default::default(),
             },
             implement: AiModelConfig {
                 model: "openai/gpt-5.6-terra".to_string(),
                 thinking: "high".to_string(),
+                harness: Default::default(),
             },
         }
     }
@@ -2573,7 +2573,7 @@ mod tests {
         assert!(s.wants_full_panel());
         let dump = render_dump(&mut s, 110, 30);
         assert!(
-            dump.contains("Planning the task with opencode..."),
+            dump.contains("Planning the task with the selected AI..."),
             "{dump}"
         );
         assert!(dump.contains("AI Activity"), "{dump}");

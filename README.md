@@ -335,6 +335,20 @@ Dashboard sub-fields:
 | `dashboard.aiStatus.enabledHarnesses` | `string[]` | `["claude_code", "opencode", "codex_cli", "gemini_cli"]` | AI harnesses included in the dashboard's `AI Status` column. |
 | `dashboard.aiStatus.activeWindowMs` | `number` | `10000` | Recency threshold used when a harness still has an unresolved prompt but no stronger live-session signal, clamped to `2000..60000`. |
 
+### AI harness configuration
+
+Every AI slot under `dashboard.ai` stores `model`, `thinking`, and `harness`. The twelve slots are `explain`, `fix.plan`, `fix.apply`, `review.strong`, `review.balanced`, `review.utility`, `update`, `bugkill.investigate`, `bugkill.fix`, `bugkill.judge`, `develop.plan`, and `develop.implement`. Omitted slots use their documented built-in defaults; an omitted `harness` in a legacy configuration means `opencode`.
+
+| Harness | Config value | Binary | Compatible model prefix | Effective permission policy |
+| --- | --- | --- | --- | --- |
+| OpenCode | `opencode` | `opencode` | Any provider/model OpenCode supports | Planning/review roles use its `plan` agent; editing roles use its normal interactive or captured execution. |
+| Codex CLI | `codex` | `codex` | `openai/…` or an unprefixed Codex model | Read-only roles use `--sandbox read-only`; editing roles use `--full-auto`. |
+| Claude Code | `claudeCode` | `claude` | `anthropic/…` or an unprefixed Claude model | Read-only roles use `--permission-mode plan`; editing roles use `--permission-mode acceptEdits`. |
+
+Install and authenticate the selected binary before starting a workflow. Wisetree uses each CLI's existing authentication; it never stores provider credentials. Claude Code captured workflows require version `2.1.214` or newer. The confirmation screen shows the resolved role, model, thinking level, harness, and permission policy before any AI command launches.
+
+Settings saves to the active configuration source: a project `.wisetree.json` when it is active, otherwise `~/.wisetree/settings.json`. These sources are selected, not merged. AI metering is reported by the selected harness when it exposes usage; OpenCode session telemetry is correlated by session title. Dashboard AI Status is independent of workflow execution and metering: it only reads local Claude Code, OpenCode, Codex CLI, and Gemini CLI state/session files to report activity.
+
 # 📟 Wisetree CLI
 
 The full surface of the binary, suitable for both humans and scripts. Every subcommand has an interactive equivalent, but the flags below let you skip the TUI entirely.

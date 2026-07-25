@@ -1540,24 +1540,9 @@ impl ReviewPullRequestScreen {
             .block(build_detail_lines(&self.request))
             .steps(&REVIEW_STEPS)
             .ai_roles(vec![
-                AiRoleRow::new(
-                    "strong",
-                    colors::NAVY,
-                    self.ai.strong.model.clone(),
-                    self.ai.strong.thinking.clone(),
-                ),
-                AiRoleRow::new(
-                    "balanced",
-                    colors::NAVY,
-                    self.ai.balanced.model.clone(),
-                    self.ai.balanced.thinking.clone(),
-                ),
-                AiRoleRow::new(
-                    "utility",
-                    colors::NAVY,
-                    self.ai.utility.model.clone(),
-                    self.ai.utility.thinking.clone(),
-                ),
+                AiRoleRow::from_config("strong", colors::NAVY, &self.ai.strong, "Read-only"),
+                AiRoleRow::from_config("balanced", colors::NAVY, &self.ai.balanced, "Read-only"),
+                AiRoleRow::from_config("utility", colors::NAVY, &self.ai.utility, "Read-only"),
             ])
             .modal(self.confirm.as_ref())
             .render(frame, area);
@@ -2708,6 +2693,7 @@ mod tests {
         let model = AiModelConfig {
             model: "opencode/review-scan".to_string(),
             thinking: "max".to_string(),
+            harness: Default::default(),
         };
         AiReviewConfig {
             strong: model.clone(),
@@ -3745,6 +3731,7 @@ mod tests {
             model_profile: "balanced".to_string(),
             model: "openai/gpt-5.6-terra".to_string(),
             thinking: "medium".to_string(),
+            harness: "opencode".to_string(),
             prompt_bytes: 1200,
             usage: crate::services::review_telemetry::ReviewTokenUsage {
                 uncached_input: Some(40_000),

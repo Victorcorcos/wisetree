@@ -45,6 +45,11 @@ tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "process", 
 vt100 = "0.15"
 walkdir = "2.5"
 
+# Vendored, patched vt100 so inline AI harnesses (codex/claude) capture their
+# scroll-region transcript into scrollback. See third_party/vt100/PATCHES.md.
+[patch.crates-io]
+vt100 = { path = "third_party/vt100" }
+
 [dev-dependencies]
 assert_cmd = "2.0"
 insta = "1.41"

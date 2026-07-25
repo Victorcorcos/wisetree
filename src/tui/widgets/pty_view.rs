@@ -1,4 +1,4 @@
-//! Embedded PTY view that hosts a subprocess (opencode) inside a ratatui
+//! Embedded PTY view that hosts an AI CLI subprocess inside a ratatui
 //! panel. Spawns the command on a real PTY via `portable-pty`, pipes its
 //! raw output through a `vt100::Parser`, and blits the resulting screen
 //! cells into the panel area on each frame so the subprocess sees a
@@ -33,16 +33,42 @@ use vt100::{Color as VtColor, MouseProtocolEncoding, MouseProtocolMode, Parser};
 /// rather not have wrap awkwardly, so we start generous.
 const DEFAULT_ROWS: u16 = 40;
 const DEFAULT_COLS: u16 = 160;
-/// How many lines of scrollback the vt100 parser retains. opencode runs
+/// How many lines of scrollback the vt100 parser retains. AI CLI runs
 /// can emit thousands of formatted lines (Thinking blocks, diffs, tool
 /// output); 5000 rows gives the user plenty of history to scroll back
 /// through without ballooning memory.
 const SCROLLBACK_ROWS: usize = 5000;
+/// `PageUp` / `PageDown` key reports, sent to alt-screen children that own
+/// their own scroll region (see [`PtyView::wheel_up`]).
+const PAGE_UP: &[u8] = b"\x1b[5~";
+const PAGE_DOWN: &[u8] = b"\x1b[6~";
+/// How long to hold a lone `Esc` while checking whether crossterm has split an
+/// SGR mouse report into individual key events. Normal PTY rendering runs
+/// every 16 ms, so a real Escape key is still delivered promptly.
+const FRAGMENTED_MOUSE_INPUT_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Reply to an `OSC 10` (query default foreground) request: a light gray,
+/// matching a dark terminal theme. Terminated with ST (`ESC \`).
+const OSC10_FG_REPLY: &[u8] = b"\x1b]10;rgb:c7c7/c7c7/c7c7\x1b\\";
+/// Reply to an `OSC 11` (query default background) request: a dark charcoal.
+///
+/// Codex (unlike claude) refuses to paint its themed message blocks until it
+/// learns the terminal background this way — with no reply it downgrades to a
+/// flat, block-less theme. Reporting a dark background unlocks the same
+/// rendering it shows in a standalone dark terminal. (A light-terminal user
+/// would want a light value here; the reply is assembled in
+/// [`terminal_query_reply`]. A future improvement could relay the host
+/// terminal's actual background instead of this fixed dark default.)
+const OSC11_BG_REPLY: &[u8] = b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\";
 
 pub struct PtyView {
     parser: Arc<Mutex<Parser>>,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Shared with the reader thread so it can answer terminal capability
+    /// queries (OSC 10/11) the instant the child asks, exactly like a real
+    /// terminal — the master exposes only a single writer, so both the host
+    /// (`send_input`) and the reader thread go through this one handle.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     reader_handle: Option<JoinHandle<()>>,
     done: Arc<AtomicBool>,
@@ -54,6 +80,20 @@ pub struct PtyView {
     /// absolute host mouse coordinates into the child's cell grid when
     /// forwarding mouse reports.
     last_area: Cell<Rect>,
+    /// Whether the child renders its transcript inline (codex, claude, a plain
+    /// shell) rather than driving an alt-screen, mouse-tracking TUI (opencode).
+    /// For inline children wisetree owns scrolling through the vt100 buffer and
+    /// must never forward raw wheel reports — they'd be echoed as literal text
+    /// and the leading ESC read as an interrupt. See [`AiHarness::renders_inline`].
+    ///
+    /// [`AiHarness::renders_inline`]: crate::config::schema::AiHarness::renders_inline
+    renders_inline: bool,
+    /// Crossterm can occasionally split one macOS wheel report into ordinary
+    /// key events during continuous scrolling (crossterm#668): `Esc`, `[`,
+    /// `<`, `6`, `5`, ... . Without reassembly, the normal keyboard path sends
+    /// those fragments to an inline child, where Codex treats the leading
+    /// `Esc` as an interrupt and inserts the printable tail into its composer.
+    fragmented_mouse_input: FragmentedMouseInput,
 }
 
 impl PtyView {
@@ -62,6 +102,7 @@ impl PtyView {
         args: &[String],
         cwd: Option<&Path>,
         env: &[(String, String)],
+        renders_inline: bool,
     ) -> std::io::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -103,10 +144,10 @@ impl PtyView {
             .master
             .try_clone_reader()
             .map_err(|err| std::io::Error::other(format!("clone reader: {err}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|err| std::io::Error::other(format!("take writer: {err}")))?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer().map_err(|err| {
+                std::io::Error::other(format!("take writer: {err}"))
+            })?));
 
         let parser = Arc::new(Mutex::new(Parser::new(
             DEFAULT_ROWS,
@@ -118,6 +159,7 @@ impl PtyView {
 
         let reader_parser = Arc::clone(&parser);
         let reader_done = Arc::clone(&done);
+        let reader_writer = Arc::clone(&writer);
         let reader_handle = thread::Builder::new()
             .name("wisetree-pty-reader".into())
             .spawn(move || {
@@ -129,6 +171,15 @@ impl PtyView {
                         Ok(n) => {
                             if let Ok(mut parser) = reader_parser.lock() {
                                 parser.process(&buf[..n]);
+                            }
+                            // Answer terminal capability queries the way a real
+                            // terminal would. Codex refuses to paint its themed
+                            // blocks until it learns the background via OSC 11.
+                            if let Some(reply) = terminal_query_reply(&buf[..n]) {
+                                if let Ok(mut writer) = reader_writer.lock() {
+                                    let _ = writer.write_all(&reply);
+                                    let _ = writer.flush();
+                                }
                             }
                         }
                         Err(err) => {
@@ -153,6 +204,8 @@ impl PtyView {
             exit_status,
             last_size: (DEFAULT_ROWS, DEFAULT_COLS),
             last_area: Cell::new(Rect::default()),
+            renders_inline,
+            fragmented_mouse_input: FragmentedMouseInput::default(),
         })
     }
 
@@ -203,8 +256,31 @@ impl PtyView {
     }
 
     pub fn send_input(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if !self.renders_inline {
+            self.write_input(bytes);
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some(stale) = self.fragmented_mouse_input.take_stale(now) {
+            self.write_input(&stale);
+        }
+        if let Some(filtered) = self.fragmented_mouse_input.filter(bytes, now) {
+            self.write_input(&filtered);
+        }
+    }
+
+    fn write_input(&mut self, bytes: &[u8]) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+        }
+    }
+
+    fn flush_stale_fragmented_mouse_input(&mut self) {
+        if let Some(stale) = self.fragmented_mouse_input.take_stale(Instant::now()) {
+            self.write_input(&stale);
+        }
     }
 
     /// Forward a host mouse event to the child, encoded per the mouse
@@ -218,7 +294,12 @@ impl PtyView {
     /// running its own text-selection / scrollback handling. Returns `false`
     /// when the child has no mouse mode active, so the host keeps its native
     /// wheel + selection behavior (e.g. a plain recovery shell that never
-    /// enabled mouse reporting).
+    /// enabled mouse reporting). Also returns `false` for wheel events aimed at
+    /// an inline harness (codex, claude — see [`renders_inline`]), so the
+    /// caller's `wheel_up`/`wheel_down` fallback drives the vt100 scrollback
+    /// instead of us injecting a wheel report the harness can't decode.
+    ///
+    /// [`renders_inline`]: crate::config::schema::AiHarness::renders_inline
     pub fn send_mouse(
         &mut self,
         kind: MouseEventKind,
@@ -226,6 +307,27 @@ impl PtyView {
         abs_row: u16,
         modifiers: KeyModifiers,
     ) -> bool {
+        // Inline harnesses (codex, claude) scroll through committed history,
+        // and wisetree owns that scrolling via the vt100 buffer. They may still
+        // enable a mouse mode (click-to-position in their composer, or a
+        // transient alt-screen pager while paging back), but they don't decode
+        // wheel reports — forwarding one raw gets echoed back as literal text
+        // and the leading ESC reads as an interrupt keystroke. Decline the
+        // wheel here so the caller's `wheel_up`/`wheel_down` fallback drives the
+        // vt100 scrollback instead. This is keyed off the harness identity, not
+        // the child's runtime alt-screen/mouse state, because codex flips both
+        // mid-scroll.
+        if self.renders_inline
+            && matches!(
+                kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+        {
+            return false;
+        }
         let (mode, encoding) = match self.parser.lock() {
             Ok(parser) => {
                 let screen = parser.screen();
@@ -254,6 +356,42 @@ impl PtyView {
         // this mode doesn't report (e.g. a bare move under button-motion mode),
         // the host must not also act on it.
         true
+    }
+
+    /// Whether the child has enabled any mouse-tracking mode. Alt-screen
+    /// TUIs (opencode) turn tracking on and own the wheel — the host forwards
+    /// wheel events to them as SGR reports. Inline-rendering harnesses (codex,
+    /// claude) never enable tracking and instead scroll through the terminal's
+    /// scrollback, so the host must drive the vt100 buffer itself.
+    pub fn tracks_mouse(&self) -> bool {
+        self.parser
+            .lock()
+            .map(|p| p.screen().mouse_protocol_mode() != MouseProtocolMode::None)
+            .unwrap_or(false)
+    }
+
+    /// One wheel tick / scroll key toward older output. Alt-screen TUIs
+    /// (opencode) manage their own scroll region, so we send them a `PageUp`
+    /// key; inline harnesses (codex, claude) scroll by moving through the vt100
+    /// scrollback buffer. Keyed off harness identity rather than the child's
+    /// live mouse-tracking state, which codex toggles mid-scroll.
+    pub fn wheel_up(&mut self, lines: u16) {
+        if self.renders_inline {
+            self.scroll_up(lines);
+        } else {
+            self.send_input(PAGE_UP);
+        }
+    }
+
+    /// One wheel tick / scroll key toward the live tail. See [`wheel_up`].
+    ///
+    /// [`wheel_up`]: Self::wheel_up
+    pub fn wheel_down(&mut self, lines: u16) {
+        if self.renders_inline {
+            self.scroll_down(lines);
+        } else {
+            self.send_input(PAGE_DOWN);
+        }
     }
 
     /// Total scrollback rows currently retained by the vt100 parser.
@@ -322,7 +460,11 @@ impl PtyView {
         self.exit_status.lock().ok().and_then(|slot| *slot)
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // A genuine standalone Escape key has no following SGR fragments.
+        // Release it after the short disambiguation window even if the user
+        // provides no further input.
+        self.flush_stale_fragmented_mouse_input();
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -396,6 +538,152 @@ impl Drop for PtyView {
                 let _ = handle.join();
             }
         }
+    }
+}
+
+/// Build the reply a real terminal would send for any capability query found
+/// in `chunk`, or `None` if there are none. We answer only the two queries an
+/// inline harness needs to theme itself — `OSC 10` (default foreground) and
+/// `OSC 11` (default background). We deliberately do **not** answer device
+/// attributes / cursor-position / kitty-keyboard probes: they're unnecessary
+/// for styling and a wrong answer risks changing input handling.
+///
+/// The query byte strings are tiny and codex emits them together in its opening
+/// burst, so a per-read scan (rather than a reassembling buffer) reliably
+/// catches them; a query split across two reads would simply go unanswered.
+fn terminal_query_reply(chunk: &[u8]) -> Option<Vec<u8>> {
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    let mut reply = Vec::new();
+    if contains(chunk, b"\x1b]10;?") {
+        reply.extend_from_slice(OSC10_FG_REPLY);
+    }
+    if contains(chunk, b"\x1b]11;?") {
+        reply.extend_from_slice(OSC11_BG_REPLY);
+    }
+    (!reply.is_empty()).then_some(reply)
+}
+
+#[derive(Debug, Default)]
+struct FragmentedMouseInput {
+    candidate: Vec<u8>,
+    updated_at: Option<Instant>,
+}
+
+impl FragmentedMouseInput {
+    /// Filter keyboard-path bytes while retaining normal keys byte-for-byte.
+    ///
+    /// A complete terminal control sequence such as an arrow key arrives in
+    /// one call and is forwarded immediately. Only a *lone* Escape starts a
+    /// candidate, matching crossterm's broken wheel-event shape. If the
+    /// following key events form a complete SGR mouse report, the report is
+    /// discarded; if they diverge, every buffered byte is released unchanged.
+    fn filter(&mut self, bytes: &[u8], now: Instant) -> Option<Vec<u8>> {
+        if self.candidate.is_empty() {
+            if bytes == b"\x1b" {
+                self.candidate.push(0x1b);
+                self.updated_at = Some(now);
+                return None;
+            }
+            return Some(bytes.to_vec());
+        }
+
+        self.candidate.extend_from_slice(bytes);
+        self.updated_at = Some(now);
+        match sgr_mouse_sequence_status(&self.candidate) {
+            SgrMouseSequenceStatus::Prefix => None,
+            SgrMouseSequenceStatus::Complete => {
+                self.clear();
+                None
+            }
+            SgrMouseSequenceStatus::Invalid => {
+                self.updated_at = None;
+                Some(std::mem::take(&mut self.candidate))
+            }
+        }
+    }
+
+    fn take_stale(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let updated_at = self.updated_at?;
+        if now.saturating_duration_since(updated_at) < FRAGMENTED_MOUSE_INPUT_TIMEOUT {
+            return None;
+        }
+        self.updated_at = None;
+        Some(std::mem::take(&mut self.candidate))
+    }
+
+    fn clear(&mut self) {
+        self.candidate.clear();
+        self.updated_at = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SgrMouseSequenceStatus {
+    Prefix,
+    Complete,
+    Invalid,
+}
+
+/// Recognize an SGR mouse report (`ESC [ < Cb ; Cx ; Cy M`) incrementally.
+///
+/// This intentionally accepts the optional semicolon before the final `M` /
+/// `m` that crossterm also accepts. A small length cap ensures a malicious or
+/// accidental `Esc[<...` prefix cannot hold input indefinitely.
+fn sgr_mouse_sequence_status(bytes: &[u8]) -> SgrMouseSequenceStatus {
+    const INTRODUCER: &[u8] = b"\x1b[<";
+    const MAX_REPORT_LEN: usize = 32;
+
+    if bytes.len() > MAX_REPORT_LEN {
+        return SgrMouseSequenceStatus::Invalid;
+    }
+    if bytes.len() < INTRODUCER.len() {
+        return if INTRODUCER.starts_with(bytes) {
+            SgrMouseSequenceStatus::Prefix
+        } else {
+            SgrMouseSequenceStatus::Invalid
+        };
+    }
+    if !bytes.starts_with(INTRODUCER) {
+        return SgrMouseSequenceStatus::Invalid;
+    }
+
+    let body = &bytes[INTRODUCER.len()..];
+    if matches!(body.last(), Some(b'M' | b'm')) {
+        let mut parameters = &body[..body.len() - 1];
+        if parameters.last() == Some(&b';') {
+            parameters = &parameters[..parameters.len() - 1];
+        }
+        let fields: Vec<&[u8]> = parameters.split(|byte| *byte == b';').collect();
+        return if fields.len() == 3
+            && fields
+                .iter()
+                .all(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+        {
+            SgrMouseSequenceStatus::Complete
+        } else {
+            SgrMouseSequenceStatus::Invalid
+        };
+    }
+
+    if body
+        .iter()
+        .any(|byte| !byte.is_ascii_digit() && *byte != b';')
+    {
+        return SgrMouseSequenceStatus::Invalid;
+    }
+    let fields: Vec<&[u8]> = body.split(|byte| *byte == b';').collect();
+    let valid_prefix = fields.len() <= 4
+        && fields.iter().enumerate().all(|(index, field)| {
+            (!field.is_empty() && field.iter().all(u8::is_ascii_digit))
+                || (field.is_empty() && index + 1 == fields.len())
+        })
+        && (fields.len() < 4 || fields.last().is_some_and(|field| field.is_empty()));
+    if valid_prefix {
+        SgrMouseSequenceStatus::Prefix
+    } else {
+        SgrMouseSequenceStatus::Invalid
     }
 }
 
@@ -534,7 +822,8 @@ mod tests {
     }
 
     fn spawn_echo() -> PtyView {
-        PtyView::spawn(&echo_binary(), &["hello".to_string()], None, &[]).expect("spawn echo")
+        // A plain inline program: wisetree owns its scrollback.
+        PtyView::spawn(&echo_binary(), &["hello".to_string()], None, &[], true).expect("spawn echo")
     }
 
     fn wait_for_exit(pty: &mut PtyView) {
@@ -549,6 +838,109 @@ mod tests {
 
     fn sgr(bytes: Option<Vec<u8>>) -> String {
         String::from_utf8(bytes.expect("expected a mouse report")).unwrap()
+    }
+
+    #[test]
+    fn fragmented_mouse_input_discards_crossterms_leaked_wheel_keys() {
+        // Exact shape reported by crossterm#668 and reproduced in Codex:
+        // one ScrollDown report becomes Esc + one printable KeyEvent per byte.
+        let mut filter = FragmentedMouseInput::default();
+        let mut now = Instant::now();
+        for byte in b"\x1b[<65;96;8M" {
+            assert_eq!(
+                filter.filter(&[*byte], now),
+                None,
+                "no fragment may reach the child"
+            );
+            now += Duration::from_millis(1);
+        }
+        assert!(filter.candidate.is_empty(), "complete report is discarded");
+        assert!(filter.updated_at.is_none());
+    }
+
+    #[test]
+    fn fragmented_mouse_input_preserves_real_escape_and_control_keys() {
+        let mut filter = FragmentedMouseInput::default();
+        let now = Instant::now();
+
+        // A complete arrow-key report was parsed normally by crossterm and
+        // must never be mistaken for its fragmented-mouse failure mode.
+        assert_eq!(filter.filter(b"\x1b[A", now), Some(b"\x1b[A".to_vec()));
+
+        // A standalone Escape is delayed only for the disambiguation window,
+        // then forwarded unchanged.
+        assert_eq!(filter.filter(b"\x1b", now), None);
+        assert_eq!(
+            filter.take_stale(now + FRAGMENTED_MOUSE_INPUT_TIMEOUT),
+            Some(vec![0x1b])
+        );
+
+        // A candidate that diverges from `ESC[<...` is released byte-for-byte.
+        assert_eq!(filter.filter(b"\x1b", now), None);
+        assert_eq!(filter.filter(b"[", now), None);
+        assert_eq!(filter.filter(b"A", now), Some(b"\x1b[A".to_vec()));
+    }
+
+    #[test]
+    fn fragmented_wheel_keys_do_not_reach_a_real_inline_child() {
+        let Some(sh) = resolve_on_path("sh") else {
+            return;
+        };
+        // Read exactly one raw byte after announcing readiness. If the leaked
+        // report is not filtered, this prints 27 (Escape); the correct first
+        // byte is the sentinel `z` (122).
+        let script = "stty raw -echo; printf 'ready\\r\\n'; head -c 1 | od -An -tu1";
+        let mut pty = PtyView::spawn(
+            &sh,
+            &["-c".to_string(), script.to_string()],
+            None,
+            &[],
+            true,
+        )
+        .expect("spawn sh");
+
+        let ready_deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < ready_deadline {
+            if pty
+                .parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("ready")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            pty.parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("ready"),
+            "child never became ready"
+        );
+
+        for byte in b"\x1b[<65;96;8M" {
+            pty.send_input(&[*byte]);
+        }
+        pty.send_input(b"z");
+
+        let output_deadline = Instant::now() + Duration::from_millis(2000);
+        let mut contents = String::new();
+        while Instant::now() < output_deadline {
+            contents = pty.parser.lock().unwrap().screen().contents();
+            if contents.contains("122") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            contents.contains("122"),
+            "expected sentinel byte 122; leaked input reached child: {contents:?}"
+        );
     }
 
     #[test]
@@ -687,6 +1079,8 @@ mod tests {
         let Some(sh) = resolve_on_path("sh") else {
             return; // no POSIX shell — skip rather than fail on odd hosts.
         };
+        // Modeled on opencode: an alt-screen TUI that owns its scroll region,
+        // so it is *not* an inline harness (renders_inline = false).
         let mut pty = PtyView::spawn(
             &sh,
             &[
@@ -695,6 +1089,7 @@ mod tests {
             ],
             None,
             &[],
+            false,
         )
         .expect("spawn sh");
         // Pretend the panel was rendered so coordinate translation has an area.
@@ -728,6 +1123,73 @@ mod tests {
     }
 
     #[test]
+    fn send_mouse_never_forwards_raw_wheel_to_an_inline_harness() {
+        // Reproduces the codex bug: an inline harness (renders_inline = true)
+        // that enters an alternate screen and enables mouse tracking must NOT
+        // receive a raw SGR wheel report. Codex doesn't decode those reports,
+        // so a forwarded one can be echoed as literal `[<64;...M` text and its
+        // leading ESC read as an interrupt keystroke. `send_mouse` must decline
+        // the wheel (false) so the caller's wheel_up/wheel_down fallback runs —
+        // purely from the harness flag, regardless of the child's live modes.
+        let Some(sh) = resolve_on_path("sh") else {
+            return;
+        };
+        let mut pty = PtyView::spawn(
+            &sh,
+            &[
+                "-c".to_string(),
+                "printf '\\033[?1049h\\033[?1000h\\033[?1006h'; sleep 2".to_string(),
+            ],
+            None,
+            &[],
+            true,
+        )
+        .expect("spawn sh");
+        pty.last_area.set(Rect::new(0, 0, 80, 24));
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let mut enabled = false;
+        while Instant::now() < deadline {
+            if pty
+                .parser
+                .lock()
+                .map(|p| p.screen().mouse_protocol_mode() != MouseProtocolMode::None)
+                .unwrap_or(false)
+            {
+                enabled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(enabled, "child never enabled mouse tracking");
+        assert!(
+            pty.parser
+                .lock()
+                .map(|p| p.screen().alternate_screen())
+                .unwrap_or(false),
+            "regression child must exercise the alternate-screen state"
+        );
+        assert!(
+            !pty.send_mouse(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE),
+            "wheel events must not be forwarded raw to an inline harness"
+        );
+        assert!(
+            !pty.send_mouse(MouseEventKind::ScrollDown, 0, 0, KeyModifiers::NONE),
+            "wheel events must not be forwarded raw to an inline harness"
+        );
+        // A non-wheel event must still forward to a tracking inline child.
+        assert!(
+            pty.send_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE
+            ),
+            "non-wheel events must still forward to a tracking inline harness"
+        );
+    }
+
+    #[test]
     fn scroll_apis_clamp_safely_and_dont_panic_on_overscroll() {
         let mut pty = spawn_echo();
         wait_for_exit(&mut pty);
@@ -745,5 +1207,206 @@ mod tests {
         // scrollback_len matches what vt100 actually retains; for a
         // single-line echo this is 0, but the accessor must still work.
         let _ = pty.scrollback_len();
+    }
+
+    #[test]
+    fn wheel_scrolls_the_vt100_buffer_for_an_inline_child() {
+        // codex and claude render inline and never enable mouse tracking, so a
+        // wheel tick must move the vt100 scrollback — sending them a page key
+        // (as we do for alt-screen children) would do nothing.
+        let Some(sh) = resolve_on_path("sh") else {
+            return; // no POSIX shell — skip rather than fail on odd hosts.
+        };
+        let mut pty = PtyView::spawn(
+            &sh,
+            &["-c".to_string(), "seq 1 200; sleep 2".to_string()],
+            None,
+            &[],
+            true,
+        )
+        .expect("spawn sh");
+
+        // Wait for enough output to build scrollback (200 lines > the grid).
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline && pty.scrollback_len() == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pty.scrollback_len() > 0, "child produced no scrollback");
+        assert!(!pty.tracks_mouse());
+
+        assert_eq!(pty.scrollback_offset(), 0);
+        pty.wheel_up(5);
+        assert_eq!(pty.scrollback_offset(), 5, "inline child must scroll vt100");
+        pty.wheel_down(3);
+        assert_eq!(pty.scrollback_offset(), 2);
+    }
+
+    /// Read the visible grid row `row` as a trimmed string (respects the
+    /// current scrollback offset, since `cell` composites scrollback + screen).
+    fn visible_row_text(pty: &PtyView, row: u16, cols: u16) -> String {
+        let parser = pty.parser.lock().unwrap();
+        let screen = parser.screen();
+        let mut s = String::new();
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                s.push_str(&cell.contents());
+            }
+        }
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn terminal_query_reply_answers_only_osc_10_and_11() {
+        // No query -> nothing to send.
+        assert!(terminal_query_reply(b"just some normal output\r\n").is_none());
+
+        // OSC 10 + OSC 11 back-to-back (codex's opening burst) -> both replies,
+        // foreground before background, each ST-terminated.
+        let reply =
+            terminal_query_reply(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?2004h").expect("reply");
+        assert_eq!(reply, [OSC10_FG_REPLY, OSC11_BG_REPLY].concat());
+
+        // Background query alone -> only the OSC 11 reply (the one that unlocks
+        // codex's themed blocks).
+        assert_eq!(
+            terminal_query_reply(b"\x1b]11;?\x07").as_deref(),
+            Some(OSC11_BG_REPLY)
+        );
+
+        // We must not answer device-attributes / cursor-position probes.
+        assert!(terminal_query_reply(b"\x1b[c\x1b[6n").is_none());
+    }
+
+    #[test]
+    fn spawned_child_gets_its_background_query_answered() {
+        // End-to-end: a child that emits the OSC 11 query must receive our
+        // reply on its stdin — the mechanism codex relies on to theme itself.
+        let Some(sh) = resolve_on_path("sh") else {
+            return;
+        };
+        // Emit the bg query, then echo whatever arrives on stdin so the test can
+        // observe the reply the reader thread wrote back.
+        let script = "printf '\\033]11;?\\033\\\\'; head -c 32";
+        let pty = PtyView::spawn(
+            &sh,
+            &["-c".to_string(), script.to_string()],
+            None,
+            &[],
+            true,
+        )
+        .expect("spawn sh");
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let mut saw_reply = false;
+        while Instant::now() < deadline {
+            let text = {
+                let parser = pty.parser.lock().unwrap();
+                parser.screen().contents()
+            };
+            // The child echoes our reply; its distinctive payload is the rgb spec.
+            if text.contains("rgb:1e1e") {
+                saw_reply = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            saw_reply,
+            "the reader thread must answer the child's OSC 11 background query"
+        );
+    }
+
+    #[test]
+    fn inline_child_scroll_region_history_reaches_scrollback() {
+        // The crux of the codex/claude embed: they commit transcript lines by
+        // scrolling *within a top-anchored DECSTBM scroll region* (reserving a
+        // bottom composer), never entering the alt screen. Stock vt100 discards
+        // rows scrolled out of an active region, so their history never reached
+        // scrollback and the panel couldn't scroll back. The vendored patch
+        // captures top-anchored regions — this test would see `scrollback_len`
+        // stuck at 0 without it.
+        let Some(sh) = resolve_on_path("sh") else {
+            return; // no POSIX shell — skip rather than fail on odd hosts.
+        };
+        // Set a scroll region of rows 1..20 (top-anchored, bottom composer
+        // reserved), park the cursor at its bottom, then emit 100 lines so the
+        // region scrolls ~80 times. Mirrors how codex commits its transcript.
+        let script = "printf '\\033[1;20r\\033[20;1H'; \
+                      for i in $(seq 1 100); do printf 'line%d\\r\\n' \"$i\"; done; \
+                      sleep 2";
+        let mut pty = PtyView::spawn(
+            &sh,
+            &["-c".to_string(), script.to_string()],
+            None,
+            &[],
+            true,
+        )
+        .expect("spawn sh");
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline && pty.scrollback_len() == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pty.scrollback_len() > 0,
+            "top-anchored scroll-region history must land in scrollback (patch A)"
+        );
+        assert!(
+            !pty.tracks_mouse(),
+            "an inline child never tracks the mouse"
+        );
+
+        // Scroll all the way back; an early committed line must be visible in
+        // the composited viewport (patch B path — `cell` reads scrollback).
+        pty.scroll_to_top();
+        assert!(
+            pty.scrollback_offset() > 0,
+            "scroll_to_top must move offset"
+        );
+        let (rows, cols) = pty.last_size;
+        // The cursor started at the bottom of the region, so the first rows to
+        // scroll into history are blank; the committed `lineN` rows follow.
+        // Scan the whole composited viewport for one.
+        let visible: Vec<String> = (0..rows).map(|r| visible_row_text(&pty, r, cols)).collect();
+        assert!(
+            visible.iter().any(|line| line.starts_with("line")),
+            "an early transcript line must be reachable in scrollback, got {visible:?}"
+        );
+    }
+
+    #[test]
+    fn wheel_leaves_the_vt100_buffer_alone_for_a_tracking_child() {
+        // An alt-screen child (opencode) owns its own scroll region, so
+        // wheel_up sends it a page key and must not move the host's buffer.
+        let Some(sh) = resolve_on_path("sh") else {
+            return;
+        };
+        // Modeled on opencode: an alt-screen TUI that owns its scroll region
+        // (renders_inline = false), so wheel_up must send a page key rather
+        // than moving the host's vt100 buffer.
+        let mut pty = PtyView::spawn(
+            &sh,
+            &[
+                "-c".to_string(),
+                "seq 1 200; printf '\\033[?1003h\\033[?1006h'; sleep 2".to_string(),
+            ],
+            None,
+            &[],
+            false,
+        )
+        .expect("spawn sh");
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline && !pty.tracks_mouse() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pty.tracks_mouse(), "child never enabled tracking");
+
+        pty.wheel_up(5);
+        assert_eq!(
+            pty.scrollback_offset(),
+            0,
+            "a tracking child owns its scroll; the host buffer must not move"
+        );
     }
 }

@@ -273,6 +273,14 @@ pub enum UpdateAllTarget {
 }
 
 impl UpdateAllTarget {
+    /// Buttons in left-to-right render order, also used for Left/Right
+    /// keyboard navigation within the "Update:" cluster.
+    const ALL: [UpdateAllTarget; 3] = [
+        UpdateAllTarget::All,
+        UpdateAllTarget::Branches,
+        UpdateAllTarget::PullRequests,
+    ];
+
     fn button_label(self) -> &'static str {
         match self {
             UpdateAllTarget::All => "All",
@@ -288,6 +296,16 @@ impl UpdateAllTarget {
             UpdateAllTarget::PullRequests => colors::BRAND,
         }
     }
+}
+
+/// Which batch-action button group in the footer currently owns the
+/// keyboard focus. `None` (stored on the screen) means the worktree table
+/// has focus instead. Tab cycles table → Update → Delete → table; Left/Right
+/// move between buttons within the focused cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterFocus {
+    Update(UpdateAllTarget),
+    Delete(BulkDeleteStatus),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,22 +483,23 @@ pub struct DashboardScreen {
     refreshed_at: Option<Instant>,
     next_pr_fetch_at: Option<Instant>,
     pr_enrichment_enabled: bool,
-    /// `Some` while the bulk-delete buttons row owns the keyboard focus,
-    /// `None` while the worktree table does. Tab toggles between the two
-    /// sections; Left/Right move between buttons; Esc returns focus to the
-    /// table.
-    bulk_focus: Option<BulkDeleteStatus>,
-    /// Remembers the bulk-delete button that was focused when Tab moved back
-    /// to the worktree table, so the next Tab into the buttons resumes from
-    /// there instead of jumping to the first button. Mirrors how the table
-    /// keeps its selected row across the same toggle.
-    last_bulk_focus: BulkDeleteStatus,
+    /// `Some` while one of the footer button clusters ("Update:" or "Delete
+    /// worktrees with status:") owns the keyboard focus, `None` while the
+    /// worktree table does. Tab cycles table → Update → Delete → table;
+    /// Left/Right move between buttons within the focused cluster; Esc
+    /// returns focus to the table.
+    footer_focus: Option<FooterFocus>,
+    /// Remembers the last-focused button within each cluster so tabbing away
+    /// and back resumes on the same button instead of jumping to the first.
+    /// Mirrors how the table keeps its selected row across the same toggle.
+    last_update_focus: UpdateAllTarget,
+    last_delete_focus: BulkDeleteStatus,
     /// Captured during render so mouse clicks on the footer buttons can
     /// be hit-tested by the app.
     bulk_button_rects: Vec<(BulkDeleteStatus, Rect)>,
     /// Captured during render so mouse clicks on the "Update all" buttons
-    /// can be hit-tested. These buttons are click-only (not part of the
-    /// Tab/arrow `bulk_focus` navigation).
+    /// can be hit-tested. These buttons also take part in the Tab/arrow
+    /// `footer_focus` keyboard navigation.
     update_all_button_rects: Vec<(UpdateAllTarget, Rect)>,
     /// Captured during render so mouse clicks on table rows can select
     /// the clicked row and open its action menu (same as pressing Enter).
@@ -523,8 +542,9 @@ impl DashboardScreen {
             refreshed_at: None,
             next_pr_fetch_at: None,
             pr_enrichment_enabled,
-            bulk_focus: None,
-            last_bulk_focus: BulkDeleteStatus::ALL[0],
+            footer_focus: None,
+            last_update_focus: UpdateAllTarget::ALL[0],
+            last_delete_focus: BulkDeleteStatus::ALL[0],
             bulk_button_rects: Vec::new(),
             update_all_button_rects: Vec::new(),
             row_rects: Vec::new(),
@@ -626,16 +646,16 @@ impl DashboardScreen {
             return DashboardAction::Refresh;
         }
 
-        // Tab toggles focus between the table and the bulk-delete buttons.
+        // Tab cycles focus table → Update → Delete → table (BackTab reverses).
         // Available even while the search query has text — Tab is never
         // typeable into the search.
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.toggle_bulk_focus();
+            self.cycle_footer_focus(key.code == KeyCode::Tab);
             return DashboardAction::Continue;
         }
 
-        if let Some(focused) = self.bulk_focus {
-            return self.handle_bulk_focus_key(key, focused);
+        if let Some(focused) = self.footer_focus {
+            return self.handle_footer_focus_key(key, focused);
         }
 
         match key.code {
@@ -649,23 +669,23 @@ impl DashboardScreen {
                 }
             }
             KeyCode::Up => {
-                // Up from the first filtered row jumps focus to the bulk
-                // delete buttons.
+                // Up from the first filtered row jumps focus to the footer's
+                // first (leftmost) cluster, "Update:".
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected == 0 {
-                    self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
+                    self.footer_focus = Some(FooterFocus::Update(self.last_update_focus));
                     return DashboardAction::Continue;
                 }
                 self.move_selection(-1);
                 DashboardAction::Continue
             }
             KeyCode::Down => {
-                // Down at the last filtered row moves focus onto the bulk
-                // delete buttons.
+                // Down at the last filtered row moves focus onto the footer's
+                // first (leftmost) cluster, "Update:".
                 // Otherwise advance selection within the table.
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 && self.selected + 1 >= filtered_len {
-                    self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
+                    self.footer_focus = Some(FooterFocus::Update(self.last_update_focus));
                     return DashboardAction::Continue;
                 }
                 self.move_selection(1);
@@ -762,36 +782,41 @@ impl DashboardScreen {
         }
     }
 
-    /// Tab toggles focus between the worktree table (`None`) and the
-    /// bulk-delete buttons. Moving into the buttons resumes on the status
-    /// that was focused last (`last_bulk_focus`); moving back to the table
-    /// remembers the focused status so the round trip preserves the
-    /// selection.
-    fn toggle_bulk_focus(&mut self) {
-        match self.bulk_focus {
-            None => self.bulk_focus = Some(self.last_bulk_focus),
-            Some(status) => {
-                self.last_bulk_focus = status;
-                self.bulk_focus = None;
-            }
+    /// Cycles keyboard focus table → Update → Delete → table (`forward`);
+    /// BackTab reverses. Entering a cluster resumes on the button focused
+    /// last (`last_update_focus`/`last_delete_focus`); leaving a cluster
+    /// records its focused button so the round trip preserves the selection.
+    fn cycle_footer_focus(&mut self, forward: bool) {
+        match self.footer_focus {
+            Some(FooterFocus::Update(target)) => self.last_update_focus = target,
+            Some(FooterFocus::Delete(status)) => self.last_delete_focus = status,
+            None => {}
         }
+        self.footer_focus = if forward {
+            match self.footer_focus {
+                None => Some(FooterFocus::Update(self.last_update_focus)),
+                Some(FooterFocus::Update(_)) => Some(FooterFocus::Delete(self.last_delete_focus)),
+                Some(FooterFocus::Delete(_)) => None,
+            }
+        } else {
+            match self.footer_focus {
+                None => Some(FooterFocus::Delete(self.last_delete_focus)),
+                Some(FooterFocus::Delete(_)) => Some(FooterFocus::Update(self.last_update_focus)),
+                Some(FooterFocus::Update(_)) => None,
+            }
+        };
     }
 
-    fn handle_bulk_focus_key(
-        &mut self,
-        key: KeyEvent,
-        focused: BulkDeleteStatus,
-    ) -> DashboardAction {
+    fn handle_footer_focus_key(&mut self, key: KeyEvent, focused: FooterFocus) -> DashboardAction {
         match key.code {
             KeyCode::Esc => {
-                self.bulk_focus = None;
+                self.footer_focus = None;
                 DashboardAction::Continue
             }
             KeyCode::Up => {
-                // Mirror the Post-Create Commands page: Up from the
-                // buttons row returns focus to the last item in the
-                // worktree list.
-                self.bulk_focus = None;
+                // Mirror the Post-Create Commands page: Up from a buttons
+                // row returns focus to the last item in the worktree list.
+                self.footer_focus = None;
                 let filtered_len = self.filtered_indices().len();
                 if filtered_len > 0 {
                     self.selected = filtered_len - 1;
@@ -799,35 +824,35 @@ impl DashboardScreen {
                 DashboardAction::Continue
             }
             KeyCode::Down => {
-                // Down from the buttons row jumps focus back to the
-                // first worktree (symmetric with Up from the first row
-                // landing on the buttons).
-                self.bulk_focus = None;
+                // Down from a buttons row jumps focus back to the first
+                // worktree (symmetric with Up from the first row landing on
+                // the buttons).
+                self.footer_focus = None;
                 self.selected = 0;
                 DashboardAction::Continue
             }
             KeyCode::Left => {
-                self.bulk_focus = next_bulk_focus(Some(focused), false);
-                if self.bulk_focus.is_none() {
-                    self.bulk_focus = Some(*BulkDeleteStatus::ALL.last().unwrap());
-                }
+                self.footer_focus = Some(step_footer_focus(focused, false));
                 DashboardAction::Continue
             }
             KeyCode::Right => {
-                self.bulk_focus = next_bulk_focus(Some(focused), true);
-                if self.bulk_focus.is_none() {
-                    self.bulk_focus = Some(BulkDeleteStatus::ALL[0]);
-                }
+                self.footer_focus = Some(step_footer_focus(focused, true));
                 DashboardAction::Continue
             }
-            KeyCode::Enter => self.trigger_bulk_delete(focused),
+            KeyCode::Enter => match focused {
+                FooterFocus::Update(target) => {
+                    self.footer_focus = None;
+                    self.trigger_update_all(target)
+                }
+                FooterFocus::Delete(status) => self.trigger_bulk_delete(status),
+            },
             _ => DashboardAction::Continue,
         }
     }
 
     fn trigger_bulk_delete(&mut self, status: BulkDeleteStatus) -> DashboardAction {
         let paths = self.bulk_target_paths(status);
-        self.bulk_focus = None;
+        self.footer_focus = None;
         // The empty case (no worktrees match this status) is reported via
         // a toast by the app layer — keep this method side-effect-free
         // beyond clearing focus so the toast is the single source of
@@ -1684,10 +1709,10 @@ impl DashboardScreen {
             data_y += 1;
         }
 
-        // When focus is on the bulk-delete buttons row, hide the
+        // When focus is on one of the footer button clusters, hide the
         // worktree selection (no highlight, no ➤ marker) so the user
         // sees a single active focus indicator at a time.
-        let show_selection = self.bulk_focus.is_none();
+        let show_selection = self.footer_focus.is_none();
         for (offset, index) in visible.iter().enumerate() {
             let row = &self.rows[*index];
             let filtered_idx = viewport.start + offset;
@@ -1870,7 +1895,7 @@ impl DashboardScreen {
             FooterRow::Reviewers => {
                 frame.render_widget(Paragraph::new(self.reviewers_line()), rect)
             }
-            FooterRow::BulkDelete => self.render_bulk_delete_buttons(frame, rect),
+            FooterRow::BulkDelete => self.render_batch_action_buttons(frame, rect),
             FooterRow::Shortcuts => {
                 frame.render_widget(Paragraph::new(self.shortcuts_line()), rect)
             }
@@ -2170,20 +2195,132 @@ impl DashboardScreen {
         ])
     }
 
-    fn render_bulk_delete_buttons(&mut self, frame: &mut Frame, area: Rect) {
+    /// Renders the footer's batch-action row: the "Update:" cluster
+    /// left-aligned (it's used far more often, so it gets the prominent left
+    /// slot) and the "Delete worktrees with status:" cluster right-aligned.
+    /// The delete cluster degrades gracefully — dropping buttons, then
+    /// vanishing entirely — when the row is too narrow to hold both.
+    fn render_batch_action_buttons(&mut self, frame: &mut Frame, area: Rect) {
         let muted_dim = Style::default()
             .fg(colors::MUTED)
             .add_modifier(Modifier::DIM);
-        let prefix = "Delete worktrees with status:";
-        let prefix_width = prefix.chars().count() as u16 + 1; // trailing space
-
         // Each button hugs its own label (label + 2 padding + 2 border) so
         // shorter labels like "Clean"/"Dirty" don't end up with a stray
         // half-char of leftover space on one side.
         let gap: u16 = 2;
+        let update_width = self.render_update_all_buttons(frame, area, gap, muted_dim);
+        self.render_bulk_delete_buttons(frame, area, update_width, gap, muted_dim);
+    }
+
+    /// Render the "Update:" label + the green All / teal Branches / purple
+    /// Pull Requests buttons, left-aligned within `area`. Returns the width
+    /// the cluster consumed (0 if it didn't fit at all), so the delete
+    /// cluster can right-align in the space that's left.
+    fn render_update_all_buttons(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        gap: u16,
+        muted_dim: Style,
+    ) -> u16 {
+        let prefix = "Update:";
+        let prefix_width = prefix.chars().count() as u16 + 1; // trailing space
+        let all_width = UpdateAllTarget::All.button_label().chars().count() as u16 + 4;
+        let branches_width = UpdateAllTarget::Branches.button_label().chars().count() as u16 + 4;
+        let pr_width = UpdateAllTarget::PullRequests.button_label().chars().count() as u16 + 4;
+        let cluster_width = prefix_width + all_width + gap + branches_width + gap + pr_width;
+
+        if cluster_width > area.width {
+            return 0;
+        }
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(prefix_width),
+                Constraint::Length(all_width),
+                Constraint::Length(gap),
+                Constraint::Length(branches_width),
+                Constraint::Length(gap),
+                Constraint::Length(pr_width),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        // Label on the middle row so it aligns with the button contents.
+        if cols[0].width > 0 {
+            let label_row = Rect {
+                x: cols[0].x,
+                y: cols[0].y + cols[0].height / 2,
+                width: cols[0].width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(prefix, muted_dim))),
+                label_row,
+            );
+        }
+
+        for (target, rect) in [
+            (UpdateAllTarget::All, cols[1]),
+            (UpdateAllTarget::Branches, cols[3]),
+            (UpdateAllTarget::PullRequests, cols[5]),
+        ] {
+            if rect.width == 0 {
+                continue;
+            }
+            let focused = self.footer_focus == Some(FooterFocus::Update(target));
+            let text_style = if focused {
+                Style::default()
+                    .fg(colors::WHITE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(target.color())
+                    .add_modifier(Modifier::BOLD)
+            };
+            let button =
+                Paragraph::new(Line::from(Span::styled(target.button_label(), text_style)))
+                    .alignment(Alignment::Center)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Plain)
+                            .border_style(Style::default().fg(target.color()))
+                            .padding(Padding::horizontal(1)),
+                    );
+            frame.render_widget(button, rect);
+            self.update_all_button_rects.push((target, rect));
+        }
+
+        cluster_width
+    }
+
+    /// Render the "Delete worktrees with status:" label + status buttons,
+    /// right-aligned within `area`. `update_width` is how much of `area` the
+    /// left-aligned Update cluster already consumed; the delete cluster drops
+    /// buttons (then vanishes) rather than colliding with it.
+    fn render_bulk_delete_buttons(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        update_width: u16,
+        gap: u16,
+        muted_dim: Style,
+    ) {
+        let prefix = "Delete worktrees with status:";
+        let prefix_width = prefix.chars().count() as u16 + 1; // trailing space
+
+        // Reserve a separating gap between the Update cluster and this one;
+        // whatever remains of the row is available for the delete cluster.
+        let separator: u16 = if update_width > 0 { 4 } else { 0 };
+        let available = area
+            .width
+            .saturating_sub(update_width)
+            .saturating_sub(separator);
 
         let mut visible_statuses = Vec::with_capacity(BulkDeleteStatus::ALL.len());
-        let mut used_width = prefix_width;
+        let mut cluster_width = prefix_width;
         for status in BulkDeleteStatus::ALL {
             let button_width = status.button_label().chars().count() as u16 + 4;
             let required_width = if visible_statuses.is_empty() {
@@ -2191,20 +2328,37 @@ impl DashboardScreen {
             } else {
                 gap + button_width
             };
-            if used_width.saturating_add(required_width) > area.width {
+            if cluster_width.saturating_add(required_width) > available {
                 break;
             }
             visible_statuses.push(status);
-            used_width = used_width.saturating_add(required_width);
+            cluster_width = cluster_width.saturating_add(required_width);
         }
 
-        if let Some(focused) = self.bulk_focus {
+        // Not enough room for the prefix + even one button: drop the cluster,
+        // and release any keyboard focus that was sitting on it.
+        if visible_statuses.is_empty() {
+            if matches!(self.footer_focus, Some(FooterFocus::Delete(_))) {
+                self.footer_focus = None;
+            }
+            return;
+        }
+
+        // Focused status scrolled out of view → clamp onto the last visible.
+        if let Some(FooterFocus::Delete(focused)) = self.footer_focus {
             if !visible_statuses.contains(&focused) {
-                self.bulk_focus = visible_statuses.last().copied();
+                self.footer_focus = visible_statuses.last().map(|s| FooterFocus::Delete(*s));
             }
         }
 
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_statuses.len() * 2 + 2);
+        let cluster_area = Rect {
+            x: area.x + area.width - cluster_width,
+            y: area.y,
+            width: cluster_width,
+            height: area.height,
+        };
+
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_statuses.len() * 2);
         constraints.push(Constraint::Length(prefix_width));
         for (index, status) in visible_statuses.iter().enumerate() {
             if index > 0 {
@@ -2213,12 +2367,11 @@ impl DashboardScreen {
             let button_width = status.button_label().chars().count() as u16 + 4;
             constraints.push(Constraint::Length(button_width));
         }
-        constraints.push(Constraint::Min(0));
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
-            .split(area);
+            .split(cluster_area);
 
         // The prefix label sits on the middle row of the 3-line area so it
         // visually aligns with the button contents.
@@ -2247,7 +2400,7 @@ impl DashboardScreen {
                 continue;
             }
 
-            let focused = self.bulk_focus == Some(*status);
+            let focused = self.footer_focus == Some(FooterFocus::Delete(*status));
             let text_style = if focused {
                 Style::default()
                     .fg(colors::WHITE)
@@ -2271,101 +2424,6 @@ impl DashboardScreen {
                     );
             frame.render_widget(button, rect);
             self.bulk_button_rects.push((*status, rect));
-        }
-
-        // Right-aligned "Update: | All | | Branches | | Pull Requests |"
-        // cluster, rendered only when it fits in the width left over after
-        // the delete buttons (same graceful-degradation policy as above).
-        self.render_update_all_buttons(frame, area, used_width, gap, muted_dim);
-    }
-
-    /// Render the "Update:" label + the green All / teal Branches / purple
-    /// Pull Requests buttons, right-aligned within `area`. `delete_width` is
-    /// how much of `area` the delete cluster already consumed; the
-    /// update-all cluster is omitted entirely if it would collide with it.
-    /// These buttons are click-only, so there is no focus highlight.
-    fn render_update_all_buttons(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        delete_width: u16,
-        gap: u16,
-        muted_dim: Style,
-    ) {
-        let prefix = "Update:";
-        let prefix_width = prefix.chars().count() as u16 + 1; // trailing space
-        let all_width = UpdateAllTarget::All.button_label().chars().count() as u16 + 4;
-        let branches_width = UpdateAllTarget::Branches.button_label().chars().count() as u16 + 4;
-        let pr_width = UpdateAllTarget::PullRequests.button_label().chars().count() as u16 + 4;
-        let cluster_width = prefix_width + all_width + gap + branches_width + gap + pr_width;
-
-        // Need a separating gap between the delete cluster and this one, plus
-        // the cluster itself, all inside the row.
-        let separator: u16 = 4;
-        if delete_width
-            .saturating_add(separator)
-            .saturating_add(cluster_width)
-            > area.width
-        {
-            return;
-        }
-
-        let cluster_area = Rect {
-            x: area.x + area.width - cluster_width,
-            y: area.y,
-            width: cluster_width,
-            height: area.height,
-        };
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(prefix_width),
-                Constraint::Length(all_width),
-                Constraint::Length(gap),
-                Constraint::Length(branches_width),
-                Constraint::Length(gap),
-                Constraint::Length(pr_width),
-            ])
-            .split(cluster_area);
-
-        // Label on the middle row so it aligns with the button contents.
-        if cols[0].width > 0 {
-            let label_row = Rect {
-                x: cols[0].x,
-                y: cols[0].y + cols[0].height / 2,
-                width: cols[0].width,
-                height: 1,
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(prefix, muted_dim))),
-                label_row,
-            );
-        }
-
-        for (target, rect) in [
-            (UpdateAllTarget::All, cols[1]),
-            (UpdateAllTarget::Branches, cols[3]),
-            (UpdateAllTarget::PullRequests, cols[5]),
-        ] {
-            if rect.width == 0 {
-                continue;
-            }
-            let button = Paragraph::new(Line::from(Span::styled(
-                target.button_label(),
-                Style::default()
-                    .fg(target.color())
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Plain)
-                    .border_style(Style::default().fg(target.color()))
-                    .padding(Padding::horizontal(1)),
-            );
-            frame.render_widget(button, rect);
-            self.update_all_button_rects.push((target, rect));
         }
     }
 
@@ -3442,30 +3500,27 @@ fn row_matches_bulk_status(row: &DashboardRow, status: BulkDeleteStatus) -> bool
     label == status.row_label()
 }
 
-/// Returns the next focused bulk-delete button, or `None` to land back
-/// on the table. `forward` controls direction (`Tab` vs `BackTab`).
-fn next_bulk_focus(current: Option<BulkDeleteStatus>, forward: bool) -> Option<BulkDeleteStatus> {
-    let all = BulkDeleteStatus::ALL;
-    let index = match current {
-        None => {
-            return if forward {
-                Some(all[0])
-            } else {
-                Some(*all.last().unwrap())
-            };
-        }
-        Some(status) => all.iter().position(|s| *s == status).unwrap_or(0),
-    };
-    if forward {
-        if index + 1 >= all.len() {
-            None
+/// Moves the focus Left/Right within the currently focused footer cluster,
+/// wrapping around at the ends. `forward` controls direction (`Right` vs
+/// `Left`). Focus never crosses between clusters — that's Tab's job.
+fn step_footer_focus(current: FooterFocus, forward: bool) -> FooterFocus {
+    fn wrap<T: Copy + PartialEq>(all: &[T], current: T, forward: bool) -> T {
+        let index = all.iter().position(|item| *item == current).unwrap_or(0);
+        let len = all.len();
+        let next = if forward {
+            (index + 1) % len
         } else {
-            Some(all[index + 1])
+            (index + len - 1) % len
+        };
+        all[next]
+    }
+    match current {
+        FooterFocus::Update(target) => {
+            FooterFocus::Update(wrap(&UpdateAllTarget::ALL, target, forward))
         }
-    } else if index == 0 {
-        None
-    } else {
-        Some(all[index - 1])
+        FooterFocus::Delete(status) => {
+            FooterFocus::Delete(wrap(&BulkDeleteStatus::ALL, status, forward))
+        }
     }
 }
 

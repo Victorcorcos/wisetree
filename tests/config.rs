@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use tempfile::TempDir;
 use wisetree::config::schema::{
     clamp_dashboard_refresh_interval, default_copy_ignores, default_copy_patterns,
-    default_path_template, AiStatusConfig, LinkStrategy, NotificationsConfig,
+    default_path_template, AiHarness, AiStatusConfig, LinkStrategy, NotificationsConfig,
 };
 use wisetree::config::{ConfigService, WorktreeConfig};
 
@@ -242,6 +242,133 @@ fn dashboard_config_round_trips_json() {
     let parsed: WorktreeConfig = serde_json::from_str(&raw).unwrap();
     assert_eq!(parsed.dashboard, cfg.dashboard);
     assert_eq!(parsed.notifications, cfg.notifications);
+}
+
+#[test]
+fn ai_harnesses_default_and_round_trip() {
+    let legacy: WorktreeConfig = serde_json::from_str(
+        r#"{
+      "dashboard": { "ai": { "model": "openai/gpt-5.6", "thinking": "high" } }
+    }"#,
+    )
+    .unwrap();
+    assert_eq!(legacy.dashboard.ai.explain.harness, AiHarness::OpenCode);
+    assert_eq!(legacy.dashboard.ai.fix.plan.harness, AiHarness::OpenCode);
+
+    let configured: WorktreeConfig = serde_json::from_str(
+        r#"{
+      "dashboard": { "ai": {
+        "explain": { "model": "openai/gpt-5.6", "harness": "codex" },
+        "update": { "model": "anthropic/claude", "harness": "claudeCode" },
+        "bugkill": { "judge": { "model": "other/model", "harness": "opencode" } }
+      } }
+    }"#,
+    )
+    .unwrap();
+    let raw = serde_json::to_string(&configured).unwrap();
+    assert!(raw.contains(r#""harness":"codex""#));
+    assert!(raw.contains(r#""harness":"claudeCode""#));
+    assert!(raw.contains(r#""harness":"opencode""#));
+    assert_eq!(
+        serde_json::from_str::<WorktreeConfig>(&raw).unwrap(),
+        configured
+    );
+}
+
+#[test]
+fn compatible_ai_harnesses_load() {
+    with_home(|_home| {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join(".wisetree.json"),
+            r#"{ "dashboard": { "ai": {
+              "explain": { "model": "openai/gpt-5.6", "harness": "codex" },
+              "update": { "model": "anthropic/claude", "harness": "claudeCode" },
+              "bugkill": { "judge": { "model": "other/model", "harness": "opencode" } }
+            } } }"#,
+        )
+        .unwrap();
+
+        ConfigService::new().load(Some(project.path())).unwrap();
+    });
+}
+
+#[test]
+fn incompatible_ai_harness_fails_loading_with_slot_and_choices() {
+    with_home(|_home| {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join(".wisetree.json"),
+            r#"{ "dashboard": { "ai": { "fix": { "apply": {
+              "model": "anthropic/claude", "harness": "codex"
+            } } } } }"#,
+        )
+        .unwrap();
+
+        let err = ConfigService::new().load(Some(project.path())).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("dashboard.ai.fix.apply.harness"),
+            "{message}"
+        );
+        assert!(message.contains("opencode, claudeCode"), "{message}");
+    });
+}
+
+#[test]
+fn blank_model_cannot_select_a_non_opencode_harness() {
+    with_home(|_home| {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join(".wisetree.json"),
+            r#"{ "dashboard": { "ai": { "explain": {
+              "model": "  ", "harness": "codex"
+            } } } }"#,
+        )
+        .unwrap();
+
+        let err = ConfigService::new().load(Some(project.path())).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("accepted harness choices: opencode"));
+    });
+}
+
+#[test]
+fn invalid_ai_harness_and_unknown_slot_key_are_rejected() {
+    for raw in [
+        r#"{ "dashboard": { "ai": { "explain": { "harness": "gemini" } } } }"#,
+        r#"{ "dashboard": { "ai": { "explain": { "unexpected": true } } } }"#,
+    ] {
+        assert!(serde_json::from_str::<WorktreeConfig>(raw).is_err());
+    }
+}
+
+#[test]
+fn checked_in_schema_covers_all_nested_ai_slots_and_harnesses() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../schema.json")).unwrap();
+    let ai = &schema["properties"]["dashboard"]["properties"]["ai"];
+    for slot in [
+        &ai["properties"]["explain"],
+        &ai["properties"]["fix"]["properties"]["plan"],
+        &ai["properties"]["fix"]["properties"]["apply"],
+        &ai["properties"]["review"]["properties"]["strong"],
+        &ai["properties"]["review"]["properties"]["balanced"],
+        &ai["properties"]["review"]["properties"]["utility"],
+        &ai["properties"]["update"],
+        &ai["properties"]["bugkill"]["properties"]["investigate"],
+        &ai["properties"]["bugkill"]["properties"]["fix"],
+        &ai["properties"]["bugkill"]["properties"]["judge"],
+        &ai["properties"]["develop"]["properties"]["plan"],
+        &ai["properties"]["develop"]["properties"]["implement"],
+    ] {
+        assert_eq!(slot["additionalProperties"], false);
+        assert_eq!(
+            slot["properties"]["harness"]["enum"],
+            serde_json::json!(["opencode", "codex", "claudeCode"])
+        );
+        assert!(slot["default"].is_object());
+    }
 }
 
 #[test]

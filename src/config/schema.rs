@@ -111,6 +111,64 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
     (resolved, warnings)
 }
 
+/// Executable harness for an AI-assisted step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub enum AiHarness {
+    #[default]
+    #[serde(rename = "opencode")]
+    OpenCode,
+    #[serde(rename = "codex")]
+    Codex,
+    #[serde(rename = "claudeCode")]
+    ClaudeCode,
+}
+
+impl AiHarness {
+    pub fn accepted_for_model(model: &str) -> &'static [Self] {
+        match model.trim().split_once('/').map(|(provider, _)| provider) {
+            Some("openai") => &[Self::OpenCode, Self::Codex],
+            Some("anthropic") => &[Self::OpenCode, Self::ClaudeCode],
+            _ => &[Self::OpenCode],
+        }
+    }
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::OpenCode => "opencode",
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claudeCode",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::OpenCode => "OpenCode",
+            Self::Codex => "Codex CLI",
+            Self::ClaudeCode => "Claude Code",
+        }
+    }
+
+    /// Whether the harness renders its transcript *inline* (like a normal
+    /// terminal program) rather than driving a full-screen, mouse-tracking
+    /// TUI. Wisetree launches Codex with `--no-alt-screen`, while Claude Code
+    /// paints inline itself; both commit history to the terminal's scrollback,
+    /// so wisetree owns scrolling for them (via the vt100 buffer) and must
+    /// never forward raw wheel reports — those get echoed back as literal text
+    /// and the leading ESC reads as an interrupt.
+    /// OpenCode drives an alt-screen TUI (opentui) that manages its own scroll
+    /// region and expects the wheel reports, so it is *not* inline.
+    ///
+    /// This is deterministic per harness, unlike probing the child's runtime
+    /// alt-screen / mouse-mode state — codex can transiently flip either while
+    /// paging through history, which would otherwise misroute the wheel.
+    pub fn renders_inline(self) -> bool {
+        match self {
+            Self::Codex | Self::ClaudeCode => true,
+            Self::OpenCode => false,
+        }
+    }
+}
+
 /// Model + thinking strength for a single AI-assisted step. The leaf of the
 /// per-command [`AiConfig`], e.g.
 /// `{ "model": "opencode/deepseek-v4-flash-free", "thinking": "max" }`.
@@ -130,6 +188,11 @@ pub struct AiModelConfig {
     /// as `--variant <thinking>` where supported.
     #[serde(default)]
     pub thinking: String,
+
+    /// Executable used to run this model. Missing values from older configs
+    /// remain compatible by defaulting to OpenCode.
+    #[serde(default)]
+    pub harness: AiHarness,
 }
 
 // Out-of-the-box defaults per AI command. Each role is explicit so changing
@@ -140,60 +203,70 @@ fn default_explain_ai() -> AiModelConfig {
     AiModelConfig {
         model: "opencode/deepseek-v4-flash-free".to_string(),
         thinking: "max".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_fix_plan_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-sol".to_string(),
         thinking: "medium".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_fix_apply_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-terra".to_string(),
         thinking: "medium".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_update_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-terra".to_string(),
         thinking: "medium".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_review_strong_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-sol".to_string(),
         thinking: "medium".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_review_balanced_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-terra".to_string(),
         thinking: "medium".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_review_utility_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-luna".to_string(),
         thinking: "low".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_bugkill_investigate_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-sol".to_string(),
         thinking: "medium".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_bugkill_fix_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-terra".to_string(),
         thinking: "high".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_bugkill_judge_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-terra".to_string(),
         thinking: "medium".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 // Develop splits engineer/bricklayer across the GPT-5.6 pair: `plan` designs
@@ -203,12 +276,14 @@ fn default_develop_plan_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-sol".to_string(),
         thinking: "high".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 fn default_develop_implement_ai() -> AiModelConfig {
     AiModelConfig {
         model: "openai/gpt-5.6-terra".to_string(),
         thinking: "medium".to_string(),
+        harness: AiHarness::OpenCode,
     }
 }
 
@@ -460,6 +535,7 @@ impl<'de> Deserialize<'de> for AiConfig {
             Some(AiModelConfig {
                 model: raw.model.unwrap_or_default(),
                 thinking: raw.thinking.unwrap_or_default(),
+                harness: AiHarness::OpenCode,
             })
         } else {
             None
@@ -711,6 +787,59 @@ impl Default for WorktreeConfig {
 }
 
 impl WorktreeConfig {
+    pub fn validate_ai_harnesses(&self) -> std::result::Result<(), String> {
+        let slots = [
+            ("dashboard.ai.explain", &self.dashboard.ai.explain),
+            ("dashboard.ai.fix.plan", &self.dashboard.ai.fix.plan),
+            ("dashboard.ai.fix.apply", &self.dashboard.ai.fix.apply),
+            (
+                "dashboard.ai.review.strong",
+                &self.dashboard.ai.review.strong,
+            ),
+            (
+                "dashboard.ai.review.balanced",
+                &self.dashboard.ai.review.balanced,
+            ),
+            (
+                "dashboard.ai.review.utility",
+                &self.dashboard.ai.review.utility,
+            ),
+            ("dashboard.ai.update", &self.dashboard.ai.update),
+            (
+                "dashboard.ai.bugkill.investigate",
+                &self.dashboard.ai.bugkill.investigate,
+            ),
+            ("dashboard.ai.bugkill.fix", &self.dashboard.ai.bugkill.fix),
+            (
+                "dashboard.ai.bugkill.judge",
+                &self.dashboard.ai.bugkill.judge,
+            ),
+            ("dashboard.ai.develop.plan", &self.dashboard.ai.develop.plan),
+            (
+                "dashboard.ai.develop.implement",
+                &self.dashboard.ai.develop.implement,
+            ),
+        ];
+
+        for (path, slot) in slots {
+            let accepted = AiHarness::accepted_for_model(&slot.model);
+            if !accepted.contains(&slot.harness) {
+                let accepted = accepted
+                    .iter()
+                    .map(|harness| harness.wire_name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "{path}.harness '{}' is incompatible with model '{}'; accepted harness choices: {accepted}",
+                    slot.harness.wire_name(),
+                    slot.model
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Fold the pre-split `dashboard.notifications` block into the top-level
     /// `notifications` field so configs written before notifications became a
     /// standalone setting keep their bell preferences. The top-level value

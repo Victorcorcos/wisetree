@@ -103,6 +103,7 @@ struct Provenance {
     source_corpus_hash: String,
     review_input_hash: String,
     provider_model: String,
+    harness: String,
     thinking: String,
     tool_permissions: String,
     timeout_seconds: u64,
@@ -194,6 +195,10 @@ async fn main() -> Result<()> {
             source_corpus_hash: source_hash.clone(),
             review_input_hash: redacted_hash,
             provider_model: args.model.clone(),
+            // The adapter currently executes the production profiles through
+            // OpenCode; record that executable so it cannot be compared to a
+            // capture produced by another harness.
+            harness: "opencode".to_owned(),
             thinking: args.thinking.clone(),
             tool_permissions: "opencode:plan; filesystem:fixture-read-only; network:no-posting"
                 .to_owned(),
