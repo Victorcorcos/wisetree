@@ -147,6 +147,11 @@ const REVIEW_DIRECTORY_INVENTORY_MAX_BYTES: usize = 2 * 1024;
 /// Full new-side files at or below this cap are attached to scan inputs.
 const REVIEW_FILE_INLINE_MAX_BYTES: usize = 16 * 1024;
 const REVIEW_SYMBOL_SOURCE_MAX_BYTES: usize = 1024 * 1024;
+/// Small files are clearer as one numbered view. Larger files only retain that
+/// view when the diff changes enough of the file to make the full context pay
+/// for itself.
+const REVIEW_WHOLE_FILE_MAX_LINES: usize = 400;
+const REVIEW_DENSE_DIFF_PERCENT: usize = 25;
 /// Compact tester evidence passed to the sole coverage-owning scan.
 const REVIEW_TESTER_FINDINGS_MAX_BYTES: usize = 2 * 1024;
 const REVIEW_TEST_FILE_INVENTORY_MAX_BYTES: usize = 2 * 1024;
@@ -9461,6 +9466,27 @@ fn review_file_evidence(file: &ReviewFile, slim_unavailable_test: bool) -> Strin
         .filter(|line| line.as_bytes().get(7) == Some(&b'+'))
         .filter_map(annotated_review_line_number)
         .collect::<HashSet<_>>();
+    let line_count = content.lines().count();
+    let dense_change =
+        changed.len().saturating_mul(100) >= line_count.saturating_mul(REVIEW_DENSE_DIFF_PERCENT);
+    if line_count > REVIEW_WHOLE_FILE_MAX_LINES && !dense_change {
+        let extracted = extract_symbol_evidence(&file.path, content, &file.annotated_diff);
+        let guidance = if extracted.complete {
+            format!(
+                "complete enclosing symbols were extracted; read `{}` only for a specific unresolved relationship",
+                file.path
+            )
+        } else {
+            format!(
+                "extraction was incomplete or ambiguous — MUST read `{}` before completing this file's discovery judgment",
+                file.path
+            )
+        };
+        return format!(
+            "### NUMBERED DIFF HUNKS (authoritative anchors)\n{}\n\n{}\n\n({guidance})",
+            file.annotated_diff, extracted.rendered
+        );
+    }
     let mut rendered = String::from(
         "### NUMBERED CURRENT FILE (`+` marks changed lines; numbers are authoritative anchors)\n",
     );
@@ -11525,6 +11551,69 @@ copy to src/copied_again.rs
         );
         assert_eq!(prompt.matches("new_call();").count(), 1, "{prompt}");
         assert!(!prompt.contains("FILE_CONTENT"));
+    }
+
+    #[test]
+    fn sparse_large_file_uses_diff_and_symbols_without_losing_anchor_validation() {
+        let mut lines = (1..=450)
+            .map(|line| format!("// unchanged {line}"))
+            .collect::<Vec<_>>();
+        lines[249] = "fn changed_handler() {".to_string();
+        lines[250] = "    changed_call();".to_string();
+        lines[251] = "}".to_string();
+        let file = ReviewFile {
+            path: "src/large.rs".to_string(),
+            annotated_diff: "@@ -250,3 +250,3 @@\n   250  fn changed_handler() {\n   251 +    changed_call();\n   252  }".to_string(),
+            full_content: Some(format!("{}\n", lines.join("\n"))),
+            commentable_lines: BTreeSet::from([250, 251, 252]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+
+        let evidence = review_file_evidence(&file, false);
+        assert!(evidence.contains("NUMBERED DIFF HUNKS"), "{evidence}");
+        assert!(
+            evidence.contains("   251 +    changed_call();"),
+            "{evidence}"
+        );
+        assert!(
+            evidence.contains("#### SYMBOL: changed_handler"),
+            "{evidence}"
+        );
+        assert!(!evidence.contains("     1  // unchanged 1"), "{evidence}");
+
+        let findings = parse_review_findings(
+            "===WISETREE-REVIEW-BEGIN===\n---FINDING---\nLINE: 1\nTITLE: invalid\n---EXPLANATION---\ninvalid anchor\n---END-FINDING---\n---FINDING---\nLINE: 251\nTITLE: valid\n---EXPLANATION---\nvalid anchor\n---END-FINDING---\n===WISETREE-REVIEW-END===",
+            &file.path,
+            &file.commentable_lines,
+            &file.annotated_diff,
+        )
+        .unwrap();
+        assert_eq!(findings[0].line, None);
+        assert_eq!(findings[1].line, Some(251));
+    }
+
+    #[test]
+    fn dense_large_file_keeps_the_numbered_whole_file_view() {
+        let content = (1..=401)
+            .map(|line| format!("line_{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let diff = (1..=101)
+            .map(|line| format!("{line:>6} +line_{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file = ReviewFile {
+            path: "src/dense.rs".to_string(),
+            annotated_diff: diff,
+            full_content: Some(content),
+            commentable_lines: (1..=101).collect(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let evidence = review_file_evidence(&file, false);
+        assert!(evidence.contains("NUMBERED CURRENT FILE"), "{evidence}");
+        assert!(evidence.contains("   401  line_401"), "{evidence}");
     }
 
     #[test]

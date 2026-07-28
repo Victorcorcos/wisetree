@@ -78,6 +78,7 @@ pub(crate) fn extract_symbol_evidence(
         .collect::<Vec<_>>();
     let mut rendered = String::from("### ENCLOSING SYMBOL EVIDENCE\n");
     let mut referenced = HashSet::new();
+    let mut truncated = false;
     for (start, end, name) in &selected {
         rendered.push_str(&format!(
             "\n#### SYMBOL: {name} (lines {}-{})\n",
@@ -91,7 +92,7 @@ pub(crate) fn extract_symbol_evidence(
             } else {
                 ' '
             };
-            push_bounded(&mut rendered, &format!("{number:>6} {marker}{line}\n"));
+            truncated |= !push_bounded(&mut rendered, &format!("{number:>6} {marker}{line}\n"));
             referenced.extend(reference_tokens(line));
         }
     }
@@ -122,7 +123,7 @@ pub(crate) fn extract_symbol_evidence(
                 symbol.start + 1
             ));
             for (index, line) in lines[start..=end].iter().enumerate() {
-                push_bounded(
+                truncated |= !push_bounded(
                     &mut rendered,
                     &format!("{:>6}  {line}\n", start + index + 1),
                 );
@@ -130,17 +131,15 @@ pub(crate) fn extract_symbol_evidence(
         }
     }
 
-    let complete = syntax_complete
+    let complete = !truncated
+        && syntax_complete
         && changed.iter().all(|line| {
             selected
                 .iter()
                 .any(|(start, end, _)| *start < *line as usize && *line as usize <= end + 1)
         });
     if !complete {
-        push_bounded(
-            &mut rendered,
-            "\nEVIDENCE-FALLBACK: extraction was partial; read the real full file before completing this file's discovery judgment.\n",
-        );
+        append_fallback(&mut rendered);
     }
     ExtractedReviewEvidence {
         rendered: rendered.trim_end().to_string(),
@@ -347,10 +346,7 @@ fn module_window(
         };
         push_bounded(&mut rendered, &format!("{number:>6} {marker}{line}\n"));
     }
-    push_bounded(
-        &mut rendered,
-        "\nEVIDENCE-FALLBACK: no unambiguous enclosing symbol; read the real full file before completing this file's discovery judgment.\n",
-    );
+    append_fallback(&mut rendered);
     ExtractedReviewEvidence {
         rendered: rendered.trim_end().to_string(),
         complete: false,
@@ -388,20 +384,35 @@ fn fallback(reason: &str) -> ExtractedReviewEvidence {
     }
 }
 
-fn push_bounded(rendered: &mut String, value: &str) {
+fn push_bounded(rendered: &mut String, value: &str) -> bool {
     if rendered.len() >= SYMBOL_EVIDENCE_MAX_BYTES {
-        return;
+        return false;
     }
     let remaining = SYMBOL_EVIDENCE_MAX_BYTES - rendered.len();
     if value.len() <= remaining {
         rendered.push_str(value);
+        true
     } else {
         let mut end = remaining;
         while end > 0 && !value.is_char_boundary(end) {
             end -= 1;
         }
         rendered.push_str(&value[..end]);
+        false
     }
+}
+
+fn append_fallback(rendered: &mut String) {
+    const FALLBACK: &str = "\nEVIDENCE-FALLBACK: extraction was partial; read the real full file before completing this file's discovery judgment.\n";
+    let max_body = SYMBOL_EVIDENCE_MAX_BYTES.saturating_sub(FALLBACK.len());
+    if rendered.len() > max_body {
+        let mut end = max_body;
+        while end > 0 && !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        rendered.truncate(end);
+    }
+    rendered.push_str(FALLBACK);
 }
 
 #[cfg(test)]
@@ -455,5 +466,15 @@ mod tests {
         );
         assert!(evidence.symbols.is_empty());
         assert!(evidence.rendered.contains("BOUNDED MODULE EVIDENCE"));
+    }
+
+    #[test]
+    fn oversized_symbol_marks_extraction_incomplete() {
+        let source = format!("fn large() {{\n{}\n}}\n", "    work();\n".repeat(3_000));
+        let evidence =
+            extract_symbol_evidence("large.rs", &source, "@@ -2 +2 @@\n     2 +    work();");
+        assert!(!evidence.complete);
+        assert!(evidence.rendered.len() <= SYMBOL_EVIDENCE_MAX_BYTES);
+        assert!(evidence.rendered.contains("EVIDENCE-FALLBACK"));
     }
 }
