@@ -3945,13 +3945,16 @@ impl DashboardService {
         let (mut findings, _) = split_run_duplicate_findings(findings);
         let mut verified = Vec::with_capacity(findings.len());
         for finding in findings.drain(..) {
+            let cross_group = groups.iter().any(|group| {
+                review_relationship_summary_has_endpoint(&group.relationship_summary, &finding.file)
+            });
             let requires_verification = matches!(
                 finding.severity,
                 ReviewSeverity::Critical | ReviewSeverity::High
             ) || finding.category.eq_ignore_ascii_case("security")
                 || finding.line.is_none()
-                || finding.suggestion.is_some()
-                || audit_titles.contains(&finding.title.to_ascii_lowercase());
+                || audit_titles.contains(&finding.title.to_ascii_lowercase())
+                || cross_group;
             if !requires_verification {
                 verified.push(finding);
                 continue;
@@ -3959,17 +3962,10 @@ impl DashboardService {
             let Some(file) = files.iter().find(|file| file.path == finding.file) else {
                 continue;
             };
-            let cross_group = groups.iter().any(|group| {
-                !group.relationship_summary.is_empty()
-                    && group
-                        .relationship_summary
-                        .contains(&format!("`{}`", finding.file))
-            });
             let strong = matches!(
                 finding.severity,
                 ReviewSeverity::Critical | ReviewSeverity::High
             ) || finding.category.eq_ignore_ascii_case("security")
-                || audit_titles.contains(&finding.title.to_ascii_lowercase())
                 || cross_group;
             let attempt = self
                 .verify_review_findings(
@@ -8699,6 +8695,30 @@ fn deterministic_suggestion_validation(file: &ReviewFile, finding: &ReviewFindin
     format!(
         "VALID-RANGE: replacement differs from authoritative lines {start}-{end} and has balanced delimiters; verifier must still judge semantics."
     )
+}
+
+/// Suggestions that bypass AI verification still have to target authoritative
+/// diff lines, change those lines, and form a syntactically plausible
+/// replacement. The verifier adds semantic judgment for high-risk findings.
+pub(crate) fn review_suggestion_is_deterministically_valid(
+    file: &ReviewFile,
+    finding: &ReviewFinding,
+) -> bool {
+    finding.suggestion.is_none()
+        || deterministic_suggestion_validation(file, finding).starts_with("VALID-RANGE:")
+}
+
+/// Cross-group summaries are rendered as `` `left` ↔ `right` `` edges. Match
+/// a path only as one of those exact endpoints; a substring can otherwise
+/// pull unrelated findings into expensive verification.
+pub(crate) fn review_relationship_summary_has_endpoint(summary: &str, path: &str) -> bool {
+    summary.lines().any(|line| {
+        let mut endpoints = line
+            .split('`')
+            .enumerate()
+            .filter_map(|(index, part)| (index % 2 == 1).then_some(part));
+        endpoints.any(|endpoint| endpoint == path)
+    })
 }
 
 /// Slot the verifier's blocks back onto the candidates they were asked

@@ -49,7 +49,8 @@ use ratatui::Frame;
 use crate::config::schema::AiReviewConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{
-    review_coverage_groups, review_file_groups, split_duplicate_findings,
+    review_coverage_groups, review_file_groups, review_relationship_summary_has_endpoint,
+    review_suggestion_is_deterministically_valid, split_duplicate_findings,
     split_run_duplicate_findings, ReviewContext, ReviewFile, ReviewFileGroup, ReviewFinding,
     ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile, ReviewVerification,
 };
@@ -902,10 +903,27 @@ impl ReviewPullRequestScreen {
         self.verification_results = self.findings.iter().cloned().map(Some).collect();
         let mut candidates = Vec::new();
         for (index, finding) in self.findings.iter().enumerate() {
-            if !self.finding_requires_verification(finding) {
+            let Some(file) = self.files.iter().find(|file| file.path == finding.file) else {
+                self.verification_results[index] = None;
+                self.summary_rows.push(SummaryRow::with_warning(
+                    format!("verify {}", finding.descriptor()),
+                    "Missing file — withheld",
+                    colors::WARNING,
+                    None,
+                ));
+                continue;
+            };
+            if !review_suggestion_is_deterministically_valid(file, finding) {
+                self.verification_results[index] = None;
+                self.summary_rows.push(SummaryRow::with_warning(
+                    format!("verify {}", finding.descriptor()),
+                    "Invalid suggestion — withheld",
+                    colors::WARNING,
+                    None,
+                ));
                 continue;
             }
-            if let Some(file) = self.files.iter().find(|file| file.path == finding.file) {
+            if self.finding_requires_verification(finding) {
                 self.verification_outstanding.insert(index);
                 candidates.push((
                     index,
@@ -932,16 +950,10 @@ impl ReviewPullRequestScreen {
         finding.severity.rank() <= ReviewSeverity::High.rank()
             || finding.category.eq_ignore_ascii_case("security")
             || finding.line.is_none()
-            || finding.suggestion.is_some()
             || self
                 .audit_finding_titles
                 .contains(&finding.title.to_ascii_lowercase())
-            || self.scan_groups.iter().any(|(_, group)| {
-                !group.relationship_summary.is_empty()
-                    && group
-                        .relationship_summary
-                        .contains(&format!("`{}`", finding.file))
-            })
+            || self.finding_has_cross_group_relationship(finding)
     }
 
     fn finding_requires_strong_verification(&self, finding: &ReviewFinding) -> bool {
@@ -949,15 +961,13 @@ impl ReviewPullRequestScreen {
             finding.severity,
             ReviewSeverity::Critical | ReviewSeverity::High
         ) || finding.category.eq_ignore_ascii_case("security")
-            || self
-                .audit_finding_titles
-                .contains(&finding.title.to_ascii_lowercase())
-            || self.scan_groups.iter().any(|(_, group)| {
-                !group.relationship_summary.is_empty()
-                    && group
-                        .relationship_summary
-                        .contains(&format!("`{}`", finding.file))
-            })
+            || self.finding_has_cross_group_relationship(finding)
+    }
+
+    fn finding_has_cross_group_relationship(&self, finding: &ReviewFinding) -> bool {
+        self.scan_groups.iter().any(|(_, group)| {
+            review_relationship_summary_has_endpoint(&group.relationship_summary, &finding.file)
+        })
     }
 
     /// Settle one candidate's verdict. Returns false for an index that was
@@ -3230,45 +3240,24 @@ mod tests {
         let mut suggestion = finding_with("a.rs", Some(3), ReviewSeverity::Low, Some("fixed"));
         suggestion.category = "Convention".to_string();
         suggestion.title = "Direct replacement".to_string();
-        screen.record_scan_result(vec![low_prose.clone(), high, suggestion]);
+        screen.record_scan_result(vec![low_prose.clone(), high, suggestion.clone()]);
         assert!(screen.finish_scanning());
         let candidates = screen.begin_verification();
         assert_eq!(
             candidates.len(),
-            2,
-            "low-severity prose should bypass verifier"
+            1,
+            "low-severity suggestions should use deterministic validation, not AI verification"
         );
         let routed_profiles = candidates
             .iter()
             .map(|(_, _, finding, strong)| (finding.title.as_str(), *strong))
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(routed_profiles.get("High impact bug"), Some(&true));
-        assert_eq!(routed_profiles.get("Direct replacement"), Some(&false));
-        let rejected = candidates[0].0;
-        screen.record_verification(
-            rejected,
-            Ok(ReviewVerification::RejectedFalsePositive {
-                reason: "guard already applies".to_string(),
-            }),
-        );
-        let failed = candidates[1].0;
+        let failed = candidates[0].0;
         screen.record_verification(failed, Err("malformed verifier output".to_string()));
         assert!(!screen.verification_pending());
         assert!(screen.finish_verification());
-        assert_eq!(screen.findings, vec![low_prose]);
-        let rejected_row = screen
-            .summary_rows
-            .iter()
-            .find(|row| {
-                row.status
-                    .as_ref()
-                    .is_some_and(|status| status.label == "Rejected false positive")
-            })
-            .expect("rejection is recorded on the summary");
-        assert!(
-            rejected_row.success,
-            "a rejected false positive is a correct verifier decision, not a failure"
-        );
+        assert_eq!(screen.findings, vec![low_prose, suggestion]);
         let withheld_row = screen
             .summary_rows
             .iter()
@@ -3282,6 +3271,88 @@ mod tests {
             !withheld_row.success,
             "a verifier that errors out is a genuine failure"
         );
+    }
+
+    #[test]
+    fn verification_routing_uses_exact_relationship_endpoints() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![
+                file("src/api.rs"),
+                file("src/client.rs"),
+                file("src/other.rs"),
+                file("src/api.rs.bak"),
+            ],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
+        screen.scan_groups = vec![(
+            0,
+            ReviewFileGroup {
+                profile: ReviewGroupProfile::Application,
+                files: vec![file("src/api.rs")],
+                relationship_summary: "- edge:test: `src/api.rs` ↔ `src/client.rs` (import)"
+                    .to_string(),
+            },
+        )];
+
+        let mut cross_group = finding_with("src/client.rs", Some(2), ReviewSeverity::Low, None);
+        cross_group.category = "Code Smell".to_string();
+        cross_group.title = "Cross-group consumer".to_string();
+        let mut missing_anchor = finding_with("src/other.rs", None, ReviewSeverity::Medium, None);
+        missing_anchor.category = "Code Smell".to_string();
+        missing_anchor.title = "Missing anchor".to_string();
+        let mut audit = finding_with("src/other.rs", Some(2), ReviewSeverity::Low, None);
+        audit.category = "Code Smell".to_string();
+        audit.title = "Audit-only concern".to_string();
+        let mut high_audit = finding_with("src/api.rs", Some(2), ReviewSeverity::High, None);
+        high_audit.category = "Code Smell".to_string();
+        high_audit.title = "High and audit".to_string();
+        let mut substring = finding_with("src/api.rs.bak", Some(2), ReviewSeverity::Low, None);
+        substring.category = "Code Smell".to_string();
+        substring.title = "Unrelated substring".to_string();
+        screen.audit_finding_titles.extend([
+            audit.title.to_ascii_lowercase(),
+            high_audit.title.to_ascii_lowercase(),
+        ]);
+        screen.findings = vec![cross_group, missing_anchor, audit, high_audit, substring];
+
+        let routes = screen
+            .begin_verification()
+            .into_iter()
+            .map(|(_, _, finding, strong)| (finding.title, strong))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(routes.len(), 4);
+        assert_eq!(routes.get("Cross-group consumer"), Some(&true));
+        assert_eq!(routes.get("Missing anchor"), Some(&false));
+        assert_eq!(routes.get("Audit-only concern"), Some(&false));
+        assert_eq!(routes.get("High and audit"), Some(&true));
+        assert!(!routes.contains_key("Unrelated substring"));
+    }
+
+    #[test]
+    fn invalid_suggestions_are_withheld_without_ai_verification() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        let mut no_op = finding_with("a.rs", Some(2), ReviewSeverity::Low, Some("    let x = 1;"));
+        no_op.category = "Code Smell".to_string();
+        let mut missing_file = finding_with("missing.rs", Some(2), ReviewSeverity::High, None);
+        missing_file.category = "Code Smell".to_string();
+        screen.findings = vec![no_op, missing_file];
+
+        assert!(screen.begin_verification().is_empty());
+        assert!(!screen.finish_verification());
+        assert!(screen.summary_rows.iter().any(|row| {
+            row.status
+                .as_ref()
+                .is_some_and(|status| status.label == "Invalid suggestion — withheld")
+        }));
+        assert!(screen.summary_rows.iter().any(|row| {
+            row.status
+                .as_ref()
+                .is_some_and(|status| status.label == "Missing file — withheld")
+        }));
     }
 
     #[test]
