@@ -58,9 +58,9 @@ use crate::tui::screens::dashboard::ReviewPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
 use crate::tui::widgets::spinner::spinner_frame;
 use crate::tui::widgets::{
-    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, Status, StatusIndicator,
-    SummaryRow,
+    labeled_line, render_scrollable_summary_table, summary_row_counts, AiRoleRow,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt,
+    PrConfirmView, Status, StatusIndicator, SummaryRow,
 };
 
 /// First synthetic `file_index` for coverage-group scans. Further groups use
@@ -864,7 +864,7 @@ impl ReviewPullRequestScreen {
                     self.findings.push(finding);
                 }
             }
-            Err(message) => self.summary_rows.push(SummaryRow::with_status(
+            Err(message) => self.summary_rows.push(SummaryRow::with_warning(
                 "global omission audit",
                 "Failed — primary findings kept",
                 colors::WARNING,
@@ -990,7 +990,7 @@ impl ReviewPullRequestScreen {
             }
             Err(message) => {
                 self.verification_results[index] = None;
-                self.summary_rows.push(SummaryRow::with_status(
+                self.summary_rows.push(SummaryRow::with_warning(
                     format!("verify {}", self.findings[index].descriptor()),
                     "Unverified — withheld",
                     colors::WARNING,
@@ -1196,6 +1196,10 @@ impl ReviewPullRequestScreen {
             persist_scan_telemetry(&self.scan_telemetry);
             self.telemetry_reported = true;
         }
+        // The table only ever shows a viewport of rows; the file keeps all of
+        // them so a long run stays diagnosable once this screen closes.
+        persist_run_report(self.request.number, self.posted.len(), &self.summary_rows);
+        self.decision_scroll = 0;
         self.step = ReviewStep::Done;
     }
 
@@ -1217,7 +1221,7 @@ impl ReviewPullRequestScreen {
 
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) -> bool {
         match self.step {
-            ReviewStep::Decision | ReviewStep::Summary => {
+            ReviewStep::Decision | ReviewStep::Summary | ReviewStep::Done => {
                 self.scroll_panel_up(lines);
                 true
             }
@@ -1227,7 +1231,7 @@ impl ReviewPullRequestScreen {
 
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) -> bool {
         match self.step {
-            ReviewStep::Decision | ReviewStep::Summary => {
+            ReviewStep::Decision | ReviewStep::Summary | ReviewStep::Done => {
                 self.scroll_panel_down(lines);
                 true
             }
@@ -1260,7 +1264,40 @@ impl ReviewPullRequestScreen {
             ReviewStep::EditFinding => self.handle_edit_key(key),
             ReviewStep::OtherInput => self.handle_other_key(key),
             ReviewStep::Summary => self.handle_summary_key(key),
-            ReviewStep::Done => ReviewAction::Done,
+            ReviewStep::Done => self.handle_done_key(key),
+        }
+    }
+
+    /// The report can outgrow its viewport by hundreds of rows, so the
+    /// scroll keys drive the table; every other key still dismisses the
+    /// screen the way "press any key to continue" promises.
+    fn handle_done_key(&mut self, key: KeyEvent) -> ReviewAction {
+        match key.code {
+            KeyCode::Up => {
+                self.scroll_panel_up(1);
+                ReviewAction::Continue
+            }
+            KeyCode::Down => {
+                self.scroll_panel_down(1);
+                ReviewAction::Continue
+            }
+            KeyCode::PageUp => {
+                self.scroll_panel_up(10);
+                ReviewAction::Continue
+            }
+            KeyCode::PageDown => {
+                self.scroll_panel_down(10);
+                ReviewAction::Continue
+            }
+            KeyCode::Home => {
+                self.decision_scroll = 0;
+                ReviewAction::Continue
+            }
+            KeyCode::End => {
+                self.decision_scroll = self.decision_max_scroll.get();
+                ReviewAction::Continue
+            }
+            _ => ReviewAction::Done,
         }
     }
 
@@ -2266,11 +2303,25 @@ impl ReviewPullRequestScreen {
     }
 
     fn render_done(&self, frame: &mut Frame, area: Rect) {
-        let failures = self.summary_rows.iter().filter(|r| !r.success).count();
-        let (status, headline) = if failures > 0 {
+        // Withheld/degraded steps are counted — and worded — apart from hard
+        // failures: a finding whose verification never completed is not a
+        // broken review, it is a finding you never got to see.
+        let (failed, withheld) = summary_row_counts(&self.summary_rows);
+        let (status, headline) = if failed > 0 || withheld > 0 {
+            let mut parts = Vec::new();
+            if failed > 0 {
+                parts.push(format!("{failed} failure(s)"));
+            }
+            if withheld > 0 {
+                parts.push(format!("{withheld} withheld"));
+            }
             (
-                Status::Error,
-                format!("Finished with {failures} failure(s) — see below."),
+                if failed > 0 {
+                    Status::Error
+                } else {
+                    Status::Info
+                },
+                format!("Finished with {} — see below.", parts.join(" · ")),
             )
         } else if self.findings.is_empty() {
             (
@@ -2304,13 +2355,52 @@ impl ReviewPullRequestScreen {
                 Paragraph::new("No comments were posted on this pull request.").style(muted_dim()),
                 chunks[1],
             );
+            self.decision_max_scroll.set(0);
         } else {
-            render_summary_table(&self.summary_rows, frame, chunks[1]);
+            let max_scroll = render_scrollable_summary_table(
+                &self.summary_rows,
+                self.decision_scroll,
+                frame,
+                chunks[1],
+            );
+            self.decision_max_scroll.set(max_scroll);
         }
-        frame.render_widget(
-            Paragraph::new("Press any key to continue").style(muted_dim()),
-            chunks[2],
-        );
+        let footer = if self.decision_max_scroll.get() > 0 {
+            format!(
+                "↑/↓ scroll · any other key continues · full report: {}",
+                review_report_path_label()
+            )
+        } else {
+            "Press any key to continue".to_string()
+        };
+        frame.render_widget(Paragraph::new(footer).style(muted_dim()), chunks[2]);
+    }
+}
+
+/// Append the finished run's complete row list to `~/.wisetree/`. Skipped
+/// under test so the suite never touches the user's home directory.
+fn persist_run_report(number: u64, posted: usize, rows: &[SummaryRow]) {
+    #[cfg(not(test))]
+    {
+        let rows = rows.to_vec();
+        tokio::task::spawn_blocking(move || {
+            crate::services::review_report::persist_review_report(number, posted, &rows);
+        });
+    }
+    #[cfg(test)]
+    let _ = (number, posted, rows);
+}
+
+/// `~/.wisetree/review_report.json`, shortened back to `~` for the footer.
+fn review_report_path_label() -> String {
+    let path = crate::constants::review_report_file();
+    let display = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => display
+            .strip_prefix(&home)
+            .map(|rest| format!("~{rest}"))
+            .unwrap_or(display),
+        _ => display,
     }
 }
 
@@ -3535,6 +3625,84 @@ mod tests {
         assert_eq!(screen.decision_scroll, max);
         screen.handle_mouse_scroll_up(1);
         assert_eq!(screen.decision_scroll, max - 1);
+    }
+
+    #[test]
+    fn done_headline_counts_withheld_findings_apart_from_failures() {
+        // A verification that never completed withholds its finding — the run
+        // degraded, but nothing failed. Reporting both as "failure(s)" made a
+        // healthy review look catastrophic.
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        let mut first = finding_with("a.rs", Some(2), ReviewSeverity::Critical, None);
+        first.title = "Unchecked index".to_string();
+        let mut second = finding_with("a.rs", Some(3), ReviewSeverity::Critical, None);
+        second.title = "Missing auth check".to_string();
+        screen.record_scan_result(vec![first, second]);
+        assert!(screen.finish_scanning());
+        screen.begin_verification();
+        screen.record_verification(0, Err("model exited 1".to_string()));
+        screen.record_verification(1, Err("model exited 1".to_string()));
+        screen.record_scan_failure(0, "scan crashed".to_string());
+        screen.enter_done();
+
+        let (failed, withheld) = summary_row_counts(&screen.summary_rows);
+        assert_eq!((failed, withheld), (1, 2));
+        let dump = render_dump(&mut screen, 110, 20);
+        assert!(
+            dump.contains("Finished with 1 failure(s) · 2 withheld"),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn done_report_scrolls_through_rows_that_outgrow_the_viewport() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        for i in 0..40 {
+            screen.record_scan_failure(0, format!("failure {i}"));
+        }
+        screen.enter_done();
+
+        let dump = render_dump(&mut screen, 110, 14);
+        assert!(dump.contains("showing 1–"), "{dump}");
+        assert!(dump.contains("of 40"), "{dump}");
+        assert!(dump.contains("↑/↓ scroll"), "{dump}");
+        let max = screen.decision_max_scroll.get();
+        assert!(max > 0, "40 rows should overflow a 14-row viewport");
+
+        // Scroll keys drive the table instead of dismissing the screen…
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Down)),
+            ReviewAction::Continue
+        );
+        assert_eq!(screen.decision_scroll, 1);
+        assert_eq!(screen.handle_key(key(KeyCode::End)), ReviewAction::Continue);
+        assert_eq!(screen.decision_scroll, max);
+        let dump = render_dump(&mut screen, 110, 14);
+        assert!(dump.contains("of 40"), "{dump}");
+        assert!(dump.contains("failure 39"), "{dump}");
+        assert!(screen.handle_mouse_scroll_up(1));
+
+        // …and any other key still continues, as the footer promises.
+        assert_eq!(screen.handle_key(key(KeyCode::Enter)), ReviewAction::Done);
+    }
+
+    #[test]
+    fn done_report_without_overflow_keeps_the_plain_footer() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.record_scan_failure(0, "scan crashed".to_string());
+        screen.enter_done();
+
+        let dump = render_dump(&mut screen, 110, 20);
+        assert!(dump.contains("Press any key to continue"), "{dump}");
+        assert!(!dump.contains("showing 1–"), "{dump}");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Down)),
+            ReviewAction::Continue
+        );
+        assert_eq!(screen.decision_scroll, 0);
     }
 
     /// A walkthrough sitting on the first of `count` findings.

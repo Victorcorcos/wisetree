@@ -30,6 +30,11 @@ pub struct SummaryRow {
     /// Optional explicit status label + color. `None` keeps the default
     /// green-✅ / red-❌ rendering driven by [`Self::success`].
     pub status: Option<RowStatus>,
+    /// A non-success row that is *not* a hard failure: the step degraded but
+    /// the pipeline kept going (e.g. a finding withheld because its
+    /// verification never completed). Lets a Done screen report the two
+    /// counts apart instead of calling everything a failure.
+    pub warning: bool,
 }
 
 impl SummaryRow {
@@ -39,6 +44,7 @@ impl SummaryRow {
             success: true,
             failure: None,
             status: None,
+            warning: false,
         }
     }
 
@@ -48,6 +54,7 @@ impl SummaryRow {
             success: false,
             failure: Some(failure.into()),
             status: None,
+            warning: false,
         }
     }
 
@@ -67,6 +74,7 @@ impl SummaryRow {
                 label: label.into(),
                 color,
             }),
+            warning: false,
         }
     }
 
@@ -88,12 +96,75 @@ impl SummaryRow {
                 label: label.into(),
                 color,
             }),
+            warning: false,
+        }
+    }
+
+    /// A non-success row that the pipeline recovered from: it did not do what
+    /// it set out to do, but nothing was aborted. Reported apart from hard
+    /// failures by [`summary_row_counts`].
+    pub fn with_warning(
+        command: impl Into<String>,
+        label: impl Into<String>,
+        color: Color,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            success: false,
+            failure: detail,
+            status: Some(RowStatus {
+                label: label.into(),
+                color,
+            }),
+            warning: true,
         }
     }
 }
 
+/// Hard failures and recovered warnings among `rows`, counted separately so a
+/// Done headline never reports a withheld step as a failure.
+pub fn summary_row_counts(rows: &[SummaryRow]) -> (usize, usize) {
+    rows.iter()
+        .filter(|r| !r.success)
+        .fold((0, 0), |(failed, warned), row| {
+            if row.warning {
+                (failed, warned + 1)
+            } else {
+                (failed + 1, warned)
+            }
+        })
+}
+
 /// Render a bordered summary table for the given rows.
 pub fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) {
+    render_table(rows, None, frame, area);
+}
+
+/// Render the table scrolled down by `offset` rows, with a `showing X–Y of N`
+/// title once the rows outgrow the area. Returns the largest offset that still
+/// shows a full viewport, for the caller to clamp its scroll state against.
+pub fn render_scrollable_summary_table(
+    rows: &[SummaryRow],
+    offset: u16,
+    frame: &mut Frame,
+    area: Rect,
+) -> u16 {
+    // Borders (2) + header (1) — whatever is left holds rows.
+    let visible = area.height.saturating_sub(3) as usize;
+    if visible == 0 || rows.len() <= visible {
+        render_table(rows, None, frame, area);
+        return 0;
+    }
+    let max_offset = rows.len() - visible;
+    let start = (offset as usize).min(max_offset);
+    let end = start + visible;
+    let title = format!(" showing {}–{} of {} ", start + 1, end, rows.len());
+    render_table(&rows[start..end], Some(title), frame, area);
+    max_offset as u16
+}
+
+fn render_table(rows: &[SummaryRow], title: Option<String>, frame: &mut Frame, area: Rect) {
     let header = Row::new(vec![
         Cell::from("Command"),
         Cell::from("Status"),
@@ -131,6 +202,8 @@ pub fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) 
                 Some(reason) => {
                     let color = if r.success {
                         colors::MUTED
+                    } else if r.warning {
+                        colors::WARNING
                     } else {
                         colors::ERROR
                     };
@@ -153,15 +226,21 @@ pub fn render_summary_table(rows: &[SummaryRow], frame: &mut Frame, area: Rect) 
         Constraint::Min(10),
     ];
 
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(colors::MUTED));
+    if let Some(title) = title {
+        block = block.title(Line::from(Span::styled(
+            title,
+            Style::default().fg(colors::MUTED),
+        )));
+    }
+
     let table = Table::new(table_rows, widths)
         .header(header)
         .column_spacing(2)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(colors::MUTED)),
-        );
+        .block(block);
 
     frame.render_widget(table, area);
 }

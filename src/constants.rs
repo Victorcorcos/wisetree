@@ -23,6 +23,11 @@ pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 /// Filename of the bounded Review Pull Request scan-telemetry history.
 pub const REVIEW_TELEMETRY_FILE_NAME: &str = "review_telemetry.json";
 
+/// Filename of the bounded Review Pull Request run-report history (every
+/// summary row of the last few runs, so a run too long for the table stays
+/// diagnosable after the screen closes).
+pub const REVIEW_REPORT_FILE_NAME: &str = "review_report.json";
+
 /// Commit message title written when the "Update Pull Request" flow
 /// committed the result of an AI-assisted conflict resolution. Kept as a
 /// constant so downstream tooling (release notes, blame heuristics) can
@@ -77,6 +82,11 @@ pub fn dashboard_pr_cache_file() -> PathBuf {
 /// Path to the bounded Review Pull Request telemetry history.
 pub fn review_telemetry_file() -> PathBuf {
     global_config_dir().join(REVIEW_TELEMETRY_FILE_NAME)
+}
+
+/// Path to the bounded Review Pull Request run-report history.
+pub fn review_report_file() -> PathBuf {
+    global_config_dir().join(REVIEW_REPORT_FILE_NAME)
 }
 
 /// Resolve opencode's persisted model-state file

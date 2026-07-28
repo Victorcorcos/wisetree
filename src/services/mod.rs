@@ -11,6 +11,7 @@ pub mod develop;
 pub mod opencode_models;
 pub mod opencode_turn;
 pub mod presets;
+pub mod review_report;
 pub mod review_telemetry;
 pub(crate) mod reviewer_evidence;
 pub(crate) mod reviewer_routing;
