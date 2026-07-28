@@ -1213,7 +1213,12 @@ impl ReviewPullRequestScreen {
         }
         // The table only ever shows a viewport of rows; the file keeps all of
         // them so a long run stays diagnosable once this screen closes.
-        persist_run_report(self.request.number, self.posted.len(), &self.summary_rows);
+        persist_run_report(
+            self.request.number,
+            self.posted.len(),
+            &self.summary_rows,
+            &self.scan_telemetry,
+        );
         self.decision_scroll = 0;
         self.step = ReviewStep::Done;
     }
@@ -2394,16 +2399,22 @@ impl ReviewPullRequestScreen {
 
 /// Append the finished run's complete row list to `~/.wisetree/`. Skipped
 /// under test so the suite never touches the user's home directory.
-fn persist_run_report(number: u64, posted: usize, rows: &[SummaryRow]) {
+fn persist_run_report(
+    number: u64,
+    posted: usize,
+    rows: &[SummaryRow],
+    scans: &[ReviewScanTelemetry],
+) {
     #[cfg(not(test))]
     {
         let rows = rows.to_vec();
+        let scans = scans.to_vec();
         tokio::task::spawn_blocking(move || {
-            crate::services::review_report::persist_review_report(number, posted, &rows);
+            crate::services::review_report::persist_review_report(number, posted, &rows, &scans);
         });
     }
     #[cfg(test)]
-    let _ = (number, posted, rows);
+    let _ = (number, posted, rows, scans);
 }
 
 /// `~/.wisetree/review_report.json`, shortened back to `~` for the footer.

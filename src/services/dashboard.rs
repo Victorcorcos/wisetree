@@ -138,6 +138,10 @@ const REVIEW_VERIFIER_LEDGER_MAX_BYTES: usize = 8 * 1024;
 /// files. Uncapped they pushed one gap-audit prompt to 2.8 MB, which the
 /// model rejected outright — the audit then contributed nothing.
 const REVIEW_RELATIONSHIP_EDGES_MAX_BYTES: usize = 16 * 1024;
+/// The omission audit has no primary-review evidence to justify a large
+/// context. Keep its *assembled* prompt below this ceiling: the individual
+/// input caps alone do not account for the template or their combined size.
+const REVIEW_GAP_AUDIT_PROMPT_MAX_BYTES: usize = 64 * 1024;
 /// Shared repository conventions are read once per review and supplied to
 /// every scan. The directory inventory has its own small bound.
 const REVIEW_REPO_CONTEXT_MAX_BYTES: usize = 6 * 1024;
@@ -3858,6 +3862,20 @@ impl DashboardService {
         );
         let prompt_bytes = prompt.len();
         let selection = self.review_model_selection(ReviewModelProfile::Strong);
+        if prompt_bytes > REVIEW_GAP_AUDIT_PROMPT_MAX_BYTES {
+            return review_scan_attempt(
+                "gap-audit".to_string(),
+                prompt_bytes,
+                started,
+                None,
+                Err(WisetreeError::other(format!(
+                    "global omission audit skipped: assembled prompt is {prompt_bytes} bytes, above the {}-byte limit.",
+                    REVIEW_GAP_AUDIT_PROMPT_MAX_BYTES,
+                ))),
+                None,
+                &selection,
+            );
+        }
         if selection.model.is_empty() {
             return review_scan_attempt(
                 "gap-audit".to_string(),
@@ -9068,35 +9086,70 @@ fn build_review_gap_audit_prompt(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    substitute_review_prompt(
-        GAP_AUDIT_PROMPT,
-        &[
-            (
-                "GLOBAL_MANIFEST",
-                &truncate_for_prompt(&manifest, 24 * 1024),
-            ),
-            (
-                "RELATIONSHIP_EDGES",
-                &truncate_for_prompt(
-                    if relationship_edges.trim().is_empty() {
-                        "(none)"
-                    } else {
-                        relationship_edges
-                    },
-                    REVIEW_RELATIONSHIP_EDGES_MAX_BYTES,
-                ),
-            ),
-            (
-                "COVERAGE_LEDGER",
-                &truncate_for_prompt(&coverage, 16 * 1024),
-            ),
-            ("SKIP_DECISIONS", &truncate_for_prompt(&skips, 8 * 1024)),
-            (
-                "EXISTING_FINDINGS",
-                &truncate_for_prompt(&findings, 8 * 1024),
-            ),
-        ],
+    let values = [
+        ("GLOBAL_MANIFEST", manifest, 22 * 1024),
+        (
+            "RELATIONSHIP_EDGES",
+            if relationship_edges.trim().is_empty() {
+                "(none)".to_string()
+            } else {
+                relationship_edges.to_string()
+            },
+            14 * 1024,
+        ),
+        ("COVERAGE_LEDGER", coverage, 14 * 1024),
+        ("SKIP_DECISIONS", skips, 6 * 1024),
+        ("EXISTING_FINDINGS", findings, 6 * 1024),
+    ];
+    build_bounded_gap_audit_prompt(GAP_AUDIT_PROMPT, &values)
+}
+
+/// Render all omission-audit sections within one total byte budget. Allocation
+/// is proportional to the requested section caps and UTF-8 safe, so multibyte
+/// repository text cannot slip past the dispatch ceiling.
+fn build_bounded_gap_audit_prompt(template: &str, values: &[(&str, String, usize)]) -> String {
+    let static_bytes = substitute_review_prompt(
+        template,
+        &values
+            .iter()
+            .map(|(token, _, _)| (*token, ""))
+            .collect::<Vec<_>>(),
     )
+    .len();
+    let available = REVIEW_GAP_AUDIT_PROMPT_MAX_BYTES.saturating_sub(static_bytes);
+    let requested = values.iter().map(|(_, _, max)| *max).sum::<usize>().max(1);
+    let rendered = values
+        .iter()
+        .map(|(token, value, max)| {
+            let budget = available.saturating_mul(*max) / requested;
+            (*token, truncate_gap_audit_text(value, budget))
+        })
+        .collect::<Vec<_>>();
+    let substitutions = rendered
+        .iter()
+        .map(|(token, value)| (*token, value.as_str()))
+        .collect::<Vec<_>>();
+    substitute_review_prompt(template, &substitutions)
+}
+
+fn truncate_gap_audit_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    const MARKER: &str = "\n\n[... audit context truncated ...]";
+    if max_bytes <= MARKER.len() {
+        return truncate_utf8_bytes(text, max_bytes).to_string();
+    }
+    let prefix = truncate_utf8_bytes(text, max_bytes - MARKER.len());
+    format!("{prefix}{MARKER}")
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn parse_gap_audit_findings(output: &str, files: &[ReviewFile]) -> Option<Vec<ReviewFinding>> {
@@ -12046,6 +12099,64 @@ copy to src/copied_again.rs
         let findings = parse_gap_audit_findings(output, &[file]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].title, "Consumer rename was missed");
+    }
+
+    #[test]
+    fn gap_audit_prompt_caps_every_combined_input_on_a_utf8_boundary() {
+        let file = ReviewFile {
+            path: "src/界.rs".to_string(),
+            annotated_diff: String::new(),
+            full_content: None,
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let context = ReviewContext {
+            changed_file_manifest: format!("- src/界.rs {}", "界".repeat(30_000)),
+            coverage_ledger: ReviewCoverageLedger {
+                entries: vec![crate::services::reviewer_tests::ReviewCoverageEntry {
+                    id: "behavior:界".to_string(),
+                    application_path: file.path.clone(),
+                    behavior: "界".repeat(20_000),
+                    changed_lines: "1".to_string(),
+                    tests: Vec::new(),
+                    status: crate::services::reviewer_tests::ReviewCoverageStatus::NoRelevantTest,
+                }],
+            },
+            ..ReviewContext::default()
+        };
+        let skipped = (0..2_000)
+            .map(|index| ReviewSkippedFile {
+                path: format!("assets/界-{index}.png"),
+                reason: "binary file without reviewable text",
+            })
+            .collect::<Vec<_>>();
+        let findings = (0..2_000)
+            .map(|index| ReviewFinding {
+                category: "Convention".to_string(),
+                severity: ReviewSeverity::Low,
+                file: file.path.clone(),
+                start_line: None,
+                line: None,
+                title: format!("{index}: {}", "界".repeat(200)),
+                explanation: String::new(),
+                suggestion: None,
+            })
+            .collect::<Vec<_>>();
+        let prompt = build_review_gap_audit_prompt(
+            &[file],
+            &context,
+            &format!("edge:界:{}", "界".repeat(30_000)),
+            &skipped,
+            &findings,
+        );
+
+        assert!(prompt.len() <= REVIEW_GAP_AUDIT_PROMPT_MAX_BYTES);
+        assert!(std::str::from_utf8(prompt.as_bytes()).is_ok());
+        assert!(prompt.contains("edge:界"));
+        assert!(prompt.contains("### BEHAVIOR behavior:界"));
+        assert!(prompt.contains("assets/界-"));
+        assert!(prompt.contains("0:"));
     }
 
     #[test]
