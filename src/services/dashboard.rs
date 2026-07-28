@@ -115,6 +115,31 @@ const REVIEW_COMMENT_KEY_MAX_BYTES: usize = 160;
 const REVIEW_COVERAGE_DIFF_MAX_BYTES: usize = 120_000;
 /// Maximum combined annotated-diff size for one focused merged review call.
 pub(crate) const REVIEW_MERGED_FOCUS_BYTES: usize = 28_000;
+/// Scan grouping budgets, measured on *rendered prompt bytes* rather than on
+/// annotated-diff bytes: the evidence a scan actually carries is the whole
+/// numbered current file, so a small diff in a large file costs almost
+/// nothing against a diff-byte budget and tens of kilobytes of prompt.
+/// Budgeting on the diff is what let coverage prompts reach 700 KB (model
+/// timeout) and 1.2 MB (rejected outright) on a large PR.
+/// [`REVIEW_GROUP_PROMPT_BYTES`] bounds one group's application evidence;
+/// attached tests may fill the rest of [`REVIEW_COVERAGE_DIFF_MAX_BYTES`],
+/// which is the cap the coverage prompt truncates at anyway. It matches the
+/// per-file evidence cap so one file always fits in exactly one group, and
+/// it keeps whole prompts near the size band that answers reliably: in the
+/// telemetry of a large review, calls under 100 KB timed out 2% of the time
+/// against 19% between 100 and 200 KB and 42% above that.
+pub(crate) const REVIEW_GROUP_PROMPT_BYTES: usize = REVIEW_DIFF_MAX_BYTES;
+/// A merged call renders every file into the same capped diff slot, so a
+/// review whose evidence exceeds that cap must be split or it silently
+/// reviews a truncated diff.
+const REVIEW_MERGED_PROMPT_BYTES: usize = REVIEW_COVERAGE_DIFF_MAX_BYTES;
+/// Bound for the (otherwise unbounded) per-group coverage ledger.
+const REVIEW_COVERAGE_LEDGER_MAX_BYTES: usize = 30_000;
+const REVIEW_VERIFIER_LEDGER_MAX_BYTES: usize = 8 * 1024;
+/// Cross-group relationship summaries grow with the square of the changed
+/// files. Uncapped they pushed one gap-audit prompt to 2.8 MB, which the
+/// model rejected outright — the audit then contributed nothing.
+const REVIEW_RELATIONSHIP_EDGES_MAX_BYTES: usize = 16 * 1024;
 /// Shared repository conventions are read once per review and supplied to
 /// every scan. The directory inventory has its own small bound.
 const REVIEW_REPO_CONTEXT_MAX_BYTES: usize = 6 * 1024;
@@ -937,15 +962,30 @@ impl ReviewContext {
 }
 
 fn review_scan_mode(files: &[ReviewFile]) -> ReviewScanMode {
-    let diff_bytes = files
-        .iter()
-        .map(|file| file.annotated_diff.len())
-        .sum::<usize>();
-    if diff_bytes <= REVIEW_MERGED_FOCUS_BYTES {
+    let prompt_bytes = files.iter().map(review_file_prompt_bytes).sum::<usize>();
+    if prompt_bytes <= REVIEW_MERGED_PROMPT_BYTES {
         ReviewScanMode::Merged
     } else {
         ReviewScanMode::Split
     }
+}
+
+/// Bytes one file contributes to a scan prompt: the rendered evidence the
+/// prompt builders actually emit, under the same per-file cap they apply.
+/// Grouping budgets use this instead of the annotated diff so a group's
+/// prompt size is bounded by the budget it was packed against.
+fn review_file_prompt_bytes(file: &ReviewFile) -> usize {
+    review_file_evidence(file, false)
+        .len()
+        .min(REVIEW_DIFF_MAX_BYTES)
+}
+
+/// Bytes one changed test contributes to a coverage prompt, which carries a
+/// compact assertion digest rather than the whole file.
+fn review_coverage_test_prompt_bytes(file: &ReviewFile) -> usize {
+    review_coverage_test_evidence(file)
+        .len()
+        .min(REVIEW_DIFF_MAX_BYTES)
 }
 
 /// Partition split-mode coverage work without ever dropping a changed
@@ -972,36 +1012,46 @@ pub(crate) fn review_coverage_groups(
     }
 
     let mut groups = Vec::new();
+    let mut group_bytes = Vec::new();
     let mut current = Vec::new();
     let mut current_bytes = 0usize;
     for file in applications {
-        let bytes = file.annotated_diff.len();
-        if !current.is_empty() && current_bytes.saturating_add(bytes) > REVIEW_MERGED_FOCUS_BYTES {
+        let bytes = review_file_prompt_bytes(file);
+        if !current.is_empty() && current_bytes.saturating_add(bytes) > REVIEW_GROUP_PROMPT_BYTES {
             groups.push(std::mem::take(&mut current));
-            current_bytes = 0;
+            group_bytes.push(std::mem::replace(&mut current_bytes, 0));
         }
         current.push(file.clone());
         current_bytes = current_bytes.saturating_add(bytes);
-        if bytes > REVIEW_MERGED_FOCUS_BYTES {
+        if bytes > REVIEW_GROUP_PROMPT_BYTES {
             groups.push(std::mem::take(&mut current));
-            current_bytes = 0;
+            group_bytes.push(std::mem::replace(&mut current_bytes, 0));
         }
     }
     if !current.is_empty() {
         groups.push(current);
+        group_bytes.push(current_bytes);
     }
     let tests = files
         .iter()
         .filter(|file| review_file_is_test(file))
         .cloned()
         .collect::<Vec<_>>();
+    // A test joins the first related group that still has room under the cap
+    // the coverage prompt truncates at. One that fits nowhere stays out of
+    // the prompt body; the ledger and the test-file inventory still name it,
+    // so the scan can target-read it.
     for test in tests {
-        if let Some(group) = groups.iter_mut().find(|group| {
-            group
-                .iter()
-                .any(|application| review_test_relates_to_application(&test, application))
-        }) {
-            group.push(test);
+        let bytes = review_coverage_test_prompt_bytes(&test);
+        let slot = groups.iter().enumerate().position(|(index, group)| {
+            group_bytes[index].saturating_add(bytes) <= REVIEW_COVERAGE_DIFF_MAX_BYTES
+                && group
+                    .iter()
+                    .any(|application| review_test_relates_to_application(&test, application))
+        });
+        if let Some(slot) = slot {
+            groups[slot].push(test);
+            group_bytes[slot] = group_bytes[slot].saturating_add(bytes);
         }
     }
     groups
@@ -1054,10 +1104,10 @@ fn review_profile_groups(
         .map(|file| ReviewRouteFile {
             path: &file.path,
             evidence: file.full_content.as_deref().unwrap_or(&file.annotated_diff),
-            bytes: file.annotated_diff.len(),
+            bytes: review_file_prompt_bytes(file),
         })
         .collect::<Vec<_>>();
-    relationship_groups(&route_files, REVIEW_MERGED_FOCUS_BYTES)
+    relationship_groups(&route_files, REVIEW_GROUP_PROMPT_BYTES)
         .into_iter()
         .map(|group| ReviewFileGroup {
             profile,
@@ -1210,9 +1260,13 @@ pub struct ReviewScanAttempt {
     pub raw_output: Option<String>,
 }
 
+/// One verifier call covering every candidate raised against a single file.
 #[derive(Debug)]
 pub struct ReviewVerificationAttempt {
-    pub result: Result<ReviewVerification>,
+    /// One entry per supplied candidate, in the order they were supplied.
+    /// `None` means the model returned no verdict for that candidate — the
+    /// caller re-asks about it alone instead of withholding the finding.
+    pub results: Vec<Option<Result<ReviewVerification>>>,
     pub telemetry: ReviewScanTelemetry,
 }
 
@@ -3497,18 +3551,25 @@ impl DashboardService {
             .await
     }
 
-    pub(crate) async fn verify_review_finding(
+    /// Adversarially verify every candidate raised against one file in a
+    /// single call. The file's evidence dominates this prompt and is the
+    /// same for all of them, so batching removes the copy the per-finding
+    /// path paid once per candidate without changing what is judged.
+    pub(crate) async fn verify_review_findings(
         &self,
         worktree_path: &str,
         file: &ReviewFile,
-        finding: &ReviewFinding,
+        findings: &[ReviewFinding],
         context: &ReviewContext,
         strong: bool,
     ) -> ReviewVerificationAttempt {
         let started = Instant::now();
-        let scan = format!("verify:{}:{}", file.path, finding.line.unwrap_or_default());
-        let suggestion_validation = validate_review_suggestion_isolated(file, finding).await;
-        let prompt = build_review_verifier_prompt(file, finding, context, &suggestion_validation);
+        let scan = format!("verify:{}:{}", file.path, findings.len());
+        let mut validations = Vec::with_capacity(findings.len());
+        for finding in findings {
+            validations.push(validate_review_suggestion_isolated(file, finding).await);
+        }
+        let prompt = build_review_verifier_prompt(file, findings, context, &validations);
         let prompt_bytes = prompt.len();
         let profile = if strong {
             ReviewModelProfile::Strong
@@ -3522,19 +3583,24 @@ impl DashboardService {
                 prompt_bytes,
                 started,
                 None,
-                Err(WisetreeError::other("ai.review model is not configured.")),
+                review_verification_failure(findings.len(), "ai.review model is not configured."),
                 &selection,
             );
         }
         let (output, usage) = self
             .run_review_prompt(Path::new(worktree_path), &selection, prompt)
             .await;
-        let result = match output {
-            Err(err) => Err(err),
-            Ok(output) => parse_review_verification(&output, file)
-                .ok_or_else(|| WisetreeError::other("could not parse the review verifier output")),
+        let results = match output {
+            Err(err) => review_verification_failure(
+                findings.len(),
+                crate::errors::user_friendly_message(&err),
+            ),
+            Ok(output) => parse_review_verifications(&output, file, findings.len())
+                .into_iter()
+                .map(|verdict| verdict.map(Ok))
+                .collect(),
         };
-        review_verification_attempt(scan, prompt_bytes, started, usage, result, &selection)
+        review_verification_attempt(scan, prompt_bytes, started, usage, results, &selection)
     }
 
     async fn execute_review_file_prompt(
@@ -3897,15 +3963,22 @@ impl DashboardService {
                 || audit_titles.contains(&finding.title.to_ascii_lowercase())
                 || cross_group;
             let attempt = self
-                .verify_review_finding(worktree_path, file, &finding, &context, strong)
+                .verify_review_findings(
+                    worktree_path,
+                    file,
+                    std::slice::from_ref(&finding),
+                    &context,
+                    strong,
+                )
                 .await;
             accumulate_review_usage(&mut usage, &attempt.telemetry.usage);
-            match attempt.result {
-                Ok(ReviewVerification::Confirmed { .. }) => verified.push(finding),
-                Ok(ReviewVerification::RejectedFalsePositive { .. }) | Err(_) => {}
-                Ok(ReviewVerification::Revise {
+            match attempt.results.into_iter().next().flatten() {
+                Some(Ok(ReviewVerification::Confirmed { .. })) => verified.push(finding),
+                Some(Ok(ReviewVerification::RejectedFalsePositive { .. })) | Some(Err(_)) => {}
+                Some(Ok(ReviewVerification::Revise {
                     finding: revised, ..
-                }) => verified.push(revised),
+                })) => verified.push(revised),
+                None => {}
             }
         }
         let (findings, _) = split_run_duplicate_findings(verified);
@@ -8036,21 +8109,41 @@ fn accumulate_review_usage(total: &mut Option<ReviewTokenUsage>, next: &ReviewTo
         .map(|(left, right)| left + right);
 }
 
+/// The whole call failed, so no candidate was judged. Reported per candidate
+/// as the same error; a failed call is never re-asked candidate by candidate,
+/// which would replay the same failure once per finding.
+fn review_verification_failure(
+    candidates: usize,
+    message: impl Into<String>,
+) -> Vec<Option<Result<ReviewVerification>>> {
+    let message = message.into();
+    (0..candidates)
+        .map(|_| Some(Err(WisetreeError::other(message.clone()))))
+        .collect()
+}
+
 fn review_verification_attempt(
     scan: String,
     prompt_bytes: usize,
     started: Instant,
     usage: Option<ReviewTokenUsage>,
-    result: Result<ReviewVerification>,
+    results: Vec<Option<Result<ReviewVerification>>>,
     selection: &ReviewModelSelection,
 ) -> ReviewVerificationAttempt {
-    let findings = usize::from(matches!(
-        &result,
-        Ok(ReviewVerification::Confirmed { .. } | ReviewVerification::Revise { .. })
-    ));
+    let findings = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result,
+                Some(Ok(
+                    ReviewVerification::Confirmed { .. } | ReviewVerification::Revise { .. }
+                ))
+            )
+        })
+        .count();
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     ReviewVerificationAttempt {
-        result,
+        results,
         telemetry: ReviewScanTelemetry {
             scan,
             scan_role: "verification".to_string(),
@@ -8381,11 +8474,14 @@ fn build_review_group_prompt_with_relationships(
     let full_content = "(included once in the authoritative numbered file evidence below)";
     let context = context.rendered();
     let context_id = review_evidence_id("repository-context", "shared", &context);
-    let relationships = if relationship_summary.trim().is_empty() {
-        "(no cross-group relationships)"
-    } else {
-        relationship_summary
-    };
+    let relationships = truncate_for_prompt(
+        if relationship_summary.trim().is_empty() {
+            "(no cross-group relationships)"
+        } else {
+            relationship_summary
+        },
+        REVIEW_RELATIONSHIP_EDGES_MAX_BYTES,
+    );
     let context = format!(
         "EVIDENCE-ID: {context_id}\n{context}\n\n### Cross-group relationship edges\n{relationships}"
     );
@@ -8449,16 +8545,22 @@ fn build_review_revision_prompt(
     )
 }
 
+/// Verify every candidate raised against one file in a single call. The
+/// file's evidence is the bulk of this prompt and is identical for all of
+/// them, so verifying per finding re-sent it once per candidate.
 fn build_review_verifier_prompt(
     file: &ReviewFile,
-    finding: &ReviewFinding,
+    findings: &[ReviewFinding],
     context: &ReviewContext,
-    suggestion_validation: &str,
+    suggestion_validations: &[String],
 ) -> String {
     const VERIFIER_PROMPT: &str = include_str!("../../prompts/reviewer_verify.md");
     let local_evidence = truncate_for_prompt(&review_file_evidence(file, false), 24 * 1024);
     let paths = BTreeSet::from([file.path.as_str()]);
-    let coverage = context.coverage_ledger.render_for_paths(&paths, &[]);
+    let coverage =
+        context
+            .coverage_ledger
+            .render_for_paths(&paths, &[], REVIEW_VERIFIER_LEDGER_MAX_BYTES);
     let related = truncate_for_prompt(
         &format!(
             "### Conventions\n{}\n\n### Directory inventory\n{}\n\n### Coverage relationship\n{}",
@@ -8466,13 +8568,27 @@ fn build_review_verifier_prompt(
         ),
         12 * 1024,
     );
+    let candidates = findings
+        .iter()
+        .enumerate()
+        .map(|(index, finding)| {
+            let validation = suggestion_validations
+                .get(index)
+                .map_or("(none)", String::as_str);
+            format!(
+                "### CANDIDATE {}\n\n```\n{}\n```\n\nDeterministic suggestion validation:\n\n```\n{validation}\n```",
+                index + 1,
+                finding.rendered_for_revision(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     substitute_review_prompt(
         VERIFIER_PROMPT,
         &[
-            ("CANDIDATE_FINDING", &finding.rendered_for_revision()),
             ("LOCAL_EVIDENCE", &local_evidence),
             ("RELATED_EVIDENCE", &related),
-            ("SUGGESTION_VALIDATION", suggestion_validation),
+            ("CANDIDATE_FINDINGS", &candidates),
         ],
     )
 }
@@ -8576,11 +8692,53 @@ fn deterministic_suggestion_validation(file: &ReviewFile, finding: &ReviewFindin
     )
 }
 
-fn parse_review_verification(output: &str, file: &ReviewFile) -> Option<ReviewVerification> {
+/// Slot the verifier's blocks back onto the candidates they were asked
+/// about. A candidate the model skipped stays `None` so the caller can
+/// re-ask about it alone rather than silently withholding the finding.
+fn parse_review_verifications(
+    output: &str,
+    file: &ReviewFile,
+    candidates: usize,
+) -> Vec<Option<ReviewVerification>> {
     const BEGIN: &str = "===WISETREE-VERIFY-BEGIN===";
     const END: &str = "===WISETREE-VERIFY-END===";
-    let after = &output[output.find(BEGIN)? + BEGIN.len()..];
-    let block = &after[..after.find(END)?];
+    let mut verdicts = vec![None; candidates];
+    let mut rest = output;
+    let mut seen = 0usize;
+    while let Some(start) = rest.find(BEGIN) {
+        let after = &rest[start + BEGIN.len()..];
+        let Some(end) = after.find(END) else { break };
+        let block = &after[..end];
+        rest = &after[end + END.len()..];
+        let slot = parse_review_verify_candidate(block)
+            .map(|number| number.saturating_sub(1))
+            .unwrap_or(seen);
+        seen += 1;
+        if let (Some(verdict), Some(entry)) = (
+            parse_review_verification(block, file),
+            verdicts.get_mut(slot),
+        ) {
+            *entry = Some(verdict);
+        }
+    }
+    verdicts
+}
+
+fn parse_review_verify_candidate(block: &str) -> Option<usize> {
+    block.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("CANDIDATE:")?;
+        value
+            .trim()
+            .trim_start_matches('#')
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .ok()
+    })
+}
+
+fn parse_review_verification(block: &str, file: &ReviewFile) -> Option<ReviewVerification> {
     let field = |name: &str| {
         block
             .lines()
@@ -8734,9 +8892,11 @@ fn build_review_whole_diff_prompt(
         .iter()
         .map(|finding| (finding.file.clone(), finding.title.clone()))
         .collect::<Vec<_>>();
-    let coverage_ledger = context
-        .coverage_ledger
-        .render_for_paths(&application_paths, &tester_links);
+    let coverage_ledger = context.coverage_ledger.render_for_paths(
+        &application_paths,
+        &tester_links,
+        REVIEW_COVERAGE_LEDGER_MAX_BYTES,
+    );
     let context = context.rendered();
     let context_id = review_evidence_id("repository-context", "shared", &context);
     let context = format!("EVIDENCE-ID: {context_id}\n{context}");
@@ -8774,9 +8934,11 @@ fn build_review_gap_audit_prompt(
         .filter(|file| !review_file_is_test(file))
         .map(|file| file.path.as_str())
         .collect::<BTreeSet<_>>();
-    let coverage = context
-        .coverage_ledger
-        .render_for_paths(&application_paths, &[]);
+    let coverage = context.coverage_ledger.render_for_paths(
+        &application_paths,
+        &[],
+        REVIEW_COVERAGE_LEDGER_MAX_BYTES,
+    );
     let manifest = format!(
         "{}\n\n### Changed behavior IDs\n{}",
         context.changed_file_manifest, coverage
@@ -8815,17 +8977,20 @@ fn build_review_gap_audit_prompt(
             ),
             (
                 "RELATIONSHIP_EDGES",
-                if relationship_edges.trim().is_empty() {
-                    "(none)"
-                } else {
-                    relationship_edges
-                },
+                &truncate_for_prompt(
+                    if relationship_edges.trim().is_empty() {
+                        "(none)"
+                    } else {
+                        relationship_edges
+                    },
+                    REVIEW_RELATIONSHIP_EDGES_MAX_BYTES,
+                ),
             ),
             (
                 "COVERAGE_LEDGER",
                 &truncate_for_prompt(&coverage, 16 * 1024),
             ),
-            ("SKIP_DECISIONS", &skips),
+            ("SKIP_DECISIONS", &truncate_for_prompt(&skips, 8 * 1024)),
             (
                 "EXISTING_FINDINGS",
                 &truncate_for_prompt(&findings, 8 * 1024),
@@ -11412,36 +11577,95 @@ copy to src/copied_again.rs
             explanation: "The new call trusts an unchecked user.".to_string(),
             suggestion: Some("authorize_checked(user);".to_string()),
         };
-        let prompt =
-            build_review_verifier_prompt(&file, &finding, &ReviewContext::default(), "VALID-RANGE");
+        let prompt = build_review_verifier_prompt(
+            &file,
+            std::slice::from_ref(&finding),
+            &ReviewContext::default(),
+            &["VALID-RANGE".to_string()],
+        );
         assert!(prompt.contains("Authorization is bypassed"));
         assert!(prompt.contains("authorize(user)"));
         assert!(prompt.contains("VALID-RANGE"));
+        assert!(prompt.contains("### CANDIDATE 1"));
         assert!(!prompt.contains("FULL_DIFF"));
 
-        let confirmed = "===WISETREE-VERIFY-BEGIN===\nVERDICT: CONFIRMED\nREASON: Evidence supports it.\n===WISETREE-VERIFY-END===";
+        let confirmed = "===WISETREE-VERIFY-BEGIN===\nCANDIDATE: 1\nVERDICT: CONFIRMED\nREASON: Evidence supports it.\n===WISETREE-VERIFY-END===";
         assert!(matches!(
-            parse_review_verification(confirmed, &file),
-            Some(ReviewVerification::Confirmed { .. })
+            parse_review_verifications(confirmed, &file, 1).as_slice(),
+            [Some(ReviewVerification::Confirmed { .. })]
         ));
         let rejected = "===WISETREE-VERIFY-BEGIN===\nVERDICT: REJECTED_FALSE_POSITIVE\nREASON: Existing guard applies.\n===WISETREE-VERIFY-END===";
         assert!(matches!(
-            parse_review_verification(rejected, &file),
-            Some(ReviewVerification::RejectedFalsePositive { .. })
+            parse_review_verifications(rejected, &file, 1).as_slice(),
+            [Some(ReviewVerification::RejectedFalsePositive { .. })]
         ));
-        let revised = "===WISETREE-VERIFY-BEGIN===\nVERDICT: REVISE\nREASON: Correct concern, wrong fix.\n---FINDING---\nCATEGORY: Security\nSEVERITY: Medium\nFILE: src/auth.rs\nLINE: 1\nSTART_LINE:\nTITLE: Validate the user before authorization\n---EXPLANATION---\nUse the checked principal.\n---SUGGESTION---\nauthorize_checked(user);\n---END-FINDING---\n===WISETREE-VERIFY-END===";
+        let revised = "===WISETREE-VERIFY-BEGIN===\nCANDIDATE: 1\nVERDICT: REVISE\nREASON: Correct concern, wrong fix.\n---FINDING---\nCATEGORY: Security\nSEVERITY: Medium\nFILE: src/auth.rs\nLINE: 1\nSTART_LINE:\nTITLE: Validate the user before authorization\n---EXPLANATION---\nUse the checked principal.\n---SUGGESTION---\nauthorize_checked(user);\n---END-FINDING---\n===WISETREE-VERIFY-END===";
         assert!(matches!(
-            parse_review_verification(revised, &file),
-            Some(ReviewVerification::Revise {
+            parse_review_verifications(revised, &file, 1).as_slice(),
+            [Some(ReviewVerification::Revise {
                 finding: ReviewFinding {
                     severity: ReviewSeverity::Medium,
                     line: Some(1),
                     ..
                 },
                 ..
-            })
+            })]
         ));
-        assert!(parse_review_verification("VERDICT: CONFIRMED", &file).is_none());
+        assert!(parse_review_verifications("VERDICT: CONFIRMED", &file, 1) == vec![None]);
+    }
+
+    /// One call answers every candidate raised against a file: verdicts land
+    /// on the candidate they name, and one the model skipped stays unjudged
+    /// so the caller can re-ask about it alone.
+    #[test]
+    fn verifier_batches_verdicts_back_onto_their_candidates() {
+        let file = ReviewFile {
+            path: "src/auth.rs".to_string(),
+            annotated_diff: "@@ -1 +1 @@\n     1 +authorize(user);".to_string(),
+            full_content: Some("authorize(user);\n".to_string()),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let finding = |title: &str| ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: file.path.clone(),
+            start_line: None,
+            line: Some(1),
+            title: title.to_string(),
+            explanation: "Explanation.".to_string(),
+            suggestion: None,
+        };
+        let findings = [finding("First"), finding("Second"), finding("Third")];
+        let prompt = build_review_verifier_prompt(
+            &file,
+            &findings,
+            &ReviewContext::default(),
+            &["A".to_string(), "B".to_string(), "C".to_string()],
+        );
+        assert!(prompt.contains("### CANDIDATE 3"));
+        assert!(prompt.contains("Second"));
+        // The file's evidence is rendered once for all three candidates.
+        assert_eq!(prompt.matches("authorize(user);").count(), 1);
+
+        // Out of order, and with the middle candidate left unanswered.
+        let output = "===WISETREE-VERIFY-BEGIN===\nCANDIDATE: 3\nVERDICT: CONFIRMED\nREASON: Real.\n===WISETREE-VERIFY-END===\n\
+             ===WISETREE-VERIFY-BEGIN===\nCANDIDATE: 1\nVERDICT: REJECTED_FALSE_POSITIVE\nREASON: Pre-existing.\n===WISETREE-VERIFY-END===";
+        assert!(matches!(
+            parse_review_verifications(output, &file, 3).as_slice(),
+            [
+                Some(ReviewVerification::RejectedFalsePositive { .. }),
+                None,
+                Some(ReviewVerification::Confirmed { .. })
+            ]
+        ));
+
+        // A failed call reports the same error for every candidate rather
+        // than replaying it once per finding.
+        let failed = review_verification_failure(3, "captured run timed out");
+        assert_eq!(failed.len(), 3);
+        assert!(failed.iter().all(|result| matches!(result, Some(Err(_)))));
     }
 
     #[tokio::test]
@@ -11661,14 +11885,22 @@ copy to src/copied_again.rs
             existing_comments: String::new(),
             existing_keys: Vec::new(),
         };
-        let fixture = file("tests/fixtures/payload.json", REVIEW_MERGED_FOCUS_BYTES + 1);
+        // Each file's evidence is capped, so it takes more than one oversized
+        // fixture to push the review past a merged call.
+        let fixtures = (0..3)
+            .map(|index| {
+                file(
+                    &format!("tests/fixtures/payload{index}.json"),
+                    REVIEW_DIFF_MAX_BYTES,
+                )
+            })
+            .collect::<Vec<_>>();
         let app = file("src/lib.rs", 100);
-        assert_eq!(
-            review_scan_mode(&[fixture.clone(), app.clone()]),
-            ReviewScanMode::Split
-        );
+        let mut files = fixtures;
+        files.push(app);
+        assert_eq!(review_scan_mode(&files), ReviewScanMode::Split);
 
-        let (reviewable, skipped) = partition_reviewable_files(vec![fixture, app]);
+        let (reviewable, skipped) = partition_reviewable_files(files);
         assert_eq!(review_scan_mode(&reviewable), ReviewScanMode::Split);
         assert!(skipped.is_empty());
     }
@@ -11989,22 +12221,32 @@ copy to src/copied_again.rs
         assert!(inputs < prompt.find("### FILE: src/lib.rs").unwrap());
     }
 
+    /// A scan carries each file's whole numbered content, not its diff, so
+    /// the merged/split decision is made on the bytes the prompt will really
+    /// hold. Budgeting on the diff let small diffs in large files pile into
+    /// one call whose diff slot then truncated them away.
     #[test]
-    fn review_scan_mode_uses_the_annotated_diff_budget_boundary() {
-        let file = |bytes: usize| ReviewFile {
-            path: "src/lib.rs".to_string(),
-            annotated_diff: "x".repeat(bytes),
-            full_content: Some("y".repeat(REVIEW_FILE_INLINE_MAX_BYTES)),
+    fn review_scan_mode_uses_the_rendered_prompt_budget_boundary() {
+        let file = |path: &str, content_bytes: usize| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: "@@ -1 +1 @@\n     1 +y".to_string(),
+            full_content: Some("y".repeat(content_bytes)),
             commentable_lines: BTreeSet::new(),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
         };
+        let big = REVIEW_DIFF_MAX_BYTES;
         assert_eq!(
-            review_scan_mode(&[file(REVIEW_MERGED_FOCUS_BYTES)]),
+            review_scan_mode(&[file("src/a.rs", 64), file("src/b.rs", 64)]),
             ReviewScanMode::Merged
         );
+        assert!(REVIEW_MERGED_PROMPT_BYTES < 3 * big);
         assert_eq!(
-            review_scan_mode(&[file(REVIEW_MERGED_FOCUS_BYTES + 1)]),
+            review_scan_mode(&[
+                file("src/a.rs", big),
+                file("src/b.rs", big),
+                file("src/c.rs", big)
+            ]),
             ReviewScanMode::Split
         );
     }
@@ -12019,10 +12261,11 @@ copy to src/copied_again.rs
             existing_comments: String::new(),
             existing_keys: Vec::new(),
         };
+        let half = REVIEW_GROUP_PROMPT_BYTES / 2;
         let files = vec![
-            file("src/a.rs", REVIEW_MERGED_FOCUS_BYTES),
+            file("src/a.rs", half),
             file("src/b.rs", 1),
-            file("src/oversized.rs", REVIEW_MERGED_FOCUS_BYTES + 1),
+            file("src/c.rs", half),
             file("src/tail.rs", 8),
             file("tests/a_test.rs", 10),
         ];
@@ -12035,9 +12278,15 @@ copy to src/copied_again.rs
             .collect::<Vec<_>>();
         assert_eq!(
             application_paths,
-            vec!["src/a.rs", "src/b.rs", "src/oversized.rs", "src/tail.rs"]
+            vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/tail.rs"]
         );
-        assert_eq!(groups.len(), 4);
+        for group in &groups {
+            let bytes = group.iter().map(review_file_prompt_bytes).sum::<usize>();
+            assert!(
+                bytes <= REVIEW_COVERAGE_DIFF_MAX_BYTES,
+                "a group must fit the cap its prompt truncates at"
+            );
+        }
         assert_eq!(
             groups
                 .iter()
@@ -12046,8 +12295,33 @@ copy to src/copied_again.rs
             1,
             "related changed test evidence must have one owning coverage group"
         );
-        assert_eq!(groups[2][0].path, "src/oversized.rs");
-        assert_eq!(groups[3][0].path, "src/tail.rs");
+        assert_eq!(groups.last().expect("groups")[0].path, "src/c.rs");
+    }
+
+    /// The scan ships each file's whole numbered content, so a one-line diff
+    /// in a large file costs that file's size against the group budget. When
+    /// this was budgeted on diff bytes, files like these piled into a single
+    /// prompt the model then timed out on or refused outright.
+    #[test]
+    fn group_budgets_count_inlined_file_content_not_diff_size() {
+        let file = |path: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: "@@ -1 +1 @@\n     1 +y".to_string(),
+            full_content: Some("y".repeat(REVIEW_GROUP_PROMPT_BYTES * 2 / 3)),
+            commentable_lines: BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let files = vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")];
+        let groups = review_coverage_groups(&files, ReviewScanMode::Split);
+        assert!(
+            groups.len() > 1,
+            "three near-budget files cannot share one prompt"
+        );
+        for group in &groups {
+            let bytes = group.iter().map(review_file_prompt_bytes).sum::<usize>();
+            assert!(bytes <= REVIEW_COVERAGE_DIFF_MAX_BYTES);
+        }
     }
 
     #[test]

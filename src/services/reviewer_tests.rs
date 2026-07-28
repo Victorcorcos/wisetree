@@ -168,10 +168,17 @@ fn build_coverage_ledger_blocking(
 }
 
 impl ReviewCoverageLedger {
+    /// Render the behaviors owned by `application_paths`, stopping before
+    /// `max_bytes` is exceeded. Every other prompt slot is capped; without a
+    /// bound here one coverage prompt grew past a megabyte on a large PR and
+    /// the call was rejected outright, so the whole group went unreviewed.
+    /// Truncation is whole-behavior and the omitted ones are named, so the
+    /// model still knows they exist and can target-read them.
     pub(crate) fn render_for_paths(
         &self,
         application_paths: &BTreeSet<&str>,
         tester_findings: &[(String, String)],
+        max_bytes: usize,
     ) -> String {
         let findings = tester_findings.iter().fold(
             BTreeMap::<&str, Vec<&str>>::new(),
@@ -181,11 +188,16 @@ impl ReviewCoverageLedger {
             },
         );
         let mut rendered = String::new();
+        let mut omitted = BTreeSet::new();
         for entry in self
             .entries
             .iter()
             .filter(|entry| application_paths.contains(entry.application_path.as_str()))
         {
+            if rendered.len() >= max_bytes {
+                omitted.insert(entry.application_path.as_str());
+                continue;
+            }
             rendered.push_str(&format!(
                 "### BEHAVIOR {}\n- application: `{}`\n- symbol/scenario: {}\n- changed anchors: {}\n- status: {}\n",
                 entry.id,
@@ -222,6 +234,19 @@ impl ReviewCoverageLedger {
                 }
             }
             rendered.push('\n');
+        }
+        if !omitted.is_empty() {
+            rendered.push_str(&format!(
+                "### BEHAVIORS OMITTED FOR SIZE (files: {})\n{}\n\
+                 (their behavior evidence did not fit this prompt — read these files \
+                 directly before judging their coverage)\n",
+                omitted.len(),
+                omitted
+                    .iter()
+                    .map(|path| format!("- `{path}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
         }
         if rendered.is_empty() {
             "(no application behaviors in this coverage group)".to_string()
@@ -553,5 +578,42 @@ mod tests {
             ReviewCoverageStatus::NoRelevantTest
         );
         assert!(ledger.entries[0].tests.is_empty());
+    }
+
+    /// The ledger is one behavior block per changed symbol and was the only
+    /// uncapped slot in the coverage prompt — on a large PR it grew past a
+    /// megabyte and the model refused the call. It now stops at its budget
+    /// and names the files it dropped so they can still be read.
+    #[test]
+    fn ledger_rendering_stops_at_its_budget_and_names_what_it_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let inputs = (0..60)
+            .map(|index| {
+                input(
+                    &format!("src/service{index}.rs"),
+                    "    10 +authenticate(token)",
+                    false,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let ledger = build_coverage_ledger_blocking(root.path(), &inputs);
+        let paths = inputs
+            .iter()
+            .map(|input| input.path.as_str())
+            .collect::<BTreeSet<_>>();
+
+        let full = ledger.render_for_paths(&paths, &[], usize::MAX);
+        assert!(!full.contains("BEHAVIORS OMITTED FOR SIZE"));
+
+        let capped = ledger.render_for_paths(&paths, &[], full.len() / 2);
+        assert!(capped.len() < full.len());
+        assert!(capped.contains("BEHAVIORS OMITTED FOR SIZE"));
+        assert!(capped.contains("`src/service59.rs`"));
+        // Whole behaviors only — a rendered block is never cut in half.
+        assert_eq!(
+            capped.matches("- application: `").count(),
+            capped.matches("### BEHAVIOR ").count()
+        );
     }
 }

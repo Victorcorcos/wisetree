@@ -3,7 +3,7 @@
 //! Owns screen routing, per-screen async work, and the wrapper-mode selected
 //! path handoff used by shell integration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -3087,16 +3087,15 @@ impl App {
                 return;
             }
             let config = self.current_dashboard_config();
-            for (index, file, finding, strong) in candidates {
-                kick_off_verify_review_finding(
+            for (file, strong, findings) in review_verification_batches(candidates) {
+                kick_off_verify_review_findings(
                     self.git_root.clone(),
                     config.clone(),
                     ReviewVerifyRequest {
                         worktree_path: worktree_path.clone(),
                         file,
-                        finding,
+                        findings,
                         context: context.clone(),
-                        index,
                         strong,
                     },
                     tx.clone(),
@@ -3327,7 +3326,10 @@ impl App {
                 }
             }
             Err(message) => {
-                if let Some(next) = next_review_retry(retry, raw_output.is_some()) {
+                let next = next_review_retry(retry, raw_output.is_some()).filter(|next| {
+                    *next != ReviewScanRetry::Full || !review_failure_repeats_on_rescan(&message)
+                });
+                if let Some(next) = next {
                     let raw_output = (next == ReviewScanRetry::Reformat)
                         .then_some(raw_output)
                         .flatten();
@@ -3425,7 +3427,12 @@ impl App {
         if let Some(telemetry) = telemetry {
             screen.record_scan_telemetry(telemetry);
         }
-        screen.record_verification(index, result);
+        // A batched call reports its telemetry once per candidate it
+        // answered; only the event carrying a fresh verdict advances the
+        // phase.
+        if !screen.record_verification(index, result) {
+            return;
+        }
         if screen.verification_pending() {
             return;
         }
@@ -9094,6 +9101,27 @@ fn next_review_retry(retry: ReviewScanRetry, has_raw_output: bool) -> Option<Rev
     }
 }
 
+/// A full rescan replays the identical prompt, so a failure caused by the
+/// prompt itself — the model timing out on it, or the provider refusing its
+/// size — fails the same way and only burns the tokens twice. Transient
+/// spawn/network failures still get their one retry.
+fn review_failure_repeats_on_rescan(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "too large",
+        "too long",
+        "context length",
+        "context window",
+        "maximum context",
+        "prompt is too",
+        "argument list too long",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 /// Inputs for one captured per-file scan call. `file_index` identifies the
 /// file the result belongs to (scans run in parallel); `retried` marks the
 /// one retry allowed after unparseable output.
@@ -9130,12 +9158,13 @@ struct ReviewReviseRequest {
     index: usize,
 }
 
+/// One verifier call: every candidate raised against `file` that shares the
+/// same model routing, paired with the walkthrough index it belongs to.
 struct ReviewVerifyRequest {
     worktree_path: String,
     file: ReviewFile,
-    finding: ReviewFinding,
+    findings: Vec<(usize, ReviewFinding)>,
     context: ReviewContext,
-    index: usize,
     strong: bool,
 }
 
@@ -9372,38 +9401,111 @@ fn kick_off_revise_review_finding(
     });
 }
 
-fn kick_off_verify_review_finding(
+/// Candidates verified together in one call: same file (its evidence is the
+/// bulk of the prompt) and same model routing, capped so a heavily flagged
+/// file still asks for a manageable number of verdicts per call.
+const REVIEW_VERIFY_BATCH: usize = 6;
+
+/// One verifier call's worth of work: the file under review, whether it
+/// routes to the strong model, and the candidates paired with their
+/// walkthrough index.
+type ReviewVerifyBatch = (ReviewFile, bool, Vec<(usize, ReviewFinding)>);
+
+fn review_verification_batches(
+    candidates: Vec<(usize, ReviewFile, ReviewFinding, bool)>,
+) -> Vec<ReviewVerifyBatch> {
+    let mut batches: Vec<ReviewVerifyBatch> = Vec::new();
+    for (index, file, finding, strong) in candidates {
+        let open = batches
+            .iter_mut()
+            .find(|(batch_file, batch_strong, batch)| {
+                batch_file.path == file.path
+                    && *batch_strong == strong
+                    && batch.len() < REVIEW_VERIFY_BATCH
+            });
+        match open {
+            Some((_, _, batch)) => batch.push((index, finding)),
+            None => batches.push((file, strong, vec![(index, finding)])),
+        }
+    }
+    batches
+}
+
+fn kick_off_verify_review_findings(
     git_root: Option<String>,
     config: DashboardConfig,
     req: ReviewVerifyRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    let index = req.index;
     let Some(root) = git_root.map(PathBuf::from) else {
-        let _ = tx.send(AppEvent::ReviewPrVerified {
-            index,
-            result: Err("Could not resolve git root.".to_string()),
-            telemetry: None,
-        });
+        for (index, _) in req.findings {
+            let _ = tx.send(AppEvent::ReviewPrVerified {
+                index,
+                result: Err("Could not resolve git root.".to_string()),
+                telemetry: None,
+            });
+        }
         return;
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
+        let findings = req
+            .findings
+            .iter()
+            .map(|(_, finding)| finding.clone())
+            .collect::<Vec<_>>();
         let attempt = service
-            .verify_review_finding(
+            .verify_review_findings(
                 &req.worktree_path,
                 &req.file,
-                &req.finding,
+                &findings,
                 &req.context,
                 req.strong,
             )
             .await;
-        let result = attempt.result.map_err(|err| user_friendly_message(&err));
-        let _ = tx.send(AppEvent::ReviewPrVerified {
-            index,
-            result,
-            telemetry: Some(attempt.telemetry),
-        });
+        // One call now answers several findings, so its telemetry rides
+        // along with the first verdict it produced and the rest report none.
+        let mut telemetry = VecDeque::from([attempt.telemetry]);
+        let mut last_index = None;
+        for ((index, finding), verdict) in req.findings.into_iter().zip(attempt.results) {
+            let result = match verdict {
+                Some(result) => result.map_err(|err| user_friendly_message(&err)),
+                // The model skipped this candidate. Ask about it alone
+                // rather than withholding a finding nobody judged.
+                None => {
+                    let solo = service
+                        .verify_review_findings(
+                            &req.worktree_path,
+                            &req.file,
+                            std::slice::from_ref(&finding),
+                            &req.context,
+                            req.strong,
+                        )
+                        .await;
+                    telemetry.push_back(solo.telemetry);
+                    match solo.results.into_iter().next().flatten() {
+                        Some(result) => result.map_err(|err| user_friendly_message(&err)),
+                        None => Err("The verifier returned no verdict.".to_string()),
+                    }
+                }
+            };
+            last_index = Some(index);
+            let _ = tx.send(AppEvent::ReviewPrVerified {
+                index,
+                result,
+                telemetry: telemetry.pop_front(),
+            });
+        }
+        // Every candidate needing its own retry can leave more telemetry
+        // than verdicts. A repeat of a settled index records the call and
+        // is ignored as a verdict, so no paid call goes unreported.
+        while let (Some(index), Some(telemetry)) = (last_index, telemetry.pop_front()) {
+            let _ = tx.send(AppEvent::ReviewPrVerified {
+                index,
+                result: Err("(telemetry only)".to_string()),
+                telemetry: Some(telemetry),
+            });
+        }
     });
 }
 
@@ -10566,6 +10668,76 @@ mod tests {
             next_review_retry(ReviewScanRetry::Initial, false),
             Some(ReviewScanRetry::Full)
         );
+    }
+
+    /// A full rescan replays the same prompt, so failures caused by the
+    /// prompt itself are not retried — in one large review those retries
+    /// burned the tokens a second time and timed out identically.
+    #[test]
+    fn review_prompt_failures_skip_the_full_rescan_but_transient_ones_keep_it() {
+        assert!(review_failure_repeats_on_rescan("captured run timed out"));
+        assert!(review_failure_repeats_on_rescan(
+            "Request too large for this model"
+        ));
+        assert!(review_failure_repeats_on_rescan(
+            "input exceeds the maximum context length"
+        ));
+        assert!(!review_failure_repeats_on_rescan(
+            "failed to spawn opencode: connection reset"
+        ));
+    }
+
+    /// Findings raised against the same file are verified in one call: the
+    /// file's evidence dominates that prompt and was previously re-sent once
+    /// per candidate. Model routing still splits strong from balanced.
+    #[test]
+    fn verification_batches_group_by_file_and_routing() {
+        use crate::services::ReviewSeverity;
+        let file = |path: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: String::new(),
+            full_content: None,
+            commentable_lines: std::collections::BTreeSet::new(),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let finding = |path: &str| ReviewFinding {
+            category: "Code Smell".to_string(),
+            severity: ReviewSeverity::Medium,
+            file: path.to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Title".to_string(),
+            explanation: "Explanation.".to_string(),
+            suggestion: None,
+        };
+        let candidates = (0..REVIEW_VERIFY_BATCH + 1)
+            .map(|index| (index, file("src/a.rs"), finding("src/a.rs"), false))
+            .chain([
+                (100, file("src/a.rs"), finding("src/a.rs"), true),
+                (101, file("src/b.rs"), finding("src/b.rs"), false),
+            ])
+            .collect::<Vec<_>>();
+        let batches = review_verification_batches(candidates);
+        let shape = batches
+            .iter()
+            .map(|(file, strong, findings)| (file.path.as_str(), *strong, findings.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            vec![
+                ("src/a.rs", false, REVIEW_VERIFY_BATCH),
+                ("src/a.rs", false, 1),
+                ("src/a.rs", true, 1),
+                ("src/b.rs", false, 1),
+            ]
+        );
+        // Every candidate keeps its walkthrough index.
+        let indices = batches
+            .iter()
+            .flat_map(|(_, _, findings)| findings.iter().map(|(index, _)| *index))
+            .collect::<Vec<_>>();
+        assert_eq!(indices.len(), REVIEW_VERIFY_BATCH + 3);
     }
 
     fn review_scan_test_app(mode: ReviewScanMode, paths: &[&str]) -> App {

@@ -960,13 +960,17 @@ impl ReviewPullRequestScreen {
             })
     }
 
+    /// Settle one candidate's verdict. Returns false for an index that was
+    /// already settled — one call now answers several candidates and reports
+    /// its telemetry against them, so a repeat carries no new verdict and
+    /// must not re-run the phase transition.
     pub fn record_verification(
         &mut self,
         index: usize,
         result: Result<ReviewVerification, String>,
-    ) {
+    ) -> bool {
         if !self.verification_outstanding.remove(&index) {
-            return;
+            return false;
         }
         match result {
             Ok(ReviewVerification::Confirmed { .. }) => {}
@@ -999,6 +1003,7 @@ impl ReviewPullRequestScreen {
             }
         }
         self.phase_message = "Double-checking high-risk findings".to_string();
+        true
     }
 
     pub fn verification_pending(&self) -> bool {
@@ -3137,7 +3142,7 @@ mod tests {
     #[test]
     fn split_pool_settles_multiple_coverage_groups_independently() {
         let mut first = file("src/first.rs");
-        first.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_MERGED_FOCUS_BYTES);
+        first.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
         let second = file("src/tail.rs");
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.set_files(vec![first, second], "o".into(), "r".into(), "sha".into());
@@ -3305,6 +3310,15 @@ mod tests {
                 reason: "independent concern".to_string(),
             }),
         );
+        assert!(
+            !screen.record_verification(
+                candidates[1].0,
+                Ok(ReviewVerification::Confirmed {
+                    reason: "repeat of a settled candidate".to_string(),
+                }),
+            ),
+            "a settled candidate reports no new verdict"
+        );
         screen.finish_verification();
         assert_eq!(screen.findings.len(), 2);
         assert!(screen.findings.contains(&revised));
@@ -3327,7 +3341,7 @@ mod tests {
     #[test]
     fn gap_audit_runs_only_for_decomposed_application_reviews() {
         let mut large = file("src/large.rs");
-        large.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_MERGED_FOCUS_BYTES);
+        large.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.set_files(
             vec![large, file("src/tail.rs")],
