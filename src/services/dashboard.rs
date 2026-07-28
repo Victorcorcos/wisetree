@@ -864,6 +864,25 @@ pub enum ReviewPreparation {
     SyncFailed(String),
 }
 
+/// Outcome of the local, GitHub-free preparation for Improve. It deliberately
+/// carries the same discovery input as Review, except there is no PR identity
+/// or existing-comment context to fetch or mutate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImprovePreparation {
+    Ready {
+        base_ref: String,
+        files: Vec<ReviewFile>,
+        scan_mode: ReviewScanMode,
+        context: ReviewContext,
+        skipped: Vec<ReviewSkippedFile>,
+    },
+    NoChanges,
+    AiNotConfigured,
+    AiUnavailable,
+    DirtyWorktree,
+    BaseRefUnresolved,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewScanMode {
     Merged,
@@ -3355,6 +3374,102 @@ impl DashboardService {
             owner,
             repo,
             head_sha,
+        })
+    }
+
+    /// Prepare Improve's local discovery input. Unlike Review this never
+    /// syncs, fetches, or consults GitHub: it reviews precisely the committed
+    /// three-dot range from the worktree's resolved base ref to `HEAD`.
+    pub async fn prepare_improve(&self, worktree_path: &str) -> Result<ImprovePreparation> {
+        if !self.config.ai.review.has_discovery_models()
+            || self.config.ai.fix.apply.model.trim().is_empty()
+        {
+            return Ok(ImprovePreparation::AiNotConfigured);
+        }
+
+        let cwd = PathBuf::from(worktree_path);
+        let runner = self.ai_runner();
+        for (slot, config, permission) in [
+            (
+                "dashboard.ai.review.strong",
+                &self.config.ai.review.strong,
+                AiPermission::Plan,
+            ),
+            (
+                "dashboard.ai.review.balanced",
+                &self.config.ai.review.balanced,
+                AiPermission::Plan,
+            ),
+            (
+                "dashboard.ai.fix.apply",
+                &self.config.ai.fix.apply,
+                AiPermission::Implement,
+            ),
+        ] {
+            if runner
+                .command(&AiRunRequest {
+                    slot: slot.to_string(),
+                    config: config.clone(),
+                    prompt: String::new(),
+                    cwd: cwd.clone(),
+                    mode: AiRunMode::Interactive,
+                    permission,
+                    timeout: Duration::from_secs(1),
+                    activity_limit: 1,
+                    session_title: None,
+                })
+                .is_err()
+            {
+                return Ok(ImprovePreparation::AiUnavailable);
+            }
+        }
+
+        let status = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git status timed out"))?
+        .map_err(WisetreeError::other)?;
+        if !status.is_empty() {
+            return Ok(ImprovePreparation::DirtyWorktree);
+        }
+
+        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await
+        else {
+            return Ok(ImprovePreparation::BaseRefUnresolved);
+        };
+        let range = format!("{base_ref}...HEAD");
+        let diff = time::timeout(
+            REVIEW_FETCH_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["diff", "--no-color", &range],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("local Improve diff timed out"))?
+        .map_err(WisetreeError::other)?;
+        let parsed = parse_review_diff(&diff);
+        if parsed.is_empty() {
+            return Ok(ImprovePreparation::NoChanges);
+        }
+        let mut parsed = parsed;
+        apply_project_test_patterns(&cwd, &mut parsed).await;
+        let (mut files, skipped) = partition_reviewable_files(parsed);
+        attach_review_file_contents(&cwd, &mut files).await;
+        let context = build_review_context(&cwd, &files).await;
+        Ok(ImprovePreparation::Ready {
+            base_ref,
+            scan_mode: review_scan_mode(&files),
+            files,
+            context,
+            skipped,
         })
     }
 
@@ -13770,6 +13885,145 @@ so the intent reads clearly.
             err.contains("could not resolve a local base ref"),
             "unexpected error: {err}"
         );
+    }
+
+    fn improve_service(repo: &Path, config: DashboardConfig) -> DashboardService {
+        DashboardService::new(repo.to_path_buf(), config).with_opencode_binary(PathBuf::from("git"))
+    }
+
+    fn improve_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("app.rs"), "fn main() {}\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "base"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, local.to_str().unwrap()],
+        );
+        (tmp, local)
+    }
+
+    #[tokio::test]
+    async fn prepare_improve_builds_local_review_input_without_gh() {
+        let (_tmp, repo) = improve_repo();
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(
+            repo.join("app.rs"),
+            "fn main() { println!(\"improved\"); }\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "change"]);
+
+        let prepared = improve_service(&repo, DashboardConfig::default())
+            .prepare_improve(repo.to_str().unwrap())
+            .await
+            .expect("prepare");
+        match prepared {
+            ImprovePreparation::Ready {
+                base_ref, files, ..
+            } => {
+                assert_eq!(base_ref, "origin/main");
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "app.rs");
+                assert!(files[0].commentable_lines.contains(&1));
+                assert!(files[0]
+                    .full_content
+                    .as_deref()
+                    .unwrap()
+                    .contains("improved"));
+            }
+            other => panic!("expected ready preparation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_improve_rejects_missing_models_or_harnesses() {
+        let (_tmp, repo) = improve_repo();
+        let mut config = DashboardConfig::default();
+        config.ai.fix.apply.model.clear();
+        assert_eq!(
+            improve_service(&repo, config)
+                .prepare_improve(repo.to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::AiNotConfigured
+        );
+        assert_eq!(
+            improve_service(&repo, DashboardConfig::default())
+                .with_opencode_binary(repo.join("missing-ai"))
+                .prepare_improve(repo.to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::AiUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_improve_rejects_dirty_or_unresolved_worktrees() {
+        let (_tmp, repo) = improve_repo();
+        std::fs::write(repo.join("dirty.txt"), "dirty\n").unwrap();
+        assert_eq!(
+            improve_service(&repo, DashboardConfig::default())
+                .prepare_improve(repo.to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::DirtyWorktree
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "initial"]);
+        assert_eq!(
+            improve_service(tmp.path(), DashboardConfig::default())
+                .prepare_improve(tmp.path().to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::BaseRefUnresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_improve_reports_empty_and_non_reviewable_diffs() {
+        let (_tmp, repo) = improve_repo();
+        assert_eq!(
+            improve_service(&repo, DashboardConfig::default())
+                .prepare_improve(repo.to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::NoChanges
+        );
+
+        git(&repo, &["checkout", "-q", "-b", "binary-change"]);
+        std::fs::write(repo.join("image.bin"), [0_u8, 1, 2]).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "binary"]);
+        match improve_service(&repo, DashboardConfig::default())
+            .prepare_improve(repo.to_str().unwrap())
+            .await
+            .unwrap()
+        {
+            ImprovePreparation::Ready { files, skipped, .. } => {
+                assert!(files.is_empty());
+                assert_eq!(skipped.len(), 1);
+                assert_eq!(skipped[0].reason, "binary file without reviewable text");
+            }
+            other => panic!("expected informative skipped result, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -47,9 +47,10 @@ use crate::services::{
     DashboardService, DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff,
     DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome,
     ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    JudgeResult, MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile,
-    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification,
-    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    ImprovePreparation, JudgeResult, MultiSourceUpdateResult, OpencodeModel, PrState,
+    ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
+    ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::router::Screen;
@@ -207,6 +208,8 @@ enum AppEvent {
     },
     /// "Review Pull Request": sync + diff fetch + per-file split finished.
     ReviewPrPrepared(Result<Box<ReviewPreparation>, String>),
+    /// "Improve": validate and build the local three-dot review input.
+    ImprovePrepared(Result<Box<ImprovePreparation>, String>),
     /// One per-file scan (or a single-finding revision) returned.
     ReviewPrScanned {
         /// File index the scan belongs to — guards against a stale result.
@@ -2866,10 +2869,74 @@ impl App {
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             // The discovery and apply pipeline is introduced by the next
-            // implementation section; keep the confirmation open until that
-            // machinery owns this transition.
-            ImproveAction::Confirmed => {}
+            // implementation section. This section only prepares its local,
+            // GitHub-free input.
+            ImproveAction::Confirmed => {
+                let Some(screen) = self.improve_pr.as_mut() else {
+                    return;
+                };
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_preparing();
+                kick_off_prepare_improve(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    tx.clone(),
+                );
+            }
         }
+    }
+
+    fn apply_improve_prepared(
+        &mut self,
+        result: Result<Box<ImprovePreparation>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.improve_pr.is_none() {
+            return;
+        }
+        let (variant, message) = match result {
+            Ok(preparation) => match *preparation {
+                ImprovePreparation::Ready { files, skipped, .. } if files.is_empty() => (
+                    ToastVariant::Info,
+                    format!(
+                        "Improve found no reviewable text changes ({} file(s) skipped).",
+                        skipped.len()
+                    ),
+                ),
+                ImprovePreparation::Ready { .. } => (
+                    ToastVariant::Info,
+                    "Improve preparation is ready for local discovery.".to_string(),
+                ),
+                ImprovePreparation::NoChanges => (
+                    ToastVariant::Info,
+                    "Improve found no changes from the local base branch.".to_string(),
+                ),
+                ImprovePreparation::AiNotConfigured => (
+                    ToastVariant::Warning,
+                    "Configure Review discovery models and the Fix apply model in Settings → Dashboard → ai before improving.".to_string(),
+                ),
+                ImprovePreparation::AiUnavailable => (
+                    ToastVariant::Error,
+                    "A configured Improve AI harness is unavailable or incompatible with its model.".to_string(),
+                ),
+                ImprovePreparation::DirtyWorktree => (
+                    ToastVariant::Warning,
+                    "Improve requires a clean worktree. Commit, stash, or remove local changes first.".to_string(),
+                ),
+                ImprovePreparation::BaseRefUnresolved => (
+                    ToastVariant::Error,
+                    "Improve could not resolve this worktree's base branch. Set an upstream or fetch a local base ref, then retry.".to_string(),
+                ),
+            },
+            Err(message) => (ToastVariant::Error, format!("Could not prepare Improve: {}", truncate_error(&message))),
+        };
+        let worktree_path = self
+            .improve_pr
+            .take()
+            .map(|screen| screen.request().worktree_path.clone());
+        self.show_toast(variant, message);
+        self.back_to_dashboard_action_menu(worktree_path, tx);
     }
 
     fn start_review_pr_flow(
@@ -6648,6 +6715,7 @@ impl App {
                 self.apply_fix_pr_committed(index, result, tx)
             }
             AppEvent::ReviewPrPrepared(result) => self.apply_review_pr_prepared(result, tx),
+            AppEvent::ImprovePrepared(result) => self.apply_improve_prepared(result, tx),
             AppEvent::ReviewPrScanned {
                 file_index,
                 retry,
@@ -9310,6 +9378,29 @@ fn kick_off_prepare_review(
             Err(err) => Err(user_friendly_message(&err)),
         };
         let _ = tx.send(AppEvent::ReviewPrPrepared(event));
+    });
+}
+
+fn kick_off_prepare_improve(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ImprovePrepared(Err(
+            "Could not resolve git root for Improve.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .prepare_improve(&worktree_path)
+            .await
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ImprovePrepared(result));
     });
 }
 

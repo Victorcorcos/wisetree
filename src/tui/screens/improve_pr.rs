@@ -28,6 +28,7 @@ pub struct ImprovePullRequestScreen {
     review_ai: AiReviewConfig,
     fix_ai: AiFixConfig,
     confirm: ConfirmationModal,
+    preparing: bool,
 }
 
 impl ImprovePullRequestScreen {
@@ -37,6 +38,7 @@ impl ImprovePullRequestScreen {
             request,
             review_ai,
             fix_ai,
+            preparing: false,
         }
     }
 
@@ -45,6 +47,9 @@ impl ImprovePullRequestScreen {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ImproveAction {
+        if self.preparing {
+            return ImproveAction::Continue;
+        }
         match self.confirm.handle_key(key) {
             ConfirmationOutcome::Confirmed => ImproveAction::Confirmed,
             ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
@@ -55,6 +60,9 @@ impl ImprovePullRequestScreen {
     }
 
     pub fn handle_mouse_click(&mut self, position: ratatui::layout::Position) -> ImproveAction {
+        if self.preparing {
+            return ImproveAction::Continue;
+        }
         match self.confirm.handle_mouse_click(position) {
             ConfirmationOutcome::Confirmed => ImproveAction::Confirmed,
             ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
@@ -99,8 +107,12 @@ impl ImprovePullRequestScreen {
                     "Edit files",
                 ),
             ])
-            .modal(Some(&self.confirm))
+            .modal((!self.preparing).then_some(&self.confirm))
             .render(frame, area);
+    }
+
+    pub fn start_preparing(&mut self) {
+        self.preparing = true;
     }
 
     fn detail_lines(&self) -> Vec<Line<'static>> {
