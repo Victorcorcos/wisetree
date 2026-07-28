@@ -2856,30 +2856,7 @@ impl App {
                     tx.clone(),
                 );
             }
-            ReviewAction::Post => {
-                let Some(screen) = self.review_pr.as_mut() else {
-                    return;
-                };
-                let Some(finding) = screen.current_finding() else {
-                    return;
-                };
-                let request = ReviewPostRequest {
-                    worktree_path: screen.request().worktree_path.clone(),
-                    owner: screen.owner().to_string(),
-                    repo: screen.repo().to_string(),
-                    number: screen.request().number,
-                    head_sha: screen.head_sha().to_string(),
-                    finding,
-                    index: screen.current_index(),
-                };
-                screen.start_posting();
-                kick_off_post_review_finding(
-                    self.git_root.clone(),
-                    self.current_dashboard_config(),
-                    request,
-                    tx.clone(),
-                );
-            }
+            ReviewAction::Post => self.post_current_review_finding(tx),
             ReviewAction::Other => {
                 if let Some(screen) = self.review_pr.as_mut() {
                     screen.show_other_input();
@@ -3130,16 +3107,60 @@ impl App {
         }
     }
 
+    /// Post the finding the walkthrough is currently on.
+    fn post_current_review_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        let Some(finding) = screen.current_finding() else {
+            return;
+        };
+        let request = ReviewPostRequest {
+            worktree_path: screen.request().worktree_path.clone(),
+            owner: screen.owner().to_string(),
+            repo: screen.repo().to_string(),
+            number: screen.request().number,
+            head_sha: screen.head_sha().to_string(),
+            finding,
+            index: screen.current_index(),
+        };
+        screen.start_posting();
+        kick_off_post_review_finding(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request,
+            tx.clone(),
+        );
+    }
+
     /// Advance the walkthrough to the next finding, or close it: posted
     /// comments first get a utility-written overview, then the deterministic
     /// summary; otherwise go straight to the final report.
     fn advance_review_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        // "Post all" keeps the loop running: post the next finding straight
+        // away instead of stopping on Decision.
+        let keep_posting = {
+            let Some(screen) = self.review_pr.as_mut() else {
+                return;
+            };
+            if screen.advance_finding() {
+                if !screen.post_all_active() {
+                    screen.enter_decision();
+                    return;
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if keep_posting {
+            self.post_current_review_finding(tx);
+            return;
+        }
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
-        if screen.advance_finding() {
-            screen.enter_decision();
-        } else if screen.posted_findings().is_empty() {
+        if screen.posted_findings().is_empty() {
             screen.enter_done();
         } else {
             let worktree_path = screen.request().worktree_path.clone();
@@ -3443,10 +3464,15 @@ impl App {
         if let Some(screen) = self.review_pr.as_mut() {
             match result {
                 Ok(()) => screen.record_outcome(ReviewRowOutcome::Posted),
-                Err(msg) => screen.record_outcome(ReviewRowOutcome::Failed(format!(
-                    "post failed: {}",
-                    truncate_error(&msg)
-                ))),
+                Err(msg) => {
+                    // Stop an unattended "Post all" run at the first failure
+                    // rather than replaying the same error on every finding.
+                    screen.cancel_post_all();
+                    screen.record_outcome(ReviewRowOutcome::Failed(format!(
+                        "post failed: {}",
+                        truncate_error(&msg)
+                    )));
+                }
             }
         }
         self.advance_review_finding(tx);
@@ -10770,6 +10796,75 @@ mod tests {
             crate::tui::screens::review_pr::ReviewStep::Done
         );
         assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 3);
+    }
+
+    /// A review app parked on Decision with `count` distinct findings.
+    fn review_walkthrough_app(count: usize) -> App {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.record_scan_result(
+            (0..count)
+                .map(|i| ReviewFinding {
+                    category: "Security".to_string(),
+                    severity: crate::services::ReviewSeverity::High,
+                    file: "src/lib.rs".to_string(),
+                    start_line: None,
+                    line: Some(i as u64 + 1),
+                    title: format!("Authorization is skipped {i}"),
+                    explanation: String::new(),
+                    suggestion: Some(format!("authorize!(:read, {i})")),
+                })
+                .collect(),
+        );
+        screen.finish_scanning();
+        screen.enter_decision();
+        app
+    }
+
+    /// Arm "Post all": focus the bulk button, open its confirmation, say yes.
+    fn arm_post_all(app: &mut App, tx: &mpsc::UnboundedSender<AppEvent>) {
+        app.handle_review_pr_key(key(KeyCode::Right), tx);
+        app.handle_review_pr_key(key(KeyCode::Enter), tx);
+        app.handle_review_pr_key(key(KeyCode::Char('y')), tx);
+        app.handle_review_pr_key(key(KeyCode::Enter), tx);
+        assert!(app.review_pr.as_ref().unwrap().post_all_active());
+    }
+
+    #[test]
+    fn post_all_keeps_posting_without_returning_to_decision() {
+        let mut app = review_walkthrough_app(crate::tui::screens::review_pr::POST_ALL_MIN_FINDINGS);
+        let tx = app_event_tx();
+        arm_post_all(&mut app, &tx);
+
+        // Each successful post immediately starts the next one instead of
+        // parking on Decision for another keystroke.
+        for _ in 0..3 {
+            app.apply_review_pr_posted(
+                app.review_pr.as_ref().unwrap().current_index(),
+                Ok(()),
+                &tx,
+            );
+            assert_eq!(
+                app.review_pr.as_ref().unwrap().step(),
+                crate::tui::screens::review_pr::ReviewStep::Working
+            );
+        }
+        assert_eq!(app.review_pr.as_ref().unwrap().current_index(), 3);
+    }
+
+    #[test]
+    fn post_all_stops_at_the_first_failure() {
+        let mut app = review_walkthrough_app(crate::tui::screens::review_pr::POST_ALL_MIN_FINDINGS);
+        let tx = app_event_tx();
+        arm_post_all(&mut app, &tx);
+
+        app.apply_review_pr_posted(0, Err("gh exploded".to_string()), &tx);
+        let screen = app.review_pr.as_ref().unwrap();
+        assert!(!screen.post_all_active());
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Decision
+        );
     }
 
     #[test]

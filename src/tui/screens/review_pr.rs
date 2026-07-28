@@ -14,7 +14,9 @@
 //!   in flight, and a running per-severity findings tally.
 //! - `Decision`  : one finding at a time — category/severity badge, the exact
 //!   comment body that would be posted, then native **Post / Edit / Other /
-//!   Skip** buttons.
+//!   Skip** buttons. Runs with at least `POST_ALL_MIN_FINDINGS` findings also
+//!   get a confirmation-gated **Post all** button that posts every remaining
+//!   comment back-to-back (a failed post drops back to the walkthrough).
 //! - `EditFinding`: deterministic, AI-free editing of the current finding —
 //!   severity cycle, title/explanation text fields, suggestion keep/remove —
 //!   with a live preview of the comment. Entirely local to this screen (the
@@ -110,14 +112,20 @@ pub enum ReviewStep {
     Done,
 }
 
-/// The four native decision buttons for one finding.
+/// The native decision buttons for one finding. `PostAll` only appears on
+/// runs big enough to make the one-by-one walkthrough a chore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecisionButton {
     Post,
+    PostAll,
     Edit,
     Other,
     Skip,
 }
+
+/// Findings needed before the bulk **Post all** button is offered. Below it
+/// the walkthrough is short enough to click through.
+pub const POST_ALL_MIN_FINDINGS: usize = 20;
 
 /// The editable rows of the `EditFinding` form, top to bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +309,13 @@ pub struct ReviewPullRequestScreen {
     /// The deterministic summary markdown, built when the walkthrough ends.
     summary_body: String,
     decision_button: DecisionButton,
-    decision_button_rects: Cell<[Rect; 4]>,
+    decision_button_rects: Cell<[Rect; 5]>,
+    /// Armed by the confirmed **Post all** button: every remaining finding is
+    /// posted back-to-back without stopping on Decision. A failed post
+    /// disarms it so the run can't blast the same error repeatedly.
+    post_all: bool,
+    /// Confirmation floating over Decision while **Post all** awaits a yes.
+    post_all_confirm: Option<ConfirmationModal>,
     /// Live state of the deterministic edit form; `Some` only on
     /// `EditFinding`.
     edit: Option<EditState>,
@@ -358,7 +372,9 @@ impl ReviewPullRequestScreen {
             posted: Vec::new(),
             summary_body: String::new(),
             decision_button: DecisionButton::Post,
-            decision_button_rects: Cell::new([Rect::default(); 4]),
+            decision_button_rects: Cell::new([Rect::default(); 5]),
+            post_all: false,
+            post_all_confirm: None,
             edit: None,
             summary_button: SummaryButton::Comment,
             summary_button_rects: Cell::new([Rect::default(); 3]),
@@ -1006,7 +1022,34 @@ impl ReviewPullRequestScreen {
         self.decision_scroll = 0;
         self.other_input = None;
         self.edit = None;
+        self.post_all_confirm = None;
         self.step = ReviewStep::Decision;
+    }
+
+    /// True when the run surfaced enough findings to offer the bulk button.
+    fn post_all_offered(&self) -> bool {
+        self.findings.len() >= POST_ALL_MIN_FINDINGS
+    }
+
+    /// Findings from the current one to the end — what **Post all** covers.
+    fn remaining_findings(&self) -> usize {
+        self.findings.len().saturating_sub(self.current)
+    }
+
+    /// `true` while the App should keep posting without stopping on Decision.
+    pub fn post_all_active(&self) -> bool {
+        self.post_all
+    }
+
+    /// Disarm the bulk loop (a post failed — hand control back to the user).
+    pub fn cancel_post_all(&mut self) {
+        self.post_all = false;
+    }
+
+    /// Float the "post every remaining finding?" confirmation over Decision.
+    /// Bulk posting is unattended and public, so it never starts on one key.
+    fn ask_post_all(&mut self) {
+        self.post_all_confirm = Some(build_post_all_confirm(self.remaining_findings()));
     }
 
     /// Open the deterministic edit form on a draft copy of the current
@@ -1056,7 +1099,15 @@ impl ReviewPullRequestScreen {
 
     pub fn start_posting(&mut self) {
         self.step = ReviewStep::Working;
-        self.phase_message = "Posting the comment on the pull request...".to_string();
+        self.phase_message = if self.post_all {
+            format!(
+                "Posting comment {} of {} on the pull request...",
+                self.current + 1,
+                self.findings.len()
+            )
+        } else {
+            "Posting the comment on the pull request...".to_string()
+        };
         self.scanning = false;
     }
 
@@ -1214,13 +1265,30 @@ impl ReviewPullRequestScreen {
     }
 
     fn handle_decision_key(&mut self, key: KeyEvent) -> ReviewAction {
+        // The Post all confirmation owns the keyboard while it is open.
+        if let Some(dialog) = self.post_all_confirm.as_mut() {
+            return match dialog.handle_key(key) {
+                ConfirmationOutcome::Confirmed => {
+                    self.post_all_confirm = None;
+                    self.post_all = true;
+                    ReviewAction::Post
+                }
+                ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                    self.post_all_confirm = None;
+                    ReviewAction::Continue
+                }
+                ConfirmationOutcome::Pending => ReviewAction::Continue,
+            };
+        }
         match key.code {
             KeyCode::Left | KeyCode::BackTab => {
-                self.decision_button = prev_decision_button(self.decision_button);
+                self.decision_button =
+                    prev_decision_button(self.decision_button, self.post_all_offered());
                 ReviewAction::Continue
             }
             KeyCode::Right | KeyCode::Tab => {
-                self.decision_button = next_decision_button(self.decision_button);
+                self.decision_button =
+                    next_decision_button(self.decision_button, self.post_all_offered());
                 ReviewAction::Continue
             }
             KeyCode::Up => {
@@ -1233,6 +1301,10 @@ impl ReviewPullRequestScreen {
             }
             KeyCode::Enter => match self.decision_button {
                 DecisionButton::Post => ReviewAction::Post,
+                DecisionButton::PostAll => {
+                    self.ask_post_all();
+                    ReviewAction::Continue
+                }
                 DecisionButton::Edit => {
                     self.show_edit();
                     ReviewAction::Continue
@@ -1410,10 +1482,29 @@ impl ReviewPullRequestScreen {
                 }
             }
             ReviewStep::Decision => {
-                let [post, edit, other, skip] = self.decision_button_rects.get();
+                if let Some(dialog) = self.post_all_confirm.as_mut() {
+                    return match dialog.handle_mouse_click(position) {
+                        ConfirmationOutcome::Confirmed => {
+                            self.post_all_confirm = None;
+                            self.post_all = true;
+                            ReviewAction::Post
+                        }
+                        ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                            self.post_all_confirm = None;
+                            ReviewAction::Continue
+                        }
+                        ConfirmationOutcome::Pending => ReviewAction::Continue,
+                    };
+                }
+                let [post, post_all, edit, other, skip] = self.decision_button_rects.get();
                 if contains_position(post, position) {
                     self.decision_button = DecisionButton::Post;
                     return ReviewAction::Post;
+                }
+                if contains_position(post_all, position) {
+                    self.decision_button = DecisionButton::PostAll;
+                    self.ask_post_all();
+                    return ReviewAction::Continue;
                 }
                 if contains_position(edit, position) {
                     self.decision_button = DecisionButton::Edit;
@@ -1892,35 +1983,57 @@ impl ReviewPullRequestScreen {
 
         self.render_decision_buttons(frame, chunks[2]);
         render_shortcut_line(frame, chunks[3], "Skip");
+
+        if let Some(dialog) = self.post_all_confirm.as_ref() {
+            dialog.render(frame, area);
+        }
     }
 
     fn render_decision_buttons(&self, frame: &mut Frame, area: Rect) {
-        let rects = render_button_row(
-            frame,
-            area,
-            [
-                (
-                    "  Post  ",
-                    colors::SUCCESS,
-                    matches!(self.decision_button, DecisionButton::Post),
-                ),
-                (
-                    "  Edit  ",
-                    colors::INFO,
-                    matches!(self.decision_button, DecisionButton::Edit),
-                ),
-                (
-                    "  Other  ",
-                    colors::BRAND,
-                    matches!(self.decision_button, DecisionButton::Other),
-                ),
-                (
-                    "  Skip  ",
-                    colors::WARNING,
-                    matches!(self.decision_button, DecisionButton::Skip),
-                ),
-            ],
+        let post = (
+            "  Post  ",
+            colors::SUCCESS,
+            matches!(self.decision_button, DecisionButton::Post),
         );
+        let edit = (
+            "  Edit  ",
+            colors::INFO,
+            matches!(self.decision_button, DecisionButton::Edit),
+        );
+        let other = (
+            "  Other  ",
+            colors::BRAND,
+            matches!(self.decision_button, DecisionButton::Other),
+        );
+        let skip = (
+            "  Skip  ",
+            colors::WARNING,
+            matches!(self.decision_button, DecisionButton::Skip),
+        );
+        let mut rects = [Rect::default(); 5];
+        if self.post_all_offered() {
+            let label = format!("  Post all ({})  ", self.remaining_findings());
+            let row = render_button_row(
+                frame,
+                area,
+                [
+                    post,
+                    (
+                        label.as_str(),
+                        colors::NAVY,
+                        matches!(self.decision_button, DecisionButton::PostAll),
+                    ),
+                    edit,
+                    other,
+                    skip,
+                ],
+            );
+            rects = row;
+        } else {
+            let row = render_button_row(frame, area, [post, edit, other, skip]);
+            rects[0] = row[0];
+            rects[2..].copy_from_slice(&row[1..]);
+        }
         self.decision_button_rects.set(rects);
     }
 
@@ -2254,22 +2367,31 @@ fn render_button_row<const N: usize>(
     rects
 }
 
-fn next_decision_button(b: DecisionButton) -> DecisionButton {
-    match b {
-        DecisionButton::Post => DecisionButton::Edit,
-        DecisionButton::Edit => DecisionButton::Other,
-        DecisionButton::Other => DecisionButton::Skip,
-        DecisionButton::Skip => DecisionButton::Post,
+/// The button cycle, in rendered order. `Post all` drops out of the ring on
+/// small runs, where it is neither rendered nor reachable.
+fn decision_button_ring(post_all: bool) -> Vec<DecisionButton> {
+    let mut ring = vec![DecisionButton::Post];
+    if post_all {
+        ring.push(DecisionButton::PostAll);
     }
+    ring.extend([
+        DecisionButton::Edit,
+        DecisionButton::Other,
+        DecisionButton::Skip,
+    ]);
+    ring
 }
 
-fn prev_decision_button(b: DecisionButton) -> DecisionButton {
-    match b {
-        DecisionButton::Post => DecisionButton::Skip,
-        DecisionButton::Edit => DecisionButton::Post,
-        DecisionButton::Other => DecisionButton::Edit,
-        DecisionButton::Skip => DecisionButton::Other,
-    }
+fn next_decision_button(b: DecisionButton, post_all: bool) -> DecisionButton {
+    let ring = decision_button_ring(post_all);
+    let at = ring.iter().position(|x| *x == b).unwrap_or(0);
+    ring[(at + 1) % ring.len()]
+}
+
+fn prev_decision_button(b: DecisionButton, post_all: bool) -> DecisionButton {
+    let ring = decision_button_ring(post_all);
+    let at = ring.iter().position(|x| *x == b).unwrap_or(0);
+    ring[(at + ring.len() - 1) % ring.len()]
 }
 
 fn next_summary_button(b: SummaryButton) -> SummaryButton {
@@ -2401,6 +2523,20 @@ fn build_confirm(request: &ReviewPullRequestRequest) -> ConfirmationModal {
         ))
         .with_confirm_text("Yes")
         .with_cancel_text("No")
+        .with_color_value(colors::NAVY)
+        .with_selected(ConfirmationChoice::Cancel)
+}
+
+fn build_post_all_confirm(remaining: usize) -> ConfirmationModal {
+    ConfirmationModal::new()
+        .with_title(format!("Post all {remaining} remaining findings?"))
+        .with_subtitle(
+            "Every remaining comment is posted on the pull request without \
+             stopping for approval. This cannot be undone from here."
+                .to_string(),
+        )
+        .with_confirm_text("Post all")
+        .with_cancel_text("Cancel")
         .with_color_value(colors::NAVY)
         .with_selected(ConfirmationChoice::Cancel)
 }
@@ -3399,6 +3535,91 @@ mod tests {
         assert_eq!(screen.decision_scroll, max);
         screen.handle_mouse_scroll_up(1);
         assert_eq!(screen.decision_scroll, max - 1);
+    }
+
+    /// A walkthrough sitting on the first of `count` findings.
+    fn screen_on_decision_with(count: usize) -> ReviewPullRequestScreen {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
+        screen.record_scan_result(
+            (0..count)
+                .map(|i| ReviewFinding {
+                    title: format!("Hardcoded API key {i}"),
+                    suggestion: Some(format!("let key = env::var(\"API_KEY_{i}\")?;")),
+                    ..finding("a.rs", Some(i as u64 + 1), ReviewSeverity::High)
+                })
+                .collect(),
+        );
+        screen.finish_scanning();
+        screen.enter_decision();
+        screen
+    }
+
+    #[test]
+    fn post_all_button_only_appears_on_big_runs() {
+        let mut small = screen_on_decision_with(POST_ALL_MIN_FINDINGS - 1);
+        let dump = render_dump(&mut small, 130, 20);
+        assert!(!dump.contains("Post all"), "{dump}");
+        // Its slot stays empty, so a stray click can't hit it.
+        assert_eq!(small.decision_button_rects.get()[1], Rect::default());
+
+        let mut big = screen_on_decision_with(POST_ALL_MIN_FINDINGS);
+        let dump = render_dump(&mut big, 130, 20);
+        assert!(
+            dump.contains(&format!("│  Post all ({POST_ALL_MIN_FINDINGS})  │")),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn post_all_needs_a_confirmation_before_it_arms() {
+        let mut screen = screen_on_decision_with(POST_ALL_MIN_FINDINGS);
+        screen.handle_key(key(KeyCode::Right)); // Post → Post all
+                                                // Enter opens the modal rather than posting anything.
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ReviewAction::Continue
+        );
+        assert!(!screen.post_all_active());
+
+        // The modal defaults to Cancel, so a bare Enter declines.
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ReviewAction::Continue
+        );
+        assert!(!screen.post_all_active());
+        assert_eq!(screen.step(), ReviewStep::Decision);
+
+        screen.handle_key(key(KeyCode::Enter)); // reopen
+        screen.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(screen.handle_key(key(KeyCode::Enter)), ReviewAction::Post);
+        assert!(screen.post_all_active());
+    }
+
+    #[test]
+    fn post_all_stays_out_of_the_button_cycle_on_small_runs() {
+        let mut screen = screen_on_decision_with(1);
+        // Post → Edit → Other → Skip → Post, never through Post all.
+        for _ in 0..4 {
+            screen.handle_key(key(KeyCode::Right));
+            assert_ne!(screen.decision_button, DecisionButton::PostAll);
+        }
+        assert_eq!(screen.decision_button, DecisionButton::Post);
+    }
+
+    #[test]
+    fn armed_post_all_reports_progress_while_posting() {
+        let mut screen = screen_on_decision_with(POST_ALL_MIN_FINDINGS);
+        screen.post_all = true;
+        screen.advance_finding();
+        screen.start_posting();
+        assert!(
+            screen
+                .phase_message
+                .contains(&format!("comment 2 of {POST_ALL_MIN_FINDINGS}")),
+            "{}",
+            screen.phase_message
+        );
     }
 
     fn screen_on_decision() -> ReviewPullRequestScreen {
