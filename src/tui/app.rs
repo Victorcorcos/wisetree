@@ -60,8 +60,8 @@ use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BugkillRequest, BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
-    DevelopRequest, ExplainPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
-    ReviewPullRequestRequest, UpdatePullRequestRequest,
+    DevelopRequest, ExplainPullRequestRequest, FixPullRequestRequest, ImproveRequest,
+    MergePullRequestRequest, ReviewPullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
@@ -69,6 +69,7 @@ use crate::tui::screens::delete::{
 use crate::tui::screens::develop_pr::{DevelopAction, DevelopPullRequestScreen, DevelopStep};
 use crate::tui::screens::explain_pr::{ExplainAction, ExplainPullRequestScreen, ExplainStep};
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome, FixStep};
+use crate::tui::screens::improve_pr::{ImproveAction, ImprovePullRequestScreen};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
 #[cfg(test)]
@@ -521,6 +522,7 @@ pub struct App {
     next_fix_operation_id: u64,
     active_fix_operation_id: Option<u64>,
     review_pr: Option<ReviewPullRequestScreen>,
+    improve_pr: Option<ImprovePullRequestScreen>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
     develop_pr: Option<DevelopPullRequestScreen>,
     next_develop_operation_id: u64,
@@ -698,6 +700,7 @@ impl App {
             next_fix_operation_id: 0,
             active_fix_operation_id: None,
             review_pr: None,
+            improve_pr: None,
             bugkill_pr: None,
             develop_pr: None,
             next_develop_operation_id: 0,
@@ -1318,6 +1321,12 @@ impl App {
                     review_pr.render(frame, panel);
                 }
             }
+            Screen::ImprovePullRequest => {
+                let panel = self.render_framed_panel_fill(frame, area);
+                if let Some(improve_pr) = self.improve_pr.as_mut() {
+                    improve_pr.render(frame, panel);
+                }
+            }
             Screen::BugkillPullRequest => {
                 // Expanded steps (Confirm, DescribeBug, Select, the live
                 // Fixing PTY, Verdict, Done…) want the whole bottom region;
@@ -1720,6 +1729,7 @@ impl App {
             Screen::ExplainPullRequest => self.handle_explain_pr_key(key, tx),
             Screen::FixPullRequest => self.handle_fix_pr_key(key, tx),
             Screen::ReviewPullRequest => self.handle_review_pr_key(key, tx),
+            Screen::ImprovePullRequest => self.handle_improve_pr_key(key, tx),
             Screen::BugkillPullRequest => self.handle_bugkill_key(key, tx),
             Screen::DevelopPullRequest => self.handle_develop_key(key, tx),
             Screen::UpdateBranch => {
@@ -2133,6 +2143,14 @@ impl App {
                     .map(|screen| screen.handle_mouse_click(position))
                     .unwrap_or(ReviewAction::Continue);
                 self.apply_review_action(action, tx);
+            }
+            Screen::ImprovePullRequest => {
+                let action = self
+                    .improve_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(ImproveAction::Continue);
+                self.apply_improve_action(action, tx);
             }
             Screen::BugkillPullRequest => {
                 let action = self
@@ -2807,6 +2825,52 @@ impl App {
     }
 
     // ── "Review Pull Request" orchestration ────────────────────────────
+
+    // ── "Improve" entry ───────────────────────────────────────────────
+
+    fn start_improve_flow(
+        &mut self,
+        request: ImproveRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let config = self.current_dashboard_config();
+        self.improve_pr = Some(ImprovePullRequestScreen::new(
+            request,
+            config.ai.review.clone(),
+            config.ai.fix.clone(),
+        ));
+        self.screen = Screen::ImprovePullRequest;
+    }
+
+    fn handle_improve_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = self
+            .improve_pr
+            .as_mut()
+            .map(|screen| screen.handle_key(key))
+            .unwrap_or(ImproveAction::Continue);
+        self.apply_improve_action(action, tx);
+    }
+
+    fn apply_improve_action(
+        &mut self,
+        action: ImproveAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match action {
+            ImproveAction::Continue => {}
+            ImproveAction::Cancelled => {
+                let worktree_path = self
+                    .improve_pr
+                    .take()
+                    .map(|screen| screen.request().worktree_path.clone());
+                self.back_to_dashboard_action_menu(worktree_path, tx);
+            }
+            // The discovery and apply pipeline is introduced by the next
+            // implementation section; keep the confirmation open until that
+            // machinery owns this transition.
+            ImproveAction::Confirmed => {}
+        }
+    }
 
     fn start_review_pr_flow(
         &mut self,
@@ -5399,6 +5463,9 @@ impl App {
             DashboardAction::ReviewPullRequest(request) => {
                 self.start_review_pr_flow(*request, tx);
             }
+            DashboardAction::Improve(request) => {
+                self.start_improve_flow(*request, tx);
+            }
             DashboardAction::Bugkill(request) => {
                 self.start_bugkill_flow(*request, tx);
             }
@@ -7501,6 +7568,13 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::ImprovePullRequest => {
+                // Only reachable through `start_improve_flow`, which seeds
+                // `improve_pr` before flipping the screen.
+                if self.improve_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
             Screen::BugkillPullRequest => {
                 // Only reachable through `start_bugkill_flow`, which seeds
                 // `bugkill_pr` before flipping the screen.
@@ -7558,6 +7632,7 @@ impl App {
         self.update_pr = None;
         self.explain_pr = None;
         self.fix_pr = None;
+        self.improve_pr = None;
         self.bugkill_pr = None;
         self.develop_pr = None;
         self.active_develop_operation_id = None;

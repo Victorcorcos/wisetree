@@ -135,6 +135,9 @@ pub mod colors {
     /// the soft-blue Fix button next to it while staying legible on the
     /// brown background.
     pub const NAVY: Color = Color::Rgb(0x4d, 0x7c, 0xfe);
+    /// Teal accent reserved for the local "Improve" command and its
+    /// confirmation screen.
+    pub const IMPROVE: Color = TEAL;
 
     // ── Background colors ───────────────────────────────────────────────
 

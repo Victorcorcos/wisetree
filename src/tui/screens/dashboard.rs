@@ -48,6 +48,7 @@ enum ActionChoice {
     ExplainPullRequest,
     FixPullRequest,
     ReviewPullRequest,
+    ImprovePullRequest,
     BugkillPullRequest,
     DevelopPullRequest,
     MergePullRequest,
@@ -168,6 +169,17 @@ pub struct ReviewPullRequestRequest {
     pub url: String,
     pub branch: String,
     pub worktree_path: String,
+}
+
+/// Payload for the "Improve" flow. Unlike Review and Fix, Improve works on
+/// every non-mother worktree, so PR context is optional and may describe a
+/// terminal PR state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImproveRequest {
+    pub branch: String,
+    pub worktree_path: String,
+    pub number: Option<u64>,
+    pub title: Option<String>,
 }
 
 /// Payload the dashboard hands to the "Bugkill" screen — the interactive
@@ -347,6 +359,9 @@ pub enum DashboardAction {
     /// review comments (scan → post → summary). Offered on a non-mother
     /// worktree whose PR is open or draft.
     ReviewPullRequest(Box<ReviewPullRequestRequest>),
+    /// Discover improvements with the configured Review models, then apply
+    /// them one by one with the configured Fix apply model. No PR is needed.
+    Improve(Box<ImproveRequest>),
     /// Investigate a described bug, rank root causes, and iterate fix
     /// attempts (commit on success, `git revert` on failure). Offered on
     /// every non-mother worktree — no PR required.
@@ -1115,6 +1130,13 @@ impl DashboardScreen {
                 color: colors::NAVY,
             });
         }
+        if build_improve_request(row).is_some() {
+            commands.push(PrCommand {
+                label: "Improve",
+                choice: ActionChoice::ImprovePullRequest,
+                color: colors::IMPROVE,
+            });
+        }
         // Bugkill investigates a described bug and iterates fix attempts.
         // Offered on every non-mother worktree — no PR required, so this
         // button may make the PR-commands section appear on rows that
@@ -1322,7 +1344,7 @@ impl DashboardScreen {
 
     /// Keyboard handling while a PR command button owns the focus: Left /
     /// Right move between buttons, Enter runs the focused action, Esc
-    /// dismisses the whole menu. Letter shortcuts (O/E/F/R/B/D/U/P/M/C)
+    /// dismisses the whole menu. Letter shortcuts (O/E/F/R/I/B/D/U/P/M/C)
     /// trigger the matching PR command directly without needing to navigate
     /// to it first.
     fn handle_pr_command_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -1344,6 +1366,7 @@ impl DashboardScreen {
                 KeyCode::Char('e') | KeyCode::Char('E') => &[ActionChoice::ExplainPullRequest],
                 KeyCode::Char('f') | KeyCode::Char('F') => &[ActionChoice::FixPullRequest],
                 KeyCode::Char('r') | KeyCode::Char('R') => &[ActionChoice::ReviewPullRequest],
+                KeyCode::Char('i') | KeyCode::Char('I') => &[ActionChoice::ImprovePullRequest],
                 KeyCode::Char('b') | KeyCode::Char('B') => &[ActionChoice::BugkillPullRequest],
                 KeyCode::Char('d') | KeyCode::Char('D') => &[ActionChoice::DevelopPullRequest],
                 KeyCode::Char('u') | KeyCode::Char('U') => &[
@@ -1415,6 +1438,7 @@ impl DashboardScreen {
         let explain_request = build_explain_request(row);
         let fix_request = build_fix_request(row);
         let review_request = build_review_request(row);
+        let improve_request = build_improve_request(row);
         let bugkill_request = build_bugkill_request(row);
         let develop_request = build_develop_request(row);
         let push_request = build_push_request(row);
@@ -1467,6 +1491,12 @@ impl DashboardScreen {
                 self.mode = DashboardMode::Table;
                 review_request
                     .map(|request| DashboardAction::ReviewPullRequest(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::ImprovePullRequest => {
+                self.mode = DashboardMode::Table;
+                improve_request
+                    .map(|request| DashboardAction::Improve(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
             ActionChoice::BugkillPullRequest => {
@@ -3279,6 +3309,22 @@ fn build_review_request(row: &DashboardRow) -> Option<ReviewPullRequestRequest> 
     })
 }
 
+/// Assemble the payload for Improve. It deliberately carries any associated
+/// PR, including closed and merged ones, purely as display context; the local
+/// review-and-apply workflow itself never requires a pull request.
+fn build_improve_request(row: &DashboardRow) -> Option<ImproveRequest> {
+    if row.worktree.is_main {
+        return None;
+    }
+    let pr = row.pull_request.as_ref();
+    Some(ImproveRequest {
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+        number: pr.map(|pr| pr.number),
+        title: pr.map(|pr| pr.title.clone()),
+    })
+}
+
 /// Assemble the payload the "Bugkill" screen needs. Returns `None` only on
 /// the mother worktree — a bug hunt works on any other worktree, PR or not.
 fn build_bugkill_request(row: &DashboardRow) -> Option<BugkillRequest> {
@@ -3861,8 +3907,8 @@ mod tests {
         assert_eq!(
             pr_labels(&r),
             vec![
-                "Open", "Explain", "Fix", "Review", "Bugkill", "Develop", "Upload", "Merge",
-                "Close"
+                "Open", "Explain", "Fix", "Review", "Improve", "Bugkill", "Develop", "Upload",
+                "Merge", "Close"
             ]
         );
     }
@@ -3873,8 +3919,8 @@ mod tests {
         assert_eq!(
             pr_labels(&r),
             vec![
-                "Open", "Explain", "Fix", "Review", "Bugkill", "Develop", "Update", "Merge",
-                "Close"
+                "Open", "Explain", "Fix", "Review", "Improve", "Bugkill", "Develop", "Update",
+                "Merge", "Close"
             ]
         );
     }
@@ -3900,11 +3946,11 @@ mod tests {
     }
 
     #[test]
-    fn pr_commands_without_pull_request_offer_only_bugkill_and_develop() {
+    fn pr_commands_without_pull_request_offer_improve_bugkill_and_develop() {
         // A non-main row with no PR now shows a PR-commands section
-        // containing just Bugkill + Develop (intended: neither needs a PR).
+        // containing Improve + Bugkill + Develop (intended: none needs a PR).
         let r = row(None, Some(branch_status(0, 0)));
-        assert_eq!(pr_labels(&r), ["Bugkill", "Develop"]);
+        assert_eq!(pr_labels(&r), ["Improve", "Bugkill", "Develop"]);
     }
 
     #[test]

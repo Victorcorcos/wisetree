@@ -1363,6 +1363,84 @@ fn action_menu_hides_merge_option_when_no_pr_present() {
     assert!(!labels.iter().any(|l| l == "Open"));
 }
 
+#[test]
+fn action_menu_offers_improve_for_every_non_mother_pr_state_or_no_pr() {
+    for state in [
+        None,
+        Some(PrState::Open),
+        Some(PrState::Draft),
+        Some(PrState::Merged),
+        Some(PrState::Closed),
+    ] {
+        let mut screen = DashboardScreen::new(
+            true,
+            true,
+            true,
+            vec!["branch".into(), "status".into()],
+            Vec::new(),
+            false,
+        );
+        let worktree = match state {
+            Some(state) => row_with_pr_state("/tmp/repo-improve", "improve", true, state),
+            None => row("/tmp/repo-improve", "improve", true),
+        };
+        screen.set_rows(vec![row("/tmp/repo", "main", true), worktree]);
+
+        let labels = open_action_menu_for_second_row(&mut screen);
+        assert!(
+            labels.iter().any(|label| label == "Improve"),
+            "state {state:?}: {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn improve_shortcut_dispatches_context_for_terminal_or_absent_prs() {
+    for state in [None, Some(PrState::Closed), Some(PrState::Merged)] {
+        let mut screen = DashboardScreen::new(
+            true,
+            true,
+            true,
+            vec!["branch".into(), "status".into()],
+            Vec::new(),
+            false,
+        );
+        let worktree = match state {
+            Some(state) => row_with_pr_state("/tmp/repo-improve", "improve", true, state),
+            None => row("/tmp/repo-improve", "improve", true),
+        };
+        screen.set_rows(vec![row("/tmp/repo", "main", true), worktree]);
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Enter));
+        screen.handle_key(key(KeyCode::Tab));
+
+        match screen.handle_key(key(KeyCode::Char('i'))) {
+            DashboardAction::Improve(request) => {
+                assert_eq!(request.branch, "improve");
+                assert_eq!(request.worktree_path, "/tmp/repo-improve");
+                assert_eq!(request.number, state.map(|_| 42));
+            }
+            other => panic!("expected Improve, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn action_menu_never_offers_improve_for_mother_worktree() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![row_with_pr("/tmp/repo", "main", true)]);
+    screen.handle_key(key(KeyCode::Enter));
+    let labels = screen.pr_command_labels();
+    assert!(!labels.iter().any(|label| label == "Improve"), "{labels:?}");
+}
+
 // ---- "Update Pull Request" visibility ----------------------------------
 // The option lives in the action menu only when the row carries an Open
 // PR *and* is behind its base — either `merge_status == Behind` or
