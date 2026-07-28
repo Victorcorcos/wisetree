@@ -103,7 +103,7 @@ TEST_FILE_INVENTORY
 FULL_DIFF
 ```
 
-- Compact keys for review comments already posted on the PR, grouped per file (do NOT re-raise anything these already cover; empty when none):
+- Structured Wisetree finding keys already posted on the PR, grouped per file (do NOT re-raise anything these already cover; empty when none):
 
 ```
 EXISTING_COMMENTS

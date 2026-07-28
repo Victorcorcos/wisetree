@@ -814,9 +814,9 @@ pub struct ReviewFile {
     /// New-side line numbers GitHub accepts inline comments on (additions +
     /// context lines present in the diff).
     pub commentable_lines: BTreeSet<u64>,
-    /// Review comments already posted on this file, rendered as compact
-    /// `- line N: title` advisory keys for the scan call.
-    /// Empty when the PR has none.
+    /// Compact advisory rendering of review comments already posted on this
+    /// file. Scan prompts use `existing_keys` exclusively; this is retained
+    /// with the parsed review data for compatibility.
     pub existing_comments: String,
     /// Structured dedup keys of the wisetree-format comments already on
     /// this file. Unlike `existing_comments` (advice the model may ignore),
@@ -831,6 +831,37 @@ pub struct ReviewFile {
 pub struct ExistingFindingKey {
     pub line: Option<u64>,
     pub title: String,
+}
+
+/// Render only the structured keys that the deterministic duplicate filter
+/// recognizes. Human comments deliberately stay out of scan prompts: they
+/// cannot suppress findings and their bodies do not improve duplicate checks.
+fn render_existing_finding_keys(files: &[ReviewFile]) -> String {
+    let rendered = files
+        .iter()
+        .filter(|file| !file.existing_keys.is_empty())
+        .map(|file| {
+            let keys = file
+                .existing_keys
+                .iter()
+                .map(|key| {
+                    let anchor = key
+                        .line
+                        .map_or_else(|| "file".to_string(), |line| format!("line {line}"));
+                    let title = compact_review_text(&key.title, REVIEW_COMMENT_KEY_MAX_BYTES);
+                    format!("- {anchor}: {title}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("### FILE: {}\n{keys}", file.path)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if rendered.is_empty() {
+        "(none)".to_string()
+    } else {
+        truncate_for_prompt(&rendered, REVIEW_COMMENTS_MAX_BYTES)
+    }
 }
 
 /// Outcome of the read-only Review preparation (`prepare_review`): sync the
@@ -7636,10 +7667,9 @@ fn review_diff_destination(header: &str) -> Option<String> {
     Some(header[start..].trim_end_matches('"').to_string())
 }
 
-/// Per-file context extracted from the PR's existing inline comments: the
-/// compact advisory keys the scan prompt shows the AI, plus the structured
-/// keys of the wisetree-format ones that back the deterministic duplicate
-/// filter.
+/// Per-file context extracted from the PR's existing inline comments: compact
+/// advisory text retained with the parsed data, plus structured keys of the
+/// wisetree-format comments that feed scan prompts and deterministic dedup.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ExistingComments {
     pub(crate) rendered: String,
@@ -8452,17 +8482,7 @@ fn build_review_group_prompt_with_relationships(
         .map(|file| format!("- {}", file.path))
         .collect::<Vec<_>>()
         .join("\n");
-    let comments = files
-        .iter()
-        .filter(|file| !file.existing_comments.trim().is_empty())
-        .map(|file| format!("### FILE: {}\n{}", file.path, file.existing_comments))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let existing = if comments.is_empty() {
-        "(none)".to_string()
-    } else {
-        truncate_for_prompt(&comments, REVIEW_COMMENTS_MAX_BYTES)
-    };
+    let existing = render_existing_finding_keys(files);
     let diff = files
         .iter()
         .map(|file| {
@@ -8487,15 +8507,14 @@ fn build_review_group_prompt_with_relationships(
         },
         REVIEW_RELATIONSHIP_EDGES_MAX_BYTES,
     );
-    let context = format!(
-        "EVIDENCE-ID: {context_id}\n{context}\n\n### Cross-group relationship edges\n{relationships}"
-    );
+    let context = format!("EVIDENCE-ID: {context_id}\n{context}");
     substitute_review_prompt(
         template,
         &[
             ("TABLES_PATH", tables_path),
             ("FILE_PATH", &paths),
             ("REPO_CONTEXT", &context),
+            ("RELATIONSHIP_EDGES", &relationships),
             ("EXISTING_COMMENTS", &existing),
             ("FILE_CONTENT", full_content),
             ("FILE_DIFF", &diff),
@@ -8900,20 +8919,7 @@ fn build_review_whole_diff_prompt(
         diff.push_str(&truncate_for_prompt(&evidence, REVIEW_DIFF_MAX_BYTES));
         diff.push_str("\n\n");
     }
-    let mut comments = String::new();
-    for file in files {
-        if !file.existing_comments.trim().is_empty() {
-            comments.push_str(&format!(
-                "### FILE: {}\n{}\n\n",
-                file.path, file.existing_comments
-            ));
-        }
-    }
-    let existing = if comments.trim().is_empty() {
-        "(none)".to_string()
-    } else {
-        truncate_for_prompt(&comments, REVIEW_COMMENTS_MAX_BYTES)
-    };
+    let existing = render_existing_finding_keys(files);
     let diff = truncate_for_prompt(&diff, REVIEW_COVERAGE_DIFF_MAX_BYTES);
     let test_file_inventory = review_test_file_inventory(files, &context.directory_inventory);
     let application_paths = files
@@ -11380,8 +11386,11 @@ copy to src/copied_again.rs
             annotated_diff: "@@ -1 +1 @@\n     1 +let x = 1;".to_string(),
             full_content: Some("fn complete() { let x = 1; }".to_string()),
             commentable_lines: BTreeSet::from([1]),
-            existing_comments: "- line 1: rename this".to_string(),
-            existing_keys: Vec::new(),
+            existing_comments: "human comment body that must not reach the prompt".to_string(),
+            existing_keys: vec![ExistingFindingKey {
+                line: Some(1),
+                title: "rename this".to_string(),
+            }],
         };
         let context = ReviewContext {
             convention_docs: "#### AGENTS.md\nUse surgical changes.".to_string(),
@@ -11406,6 +11415,7 @@ copy to src/copied_again.rs
             "TABLES_PATH",
             "REPO_CONTEXT",
             "FILE_CONTENT",
+            "RELATIONSHIP_EDGES",
         ] {
             assert!(!prompt.contains(token), "{token} leaked into the prompt");
         }
@@ -11422,6 +11432,63 @@ copy to src/copied_again.rs
         let prompt = build_review_scan_prompt(&not_inlined, &ReviewContext::default(), "/tmp/t.md");
         assert!(prompt
             .contains("MUST read `src/lib.rs` before completing this file's discovery judgment"));
+    }
+
+    #[test]
+    fn review_scan_prompts_share_the_invariant_context_prefix() {
+        let file = |path: &str| ReviewFile {
+            path: path.to_string(),
+            annotated_diff: "     1 +changed();".to_string(),
+            full_content: Some("changed();".to_string()),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let context = ReviewContext {
+            convention_docs: "shared conventions".to_string(),
+            directory_inventory: "shared inventory".to_string(),
+            changed_file_manifest: "shared manifest".to_string(),
+            coverage_ledger: ReviewCoverageLedger::default(),
+        };
+        let first = build_review_group_prompt_with_relationships(
+            &[file("src/first.rs")],
+            ReviewGroupProfile::Application,
+            &context,
+            "/tmp/tables.md",
+            "first relationship",
+        );
+        let second = build_review_group_prompt_with_relationships(
+            &[file("src/second.rs")],
+            ReviewGroupProfile::Application,
+            &context,
+            "/tmp/tables.md",
+            "second relationship",
+        );
+        let context_end = first.find("- Cross-group relationship edges").unwrap();
+        assert_eq!(&first[..context_end], &second[..context_end]);
+        assert!(first[..context_end].contains("shared conventions"));
+        assert!(second[context_end..].contains("second relationship"));
+    }
+
+    #[test]
+    fn existing_finding_key_prompt_context_uses_only_bounded_structured_keys() {
+        let mut file = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: String::new(),
+            full_content: None,
+            commentable_lines: BTreeSet::new(),
+            existing_comments: "human comment body".to_string(),
+            existing_keys: vec![ExistingFindingKey {
+                line: Some(7),
+                title: "x".repeat(REVIEW_COMMENT_KEY_MAX_BYTES + 1),
+            }],
+        };
+        let rendered = render_existing_finding_keys(&[file.clone()]);
+        assert!(rendered.starts_with("### FILE: src/lib.rs\n- line 7: "));
+        assert!(!rendered.contains("human comment body"));
+        assert!(rendered.len() <= REVIEW_COMMENTS_MAX_BYTES);
+        file.existing_keys.clear();
+        assert_eq!(render_existing_finding_keys(&[file]), "(none)");
     }
 
     #[test]
@@ -12250,8 +12317,11 @@ copy to src/copied_again.rs
             annotated_diff: "     1 +let x = 1;".to_string(),
             full_content: Some("coverage body must stay out".to_string()),
             commentable_lines: BTreeSet::from([1]),
-            existing_comments: "- line 1: please test this".to_string(),
-            existing_keys: Vec::new(),
+            existing_comments: "human comment body that must not reach the prompt".to_string(),
+            existing_keys: vec![ExistingFindingKey {
+                line: Some(1),
+                title: "please test this".to_string(),
+            }],
         };
         let test = ReviewFile {
             path: "tests/lib_test.rs".to_string(),
@@ -12305,6 +12375,10 @@ copy to src/copied_again.rs
         let inputs = prompt.find("## Inputs (provided by the harness)").unwrap();
         assert!(contract < inputs, "static contract must precede inputs");
         assert!(inputs < prompt.find("### FILE: src/lib.rs").unwrap());
+        assert!(
+            prompt.find("coverage convention").unwrap()
+                < prompt.find("Assertion is too weak").unwrap()
+        );
     }
 
     /// A scan carries each file's whole numbered content, not its diff, so
@@ -12688,6 +12762,9 @@ copy to src/copied_again.rs
         assert!(prompt.contains("merged convention"));
         assert!(prompt.contains("merged inventory"));
         assert!(prompt.contains("never your ability to read the real files"));
+        assert!(
+            prompt.find("merged convention").unwrap() < prompt.find("Over-mocked flow").unwrap()
+        );
         assert!(!prompt.contains("### FULL CURRENT FILE CONTENT APPENDIX"));
         assert!(prompt.contains("fn merged_body() {}"));
         assert!(!prompt.contains("fn test_body() { expensive_setup(); }"));
