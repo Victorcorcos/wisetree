@@ -3132,20 +3132,22 @@ mod tests {
             "r".into(),
             "sha".into(),
         );
-        let indices = (0..2)
-            .map(|_| screen.take_next_scan_file().unwrap().0)
-            .collect::<Vec<_>>();
-        assert_eq!(indices, vec![1, 2]);
+        let (index, tester) = screen.take_next_scan_file().unwrap();
+        assert_eq!(
+            tester
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tests/a_test.rs", "tests/b_test.rs"]
+        );
         assert!(screen.take_coverage_scan().is_none());
 
         let weak = finding("tests/a_test.rs", Some(3), ReviewSeverity::Medium);
         let second_weak = finding("tests/b_test.rs", Some(2), ReviewSeverity::Low);
-        screen.record_tester_findings(indices[0], std::slice::from_ref(&weak));
-        screen.record_tester_findings(indices[1], std::slice::from_ref(&second_weak));
-        screen.note_scan_done(indices[0]);
+        screen.record_tester_findings(index, &[weak.clone(), second_weak.clone()]);
+        screen.note_scan_done(index);
         assert_eq!(screen.tester_findings(), vec![weak, second_weak]);
-        assert!(screen.take_coverage_scan().is_none());
-        screen.note_scan_done(indices[1]);
         assert_eq!(screen.take_coverage_scan().unwrap().1.len(), 4);
     }
 
@@ -3153,12 +3155,20 @@ mod tests {
     fn split_pool_settles_multiple_coverage_groups_independently() {
         let mut first = file("src/first.rs");
         first.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
-        let second = file("src/tail.rs");
+        let mut second = file("src/second.rs");
+        second.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
+        let mut tail = file("src/tail.rs");
+        tail.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
-        screen.set_files(vec![first, second], "o".into(), "r".into(), "sha".into());
+        screen.set_files(
+            vec![first, second, tail],
+            "o".into(),
+            "r".into(),
+            "sha".into(),
+        );
 
         let first_file = screen.take_next_scan_file().unwrap().0;
-        let second_file = screen.take_next_scan_file().unwrap().0;
+        assert!(screen.take_next_scan_file().is_none());
         let (first_group, first_files) = screen.take_coverage_scan().unwrap();
         let (second_group, second_files) = screen.take_coverage_scan().unwrap();
         assert_eq!(first_group, COVERAGE_SCAN_INDEX);
@@ -3169,7 +3179,6 @@ mod tests {
         screen.record_scan_failure(first_group, "bad group".to_string());
         screen.note_scan_done(first_group);
         screen.note_scan_done(first_file);
-        screen.note_scan_done(second_file);
         assert!(
             screen.scans_pending(),
             "tail coverage group is still active"
@@ -3413,9 +3422,15 @@ mod tests {
     fn gap_audit_runs_only_for_decomposed_application_reviews() {
         let mut large = file("src/large.rs");
         large.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
+        let mut second = file("src/second.rs");
+        second.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
+        let mut third = file("src/third.rs");
+        third.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
+        let mut fourth = file("src/fourth.rs");
+        fourth.annotated_diff = "x".repeat(crate::services::dashboard::REVIEW_GROUP_PROMPT_BYTES);
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.set_files(
-            vec![large, file("src/tail.rs")],
+            vec![large, second, third, fourth, file("src/tail.rs")],
             "o".into(),
             "r".into(),
             "sha".into(),

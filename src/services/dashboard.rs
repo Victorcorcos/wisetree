@@ -121,14 +121,12 @@ pub(crate) const REVIEW_MERGED_FOCUS_BYTES: usize = 28_000;
 /// nothing against a diff-byte budget and tens of kilobytes of prompt.
 /// Budgeting on the diff is what let coverage prompts reach 700 KB (model
 /// timeout) and 1.2 MB (rejected outright) on a large PR.
-/// [`REVIEW_GROUP_PROMPT_BYTES`] bounds one group's application evidence;
-/// attached tests may fill the rest of [`REVIEW_COVERAGE_DIFF_MAX_BYTES`],
-/// which is the cap the coverage prompt truncates at anyway. It matches the
-/// per-file evidence cap so one file always fits in exactly one group, and
-/// it keeps whole prompts near the size band that answers reliably: in the
-/// telemetry of a large review, calls under 100 KB timed out 2% of the time
-/// against 19% between 100 and 200 KB and 42% above that.
-pub(crate) const REVIEW_GROUP_PROMPT_BYTES: usize = REVIEW_DIFF_MAX_BYTES;
+/// [`REVIEW_GROUP_PROMPT_BYTES`] bounds one ordinary application or tester
+/// scan. It is deliberately independent from the per-file evidence cap and
+/// coverage's whole-prompt cap: combining several individually capped files
+/// amortizes the fixed model-turn overhead without allowing coverage prompts
+/// to silently truncate their evidence.
+pub(crate) const REVIEW_GROUP_PROMPT_BYTES: usize = 240_000;
 /// A merged call renders every file into the same capped diff slot, so a
 /// review whose evidence exceeds that cap must be split or it silently
 /// reviews a truncated diff.
@@ -1039,7 +1037,7 @@ fn review_coverage_application_prompt_bytes(file: &ReviewFile) -> usize {
 /// application group they are deterministically related to; every group still
 /// sees the compact global manifest and may target-read a listed test. This
 /// prevents a test-heavy PR from multiplying the same payload by every group.
-/// An application file over the focus budget is kept alone and its prompt
+/// An application file over the coverage prompt budget is kept alone and its prompt
 /// carries the normal truncation/read marker.
 pub(crate) fn review_coverage_groups(
     files: &[ReviewFile],
@@ -1062,13 +1060,15 @@ pub(crate) fn review_coverage_groups(
     let mut current_bytes = 0usize;
     for file in applications {
         let bytes = review_coverage_application_prompt_bytes(file);
-        if !current.is_empty() && current_bytes.saturating_add(bytes) > REVIEW_GROUP_PROMPT_BYTES {
+        if !current.is_empty()
+            && current_bytes.saturating_add(bytes) > REVIEW_COVERAGE_DIFF_MAX_BYTES
+        {
             groups.push(std::mem::take(&mut current));
             group_bytes.push(std::mem::replace(&mut current_bytes, 0));
         }
         current.push(file.clone());
         current_bytes = current_bytes.saturating_add(bytes);
-        if bytes > REVIEW_GROUP_PROMPT_BYTES {
+        if bytes > REVIEW_COVERAGE_DIFF_MAX_BYTES {
             groups.push(std::mem::take(&mut current));
             group_bytes.push(std::mem::replace(&mut current_bytes, 0));
         }
@@ -12510,7 +12510,7 @@ copy to src/copied_again.rs
             existing_comments: String::new(),
             existing_keys: Vec::new(),
         };
-        let half = REVIEW_GROUP_PROMPT_BYTES / 2;
+        let half = REVIEW_DIFF_MAX_BYTES;
         let files = vec![
             file("src/a.rs", half),
             file("src/b.rs", 1),
@@ -12554,22 +12554,21 @@ copy to src/copied_again.rs
         let file = |path: &str| ReviewFile {
             path: path.to_string(),
             annotated_diff: "@@ -1 +1 @@\n     1 +y".to_string(),
-            full_content: Some(format!(
-                "y\n{}",
-                "x\n".repeat(REVIEW_GROUP_PROMPT_BYTES / 3)
-            )),
+            full_content: Some(format!("y\n{}", "x\n".repeat(REVIEW_DIFF_MAX_BYTES / 3))),
             commentable_lines: BTreeSet::new(),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
         };
-        let files = vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")];
+        let files = vec![
+            file("src/a.rs"),
+            file("src/b.rs"),
+            file("src/c.rs"),
+            file("src/d.rs"),
+            file("src/e.rs"),
+            file("src/tail.rs"),
+        ];
         let coverage_groups = review_coverage_groups(&files, ReviewScanMode::Split);
         assert_eq!(coverage_groups.len(), 1);
-        let application_groups = review_file_groups(&files, ReviewScanMode::Split);
-        assert!(
-            application_groups.len() > 1,
-            "ordinary scans must retain their complete-file budget"
-        );
         for group in &coverage_groups {
             let bytes = group
                 .iter()
@@ -12622,15 +12621,29 @@ copy to src/copied_again.rs
             file("tests/oversized_test.rs", REVIEW_MERGED_FOCUS_BYTES + 1),
         ];
         let groups = review_file_groups(&files, ReviewScanMode::Split);
-        assert_eq!(groups.len(), 6);
+        assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].profile, ReviewGroupProfile::Tester);
-        assert_eq!(groups[0].files[0].path, "tests/a_test.rs");
-        assert_eq!(groups[1].files[0].path, "tests/b_test.rs");
-        assert_eq!(groups[2].files[0].path, "tests/oversized_test.rs");
-        assert_eq!(groups[3].profile, ReviewGroupProfile::Application);
-        assert_eq!(groups[3].files[0].path, "src/a.rs");
-        assert_eq!(groups[4].files[0].path, "src/b.rs");
-        assert_eq!(groups[5].files[0].path, "other/c.rs");
+        assert_eq!(
+            groups[0]
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "tests/a_test.rs",
+                "tests/b_test.rs",
+                "tests/oversized_test.rs"
+            ]
+        );
+        assert_eq!(groups[1].profile, ReviewGroupProfile::Application);
+        assert_eq!(
+            groups[1]
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/b.rs", "other/c.rs"]
+        );
 
         let merged = review_file_groups(&files, ReviewScanMode::Merged);
         assert!(merged
