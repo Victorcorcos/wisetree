@@ -326,15 +326,36 @@ fn cwd_from_line(harness: JsonlHarness, line: &Value) -> Option<String> {
 }
 
 fn codex_turn(lines: &[Value]) -> AiTurn {
-    let mut state = None;
+    let mut active = false;
+    let mut completed = false;
+    let mut failure: Option<String> = None;
+    let mut fallback_text: Option<String> = None;
+    let mut text = Vec::new();
     for line in lines {
         let kind = line.pointer("/payload/type").and_then(Value::as_str);
+        if line.get("type").and_then(Value::as_str) == Some("response_item") && active {
+            text.extend(codex_line_text(line));
+            continue;
+        }
         if line.get("type").and_then(Value::as_str) != Some("event_msg") {
             continue;
         }
-        state = match kind {
-            Some("task_started") | Some("turn_started") => Some(Ok(())),
-            Some("task_complete") | Some("turn_complete") => Some(Err(false)),
+        match kind {
+            Some("task_started") | Some("turn_started") => {
+                active = true;
+                completed = false;
+                failure = None;
+                fallback_text = None;
+                text.clear();
+            }
+            Some("task_complete") | Some("turn_complete") if active => {
+                completed = true;
+                fallback_text = line
+                    .pointer("/payload/last_agent_message")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                    .map(str::to_string);
+            }
             // An Esc-interrupt in the interactive TUI emits `turn_aborted`.
             // That is the user stopping to redirect, not a finished or failed
             // turn — keep it `Working` so a follow-up prompt (which writes a
@@ -343,42 +364,73 @@ fn codex_turn(lines: &[Value]) -> AiTurn {
             // likewise leave the turn `Working`. A genuine failure still
             // arrives as `error`/`task_failed` below. An early quit with no
             // resume is caught by the PTY-exit handlers, not here.
-            Some("turn_aborted") => Some(Ok(())),
-            Some("error") | Some("task_failed") => Some(Err(true)),
-            _ => state,
-        };
+            Some("turn_aborted") if active => {
+                completed = false;
+                failure = None;
+                fallback_text = None;
+                text.clear();
+            }
+            Some("error") | Some("task_failed") if active => {
+                failure = Some(
+                    codex_error_message(line)
+                        .unwrap_or_else(|| "Codex aborted the turn.".to_string()),
+                );
+            }
+            _ => {}
+        }
     }
-    match state {
-        Some(Ok(())) | None => AiTurn::Working,
-        Some(Err(true)) => AiTurn::Failed {
-            message: "Codex aborted the turn.".to_string(),
-        },
-        Some(Err(false)) => AiTurn::Finished {
-            transcript: codex_text(lines),
-        },
+    if let Some(message) = failure {
+        return AiTurn::Failed { message };
+    }
+    if !active || !completed {
+        return AiTurn::Working;
+    }
+    let transcript = fallback_text.or_else(|| (!text.is_empty()).then(|| text.join("\n\n")));
+    match transcript {
+        Some(transcript) => AiTurn::Finished { transcript },
+        None => AiTurn::Working,
     }
 }
 
-fn codex_text(lines: &[Value]) -> String {
-    lines
-        .iter()
-        .filter_map(|line| {
-            (line.get("type").and_then(Value::as_str) == Some("response_item"))
-                .then(|| line.pointer("/payload"))
-                .flatten()
-                .filter(|payload| {
-                    payload.get("type").and_then(Value::as_str) == Some("message")
-                        && payload.get("role").and_then(Value::as_str) == Some("assistant")
-                })
-                .and_then(|payload| payload.get("content").and_then(Value::as_array))
+fn codex_error_message(line: &Value) -> Option<String> {
+    line.pointer("/payload/message")
+        .or_else(|| line.pointer("/payload/error/message"))
+        .or_else(|| line.pointer("/payload/error"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn codex_line_text(line: &Value) -> Vec<String> {
+    line.pointer("/payload")
+        .filter(|payload| {
+            payload.get("type").and_then(Value::as_str) == Some("message")
+                && payload.get("role").and_then(Value::as_str) == Some("assistant")
         })
+        .and_then(|payload| payload.get("content").and_then(Value::as_array))
+        .into_iter()
         .flatten()
-        .filter_map(|block| {
-            (block.get("type").and_then(Value::as_str) == Some("output_text"))
-                .then(|| block.get("text").and_then(Value::as_str))
-                .flatten()
-                .map(str::to_string)
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn codex_text(lines: &[Value]) -> String {
+    let start = lines
+        .iter()
+        .rposition(|line| {
+            matches!(
+                line.pointer("/payload/type").and_then(Value::as_str),
+                Some("task_started" | "turn_started")
+            )
         })
+        .unwrap_or(0);
+    lines[start..]
+        .iter()
+        .filter(|line| line.get("type").and_then(Value::as_str) == Some("response_item"))
+        .flat_map(codex_line_text)
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -389,27 +441,47 @@ fn claude_turn(lines: &[Value]) -> AiTurn {
         if line.get("type").and_then(Value::as_str) == Some("user")
             && line.get("promptId").is_some()
         {
-            state = Some(Ok(()));
+            state = Some(Ok(false));
         }
         if line.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
+        if line.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
+            let message = claude_line_text(line)
+                .unwrap_or_else(|| "Claude Code reported an API error.".to_string());
+            state = Some(Err(message));
+            continue;
+        }
         match line.pointer("/message/stop_reason").and_then(Value::as_str) {
-            Some("tool_use") => state = Some(Ok(())),
-            Some("error") | Some("aborted") => state = Some(Err(true)),
-            Some(_) => state = Some(Err(false)),
+            Some("tool_use") => state = Some(Ok(false)),
+            Some("error") | Some("aborted") => {
+                state = Some(Err("Claude Code aborted the turn.".to_string()))
+            }
+            Some(_) if claude_line_text(line).is_some() => state = Some(Ok(true)),
+            Some(_) => state = Some(Ok(false)),
             None => {}
         }
     }
     match state {
-        Some(Ok(())) | None => AiTurn::Working,
-        Some(Err(true)) => AiTurn::Failed {
-            message: "Claude Code aborted the turn.".to_string(),
-        },
-        Some(Err(false)) => AiTurn::Finished {
+        Some(Ok(false)) | None => AiTurn::Working,
+        Some(Err(message)) => AiTurn::Failed { message },
+        Some(Ok(true)) => AiTurn::Finished {
             transcript: claude_text(lines),
         },
     }
+}
+
+fn claude_line_text(line: &Value) -> Option<String> {
+    let text = line
+        .pointer("/message/content")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn claude_text(lines: &[Value]) -> String {
@@ -519,7 +591,7 @@ mod tests {
         fs::write(
             &ours,
             format!(
-                "{}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}",
+                "{}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"done\"}}]}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}",
                 fs::read_to_string(&ours).unwrap()
             ),
         )
@@ -546,6 +618,67 @@ mod tests {
     }
 
     #[test]
+    fn codex_quota_error_is_not_overwritten_by_task_complete() {
+        let lines = vec![
+            serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "error", "message": "You've hit your usage limit"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": null}
+            }),
+        ];
+
+        assert_eq!(
+            codex_turn(&lines),
+            AiTurn::Failed {
+                message: "You've hit your usage limit".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn codex_textless_internal_turn_does_not_reuse_an_older_answer() {
+        let mut lines = vec![
+            serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "old answer"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "old answer"}
+            }),
+            serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": null}
+            }),
+        ];
+
+        assert_eq!(codex_turn(&lines), AiTurn::Working);
+        assert_eq!(codex_text(&lines), "");
+
+        lines.push(serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}));
+        lines.push(serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "last_agent_message": "final answer"}
+        }));
+        assert_eq!(
+            codex_turn(&lines),
+            AiTurn::Finished {
+                transcript: "final answer".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn claude_tool_use_waits_but_terminal_stop_returns_only_text_blocks() {
         let tmp = tempfile::tempdir().unwrap();
         let worktree = tmp.path().join("worktree");
@@ -564,6 +697,73 @@ mod tests {
             watcher.check_now(),
             AiTurn::Finished {
                 transcript: "calling tool\n\ndone".into()
+            }
+        );
+    }
+
+    #[test]
+    fn claude_thinking_only_terminal_snapshot_waits_for_text() {
+        let lines = vec![
+            serde_json::json!({"type": "user", "promptId": "p"}),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": "message-1",
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "text", "text": "exploring"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": "message-1",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "thinking", "thinking": ""}]
+                }
+            }),
+        ];
+
+        assert_eq!(claude_turn(&lines), AiTurn::Working);
+
+        let mut completed = lines;
+        completed.push(serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": "message-1",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "==== TASK ===="}]
+            }
+        }));
+        assert_eq!(
+            claude_turn(&completed),
+            AiTurn::Finished {
+                transcript: "exploring\n\n==== TASK ====".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn claude_api_limit_is_a_failure_with_the_provider_message() {
+        let lines = vec![
+            serde_json::json!({"type": "user", "promptId": "p"}),
+            serde_json::json!({
+                "type": "assistant",
+                "isApiErrorMessage": true,
+                "error": "rate_limit",
+                "message": {
+                    "stop_reason": "stop_sequence",
+                    "content": [{
+                        "type": "text",
+                        "text": "You've hit your weekly limit · resets 6am"
+                    }]
+                }
+            }),
+        ];
+
+        assert_eq!(
+            claude_turn(&lines),
+            AiTurn::Failed {
+                message: "You've hit your weekly limit · resets 6am".to_string()
             }
         );
     }

@@ -418,15 +418,20 @@ impl UpdatePullRequestScreen {
             pty.resize(rows, cols);
         }
         if pty.poll_exited() {
-            if self.ai_done || self.ai_failed {
-                return false;
-            }
             // Commit+push shell finished — record the exit code and flip
-            // into the done summary view.
+            // into the done summary view. Checked before the AI guards
+            // below because this step only ever runs *after* the AI phase
+            // completed, so `ai_done` is always set by now.
             if matches!(self.step, UpdateStep::CommitPush) {
+                if self.commit_push_done {
+                    return false;
+                }
                 let code = pty.exit_code();
                 self.mark_commit_push_done(code);
                 return true;
+            }
+            if self.ai_done || self.ai_failed {
+                return false;
             }
             // In the Terminal Activity recovery flow the user may type
             // `exit`, killing the shell. That is *not* the AI-done signal —
@@ -2634,6 +2639,36 @@ mod tests {
             dump.to_lowercase().contains("pushed"),
             "PR done page should mention the push: {dump}"
         );
+    }
+
+    #[test]
+    fn commit_push_pty_exit_flips_to_the_done_page_after_the_ai_phase() {
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
+        screen.start_updating();
+        screen.mark_ai_active();
+        // The Complete button only appears once the AI is done, so by the
+        // time the commit shell runs `ai_done` is always set.
+        screen.mark_ai_done();
+
+        screen.start_commit_push_pty(
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), "true".to_string()],
+            std::env::temp_dir(),
+            Vec::new(),
+        );
+        assert!(screen.commit_push_running());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !screen.commit_push_done() && std::time::Instant::now() < deadline {
+            screen.tick_pty(None);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(screen.commit_push_done(), "commit shell exit must be seen");
+        assert!(screen.commit_push_succeeded());
+        // The done page releases the key lock so the user can leave.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(enter), UpdateAction::Cancelled);
     }
 
     #[test]

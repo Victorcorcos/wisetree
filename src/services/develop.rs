@@ -192,13 +192,21 @@ fn parse_fields<const N: usize>(lines: &[&str], keys: [&str; N]) -> [Option<Stri
 
 fn parse_task_block(lines: &[&str]) -> Option<(String, u8)> {
     let [description, complexity] = parse_fields(lines, ["DESCRIPTION:", "COMPLEXITY:"]);
-    let description = description?.trim().to_string();
+    let mut description = description?.trim().to_string();
     if description.is_empty() {
         return None;
     }
-    let complexity: u8 = complexity?.trim().parse().ok()?;
+    let complexity = complexity?;
+    let mut complexity_lines = complexity.lines();
+    let complexity: u8 = complexity_lines.next()?.trim().parse().ok()?;
     if !(1..=99).contains(&complexity) {
         return None;
+    }
+    let trailing = complexity_lines.collect::<Vec<_>>().join("\n");
+    let trailing = trailing.trim();
+    if !trailing.is_empty() {
+        description.push_str("\n\n");
+        description.push_str(trailing);
     }
     Some((description, complexity))
 }
@@ -820,6 +828,30 @@ CRITERIA: - c
         assert_eq!(parse_plan_transcript(&empty_name), None);
         let empty_criteria = template.replace("CRITERIA: - c", "CRITERIA:");
         assert_eq!(parse_plan_transcript(&empty_criteria), None);
+    }
+
+    #[test]
+    fn prose_after_complexity_is_preserved_in_the_task_description() {
+        let transcript = "\
+==== TASK ====
+DESCRIPTION: Build the feature
+COMPLEXITY: 20
+
+Splitting this epic into independent tasks is recommended.
+==== END ====
+==== SECTION ====
+NAME: Foundation
+GOAL: Establish the foundation
+CRITERIA: - foundation works
+==== END ====";
+
+        let plan = parse_plan_transcript(transcript).expect("plan should parse");
+
+        assert_eq!(plan.complexity, 20);
+        assert_eq!(
+            plan.task_description,
+            "Build the feature\n\nSplitting this epic into independent tasks is recommended."
+        );
     }
 
     #[test]

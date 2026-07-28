@@ -4682,10 +4682,19 @@ impl DashboardService {
             }
         }
         let status = self
-            .develop_git(&cwd, &["status", "--porcelain", "--untracked-files=all"])
+            .develop_git(
+                &cwd,
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            )
             .await
             .map_err(WisetreeError::other)?;
-        if !status.trim().is_empty() {
+        let status = parse_porcelain_v2(&status);
+        let has_non_plan_changes = !status.tracked.is_empty()
+            || status
+                .untracked
+                .iter()
+                .any(|path| path != DEVELOP_PLAN_FILE);
+        if has_non_plan_changes {
             return Err(WisetreeError::other(
                 "Develop requires a clean worktree before starting.".to_string(),
             ));
@@ -15130,8 +15139,6 @@ so the intent reads clearly.
             notes: vec!["Planning complete".to_string()],
         };
         std::fs::write(repo.join(PLAN_FILE), render_plan_md(&expected_plan)).unwrap();
-        git(&repo, &["add", PLAN_FILE]);
-        git(&repo, &["commit", "-q", "-m", "add valid plan"]);
         let expected_base_ref = Some("origin/main".to_string());
         let service = DashboardService::new(repo.clone(), DashboardConfig::default())
             .with_opencode_binary(PathBuf::from("git"));
@@ -15149,6 +15156,24 @@ so the intent reads clearly.
         };
         assert_eq!(plan, expected_plan);
         assert_eq!(preflight.base_ref, expected_base_ref);
+    }
+
+    #[tokio::test]
+    async fn develop_preflight_rejects_changes_besides_an_untracked_plan() {
+        let (_tmp, repo) = develop_repo();
+        std::fs::write(repo.join(PLAN_FILE), "# Development Plan").unwrap();
+        std::fs::write(repo.join("unexpected.txt"), "dirty").unwrap();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let error = service
+            .develop_preflight(repo.to_str().unwrap())
+            .await
+            .expect_err("other untracked files must still block Develop");
+
+        assert!(error
+            .to_string()
+            .contains("Develop requires a clean worktree"));
     }
 
     #[tokio::test]
