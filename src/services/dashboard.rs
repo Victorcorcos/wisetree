@@ -4039,6 +4039,11 @@ impl DashboardService {
         let first = self.scan_review_group(worktree_path, group, context).await;
         accumulate_review_usage(usage, &first.telemetry.usage);
         let raw = first.raw_output.clone();
+        let retry_full = first
+            .result
+            .as_ref()
+            .err()
+            .is_some_and(|error| !review_failure_repeats_on_rescan(&error.to_string()));
         if let Ok(findings) = first.result {
             return Ok(findings);
         }
@@ -4050,6 +4055,19 @@ impl DashboardService {
             if let Ok(findings) = reformatted.result {
                 return Ok(findings);
             }
+            if reformatted
+                .result
+                .as_ref()
+                .err()
+                .is_some_and(|error| review_failure_repeats_on_rescan(&error.to_string()))
+            {
+                return reformatted.result;
+            }
+        }
+        if !retry_full {
+            return Err(WisetreeError::other(
+                "review group failure cannot succeed on an identical full rescan.",
+            ));
         }
         let full = self.scan_review_group(worktree_path, group, context).await;
         accumulate_review_usage(usage, &full.telemetry.usage);
@@ -4074,6 +4092,11 @@ impl DashboardService {
         };
         accumulate_review_usage(usage, &first.telemetry.usage);
         let raw = first.raw_output.clone();
+        let retry_full = first
+            .result
+            .as_ref()
+            .err()
+            .is_some_and(|error| !review_failure_repeats_on_rescan(&error.to_string()));
         if let Ok(findings) = first.result {
             return Ok(findings);
         }
@@ -4089,6 +4112,19 @@ impl DashboardService {
             if let Ok(findings) = reformatted.result {
                 return Ok(findings);
             }
+            if reformatted
+                .result
+                .as_ref()
+                .err()
+                .is_some_and(|error| review_failure_repeats_on_rescan(&error.to_string()))
+            {
+                return reformatted.result;
+            }
+        }
+        if !retry_full {
+            return Err(WisetreeError::other(
+                "review coverage failure cannot succeed on an identical full rescan.",
+            ));
         }
         let full = if mode == ReviewScanMode::Merged {
             self.scan_review_merged(worktree_path, files, context, tester_findings)
@@ -8118,6 +8154,26 @@ fn review_scan_attempt(
     }
 }
 
+/// Retrying an identical discovery prompt cannot recover from a provider
+/// timeout or size/context rejection. Network and process failures remain
+/// eligible for the one full retry.
+fn review_failure_repeats_on_rescan(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "too large",
+        "too long",
+        "context length",
+        "context window",
+        "maximum context",
+        "prompt is too",
+        "argument list too long",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 fn accumulate_review_usage(total: &mut Option<ReviewTokenUsage>, next: &ReviewTokenUsage) {
     let Some(current) = total.as_mut() else {
         *total = Some(next.clone());
@@ -12014,6 +12070,18 @@ copy to src/copied_again.rs
         assert!(merged.contains("CATEGORY: <Code Smell | Security"));
         assert!(merged.contains("FILE: <one exact path from a `### FILE:` section>"));
         assert!(merged.contains("bad merged output"));
+    }
+
+    #[test]
+    fn full_rescan_skips_terminal_prompt_failures() {
+        assert!(review_failure_repeats_on_rescan("request timed out"));
+        assert!(review_failure_repeats_on_rescan("request body too large"));
+        assert!(review_failure_repeats_on_rescan(
+            "input exceeds the maximum context length"
+        ));
+        assert!(!review_failure_repeats_on_rescan(
+            "connection reset by peer"
+        ));
     }
 
     #[test]
