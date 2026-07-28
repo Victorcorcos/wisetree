@@ -988,6 +988,15 @@ fn review_coverage_test_prompt_bytes(file: &ReviewFile) -> usize {
         .min(REVIEW_DIFF_MAX_BYTES)
 }
 
+/// Bytes one changed application file contributes to a split coverage prompt.
+/// This deliberately differs from ordinary scan evidence: coverage needs the
+/// changed behavior's declaration and anchors, not its complete body.
+fn review_coverage_application_prompt_bytes(file: &ReviewFile) -> usize {
+    review_coverage_application_evidence(file)
+        .len()
+        .min(REVIEW_DIFF_MAX_BYTES)
+}
+
 /// Partition split-mode coverage work without ever dropping a changed
 /// application file behind the whole-prompt cap. Application files appear in
 /// exactly one group. Changed tests are supplied in full only to the first
@@ -1016,7 +1025,7 @@ pub(crate) fn review_coverage_groups(
     let mut current = Vec::new();
     let mut current_bytes = 0usize;
     for file in applications {
-        let bytes = review_file_prompt_bytes(file);
+        let bytes = review_coverage_application_prompt_bytes(file);
         if !current.is_empty() && current_bytes.saturating_add(bytes) > REVIEW_GROUP_PROMPT_BYTES {
             groups.push(std::mem::take(&mut current));
             group_bytes.push(std::mem::replace(&mut current_bytes, 0));
@@ -8821,7 +8830,7 @@ fn build_review_coverage_prompt(
     tester_findings: &[ReviewFinding],
 ) -> String {
     const COVERAGE_PROMPT: &str = include_str!("../../prompts/reviewer_coverage.md");
-    build_review_whole_diff_prompt(COVERAGE_PROMPT, files, context, tester_findings, None)
+    build_review_whole_diff_prompt(COVERAGE_PROMPT, files, context, tester_findings, None, true)
 }
 
 fn build_review_merged_prompt(
@@ -8837,6 +8846,7 @@ fn build_review_merged_prompt(
         context,
         tester_findings,
         Some(tables_path),
+        false,
     )
 }
 
@@ -8846,11 +8856,14 @@ fn build_review_whole_diff_prompt(
     context: &ReviewContext,
     tester_findings: &[ReviewFinding],
     tables_path: Option<&str>,
+    compact_applications: bool,
 ) -> String {
     let mut diff = String::new();
     for file in files {
         let evidence = if review_file_is_test(file) {
             review_coverage_test_evidence(file)
+        } else if compact_applications {
+            review_coverage_application_evidence(file)
         } else {
             review_file_evidence(file, false)
         };
@@ -9027,6 +9040,59 @@ fn review_coverage_test_evidence(file: &ReviewFile) -> String {
     )
 }
 
+/// Render the smallest application evidence a coverage scan can use safely:
+/// changed declaration signatures and the authoritative added lines. The
+/// application scan retains full bodies for code-quality review; merged review
+/// does too because it is the sole review pass in that mode.
+fn review_coverage_application_evidence(file: &ReviewFile) -> String {
+    if review_file_is_deleted(file) || file.full_content.is_none() {
+        return review_file_evidence(file, false);
+    }
+
+    let content = file.full_content.as_deref().unwrap_or_default();
+    let extracted = extract_symbol_evidence(&file.path, content, &file.annotated_diff);
+    let changed = file
+        .annotated_diff
+        .lines()
+        .filter(|line| line.as_bytes().get(7) == Some(&b'+'))
+        .filter_map(annotated_review_line_number)
+        .collect::<BTreeSet<_>>();
+    if changed.is_empty() {
+        return review_file_evidence(file, false);
+    }
+
+    let mut rendered = String::from(
+        "### CHANGED APPLICATION COVERAGE EVIDENCE (signatures and `+` lines are authoritative anchors)\n",
+    );
+    if !extracted.symbols.is_empty() {
+        rendered.push_str(&format!(
+            "Changed symbols: {}\n",
+            extracted.symbols.join(", ")
+        ));
+    }
+    if !extracted.signatures.is_empty() {
+        rendered.push_str("### CHANGED SYMBOL SIGNATURES\n");
+        for signature in &extracted.signatures {
+            rendered.push_str(signature);
+            rendered.push('\n');
+        }
+    }
+    rendered.push_str("### NUMBERED CHANGED LINES\n");
+    for (index, line) in content.lines().enumerate() {
+        let number = index as u64 + 1;
+        if changed.contains(&number) {
+            rendered.push_str(&format!("{number:>6} +{line}\n"));
+        }
+    }
+    if !extracted.complete {
+        rendered.push_str(&format!(
+            "\n(EVIDENCE-FALLBACK: changed-symbol extraction was partial or unavailable; read `{}` for an unresolved coverage decision.)\n",
+            file.path
+        ));
+    }
+    rendered.trim_end().to_string()
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReviewPromptEvidenceStats {
     bytes_by_role: BTreeMap<String, usize>,
@@ -9099,7 +9165,7 @@ fn review_prompt_evidence_stats(
                 let evidence = review_coverage_test_evidence(file);
                 ledger.record(&role, "changed-test-digest", &file.path, &evidence);
             } else {
-                let evidence = review_file_evidence(file, false);
+                let evidence = review_coverage_application_evidence(file);
                 ledger.record(&role, "coverage-application", &file.path, &evidence);
             }
         }
@@ -12298,30 +12364,60 @@ copy to src/copied_again.rs
         assert_eq!(groups.last().expect("groups")[0].path, "src/c.rs");
     }
 
-    /// The scan ships each file's whole numbered content, so a one-line diff
-    /// in a large file costs that file's size against the group budget. When
-    /// this was budgeted on diff bytes, files like these piled into a single
-    /// prompt the model then timed out on or refused outright.
+    /// Split coverage groups use compact application evidence, while ordinary
+    /// application scan groups still budget their complete numbered files.
     #[test]
-    fn group_budgets_count_inlined_file_content_not_diff_size() {
+    fn coverage_groups_budget_compact_application_evidence() {
         let file = |path: &str| ReviewFile {
             path: path.to_string(),
             annotated_diff: "@@ -1 +1 @@\n     1 +y".to_string(),
-            full_content: Some("y".repeat(REVIEW_GROUP_PROMPT_BYTES * 2 / 3)),
+            full_content: Some(format!(
+                "y\n{}",
+                "x\n".repeat(REVIEW_GROUP_PROMPT_BYTES / 3)
+            )),
             commentable_lines: BTreeSet::new(),
             existing_comments: String::new(),
             existing_keys: Vec::new(),
         };
         let files = vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")];
-        let groups = review_coverage_groups(&files, ReviewScanMode::Split);
+        let coverage_groups = review_coverage_groups(&files, ReviewScanMode::Split);
+        assert_eq!(coverage_groups.len(), 1);
+        let application_groups = review_file_groups(&files, ReviewScanMode::Split);
         assert!(
-            groups.len() > 1,
-            "three near-budget files cannot share one prompt"
+            application_groups.len() > 1,
+            "ordinary scans must retain their complete-file budget"
         );
-        for group in &groups {
-            let bytes = group.iter().map(review_file_prompt_bytes).sum::<usize>();
+        for group in &coverage_groups {
+            let bytes = group
+                .iter()
+                .map(review_coverage_application_prompt_bytes)
+                .sum::<usize>();
             assert!(bytes <= REVIEW_COVERAGE_DIFF_MAX_BYTES);
         }
+    }
+
+    #[test]
+    fn coverage_application_evidence_keeps_signatures_and_changed_anchors_not_bodies() {
+        let file = ReviewFile {
+            path: "src/access.rs".to_string(),
+            annotated_diff: "@@ -1,4 +1,4 @@\n     1  fn can_access(user: &User) -> bool {\n     2 +    audit(user);\n     3      user.is_admin\n     4  }".to_string(),
+            full_content: Some(
+                "fn can_access(user: &User) -> bool {\n    audit(user);\n    user.is_admin\n}\n"
+                    .to_string(),
+            ),
+            commentable_lines: BTreeSet::from([1, 2, 3, 4]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let coverage = review_coverage_application_evidence(&file);
+        assert!(coverage.contains("Changed symbols: can_access"));
+        assert!(coverage.contains("     1  fn can_access(user: &User) -> bool {"));
+        assert!(coverage.contains("     2 +    audit(user);"));
+        assert!(!coverage.contains("     3      user.is_admin"));
+
+        let merged =
+            build_review_merged_prompt(&[file], &ReviewContext::default(), &[], "/tmp/tables.md");
+        assert!(merged.contains("     3      user.is_admin"));
     }
 
     #[test]

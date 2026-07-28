@@ -15,6 +15,9 @@ pub(crate) struct ExtractedReviewEvidence {
     pub rendered: String,
     pub complete: bool,
     pub symbols: Vec<String>,
+    /// Declaration lines for the changed symbols. Consumers that only need a
+    /// coverage-oriented summary can retain these without including bodies.
+    pub signatures: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -62,6 +65,16 @@ pub(crate) fn extract_symbol_evidence(
     let selected_symbols = selected
         .iter()
         .map(|(_, _, name)| name.clone())
+        .collect::<Vec<_>>();
+    let signatures = selected
+        .iter()
+        .filter_map(|(start, end, name)| {
+            lines[*start..=*end]
+                .iter()
+                .enumerate()
+                .find(|(_, line)| declaration_name(line).as_deref() == Some(name))
+                .map(|(index, line)| format!("{:>6}  {}", start + index + 1, line.trim_end()))
+        })
         .collect::<Vec<_>>();
     let mut rendered = String::from("### ENCLOSING SYMBOL EVIDENCE\n");
     let mut referenced = HashSet::new();
@@ -133,6 +146,7 @@ pub(crate) fn extract_symbol_evidence(
         rendered: rendered.trim_end().to_string(),
         complete,
         symbols: selected_symbols,
+        signatures,
     }
 }
 
@@ -341,6 +355,7 @@ fn module_window(
         rendered: rendered.trim_end().to_string(),
         complete: false,
         symbols: Vec::new(),
+        signatures: Vec::new(),
     }
 }
 
@@ -369,6 +384,7 @@ fn fallback(reason: &str) -> ExtractedReviewEvidence {
         ),
         complete: false,
         symbols: Vec::new(),
+        signatures: Vec::new(),
     }
 }
 
@@ -399,6 +415,7 @@ mod tests {
         let evidence = extract_symbol_evidence("tests/a.rs", source, diff);
         assert!(evidence.complete);
         assert_eq!(evidence.symbols, vec!["inner"]);
+        assert_eq!(evidence.signatures, vec!["     3      fn inner() {"]);
         assert_eq!(evidence.rendered.matches("#### SYMBOL: inner").count(), 1);
     }
 
