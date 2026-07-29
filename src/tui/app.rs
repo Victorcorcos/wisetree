@@ -1326,7 +1326,9 @@ impl App {
             }
             Screen::ImprovePullRequest => {
                 let panel = self.render_framed_panel_fill(frame, area);
-                if let Some(improve_pr) = self.improve_pr.as_mut() {
+                if let Some(review_pr) = self.review_pr.as_mut() {
+                    review_pr.render(frame, panel);
+                } else if let Some(improve_pr) = self.improve_pr.as_mut() {
                     improve_pr.render(frame, panel);
                 }
             }
@@ -2148,12 +2150,20 @@ impl App {
                 self.apply_review_action(action, tx);
             }
             Screen::ImprovePullRequest => {
-                let action = self
-                    .improve_pr
-                    .as_mut()
-                    .map(|screen| screen.handle_mouse_click(position))
-                    .unwrap_or(ImproveAction::Continue);
-                self.apply_improve_action(action, tx);
+                if let Some(screen) = self.review_pr.as_mut() {
+                    if matches!(screen.handle_mouse_click(position), ReviewAction::Done) {
+                        let worktree_path = screen.request().worktree_path.clone();
+                        self.review_pr = None;
+                        self.back_to_dashboard_action_menu(Some(worktree_path), tx);
+                    }
+                } else {
+                    let action = self
+                        .improve_pr
+                        .as_mut()
+                        .map(|screen| screen.handle_mouse_click(position))
+                        .unwrap_or(ImproveAction::Continue);
+                    self.apply_improve_action(action, tx);
+                }
             }
             Screen::BugkillPullRequest => {
                 let action = self
@@ -2846,6 +2856,14 @@ impl App {
     }
 
     fn handle_improve_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if let Some(screen) = self.review_pr.as_mut() {
+            if matches!(screen.handle_key(key), ReviewAction::Done) {
+                let worktree_path = screen.request().worktree_path.clone();
+                self.review_pr = None;
+                self.back_to_dashboard_action_menu(Some(worktree_path), tx);
+            }
+            return;
+        }
         let action = self
             .improve_pr
             .as_mut()
@@ -2895,19 +2913,33 @@ impl App {
         if self.improve_pr.is_none() {
             return;
         }
-        let (variant, message) = match result {
+        let prepared = match result {
             Ok(preparation) => match *preparation {
-                ImprovePreparation::Ready { files, skipped, .. } if files.is_empty() => (
-                    ToastVariant::Info,
-                    format!(
-                        "Improve found no reviewable text changes ({} file(s) skipped).",
-                        skipped.len()
-                    ),
-                ),
-                ImprovePreparation::Ready { .. } => (
-                    ToastVariant::Info,
-                    "Improve preparation is ready for local discovery.".to_string(),
-                ),
+                ImprovePreparation::Ready { files, skipped, .. } if files.is_empty() => {
+                    let worktree_path = self.improve_pr.take().map(|screen| screen.request().worktree_path.clone());
+                    self.show_toast(
+                        ToastVariant::Info,
+                        format!("Improve found no reviewable text changes ({} file(s) skipped).", skipped.len()),
+                    );
+                    self.back_to_dashboard_action_menu(worktree_path, tx);
+                    return;
+                }
+                ImprovePreparation::Ready { files, scan_mode, context, skipped, .. } => {
+                    let Some(request) = self.improve_pr.take().map(|screen| screen.request().clone()) else {
+                        return;
+                    };
+                    let mut discovery = ReviewPullRequestScreen::new_improve(
+                        request,
+                        self.current_dashboard_config().ai.review.clone(),
+                    );
+                    discovery.set_scan_mode(scan_mode);
+                    discovery.set_review_context(context);
+                    discovery.set_files(files, String::new(), String::new(), String::new());
+                    discovery.record_skipped_files(&skipped);
+                    self.review_pr = Some(discovery);
+                    self.start_review_scans(tx);
+                    return;
+                }
                 ImprovePreparation::NoChanges => (
                     ToastVariant::Info,
                     "Improve found no changes from the local base branch.".to_string(),
@@ -2935,7 +2967,7 @@ impl App {
             .improve_pr
             .take()
             .map(|screen| screen.request().worktree_path.clone());
-        self.show_toast(variant, message);
+        self.show_toast(prepared.0, prepared.1);
         self.back_to_dashboard_action_menu(worktree_path, tx);
     }
 
@@ -3214,7 +3246,11 @@ impl App {
             let context = screen.review_context();
             let candidates = screen.begin_verification();
             if candidates.is_empty() {
-                screen.enter_decision();
+                if screen.is_improve() {
+                    screen.enter_done();
+                } else {
+                    screen.enter_decision();
+                }
                 return;
             }
             let config = self.current_dashboard_config();
@@ -3568,7 +3604,11 @@ impl App {
             return;
         }
         if screen.finish_verification() {
-            screen.enter_decision();
+            if screen.is_improve() {
+                screen.enter_done();
+            } else {
+                screen.enter_decision();
+            }
         } else {
             screen.enter_done();
         }
@@ -10946,6 +10986,45 @@ mod tests {
         app
     }
 
+    fn improve_scan_test_app(mode: ReviewScanMode, paths: &[&str]) -> App {
+        let request = ImproveRequest {
+            branch: "improve-retries".to_string(),
+            worktree_path: "/tmp/improve-retries".to_string(),
+            number: None,
+            title: None,
+        };
+        let model = crate::config::schema::AiModelConfig {
+            model: "opencode/test".to_string(),
+            thinking: "max".to_string(),
+            harness: Default::default(),
+        };
+        let ai = crate::config::schema::AiReviewConfig {
+            strong: model.clone(),
+            balanced: model.clone(),
+            utility: model,
+        };
+        let files = paths
+            .iter()
+            .map(|path| ReviewFile {
+                path: (*path).to_string(),
+                annotated_diff: "@@ -1 +1 @@\n     1 +changed".to_string(),
+                full_content: None,
+                commentable_lines: std::collections::BTreeSet::from([1]),
+                existing_comments: String::new(),
+                existing_keys: Vec::new(),
+            })
+            .collect();
+        let mut screen = ReviewPullRequestScreen::new_improve(request, ai);
+        screen.set_scan_mode(mode);
+        screen.set_files(files, String::new(), String::new(), String::new());
+        screen.begin_scan_phase();
+
+        let mut app = App::new(AppMode::Dashboard, false);
+        app.screen = Screen::ImprovePullRequest;
+        app.review_pr = Some(screen);
+        app
+    }
+
     fn review_test_telemetry(scan: &str) -> ReviewScanTelemetry {
         ReviewScanTelemetry {
             scan: scan.to_string(),
@@ -11280,6 +11359,100 @@ mod tests {
                 crate::tui::screens::review_pr::ReviewStep::Done
             );
         }
+    }
+
+    #[test]
+    fn improve_retry_exhaustion_settles_and_rejects_stale_scan_events() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["tests/unit_test.rs"]);
+        app.review_pr.as_mut().unwrap().take_next_scan_file();
+        let tx = app_event_tx();
+        for (retry, raw_output) in [
+            (ReviewScanRetry::Initial, Some("bad output".to_string())),
+            (ReviewScanRetry::Reformat, Some("still bad".to_string())),
+            (ReviewScanRetry::Full, None),
+        ] {
+            app.apply_review_pr_scanned(
+                0,
+                retry,
+                Err("malformed".to_string()),
+                None,
+                raw_output,
+                &tx,
+            );
+        }
+        let screen = app.review_pr.as_ref().unwrap();
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+        assert!(screen.is_improve());
+        assert_eq!(screen.scan_telemetry_len(), 0);
+
+        app.apply_review_pr_scanned(
+            0,
+            ReviewScanRetry::Full,
+            Ok(Vec::new()),
+            Some(review_test_telemetry("stale")),
+            None,
+            &tx,
+        );
+        assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 0);
+    }
+
+    #[test]
+    fn improve_verification_replaces_or_rejects_before_ending_discovery() {
+        let finding = |title: &str| ReviewFinding {
+            category: "Security".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: title.to_string(),
+            explanation: "Missing authorization.".to_string(),
+            suggestion: Some("authorize();".to_string()),
+        };
+        let tx = app_event_tx();
+
+        let mut revised = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = revised.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![finding("Original")]);
+        assert!(screen.finish_scanning());
+        assert_eq!(screen.begin_verification().len(), 1);
+        revised.apply_review_pr_verified(
+            0,
+            Ok(ReviewVerification::Revise {
+                reason: "Narrowed the claim.".to_string(),
+                finding: finding("Revised"),
+            }),
+            None,
+        );
+        let screen = revised.review_pr.as_ref().unwrap();
+        assert_eq!(screen.findings_len(), 1);
+        assert_eq!(screen.current_finding().unwrap().title, "Revised");
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+
+        let mut rejected = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = rejected.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![finding("False positive")]);
+        screen.finish_scanning();
+        screen.begin_verification();
+        rejected.apply_review_pr_verified(
+            0,
+            Ok(ReviewVerification::RejectedFalsePositive {
+                reason: "Existing guard.".to_string(),
+            }),
+            None,
+        );
+        let screen = rejected.review_pr.as_ref().unwrap();
+        assert_eq!(screen.findings_len(), 0);
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+        drop(tx);
     }
 
     fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> NotificationsConfig {
