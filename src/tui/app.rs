@@ -2857,11 +2857,16 @@ impl App {
 
     fn handle_improve_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         if let Some(screen) = self.review_pr.as_mut() {
-            if matches!(screen.handle_key(key), ReviewAction::Done) {
-                let worktree_path = screen.request().worktree_path.clone();
-                self.review_pr = None;
-                self.back_to_dashboard_action_menu(Some(worktree_path), tx);
-            }
+            // Discovery has handed a verified finding to Improve; it now owns
+            // all decision input, while this screen remains the immutable
+            // finding source until the apply stage takes over.
+            let _ = screen;
+            let action = self
+                .improve_pr
+                .as_mut()
+                .map(|s| s.handle_key(key))
+                .unwrap_or(ImproveAction::Continue);
+            self.apply_improve_action(action, tx);
             return;
         }
         let action = self
@@ -2902,7 +2907,93 @@ impl App {
                     tx.clone(),
                 );
             }
+            ImproveAction::Other => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.show_other_input();
+                }
+            }
+            ImproveAction::Skip => self.advance_improve_finding(tx),
+            ImproveAction::Edit => {
+                // Local edit UI is deliberately owned by Improve; this action
+                // is retained for the later apply handoff.
+            }
+            ImproveAction::Apply => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.start_preparing();
+                }
+                self.show_toast(
+                    ToastVariant::Info,
+                    "Improvement approved; applying it is the next pipeline stage.".to_string(),
+                );
+            }
+            ImproveAction::Revise(feedback) => self.revise_improve_finding(feedback, tx),
         }
+    }
+
+    fn begin_improve_finding_review(&mut self) {
+        let Some(discovery) = self.review_pr.as_ref() else {
+            return;
+        };
+        let Some(finding) = discovery.current_finding() else {
+            return;
+        };
+        if let Some(improve) = self.improve_pr.as_mut() {
+            improve.show_finding(finding, discovery.current_index(), discovery.findings_len());
+        }
+    }
+
+    fn advance_improve_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let more = self
+            .review_pr
+            .as_mut()
+            .is_some_and(|screen| screen.advance_finding());
+        if more {
+            self.begin_improve_finding_review();
+        } else {
+            let path = self
+                .improve_pr
+                .take()
+                .map(|s| s.request().worktree_path.clone());
+            self.review_pr = None;
+            self.back_to_dashboard_action_menu(path, tx);
+        }
+    }
+
+    fn revise_improve_finding(&mut self, feedback: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(improve) = self.improve_pr.as_ref() else {
+            return;
+        };
+        let Some(finding) = improve.current_finding() else {
+            return;
+        };
+        let index = improve.current_index();
+        let Some(review) = self.review_pr.as_ref() else {
+            return;
+        };
+        let Some(file) = review.file_for(&finding) else {
+            return;
+        };
+        let request = ReviewReviseRequest {
+            worktree_path: review.request().worktree_path.clone(),
+            file,
+            finding,
+            mode: if review_feedback_needs_expanded_context(&feedback) {
+                ReviewRevisionMode::Expanded
+            } else {
+                ReviewRevisionMode::Focused
+            },
+            feedback,
+            index,
+        };
+        if let Some(improve) = self.improve_pr.as_mut() {
+            improve.start_preparing();
+        }
+        kick_off_revise_review_finding(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request,
+            tx.clone(),
+        );
     }
 
     fn apply_improve_prepared(
@@ -2925,7 +3016,7 @@ impl App {
                     return;
                 }
                 ImprovePreparation::Ready { files, scan_mode, context, skipped, .. } => {
-                    let Some(request) = self.improve_pr.take().map(|screen| screen.request().clone()) else {
+                    let Some(request) = self.improve_pr.as_ref().map(|screen| screen.request().clone()) else {
                         return;
                     };
                     let mut discovery = ReviewPullRequestScreen::new_improve(
@@ -3247,7 +3338,7 @@ impl App {
             let candidates = screen.begin_verification();
             if candidates.is_empty() {
                 if screen.is_improve() {
-                    screen.enter_done();
+                    self.begin_improve_finding_review();
                 } else {
                     screen.enter_decision();
                 }
@@ -3526,6 +3617,56 @@ impl App {
         if !self.review_at_index(index) {
             return;
         }
+        if self.improve_pr.is_some() {
+            match result {
+                Ok(mut findings) if !findings.is_empty() => {
+                    let mut revised = findings.remove(0);
+                    if let Some(old) = self.improve_pr.as_ref().and_then(|s| s.current_finding()) {
+                        revised.file = old.file;
+                    }
+                    if let Some(improve) = self.improve_pr.as_mut() {
+                        improve.show_revised(revised);
+                    }
+                }
+                _ if mode == ReviewRevisionMode::Focused => {
+                    // The normal Review revision handler retries with expanded
+                    // context. Keep the same guarded index and feedback here.
+                    let request = self.review_pr.as_ref().and_then(|review| {
+                        let finding = self.improve_pr.as_ref()?.current_finding()?;
+                        Some(ReviewReviseRequest {
+                            worktree_path: review.request().worktree_path.clone(),
+                            file: review.file_for(&finding)?,
+                            finding,
+                            mode: ReviewRevisionMode::Expanded,
+                            feedback,
+                            index,
+                        })
+                    });
+                    if let Some(request) = request {
+                        kick_off_revise_review_finding(
+                            self.git_root.clone(),
+                            self.current_dashboard_config(),
+                            request,
+                            tx.clone(),
+                        );
+                        return;
+                    }
+                    if let Some(improve) = self.improve_pr.as_mut() {
+                        improve.revision_failed();
+                    }
+                }
+                _ => {
+                    if let Some(improve) = self.improve_pr.as_mut() {
+                        improve.revision_failed();
+                    }
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        "The revision was malformed; kept the current improvement.".to_string(),
+                    );
+                }
+            }
+            return;
+        }
         if let (Some(screen), Some(telemetry)) = (self.review_pr.as_mut(), telemetry) {
             screen.record_scan_telemetry(telemetry);
         }
@@ -3605,7 +3746,7 @@ impl App {
         }
         if screen.finish_verification() {
             if screen.is_improve() {
-                screen.enter_done();
+                self.begin_improve_finding_review();
             } else {
                 screen.enter_decision();
             }
