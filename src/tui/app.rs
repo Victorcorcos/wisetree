@@ -2941,6 +2941,7 @@ impl App {
                     .map(|screen| screen.request().worktree_path.clone());
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
+            ImproveAction::Done => self.finish_improve_flow(tx),
             // The discovery and apply pipeline is introduced by the next
             // implementation section. This section only prepares its local,
             // GitHub-free input.
@@ -2962,7 +2963,12 @@ impl App {
                     screen.show_other_input();
                 }
             }
-            ImproveAction::Skip => self.advance_improve_finding(tx),
+            ImproveAction::Skip => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.record_skipped();
+                }
+                self.advance_improve_finding(tx);
+            }
             ImproveAction::Edit => {
                 // Local edit UI is deliberately owned by Improve; this action
                 // is retained for the later apply handoff.
@@ -2987,24 +2993,36 @@ impl App {
                 );
             }
             ImproveAction::ApplyReady => self.finish_improve_apply(tx),
-            ImproveAction::AbortApply => self.abort_improve_apply(tx),
+            ImproveAction::AbortApply => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.record_failed(
+                        "Apply cancelled before a checkpoint was created.".to_string(),
+                    );
+                }
+                self.abort_improve_apply(tx);
+                self.advance_improve_finding(tx);
+            }
             ImproveAction::Revise(feedback) => self.revise_improve_finding(feedback, tx),
         }
     }
 
     fn begin_improve_finding_review(&mut self) {
-        let Some(discovery) = self.review_pr.as_ref() else {
-            return;
-        };
-        let Some(finding) = discovery.current_finding() else {
+        let Some((finding, current, total)) = self.review_pr.as_ref().and_then(|discovery| {
+            discovery
+                .current_finding()
+                .map(|finding| (finding, discovery.current_index(), discovery.findings_len()))
+        }) else {
+            if let Some(improve) = self.improve_pr.as_mut() {
+                improve.enter_done();
+            }
             return;
         };
         if let Some(improve) = self.improve_pr.as_mut() {
-            improve.show_finding(finding, discovery.current_index(), discovery.findings_len());
+            improve.show_finding(finding, current, total);
         }
     }
 
-    fn advance_improve_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn advance_improve_finding(&mut self, _tx: &mpsc::UnboundedSender<AppEvent>) {
         let more = self
             .review_pr
             .as_mut()
@@ -3012,12 +3030,22 @@ impl App {
         if more {
             self.begin_improve_finding_review();
         } else {
-            let path = self
-                .improve_pr
-                .take()
-                .map(|s| s.request().worktree_path.clone());
             self.review_pr = None;
-            self.back_to_dashboard_action_menu(path, tx);
+            if let Some(screen) = self.improve_pr.as_mut() {
+                screen.enter_done();
+            }
+        }
+    }
+
+    fn finish_improve_flow(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let path = self
+            .improve_pr
+            .take()
+            .map(|screen| screen.request().worktree_path.clone());
+        self.review_pr = None;
+        self.back_to_dashboard_action_menu(path, tx);
+        if let Some(watch) = self.dashboard_watch.as_ref() {
+            watch.refresh();
         }
     }
 
@@ -3112,7 +3140,14 @@ impl App {
             AiTurn::Working => {}
             AiTurn::Finished { .. } => self.finish_improve_apply(tx),
             AiTurn::Failed { message } => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.record_failed(format!(
+                        "AI CLI reported an error: {}",
+                        truncate_error(&message)
+                    ));
+                }
                 self.abort_improve_apply(tx);
+                self.advance_improve_finding(tx);
                 self.show_toast(
                     ToastVariant::Error,
                     format!("Improve apply failed: {}", truncate_error(&message)),
@@ -3177,20 +3212,34 @@ impl App {
             return;
         }
         match result {
-            Ok(ImproveCommitOutcome::Committed { sha }) => self.show_toast(
-                ToastVariant::Success,
-                format!("Improve checkpoint committed: {}", &sha[..sha.len().min(8)]),
-            ),
-            Ok(ImproveCommitOutcome::NoChanges) => self.show_toast(
-                ToastVariant::Info,
-                "No changes needed; improvement already addressed.".to_string(),
-            ),
+            Ok(ImproveCommitOutcome::Committed { sha }) => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.record_applied(sha.clone());
+                }
+                self.show_toast(
+                    ToastVariant::Success,
+                    format!("Improve checkpoint committed: {}", &sha[..sha.len().min(8)]),
+                );
+            }
+            Ok(ImproveCommitOutcome::NoChanges) => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.record_addressed();
+                }
+                self.show_toast(
+                    ToastVariant::Info,
+                    "No changes needed; improvement already addressed.".to_string(),
+                );
+            }
             Err(message) => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.record_failed(truncate_error(&message));
+                }
                 self.abort_improve_apply(tx);
                 self.show_toast(
                     ToastVariant::Error,
                     format!("Improve checkpoint failed: {}", truncate_error(&message)),
                 );
+                self.advance_improve_finding(tx);
                 return;
             }
         }
@@ -3208,12 +3257,10 @@ impl App {
         let prepared = match result {
             Ok(preparation) => match *preparation {
                 ImprovePreparation::Ready { files, skipped, .. } if files.is_empty() => {
-                    let worktree_path = self.improve_pr.take().map(|screen| screen.request().worktree_path.clone());
-                    self.show_toast(
-                        ToastVariant::Info,
-                        format!("Improve found no reviewable text changes ({} file(s) skipped).", skipped.len()),
-                    );
-                    self.back_to_dashboard_action_menu(worktree_path, tx);
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.record_skipped_files(&skipped);
+                        screen.enter_done();
+                    }
                     return;
                 }
                 ImprovePreparation::Ready { files, scan_mode, context, skipped, .. } => {
@@ -3228,14 +3275,19 @@ impl App {
                     discovery.set_review_context(context);
                     discovery.set_files(files, String::new(), String::new(), String::new());
                     discovery.record_skipped_files(&skipped);
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.record_skipped_files(&skipped);
+                    }
                     self.review_pr = Some(discovery);
                     self.start_review_scans(tx);
                     return;
                 }
-                ImprovePreparation::NoChanges => (
-                    ToastVariant::Info,
-                    "Improve found no changes from the local base branch.".to_string(),
-                ),
+                ImprovePreparation::NoChanges => {
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.enter_done();
+                    }
+                    return;
+                }
                 ImprovePreparation::AiNotConfigured => (
                     ToastVariant::Warning,
                     "Configure Review discovery models and the Fix apply model in Settings → Dashboard → ai before improving.".to_string(),
@@ -3562,6 +3614,9 @@ impl App {
             }
         } else {
             screen.enter_done();
+            if screen.is_improve() {
+                self.begin_improve_finding_review();
+            }
         }
     }
 
@@ -11836,6 +11891,16 @@ mod tests {
     #[test]
     fn improve_retry_exhaustion_settles_and_rejects_stale_scan_events() {
         let mut app = improve_scan_test_app(ReviewScanMode::Split, &["tests/unit_test.rs"]);
+        app.improve_pr = Some(ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        ));
         app.review_pr.as_mut().unwrap().take_next_scan_file();
         let tx = app_event_tx();
         for (retry, raw_output) in [
@@ -11859,6 +11924,13 @@ mod tests {
         );
         assert!(screen.is_improve());
         assert_eq!(screen.scan_telemetry_len(), 0);
+        assert_eq!(
+            app.improve_pr
+                .as_mut()
+                .unwrap()
+                .handle_key(key(KeyCode::Enter)),
+            ImproveAction::Done
+        );
 
         app.apply_review_pr_scanned(
             0,

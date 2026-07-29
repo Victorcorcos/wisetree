@@ -16,6 +16,7 @@ use crate::config::schema::{AiFixConfig, AiReviewConfig};
 use crate::messages::colors;
 use crate::services::dashboard::ReviewFinding;
 use crate::services::BugkillSnapshot;
+use crate::services::ReviewSkippedFile;
 use crate::tui::screens::dashboard::ImproveRequest;
 use crate::tui::screens::update_pr::key_event_to_pty_bytes;
 use crate::tui::widgets::PtyView;
@@ -36,6 +37,14 @@ pub enum ImproveAction {
     Revise(String),
     ApplyReady,
     AbortApply,
+    Done,
+}
+
+#[derive(Clone)]
+struct ImproveOutcome {
+    item: String,
+    status: String,
+    color: ratatui::style::Color,
 }
 
 pub struct ImprovePullRequestScreen {
@@ -55,6 +64,9 @@ pub struct ImprovePullRequestScreen {
     pty: Option<PtyView>,
     pty_focused: bool,
     pre_snapshot: Option<BugkillSnapshot>,
+    outcomes: Vec<ImproveOutcome>,
+    done: bool,
+    done_scroll: u16,
 }
 
 impl ImprovePullRequestScreen {
@@ -76,6 +88,9 @@ impl ImprovePullRequestScreen {
             pty: None,
             pty_focused: false,
             pre_snapshot: None,
+            outcomes: Vec::new(),
+            done: false,
+            done_scroll: 0,
         }
     }
 
@@ -84,6 +99,20 @@ impl ImprovePullRequestScreen {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ImproveAction {
+        if self.done {
+            return match key.code {
+                KeyCode::Up => {
+                    self.done_scroll = self.done_scroll.saturating_sub(1);
+                    ImproveAction::Continue
+                }
+                KeyCode::Down => {
+                    self.done_scroll = self.done_scroll.saturating_add(1);
+                    ImproveAction::Continue
+                }
+                KeyCode::Enter | KeyCode::Esc => ImproveAction::Done,
+                _ => ImproveAction::Continue,
+            };
+        }
         if self.applying {
             if self.pty.is_some() && matches!(key.code, KeyCode::Tab) {
                 self.pty_focused = !self.pty_focused;
@@ -174,6 +203,10 @@ impl ImprovePullRequestScreen {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        if self.done {
+            self.render_done(frame, area);
+            return;
+        }
         if self.applying {
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -372,6 +405,97 @@ impl ImprovePullRequestScreen {
         self.total = total;
         self.selected = 0;
     }
+    pub fn record_skipped_files(&mut self, skipped: &[ReviewSkippedFile]) {
+        self.outcomes
+            .extend(skipped.iter().map(|file| ImproveOutcome {
+                item: format!("Skipped file: {}", file.path),
+                status: format!("Skipped ({})", file.reason),
+                color: colors::MUTED,
+            }));
+    }
+    pub fn record_applied(&mut self, sha: String) {
+        self.record_current_outcome(
+            format!("Applied ({})", &sha[..sha.len().min(8)]),
+            colors::SUCCESS,
+        );
+    }
+    pub fn record_addressed(&mut self) {
+        self.record_current_outcome("Already addressed".to_string(), colors::MUTED);
+    }
+    pub fn record_skipped(&mut self) {
+        self.record_current_outcome("Skipped".to_string(), colors::MUTED);
+    }
+    pub fn record_failed(&mut self, message: String) {
+        self.record_current_outcome(format!("Failed: {message}"), colors::ERROR);
+    }
+    pub fn enter_done(&mut self) {
+        self.preparing = false;
+        self.applying = false;
+        self.finding = None;
+        self.done = true;
+        self.done_scroll = 0;
+    }
+
+    fn record_current_outcome(&mut self, status: String, color: ratatui::style::Color) {
+        if let Some(finding) = self.finding.as_ref() {
+            self.outcomes.push(ImproveOutcome {
+                item: format!("{} — {}", finding.descriptor(), finding.title),
+                status,
+                color,
+            });
+        }
+    }
+
+    fn render_done(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let applied = self
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.status.starts_with("Applied"))
+            .count();
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "Improve complete",
+                Style::default()
+                    .fg(colors::IMPROVE)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!(
+                "{} checkpoint commit(s) created. Every result is retained below.",
+                applied
+            )),
+            Line::default(),
+        ];
+        if self.outcomes.is_empty() {
+            lines.push(Line::from("No reviewable improvements were found."));
+        } else {
+            for outcome in &self.outcomes {
+                lines.push(Line::from(Span::styled(
+                    outcome.item.clone(),
+                    Style::default().fg(colors::WHITE),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", outcome.status),
+                    Style::default().fg(outcome.color),
+                )));
+            }
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "↑/↓ scroll · Enter/Esc return to dashboard",
+            Style::default().fg(colors::MUTED),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Improve results "),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((self.done_scroll, 0)),
+            area,
+        );
+    }
     pub fn current_index(&self) -> usize {
         self.current
     }
@@ -452,6 +576,8 @@ fn build_confirm(request: &ImproveRequest) -> ConfirmationModal {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     use super::*;
 
@@ -527,5 +653,60 @@ mod tests {
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Revise("n".into())
         );
+    }
+
+    fn render(screen: &mut ImprovePullRequestScreen, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn done_report_lists_mixed_outcomes_and_scrolls_at_narrow_sizes() {
+        let mut screen = screen();
+        screen.record_skipped_files(&[ReviewSkippedFile {
+            path: "generated/a-very-long-file-name-that-must-wrap.rs".into(),
+            reason: "generated file",
+        }]);
+        screen.show_finding(finding(), 0, 3);
+        screen.record_applied("1234567890abcdef".into());
+        screen.record_addressed();
+        screen.record_skipped();
+        screen.record_failed(
+            "a deliberately long failure that remains visible after scrolling".into(),
+        );
+        screen.enter_done();
+
+        let wide = render(&mut screen, 100, 20);
+        assert!(wide.contains("Improve complete"));
+        assert!(wide.contains("checkpoint commit"));
+        assert!(wide.contains("Applied (12345678)"));
+        assert!(wide.contains("Already addressed"));
+        assert!(wide.contains("Skipped"));
+        assert!(wide.contains("Failed:"));
+
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let narrow = render(&mut screen, 36, 8);
+        assert!(narrow.contains("Improve results"));
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ImproveAction::Done
+        );
+    }
+
+    #[test]
+    fn empty_done_report_is_meaningful() {
+        let mut screen = screen();
+        screen.enter_done();
+        assert!(render(&mut screen, 70, 12).contains("No reviewable improvements were found."));
     }
 }
