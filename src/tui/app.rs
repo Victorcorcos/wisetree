@@ -210,6 +210,18 @@ enum AppEvent {
     ReviewPrPrepared(Result<Box<ReviewPreparation>, String>),
     /// "Improve": validate and build the local three-dot review input.
     ImprovePrepared(Result<Box<ImprovePreparation>, String>),
+    ImproveApplyReady {
+        index: usize,
+        result: Result<Box<(BugkillSnapshot, FixApplyHandoff)>, String>,
+    },
+    ImproveCommitted {
+        index: usize,
+        result: Result<ImproveCommitOutcome, String>,
+    },
+    ImproveAborted {
+        index: usize,
+        result: Result<(), String>,
+    },
     /// One per-file scan (or a single-finding revision) returned.
     ReviewPrScanned {
         /// File index the scan belongs to — guards against a stale result.
@@ -362,6 +374,11 @@ enum BugkillCommitOutcome {
         sha: String,
         changes: AttemptChanges,
     },
+}
+
+enum ImproveCommitOutcome {
+    NoChanges,
+    Committed { sha: String },
 }
 
 struct MergePrDetailsPayload {
@@ -526,6 +543,7 @@ pub struct App {
     active_fix_operation_id: Option<u64>,
     review_pr: Option<ReviewPullRequestScreen>,
     improve_pr: Option<ImprovePullRequestScreen>,
+    improve_apply_watch: Option<AiTurnWatcher>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
     develop_pr: Option<DevelopPullRequestScreen>,
     next_develop_operation_id: u64,
@@ -704,6 +722,7 @@ impl App {
             active_fix_operation_id: None,
             review_pr: None,
             improve_pr: None,
+            improve_apply_watch: None,
             bugkill_pr: None,
             develop_pr: None,
             next_develop_operation_id: 0,
@@ -912,6 +931,36 @@ impl App {
                             self.fix_apply_watch = None;
                         }
                     }
+                    let improve_status = self
+                        .improve_pr
+                        .as_mut()
+                        .map(|screen| (screen.tick_pty(), screen.applying()));
+                    match improve_status {
+                        Some((true, true)) => {
+                            let turn = self
+                                .improve_apply_watch
+                                .as_mut()
+                                .map(AiTurnWatcher::check_now)
+                                .unwrap_or(AiTurn::Working);
+                            if matches!(turn, AiTurn::Working) {
+                                // A PTY exit without a completed turn is an
+                                // interruption, never an approval to commit.
+                                self.abort_improve_apply(&tx);
+                            } else {
+                                self.on_improve_turn(turn, &tx);
+                            }
+                        }
+                        Some((false, true)) => {
+                            if let Some(turn) = self
+                                .improve_apply_watch
+                                .as_mut()
+                                .and_then(AiTurnWatcher::poll)
+                            {
+                                self.on_improve_turn(turn, &tx);
+                            }
+                        }
+                        _ => self.improve_apply_watch = None,
+                    }
                     // Same for the Bugkill PTYs. The Investigating TUI never
                     // exits on its own, so completion comes from the turn
                     // watcher polling the selected harness; an early PTY exit
@@ -1018,6 +1067,7 @@ impl App {
             || self.bugkill_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.develop_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.fix_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.improve_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -2918,14 +2968,26 @@ impl App {
                 // is retained for the later apply handoff.
             }
             ImproveAction::Apply => {
-                if let Some(screen) = self.improve_pr.as_mut() {
-                    screen.start_preparing();
-                }
-                self.show_toast(
-                    ToastVariant::Info,
-                    "Improvement approved; applying it is the next pipeline stage.".to_string(),
+                let Some(screen) = self.improve_pr.as_mut() else {
+                    return;
+                };
+                let Some(finding) = screen.current_finding() else {
+                    return;
+                };
+                let index = screen.current_index();
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_applying();
+                kick_off_improve_apply(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    finding,
+                    index,
+                    tx.clone(),
                 );
             }
+            ImproveAction::ApplyReady => self.finish_improve_apply(tx),
+            ImproveAction::AbortApply => self.abort_improve_apply(tx),
             ImproveAction::Revise(feedback) => self.revise_improve_finding(feedback, tx),
         }
     }
@@ -2994,6 +3056,145 @@ impl App {
             request,
             tx.clone(),
         );
+    }
+
+    fn finish_improve_apply(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.improve_apply_watch = None;
+        let Some(screen) = self.improve_pr.as_mut() else {
+            return;
+        };
+        let Some(finding) = screen.current_finding() else {
+            return;
+        };
+        let Some(pre) = screen.pre_snapshot() else {
+            return;
+        };
+        let index = screen.current_index();
+        let worktree_path = screen.request().worktree_path.clone();
+        screen.finish_apply();
+        kick_off_improve_commit(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            worktree_path,
+            finding,
+            pre,
+            index,
+            tx.clone(),
+        );
+    }
+
+    fn abort_improve_apply(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.improve_apply_watch = None;
+        let Some(screen) = self.improve_pr.as_mut() else {
+            return;
+        };
+        let index = screen.current_index();
+        let pre = screen.pre_snapshot();
+        let worktree_path = screen.request().worktree_path.clone();
+        screen.finish_apply();
+        let Some(pre) = pre else {
+            // The user cancelled while the snapshot/handoff task was still
+            // pending, before an AI process could have changed the tree.
+            return;
+        };
+        kick_off_improve_abort(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            worktree_path,
+            pre,
+            index,
+            tx.clone(),
+        );
+    }
+
+    fn on_improve_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match turn {
+            AiTurn::Working => {}
+            AiTurn::Finished { .. } => self.finish_improve_apply(tx),
+            AiTurn::Failed { message } => {
+                self.abort_improve_apply(tx);
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Improve apply failed: {}", truncate_error(&message)),
+                );
+            }
+        }
+    }
+
+    fn apply_improve_apply_ready(
+        &mut self,
+        index: usize,
+        result: Result<Box<(BugkillSnapshot, FixApplyHandoff)>, String>,
+    ) {
+        if !self
+            .improve_pr
+            .as_ref()
+            .is_some_and(|s| s.current_index() == index && s.applying())
+        {
+            return;
+        }
+        match result {
+            Ok(payload) => {
+                let (snapshot, handoff) = *payload;
+                self.improve_apply_watch =
+                    Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.set_pre_snapshot(snapshot);
+                    screen.spawn_opencode_pty(
+                        handoff.command.binary,
+                        handoff.command.args,
+                        handoff.command.cwd,
+                        handoff.harness.renders_inline(),
+                    );
+                }
+            }
+            Err(message) => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.finish_apply();
+                }
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!(
+                        "Could not start Improve apply: {}",
+                        truncate_error(&message)
+                    ),
+                );
+            }
+        }
+    }
+
+    fn apply_improve_committed(
+        &mut self,
+        index: usize,
+        result: Result<ImproveCommitOutcome, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self
+            .improve_pr
+            .as_ref()
+            .is_some_and(|s| s.current_index() == index)
+        {
+            return;
+        }
+        match result {
+            Ok(ImproveCommitOutcome::Committed { sha }) => self.show_toast(
+                ToastVariant::Success,
+                format!("Improve checkpoint committed: {}", &sha[..sha.len().min(8)]),
+            ),
+            Ok(ImproveCommitOutcome::NoChanges) => self.show_toast(
+                ToastVariant::Info,
+                "No changes needed; improvement already addressed.".to_string(),
+            ),
+            Err(message) => {
+                self.abort_improve_apply(tx);
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Improve checkpoint failed: {}", truncate_error(&message)),
+                );
+                return;
+            }
+        }
+        self.advance_improve_finding(tx);
     }
 
     fn apply_improve_prepared(
@@ -3746,7 +3947,14 @@ impl App {
         }
         if screen.finish_verification() {
             if screen.is_improve() {
-                self.begin_improve_finding_review();
+                // Improve normally has its companion decision screen. Keep
+                // the discovery state terminal in isolated/test callers that
+                // only construct the read-only discovery screen.
+                if self.improve_pr.is_some() {
+                    self.begin_improve_finding_review();
+                } else if let Some(screen) = self.review_pr.as_mut() {
+                    screen.enter_done();
+                }
             } else {
                 screen.enter_decision();
             }
@@ -6897,6 +7105,34 @@ impl App {
             }
             AppEvent::ReviewPrPrepared(result) => self.apply_review_pr_prepared(result, tx),
             AppEvent::ImprovePrepared(result) => self.apply_improve_prepared(result, tx),
+            AppEvent::ImproveApplyReady { index, result } => {
+                self.apply_improve_apply_ready(index, result)
+            }
+            AppEvent::ImproveCommitted { index, result } => {
+                self.apply_improve_committed(index, result, tx)
+            }
+            AppEvent::ImproveAborted { index, result } => {
+                if self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(|s| s.current_index() == index)
+                {
+                    match result {
+                        Ok(()) => self.show_toast(
+                            ToastVariant::Info,
+                            "Improve attempt cancelled; its uncommitted changes were removed."
+                                .to_string(),
+                        ),
+                        Err(message) => self.show_toast(
+                            ToastVariant::Error,
+                            format!(
+                                "Could not clean up Improve attempt: {}",
+                                truncate_error(&message)
+                            ),
+                        ),
+                    }
+                }
+            }
             AppEvent::ReviewPrScanned {
                 file_index,
                 retry,
@@ -9582,6 +9818,101 @@ fn kick_off_prepare_improve(
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ImprovePrepared(result));
+    });
+}
+
+fn kick_off_improve_apply(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    finding: ReviewFinding,
+    index: usize,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ImproveApplyReady {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = async {
+            let snapshot = service.bugkill_snapshot(&worktree_path).await?;
+            let handoff = service
+                .prepare_improve_apply(&worktree_path, &finding)
+                .await?;
+            Ok::<_, crate::errors::WisetreeError>(Box::new((snapshot, handoff)))
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ImproveApplyReady { index, result });
+    });
+}
+
+fn kick_off_improve_commit(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    finding: ReviewFinding,
+    pre: BugkillSnapshot,
+    index: usize,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ImproveCommitted {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = async {
+            let post = service.bugkill_snapshot(&worktree_path).await?;
+            let changes = compute_attempt_changes(&post.tracked, &post.untracked, &pre.untracked);
+            if changes.commit_paths.is_empty() {
+                return Ok(ImproveCommitOutcome::NoChanges);
+            }
+            let sha = service
+                .improve_commit_attempt(&worktree_path, &changes, index + 1, &finding)
+                .await?;
+            Ok(ImproveCommitOutcome::Committed { sha })
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ImproveCommitted { index, result });
+    });
+}
+
+fn kick_off_improve_abort(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    pre: BugkillSnapshot,
+    index: usize,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ImproveAborted {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = async {
+            let post = service.bugkill_snapshot(&worktree_path).await?;
+            let changes = compute_attempt_changes(&post.tracked, &post.untracked, &pre.untracked);
+            service
+                .bugkill_abort_cleanup(&worktree_path, &changes.all)
+                .await
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ImproveAborted { index, result });
     });
 }
 

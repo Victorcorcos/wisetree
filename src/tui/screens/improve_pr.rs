@@ -3,6 +3,8 @@
 //! Later pipeline stages own discovery and application. This screen only
 //! presents the already-configured Review and Fix models and gates entry.
 
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
@@ -13,7 +15,10 @@ use ratatui::Frame;
 use crate::config::schema::{AiFixConfig, AiReviewConfig};
 use crate::messages::colors;
 use crate::services::dashboard::ReviewFinding;
+use crate::services::BugkillSnapshot;
 use crate::tui::screens::dashboard::ImproveRequest;
+use crate::tui::screens::update_pr::key_event_to_pty_bytes;
+use crate::tui::widgets::PtyView;
 use crate::tui::widgets::{
     labeled_line, AiRoleRow, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
     PrConfirmView,
@@ -29,6 +34,8 @@ pub enum ImproveAction {
     Other,
     Skip,
     Revise(String),
+    ApplyReady,
+    AbortApply,
 }
 
 pub struct ImprovePullRequestScreen {
@@ -43,6 +50,11 @@ pub struct ImprovePullRequestScreen {
     selected: u8,
     other: Option<crate::tui::widgets::InputPrompt>,
     autonomous: bool,
+    applying: bool,
+    ai_done: bool,
+    pty: Option<PtyView>,
+    pty_focused: bool,
+    pre_snapshot: Option<BugkillSnapshot>,
 }
 
 impl ImprovePullRequestScreen {
@@ -59,6 +71,11 @@ impl ImprovePullRequestScreen {
             selected: 0,
             other: None,
             autonomous: false,
+            applying: false,
+            ai_done: false,
+            pty: None,
+            pty_focused: false,
+            pre_snapshot: None,
         }
     }
 
@@ -67,6 +84,28 @@ impl ImprovePullRequestScreen {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ImproveAction {
+        if self.applying {
+            if self.pty.is_some() && matches!(key.code, KeyCode::Tab) {
+                self.pty_focused = !self.pty_focused;
+                return ImproveAction::Continue;
+            }
+            if self.pty_focused {
+                if let Some(pty) = self.pty.as_mut() {
+                    if let Some(bytes) = key_event_to_pty_bytes(&key) {
+                        pty.send_input(&bytes);
+                    }
+                }
+                return ImproveAction::Continue;
+            }
+            return match key.code {
+                KeyCode::Enter => {
+                    self.ai_done = true;
+                    ImproveAction::ApplyReady
+                }
+                KeyCode::Esc => ImproveAction::AbortApply,
+                _ => ImproveAction::Continue,
+            };
+        }
         if self.preparing {
             return ImproveAction::Continue;
         }
@@ -134,7 +173,28 @@ impl ImprovePullRequestScreen {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        if self.applying {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(if self.pty_focused {
+                    " AI Activity · inner focused "
+                } else {
+                    " AI Activity · outer focused "
+                });
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            if let Some(pty) = self.pty.as_mut() {
+                pty.render(frame, inner);
+            } else {
+                frame.render_widget(
+                    Paragraph::new("Preparing the Fix apply model...")
+                        .style(Style::default().fg(colors::MUTED)),
+                    inner,
+                );
+            }
+            return;
+        }
         if let Some(finding) = self.finding.as_ref() {
             if let Some(input) = self.other.as_ref() {
                 input.render(frame, area, 0);
@@ -256,6 +316,53 @@ impl ImprovePullRequestScreen {
 
     pub fn start_preparing(&mut self) {
         self.preparing = true;
+    }
+    pub fn start_applying(&mut self) {
+        self.preparing = true;
+        self.applying = true;
+        self.ai_done = false;
+        self.pty = None;
+        self.pty_focused = false;
+        self.pre_snapshot = None;
+    }
+    pub fn set_pre_snapshot(&mut self, snapshot: BugkillSnapshot) {
+        self.pre_snapshot = Some(snapshot);
+    }
+    pub fn pre_snapshot(&self) -> Option<BugkillSnapshot> {
+        self.pre_snapshot.clone()
+    }
+    pub fn spawn_opencode_pty(
+        &mut self,
+        binary: PathBuf,
+        args: Vec<String>,
+        cwd: PathBuf,
+        renders_inline: bool,
+    ) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &[], renders_inline) {
+            Ok(pty) => self.pty = Some(pty),
+            Err(_) => self.applying = false,
+        }
+    }
+    pub fn tick_pty(&mut self) -> bool {
+        let Some(pty) = self.pty.as_mut() else {
+            return false;
+        };
+        if pty.poll_exited() && !self.ai_done {
+            self.ai_done = true;
+            return true;
+        }
+        false
+    }
+    pub fn finish_apply(&mut self) {
+        self.preparing = false;
+        self.applying = false;
+        self.pty = None;
+    }
+    pub fn applying(&self) -> bool {
+        self.applying
+    }
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
     }
 
     pub fn show_finding(&mut self, finding: ReviewFinding, current: usize, total: usize) {

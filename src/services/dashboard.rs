@@ -3052,6 +3052,80 @@ impl DashboardService {
         })
     }
 
+    /// Build the live, local-only handoff for one approved Improve finding.
+    /// Unlike `prepare_apply`, this deliberately has no PR comment or plan:
+    /// the reviewed finding itself is the complete implementation instruction.
+    pub async fn prepare_improve_apply(
+        &self,
+        worktree_path: &str,
+        finding: &ReviewFinding,
+    ) -> Result<FixApplyHandoff> {
+        let cwd = PathBuf::from(worktree_path);
+        let prompt = format!(
+            "Implement this approved local improvement. Work only on the smallest safe change, including tests when required. Do not create a pull request, post comments, push, or commit; Wisetree will checkpoint your changes.\n\nLocation: {}\nCategory: {}\nSeverity: {}\nTitle: {}\n\nWhy it matters:\n{}\n\nSuggested change:\n{}",
+            finding.descriptor(),
+            finding.category,
+            finding.severity.label(),
+            finding.title,
+            finding.explanation,
+            finding.suggestion.as_deref().unwrap_or("Implement the smallest safe correction."),
+        );
+        let command = self
+            .ai_command(
+                "dashboard.ai.fix.apply",
+                &self.config.ai.fix.apply,
+                prompt,
+                cwd,
+                AiRunMode::Interactive,
+                AiPermission::Implement,
+            )
+            .await?;
+        Ok(FixApplyHandoff {
+            command,
+            harness: self.config.ai.fix.apply.harness,
+        })
+    }
+
+    /// Commit exactly the files introduced or changed by one Improve attempt.
+    /// The caller computes `changes` from an attempt snapshot; in particular,
+    /// this must never stage ambient dirty files or harness-owned output.
+    pub async fn improve_commit_attempt(
+        &self,
+        worktree_path: &str,
+        changes: &AttemptChanges,
+        number: usize,
+        finding: &ReviewFinding,
+    ) -> Result<String> {
+        if changes.commit_paths.is_empty() {
+            return Err(WisetreeError::other(
+                "nothing to commit for this improvement.",
+            ));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        for path in &changes.commit_paths {
+            self.bugkill_git(&cwd, &["add", "--", path])
+                .await
+                .map_err(WisetreeError::other)?;
+        }
+        let subject = format!(
+            "improve: checkpoint #{number} — {}",
+            finding.title.chars().take(50).collect::<String>()
+        );
+        self.bugkill_git(&cwd, &["commit", "-m", &subject])
+            .await
+            .map_err(|err| {
+                WisetreeError::other(if err.trim().is_empty() {
+                    "git commit failed after staging the improvement.".to_string()
+                } else {
+                    err
+                })
+            })?;
+        let sha = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+        Ok(sha.trim().to_string())
+    }
+
     /// After a live apply: stage the change, commit it with the review
     /// commit-message format, and reply to the reviewer with the commit link.
     /// All deterministic — no AI. `comment_index` is the 1-based position in
