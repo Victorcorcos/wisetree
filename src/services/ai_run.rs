@@ -153,23 +153,11 @@ impl AiRunner {
                 // SGR mouse reports (whose leading ESC interrupts the turn).
                 let mut args = vec![
                     "--no-alt-screen".into(),
+                    "--dangerously-bypass-approvals-and-sandbox".into(),
                     "--model".into(),
                     model,
                     prompt.clone(),
                 ];
-                if request.permission == AiPermission::Plan {
-                    args.extend(["--sandbox".into(), "read-only".into()]);
-                } else {
-                    // The interactive `codex` root command has no `--full-auto`
-                    // flag (removed upstream); autonomy is `workspace-write`
-                    // plus never prompting for approval.
-                    args.extend([
-                        "--sandbox".into(),
-                        "workspace-write".into(),
-                        "--ask-for-approval".into(),
-                        "never".into(),
-                    ]);
-                }
                 if !effort.is_empty() {
                     args.extend([
                         "--config".into(),
@@ -179,15 +167,13 @@ impl AiRunner {
                 args
             }
             (AiHarness::Codex, AiRunMode::Captured) => {
-                let mut args = vec!["exec".into(), "--model".into(), model, prompt.clone()];
-                if request.permission == AiPermission::Plan {
-                    args.extend(["--sandbox".into(), "read-only".into()]);
-                } else {
-                    // `codex exec` runs non-interactively (never prompts), so
-                    // `workspace-write` alone is the autonomy policy; it has no
-                    // `--full-auto` / `--ask-for-approval` flag.
-                    args.extend(["--sandbox".into(), "workspace-write".into()]);
-                }
+                let mut args = vec![
+                    "exec".into(),
+                    "--dangerously-bypass-approvals-and-sandbox".into(),
+                    "--model".into(),
+                    model,
+                    prompt.clone(),
+                ];
                 if !effort.is_empty() {
                     args.extend([
                         "--config".into(),
@@ -197,8 +183,12 @@ impl AiRunner {
                 args
             }
             (AiHarness::ClaudeCode, AiRunMode::Interactive) => {
-                let mut args = vec!["--model".into(), model, prompt.clone()];
-                args.extend(permission_args(request.permission));
+                let mut args = vec![
+                    "--dangerously-skip-permissions".into(),
+                    "--model".into(),
+                    model,
+                    prompt.clone(),
+                ];
                 if !effort.is_empty() {
                     args.extend(["--effort".into(), effort.into()]);
                 }
@@ -207,13 +197,13 @@ impl AiRunner {
             (AiHarness::ClaudeCode, AiRunMode::Captured) => {
                 let mut args = vec![
                     "-p".into(),
+                    "--dangerously-skip-permissions".into(),
                     prompt.clone(),
                     "--model".into(),
                     model,
                     "--output-format".into(),
                     "text".into(),
                 ];
-                args.extend(permission_args(request.permission));
                 if !effort.is_empty() {
                     args.extend(["--effort".into(), effort.into()]);
                 }
@@ -413,13 +403,6 @@ fn append_attachment_paths(prompt: &str, attachments: &[PathBuf], mention: &str)
         ));
     }
     out
-}
-
-fn permission_args(permission: AiPermission) -> Vec<String> {
-    match permission {
-        AiPermission::Plan => vec!["--permission-mode".into(), "plan".into()],
-        AiPermission::Implement => vec!["--permission-mode".into(), "acceptEdits".into()],
-    }
 }
 
 fn canonical_model(harness: AiHarness, model: &str) -> Option<String> {
@@ -763,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn translates_canonical_models_and_permission_policy() {
+    fn translates_canonical_codex_models() {
         let runner = AiRunner::default().with_binary(AiHarness::Codex, PathBuf::from("true"));
         let command = runner
             .command(&request(AiHarness::Codex, AiRunMode::Captured))
@@ -772,44 +755,53 @@ mod tests {
             .args
             .windows(2)
             .any(|args| args == ["--model", "gpt-5"]));
-        assert!(command
-            .args
-            .windows(2)
-            .any(|args| args == ["--sandbox", "read-only"]));
     }
 
     #[test]
-    fn codex_implement_uses_valid_autonomy_flags_not_full_auto() {
-        // codex-cli removed `--full-auto`; passing it makes codex exit
-        // immediately with "unexpected argument", which the PR commands
-        // surfaced as "AI exited before finishing". Autonomy is expressed via
-        // `--sandbox workspace-write` (plus `--ask-for-approval never` for the
-        // interactive TUI, which — unlike `exec` — can prompt).
+    fn codex_always_bypasses_approvals_and_sandbox() {
         let runner = AiRunner::default().with_binary(AiHarness::Codex, PathBuf::from("true"));
         for mode in [AiRunMode::Interactive, AiRunMode::Captured] {
-            let mut req = request(AiHarness::Codex, mode);
-            req.permission = AiPermission::Implement;
-            let command = runner.command(&req).unwrap();
+            for permission in [AiPermission::Plan, AiPermission::Implement] {
+                let mut req = request(AiHarness::Codex, mode);
+                req.permission = permission;
+                let command = runner.command(&req).unwrap();
+                assert!(command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+                assert!(!command.args.iter().any(|arg| arg == "--sandbox"));
+                assert!(!command.args.iter().any(|arg| arg == "--ask-for-approval"));
+            }
+        }
+    }
+
+    #[test]
+    fn claude_always_skips_permissions() {
+        let runner = AiRunner::default().with_binary(AiHarness::ClaudeCode, PathBuf::from("true"));
+        for mode in [AiRunMode::Interactive, AiRunMode::Captured] {
+            for permission in [AiPermission::Plan, AiPermission::Implement] {
+                let mut req = request(AiHarness::ClaudeCode, mode);
+                req.permission = permission;
+                let command = runner.command(&req).unwrap();
+                assert!(command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions"));
+                assert!(!command.args.iter().any(|arg| arg == "--permission-mode"));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_does_not_use_removed_full_auto_flag() {
+        let runner = AiRunner::default().with_binary(AiHarness::Codex, PathBuf::from("true"));
+        for mode in [AiRunMode::Interactive, AiRunMode::Captured] {
+            let command = runner.command(&request(AiHarness::Codex, mode)).unwrap();
             assert!(
                 !command.args.iter().any(|arg| arg == "--full-auto"),
                 "codex {mode:?} must not pass the removed --full-auto flag"
             );
-            assert!(
-                command
-                    .args
-                    .windows(2)
-                    .any(|args| args == ["--sandbox", "workspace-write"]),
-                "codex {mode:?} Implement should run under workspace-write"
-            );
         }
-
-        let mut interactive = request(AiHarness::Codex, AiRunMode::Interactive);
-        interactive.permission = AiPermission::Implement;
-        let command = runner.command(&interactive).unwrap();
-        assert!(command
-            .args
-            .windows(2)
-            .any(|args| args == ["--ask-for-approval", "never"]));
     }
 
     #[test]
