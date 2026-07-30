@@ -548,9 +548,10 @@ pub struct App {
     /// to Review once opencode finishes writing `pull_request.md`. `Some`
     /// only while the `Explaining` step is active.
     explain_draft: Option<AiTurnWatcher>,
-    /// Same idea for the Fix screen's apply TUI in Autonomous mode — commits
-    /// each fix + replies the moment opencode's turn finishes, so the user
-    /// never has to press Enter. `Some` only while an autonomous `Applying`
+    /// Same idea for the Fix screen's apply TUI — commits each fix + replies
+    /// the moment the AI CLI's turn finishes, so the user never has to press
+    /// Enter. Manual mode still picks Apply / Other / Skip per comment; only
+    /// the "is it done yet" finalize is automated. `Some` while an `Applying`
     /// step is live.
     fix_apply_watch: Option<AiTurnWatcher>,
     /// Same idea for Update PR's (and "Update branch (locally)"'s) conflict-
@@ -831,6 +832,17 @@ impl App {
                         // its last known size between resize events.
                         screen.tick_pty(None);
                     }
+                    // The AI CLI's PTY exited: never trusted as "the merge is
+                    // resolved" on its own, so the handler re-checks the
+                    // harness state first. Consumed before the poll below so
+                    // the watcher is still around to answer.
+                    if self
+                        .update_pr
+                        .as_mut()
+                        .is_some_and(UpdatePullRequestScreen::take_ai_exit)
+                    {
+                        self.on_update_conflict_pty_exited();
+                    }
                     // The conflict-resolution TUI never exits on its own, so
                     // completion comes from the turn watcher polling
                     // opencode's database and marking the AI done
@@ -881,30 +893,12 @@ impl App {
                             self.explain_draft = None;
                         }
                     }
-                    // Same for the Fix PR apply PTY. In autonomous mode a
-                    // finished opencode turn (detected via the database)
-                    // commits the fix automatically; in manual mode the user
-                    // finalizes with Enter, so PTY exit is ignored. A PTY exit
-                    // in autonomous mode is *not* trusted as "done" —
-                    // `on_fix_apply_pty_exited` re-checks the database so an
-                    // interrupted / early-quit opencode can't be mistaken for
-                    // a successfully applied fix.
-                    let fix_status = self
+                    let fix_tick = self
                         .fix_pr
                         .as_mut()
-                        .map(|screen| (screen.tick_pty(None), screen.step(), screen.autonomous()));
-                    match fix_status {
-                        Some((true, FixStep::Applying, true)) => self.on_fix_apply_pty_exited(&tx),
-                        Some((false, FixStep::Applying, true)) => {
-                            if let Some(turn) =
-                                self.fix_apply_watch.as_mut().and_then(AiTurnWatcher::poll)
-                            {
-                                self.on_fix_turn(turn, &tx);
-                            }
-                        }
-                        _ => {
-                            self.fix_apply_watch = None;
-                        }
+                        .map(|screen| (screen.tick_pty(None), screen.step()));
+                    if let Some((exited, step)) = fix_tick {
+                        self.on_fix_tick(exited, step, &tx);
                     }
                     let bugkill_tick = self
                         .bugkill_pr
@@ -913,52 +907,12 @@ impl App {
                     if let Some((exited, step)) = bugkill_tick {
                         self.on_bugkill_tick(exited, step, &tx);
                     }
-                    // Same for the Develop TUIs. Both live steps are watched
-                    // through opencode's database: a completed Planning turn
-                    // carries the plan transcript; a completed Implementing
-                    // turn marks the section(s) ✅ and (on a Ralph Loop)
-                    // opens the next run. An early PTY exit falls back to the
-                    // same handlers, but only when the child exited with status
-                    // 0 — a crashed or force-quit opencode session is treated
-                    // as a failure rather than a successful completion.
-                    let develop_exited = self
+                    let develop_tick = self
                         .develop_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step()));
-                    match develop_exited {
-                        Some((Some(0), DevelopStep::Planning)) => {
-                            self.on_develop_plan_pty_exited(&tx)
-                        }
-                        Some((Some(0), DevelopStep::Implementing)) => {
-                            self.on_develop_implement_pty_exited(&tx)
-                        }
-                        Some((Some(_), DevelopStep::Planning)) => {
-                            self.develop_watch = None;
-                            if let Some(screen) = self.develop_pr.as_mut() {
-                                screen.kill_pty();
-                                screen.set_planning_error(
-                                    "AI CLI exited before the plan was finished.".to_string(),
-                                    screen.plan_corrective(),
-                                );
-                            }
-                        }
-                        Some((Some(_), DevelopStep::Implementing)) => {
-                            self.develop_watch = None;
-                            if let Some(screen) = self.develop_pr.as_mut() {
-                                screen.kill_pty();
-                                screen.set_error(
-                                    "AI CLI exited before the implementation finished.".to_string(),
-                                );
-                            }
-                        }
-                        Some((None, DevelopStep::Planning | DevelopStep::Implementing)) => {
-                            if let Some(turn) =
-                                self.develop_watch.as_mut().and_then(AiTurnWatcher::poll)
-                            {
-                                self.on_develop_turn(turn, &tx);
-                            }
-                        }
-                        _ => {}
+                    if let Some((exited, step)) = develop_tick {
+                        self.on_develop_tick(exited, step, &tx);
                     }
                 }
                 Event::Resize(width, height) => {
@@ -2734,12 +2688,34 @@ impl App {
         );
     }
 
-    /// Autonomous Fix apply TUI exited before the watcher saw a completed
-    /// turn (the user quit opencode, it crashed, or an Esc-interrupt left the
-    /// turn unfinished). Consult the database once: a genuinely finished turn
-    /// commits + replies; an early exit is recorded as a failed attempt and
-    /// the loop advances, rather than silently committing an unfinished fix.
-    /// Mirrors Development / Bugkill Investigating.
+    /// One tick of the Fix apply PTY, in both modes. The apply TUI never exits
+    /// on its own, so a finished turn read from the harness state is the
+    /// completion signal that commits the fix. Autonomous only decides whether
+    /// the *decision* (Apply / Other / Skip) is automated — not whether the
+    /// finish is detected; without this poll a manual-mode user has to
+    /// hand-confirm (Enter → Yes) an AI CLI that is visibly done. A PTY exit is
+    /// never trusted as "done": `on_fix_apply_pty_exited` re-checks the harness
+    /// so an interrupted / early-quit AI CLI can't be mistaken for a
+    /// successfully applied fix.
+    fn on_fix_tick(&mut self, exited: bool, step: FixStep, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match (exited, step) {
+            (true, FixStep::Applying) => self.on_fix_apply_pty_exited(tx),
+            (false, FixStep::Applying) => {
+                if let Some(turn) = self.fix_apply_watch.as_mut().and_then(AiTurnWatcher::poll) {
+                    self.on_fix_turn(turn, tx);
+                }
+            }
+            _ => self.fix_apply_watch = None,
+        }
+    }
+
+    /// The Fix apply TUI exited before the watcher saw a completed turn (the
+    /// user quit the AI CLI, it crashed, or an Esc-interrupt left the turn
+    /// unfinished). Consult the harness state once: a genuinely finished turn
+    /// commits + replies. An early exit is recorded as a failed attempt in
+    /// autonomous mode, rather than silently committing an unfinished fix;
+    /// in manual mode the screen is left alone so the user keeps the Enter →
+    /// finalize escape hatch. Mirrors Development / Bugkill Investigating.
     fn on_fix_apply_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let turn = self
             .fix_apply_watch
@@ -2749,6 +2725,13 @@ impl App {
         match turn {
             AiTurn::Working => {
                 self.fix_apply_watch = None;
+                if !self
+                    .fix_pr
+                    .as_ref()
+                    .is_some_and(FixPullRequestScreen::autonomous)
+                {
+                    return;
+                }
                 if let Some(screen) = self.fix_pr.as_mut() {
                     screen.record_outcome(FixRowOutcome::Failed(
                         "opencode exited before the fix was applied.".to_string(),
@@ -2760,8 +2743,8 @@ impl App {
         }
     }
 
-    /// Autonomous Fix apply: opencode's turn finished (or errored) in the
-    /// database. A finished turn commits + replies; a failed turn records the
+    /// Fix apply: the AI CLI's turn finished (or errored) in the harness
+    /// state. A finished turn commits + replies; a failed turn records the
     /// error as a Failed row and advances to the next comment.
     fn on_fix_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
@@ -4554,8 +4537,35 @@ impl App {
         }
     }
 
+    /// One tick of the Develop PTYs. Both live steps are watched through the
+    /// harness state: a completed Planning turn carries the plan transcript; a
+    /// completed Implementing turn marks the section(s) ✅ and (on a Ralph
+    /// Loop) opens the next run. A PTY exit routes to the same handlers
+    /// whatever the exit code, since the code says nothing about whether the
+    /// turn finished — an AI CLI that wrote the plan and then crashed (or was
+    /// force-quit) on the way out still deserves its work; the handlers
+    /// re-check the harness and only error when the turn really was
+    /// unfinished.
+    fn on_develop_tick(
+        &mut self,
+        exited: Option<i32>,
+        step: DevelopStep,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match (exited, step) {
+            (Some(_), DevelopStep::Planning) => self.on_develop_plan_pty_exited(tx),
+            (Some(_), DevelopStep::Implementing) => self.on_develop_implement_pty_exited(tx),
+            (None, DevelopStep::Planning | DevelopStep::Implementing) => {
+                if let Some(turn) = self.develop_watch.as_mut().and_then(AiTurnWatcher::poll) {
+                    self.on_develop_turn(turn, tx);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The planning TUI exited before the watcher saw a completed turn (the
-    /// user quit opencode, or it crashed). Check the database once —
+    /// user quit the AI CLI, or it crashed). Check the harness state once —
     /// otherwise error.
     fn on_develop_plan_pty_exited(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let turn = self
@@ -5240,13 +5250,12 @@ impl App {
             Ok(handoff) => {
                 let handoff = *handoff;
                 if let Some(s) = self.fix_pr.as_mut() {
-                    // In Autonomous mode, watch opencode's database so the
-                    // finished turn commits the fix automatically; manual mode
-                    // waits for the user's Enter + finalize confirm instead.
-                    if s.autonomous() {
-                        self.fix_apply_watch =
-                            Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
-                    }
+                    // Watch the harness state in both modes so a finished turn
+                    // commits the fix automatically. The manual mode's choice
+                    // is Apply / Other / Skip per comment; nobody wants to also
+                    // hand-confirm an AI CLI that is visibly done.
+                    self.fix_apply_watch =
+                        Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                     s.spawn_opencode_pty(
                         handoff.command.binary,
                         handoff.command.args,
@@ -5698,6 +5707,30 @@ impl App {
     /// Only a completed provider turn with transcript evidence may unlock the
     /// unattended batch commit. Failed or uncorrelated turns remain a manual
     /// recovery path and must never be interpreted as resolved conflicts.
+    /// The conflict-resolution PTY exited before the watcher saw a completed
+    /// turn (the user quit the AI CLI, it crashed, or an Esc-interrupt left
+    /// the turn unfinished). Consult the harness state once — a genuinely
+    /// finished turn resolves exactly as if the watcher had seen it, so an AI
+    /// that finished and then died on the way out keeps its work; anything
+    /// else is a failure rather than a silently "resolved" merge. Mirrors
+    /// Develop / Fix / Bugkill / Explain.
+    fn on_update_conflict_pty_exited(&mut self) {
+        let turn = self
+            .update_conflict
+            .as_mut()
+            .map(AiTurnWatcher::check_now)
+            .unwrap_or(AiTurn::Working);
+        match turn {
+            AiTurn::Working => {
+                self.update_conflict = None;
+                if let Some(screen) = self.update_pr.as_mut() {
+                    screen.mark_ai_failed("AI CLI exited before resolving the merge.".to_string());
+                }
+            }
+            turn => self.on_update_conflict_turn(turn),
+        }
+    }
+
     fn on_update_conflict_turn(&mut self, turn: AiTurn) {
         match turn {
             AiTurn::Working => return,
@@ -10625,16 +10658,18 @@ fn reset_global_config() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::WorktreeConfig;
+    use crate::config::schema::{AiFixConfig, WorktreeConfig};
     use crate::config::service::ConfigService;
     use crate::services::{
-        AiStatusReport, DevelopPlan, DevelopPreflight, PlanSection, PullRequest, ReviewerSummary,
+        AiStatusReport, DevelopPlan, DevelopPreflight, PlanSection, PullRequest, ReviewComment,
+        ReviewerSummary,
     };
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::fs;
+    use std::path::Path;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -12863,6 +12898,298 @@ mod tests {
             None,
             "a finished turn is not an early exit"
         );
+    }
+
+    /// Build a Fix screen parked on a live `Applying` step for `worktree`,
+    /// with the turn watcher pointed at a hermetic Claude Code state dir.
+    fn applying_fix_app(worktree: &Path, claude_projects: &Path) -> App {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::FixPullRequest;
+        let mut screen = FixPullRequestScreen::new(
+            FixPullRequestRequest {
+                number: 42,
+                title: "Add retry logic".to_string(),
+                url: "https://github.com/o/r/pull/42".to_string(),
+                branch: "digit-3131-retry".to_string(),
+                worktree_path: worktree.display().to_string(),
+            },
+            AiFixConfig::default(),
+        );
+        screen.set_groups(
+            vec![CommentGroup {
+                file: Some("a.rs".to_string()),
+                line: Some(10),
+                reply_comment_id: Some(7),
+                comments: vec![ReviewComment {
+                    author: "alice".to_string(),
+                    body: "Magic number 3000 is unclear".to_string(),
+                    database_id: Some(7),
+                    viewer_did_author: false,
+                }],
+            }],
+            "o".to_string(),
+            "r".to_string(),
+        );
+        screen.show_decision(FixPlan {
+            summary: "extract retry delay into a named constant".to_string(),
+            validity: "Valid.".to_string(),
+            explanation: "Replace the literal with RETRY_DELAY_MS.".to_string(),
+            change: "diff".to_string(),
+        });
+        screen.start_applying();
+        // Manual mode: the user picked Apply by hand and Autonomous is off.
+        assert!(!screen.autonomous());
+        app.fix_pr = Some(screen);
+        app.fix_apply_watch = Some(AiTurnWatcher::with_paths(
+            AiHarness::ClaudeCode,
+            worktree,
+            crate::services::AiStatusPaths {
+                claude_projects: Some(claude_projects.to_path_buf()),
+                ..Default::default()
+            },
+            std::time::SystemTime::now() - Duration::from_secs(1),
+        ));
+        app
+    }
+
+    #[tokio::test]
+    async fn fix_apply_tick_commits_a_finished_turn_without_autonomous_mode() {
+        // The apply TUI never exits on its own, so a finished turn on disk has
+        // to be picked up by the tick poll — in manual mode too. Autonomous
+        // only automates the Apply / Other / Skip decision; without this poll
+        // the user has to hand-confirm (Enter → Yes) an AI CLI that is visibly
+        // done. A turn still Working (tool call in flight, or the user pressed
+        // Esc to send an extra prompt) must keep the apply step open.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("repo-retry");
+        fs::create_dir(&worktree).expect("worktree dir");
+        let session = tmp.path().join("claude/project/session.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).expect("session dir");
+        fs::write(
+            &session,
+            format!(
+                "{{\"type\":\"user\",\"promptId\":\"p\",\"cwd\":\"{}\"}}\n\
+                 {{\"type\":\"assistant\",\"message\":{{\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"text\",\"text\":\"editing\"}}]}}}}",
+                worktree.display()
+            ),
+        )
+        .expect("write session");
+
+        let mut app = applying_fix_app(&worktree, &tmp.path().join("claude"));
+
+        // PTY still alive (`false`), turn still Working → nothing happens.
+        app.on_fix_tick(false, FixStep::Applying, &tx);
+        assert_eq!(app.fix_pr.as_ref().unwrap().step(), FixStep::Applying);
+        assert!(
+            app.fix_apply_watch.is_some(),
+            "an unfinished turn must keep the apply step open"
+        );
+
+        fs::write(
+            &session,
+            format!(
+                "{}\n{{\"type\":\"assistant\",\"message\":{{\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"fix applied\"}}]}}}}",
+                fs::read_to_string(&session).unwrap()
+            ),
+        )
+        .expect("append session");
+        // `poll` is rate-limited to one check per second; the tick loop runs
+        // far faster, so wait out the period the same way the real loop does.
+        std::thread::sleep(Duration::from_millis(1100));
+
+        app.on_fix_tick(false, FixStep::Applying, &tx);
+
+        assert!(
+            app.fix_apply_watch.is_none(),
+            "a finished turn must commit from the tick, with no Enter → Yes"
+        );
+        assert_eq!(
+            app.fix_pr.as_ref().unwrap().step(),
+            FixStep::Working,
+            "the finished turn hands off to the commit + reply phase"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_fix_apply_pty_exit_without_a_finished_turn_keeps_the_screen() {
+        // Quitting the AI CLI mid-turn in manual mode is not "done": the fix
+        // must not be committed. Unlike autonomous mode it is not recorded as
+        // a failure either — the user keeps the Enter → finalize escape hatch.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("repo-retry");
+        fs::create_dir(&worktree).expect("worktree dir");
+
+        let mut app = applying_fix_app(&worktree, &tmp.path().join("claude"));
+        app.on_fix_tick(true, FixStep::Applying, &tx);
+
+        assert!(app.fix_apply_watch.is_none());
+        assert_eq!(
+            app.fix_pr.as_ref().unwrap().step(),
+            FixStep::Applying,
+            "an early exit must neither commit nor advance past the comment"
+        );
+    }
+
+    /// Write a hermetic Claude Code session recording one finished turn in
+    /// `worktree` whose assistant text is `transcript`, and return the state
+    /// directory an `AiTurnWatcher` should be pointed at.
+    fn finished_claude_turn(root: &Path, worktree: &Path, transcript: &str) -> std::path::PathBuf {
+        let projects = root.join("claude");
+        let session = projects.join("project/session.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).expect("session dir");
+        let user = serde_json::json!({
+            "type": "user",
+            "promptId": "p",
+            "cwd": worktree.display().to_string(),
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "stop_reason": "end_turn",
+                "content": [{ "type": "text", "text": transcript }],
+            },
+        });
+        fs::write(&session, format!("{user}\n{assistant}\n")).expect("write session");
+        projects
+    }
+
+    fn claude_watcher(worktree: &Path, projects: &Path) -> AiTurnWatcher {
+        AiTurnWatcher::with_paths(
+            AiHarness::ClaudeCode,
+            worktree,
+            crate::services::AiStatusPaths {
+                claude_projects: Some(projects.to_path_buf()),
+                ..Default::default()
+            },
+            std::time::SystemTime::now() - Duration::from_secs(1),
+        )
+    }
+
+    #[test]
+    fn develop_plan_pty_exit_uses_a_finished_turn_whatever_the_exit_code() {
+        // An AI CLI that wrote the plan and then died on the way out (crash,
+        // force-quit, signal) exits non-zero. The exit code says nothing about
+        // whether the turn finished, so the plan on disk must still be used
+        // instead of throwing the work away with "exited before the plan was
+        // finished".
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, _rx) = app_with_active_develop_flow(&repo);
+            let projects =
+                finished_claude_turn(home.path(), &repo, &valid_develop_plan_transcript());
+            app.develop_watch = Some(claude_watcher(&repo, &projects));
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                app.on_develop_tick(Some(1), DevelopStep::Planning, &tx);
+            });
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(
+                screen.plan().is_some(),
+                "the finished plan must survive a non-zero exit: {:?}",
+                screen.error()
+            );
+            assert_eq!(screen.error(), None);
+        });
+    }
+
+    #[test]
+    fn develop_plan_pty_exit_without_a_finished_turn_still_errors() {
+        // The other direction: no finished turn on disk means the AI really
+        // did quit early, and a zero exit code must not buy it a pass.
+        with_home(|home| {
+            let repo = develop_repo(home);
+            let (mut app, tx, _rx) = app_with_active_develop_flow(&repo);
+            app.develop_watch = Some(claude_watcher(&repo, &home.path().join("empty")));
+
+            app.on_develop_tick(Some(0), DevelopStep::Planning, &tx);
+
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert!(screen.plan().is_none());
+            assert!(
+                screen
+                    .error()
+                    .is_some_and(|error| error.contains("exited before the plan was finished")),
+                "an unfinished turn must surface the early-exit error: {:?}",
+                screen.error()
+            );
+        });
+    }
+
+    /// Mount an Update PR screen parked on a live conflict-resolution turn,
+    /// with the watcher pointed at `projects`.
+    fn resolving_conflict_app(worktree: &Path, projects: &Path) -> App {
+        let mut app = initialized_menu_app();
+        app.screen = Screen::UpdatePullRequest;
+        let mut screen = UpdatePullRequestScreen::new(
+            UpdatePullRequestRequest {
+                number: 21,
+                title: "Improve onboarding flow".to_string(),
+                url: "https://github.com/o/r/pull/21".to_string(),
+                branch: "feat-onboarding".to_string(),
+                worktree_path: worktree.display().to_string(),
+                ahead: 4,
+                behind: 7,
+                base_ref: Some("main".to_string()),
+                pr_base_ref: Some("main".to_string()),
+                autonomous: true,
+            },
+            crate::config::schema::AiModelConfig::default(),
+        );
+        screen.start_updating();
+        screen.mark_ai_active();
+        app.update_pr = Some(screen);
+        app.update_conflict = Some(claude_watcher(worktree, projects));
+        app
+    }
+
+    #[test]
+    fn update_conflict_pty_exit_uses_a_finished_turn_whatever_the_exit_code() {
+        // Same rule as Develop / Fix / Bugkill / Explain: the merge is
+        // resolved because the turn finished, not because the process exited
+        // cleanly. A finished turn with transcript evidence unlocks
+        // Complete/Cancel and the unattended batch commit.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("repo-onboarding");
+        fs::create_dir(&worktree).expect("worktree dir");
+        let projects = finished_claude_turn(tmp.path(), &worktree, "conflicts resolved");
+
+        let mut app = resolving_conflict_app(&worktree, &projects);
+        app.on_update_conflict_pty_exited();
+
+        let screen = app.update_pr.as_ref().unwrap();
+        assert!(screen.ai_done(), "a finished turn resolves the merge");
+        assert!(
+            screen.ai_verified(),
+            "transcript evidence unlocks the unattended commit"
+        );
+        assert!(app.update_conflict.is_none());
+    }
+
+    #[test]
+    fn update_conflict_pty_exit_without_a_finished_turn_fails_the_merge() {
+        // Quitting the AI CLI mid-turn used to be read as "resolved" whenever
+        // the exit code happened to be 0 — a half-merged tree could then be
+        // committed by an unattended batch.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("repo-onboarding");
+        fs::create_dir(&worktree).expect("worktree dir");
+
+        let mut app = resolving_conflict_app(&worktree, &tmp.path().join("empty"));
+        app.on_update_conflict_pty_exited();
+
+        let screen = app.update_pr.as_ref().unwrap();
+        assert!(
+            !screen.ai_done() && !screen.ai_verified(),
+            "an unfinished turn must never count as a resolved merge"
+        );
+        assert!(app.update_conflict.is_none());
     }
 
     #[test]
