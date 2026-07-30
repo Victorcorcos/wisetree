@@ -887,7 +887,7 @@ impl FixPullRequestScreen {
         let description = if self.autonomous {
             "wisetree approves each fix and commits it when the selected AI finishes — no prompts"
         } else {
-            "you choose Apply / Other / Skip per comment and finalize each fix with Enter"
+            "you choose Apply / Other / Skip per comment; each fix commits when the AI finishes"
         };
         PrConfirmView::new(format!(
             "Fix review comments on Pull Request #{}?",
