@@ -125,6 +125,11 @@ pub struct UpdatePullRequestScreen {
     /// with transcript evidence. Update All requires this before auto-commit.
     ai_verified: bool,
     ai_failed: bool,
+    /// One-shot signal that the AI CLI's PTY just exited, consumed by the App
+    /// through [`Self::take_ai_exit`]. The screen deliberately does not decide
+    /// done-vs-failed itself: only the App holds the turn watcher that can say
+    /// whether the turn actually finished.
+    ai_exit_pending: bool,
     /// Currently focused button in the Complete/Cancel pair.
     ai_button: AiButton,
     /// Embedded opencode subprocess + vt100 emulator. `Some` once the
@@ -208,6 +213,7 @@ impl UpdatePullRequestScreen {
             ai_done: false,
             ai_verified: false,
             ai_failed: false,
+            ai_exit_pending: false,
             ai_button: AiButton::Complete,
             pty: None,
             pty_focused: false,
@@ -441,16 +447,24 @@ impl UpdatePullRequestScreen {
                 self.pty_focused = false;
                 return true;
             }
-            if pty.exit_code() == Some(0) {
-                // A clean child exit is enough for a human to review the
-                // merge, but not enough evidence for an unattended batch.
-                self.mark_ai_done();
-            } else {
-                self.mark_ai_failed("AI CLI exited before resolving the merge.".to_string());
-            }
+            // The AI CLI exited. Unlike the commit shell, its exit code
+            // decides nothing: a clean quit can leave the merge unresolved
+            // and a crash on the way out can follow a finished turn. Hand the
+            // edge to the App (`on_update_conflict_pty_exited`), which
+            // re-checks the harness state before marking the AI done or
+            // failed — same rule as Develop / Fix / Bugkill / Explain.
+            self.ai_exit_pending = true;
             return true;
         }
         false
+    }
+
+    /// Take the one-shot "the AI CLI's PTY exited" signal set by
+    /// [`Self::tick_pty`]. The App answers it by consulting the turn watcher;
+    /// the `ai_done || ai_failed` guard in `tick_pty` makes sure the edge is
+    /// only ever raised once per run.
+    pub fn take_ai_exit(&mut self) -> bool {
+        std::mem::take(&mut self.ai_exit_pending)
     }
 
     /// Flip on the AI Activity panel. Called by the App once the pipeline
@@ -2638,6 +2652,49 @@ mod tests {
         assert!(
             dump.to_lowercase().contains("pushed"),
             "PR done page should mention the push: {dump}"
+        );
+    }
+
+    #[test]
+    fn ai_pty_exit_defers_the_verdict_to_the_app_instead_of_marking_done() {
+        // A clean exit of the AI CLI is not evidence that the merge was
+        // resolved — only the App's turn watcher knows whether the turn
+        // finished, so the screen just raises the edge and waits.
+        let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
+        screen.start_updating();
+        screen.mark_ai_active();
+        screen.spawn_opencode_pty(
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), "true".to_string()],
+            std::env::temp_dir(),
+            Vec::new(),
+            false,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut exited = false;
+        while !exited && std::time::Instant::now() < deadline {
+            screen.tick_pty(None);
+            exited = screen.take_ai_exit();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(exited, "the AI PTY exit must be raised to the App");
+        assert!(
+            !screen.ai_done(),
+            "a bare exit code must not unlock Complete/Cancel on its own"
+        );
+        assert!(
+            !screen.ai_verified(),
+            "and must never count as verified evidence for an unattended batch"
+        );
+        // `poll_exited` keeps reporting the dead child every tick, so the edge
+        // is only quiet once the App has answered it with a verdict.
+        screen.mark_ai_failed("AI CLI exited before resolving the merge.".to_string());
+        screen.tick_pty(None);
+        assert!(
+            !screen.take_ai_exit(),
+            "an answered exit must not be raised again"
         );
     }
 
