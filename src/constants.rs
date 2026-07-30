@@ -22,6 +22,14 @@ pub const CACHE_DIR_NAME: &str = "cache";
 /// project files.
 pub const IMAGE_UPLOADS_DIR_NAME: &str = "uploads";
 
+/// Attachments not referenced by a live or resumable workflow become eligible
+/// for cleanup after this long. This leaves abandoned drafts recoverable while
+/// keeping the global content-addressed store bounded over time.
+pub const IMAGE_UPLOAD_RETENTION_DAYS: u64 = 30;
+
+/// A single cleanup pass never deletes more than this many files.
+pub const IMAGE_UPLOAD_CLEANUP_LIMIT: usize = 64;
+
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 

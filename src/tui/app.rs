@@ -7797,6 +7797,7 @@ impl App {
     }
 
     fn back_to_menu(&mut self) {
+        kick_off_image_upload_cleanup(self.git_root.clone());
         self.clear_screen_state();
         self.screen = Screen::Menu;
         self.pending_delete_path = None;
@@ -8477,6 +8478,35 @@ impl App {
     }
 }
 
+fn kick_off_image_upload_cleanup(git_root: Option<String>) {
+    let Some(git_root) = git_root else {
+        return;
+    };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let output = std::process::Command::new("git")
+                .args(["-C", &git_root, "worktree", "list", "--porcelain"])
+                .output();
+            let worktrees = output
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .into_iter()
+                .flat_map(|output| {
+                    output
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("worktree ").map(PathBuf::from))
+                        .collect::<Vec<_>>()
+                });
+            let _ = ImageStorage::default().cleanup_unreferenced_in_worktrees(worktrees);
+        })
+        .await;
+    });
+}
+
 struct InitOutcome {
     git_root: Option<String>,
     result: Result<WorktreeService, String>,
@@ -8899,7 +8929,36 @@ fn read_clipboard_paste() -> Result<ClipboardPaste, String> {
     }
 
     #[cfg(not(target_os = "macos"))]
-    Err("image clipboard paste is unavailable on this platform".to_string())
+    read_text_clipboard()
+        .map(ClipboardPaste::Text)
+        .map_err(|_| "image clipboard paste is unavailable on this platform".to_string())
+}
+
+/// Platforms without native image clipboard support still use their ordinary
+/// text clipboard provider. This preserves Ctrl+V for text while returning a
+/// short capability error when an image-only clipboard cannot be read.
+#[cfg(not(target_os = "macos"))]
+fn read_text_clipboard() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    let candidates: &[(&str, &[&str])] = &[(
+        "powershell",
+        &["-NoProfile", "-Command", "Get-Clipboard -Raw"],
+    )];
+    #[cfg(not(target_os = "windows"))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+    ];
+
+    for (program, args) in candidates {
+        let Ok(output) = std::process::Command::new(program).args(*args).output() else {
+            continue;
+        };
+        if output.status.success() {
+            return String::from_utf8(output.stdout).map_err(|error| error.to_string());
+        }
+    }
+    Err("no supported text clipboard tool found".to_string())
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>, String> {

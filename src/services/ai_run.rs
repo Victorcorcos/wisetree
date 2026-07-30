@@ -636,6 +636,21 @@ mod tests {
     }
 
     #[test]
+    fn image_paths_with_shell_syntax_remain_single_literal_arguments() {
+        let attachment = PathBuf::from("/tmp/image; touch should-not-run.png");
+        for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
+            let runner = AiRunner::default().with_binary(harness, PathBuf::from("true"));
+            let mut req = request(harness, AiRunMode::Captured);
+            req.attachments = vec![attachment.clone()];
+            let command = runner.command(&req).unwrap();
+            assert!(command
+                .args
+                .windows(2)
+                .any(|args| args[1] == attachment.to_string_lossy()));
+        }
+    }
+
+    #[test]
     fn translates_canonical_models_and_permission_policy() {
         let runner = AiRunner::default().with_binary(AiHarness::Codex, PathBuf::from("true"));
         let command = runner

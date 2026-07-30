@@ -6,14 +6,18 @@
 //! binary data in a prompt or leaving untracked files behind.
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::constants::image_uploads_dir;
+use crate::constants::{
+    image_uploads_dir, IMAGE_UPLOAD_CLEANUP_LIMIT, IMAGE_UPLOAD_RETENTION_DAYS,
+};
 
 /// A durable reference to an image uploaded from a clipboard or dropped file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +156,102 @@ impl ImageStorage {
             path,
         })
     }
+
+    /// Remove a bounded number of old upload files that are not referenced by
+    /// a live draft or resumable workflow. Missing files and malformed
+    /// directory entries are intentionally ignored: cleanup is best-effort
+    /// and must never prevent a prompt from being resumed.
+    pub fn cleanup_unreferenced(
+        &self,
+        referenced: impl IntoIterator<Item = PathBuf>,
+    ) -> std::io::Result<usize> {
+        self.cleanup_unreferenced_at(referenced, SystemTime::now())
+    }
+
+    /// Find references written into active `PLAN.md` and
+    /// `BUG_INVESTIGATION.md` workflow files before cleanup. Partial or
+    /// malformed metadata is ignored conservatively: no valid reference is
+    /// needed before an unrelated stale upload can become eligible.
+    pub fn cleanup_unreferenced_in_worktrees(
+        &self,
+        worktrees: impl IntoIterator<Item = PathBuf>,
+    ) -> std::io::Result<usize> {
+        let mut referenced = Vec::new();
+        for worktree in worktrees {
+            for name in ["PLAN.md", "BUG_INVESTIGATION.md"] {
+                let Ok(content) = fs::read_to_string(worktree.join(name)) else {
+                    continue;
+                };
+                let Some(paths) = referenced_paths(&content) else {
+                    // An incomplete resumable file might still refer to an
+                    // attachment. Preserve the store until it is repaired or
+                    // removed rather than risk losing that context.
+                    return Ok(0);
+                };
+                referenced.extend(paths);
+            }
+        }
+        self.cleanup_unreferenced(referenced)
+    }
+
+    fn cleanup_unreferenced_at(
+        &self,
+        referenced: impl IntoIterator<Item = PathBuf>,
+        now: SystemTime,
+    ) -> std::io::Result<usize> {
+        let referenced: HashSet<_> = referenced.into_iter().collect();
+        let retention = Duration::from_secs(IMAGE_UPLOAD_RETENTION_DAYS * 24 * 60 * 60);
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Ok(0);
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            if removed == IMAGE_UPLOAD_CLEANUP_LIMIT {
+                break;
+            }
+            let path = entry.path();
+            if referenced.contains(&path) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let old_enough = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= retention);
+            if !metadata.is_file() || !old_enough {
+                continue;
+            }
+            match fs::remove_file(path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+        Ok(removed)
+    }
+}
+
+fn referenced_paths(content: &str) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for prefix in [
+        "<!-- wisetree:image-attachments:",
+        "<!-- wisetree-bug-attachments: ",
+    ] {
+        let Some(json) = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(prefix))
+        else {
+            continue;
+        };
+        let attachments =
+            serde_json::from_str::<Vec<ImageAttachment>>(json.trim_end_matches(" -->").trim())
+                .ok()?;
+        paths.extend(attachments.into_iter().map(|attachment| attachment.path));
+    }
+    Some(paths)
 }
 
 fn identify_image(bytes: &[u8]) -> Result<(&'static str, &'static str), ImageUploadError> {
@@ -378,6 +478,59 @@ mod tests {
             ImageStorage::new(root_file).ingest_bytes(PNG),
             Err(ImageUploadError::Storage(_))
         ));
+    }
+
+    #[test]
+    fn cleanup_keeps_referenced_uploads_and_tolerates_partial_storage() {
+        let dir = tempdir().unwrap();
+        let storage = ImageStorage::new(dir.path().join("uploads"));
+        let kept = storage.ingest_bytes(PNG).unwrap();
+        let stale = storage.root().join("stale.png");
+        fs::write(&stale, PNG).unwrap();
+        let partial = storage.root().join("partial.tmp");
+        fs::create_dir(&partial).unwrap();
+
+        let after_retention = SystemTime::now()
+            .checked_add(Duration::from_secs(
+                (IMAGE_UPLOAD_RETENTION_DAYS + 1) * 24 * 60 * 60,
+            ))
+            .unwrap();
+        assert_eq!(
+            storage
+                .cleanup_unreferenced_at([kept.path.clone()], after_retention)
+                .unwrap(),
+            1
+        );
+        assert!(kept.path.exists());
+        assert!(!stale.exists());
+        assert!(partial.exists());
+    }
+
+    #[test]
+    fn cleanup_reads_live_plan_and_investigation_references() {
+        let dir = tempdir().unwrap();
+        let storage = ImageStorage::new(dir.path().join("uploads"));
+        let attachment = storage.ingest_bytes(PNG).unwrap();
+        fs::write(
+            dir.path().join("PLAN.md"),
+            format!(
+                "<!-- wisetree:image-attachments:{} -->",
+                serde_json::json!([attachment])
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .cleanup_unreferenced_in_worktrees([dir.path().to_path_buf()])
+                .unwrap(),
+            0
+        );
+        assert!(storage.root().read_dir().unwrap().next().is_some());
+    }
+
+    #[test]
+    fn incomplete_workflow_metadata_blocks_cleanup_conservatively() {
+        assert!(referenced_paths("<!-- wisetree:image-attachments: [not-json -->").is_none());
     }
 
     #[test]
