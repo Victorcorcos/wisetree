@@ -52,6 +52,7 @@ use crate::services::{
     Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
+use crate::tui::image_upload::{ImageAttachment, ImageStorage};
 use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
@@ -144,6 +145,10 @@ enum AppEvent {
     ClipboardCopyFinished {
         success_message: String,
         error: Option<String>,
+    },
+    ClipboardPasteFinished {
+        target: ImagePasteTarget,
+        result: Result<ClipboardPaste, String>,
     },
     WisePresetDiscovered(Result<WisePresetDiscovery, String>),
     MergePrDetailsLoaded(Result<MergePrDetailsPayload, String>),
@@ -347,6 +352,19 @@ enum AppEvent {
         result: Result<std::collections::HashMap<String, Vec<String>>, String>,
     },
     ShellIntegrationDetected(ShellIntegrationStatus),
+}
+
+/// The focused textarea that initiated a clipboard image read. Its generation
+/// prevents a slow platform clipboard call from mutating a later draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImagePasteTarget {
+    Develop(u64),
+    Bugkill(u64),
+}
+
+enum ClipboardPaste {
+    Image(ImageAttachment),
+    Text(String),
 }
 
 /// Outcome of the post-attempt scan + commit task: either the fix AI made
@@ -1457,6 +1475,16 @@ impl App {
 
         self.mouse_selection = None;
 
+        if (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER))
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        {
+            if let Some(target) = self.image_paste_target() {
+                kick_off_clipboard_paste(target, tx.clone());
+            }
+            return;
+        }
+
         match self.phase {
             InitPhase::Errored => self.handle_error_key(key, tx),
             InitPhase::Ready => self.handle_screen_key(key, tx),
@@ -1474,6 +1502,14 @@ impl App {
         self.mouse_selection = None;
         if !matches!(self.phase, InitPhase::Ready) {
             return;
+        }
+        if let Some(target) = self.image_paste_target() {
+            if let Some(attachments) = ingest_dropped_images(&text) {
+                for attachment in attachments {
+                    self.insert_image_attachment(target, attachment);
+                }
+                return;
+            }
         }
         if matches!(self.screen, Screen::BugkillPullRequest) {
             let action = self
@@ -1500,6 +1536,83 @@ impl App {
                 continue;
             }
             self.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), tx);
+        }
+    }
+
+    fn image_paste_target(&self) -> Option<ImagePasteTarget> {
+        match self.screen {
+            Screen::DevelopPullRequest => self
+                .develop_pr
+                .as_ref()
+                .and_then(DevelopPullRequestScreen::attachment_input_generation)
+                .map(ImagePasteTarget::Develop),
+            Screen::BugkillPullRequest => self
+                .bugkill_pr
+                .as_ref()
+                .and_then(BugkillPullRequestScreen::attachment_input_generation)
+                .map(ImagePasteTarget::Bugkill),
+            _ => None,
+        }
+    }
+
+    fn insert_image_attachment(
+        &mut self,
+        target: ImagePasteTarget,
+        attachment: ImageAttachment,
+    ) -> bool {
+        match target {
+            ImagePasteTarget::Develop(generation) if self.screen == Screen::DevelopPullRequest => {
+                self.develop_pr
+                    .as_mut()
+                    .is_some_and(|screen| screen.insert_attachment(generation, attachment))
+            }
+            ImagePasteTarget::Bugkill(generation) if self.screen == Screen::BugkillPullRequest => {
+                self.bugkill_pr
+                    .as_mut()
+                    .is_some_and(|screen| screen.insert_attachment(generation, attachment))
+            }
+            _ => false,
+        }
+    }
+
+    fn paste_text_into_target(
+        &mut self,
+        target: ImagePasteTarget,
+        text: &str,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match target {
+            ImagePasteTarget::Develop(generation)
+                if self.screen == Screen::DevelopPullRequest
+                    && self
+                        .develop_pr
+                        .as_ref()
+                        .and_then(DevelopPullRequestScreen::attachment_input_generation)
+                        == Some(generation) =>
+            {
+                let action = self
+                    .develop_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_paste(text))
+                    .unwrap_or(DevelopAction::Continue);
+                self.apply_develop_action(action, tx);
+            }
+            ImagePasteTarget::Bugkill(generation)
+                if self.screen == Screen::BugkillPullRequest
+                    && self
+                        .bugkill_pr
+                        .as_ref()
+                        .and_then(BugkillPullRequestScreen::attachment_input_generation)
+                        == Some(generation) =>
+            {
+                let action = self
+                    .bugkill_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_paste(text))
+                    .unwrap_or(BugkillAction::Continue);
+                self.apply_bugkill_action(action, tx);
+            }
+            _ => {}
         }
     }
 
@@ -6526,6 +6639,16 @@ impl App {
                     self.show_toast(ToastVariant::Error, format!("Clipboard copy failed: {err}"))
                 }
             },
+            AppEvent::ClipboardPasteFinished { target, result } => match result {
+                Ok(ClipboardPaste::Image(attachment)) => {
+                    self.insert_image_attachment(target, attachment);
+                }
+                Ok(ClipboardPaste::Text(text)) => self.paste_text_into_target(target, &text, tx),
+                Err(error) => self.show_toast(
+                    ToastVariant::Error,
+                    format!("Clipboard paste failed: {error}"),
+                ),
+            },
             AppEvent::WisePresetDiscovered(result) => self.apply_wise_preset_discovery(result),
             AppEvent::MergePrDetailsLoaded(result) => self.apply_merge_pr_details(result, tx),
             AppEvent::MergePrFinished(result) => self.apply_merge_pr_finished(result, tx),
@@ -8623,6 +8746,149 @@ fn kick_off_clipboard_copy(
             error: result.err(),
         });
     });
+}
+
+/// Read the system clipboard off the UI thread. Image data takes precedence;
+/// text is only returned when the clipboard does not contain an image, so a
+/// sentence mentioning `screenshot.png` is never treated as an upload.
+fn kick_off_clipboard_paste(target: ImagePasteTarget, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(read_clipboard_paste)
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+        let _ = tx.send(AppEvent::ClipboardPasteFinished { target, result });
+    });
+}
+
+fn read_clipboard_paste() -> Result<ClipboardPaste, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let image_script = r#"
+            ObjC.import('AppKit');
+            const image = $.NSImage.alloc.initWithPasteboard($.NSPasteboard.generalPasteboard);
+            if (image && image.TIFFRepresentation) {
+                console.log(ObjC.unwrap(image.TIFFRepresentation.base64EncodedStringWithOptions(0)));
+            }
+        "#;
+        let output = std::process::Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", image_script])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() && !output.stdout.is_empty() {
+            let bytes = decode_base64(
+                std::str::from_utf8(&output.stdout).map_err(|error| error.to_string())?,
+            )?;
+            return ImageStorage::default()
+                .ingest_bytes(&bytes)
+                .map(ClipboardPaste::Image)
+                .map_err(|error| error.to_string());
+        }
+        let text = std::process::Command::new("pbpaste")
+            .output()
+            .map_err(|error| error.to_string())?;
+        String::from_utf8(text.stdout)
+            .map(ClipboardPaste::Text)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Err("image clipboard paste is unavailable on this platform".to_string())
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut group = [0u8; 4];
+    let mut len = 0usize;
+    for byte in value.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        group[len] = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 64,
+            _ => return Err("clipboard image is not valid base64".to_string()),
+        };
+        len += 1;
+        if len == 4 {
+            if group[0] == 64 || group[1] == 64 || (group[2] == 64 && group[3] != 64) {
+                return Err("clipboard image is not valid base64".to_string());
+            }
+            output.push((group[0] << 2) | (group[1] >> 4));
+            if group[2] != 64 {
+                output.push((group[1] << 4) | (group[2] >> 2));
+            }
+            if group[3] != 64 {
+                output.push((group[2] << 6) | group[3]);
+            }
+            len = 0;
+        }
+    }
+    (len == 0 && !output.is_empty())
+        .then_some(output)
+        .ok_or_else(|| "clipboard image is not valid base64".to_string())
+}
+
+/// Terminal drag/drop sends a bracketed-paste string containing absolute
+/// paths or `file://` URIs. Only consume it when every parsed item is such a
+/// path and at least one is a valid image; everything else remains ordinary
+/// text paste (including prose that merely names an image file).
+fn ingest_dropped_images(text: &str) -> Option<Vec<ImageAttachment>> {
+    ingest_dropped_images_with_storage(text, &ImageStorage::default())
+}
+
+fn ingest_dropped_images_with_storage(
+    text: &str,
+    storage: &ImageStorage,
+) -> Option<Vec<ImageAttachment>> {
+    let paths = crate::tui::image_upload::parse_dropped_paths(text).ok()?;
+    if !paths.iter().all(|path| path.is_absolute()) {
+        return None;
+    }
+    let attachments: Vec<_> = storage
+        .ingest_dropped_paths(paths)
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+    (!attachments.is_empty()).then_some(attachments)
+}
+
+#[cfg(test)]
+mod image_paste_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    // A valid 1×1 PNG, matching the image-storage test fixture.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\rIDATx\x9cc\xf8\xcf\xc0\xf0\x1f\0\x05\0\x01\xff\x89\x99=\x1d\0\0\0\0IEND\xaeB`\x82";
+
+    #[test]
+    fn dropped_image_paths_and_file_uris_insert_every_image() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.png");
+        let second = dir.path().join("second.png");
+        fs::write(&first, PNG).unwrap();
+        fs::write(&second, PNG).unwrap();
+        let storage = ImageStorage::new(dir.path().join("uploads"));
+
+        let dropped = format!("{}\nfile://{}", first.display(), second.display());
+        let attachments = ingest_dropped_images_with_storage(&dropped, &storage).unwrap();
+
+        assert_eq!(attachments.len(), 2);
+        assert!(attachments
+            .iter()
+            .all(|attachment| attachment.path.is_file()));
+    }
+
+    #[test]
+    fn prose_that_mentions_an_image_filename_stays_text() {
+        let storage = ImageStorage::new(tempdir().unwrap().path().join("uploads"));
+        assert!(
+            ingest_dropped_images_with_storage("See screenshot.png for details", &storage)
+                .is_none()
+        );
+    }
 }
 
 fn kick_off_fetch_pr_details(

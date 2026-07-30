@@ -46,6 +46,7 @@ use crate::config::schema::AiBugkillConfig;
 use crate::messages::colors;
 use crate::services::bugkill::{render_investigation_md, BugHypothesis, EvidenceQuality};
 use crate::services::{BugkillSnapshot, BugkillUnverdicted, ParsedInvestigation};
+use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::BugkillRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
@@ -160,6 +161,7 @@ pub struct BugkillPullRequestScreen {
     working_locked: bool,
     // ── bug description / Other input ───────────────────────────────────
     input: Option<InputPrompt>,
+    input_generation: u64,
     describe_warning: bool,
     bug_description: String,
     // ── preflight results ───────────────────────────────────────────────
@@ -218,6 +220,7 @@ impl BugkillPullRequestScreen {
             phase_message: String::new(),
             working_locked: false,
             input: None,
+            input_generation: 0,
             describe_warning: false,
             bug_description: String::new(),
             base_ref: None,
@@ -263,6 +266,24 @@ impl BugkillPullRequestScreen {
     }
     pub fn bug_description(&self) -> &str {
         &self.bug_description
+    }
+
+    /// Identity of the currently focused textarea. App uses it to discard an
+    /// asynchronous clipboard read after this draft has been replaced.
+    pub fn attachment_input_generation(&self) -> Option<u64> {
+        self.input
+            .as_ref()
+            .filter(|input| input.accepts_attachments())
+            .map(|_| self.input_generation)
+    }
+
+    pub fn insert_attachment(&mut self, generation: u64, attachment: ImageAttachment) -> bool {
+        if generation != self.input_generation {
+            return false;
+        }
+        self.input
+            .as_mut()
+            .is_some_and(|input| input.insert_attachment(attachment))
     }
     pub fn base_ref(&self) -> Option<&str> {
         self.base_ref.as_deref()
@@ -340,6 +361,7 @@ impl BugkillPullRequestScreen {
             .multiline()
             .expand_to_fill(),
         );
+        self.input_generation = self.input_generation.wrapping_add(1);
         self.step = BugkillStep::DescribeBug;
     }
 
@@ -614,6 +636,7 @@ impl BugkillPullRequestScreen {
                 .multiline()
                 .expand_to_fill(),
         );
+        self.input_generation = self.input_generation.wrapping_add(1);
         self.step = BugkillStep::OtherInput;
     }
 

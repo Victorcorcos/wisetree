@@ -7,6 +7,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifi
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+use std::path::PathBuf;
+use wisetree::tui::image_upload::ImageAttachment;
 use wisetree::tui::widgets::{
     BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, CommandListProgress,
     CommandProgress, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Spinner,
@@ -48,6 +50,78 @@ where
 }
 
 // -- InputPrompt --------------------------------------------------------------
+
+fn attachment(name: &str) -> ImageAttachment {
+    ImageAttachment {
+        id: name.to_string(),
+        filename: name.to_string(),
+        mime_type: "image/png".to_string(),
+        path: PathBuf::from(format!("/tmp/{name}")),
+    }
+}
+
+#[test]
+fn multiline_attachment_inserts_at_beginning_middle_and_end_of_unicode_text() {
+    let mut input = InputPrompt::new("Description")
+        .multiline()
+        .with_default("日語");
+
+    input.handle_key(key(KeyCode::Home));
+    assert!(input.insert_attachment(attachment("first.png")));
+    input.handle_key(key(KeyCode::Right));
+    assert!(input.insert_attachment(attachment("middle.png")));
+    input.handle_key(key(KeyCode::End));
+    assert!(input.insert_attachment(attachment("last.png")));
+
+    assert_eq!(
+        input
+            .attachments()
+            .iter()
+            .map(|item| item.filename.as_str())
+            .collect::<Vec<_>>(),
+        ["first.png", "middle.png", "last.png"]
+    );
+    let rendered = dump(80, 12, |frame| input.render(frame, frame.area(), 0));
+    assert!(rendered.contains("Image 1: first.png"));
+    assert!(rendered.contains("Image 2: middle.png"));
+    assert!(rendered.contains("Image 3: last.png"));
+}
+
+#[test]
+fn deleting_an_attachment_removes_its_durable_reference() {
+    let mut input = InputPrompt::new("Description").multiline();
+    input.insert_attachment(attachment("before.png"));
+    input.handle_key(key(KeyCode::Char('x')));
+    input.insert_attachment(attachment("after.png"));
+
+    input.handle_key(key(KeyCode::Backspace));
+    assert_eq!(
+        input
+            .attachments()
+            .iter()
+            .map(|item| item.filename.as_str())
+            .collect::<Vec<_>>(),
+        ["before.png"]
+    );
+    input.handle_key(key(KeyCode::Home));
+    input.handle_key(key(KeyCode::Delete));
+    assert!(input.attachments().is_empty());
+}
+
+#[test]
+fn multiline_text_paste_remains_text_and_preserves_line_endings() {
+    let mut input = InputPrompt::new("Description").multiline();
+    input.paste("mentions screenshot.png\r\nnext line");
+    assert_eq!(input.value, "mentions screenshot.png\nnext line");
+    assert!(input.attachments().is_empty());
+}
+
+#[test]
+fn single_line_inputs_do_not_accept_image_attachments() {
+    let mut input = InputPrompt::new("Name");
+    assert!(!input.insert_attachment(attachment("image.png")));
+    assert!(input.attachments().is_empty());
+}
 
 #[test]
 fn input_prompt_appends_printable_chars() {
