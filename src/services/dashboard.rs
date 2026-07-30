@@ -16014,6 +16014,118 @@ so the intent reads clearly.
         assert_eq!(git(repo.path(), &["status", "--porcelain"]), "?? notes.txt");
     }
 
+    fn improve_test_finding() -> ReviewFinding {
+        ReviewFinding {
+            category: "Correctness".to_string(),
+            severity: ReviewSeverity::High,
+            file: "seed.txt".to_string(),
+            start_line: Some(1),
+            line: Some(1),
+            title: "Preserve the seed value".to_string(),
+            explanation: "The value must remain stable across retries.".to_string(),
+            suggestion: Some("Write the corrected value.".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn improve_apply_handoff_contains_only_local_checkpoint_instructions() {
+        let repo = initialized_temp_repo();
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let handoff = service
+            .prepare_improve_apply(repo.path().to_str().unwrap(), &improve_test_finding())
+            .await
+            .expect("handoff");
+
+        assert_eq!(handoff.command.binary, PathBuf::from("git"));
+        assert_eq!(handoff.command.cwd, repo.path());
+        assert_eq!(handoff.command.args[0], "--prompt");
+        let prompt = &handoff.command.args[1];
+        assert!(prompt.contains("Location: seed.txt:1"));
+        assert!(prompt.contains("Preserve the seed value"));
+        assert!(
+            prompt.contains("Do not create a pull request, post comments, push, or commit"),
+            "Improve must not expose a GitHub write path: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn improve_commit_attempt_checkpoints_only_attempt_paths() {
+        let repo = initialized_temp_repo();
+        std::fs::write(repo.path().join("seed.txt"), "improved").unwrap();
+        std::fs::write(repo.path().join("ambient.txt"), "leave me dirty").unwrap();
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default());
+        let changes = AttemptChanges {
+            all: vec!["seed.txt".to_string()],
+            commit_paths: vec!["seed.txt".to_string()],
+            modified_preexisting_untracked: Vec::new(),
+        };
+
+        let sha = service
+            .improve_commit_attempt(
+                repo.path().to_str().unwrap(),
+                &changes,
+                2,
+                &improve_test_finding(),
+            )
+            .await
+            .expect("checkpoint commit");
+
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            git(repo.path(), &["log", "-1", "--format=%s"]),
+            "improve: checkpoint #2 — Preserve the seed value"
+        );
+        assert_eq!(git(repo.path(), &["show", "HEAD:seed.txt"]), "improved");
+        assert_eq!(
+            git(repo.path(), &["status", "--porcelain"]),
+            "?? ambient.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn improve_commit_attempt_reports_no_change_and_commit_failures() {
+        let repo = initialized_temp_repo();
+        let empty = AttemptChanges {
+            all: Vec::new(),
+            commit_paths: Vec::new(),
+            modified_preexisting_untracked: Vec::new(),
+        };
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default());
+        assert_eq!(
+            service
+                .improve_commit_attempt(
+                    repo.path().to_str().unwrap(),
+                    &empty,
+                    1,
+                    &improve_test_finding(),
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "nothing to commit for this improvement."
+        );
+
+        std::fs::write(repo.path().join("seed.txt"), "changed").unwrap();
+        let failing = dashboard_with_failing_git(&repo, "commit", "commit blocked");
+        let changes = AttemptChanges {
+            all: vec!["seed.txt".to_string()],
+            commit_paths: vec!["seed.txt".to_string()],
+            modified_preexisting_untracked: Vec::new(),
+        };
+        let error = failing
+            .improve_commit_attempt(
+                repo.path().to_str().unwrap(),
+                &changes,
+                1,
+                &improve_test_finding(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("commit blocked"));
+    }
+
     #[tokio::test]
     async fn develop_commit_section_excludes_preexisting_paths() {
         let (_tmp, repo) = develop_repo();

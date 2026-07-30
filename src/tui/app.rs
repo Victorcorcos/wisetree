@@ -11793,6 +11793,134 @@ mod tests {
         assert_eq!(screen.current_index(), 1);
     }
 
+    #[test]
+    fn improve_commit_handlers_finalize_manual_results_and_ignore_stale_events() {
+        let finding = |title: &str, line| ReviewFinding {
+            category: "Correctness".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: Some(line),
+            line: Some(line),
+            title: title.to_string(),
+            explanation: "Keep the local result correct.".to_string(),
+            suggestion: Some("Use the local value.".to_string()),
+        };
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.review_pr.as_mut().unwrap().record_scan_result(vec![
+            finding("First checkpoint", 1),
+            finding("Already correct", 2),
+        ]);
+        app.improve_pr = Some(ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        ));
+        let tx = app_event_tx();
+        app.begin_improve_finding_review(&tx);
+
+        // Manual mode does not need a watcher: the explicit completion path
+        // starts the checkpoint, and a matching event advances exactly once.
+        let screen = app.improve_pr.as_mut().unwrap();
+        screen.start_applying();
+        screen.finish_apply();
+        screen.begin_commit();
+        app.apply_improve_committed(
+            0,
+            Ok(ImproveCommitOutcome::Committed {
+                sha: "0123456789abcdef".to_string(),
+            }),
+            &tx,
+        );
+        assert_eq!(app.improve_pr.as_ref().unwrap().current_index(), 1);
+        assert!(!app.improve_pr.as_ref().unwrap().committing());
+
+        // An old completion cannot overwrite the active finding.
+        app.apply_improve_committed(0, Ok(ImproveCommitOutcome::NoChanges), &tx);
+        assert_eq!(app.improve_pr.as_ref().unwrap().current_index(), 1);
+
+        let screen = app.improve_pr.as_mut().unwrap();
+        screen.start_applying();
+        screen.finish_apply();
+        screen.begin_commit();
+        app.apply_improve_committed(1, Ok(ImproveCommitOutcome::NoChanges), &tx);
+        assert_eq!(
+            app.improve_pr
+                .as_mut()
+                .unwrap()
+                .handle_key(key(KeyCode::Enter)),
+            ImproveAction::Done
+        );
+    }
+
+    #[test]
+    fn improve_abort_event_cleans_up_before_advancing_and_rejects_stale_results() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.review_pr
+            .as_mut()
+            .unwrap()
+            .record_scan_result(vec![ReviewFinding {
+                category: "Correctness".to_string(),
+                severity: crate::services::ReviewSeverity::High,
+                file: "src/lib.rs".to_string(),
+                start_line: Some(1),
+                line: Some(1),
+                title: "Interrupted change".to_string(),
+                explanation: "The session stopped early.".to_string(),
+                suggestion: None,
+            }]);
+        app.improve_pr = Some(ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        ));
+        let tx = app_event_tx();
+        app.begin_improve_finding_review(&tx);
+        let screen = app.improve_pr.as_mut().unwrap();
+        screen.start_applying();
+        screen.set_pre_snapshot(BugkillSnapshot {
+            tracked: Vec::new(),
+            untracked: Vec::new(),
+            untracked_contents: Vec::new(),
+        });
+        screen.finish_apply();
+        screen.begin_abort();
+
+        app.handle_app_event(
+            AppEvent::ImproveAborted {
+                index: 99,
+                result: Ok(()),
+            },
+            &tx,
+        );
+        assert!(app.improve_pr.as_ref().unwrap().aborting());
+
+        app.handle_app_event(
+            AppEvent::ImproveAborted {
+                index: 0,
+                result: Ok(()),
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.improve_pr
+                .as_mut()
+                .unwrap()
+                .handle_key(key(KeyCode::Enter)),
+            ImproveAction::Done
+        );
+        assert!(!app.improve_pr.as_ref().unwrap().aborting());
+    }
+
     fn review_test_telemetry(scan: &str) -> ReviewScanTelemetry {
         ReviewScanTelemetry {
             scan: scan.to_string(),
