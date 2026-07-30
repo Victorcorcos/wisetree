@@ -3718,7 +3718,7 @@ impl App {
                 }
             }
             BugkillAction::ForceInvestigationDone => self.force_bugkill_investigation_done(tx),
-            BugkillAction::AttemptFix => self.start_bugkill_attempt(None, tx),
+            BugkillAction::AttemptFix => self.start_bugkill_attempt(None, Vec::new(), tx),
             BugkillAction::AbortFix => {
                 let Some(screen) = self.bugkill_pr.as_mut() else {
                     return;
@@ -3762,6 +3762,7 @@ impl App {
                     return;
                 };
                 let worktree_path = screen.request().worktree_path.clone();
+                let attachments = screen.attempt_feedback_attachments();
                 screen.start_working("Judging the outcome...", false);
                 kick_off_bugkill_judge(
                     self.git_root.clone(),
@@ -3769,6 +3770,7 @@ impl App {
                     worktree_path,
                     row,
                     text,
+                    attachments,
                     tx.clone(),
                 );
             }
@@ -3779,8 +3781,12 @@ impl App {
                 // Re-enter the fix phase for the same row, without reverting:
                 // the previous edits stay committed and the retry's edits are
                 // folded into the same attempt commit via --amend.
-                let feedback = self.bugkill_pr.as_ref().and_then(|s| s.attempt_feedback());
-                self.start_bugkill_attempt(feedback, tx);
+                let (feedback, feedback_attachments) = self
+                    .bugkill_pr
+                    .as_ref()
+                    .map(|s| (s.attempt_feedback(), s.attempt_feedback_attachments()))
+                    .unwrap_or_default();
+                self.start_bugkill_attempt(feedback, feedback_attachments, tx);
             }
             BugkillAction::Done => {
                 self.bugkill_pr = None;
@@ -3805,14 +3811,18 @@ impl App {
         let worktree_path = screen.request().worktree_path.clone();
         let description = screen.bug_description().to_string();
         let base_ref = screen.base_ref().map(str::to_string);
+        let attachments = screen.bug_attachments();
         screen.start_working("Preparing the investigation...", false);
         kick_off_bugkill_prepare_investigate(
             self.git_root.clone(),
             self.current_dashboard_config(),
-            worktree_path,
-            description,
-            base_ref,
-            corrective,
+            BugkillPrepareInvestigateRequest {
+                worktree_path,
+                description,
+                base_ref,
+                attachments,
+                corrective,
+            },
             tx.clone(),
         );
     }
@@ -3823,6 +3833,7 @@ impl App {
     fn start_bugkill_attempt(
         &mut self,
         feedback: Option<String>,
+        feedback_attachments: Vec<ImageAttachment>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let Some(screen) = self.bugkill_pr.as_mut() else {
@@ -3836,6 +3847,12 @@ impl App {
         };
         let worktree_path = screen.request().worktree_path.clone();
         let bug_description = screen.bug_description().to_string();
+        let mut attachments = screen.bug_attachments();
+        for attachment in feedback_attachments {
+            if !attachments.iter().any(|item| item.id == attachment.id) {
+                attachments.push(attachment);
+            }
+        }
         screen.start_working("Preparing the fix...", false);
         kick_off_bugkill_prepare_fix(
             self.git_root.clone(),
@@ -3846,6 +3863,7 @@ impl App {
                 row,
                 row_index,
                 feedback,
+                attachments,
             },
             tx.clone(),
         );
@@ -4295,7 +4313,9 @@ impl App {
             }
             Ok(verdict) => match verdict.result {
                 JudgeResult::Fixed => self.apply_bugkill_action(BugkillAction::VerdictYes, tx),
-                JudgeResult::NotFixed => screen.show_retry_prompt(user_text),
+                JudgeResult::NotFixed => {
+                    screen.show_retry_prompt(user_text, screen.attempt_feedback_attachments())
+                }
                 JudgeResult::Unclear => {
                     let note = if verdict.reason.trim().is_empty() {
                         "The judge could not tell — please answer Yes or No.".to_string()
@@ -9890,6 +9910,15 @@ struct BugkillPrepareFixRequest {
     row: BugHypothesis,
     row_index: usize,
     feedback: Option<String>,
+    attachments: Vec<ImageAttachment>,
+}
+
+struct BugkillPrepareInvestigateRequest {
+    worktree_path: String,
+    description: String,
+    base_ref: Option<String>,
+    attachments: Vec<ImageAttachment>,
+    corrective: bool,
 }
 
 /// Inputs for the post-attempt scan + harness commit.
@@ -9950,12 +9979,10 @@ fn kick_off_bugkill_discard(
 fn kick_off_bugkill_prepare_investigate(
     git_root: Option<String>,
     config: DashboardConfig,
-    worktree_path: String,
-    bug_description: String,
-    base_ref: Option<String>,
-    corrective: bool,
+    req: BugkillPrepareInvestigateRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let corrective = req.corrective;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::BugkillInvestigateReady {
             corrective,
@@ -9969,10 +9996,11 @@ fn kick_off_bugkill_prepare_investigate(
         let service = DashboardService::new(root, config);
         let result = service
             .prepare_bugkill_investigate(
-                &worktree_path,
-                &bug_description,
-                base_ref.as_deref(),
-                corrective,
+                &req.worktree_path,
+                &req.description,
+                req.base_ref.as_deref(),
+                &req.attachments,
+                req.corrective,
             )
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
@@ -10005,6 +10033,7 @@ fn kick_off_bugkill_prepare_fix(
                     &req.bug_description,
                     &req.row,
                     req.feedback.as_deref(),
+                    &req.attachments,
                 )
                 .await?;
             Ok::<_, crate::errors::WisetreeError>(Box::new((snapshot, handoff)))
@@ -10091,6 +10120,7 @@ fn kick_off_bugkill_judge(
     worktree_path: String,
     row: BugHypothesis,
     user_text: String,
+    attachments: Vec<ImageAttachment>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -10103,7 +10133,7 @@ fn kick_off_bugkill_judge(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let result = service
-            .bugkill_judge(&worktree_path, &row, &user_text)
+            .bugkill_judge(&worktree_path, &row, &user_text, &attachments)
             .await
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::BugkillJudged { user_text, result });

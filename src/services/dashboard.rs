@@ -4432,6 +4432,7 @@ impl DashboardService {
         worktree_path: &str,
         bug_description: &str,
         base_ref: Option<&str>,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
         corrective: bool,
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.investigate;
@@ -4458,7 +4459,7 @@ impl DashboardService {
             timeout: Duration::from_secs(1),
             activity_limit: 1,
             session_title: None,
-            attachments: Vec::new(),
+            attachments: Self::bugkill_attachment_paths(attachments)?,
         })?;
         Ok(FixApplyHandoff {
             command,
@@ -4475,6 +4476,7 @@ impl DashboardService {
         bug_description: &str,
         row: &BugHypothesis,
         feedback: Option<&str>,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.fix;
         if slot.model.trim().is_empty() {
@@ -4494,7 +4496,7 @@ impl DashboardService {
             timeout: Duration::from_secs(1),
             activity_limit: 1,
             session_title: None,
-            attachments: Vec::new(),
+            attachments: Self::bugkill_attachment_paths(attachments)?,
         })?;
         Ok(FixApplyHandoff {
             command,
@@ -4511,6 +4513,7 @@ impl DashboardService {
         worktree_path: &str,
         row: &BugHypothesis,
         user_text: &str,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
     ) -> Result<BugkillVerdict> {
         let slot = &self.config.ai.bugkill.judge;
         if slot.model.trim().is_empty() {
@@ -4537,7 +4540,7 @@ impl DashboardService {
                     timeout: BUGKILL_JUDGE_TIMEOUT,
                     activity_limit: 1,
                     session_title: None,
-                    attachments: Vec::new(),
+                    attachments: Self::bugkill_attachment_paths(attachments)?,
                 },
                 None,
                 cancel,
@@ -4918,6 +4921,23 @@ impl DashboardService {
             }
         }
         Ok(())
+    }
+
+    fn bugkill_attachment_paths(
+        attachments: &[crate::tui::image_upload::ImageAttachment],
+    ) -> Result<Vec<PathBuf>> {
+        for attachment in attachments {
+            if !attachment.path.is_file() {
+                return Err(WisetreeError::other(format!(
+                    "Attached image is no longer available: {}. Reattach it before continuing.",
+                    attachment.path.display()
+                )));
+            }
+        }
+        Ok(attachments
+            .iter()
+            .map(|attachment| attachment.path.clone())
+            .collect())
     }
 
     /// Run the configured check command (Ralph-canon backpressure) in the

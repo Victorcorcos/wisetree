@@ -15,6 +15,23 @@ use wisetree::services::bugkill::{
     compute_attempt_changes, render_investigation_md, BugHypothesis, EvidenceQuality,
 };
 use wisetree::services::{BugkillPreflightOutcome, BugkillResumeState, DashboardService};
+use wisetree::tui::image_upload::ImageAttachment;
+
+fn attachment(path: PathBuf, id: &str) -> ImageAttachment {
+    ImageAttachment {
+        id: id.to_string(),
+        filename: format!("{id}.png"),
+        mime_type: "image/png".to_string(),
+        path,
+    }
+}
+
+fn command_attachments(args: &[String]) -> Vec<&str> {
+    args.windows(2)
+        .filter(|args| args[0] == "--file" || args[0] == "--image")
+        .map(|args| args[1].as_str())
+        .collect()
+}
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -133,7 +150,7 @@ impl Fixture {
     fn write_investigation(&self, hypotheses: &[BugHypothesis]) {
         fs::write(
             self.repo.join("BUG_INVESTIGATION.md"),
-            render_investigation_md("Saving crashes.", hypotheses, &[]),
+            render_investigation_md("Saving crashes.", hypotheses, &[], &[]),
         )
         .unwrap();
     }
@@ -446,12 +463,12 @@ async fn bugkill_uses_each_configured_harness_for_investigation_and_fix() {
     for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
         let service = fx.service_with_harness(harness);
         let investigate = service
-            .prepare_bugkill_investigate(fx.repo_str(), "Saving crashes.", None, false)
+            .prepare_bugkill_investigate(fx.repo_str(), "Saving crashes.", None, &[], false)
             .unwrap();
         assert_eq!(investigate.harness, harness);
 
         let fix = service
-            .prepare_bugkill_fix(fx.repo_str(), "Saving crashes.", &row, None)
+            .prepare_bugkill_fix(fx.repo_str(), "Saving crashes.", &row, None, &[])
             .await
             .unwrap();
         assert_eq!(fix.harness, harness);
@@ -497,6 +514,164 @@ async fn bugkill_uses_each_configured_harness_for_investigation_and_fix() {
 }
 
 #[tokio::test]
+async fn bugkill_threads_original_and_feedback_images_without_leaking_feedback() {
+    let fx = Fixture::new();
+    let original_path = fx._parent.path().join("original.png");
+    let feedback_path = fx._parent.path().join("feedback.png");
+    fs::write(&original_path, "original").unwrap();
+    fs::write(&feedback_path, "feedback").unwrap();
+    let original = attachment(original_path, "original");
+    let feedback = attachment(feedback_path, "feedback");
+    let row = fx.hypothesis(false, None);
+
+    for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
+        let service = fx.service_with_harness(harness);
+        let initial = service
+            .prepare_bugkill_investigate(
+                fx.repo_str(),
+                "Saving crashes.",
+                None,
+                &[original.clone()],
+                false,
+            )
+            .unwrap();
+        let corrective = service
+            .prepare_bugkill_investigate(
+                fx.repo_str(),
+                "Saving crashes.",
+                None,
+                &[original.clone()],
+                true,
+            )
+            .unwrap();
+        let first_fix = service
+            .prepare_bugkill_fix(
+                fx.repo_str(),
+                "Saving crashes.",
+                &row,
+                None,
+                &[original.clone()],
+            )
+            .await
+            .unwrap();
+        let retry = service
+            .prepare_bugkill_fix(
+                fx.repo_str(),
+                "Saving crashes.",
+                &row,
+                Some("still broken"),
+                &[original.clone(), feedback.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            command_attachments(&initial.command.args),
+            [original.path.to_string_lossy()]
+        );
+        assert_eq!(
+            command_attachments(&corrective.command.args),
+            [original.path.to_string_lossy()]
+        );
+        assert_eq!(
+            command_attachments(&first_fix.command.args),
+            [original.path.to_string_lossy()]
+        );
+        assert_eq!(
+            command_attachments(&retry.command.args),
+            [
+                original.path.to_string_lossy(),
+                feedback.path.to_string_lossy()
+            ]
+        );
+
+        let judge_binary = fx._parent.path().join(format!("judge-{harness:?}"));
+        let judge_args = fx._parent.path().join(format!("judge-{harness:?}.args"));
+        fs::write(
+            &judge_binary,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.214'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\necho '==== VERDICT ===='\necho 'RESULT: NOT_FIXED'\necho 'REASON: still broken'\necho '==== END ===='\n",
+                judge_args.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&judge_binary);
+        service
+            .with_ai_binary(harness, judge_binary)
+            .bugkill_judge(fx.repo_str(), &row, "still broken", &[feedback.clone()])
+            .await
+            .unwrap();
+        let judge_args: Vec<String> = fs::read_to_string(judge_args)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let attachment_flag = if harness == AiHarness::OpenCode {
+            "--file"
+        } else {
+            "--image"
+        };
+        assert!(
+            judge_args
+                .windows(2)
+                .any(|args| args == [attachment_flag, feedback.path.to_string_lossy().as_ref()]),
+            "{judge_args:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bugkill_rejects_missing_attachment_before_starting_a_run() {
+    let fx = Fixture::new();
+    let missing = attachment(fx._parent.path().join("missing.png"), "missing");
+    let error = fx
+        .service()
+        .prepare_bugkill_investigate(fx.repo_str(), "Saving crashes.", None, &[missing], false)
+        .unwrap_err();
+    assert!(error.to_string().contains("Reattach it before continuing"));
+}
+
+#[tokio::test]
+async fn resume_preserves_original_bug_image_and_rejects_it_if_removed() {
+    let fx = Fixture::new();
+    let image_path = fx._parent.path().join("original.png");
+    fs::write(&image_path, "original").unwrap();
+    let original = attachment(image_path.clone(), "original");
+    fs::write(
+        fx.repo.join("BUG_INVESTIGATION.md"),
+        render_investigation_md(
+            "Saving crashes.",
+            &[fx.hypothesis(false, None)],
+            &[],
+            &[original.clone()],
+        ),
+    )
+    .unwrap();
+
+    let resumed = match fx.service().bugkill_preflight(fx.repo_str()).await.unwrap() {
+        BugkillPreflightOutcome::Ready(preflight) => match preflight.resume {
+            BugkillResumeState::Parsed { investigation, .. } => investigation,
+            other => panic!("expected parsed resume, got {other:?}"),
+        },
+        other => panic!("expected Ready, got {other:?}"),
+    };
+    assert_eq!(resumed.attachments, vec![original.clone()]);
+
+    fs::remove_file(image_path).unwrap();
+    let error = fx
+        .service()
+        .prepare_bugkill_fix(
+            fx.repo_str(),
+            &resumed.bug_description,
+            &resumed.hypotheses[0],
+            None,
+            &resumed.attachments,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Reattach it before continuing"));
+}
+
+#[tokio::test]
 async fn malformed_judge_output_is_unclear_but_execution_failure_is_actionable() {
     let fx = Fixture::new();
     let row = fx.hypothesis(true, None);
@@ -512,7 +687,7 @@ async fn malformed_judge_output_is_unclear_but_execution_failure_is_actionable()
         .service_with_harness(AiHarness::Codex)
         .with_ai_binary(AiHarness::Codex, judge);
     let verdict = service
-        .bugkill_judge(fx.repo_str(), &row, "It still crashes.")
+        .bugkill_judge(fx.repo_str(), &row, "It still crashes.", &[])
         .await
         .unwrap();
     assert_eq!(verdict.result, wisetree::services::JudgeResult::Unclear);
@@ -520,7 +695,7 @@ async fn malformed_judge_output_is_unclear_but_execution_failure_is_actionable()
     let failed = fx
         .service_with_harness(AiHarness::Codex)
         .with_ai_binary(AiHarness::Codex, fx._parent.path().join("bin/missing"))
-        .bugkill_judge(fx.repo_str(), &row, "It still crashes.")
+        .bugkill_judge(fx.repo_str(), &row, "It still crashes.", &[])
         .await;
     assert!(failed.is_err());
 }
