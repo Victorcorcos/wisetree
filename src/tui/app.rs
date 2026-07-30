@@ -365,6 +365,7 @@ enum ImagePasteTarget {
 }
 
 enum ClipboardPaste {
+    #[cfg(target_os = "macos")]
     Image(ImageAttachment),
     Text(String),
 }
@@ -6748,6 +6749,7 @@ impl App {
                 }
             },
             AppEvent::ClipboardPasteFinished { target, result } => match result {
+                #[cfg(target_os = "macos")]
                 Ok(ClipboardPaste::Image(attachment)) => {
                     self.insert_image_attachment(target, attachment);
                 }
@@ -8979,6 +8981,7 @@ fn read_text_clipboard() -> Result<String, String> {
     Err("no supported text clipboard tool found".to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut group = [0u8; 4];
