@@ -37,6 +37,7 @@ use ratatui::Frame;
 use crate::config::schema::AiFixConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{CommentGroup, FixPlan};
+use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::FixPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
@@ -114,7 +115,7 @@ pub enum FixAction {
     /// Decision: skip this comment, move on.
     Skip,
     /// OtherInput submitted — re-plan with this feedback.
-    Replan(String),
+    Replan(String, Vec<ImageAttachment>),
     /// Applying finished (opencode exited or the user confirmed) — the `App`
     /// commits the change and replies.
     ApplyReady,
@@ -161,6 +162,7 @@ pub struct FixPullRequestScreen {
     /// Scroll offset for the (potentially long) proposal text on Decision.
     decision_scroll: u16,
     other_input: Option<InputPrompt>,
+    input_generation: u64,
     // ── live-apply PTY state (mirrors Explain PR) ──────────────────────────
     ai_done: bool,
     pty: Option<PtyView>,
@@ -193,6 +195,7 @@ impl FixPullRequestScreen {
             decision_button_rects: Cell::new([Rect::default(); 3]),
             decision_scroll: 0,
             other_input: None,
+            input_generation: 0,
             ai_done: false,
             pty: None,
             pty_focused: false,
@@ -356,9 +359,35 @@ impl FixPullRequestScreen {
     pub fn show_other_input(&mut self) {
         self.other_input = Some(
             InputPrompt::new("Tell the AI what to change about this plan:")
+                .multiline()
                 .with_placeholder("e.g. avoid nested ifs; keep the original name"),
         );
+        self.input_generation = self.input_generation.wrapping_add(1);
         self.step = FixStep::OtherInput;
+    }
+
+    /// Identity of the focused textarea, used to reject a delayed clipboard
+    /// read after this feedback draft has been closed or replaced.
+    pub fn attachment_input_generation(&self) -> Option<u64> {
+        self.other_input
+            .as_ref()
+            .filter(|input| input.accepts_attachments())
+            .map(|_| self.input_generation)
+    }
+
+    pub fn insert_attachment(&mut self, generation: u64, attachment: ImageAttachment) -> bool {
+        generation == self.input_generation
+            && self
+                .other_input
+                .as_mut()
+                .is_some_and(|input| input.insert_attachment(attachment))
+    }
+
+    pub fn handle_paste(&mut self, text: &str) -> FixAction {
+        if let Some(input) = self.other_input.as_mut() {
+            input.paste(text);
+        }
+        FixAction::Continue
     }
 
     /// The current plan rendered back to text, threaded into a re-plan call so
@@ -636,14 +665,25 @@ impl FixPullRequestScreen {
             self.step = FixStep::Decision;
             return FixAction::Continue;
         };
+        if input.wants_copy_all(&key) {
+            return FixAction::Continue;
+        }
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
-                let trimmed = text.trim().to_string();
-                if trimmed.is_empty() {
+                let attachments = input.attachments().to_vec();
+                let trimmed = text.replace('\u{fffc}', "").trim().to_string();
+                if trimmed.is_empty() && attachments.is_empty() {
                     return FixAction::Continue;
                 }
                 self.other_input = None;
-                FixAction::Replan(trimmed)
+                FixAction::Replan(
+                    if trimmed.is_empty() {
+                        "See the attached image.".to_string()
+                    } else {
+                        trimmed
+                    },
+                    attachments,
+                )
             }
             // Cancel returns to the Decision view with the same plan.
             InputOutcome::Cancelled => {
@@ -1911,13 +1951,33 @@ mod tests {
         screen.handle_key(key(KeyCode::Char('o')));
         assert_eq!(
             screen.handle_key(key(KeyCode::Enter)),
-            FixAction::Replan("no".to_string())
+            FixAction::Replan("no".to_string(), Vec::new())
         );
         // Re-planning supplies the previous plan back to the model.
         assert!(screen
             .previous_plan_text()
             .unwrap()
             .contains("RETRY_DELAY_MS"));
+    }
+
+    #[test]
+    fn other_input_forwards_only_its_own_image_attachment() {
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.show_decision(plan());
+        screen.show_other_input();
+        let generation = screen.attachment_input_generation().unwrap();
+        let attachment = ImageAttachment {
+            id: "image-id".to_string(),
+            filename: "image-id.png".to_string(),
+            mime_type: "image/png".to_string(),
+            path: "/tmp/image-id.png".into(),
+        };
+        assert!(screen.insert_attachment(generation, attachment.clone()));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            FixAction::Replan("See the attached image.".to_string(), vec![attachment])
+        );
     }
 
     #[test]

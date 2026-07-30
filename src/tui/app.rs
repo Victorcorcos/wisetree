@@ -223,8 +223,7 @@ enum AppEvent {
     /// An "Other" revision of the current finding returned.
     ReviewPrRevised {
         index: usize,
-        mode: ReviewRevisionMode,
-        feedback: String,
+        revision: (ReviewRevisionMode, String, Vec<ImageAttachment>),
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
     },
@@ -360,6 +359,8 @@ enum AppEvent {
 enum ImagePasteTarget {
     Develop(u64),
     Bugkill(u64),
+    Fix(u64),
+    Review(u64),
 }
 
 enum ClipboardPaste {
@@ -1531,6 +1532,24 @@ impl App {
             self.apply_develop_action(action, tx);
             return;
         }
+        if matches!(self.screen, Screen::FixPullRequest) {
+            let action = self
+                .fix_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(FixAction::Continue);
+            self.apply_fix_action(action, tx);
+            return;
+        }
+        if matches!(self.screen, Screen::ReviewPullRequest) {
+            let action = self
+                .review_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(ReviewAction::Continue);
+            self.apply_review_action(action, tx);
+            return;
+        }
         for ch in text.chars() {
             if ch.is_control() {
                 continue;
@@ -1551,6 +1570,16 @@ impl App {
                 .as_ref()
                 .and_then(BugkillPullRequestScreen::attachment_input_generation)
                 .map(ImagePasteTarget::Bugkill),
+            Screen::FixPullRequest => self
+                .fix_pr
+                .as_ref()
+                .and_then(FixPullRequestScreen::attachment_input_generation)
+                .map(ImagePasteTarget::Fix),
+            Screen::ReviewPullRequest => self
+                .review_pr
+                .as_ref()
+                .and_then(ReviewPullRequestScreen::attachment_input_generation)
+                .map(ImagePasteTarget::Review),
             _ => None,
         }
     }
@@ -1568,6 +1597,15 @@ impl App {
             }
             ImagePasteTarget::Bugkill(generation) if self.screen == Screen::BugkillPullRequest => {
                 self.bugkill_pr
+                    .as_mut()
+                    .is_some_and(|screen| screen.insert_attachment(generation, attachment))
+            }
+            ImagePasteTarget::Fix(generation) if self.screen == Screen::FixPullRequest => self
+                .fix_pr
+                .as_mut()
+                .is_some_and(|screen| screen.insert_attachment(generation, attachment)),
+            ImagePasteTarget::Review(generation) if self.screen == Screen::ReviewPullRequest => {
+                self.review_pr
                     .as_mut()
                     .is_some_and(|screen| screen.insert_attachment(generation, attachment))
             }
@@ -1611,6 +1649,36 @@ impl App {
                     .map(|screen| screen.handle_paste(text))
                     .unwrap_or(BugkillAction::Continue);
                 self.apply_bugkill_action(action, tx);
+            }
+            ImagePasteTarget::Fix(generation)
+                if self.screen == Screen::FixPullRequest
+                    && self
+                        .fix_pr
+                        .as_ref()
+                        .and_then(FixPullRequestScreen::attachment_input_generation)
+                        == Some(generation) =>
+            {
+                let action = self
+                    .fix_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_paste(text))
+                    .unwrap_or(FixAction::Continue);
+                self.apply_fix_action(action, tx);
+            }
+            ImagePasteTarget::Review(generation)
+                if self.screen == Screen::ReviewPullRequest
+                    && self
+                        .review_pr
+                        .as_ref()
+                        .and_then(ReviewPullRequestScreen::attachment_input_generation)
+                        == Some(generation) =>
+            {
+                let action = self
+                    .review_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_paste(text))
+                    .unwrap_or(ReviewAction::Continue);
+                self.apply_review_action(action, tx);
             }
             _ => {}
         }
@@ -2766,9 +2834,9 @@ impl App {
                 }
                 self.advance_fix(tx);
             }
-            FixAction::Replan(feedback) => {
+            FixAction::Replan(feedback, attachments) => {
                 let previous_plan = self.fix_pr.as_ref().and_then(|s| s.previous_plan_text());
-                self.plan_current_fix(tx, Some(feedback), previous_plan);
+                self.plan_current_fix(tx, Some((feedback, attachments)), previous_plan);
             }
             FixAction::ApplyReady => self.on_fix_apply_done(tx),
             FixAction::Done => {
@@ -2784,7 +2852,7 @@ impl App {
     fn plan_current_fix(
         &mut self,
         tx: &mpsc::UnboundedSender<AppEvent>,
-        feedback: Option<String>,
+        feedback: Option<(String, Vec<ImageAttachment>)>,
         previous_plan: Option<String>,
     ) {
         let Some(screen) = self.fix_pr.as_mut() else {
@@ -2798,6 +2866,9 @@ impl App {
         let worktree_path = screen.request().worktree_path.clone();
         let history = screen.history_text();
         let operation_id = self.active_fix_operation_id.unwrap_or_default();
+        let (feedback, attachments) = feedback
+            .map(|(feedback, attachments)| (Some(feedback), attachments))
+            .unwrap_or_default();
         screen.start_planning(index + 1, total);
         kick_off_plan_comment(
             self.git_root.clone(),
@@ -2808,6 +2879,7 @@ impl App {
                 feedback,
                 previous_plan,
                 history,
+                attachments,
                 index,
                 operation_id,
             },
@@ -2981,7 +3053,7 @@ impl App {
                 }
                 self.advance_review_finding(tx);
             }
-            ReviewAction::Revise(feedback) => {
+            ReviewAction::Revise(feedback, attachments) => {
                 let Some(screen) = self.review_pr.as_mut() else {
                     return;
                 };
@@ -3004,6 +3076,7 @@ impl App {
                         ReviewRevisionMode::Focused
                     },
                     feedback,
+                    attachments,
                     index: screen.current_index(),
                 };
                 screen.start_revising();
@@ -3463,12 +3536,12 @@ impl App {
     fn apply_review_pr_revised(
         &mut self,
         index: usize,
-        mode: ReviewRevisionMode,
-        feedback: String,
+        revision: (ReviewRevisionMode, String, Vec<ImageAttachment>),
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
+        let (mode, feedback, attachments) = revision;
         if !self.review_at_index(index) {
             return;
         }
@@ -3500,6 +3573,7 @@ impl App {
                             file,
                             finding,
                             feedback: feedback.clone(),
+                            attachments: attachments.clone(),
                             mode: ReviewRevisionMode::Expanded,
                             index,
                         })
@@ -6746,11 +6820,10 @@ impl App {
             } => self.apply_review_pr_scanned(file_index, retry, result, telemetry, raw_output, tx),
             AppEvent::ReviewPrRevised {
                 index,
-                mode,
-                feedback,
+                revision,
                 result,
                 telemetry,
-            } => self.apply_review_pr_revised(index, mode, feedback, result, telemetry, tx),
+            } => self.apply_review_pr_revised(index, revision, result, telemetry, tx),
             AppEvent::ReviewPrVerified {
                 index,
                 result,
@@ -9146,6 +9219,7 @@ struct FixPlanRequest {
     /// Comments + replies + fixes already resolved earlier this run, so the
     /// model can interpret a comment that refers back to them.
     history: Option<String>,
+    attachments: Vec<ImageAttachment>,
     index: usize,
     operation_id: u64,
 }
@@ -9234,6 +9308,7 @@ fn kick_off_plan_comment(
                 req.feedback.as_deref(),
                 req.previous_plan.as_deref(),
                 req.history.as_deref(),
+                &req.attachments,
             )
             .await
             .map_err(|err| user_friendly_message(&err));
@@ -9453,6 +9528,7 @@ struct ReviewReviseRequest {
     file: ReviewFile,
     finding: ReviewFinding,
     feedback: String,
+    attachments: Vec<ImageAttachment>,
     mode: ReviewRevisionMode,
     index: usize,
 }
@@ -9668,11 +9744,11 @@ fn kick_off_revise_review_finding(
     let index = req.index;
     let mode = req.mode;
     let feedback = req.feedback.clone();
+    let attachments = req.attachments.clone();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrRevised {
             index,
-            mode,
-            feedback,
+            revision: (mode, feedback, attachments),
             result: Err("Could not resolve git root.".to_string()),
             telemetry: None,
         });
@@ -9686,14 +9762,14 @@ fn kick_off_revise_review_finding(
                 &req.file,
                 &req.finding,
                 &req.feedback,
+                &req.attachments,
                 req.mode,
             )
             .await;
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrRevised {
             index,
-            mode,
-            feedback,
+            revision: (mode, feedback, attachments),
             result,
             telemetry: Some(attempt.telemetry),
         });
@@ -11228,8 +11304,11 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.apply_review_pr_revised(
             0,
-            ReviewRevisionMode::Focused,
-            "use more context".to_string(),
+            (
+                ReviewRevisionMode::Focused,
+                "use more context".to_string(),
+                Vec::new(),
+            ),
             Err("malformed".to_string()),
             None,
             &tx,
@@ -11238,7 +11317,7 @@ mod tests {
         assert!(matches!(
             event,
             AppEvent::ReviewPrRevised {
-                mode: ReviewRevisionMode::Expanded,
+                revision: (ReviewRevisionMode::Expanded, _, _),
                 ..
             }
         ));

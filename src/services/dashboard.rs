@@ -2975,6 +2975,7 @@ impl DashboardService {
         feedback: Option<&str>,
         previous_plan: Option<&str>,
         history: Option<&str>,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
     ) -> Result<FixVerdict> {
         let cwd = PathBuf::from(worktree_path);
         let code = match &group.file {
@@ -2992,7 +2993,7 @@ impl DashboardService {
             timeout: FIX_PLAN_TIMEOUT,
             activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
             session_title: None,
-            attachments: Vec::new(),
+            attachments: Self::attached_image_paths(attachments)?,
         };
         let (_cancel_tx, cancel_rx) = oneshot::channel();
         let output = self
@@ -3522,6 +3523,7 @@ impl DashboardService {
         file: &ReviewFile,
         finding: &ReviewFinding,
         feedback: &str,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
         mode: ReviewRevisionMode,
     ) -> ReviewScanAttempt {
         let started = Instant::now();
@@ -3549,8 +3551,22 @@ impl DashboardService {
             );
         }
         let prompt = build_review_revision_prompt(file, finding, feedback, mode);
-        self.execute_review_file_prompt(cwd, file, scan, started, prompt, selection)
-            .await
+        let attachments = match Self::attached_image_paths(attachments) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                return review_scan_attempt(scan, 0, started, None, Err(error), None, &selection)
+            }
+        };
+        self.execute_review_attachment_prompt(ReviewAttachmentPrompt {
+            cwd,
+            file,
+            scan,
+            started,
+            prompt,
+            selection,
+            attachments,
+        })
+        .await
     }
 
     /// Adversarially verify every candidate raised against one file in a
@@ -3644,6 +3660,51 @@ impl DashboardService {
         )
     }
 
+    async fn execute_review_attachment_prompt(
+        &self,
+        request: ReviewAttachmentPrompt<'_>,
+    ) -> ReviewScanAttempt {
+        let ReviewAttachmentPrompt {
+            cwd,
+            file,
+            scan,
+            started,
+            prompt,
+            selection,
+            attachments,
+        } = request;
+        let prompt_bytes = prompt.len();
+        let (output, usage) = self
+            .run_review_prompt_with_attachments(&cwd, &selection, prompt, attachments)
+            .await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_review_findings(
+                &output,
+                &file.path,
+                &file.commentable_lines,
+                &file.annotated_diff,
+            ) {
+                Some(findings) => (Ok(findings), None),
+                None => (
+                    Err(WisetreeError::other(
+                        "could not parse findings from the review AI output.",
+                    )),
+                    Some(output),
+                ),
+            },
+        };
+        review_scan_attempt(
+            scan,
+            prompt_bytes,
+            started,
+            usage,
+            result,
+            raw_output,
+            &selection,
+        )
+    }
+
     /// Runs exactly the configured review harness under its read-only policy.
     /// OpenCode usage is correlated with its session title; other harnesses do
     /// not borrow OpenCode's storage and therefore remain explicitly unknown.
@@ -3655,6 +3716,43 @@ impl DashboardService {
     ) -> (Result<String>, Option<ReviewTokenUsage>) {
         self.run_review_prompt_with_timeout(cwd, selection, prompt, REVIEW_SCAN_TIMEOUT)
             .await
+    }
+
+    async fn run_review_prompt_with_attachments(
+        &self,
+        cwd: &Path,
+        selection: &ReviewModelSelection,
+        prompt: String,
+        attachments: Vec<PathBuf>,
+    ) -> (Result<String>, Option<ReviewTokenUsage>) {
+        let title = (selection.harness == AiHarness::OpenCode).then(review_scan_title);
+        let request = AiRunRequest {
+            slot: format!("dashboard.ai.review.{}", selection.profile.label()),
+            config: AiModelConfig {
+                model: selection.model.clone(),
+                thinking: selection.thinking.clone(),
+                harness: selection.harness,
+            },
+            prompt,
+            cwd: cwd.to_path_buf(),
+            mode: AiRunMode::Captured,
+            permission: AiPermission::Plan,
+            timeout: REVIEW_SCAN_TIMEOUT,
+            activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+            session_title: title.clone(),
+            attachments,
+        };
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let result = self
+            .ai_runner()
+            .run_captured(&request, None, cancel_rx)
+            .await
+            .map(|run| run.transcript);
+        let usage = match title {
+            Some(title) => opencode_usage_for_title(title).await,
+            None => None,
+        };
+        (result, usage)
     }
 
     async fn run_review_prompt_with_timeout(
@@ -4940,6 +5038,23 @@ impl DashboardService {
             .collect())
     }
 
+    fn attached_image_paths(
+        attachments: &[crate::tui::image_upload::ImageAttachment],
+    ) -> Result<Vec<PathBuf>> {
+        for attachment in attachments {
+            if !attachment.path.is_file() {
+                return Err(WisetreeError::other(format!(
+                    "Attached image is no longer available: {}. Reattach it before continuing.",
+                    attachment.path.display()
+                )));
+            }
+        }
+        Ok(attachments
+            .iter()
+            .map(|attachment| attachment.path.clone())
+            .collect())
+    }
+
     /// Run the configured check command (Ralph-canon backpressure) in the
     /// worktree, deterministically — no AI. The command is run through the
     /// user's login shell so their PATH / toolchain shims resolve exactly as
@@ -5653,6 +5768,16 @@ impl DashboardService {
             }
         }
     }
+}
+
+struct ReviewAttachmentPrompt<'a> {
+    cwd: PathBuf,
+    file: &'a ReviewFile,
+    scan: String,
+    started: Instant,
+    prompt: String,
+    selection: ReviewModelSelection,
+    attachments: Vec<PathBuf>,
 }
 
 fn binary_available(binary: &Path) -> bool {

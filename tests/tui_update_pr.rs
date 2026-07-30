@@ -15,6 +15,37 @@ use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
 use wisetree::services::{DashboardService, UpdateBranchOutcome, UpdatePullRequestOutcome};
 
+#[test]
+fn every_freeform_textarea_uses_the_shared_image_enabled_prompt() {
+    // Keep this list explicit: these are the project-owned multiline prompt
+    // destinations, and `InputPrompt::multiline` is the shared attachment
+    // capability boundary. New textareas should be added here deliberately.
+    let surfaces = [
+        include_str!("../src/tui/screens/develop_pr.rs"),
+        include_str!("../src/tui/screens/bugkill_pr.rs"),
+        include_str!("../src/tui/screens/review_pr.rs"),
+        include_str!("../src/tui/screens/fix_pr.rs"),
+    ];
+    for surface in surfaces {
+        assert!(
+            surface.contains(".multiline()"),
+            "freeform textarea surface must opt into InputPrompt::multiline"
+        );
+    }
+
+    let review = surfaces[2];
+    let fix = surfaces[3];
+    assert!(review.contains("Edit the explanation (Ctrl+J for a new line):"));
+    assert!(
+        review.contains("Tell the AI what to change about this comment:")
+            && review.contains("Revise(String, Vec<ImageAttachment>)")
+    );
+    assert!(
+        fix.contains("Tell the AI what to change about this plan:")
+            && fix.contains("Replan(String, Vec<ImageAttachment>)")
+    );
+}
+
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
