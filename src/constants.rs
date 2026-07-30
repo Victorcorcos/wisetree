@@ -30,6 +30,11 @@ pub const IMAGE_UPLOAD_RETENTION_DAYS: u64 = 30;
 /// A single cleanup pass never deletes more than this many files.
 pub const IMAGE_UPLOAD_CLEANUP_LIMIT: usize = 64;
 
+/// Largest image accepted, matching Claude's documented 10 MB per-image API
+/// limit. Rejecting here turns a mid-run harness failure into an immediate,
+/// actionable message in the textarea.
+pub const IMAGE_UPLOAD_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 

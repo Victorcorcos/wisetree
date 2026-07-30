@@ -45,11 +45,12 @@ use crate::services::{
     AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
     BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
     DashboardService, DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff,
-    DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome,
-    ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    JudgeResult, MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile,
-    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification,
-    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    DevelopPlanPrompt, DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation,
+    ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan,
+    FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult, OpencodeModel, PrState,
+    ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
+    ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::image_upload::{ImageAttachment, ImageStorage};
@@ -8900,11 +8901,28 @@ fn kick_off_clipboard_paste(target: ImagePasteTarget, tx: mpsc::UnboundedSender<
 fn read_clipboard_paste() -> Result<ClipboardPaste, String> {
     #[cfg(target_os = "macos")]
     {
+        // The pasteboard's own PNG data is preferred, and a TIFF-only
+        // pasteboard (what `NSImage` hands back for many sources) is converted
+        // to PNG here. Emitting the raw TIFF would produce a file that none of
+        // OpenCode, Codex, or Claude Code accepts.
         let image_script = r#"
             ObjC.import('AppKit');
-            const image = $.NSImage.alloc.initWithPasteboard($.NSPasteboard.generalPasteboard);
-            if (image && image.TIFFRepresentation) {
-                console.log(ObjC.unwrap(image.TIFFRepresentation.base64EncodedStringWithOptions(0)));
+            const board = $.NSPasteboard.generalPasteboard;
+            let data = board.dataForType($.NSPasteboardTypePNG);
+            if (!data || !data.length) {
+                const tiff = board.dataForType($.NSPasteboardTypeTIFF);
+                const rep = tiff && tiff.length
+                    ? $.NSBitmapImageRep.imageRepWithData(tiff)
+                    : null;
+                if (rep) {
+                    data = rep.representationUsingTypeProperties(
+                        $.NSBitmapImageFileTypePNG,
+                        $.NSDictionary.dictionary
+                    );
+                }
+            }
+            if (data && data.length) {
+                console.log(ObjC.unwrap(data.base64EncodedStringWithOptions(0)));
             }
         "#;
         let output = std::process::Command::new("osascript")
@@ -10367,15 +10385,15 @@ fn kick_off_develop_prepare_plan(
             None => (None, None),
         };
         let result = service
-            .prepare_develop_plan(
-                &req.worktree_path,
-                &req.task_description,
-                req.base_ref.as_deref(),
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: &req.worktree_path,
+                task_description: &req.task_description,
+                base_ref: req.base_ref.as_deref(),
                 previous_plan,
                 feedback,
-                &req.attachments,
+                attachments: &req.attachments,
                 corrective,
-            )
+            })
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopPlanReady {

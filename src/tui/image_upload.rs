@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::constants::{
-    image_uploads_dir, IMAGE_UPLOAD_CLEANUP_LIMIT, IMAGE_UPLOAD_RETENTION_DAYS,
+    image_uploads_dir, IMAGE_UPLOAD_CLEANUP_LIMIT, IMAGE_UPLOAD_MAX_BYTES,
+    IMAGE_UPLOAD_RETENTION_DAYS,
 };
 
 /// A durable reference to an image uploaded from a clipboard or dropped file.
@@ -57,10 +58,15 @@ pub enum ImageUploadError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("This image format is not supported. Use PNG, JPEG, GIF, WebP, BMP, ICO, or TIFF.")]
+    /// The supported set is the intersection of what OpenCode, Codex, and
+    /// Claude Code all accept. Codex rejects BMP/TIFF outright and Claude's
+    /// vision API accepts only these four media types.
+    #[error("This image format is not supported. Use PNG, JPEG, GIF, or WebP.")]
     UnsupportedFormat,
     #[error("The image is corrupt or cannot be decoded.")]
     CorruptImage,
+    #[error("The image is {size_mb:.1} MB; the {limit_mb} MB limit keeps it within what the AI harnesses accept.")]
+    TooLarge { size_mb: f64, limit_mb: u64 },
     #[error("Could not store the image: {0}")]
     Storage(#[source] std::io::Error),
     #[error("Invalid file URI: {0}")]
@@ -131,6 +137,13 @@ impl ImageStorage {
 
     pub fn ingest_bytes(&self, bytes: &[u8]) -> Result<ImageAttachment, ImageUploadError> {
         let (extension, mime_type) = identify_image(bytes)?;
+        let limit = IMAGE_UPLOAD_MAX_BYTES;
+        if bytes.len() as u64 > limit {
+            return Err(ImageUploadError::TooLarge {
+                size_mb: bytes.len() as f64 / (1024.0 * 1024.0),
+                limit_mb: limit / (1024 * 1024),
+            });
+        }
         let id = blake3::hash(bytes).to_hex().to_string();
         let filename = format!("{id}.{extension}");
         let path = self.root.join(&filename);
@@ -267,16 +280,10 @@ fn identify_image(bytes: &[u8]) -> Result<(&'static str, &'static str), ImageUpl
         (bytes.len() >= 12
             && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8 == bytes.len())
         .then_some(("webp", "image/webp"))
-    } else if bytes.starts_with(b"BM") {
-        (bytes.len() >= 26
-            && u32::from_le_bytes(bytes[2..6].try_into().unwrap()) as usize <= bytes.len()
-            && u32::from_le_bytes(bytes[14..18].try_into().unwrap()) >= 12)
-            .then_some(("bmp", "image/bmp"))
-    } else if bytes.starts_with(&[0, 0, 1, 0]) {
-        (bytes.len() >= 22).then_some(("ico", "image/x-icon"))
-    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
-        valid_tiff(bytes).then_some(("tiff", "image/tiff"))
     } else {
+        // BMP, ICO, and TIFF are deliberately absent: Codex rejects them and
+        // Claude's vision API accepts only the four types above, so accepting
+        // them here would only defer the failure to the AI run.
         return Err(ImageUploadError::UnsupportedFormat);
     };
     detected.ok_or(ImageUploadError::CorruptImage)
@@ -304,15 +311,6 @@ fn valid_png(bytes: &[u8]) -> bool {
         offset = next;
     }
     false
-}
-
-fn valid_tiff(bytes: &[u8]) -> bool {
-    bytes.len() >= 8
-        && match &bytes[..2] {
-            b"II" => (u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize) < bytes.len(),
-            b"MM" => (u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize) < bytes.len(),
-            _ => false,
-        }
 }
 
 /// Parse a terminal-provided file list. It accepts newline-separated paths,
@@ -533,6 +531,7 @@ mod tests {
         assert!(referenced_paths("<!-- wisetree:image-attachments: [not-json -->").is_none());
     }
 
+    /// Exactly the four types every supported harness accepts — no more.
     #[test]
     fn recognizes_the_explicit_supported_formats() {
         let formats: &[(&[u8], &str)] = &[
@@ -540,20 +539,45 @@ mod tests {
             (b"\xff\xd8\xff\xd9", "image/jpeg"),
             (b"GIF89a\0\0\0\0\0\0\0;", "image/gif"),
             (b"RIFF\x04\0\0\0WEBP", "image/webp"),
-            (
-                b"BM\x1a\0\0\0\0\0\0\0\0\0\0\0\x0c\0\0\0\0\0\0\0\0\0\0\0",
-                "image/bmp",
-            ),
-            (
-                &[
-                    0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 32, 0, 0, 0, 0, 0, 22, 0, 0, 0,
-                ],
-                "image/x-icon",
-            ),
-            (b"II*\0\x08\0\0\0\0", "image/tiff"),
         ];
         for (bytes, mime_type) in formats {
             assert_eq!(identify_image(bytes).unwrap().1, *mime_type);
         }
+    }
+
+    /// Codex rejects BMP/TIFF and Claude's vision API accepts none of these,
+    /// so they must fail in the textarea rather than mid-run.
+    #[test]
+    fn rejects_formats_no_harness_can_read() {
+        let unsupported: &[&[u8]] = &[
+            b"BM\x1a\0\0\0\0\0\0\0\0\0\0\0\x0c\0\0\0\0\0\0\0\0\0\0\0",
+            &[
+                0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 32, 0, 0, 0, 0, 0, 22, 0, 0, 0,
+            ],
+            b"II*\0\x08\0\0\0\0",
+            b"MM\0*\0\0\0\x08\0",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+        ];
+        for bytes in unsupported {
+            assert!(matches!(
+                identify_image(bytes),
+                Err(ImageUploadError::UnsupportedFormat)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_images_larger_than_the_harness_limit() {
+        let storage = ImageStorage::new(tempdir().unwrap().path().join("uploads"));
+        // A GIF whose declared structure is valid but whose payload exceeds
+        // the per-image limit every harness enforces.
+        let mut oversized = b"GIF89a".to_vec();
+        oversized.resize(IMAGE_UPLOAD_MAX_BYTES as usize + 1, 0);
+        *oversized.last_mut().unwrap() = 0x3b;
+        assert!(matches!(
+            storage.ingest_bytes(&oversized),
+            Err(ImageUploadError::TooLarge { .. })
+        ));
+        assert!(!storage.root().exists());
     }
 }

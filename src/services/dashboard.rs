@@ -785,6 +785,19 @@ pub struct DevelopHandoff {
     pub harness: AiHarness,
 }
 
+/// Inputs for one Develop planning run. `previous_plan` + `feedback` are set
+/// on a revision after the user rejects a plan; `corrective` marks the single
+/// retry after a parse failure.
+pub struct DevelopPlanPrompt<'a> {
+    pub worktree_path: &'a str,
+    pub task_description: &'a str,
+    pub base_ref: Option<&'a str>,
+    pub previous_plan: Option<&'a str>,
+    pub feedback: Option<&'a str>,
+    pub attachments: &'a [crate::tui::image_upload::ImageAttachment],
+    pub corrective: bool,
+}
+
 /// Result of the post-apply [`DashboardService::commit_and_reply`] step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixCommitOutcome {
@@ -4903,16 +4916,16 @@ impl DashboardService {
     /// revision after the user rejects the plan; `corrective` appends the
     /// stricter-contract suffix used on the single retry after a parse
     /// failure.
-    pub fn prepare_develop_plan(
-        &self,
-        worktree_path: &str,
-        task_description: &str,
-        base_ref: Option<&str>,
-        previous_plan: Option<&str>,
-        feedback: Option<&str>,
-        attachments: &[crate::tui::image_upload::ImageAttachment],
-        corrective: bool,
-    ) -> Result<DevelopHandoff> {
+    pub fn prepare_develop_plan(&self, req: DevelopPlanPrompt<'_>) -> Result<DevelopHandoff> {
+        let DevelopPlanPrompt {
+            worktree_path,
+            task_description,
+            base_ref,
+            previous_plan,
+            feedback,
+            attachments,
+            corrective,
+        } = req;
         let slot = &self.config.ai.develop.plan;
         let model = slot.model.trim().to_string();
         if model.is_empty() {
@@ -15309,15 +15322,15 @@ so the intent reads clearly.
         let (service, worktree) = develop_dashboard_service();
 
         let handoff = service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "Add dashboard filtering",
-                Some("origin/main"),
-                None,
-                None,
-                &[],
-                false,
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "Add dashboard filtering",
+                base_ref: Some("origin/main"),
+                previous_plan: None,
+                feedback: None,
+                attachments: &[],
+                corrective: false,
+            })
             .unwrap();
 
         assert_eq!(handoff.command.binary, service.opencode_binary);
@@ -15360,28 +15373,31 @@ so the intent reads clearly.
                 "section",
                 "outline",
                 None,
-                &[attachment.clone()],
+                std::slice::from_ref(&attachment),
             )
             .unwrap();
+        // Develop runs the interactive opencode TUI, which has no attachment
+        // flag, so the path must reach the agent through the prompt instead.
+        assert!(!handoff.command.args.iter().any(|arg| arg == "--file"));
         assert!(handoff
             .command
             .args
-            .windows(2)
-            .any(|args| args == ["--file", path.to_str().unwrap()]));
+            .iter()
+            .any(|arg| arg.contains(path.to_str().unwrap())));
         let missing = crate::tui::image_upload::ImageAttachment {
             path: worktree.path().join("gone.png"),
             ..attachment
         };
         assert!(service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "task",
-                None,
-                None,
-                None,
-                &[missing],
-                false
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "task",
+                base_ref: None,
+                previous_plan: None,
+                feedback: None,
+                attachments: &[missing],
+                corrective: false,
+            })
             .unwrap_err()
             .to_string()
             .contains("Attached image is no longer available"));
@@ -15392,15 +15408,15 @@ so the intent reads clearly.
         let (service, worktree) = develop_dashboard_service();
 
         let handoff = service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "Add dashboard filtering",
-                None,
-                None,
-                None,
-                &[],
-                true,
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "Add dashboard filtering",
+                base_ref: None,
+                previous_plan: None,
+                feedback: None,
+                attachments: &[],
+                corrective: true,
+            })
             .unwrap();
 
         assert!(handoff.command.args.get(1).unwrap().ends_with(
@@ -15415,15 +15431,15 @@ so the intent reads clearly.
         service.config.ai.develop.plan.model = "   ".to_string();
 
         let error = service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "Add dashboard filtering",
-                None,
-                None,
-                None,
-                &[],
-                false,
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "Add dashboard filtering",
+                base_ref: None,
+                previous_plan: None,
+                feedback: None,
+                attachments: &[],
+                corrective: false,
+            })
             .unwrap_err();
 
         assert_eq!(
@@ -15438,15 +15454,15 @@ so the intent reads clearly.
         service.opencode_binary = worktree.path().join("missing-opencode");
 
         let error = service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "Add dashboard filtering",
-                None,
-                None,
-                None,
-                &[],
-                false,
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "Add dashboard filtering",
+                base_ref: None,
+                previous_plan: None,
+                feedback: None,
+                attachments: &[],
+                corrective: false,
+            })
             .unwrap_err();
 
         assert!(error

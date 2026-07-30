@@ -8,7 +8,7 @@ You are planning ONE development task in the current working directory for an au
 TASK_DESCRIPTION
 ```
 
-Any image attachments are supplied separately by the CLI. Inspect them when they are relevant to the task or feedback; do not expect image bytes or paths in the text above.
+Any image attachments arrive either as native CLI attachments or as a list of file paths at the very end of this prompt. Inspect them when they are relevant to the task or feedback; never expect image bytes in the text above.
 
 - The branch's base ref, for context only (may be `(none resolved)`): `BASE_REF`
 

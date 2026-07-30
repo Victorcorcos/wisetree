@@ -26,10 +26,26 @@ fn attachment(path: PathBuf, id: &str) -> ImageAttachment {
     }
 }
 
-fn command_attachments(args: &[String]) -> Vec<&str> {
-    args.windows(2)
+/// Attachment paths a built command actually carries, by whichever route the
+/// harness supports: a native flag (`opencode run`, `codex`) or the numbered
+/// trailer appended to the prompt for CLIs with no attachment flag (the
+/// interactive `opencode` TUI, `claude`).
+fn command_attachments(args: &[String]) -> Vec<String> {
+    let flagged: Vec<String> = args
+        .windows(2)
         .filter(|args| args[0] == "--file" || args[0] == "--image")
-        .map(|args| args[1].as_str())
+        .map(|args| args[1].clone())
+        .collect();
+    if !flagged.is_empty() {
+        return flagged;
+    }
+    args.iter()
+        .flat_map(|arg| arg.lines())
+        .filter_map(|line| line.split_once(". "))
+        .filter(|(number, _)| number.trim().parse::<u32>().is_ok())
+        // opencode's interactive TUI needs `@path`; Claude Code takes a bare path.
+        .map(|(_, path)| path.trim_start_matches('@').to_string())
+        .filter(|path| path.starts_with('/'))
         .collect()
 }
 
@@ -531,7 +547,7 @@ async fn bugkill_threads_original_and_feedback_images_without_leaking_feedback()
                 fx.repo_str(),
                 "Saving crashes.",
                 None,
-                &[original.clone()],
+                std::slice::from_ref(&original),
                 false,
             )
             .unwrap();
@@ -540,7 +556,7 @@ async fn bugkill_threads_original_and_feedback_images_without_leaking_feedback()
                 fx.repo_str(),
                 "Saving crashes.",
                 None,
-                &[original.clone()],
+                std::slice::from_ref(&original),
                 true,
             )
             .unwrap();
@@ -550,7 +566,7 @@ async fn bugkill_threads_original_and_feedback_images_without_leaking_feedback()
                 "Saving crashes.",
                 &row,
                 None,
-                &[original.clone()],
+                std::slice::from_ref(&original),
             )
             .await
             .unwrap();
@@ -564,24 +580,29 @@ async fn bugkill_threads_original_and_feedback_images_without_leaking_feedback()
             )
             .await
             .unwrap();
+        let original_only = vec![original.path.display().to_string()];
         assert_eq!(
             command_attachments(&initial.command.args),
-            [original.path.to_string_lossy()]
+            original_only,
+            "{harness:?} initial investigation"
         );
         assert_eq!(
             command_attachments(&corrective.command.args),
-            [original.path.to_string_lossy()]
+            original_only,
+            "{harness:?} corrective investigation"
         );
         assert_eq!(
             command_attachments(&first_fix.command.args),
-            [original.path.to_string_lossy()]
+            original_only,
+            "{harness:?} first fix"
         );
         assert_eq!(
             command_attachments(&retry.command.args),
-            [
-                original.path.to_string_lossy(),
-                feedback.path.to_string_lossy()
-            ]
+            vec![
+                original.path.display().to_string(),
+                feedback.path.display().to_string()
+            ],
+            "{harness:?} retry"
         );
 
         let judge_binary = fx._parent.path().join(format!("judge-{harness:?}"));
@@ -597,7 +618,12 @@ async fn bugkill_threads_original_and_feedback_images_without_leaking_feedback()
         make_executable(&judge_binary);
         service
             .with_ai_binary(harness, judge_binary)
-            .bugkill_judge(fx.repo_str(), &row, "still broken", &[feedback.clone()])
+            .bugkill_judge(
+                fx.repo_str(),
+                &row,
+                "still broken",
+                std::slice::from_ref(&feedback),
+            )
             .await
             .unwrap();
         let judge_args: Vec<String> = fs::read_to_string(judge_args)
@@ -605,16 +631,12 @@ async fn bugkill_threads_original_and_feedback_images_without_leaking_feedback()
             .lines()
             .map(str::to_owned)
             .collect();
-        let attachment_flag = if harness == AiHarness::OpenCode {
-            "--file"
-        } else {
-            "--image"
-        };
-        assert!(
-            judge_args
-                .windows(2)
-                .any(|args| args == [attachment_flag, feedback.path.to_string_lossy().as_ref()]),
-            "{judge_args:?}"
+        // The judge only ever sees the verdict feedback's image, never the
+        // original bug report's.
+        assert_eq!(
+            command_attachments(&judge_args),
+            vec![feedback.path.display().to_string()],
+            "{harness:?} judge: {judge_args:?}"
         );
     }
 }
@@ -642,7 +664,7 @@ async fn resume_preserves_original_bug_image_and_rejects_it_if_removed() {
             "Saving crashes.",
             &[fx.hypothesis(false, None)],
             &[],
-            &[original.clone()],
+            std::slice::from_ref(&original),
         ),
     )
     .unwrap();
