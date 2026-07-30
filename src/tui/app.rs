@@ -1621,6 +1621,14 @@ impl App {
                     };
                 }
             }
+            Screen::ImprovePullRequest => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
             Screen::BugkillPullRequest => {
                 if let Some(screen) = self.bugkill_pr.as_mut() {
                     match direction {
@@ -1665,6 +1673,10 @@ impl App {
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             Screen::DevelopPullRequest => self
                 .develop_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            Screen::ImprovePullRequest => self
+                .improve_pr
                 .as_mut()
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             _ => false,
@@ -2949,10 +2961,20 @@ impl App {
         match action {
             ImproveAction::Continue => {}
             ImproveAction::Cancelled => {
+                let preparing = self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(ImprovePullRequestScreen::preparing);
                 let worktree_path = self
                     .improve_pr
                     .take()
                     .map(|screen| screen.request().worktree_path.clone());
+                if preparing {
+                    self.show_toast(
+                        ToastVariant::Info,
+                        "Improve discovery cancelled before any changes were made.".to_string(),
+                    );
+                }
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             ImproveAction::Done => self.finish_improve_flow(tx),
@@ -3314,14 +3336,15 @@ impl App {
         }
         let prepared = match result {
             Ok(preparation) => match *preparation {
-                ImprovePreparation::Ready { files, skipped, .. } if files.is_empty() => {
+                ImprovePreparation::Ready { base_ref, files, skipped, .. } if files.is_empty() => {
                     if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.set_reviewed_range(base_ref);
                         screen.record_skipped_files(&skipped);
                         screen.enter_done();
                     }
                     return;
                 }
-                ImprovePreparation::Ready { files, scan_mode, context, skipped, .. } => {
+                ImprovePreparation::Ready { base_ref, files, scan_mode, context, skipped } => {
                     let Some(request) = self.improve_pr.as_ref().map(|screen| screen.request().clone()) else {
                         return;
                     };
@@ -3334,6 +3357,7 @@ impl App {
                     discovery.set_files(files, String::new(), String::new(), String::new());
                     discovery.record_skipped_files(&skipped);
                     if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.set_reviewed_range(base_ref);
                         screen.record_skipped_files(&skipped);
                     }
                     self.review_pr = Some(discovery);
@@ -11673,6 +11697,53 @@ mod tests {
 
         assert!(rendered.contains("Proposed improvement"));
         assert!(rendered.contains("Improve #1 of 1"));
+    }
+
+    #[test]
+    fn improve_revision_feedback_accepts_bracketed_paste_without_submitting() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.phase = InitPhase::Ready;
+        let mut improve = ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        );
+        improve.show_finding(
+            ReviewFinding {
+                category: "Code Smell".to_string(),
+                severity: crate::services::ReviewSeverity::High,
+                file: "src/lib.rs".to_string(),
+                start_line: Some(4),
+                line: Some(4),
+                title: "Avoid duplicate work".to_string(),
+                explanation: "The operation runs twice.".to_string(),
+                suggestion: Some("Cache the result.".to_string()),
+            },
+            0,
+            1,
+        );
+        improve.show_other_input();
+        app.improve_pr = Some(improve);
+
+        app.handle_paste("prefer a local cache\n".to_string(), &app_event_tx());
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("prefer a local cache"));
+        assert!(app.improve_pr.as_ref().unwrap().current_finding().is_some());
     }
 
     #[test]

@@ -5,8 +5,8 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -176,6 +176,11 @@ pub struct ImprovePullRequestScreen {
     outcomes: Vec<ImproveOutcome>,
     done: bool,
     done_scroll: u16,
+    done_max_scroll: u16,
+    finding_scroll: u16,
+    finding_max_scroll: u16,
+    finding_action_areas: Option<[Rect; 4]>,
+    reviewed_range: Option<String>,
 }
 
 impl ImprovePullRequestScreen {
@@ -203,6 +208,11 @@ impl ImprovePullRequestScreen {
             outcomes: Vec::new(),
             done: false,
             done_scroll: 0,
+            done_max_scroll: 0,
+            finding_scroll: 0,
+            finding_max_scroll: 0,
+            finding_action_areas: None,
+            reviewed_range: None,
         }
     }
 
@@ -218,7 +228,7 @@ impl ImprovePullRequestScreen {
                     ImproveAction::Continue
                 }
                 KeyCode::Down => {
-                    self.done_scroll = self.done_scroll.saturating_add(1);
+                    self.done_scroll = self.done_scroll.saturating_add(1).min(self.done_max_scroll);
                     ImproveAction::Continue
                 }
                 KeyCode::Enter | KeyCode::Esc => ImproveAction::Done,
@@ -251,7 +261,11 @@ impl ImprovePullRequestScreen {
             };
         }
         if self.preparing {
-            return ImproveAction::Continue;
+            return if matches!(key.code, KeyCode::Esc) {
+                ImproveAction::Cancelled
+            } else {
+                ImproveAction::Continue
+            };
         }
         if self.finding.is_some() {
             if self.edit.is_some() {
@@ -273,6 +287,28 @@ impl ImprovePullRequestScreen {
                 };
             }
             return match key.code {
+                KeyCode::Up => {
+                    self.finding_scroll = self.finding_scroll.saturating_sub(1);
+                    ImproveAction::Continue
+                }
+                KeyCode::Down => {
+                    self.finding_scroll = self
+                        .finding_scroll
+                        .saturating_add(1)
+                        .min(self.finding_max_scroll);
+                    ImproveAction::Continue
+                }
+                KeyCode::PageUp => {
+                    self.finding_scroll = self.finding_scroll.saturating_sub(8);
+                    ImproveAction::Continue
+                }
+                KeyCode::PageDown => {
+                    self.finding_scroll = self
+                        .finding_scroll
+                        .saturating_add(8)
+                        .min(self.finding_max_scroll);
+                    ImproveAction::Continue
+                }
                 KeyCode::Left | KeyCode::BackTab => {
                     self.selected = (self.selected + 3) % 4;
                     ImproveAction::Continue
@@ -314,9 +350,33 @@ impl ImprovePullRequestScreen {
         }
     }
 
-    pub fn handle_mouse_click(&mut self, position: ratatui::layout::Position) -> ImproveAction {
-        if self.preparing {
+    pub fn handle_mouse_click(&mut self, position: Position) -> ImproveAction {
+        if self.preparing || self.applying || self.committing || self.aborting || self.done {
             return ImproveAction::Continue;
+        }
+        if self.finding.is_some() {
+            if self.edit.is_some() || self.other.is_some() {
+                return ImproveAction::Continue;
+            }
+            let Some(areas) = self.finding_action_areas else {
+                return ImproveAction::Continue;
+            };
+            let Some(selected) = areas.iter().position(|area| area.contains(position)) else {
+                return ImproveAction::Continue;
+            };
+            self.selected = selected as u8;
+            return match selected {
+                0 => ImproveAction::Apply,
+                1 => {
+                    self.show_edit();
+                    ImproveAction::Continue
+                }
+                2 => {
+                    self.show_other_input();
+                    ImproveAction::Continue
+                }
+                _ => ImproveAction::Skip,
+            };
         }
         match self.confirm.handle_mouse_click(position) {
             ConfirmationOutcome::Confirmed => ImproveAction::Confirmed,
@@ -353,6 +413,30 @@ impl ImprovePullRequestScreen {
             }
             return;
         }
+        if self.preparing {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Preparing Improve discovery",
+                        Style::default()
+                            .fg(colors::IMPROVE)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(
+                        "Inspecting the clean local worktree and building the reviewed range.",
+                    ),
+                    Line::default(),
+                    Line::from(Span::styled(
+                        "Esc cancel and return to the worktree actions",
+                        Style::default().fg(colors::MUTED),
+                    )),
+                ])
+                .block(Block::default().borders(Borders::ALL).title(" Improve "))
+                .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
         if let Some(finding) = self.finding.as_ref() {
             if let Some(edit) = self.edit.as_ref() {
                 self.render_edit(frame, area, edit);
@@ -373,12 +457,16 @@ impl ImprovePullRequestScreen {
                 .split(area);
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Improve #{} of {} · [{}] [{}] · {}",
+                    "Improve #{} of {} · [{}] [{}] · {}{}",
                     self.current + 1,
                     self.total,
                     finding.category,
                     finding.severity.label(),
-                    finding.descriptor()
+                    finding.descriptor(),
+                    self.reviewed_range
+                        .as_deref()
+                        .map(|range| format!(" · {range}"))
+                        .unwrap_or_default(),
                 ))
                 .style(
                     Style::default()
@@ -392,24 +480,27 @@ impl ImprovePullRequestScreen {
                 .title(" Proposed improvement ");
             let inner = block.inner(chunks[1]);
             frame.render_widget(block, chunks[1]);
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "Location: {}\n\n{}\n\nSuggested change:\n{}",
-                    finding.descriptor(),
-                    finding.explanation,
-                    finding
-                        .suggestion
-                        .as_deref()
-                        .unwrap_or("Implement the smallest safe correction.")
-                ))
-                .wrap(Wrap { trim: false }),
-                inner,
-            );
+            let paragraph = Paragraph::new(format!(
+                "Location: {}\n\n{}\n\nSuggested change:\n{}",
+                finding.descriptor(),
+                finding.explanation,
+                finding
+                    .suggestion
+                    .as_deref()
+                    .unwrap_or("Implement the smallest safe correction.")
+            ))
+            .wrap(Wrap { trim: false });
+            self.finding_max_scroll = paragraph
+                .line_count(inner.width)
+                .saturating_sub(inner.height.into()) as u16;
+            self.finding_scroll = self.finding_scroll.min(self.finding_max_scroll);
+            frame.render_widget(paragraph.scroll((self.finding_scroll, 0)), inner);
             let names = [" Apply ", " Edit ", " Other ", " Skip "];
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints(names.map(|s| Constraint::Length(s.len() as u16 + 2)))
                 .split(chunks[2]);
+            self.finding_action_areas = Some([cols[0], cols[1], cols[2], cols[3]]);
             for (i, name) in names.into_iter().enumerate() {
                 frame.render_widget(
                     Paragraph::new(name).style(
@@ -478,6 +569,7 @@ impl ImprovePullRequestScreen {
 
     pub fn start_preparing(&mut self) {
         self.preparing = true;
+        self.finding_action_areas = None;
     }
     pub fn start_applying(&mut self) {
         self.preparing = true;
@@ -488,6 +580,7 @@ impl ImprovePullRequestScreen {
         self.pty = None;
         self.pty_focused = false;
         self.pre_snapshot = None;
+        self.finding_action_areas = None;
     }
     pub fn set_pre_snapshot(&mut self, snapshot: BugkillSnapshot) {
         self.pre_snapshot = Some(snapshot);
@@ -557,6 +650,48 @@ impl ImprovePullRequestScreen {
     pub fn has_pty(&self) -> bool {
         self.pty.is_some()
     }
+    pub fn forward_pty_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !self.pty_focused {
+            return false;
+        }
+        self.pty
+            .as_mut()
+            .is_some_and(|pty| pty.send_mouse(mouse.kind, mouse.column, mouse.row, mouse.modifiers))
+    }
+    pub fn handle_mouse_scroll_up(&mut self, lines: u16) {
+        if self.done {
+            self.done_scroll = self.done_scroll.saturating_sub(lines);
+        } else if self.finding.is_some() && self.edit.is_none() && self.other.is_none() {
+            self.finding_scroll = self.finding_scroll.saturating_sub(lines);
+        } else if self.applying {
+            if let Some(pty) = self.pty.as_mut() {
+                pty.wheel_up(lines);
+            }
+        }
+    }
+    pub fn handle_mouse_scroll_down(&mut self, lines: u16) {
+        if self.done {
+            self.done_scroll = self
+                .done_scroll
+                .saturating_add(lines)
+                .min(self.done_max_scroll);
+        } else if self.finding.is_some() && self.edit.is_none() && self.other.is_none() {
+            self.finding_scroll = self
+                .finding_scroll
+                .saturating_add(lines)
+                .min(self.finding_max_scroll);
+        } else if self.applying {
+            if let Some(pty) = self.pty.as_mut() {
+                pty.wheel_down(lines);
+            }
+        }
+    }
+    pub fn set_reviewed_range(&mut self, base_ref: String) {
+        self.reviewed_range = Some(format!("reviewing {base_ref}...HEAD"));
+    }
+    pub fn preparing(&self) -> bool {
+        self.preparing
+    }
 
     pub fn show_finding(&mut self, finding: ReviewFinding, current: usize, total: usize) {
         self.preparing = false;
@@ -567,6 +702,9 @@ impl ImprovePullRequestScreen {
         self.total = total;
         self.selected = 0;
         self.edit = None;
+        self.finding_scroll = 0;
+        self.finding_max_scroll = 0;
+        self.finding_action_areas = None;
     }
     pub fn record_skipped_files(&mut self, skipped: &[ReviewSkippedFile]) {
         self.outcomes
@@ -599,6 +737,7 @@ impl ImprovePullRequestScreen {
         self.finding = None;
         self.done = true;
         self.done_scroll = 0;
+        self.done_max_scroll = 0;
     }
 
     fn record_current_outcome(&mut self, status: String, color: ratatui::style::Color) {
@@ -611,7 +750,7 @@ impl ImprovePullRequestScreen {
         }
     }
 
-    fn render_done(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+    fn render_done(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let applied = self
             .outcomes
             .iter()
@@ -630,6 +769,13 @@ impl ImprovePullRequestScreen {
             )),
             Line::default(),
         ];
+        if let Some(range) = &self.reviewed_range {
+            lines.push(Line::from(Span::styled(
+                range.clone(),
+                Style::default().fg(colors::MUTED),
+            )));
+            lines.push(Line::default());
+        }
         if self.outcomes.is_empty() {
             lines.push(Line::from("No reviewable improvements were found."));
         } else {
@@ -649,17 +795,16 @@ impl ImprovePullRequestScreen {
             "↑/↓ scroll · Enter/Esc return to dashboard",
             Style::default().fg(colors::MUTED),
         )));
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Improve results "),
-                )
-                .wrap(Wrap { trim: false })
-                .scroll((self.done_scroll, 0)),
-            area,
-        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Improve results ");
+        let inner = block.inner(area);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        self.done_max_scroll = paragraph
+            .line_count(inner.width)
+            .saturating_sub(inner.height.into()) as u16;
+        self.done_scroll = self.done_scroll.min(self.done_max_scroll);
+        frame.render_widget(paragraph.block(block).scroll((self.done_scroll, 0)), area);
     }
     pub fn current_index(&self) -> usize {
         self.current
@@ -1063,6 +1208,13 @@ mod tests {
         screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let narrow = render(&mut screen, 36, 8);
         assert!(narrow.contains("Improve results"));
+        for _ in 0..40 {
+            screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            render(&mut screen, 36, 8);
+        }
+        let bottom = screen.done_scroll;
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, bottom);
         assert_eq!(
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Done
@@ -1074,5 +1226,51 @@ mod tests {
         let mut screen = screen();
         screen.enter_done();
         assert!(render(&mut screen, 70, 12).contains("No reviewable improvements were found."));
+    }
+
+    #[test]
+    fn finding_content_scrolls_without_overshooting_the_wrapped_tail() {
+        let mut screen = screen();
+        let mut long = finding();
+        long.explanation = format!("{}\ntail marker", "word ".repeat(200));
+        screen.show_finding(long, 0, 1);
+
+        assert!(!render(&mut screen, 48, 10).contains("tail marker"));
+        for _ in 0..40 {
+            screen.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+            render(&mut screen, 48, 10);
+        }
+        assert!(render(&mut screen, 48, 10).contains("tail marker"));
+        let bottom = screen.finding_scroll;
+        screen.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        render(&mut screen, 48, 10);
+        assert_eq!(screen.finding_scroll, bottom);
+    }
+
+    #[test]
+    fn preparing_is_cancellable_and_stale_confirmation_clicks_do_nothing() {
+        let mut screen = screen();
+        screen.start_preparing();
+        assert!(render(&mut screen, 70, 12).contains("Preparing Improve discovery"));
+        assert_eq!(
+            screen.handle_mouse_click(Position { x: 69, y: 0 }),
+            ImproveAction::Continue
+        );
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ImproveAction::Cancelled
+        );
+
+        screen.show_finding(finding(), 0, 1);
+        render(&mut screen, 70, 12);
+        assert_eq!(
+            screen.handle_mouse_click(Position { x: 69, y: 0 }),
+            ImproveAction::Continue
+        );
+        screen.enter_done();
+        assert_eq!(
+            screen.handle_mouse_click(Position { x: 30, y: 10 }),
+            ImproveAction::Continue
+        );
     }
 }
