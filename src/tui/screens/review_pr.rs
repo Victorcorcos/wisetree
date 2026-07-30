@@ -1738,9 +1738,14 @@ impl ReviewPullRequestScreen {
             .block(build_detail_lines(&self.request))
             .steps(&REVIEW_STEPS)
             .ai_roles(vec![
-                AiRoleRow::from_config("strong", colors::NAVY, &self.ai.strong, "Read-only"),
+                AiRoleRow::from_config("strong", colors::DARK_NAVY, &self.ai.strong, "Read-only"),
                 AiRoleRow::from_config("balanced", colors::NAVY, &self.ai.balanced, "Read-only"),
-                AiRoleRow::from_config("utility", colors::NAVY, &self.ai.utility, "Read-only"),
+                AiRoleRow::from_config(
+                    "utility",
+                    colors::LIGHT_NAVY,
+                    &self.ai.utility,
+                    "Read-only",
+                ),
             ])
             .modal(self.confirm.as_ref())
             .render(frame, area);
