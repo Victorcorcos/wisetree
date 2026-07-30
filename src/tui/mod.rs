@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod event;
+pub mod image_upload;
 pub mod router;
 pub mod screens;
 pub mod selection;

@@ -792,6 +792,19 @@ pub struct DevelopHandoff {
     pub harness: AiHarness,
 }
 
+/// Inputs for one Develop planning run. `previous_plan` + `feedback` are set
+/// on a revision after the user rejects a plan; `corrective` marks the single
+/// retry after a parse failure.
+pub struct DevelopPlanPrompt<'a> {
+    pub worktree_path: &'a str,
+    pub task_description: &'a str,
+    pub base_ref: Option<&'a str>,
+    pub previous_plan: Option<&'a str>,
+    pub feedback: Option<&'a str>,
+    pub attachments: &'a [crate::tui::image_upload::ImageAttachment],
+    pub corrective: bool,
+}
+
 /// Result of the post-apply [`DashboardService::commit_and_reply`] step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixCommitOutcome {
@@ -1822,6 +1835,7 @@ impl DashboardService {
                 timeout: Duration::from_secs(0),
                 activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
                 session_title: None,
+                attachments: Vec::new(),
             })
             .await
     }
@@ -3045,6 +3059,7 @@ impl DashboardService {
         feedback: Option<&str>,
         previous_plan: Option<&str>,
         history: Option<&str>,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
     ) -> Result<FixVerdict> {
         let cwd = PathBuf::from(worktree_path);
         let code = match &group.file {
@@ -3062,6 +3077,7 @@ impl DashboardService {
             timeout: FIX_PLAN_TIMEOUT,
             activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
             session_title: None,
+            attachments: Self::attached_image_paths(attachments)?,
         };
         let (_cancel_tx, cancel_rx) = oneshot::channel();
         let output = self
@@ -3543,6 +3559,7 @@ impl DashboardService {
                     timeout: Duration::from_secs(1),
                     activity_limit: 1,
                     session_title: None,
+                    attachments: Vec::new(),
                 })
                 .is_err()
             {
@@ -3761,6 +3778,7 @@ impl DashboardService {
         file: &ReviewFile,
         finding: &ReviewFinding,
         feedback: &str,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
         mode: ReviewRevisionMode,
     ) -> ReviewScanAttempt {
         let started = Instant::now();
@@ -3788,8 +3806,22 @@ impl DashboardService {
             );
         }
         let prompt = build_review_revision_prompt(file, finding, feedback, mode);
-        self.execute_review_file_prompt(cwd, file, scan, started, prompt, selection)
-            .await
+        let attachments = match Self::attached_image_paths(attachments) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                return review_scan_attempt(scan, 0, started, None, Err(error), None, &selection)
+            }
+        };
+        self.execute_review_attachment_prompt(ReviewAttachmentPrompt {
+            cwd,
+            file,
+            scan,
+            started,
+            prompt,
+            selection,
+            attachments,
+        })
+        .await
     }
 
     /// Adversarially verify every candidate raised against one file in a
@@ -3883,6 +3915,51 @@ impl DashboardService {
         )
     }
 
+    async fn execute_review_attachment_prompt(
+        &self,
+        request: ReviewAttachmentPrompt<'_>,
+    ) -> ReviewScanAttempt {
+        let ReviewAttachmentPrompt {
+            cwd,
+            file,
+            scan,
+            started,
+            prompt,
+            selection,
+            attachments,
+        } = request;
+        let prompt_bytes = prompt.len();
+        let (output, usage) = self
+            .run_review_prompt_with_attachments(&cwd, &selection, prompt, attachments)
+            .await;
+        let (result, raw_output) = match output {
+            Err(err) => (Err(err), None),
+            Ok(output) => match parse_review_findings(
+                &output,
+                &file.path,
+                &file.commentable_lines,
+                &file.annotated_diff,
+            ) {
+                Some(findings) => (Ok(findings), None),
+                None => (
+                    Err(WisetreeError::other(
+                        "could not parse findings from the review AI output.",
+                    )),
+                    Some(output),
+                ),
+            },
+        };
+        review_scan_attempt(
+            scan,
+            prompt_bytes,
+            started,
+            usage,
+            result,
+            raw_output,
+            &selection,
+        )
+    }
+
     /// Runs exactly the configured review harness under its read-only policy.
     /// OpenCode usage is correlated with its session title; other harnesses do
     /// not borrow OpenCode's storage and therefore remain explicitly unknown.
@@ -3894,6 +3971,43 @@ impl DashboardService {
     ) -> (Result<String>, Option<ReviewTokenUsage>) {
         self.run_review_prompt_with_timeout(cwd, selection, prompt, REVIEW_SCAN_TIMEOUT)
             .await
+    }
+
+    async fn run_review_prompt_with_attachments(
+        &self,
+        cwd: &Path,
+        selection: &ReviewModelSelection,
+        prompt: String,
+        attachments: Vec<PathBuf>,
+    ) -> (Result<String>, Option<ReviewTokenUsage>) {
+        let title = (selection.harness == AiHarness::OpenCode).then(review_scan_title);
+        let request = AiRunRequest {
+            slot: format!("dashboard.ai.review.{}", selection.profile.label()),
+            config: AiModelConfig {
+                model: selection.model.clone(),
+                thinking: selection.thinking.clone(),
+                harness: selection.harness,
+            },
+            prompt,
+            cwd: cwd.to_path_buf(),
+            mode: AiRunMode::Captured,
+            permission: AiPermission::Plan,
+            timeout: REVIEW_SCAN_TIMEOUT,
+            activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+            session_title: title.clone(),
+            attachments,
+        };
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let result = self
+            .ai_runner()
+            .run_captured(&request, None, cancel_rx)
+            .await
+            .map(|run| run.transcript);
+        let usage = match title {
+            Some(title) => opencode_usage_for_title(title).await,
+            None => None,
+        };
+        (result, usage)
     }
 
     async fn run_review_prompt_with_timeout(
@@ -3918,6 +4032,7 @@ impl DashboardService {
             timeout,
             activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
             session_title: title.clone(),
+            attachments: Vec::new(),
         };
         let (_cancel_tx, cancel_rx) = oneshot::channel();
         let result = self
@@ -4646,6 +4761,7 @@ impl DashboardService {
                 timeout: Duration::from_secs(1),
                 activity_limit: 1,
                 session_title: None,
+                attachments: Vec::new(),
             })
             .is_err()
         {
@@ -4715,6 +4831,7 @@ impl DashboardService {
         worktree_path: &str,
         bug_description: &str,
         base_ref: Option<&str>,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
         corrective: bool,
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.investigate;
@@ -4741,6 +4858,7 @@ impl DashboardService {
             timeout: Duration::from_secs(1),
             activity_limit: 1,
             session_title: None,
+            attachments: Self::bugkill_attachment_paths(attachments)?,
         })?;
         Ok(FixApplyHandoff {
             command,
@@ -4757,6 +4875,7 @@ impl DashboardService {
         bug_description: &str,
         row: &BugHypothesis,
         feedback: Option<&str>,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
     ) -> Result<FixApplyHandoff> {
         let slot = &self.config.ai.bugkill.fix;
         if slot.model.trim().is_empty() {
@@ -4776,6 +4895,7 @@ impl DashboardService {
             timeout: Duration::from_secs(1),
             activity_limit: 1,
             session_title: None,
+            attachments: Self::bugkill_attachment_paths(attachments)?,
         })?;
         Ok(FixApplyHandoff {
             command,
@@ -4792,6 +4912,7 @@ impl DashboardService {
         worktree_path: &str,
         row: &BugHypothesis,
         user_text: &str,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
     ) -> Result<BugkillVerdict> {
         let slot = &self.config.ai.bugkill.judge;
         if slot.model.trim().is_empty() {
@@ -4818,6 +4939,7 @@ impl DashboardService {
                     timeout: BUGKILL_JUDGE_TIMEOUT,
                     activity_limit: 1,
                     session_title: None,
+                    attachments: Self::bugkill_attachment_paths(attachments)?,
                 },
                 None,
                 cancel,
@@ -5078,6 +5200,7 @@ impl DashboardService {
                     timeout: Duration::from_secs(1),
                     activity_limit: 1,
                     session_title: None,
+                    attachments: Vec::new(),
                 })
                 .is_err()
             {
@@ -5124,15 +5247,16 @@ impl DashboardService {
     /// revision after the user rejects the plan; `corrective` appends the
     /// stricter-contract suffix used on the single retry after a parse
     /// failure.
-    pub fn prepare_develop_plan(
-        &self,
-        worktree_path: &str,
-        task_description: &str,
-        base_ref: Option<&str>,
-        previous_plan: Option<&str>,
-        feedback: Option<&str>,
-        corrective: bool,
-    ) -> Result<DevelopHandoff> {
+    pub fn prepare_develop_plan(&self, req: DevelopPlanPrompt<'_>) -> Result<DevelopHandoff> {
+        let DevelopPlanPrompt {
+            worktree_path,
+            task_description,
+            base_ref,
+            previous_plan,
+            feedback,
+            attachments,
+            corrective,
+        } = req;
         let slot = &self.config.ai.develop.plan;
         let model = slot.model.trim().to_string();
         if model.is_empty() {
@@ -5149,6 +5273,7 @@ impl DashboardService {
                  delimited blocks, exactly as specified."
             );
         }
+        Self::ensure_develop_attachments(attachments)?;
         let command = self.develop_runner().command(&AiRunRequest {
             slot: "dashboard.ai.develop.plan".to_string(),
             config: slot.clone(),
@@ -5159,6 +5284,10 @@ impl DashboardService {
             timeout: Duration::from_secs(1),
             activity_limit: 1,
             session_title: None,
+            attachments: attachments
+                .iter()
+                .map(|attachment| attachment.path.clone())
+                .collect(),
         })?;
         Ok(DevelopHandoff {
             command,
@@ -5179,6 +5308,7 @@ impl DashboardService {
         sections: &str,
         outline: &str,
         check_failure: Option<&str>,
+        attachments: &[crate::tui::image_upload::ImageAttachment],
     ) -> Result<DevelopHandoff> {
         let slot = &self.config.ai.develop.implement;
         let model = slot.model.trim().to_string();
@@ -5195,6 +5325,7 @@ impl DashboardService {
             self.config.develop.check_command.trim(),
             check_failure,
         );
+        Self::ensure_develop_attachments(attachments)?;
         let command = self.develop_runner().command(&AiRunRequest {
             slot: "dashboard.ai.develop.implement".to_string(),
             config: slot.clone(),
@@ -5205,6 +5336,10 @@ impl DashboardService {
             timeout: Duration::from_secs(1),
             activity_limit: 1,
             session_title: None,
+            attachments: attachments
+                .iter()
+                .map(|attachment| attachment.path.clone())
+                .collect(),
         })?;
         Ok(DevelopHandoff {
             command,
@@ -5214,6 +5349,54 @@ impl DashboardService {
 
     fn develop_runner(&self) -> AiRunner {
         self.ai_runner()
+    }
+
+    fn ensure_develop_attachments(
+        attachments: &[crate::tui::image_upload::ImageAttachment],
+    ) -> Result<()> {
+        for attachment in attachments {
+            if !attachment.path.is_file() {
+                return Err(WisetreeError::other(format!(
+                    "Attached image is no longer available: {}",
+                    attachment.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn bugkill_attachment_paths(
+        attachments: &[crate::tui::image_upload::ImageAttachment],
+    ) -> Result<Vec<PathBuf>> {
+        for attachment in attachments {
+            if !attachment.path.is_file() {
+                return Err(WisetreeError::other(format!(
+                    "Attached image is no longer available: {}. Reattach it before continuing.",
+                    attachment.path.display()
+                )));
+            }
+        }
+        Ok(attachments
+            .iter()
+            .map(|attachment| attachment.path.clone())
+            .collect())
+    }
+
+    fn attached_image_paths(
+        attachments: &[crate::tui::image_upload::ImageAttachment],
+    ) -> Result<Vec<PathBuf>> {
+        for attachment in attachments {
+            if !attachment.path.is_file() {
+                return Err(WisetreeError::other(format!(
+                    "Attached image is no longer available: {}. Reattach it before continuing.",
+                    attachment.path.display()
+                )));
+            }
+        }
+        Ok(attachments
+            .iter()
+            .map(|attachment| attachment.path.clone())
+            .collect())
     }
 
     /// Run the configured check command (Ralph-canon backpressure) in the
@@ -5929,6 +6112,16 @@ impl DashboardService {
             }
         }
     }
+}
+
+struct ReviewAttachmentPrompt<'a> {
+    cwd: PathBuf,
+    file: &'a ReviewFile,
+    scan: String,
+    started: Instant,
+    prompt: String,
+    selection: ReviewModelSelection,
+    attachments: Vec<PathBuf>,
 }
 
 fn binary_available(binary: &Path) -> bool {
@@ -15978,14 +16171,15 @@ so the intent reads clearly.
         let (service, worktree) = develop_dashboard_service();
 
         let handoff = service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "Add dashboard filtering",
-                Some("origin/main"),
-                None,
-                None,
-                false,
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "Add dashboard filtering",
+                base_ref: Some("origin/main"),
+                previous_plan: None,
+                feedback: None,
+                attachments: &[],
+                corrective: false,
+            })
             .unwrap();
 
         assert_eq!(handoff.command.binary, service.opencode_binary);
@@ -16010,18 +16204,68 @@ so the intent reads clearly.
     }
 
     #[test]
+    fn develop_handoffs_attach_images_and_reject_missing_files() {
+        let (mut service, worktree) = develop_dashboard_service();
+        service.config.ai.develop.implement.model = "provider/model".to_string();
+        let path = worktree.path().join("screen.png");
+        std::fs::write(&path, b"image").unwrap();
+        let attachment = crate::tui::image_upload::ImageAttachment {
+            id: "screen".to_string(),
+            filename: "screen.png".to_string(),
+            mime_type: "image/png".to_string(),
+            path: path.clone(),
+        };
+        let handoff = service
+            .prepare_develop_implement(
+                worktree.path().to_str().unwrap(),
+                "task",
+                "section",
+                "outline",
+                None,
+                std::slice::from_ref(&attachment),
+            )
+            .unwrap();
+        // Develop runs the interactive opencode TUI, which has no attachment
+        // flag, so the path must reach the agent through the prompt instead.
+        assert!(!handoff.command.args.iter().any(|arg| arg == "--file"));
+        assert!(handoff
+            .command
+            .args
+            .iter()
+            .any(|arg| arg.contains(path.to_str().unwrap())));
+        let missing = crate::tui::image_upload::ImageAttachment {
+            path: worktree.path().join("gone.png"),
+            ..attachment
+        };
+        assert!(service
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "task",
+                base_ref: None,
+                previous_plan: None,
+                feedback: None,
+                attachments: &[missing],
+                corrective: false,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("Attached image is no longer available"));
+    }
+
+    #[test]
     fn prepare_develop_plan_appends_corrective_retry_instruction() {
         let (service, worktree) = develop_dashboard_service();
 
         let handoff = service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "Add dashboard filtering",
-                None,
-                None,
-                None,
-                true,
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "Add dashboard filtering",
+                base_ref: None,
+                previous_plan: None,
+                feedback: None,
+                attachments: &[],
+                corrective: true,
+            })
             .unwrap();
 
         assert!(handoff.command.args.get(1).unwrap().ends_with(
@@ -16036,14 +16280,15 @@ so the intent reads clearly.
         service.config.ai.develop.plan.model = "   ".to_string();
 
         let error = service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "Add dashboard filtering",
-                None,
-                None,
-                None,
-                false,
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "Add dashboard filtering",
+                base_ref: None,
+                previous_plan: None,
+                feedback: None,
+                attachments: &[],
+                corrective: false,
+            })
             .unwrap_err();
 
         assert_eq!(
@@ -16058,14 +16303,15 @@ so the intent reads clearly.
         service.opencode_binary = worktree.path().join("missing-opencode");
 
         let error = service
-            .prepare_develop_plan(
-                worktree.path().to_str().unwrap(),
-                "Add dashboard filtering",
-                None,
-                None,
-                None,
-                false,
-            )
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: worktree.path().to_str().unwrap(),
+                task_description: "Add dashboard filtering",
+                base_ref: None,
+                previous_plan: None,
+                feedback: None,
+                attachments: &[],
+                corrective: false,
+            })
             .unwrap_err();
 
         assert!(error
@@ -16086,6 +16332,7 @@ so the intent reads clearly.
                 "SECTION content",
                 "1. Section [pending]",
                 Some("previous check failure"),
+                &[],
             )
             .unwrap();
 
@@ -16126,6 +16373,7 @@ so the intent reads clearly.
                 "sections",
                 "outline",
                 None,
+                &[],
             )
             .unwrap_err();
 
@@ -16148,6 +16396,7 @@ so the intent reads clearly.
                 "sections",
                 "outline",
                 None,
+                &[],
             )
             .unwrap_err();
 
@@ -16249,6 +16498,7 @@ so the intent reads clearly.
         git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         let expected_plan = DevelopPlan {
             task_description: "Add Develop preflight coverage".to_string(),
+            attachments: Vec::new(),
             complexity: 3,
             overview: None,
             sections: vec![PlanSection {
