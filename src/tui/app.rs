@@ -934,9 +934,9 @@ impl App {
                     let improve_status = self
                         .improve_pr
                         .as_mut()
-                        .map(|screen| (screen.tick_pty(), screen.applying()));
+                        .map(|screen| (screen.tick_pty(), screen.applying(), screen.autonomous()));
                     match improve_status {
-                        Some((true, true)) => {
+                        Some((true, true, true)) => {
                             let turn = self
                                 .improve_apply_watch
                                 .as_mut()
@@ -950,7 +950,7 @@ impl App {
                                 self.on_improve_turn(turn, &tx);
                             }
                         }
-                        Some((false, true)) => {
+                        Some((false, true, true)) => {
                             if let Some(turn) = self
                                 .improve_apply_watch
                                 .as_mut()
@@ -2980,8 +2980,9 @@ impl App {
                 self.advance_improve_finding(tx);
             }
             ImproveAction::Edit => {
-                // Local edit UI is deliberately owned by Improve; this action
-                // is retained for the later apply handoff.
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.show_edit();
+                }
             }
             ImproveAction::Apply => {
                 let Some(screen) = self.improve_pr.as_mut() else {
@@ -3005,6 +3006,7 @@ impl App {
             ImproveAction::ApplyReady => self.finish_improve_apply(tx),
             ImproveAction::AbortApply => {
                 if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.disarm_autonomous();
                     screen.record_failed(
                         "Apply cancelled before a checkpoint was created.".to_string(),
                     );
@@ -3016,7 +3018,7 @@ impl App {
         }
     }
 
-    fn begin_improve_finding_review(&mut self) {
+    fn begin_improve_finding_review(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some((finding, current, total)) = self.review_pr.as_ref().and_then(|discovery| {
             discovery
                 .current_finding()
@@ -3030,15 +3032,22 @@ impl App {
         if let Some(improve) = self.improve_pr.as_mut() {
             improve.show_finding(finding, current, total);
         }
+        if self
+            .improve_pr
+            .as_ref()
+            .is_some_and(ImprovePullRequestScreen::autonomous)
+        {
+            self.apply_improve_action(ImproveAction::Apply, tx);
+        }
     }
 
-    fn advance_improve_finding(&mut self, _tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn advance_improve_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let more = self
             .review_pr
             .as_mut()
             .is_some_and(|screen| screen.advance_finding());
         if more {
-            self.begin_improve_finding_review();
+            self.begin_improve_finding_review(tx);
         } else {
             self.review_pr = None;
             if let Some(screen) = self.improve_pr.as_mut() {
@@ -3126,6 +3135,7 @@ impl App {
         let Some(screen) = self.improve_pr.as_mut() else {
             return;
         };
+        screen.disarm_autonomous();
         let index = screen.current_index();
         let pre = screen.pre_snapshot();
         let worktree_path = screen.request().worktree_path.clone();
@@ -3151,6 +3161,7 @@ impl App {
             AiTurn::Finished { .. } => self.finish_improve_apply(tx),
             AiTurn::Failed { message } => {
                 if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.disarm_autonomous();
                     screen.record_failed(format!(
                         "AI CLI reported an error: {}",
                         truncate_error(&message)
@@ -3181,9 +3192,11 @@ impl App {
         match result {
             Ok(payload) => {
                 let (snapshot, handoff) = *payload;
-                self.improve_apply_watch =
-                    Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                 if let Some(screen) = self.improve_pr.as_mut() {
+                    if screen.autonomous() {
+                        self.improve_apply_watch =
+                            Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
+                    }
                     screen.set_pre_snapshot(snapshot);
                     screen.spawn_opencode_pty(
                         handoff.command.binary,
@@ -3195,6 +3208,7 @@ impl App {
             }
             Err(message) => {
                 if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.disarm_autonomous();
                     screen.finish_apply();
                 }
                 self.show_toast(
@@ -3242,6 +3256,7 @@ impl App {
             }
             Err(message) => {
                 if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.disarm_autonomous();
                     screen.record_failed(truncate_error(&message));
                 }
                 self.abort_improve_apply(tx);
@@ -3601,7 +3616,7 @@ impl App {
             let candidates = screen.begin_verification();
             if candidates.is_empty() {
                 if screen.is_improve() {
-                    self.begin_improve_finding_review();
+                    self.begin_improve_finding_review(tx);
                 } else {
                     screen.enter_decision();
                 }
@@ -3625,7 +3640,7 @@ impl App {
         } else {
             screen.enter_done();
             if screen.is_improve() {
-                self.begin_improve_finding_review();
+                self.begin_improve_finding_review(tx);
             }
         }
     }
@@ -3994,6 +4009,7 @@ impl App {
         index: usize,
         result: Result<ReviewVerification, String>,
         telemetry: Option<ReviewScanTelemetry>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
@@ -4016,7 +4032,7 @@ impl App {
                 // the discovery state terminal in isolated/test callers that
                 // only construct the read-only discovery screen.
                 if self.improve_pr.is_some() {
-                    self.begin_improve_finding_review();
+                    self.begin_improve_finding_review(tx);
                 } else if let Some(screen) = self.review_pr.as_mut() {
                     screen.enter_done();
                 }
@@ -7216,7 +7232,7 @@ impl App {
                 index,
                 result,
                 telemetry,
-            } => self.apply_review_pr_verified(index, result, telemetry),
+            } => self.apply_review_pr_verified(index, result, telemetry, tx),
             AppEvent::ReviewPrGapAudited { result, telemetry } => {
                 self.apply_review_pr_gap_audited(result, telemetry, tx)
             }
@@ -11607,6 +11623,53 @@ mod tests {
         assert!(rendered.contains("Improve #1 of 1"));
     }
 
+    #[test]
+    fn improve_autonomous_starts_remaining_findings_and_disarms_on_failure() {
+        let finding = |title: &str, line| ReviewFinding {
+            category: "Code Smell".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(line),
+            title: title.to_string(),
+            explanation: "The operation runs twice.".to_string(),
+            suggestion: Some("Cache the result.".to_string()),
+        };
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.review_pr
+            .as_mut()
+            .unwrap()
+            .record_scan_result(vec![finding("First", 1), finding("Second", 2)]);
+        app.improve_pr = Some(ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        ));
+        let tx = app_event_tx();
+
+        app.begin_improve_finding_review(&tx);
+        assert!(!app.improve_pr.as_ref().unwrap().applying());
+
+        app.handle_improve_pr_key(key(KeyCode::Char(' ')), &tx);
+        assert!(app.improve_pr.as_ref().unwrap().applying());
+
+        app.on_improve_turn(
+            AiTurn::Failed {
+                message: "interrupted".to_string(),
+            },
+            &tx,
+        );
+        let screen = app.improve_pr.as_ref().unwrap();
+        assert!(!screen.autonomous());
+        assert!(!screen.applying());
+        assert_eq!(screen.current_index(), 1);
+    }
+
     fn review_test_telemetry(scan: &str) -> ReviewScanTelemetry {
         ReviewScanTelemetry {
             scan: scan.to_string(),
@@ -12024,6 +12087,7 @@ mod tests {
                 finding: finding("Revised"),
             }),
             None,
+            &tx,
         );
         let screen = revised.review_pr.as_ref().unwrap();
         assert_eq!(screen.findings_len(), 1);
@@ -12044,6 +12108,7 @@ mod tests {
                 reason: "Existing guard.".to_string(),
             }),
             None,
+            &tx,
         );
         let screen = rejected.review_pr.as_ref().unwrap();
         assert_eq!(screen.findings_len(), 0);

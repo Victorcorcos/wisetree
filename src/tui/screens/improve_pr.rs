@@ -14,7 +14,7 @@ use ratatui::Frame;
 
 use crate::config::schema::{AiFixConfig, AiReviewConfig};
 use crate::messages::colors;
-use crate::services::dashboard::ReviewFinding;
+use crate::services::dashboard::{ReviewFinding, ReviewSeverity};
 use crate::services::BugkillSnapshot;
 use crate::services::ReviewSkippedFile;
 use crate::tui::screens::dashboard::ImproveRequest;
@@ -47,6 +47,112 @@ struct ImproveOutcome {
     color: ratatui::style::Color,
 }
 
+#[derive(Clone, Copy)]
+enum EditRow {
+    Severity,
+    Title,
+    Explanation,
+    Suggestion,
+}
+
+impl EditRow {
+    fn index(self) -> usize {
+        match self {
+            Self::Severity => 0,
+            Self::Title => 1,
+            Self::Explanation => 2,
+            Self::Suggestion => 3,
+        }
+    }
+    fn next(self) -> Self {
+        [
+            Self::Severity,
+            Self::Title,
+            Self::Explanation,
+            Self::Suggestion,
+        ][(self.index() + 1) % 4]
+    }
+    fn previous(self) -> Self {
+        [
+            Self::Severity,
+            Self::Title,
+            Self::Explanation,
+            Self::Suggestion,
+        ][(self.index() + 3) % 4]
+    }
+}
+
+struct EditState {
+    draft: ReviewFinding,
+    removed_suggestion: Option<String>,
+    row: EditRow,
+    input: Option<crate::tui::widgets::InputPrompt>,
+}
+
+impl EditState {
+    fn new(draft: ReviewFinding) -> Self {
+        Self {
+            draft,
+            removed_suggestion: None,
+            row: EditRow::Severity,
+            input: None,
+        }
+    }
+    fn cycle_severity(&mut self, forward: bool) {
+        const ORDER: [ReviewSeverity; 4] = [
+            ReviewSeverity::Critical,
+            ReviewSeverity::High,
+            ReviewSeverity::Medium,
+            ReviewSeverity::Low,
+        ];
+        let index = ORDER
+            .iter()
+            .position(|severity| *severity == self.draft.severity)
+            .unwrap_or(0);
+        self.draft.severity = ORDER[(index + if forward { 1 } else { 3 }) % ORDER.len()];
+    }
+    fn toggle_suggestion(&mut self) {
+        if self.draft.suggestion.is_some() {
+            self.removed_suggestion = self.draft.suggestion.take();
+        } else if self.removed_suggestion.is_some() {
+            self.draft.suggestion = self.removed_suggestion.take();
+        }
+    }
+    fn activate(&mut self) {
+        self.input = match self.row {
+            EditRow::Title => Some(
+                crate::tui::widgets::InputPrompt::new("Edit the title:")
+                    .with_default(self.draft.title.clone())
+                    .with_validator(|value| {
+                        value
+                            .trim()
+                            .is_empty()
+                            .then(|| "The title cannot be empty.".to_string())
+                    }),
+            ),
+            EditRow::Explanation => Some(
+                crate::tui::widgets::InputPrompt::new(
+                    "Edit the explanation (Ctrl+J for a new line):",
+                )
+                .multiline()
+                .with_default(self.draft.explanation.clone())
+                .with_validator(|value| {
+                    value
+                        .trim()
+                        .is_empty()
+                        .then(|| "The explanation cannot be empty.".to_string())
+                }),
+            ),
+            _ => None,
+        };
+        match self.row {
+            EditRow::Severity => self.cycle_severity(true),
+            EditRow::Suggestion => self.toggle_suggestion(),
+            _ => {}
+        }
+    }
+}
+
 pub struct ImprovePullRequestScreen {
     request: ImproveRequest,
     review_ai: AiReviewConfig,
@@ -58,6 +164,7 @@ pub struct ImprovePullRequestScreen {
     total: usize,
     selected: u8,
     other: Option<crate::tui::widgets::InputPrompt>,
+    edit: Option<EditState>,
     autonomous: bool,
     applying: bool,
     ai_done: bool,
@@ -82,6 +189,7 @@ impl ImprovePullRequestScreen {
             total: 0,
             selected: 0,
             other: None,
+            edit: None,
             autonomous: false,
             applying: false,
             ai_done: false,
@@ -139,6 +247,9 @@ impl ImprovePullRequestScreen {
             return ImproveAction::Continue;
         }
         if self.finding.is_some() {
+            if self.edit.is_some() {
+                return self.handle_edit_key(key);
+            }
             if let Some(input) = self.other.as_mut() {
                 return match input.handle_key(key) {
                     crate::tui::widgets::InputOutcome::Submitted(text)
@@ -165,11 +276,18 @@ impl ImprovePullRequestScreen {
                 }
                 KeyCode::Char(' ') => {
                     self.autonomous = !self.autonomous;
-                    ImproveAction::Continue
+                    if self.autonomous {
+                        ImproveAction::Apply
+                    } else {
+                        ImproveAction::Continue
+                    }
                 }
                 KeyCode::Enter => match self.selected {
                     0 => ImproveAction::Apply,
-                    1 => ImproveAction::Edit,
+                    1 => {
+                        self.show_edit();
+                        ImproveAction::Continue
+                    }
                     2 => {
                         self.show_other_input();
                         ImproveAction::Continue
@@ -229,6 +347,10 @@ impl ImprovePullRequestScreen {
             return;
         }
         if let Some(finding) = self.finding.as_ref() {
+            if let Some(edit) = self.edit.as_ref() {
+                self.render_edit(frame, area, edit);
+                return;
+            }
             if let Some(input) = self.other.as_ref() {
                 input.render(frame, area, 0);
                 return;
@@ -409,6 +531,7 @@ impl ImprovePullRequestScreen {
         self.current = current;
         self.total = total;
         self.selected = 0;
+        self.edit = None;
     }
     pub fn record_skipped_files(&mut self, skipped: &[ReviewSkippedFile]) {
         self.outcomes
@@ -510,6 +633,9 @@ impl ImprovePullRequestScreen {
     pub fn autonomous(&self) -> bool {
         self.autonomous
     }
+    pub fn disarm_autonomous(&mut self) {
+        self.autonomous = false;
+    }
     pub fn show_revised(&mut self, finding: ReviewFinding) {
         self.preparing = false;
         self.finding = Some(finding);
@@ -523,6 +649,130 @@ impl ImprovePullRequestScreen {
         self.other = Some(
             crate::tui::widgets::InputPrompt::new("Tell the AI how to revise this improvement:")
                 .with_placeholder("e.g. focus on a simpler local fix"),
+        );
+    }
+
+    pub fn show_edit(&mut self) {
+        self.edit = self.finding.clone().map(EditState::new);
+    }
+
+    fn handle_edit_key(&mut self, key: KeyEvent) -> ImproveAction {
+        let Some(edit) = self.edit.as_mut() else {
+            return ImproveAction::Continue;
+        };
+        if let Some(input) = edit.input.as_mut() {
+            match input.handle_key(key) {
+                crate::tui::widgets::InputOutcome::Submitted(text) => {
+                    match edit.row {
+                        EditRow::Title => edit.draft.title = text.trim().to_string(),
+                        EditRow::Explanation => edit.draft.explanation = text.trim().to_string(),
+                        _ => {}
+                    }
+                    edit.input = None;
+                }
+                crate::tui::widgets::InputOutcome::Cancelled => edit.input = None,
+                crate::tui::widgets::InputOutcome::Pending => {}
+            }
+            return ImproveAction::Continue;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => edit.row = edit.row.previous(),
+            KeyCode::Down | KeyCode::Tab => edit.row = edit.row.next(),
+            KeyCode::Left => match edit.row {
+                EditRow::Severity => edit.cycle_severity(false),
+                EditRow::Suggestion => edit.toggle_suggestion(),
+                _ => {}
+            },
+            KeyCode::Right => match edit.row {
+                EditRow::Severity => edit.cycle_severity(true),
+                EditRow::Suggestion => edit.toggle_suggestion(),
+                _ => {}
+            },
+            KeyCode::Enter => edit.activate(),
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                if let Some(finding) = self.finding.as_mut() {
+                    *finding = edit.draft.clone();
+                }
+                self.edit = None;
+            }
+            KeyCode::Esc => self.edit = None,
+            _ => {}
+        }
+        ImproveAction::Continue
+    }
+
+    fn render_edit(&self, frame: &mut Frame, area: ratatui::layout::Rect, edit: &EditState) {
+        if let Some(input) = edit.input.as_ref() {
+            input.render(frame, area, 0);
+            return;
+        }
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(4),
+                Constraint::Min(4),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Edit improvement #{} of {} — Esc restores the original",
+                self.current + 1,
+                self.total
+            ))
+            .style(
+                Style::default()
+                    .fg(colors::IMPROVE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            chunks[0],
+        );
+        let rows = [
+            format!("Severity: ‹ {} ›", edit.draft.severity.label()),
+            format!("Title: {}", edit.draft.title),
+            format!(
+                "Explanation: {}",
+                edit.draft.explanation.lines().next().unwrap_or_default()
+            ),
+            match (&edit.draft.suggestion, &edit.removed_suggestion) {
+                (Some(_), _) => "Suggestion: Kept — ← → removes it".to_string(),
+                (None, Some(_)) => "Suggestion: Removed — ← → restores it".to_string(),
+                (None, None) => "Suggestion: (none)".to_string(),
+            },
+        ];
+        let row_areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1); 4])
+            .split(chunks[1]);
+        for (index, row) in rows.into_iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(row).style(Style::default().add_modifier(
+                    if edit.row.index() == index {
+                        Modifier::REVERSED
+                    } else {
+                        Modifier::empty()
+                    },
+                )),
+                row_areas[index],
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Preview:\n\n{}\n\nSuggested change:\n{}",
+                edit.draft.explanation,
+                edit.draft
+                    .suggestion
+                    .as_deref()
+                    .unwrap_or("Implement the smallest safe correction.")
+            ))
+            .wrap(Wrap { trim: false }),
+            chunks[2],
+        );
+        frame.render_widget(
+            Paragraph::new("↑/↓ field · ←/→ change · Enter edit · S save · Esc cancel")
+                .style(Style::default().fg(colors::MUTED)),
+            chunks[3],
         );
     }
 
@@ -658,6 +908,61 @@ mod tests {
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Revise("n".into())
         );
+    }
+
+    #[test]
+    fn edit_round_trip_saves_draft_and_cancel_keeps_original() {
+        let mut screen = screen();
+        screen.show_finding(finding(), 0, 1);
+        screen.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(screen.edit.is_some());
+        screen.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let edited = screen.current_finding().unwrap();
+        assert_eq!(
+            edited.severity,
+            crate::services::dashboard::ReviewSeverity::Critical
+        );
+        assert_eq!(edited.title, "Avoid duplicate work!");
+        assert!(edited.suggestion.is_none());
+
+        screen.show_edit();
+        screen.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(screen.current_finding().unwrap(), edited);
+    }
+
+    #[test]
+    fn empty_required_edit_is_rejected_without_changing_finding() {
+        let mut screen = screen();
+        let original = finding();
+        screen.show_finding(original.clone(), 0, 1);
+        screen.show_edit();
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        screen
+            .edit
+            .as_mut()
+            .unwrap()
+            .input
+            .as_mut()
+            .unwrap()
+            .value
+            .clear();
+        screen.edit.as_mut().unwrap().input.as_mut().unwrap().cursor = 0;
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(screen.edit.as_ref().unwrap().input.is_some());
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(screen.current_finding().unwrap(), original);
     }
 
     fn render(screen: &mut ImprovePullRequestScreen, width: u16, height: u16) -> String {
