@@ -326,10 +326,10 @@ Every AI slot under `dashboard.ai` stores `model`, `thinking`, and `harness`. Th
 | Harness | Config value | Binary | Compatible model prefix | Effective permission policy |
 | --- | --- | --- | --- | --- |
 | OpenCode | `opencode` | `opencode` | Any provider/model OpenCode supports | Planning/review roles use its `plan` agent; editing roles use its normal interactive or captured execution. |
-| Codex CLI | `codex` | `codex` | `openai/…` or an unprefixed Codex model | Read-only roles use `--sandbox read-only`; editing roles use `--full-auto`. |
-| Claude Code | `claudeCode` | `claude` | `anthropic/…` or an unprefixed Claude model | Read-only roles use `--permission-mode plan`; editing roles use `--permission-mode acceptEdits`. |
+| Codex CLI | `codex` | `codex` | `openai/…` or an unprefixed Codex model | All roles use `--dangerously-bypass-approvals-and-sandbox` for autonomous execution. |
+| Claude Code | `claudeCode` | `claude` | `anthropic/…` or an unprefixed Claude model | All roles use `--dangerously-skip-permissions` for autonomous execution. |
 
-Install and authenticate the selected binary before starting a workflow. Wisetree uses each CLI's existing authentication; it never stores provider credentials. Claude Code captured workflows require version `2.1.214` or newer. The confirmation screen shows the resolved role, model, thinking level, harness, and permission policy before any AI command launches.
+Install and authenticate the selected binary before starting a workflow. Wisetree uses each CLI's existing authentication; it never stores provider credentials. Claude Code captured workflows require version `2.1.214` or newer. Codex and Claude Code run without approval prompts or CLI sandbox enforcement, so use Wisetree only with repositories and instructions you trust. The confirmation screen shows the resolved role, model, thinking level, harness, and effective permission policy before any AI command launches.
 
 Settings saves to the active configuration source: a project `.wisetree.json` when it is active, otherwise `~/.wisetree/settings.json`. These sources are selected, not merged. AI metering is reported by the selected harness when it exposes usage; OpenCode session telemetry is correlated by session title. Dashboard AI Status is independent of workflow execution and metering: it only reads local Claude Code, OpenCode, Codex CLI, and Gemini CLI state/session files to report activity.
 

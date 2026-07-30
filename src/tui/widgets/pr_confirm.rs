@@ -35,7 +35,7 @@ use ratatui::Frame;
 
 use super::confirmation_modal::ConfirmationModal;
 use super::options_group::OptionsGroup;
-use crate::config::schema::AiModelConfig;
+use crate::config::schema::{AiHarness, AiModelConfig};
 use crate::messages::colors;
 
 /// Rows reserved for the `ConfirmationModal` slot. Matches the footprint the
@@ -70,13 +70,17 @@ impl AiRoleRow {
         config: &AiModelConfig,
         permission: impl Into<String>,
     ) -> Self {
+        let permission = match config.harness {
+            AiHarness::Codex | AiHarness::ClaudeCode => "Full access".to_string(),
+            AiHarness::OpenCode => permission.into(),
+        };
         Self {
             role: role.into(),
             role_color,
             model: config.model.clone(),
             thinking: config.thinking.clone(),
             harness: config.harness.display_name().to_string(),
-            permission: permission.into(),
+            permission,
         }
     }
 }
@@ -612,6 +616,25 @@ mod tests {
         let out = dump(&view, 58, 8);
         assert!(out.contains("Harness"), "{out}");
         assert!(out.contains("Claude Code"), "{out}");
-        assert!(out.contains("Edit files"), "{out}");
+        assert!(out.contains("Full access"), "{out}");
+    }
+
+    #[test]
+    fn dangerous_harnesses_show_full_access_for_read_only_roles() {
+        for harness in [AiHarness::Codex, AiHarness::ClaudeCode] {
+            let view = PrConfirmView::new("Confirm?").ai_roles(vec![AiRoleRow::from_config(
+                "plan",
+                colors::INFO,
+                &AiModelConfig {
+                    model: "model".to_string(),
+                    thinking: String::new(),
+                    harness,
+                },
+                "Read-only",
+            )]);
+            let out = dump(&view, 80, 8);
+            assert!(out.contains("Full access"), "{out}");
+            assert!(!out.contains("Read-only"), "{out}");
+        }
     }
 }

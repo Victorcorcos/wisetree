@@ -469,28 +469,25 @@ async fn bugkill_uses_each_configured_harness_for_investigation_and_fix() {
                 assert!(investigate
                     .command
                     .args
-                    .windows(2)
-                    .any(|args| args == ["--sandbox", "read-only"]));
-                // codex-cli removed `--full-auto`; autonomy for the fix step
-                // is expressed via `--sandbox workspace-write` instead.
-                assert!(!fix.command.args.iter().any(|arg| arg == "--full-auto"));
+                    .iter()
+                    .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
                 assert!(fix
                     .command
                     .args
-                    .windows(2)
-                    .any(|args| args == ["--sandbox", "workspace-write"]));
+                    .iter()
+                    .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
             }
             AiHarness::ClaudeCode => {
                 assert!(investigate
                     .command
                     .args
-                    .windows(2)
-                    .any(|args| args == ["--permission-mode", "plan"]));
+                    .iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions"));
                 assert!(fix
                     .command
                     .args
-                    .windows(2)
-                    .any(|args| args == ["--permission-mode", "acceptEdits"]));
+                    .iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions"));
             }
         }
     }
