@@ -394,6 +394,11 @@ impl ImprovePullRequestScreen {
     pub fn applying(&self) -> bool {
         self.applying
     }
+    /// Once Improve has a finding, is applying it, or has finished, it owns
+    /// the frame and input. Review remains the discovery data source only.
+    pub fn owns_interaction(&self) -> bool {
+        self.finding.is_some() || self.applying || self.done
+    }
     pub fn has_pty(&self) -> bool {
         self.pty.is_some()
     }

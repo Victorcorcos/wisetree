@@ -1376,7 +1376,15 @@ impl App {
             }
             Screen::ImprovePullRequest => {
                 let panel = self.render_framed_panel_fill(frame, area);
-                if let Some(review_pr) = self.review_pr.as_mut() {
+                if self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(ImprovePullRequestScreen::owns_interaction)
+                {
+                    if let Some(improve_pr) = self.improve_pr.as_mut() {
+                        improve_pr.render(frame, panel);
+                    }
+                } else if let Some(review_pr) = self.review_pr.as_mut() {
                     review_pr.render(frame, panel);
                 } else if let Some(improve_pr) = self.improve_pr.as_mut() {
                     improve_pr.render(frame, panel);
@@ -2200,19 +2208,25 @@ impl App {
                 self.apply_review_action(action, tx);
             }
             Screen::ImprovePullRequest => {
-                if let Some(screen) = self.review_pr.as_mut() {
-                    if matches!(screen.handle_mouse_click(position), ReviewAction::Done) {
-                        let worktree_path = screen.request().worktree_path.clone();
-                        self.review_pr = None;
-                        self.back_to_dashboard_action_menu(Some(worktree_path), tx);
-                    }
-                } else {
+                if self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(ImprovePullRequestScreen::owns_interaction)
+                    || self.review_pr.is_none()
+                {
                     let action = self
                         .improve_pr
                         .as_mut()
                         .map(|screen| screen.handle_mouse_click(position))
                         .unwrap_or(ImproveAction::Continue);
                     self.apply_improve_action(action, tx);
+                } else {
+                    let action = self
+                        .review_pr
+                        .as_mut()
+                        .map(|screen| screen.handle_mouse_click(position))
+                        .unwrap_or(ReviewAction::Continue);
+                    self.apply_review_action(action, tx);
                 }
             }
             Screen::BugkillPullRequest => {
@@ -2906,17 +2920,13 @@ impl App {
     }
 
     fn handle_improve_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
-        if let Some(screen) = self.review_pr.as_mut() {
-            // Discovery has handed a verified finding to Improve; it now owns
-            // all decision input, while this screen remains the immutable
-            // finding source until the apply stage takes over.
-            let _ = screen;
-            let action = self
-                .improve_pr
-                .as_mut()
-                .map(|s| s.handle_key(key))
-                .unwrap_or(ImproveAction::Continue);
-            self.apply_improve_action(action, tx);
+        if !self
+            .improve_pr
+            .as_ref()
+            .is_some_and(ImprovePullRequestScreen::owns_interaction)
+            && self.review_pr.is_some()
+        {
+            self.handle_review_pr_key(key, tx);
             return;
         }
         let action = self
@@ -11550,6 +11560,51 @@ mod tests {
         app.screen = Screen::ImprovePullRequest;
         app.review_pr = Some(screen);
         app
+    }
+
+    #[test]
+    fn improve_finding_view_is_rendered_after_discovery_handoff() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.phase = InitPhase::Ready;
+        let mut improve = ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        );
+        improve.show_finding(
+            ReviewFinding {
+                category: "Code Smell".to_string(),
+                severity: crate::services::ReviewSeverity::High,
+                file: "src/lib.rs".to_string(),
+                start_line: Some(4),
+                line: Some(4),
+                title: "Avoid duplicate work".to_string(),
+                explanation: "The operation runs twice.".to_string(),
+                suggestion: Some("Cache the result.".to_string()),
+            },
+            0,
+            1,
+        );
+        app.improve_pr = Some(improve);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Proposed improvement"));
+        assert!(rendered.contains("Improve #1 of 1"));
     }
 
     fn review_test_telemetry(scan: &str) -> ReviewScanTelemetry {
