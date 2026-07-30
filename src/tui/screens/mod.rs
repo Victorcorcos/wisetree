@@ -11,6 +11,7 @@ pub mod develop_pr;
 pub mod error;
 pub mod explain_pr;
 pub mod fix_pr;
+pub mod improve_pr;
 pub mod loading;
 pub mod menu;
 pub mod merge_pr;

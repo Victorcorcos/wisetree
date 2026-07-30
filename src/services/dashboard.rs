@@ -915,6 +915,25 @@ pub enum ReviewPreparation {
     SyncFailed(String),
 }
 
+/// Outcome of the local, GitHub-free preparation for Improve. It deliberately
+/// carries the same discovery input as Review, except there is no PR identity
+/// or existing-comment context to fetch or mutate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImprovePreparation {
+    Ready {
+        base_ref: String,
+        files: Vec<ReviewFile>,
+        scan_mode: ReviewScanMode,
+        context: ReviewContext,
+        skipped: Vec<ReviewSkippedFile>,
+    },
+    NoChanges,
+    AiNotConfigured,
+    AiUnavailable,
+    DirtyWorktree,
+    BaseRefUnresolved,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewScanMode {
     Merged,
@@ -1434,6 +1453,9 @@ pub struct BugkillSnapshot {
     /// `(path, content hash)` for every untracked file, excluding
     /// `BUG_INVESTIGATION.md`.
     pub untracked: Vec<(String, String)>,
+    /// Original bytes for untracked files. Improve uses these to restore an
+    /// attempt that modified a user-owned untracked file without committing it.
+    pub untracked_contents: Vec<(String, Vec<u8>)>,
 }
 
 /// An attempt row recovered from `BUG_INVESTIGATION.md` that was committed
@@ -3098,6 +3120,80 @@ impl DashboardService {
         })
     }
 
+    /// Build the live, local-only handoff for one approved Improve finding.
+    /// Unlike `prepare_apply`, this deliberately has no PR comment or plan:
+    /// the reviewed finding itself is the complete implementation instruction.
+    pub async fn prepare_improve_apply(
+        &self,
+        worktree_path: &str,
+        finding: &ReviewFinding,
+    ) -> Result<FixApplyHandoff> {
+        let cwd = PathBuf::from(worktree_path);
+        let prompt = format!(
+            "Implement this approved local improvement. Work only on the smallest safe change, including tests when required. Do not create a pull request, post comments, push, or commit; Wisetree will checkpoint your changes.\n\nLocation: {}\nCategory: {}\nSeverity: {}\nTitle: {}\n\nWhy it matters:\n{}\n\nSuggested change:\n{}",
+            finding.descriptor(),
+            finding.category,
+            finding.severity.label(),
+            finding.title,
+            finding.explanation,
+            finding.suggestion.as_deref().unwrap_or("Implement the smallest safe correction."),
+        );
+        let command = self
+            .ai_command(
+                "dashboard.ai.fix.apply",
+                &self.config.ai.fix.apply,
+                prompt,
+                cwd,
+                AiRunMode::Interactive,
+                AiPermission::Implement,
+            )
+            .await?;
+        Ok(FixApplyHandoff {
+            command,
+            harness: self.config.ai.fix.apply.harness,
+        })
+    }
+
+    /// Commit exactly the files introduced or changed by one Improve attempt.
+    /// The caller computes `changes` from an attempt snapshot; in particular,
+    /// this must never stage ambient dirty files or harness-owned output.
+    pub async fn improve_commit_attempt(
+        &self,
+        worktree_path: &str,
+        changes: &AttemptChanges,
+        number: usize,
+        finding: &ReviewFinding,
+    ) -> Result<String> {
+        if changes.commit_paths.is_empty() {
+            return Err(WisetreeError::other(
+                "nothing to commit for this improvement.",
+            ));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        for path in &changes.commit_paths {
+            self.bugkill_git(&cwd, &["add", "--", path])
+                .await
+                .map_err(WisetreeError::other)?;
+        }
+        let subject = format!(
+            "improve: checkpoint #{number} — {}",
+            finding.title.chars().take(50).collect::<String>()
+        );
+        self.bugkill_git(&cwd, &["commit", "-m", &subject])
+            .await
+            .map_err(|err| {
+                WisetreeError::other(if err.trim().is_empty() {
+                    "git commit failed after staging the improvement.".to_string()
+                } else {
+                    err
+                })
+            })?;
+        let sha = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+        Ok(sha.trim().to_string())
+    }
+
     /// After a live apply: stage the change, commit it with the review
     /// commit-message format, and reply to the reviewer with the commit link.
     /// All deterministic — no AI. `comment_index` is the 1-based position in
@@ -3420,6 +3516,103 @@ impl DashboardService {
             owner,
             repo,
             head_sha,
+        })
+    }
+
+    /// Prepare Improve's local discovery input. Unlike Review this never
+    /// syncs, fetches, or consults GitHub: it reviews precisely the committed
+    /// three-dot range from the worktree's resolved base ref to `HEAD`.
+    pub async fn prepare_improve(&self, worktree_path: &str) -> Result<ImprovePreparation> {
+        if !self.config.ai.review.has_discovery_models()
+            || self.config.ai.fix.apply.model.trim().is_empty()
+        {
+            return Ok(ImprovePreparation::AiNotConfigured);
+        }
+
+        let cwd = PathBuf::from(worktree_path);
+        let runner = self.ai_runner();
+        for (slot, config, permission) in [
+            (
+                "dashboard.ai.review.strong",
+                &self.config.ai.review.strong,
+                AiPermission::Plan,
+            ),
+            (
+                "dashboard.ai.review.balanced",
+                &self.config.ai.review.balanced,
+                AiPermission::Plan,
+            ),
+            (
+                "dashboard.ai.fix.apply",
+                &self.config.ai.fix.apply,
+                AiPermission::Implement,
+            ),
+        ] {
+            if runner
+                .command(&AiRunRequest {
+                    slot: slot.to_string(),
+                    config: config.clone(),
+                    prompt: String::new(),
+                    cwd: cwd.clone(),
+                    mode: AiRunMode::Interactive,
+                    permission,
+                    timeout: Duration::from_secs(1),
+                    activity_limit: 1,
+                    session_title: None,
+                    attachments: Vec::new(),
+                })
+                .is_err()
+            {
+                return Ok(ImprovePreparation::AiUnavailable);
+            }
+        }
+
+        let status = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("git status timed out"))?
+        .map_err(WisetreeError::other)?;
+        if !status.is_empty() {
+            return Ok(ImprovePreparation::DirtyWorktree);
+        }
+
+        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await
+        else {
+            return Ok(ImprovePreparation::BaseRefUnresolved);
+        };
+        let range = format!("{base_ref}...HEAD");
+        let diff = time::timeout(
+            REVIEW_FETCH_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["diff", "--no-color", &range],
+                Some(&cwd),
+            ),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("local Improve diff timed out"))?
+        .map_err(WisetreeError::other)?;
+        let parsed = parse_review_diff(&diff);
+        if parsed.is_empty() {
+            return Ok(ImprovePreparation::NoChanges);
+        }
+        let mut parsed = parsed;
+        apply_project_test_patterns(&cwd, &mut parsed).await;
+        let (mut files, skipped) = partition_reviewable_files(parsed);
+        attach_review_file_contents(&cwd, &mut files).await;
+        let context = build_review_context(&cwd, &files).await;
+        Ok(ImprovePreparation::Ready {
+            base_ref,
+            scan_mode: review_scan_mode(&files),
+            files,
+            context,
+            skipped,
         })
     }
 
@@ -4767,10 +4960,53 @@ impl DashboardService {
         let cwd = PathBuf::from(worktree_path);
         let status = self.bugkill_git_status(&cwd).await?;
         let untracked = hash_untracked(&cwd, &status.untracked).await;
+        let mut untracked_contents = Vec::new();
+        for path in &status.untracked {
+            if path != INVESTIGATION_FILE {
+                if let Ok(contents) = tokio::fs::read(cwd.join(path)).await {
+                    untracked_contents.push((path.clone(), contents));
+                }
+            }
+        }
         Ok(BugkillSnapshot {
             tracked: status.tracked,
             untracked,
+            untracked_contents,
         })
+    }
+
+    /// Discard one Improve attempt while preserving pre-existing untracked
+    /// files that the AI modified. Those files are never committed, but must
+    /// be restored to their pre-attempt contents rather than deleted.
+    pub async fn improve_abort_cleanup(
+        &self,
+        worktree_path: &str,
+        changes: &AttemptChanges,
+        pre: &BugkillSnapshot,
+    ) -> Result<()> {
+        let ordinary_paths = changes
+            .all
+            .iter()
+            .filter(|path| !changes.modified_preexisting_untracked.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.bugkill_abort_cleanup(worktree_path, &ordinary_paths)
+            .await?;
+
+        let cwd = PathBuf::from(worktree_path);
+        for path in &changes.modified_preexisting_untracked {
+            let Some((_, contents)) = pre
+                .untracked_contents
+                .iter()
+                .find(|(pre_path, _)| pre_path == path)
+            else {
+                return Err(WisetreeError::other(format!(
+                    "could not restore pre-existing untracked file `{path}`."
+                )));
+            };
+            tokio::fs::write(cwd.join(path), contents).await?;
+        }
+        Ok(())
     }
 
     /// Commit one applied attempt — the harness, never the AI. Stages each
@@ -14438,6 +14674,145 @@ so the intent reads clearly.
         );
     }
 
+    fn improve_service(repo: &Path, config: DashboardConfig) -> DashboardService {
+        DashboardService::new(repo.to_path_buf(), config).with_opencode_binary(PathBuf::from("git"))
+    }
+
+    fn improve_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("app.rs"), "fn main() {}\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "base"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, local.to_str().unwrap()],
+        );
+        (tmp, local)
+    }
+
+    #[tokio::test]
+    async fn prepare_improve_builds_local_review_input_without_gh() {
+        let (_tmp, repo) = improve_repo();
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(
+            repo.join("app.rs"),
+            "fn main() { println!(\"improved\"); }\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "change"]);
+
+        let prepared = improve_service(&repo, DashboardConfig::default())
+            .prepare_improve(repo.to_str().unwrap())
+            .await
+            .expect("prepare");
+        match prepared {
+            ImprovePreparation::Ready {
+                base_ref, files, ..
+            } => {
+                assert_eq!(base_ref, "origin/main");
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "app.rs");
+                assert!(files[0].commentable_lines.contains(&1));
+                assert!(files[0]
+                    .full_content
+                    .as_deref()
+                    .unwrap()
+                    .contains("improved"));
+            }
+            other => panic!("expected ready preparation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_improve_rejects_missing_models_or_harnesses() {
+        let (_tmp, repo) = improve_repo();
+        let mut config = DashboardConfig::default();
+        config.ai.fix.apply.model.clear();
+        assert_eq!(
+            improve_service(&repo, config)
+                .prepare_improve(repo.to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::AiNotConfigured
+        );
+        assert_eq!(
+            improve_service(&repo, DashboardConfig::default())
+                .with_opencode_binary(repo.join("missing-ai"))
+                .prepare_improve(repo.to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::AiUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_improve_rejects_dirty_or_unresolved_worktrees() {
+        let (_tmp, repo) = improve_repo();
+        std::fs::write(repo.join("dirty.txt"), "dirty\n").unwrap();
+        assert_eq!(
+            improve_service(&repo, DashboardConfig::default())
+                .prepare_improve(repo.to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::DirtyWorktree
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "initial"]);
+        assert_eq!(
+            improve_service(tmp.path(), DashboardConfig::default())
+                .prepare_improve(tmp.path().to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::BaseRefUnresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_improve_reports_empty_and_non_reviewable_diffs() {
+        let (_tmp, repo) = improve_repo();
+        assert_eq!(
+            improve_service(&repo, DashboardConfig::default())
+                .prepare_improve(repo.to_str().unwrap())
+                .await
+                .unwrap(),
+            ImprovePreparation::NoChanges
+        );
+
+        git(&repo, &["checkout", "-q", "-b", "binary-change"]);
+        std::fs::write(repo.join("image.bin"), [0_u8, 1, 2]).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "binary"]);
+        match improve_service(&repo, DashboardConfig::default())
+            .prepare_improve(repo.to_str().unwrap())
+            .await
+            .unwrap()
+        {
+            ImprovePreparation::Ready { files, skipped, .. } => {
+                assert!(files.is_empty());
+                assert_eq!(skipped.len(), 1);
+                assert_eq!(skipped[0].reason, "binary file without reviewable text");
+            }
+            other => panic!("expected informative skipped result, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn fetch_base_ref_reports_no_change_when_base_is_current() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -16332,6 +16707,147 @@ so the intent reads clearly.
             .unwrap_err();
 
         assert!(error.to_string().contains("HEAD resolution failed"));
+    }
+
+    #[tokio::test]
+    async fn improve_cleanup_restores_modified_preexisting_untracked_files() {
+        let repo = initialized_temp_repo();
+        let repo_path = repo.path().to_str().unwrap();
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default());
+        std::fs::write(repo.path().join("notes.txt"), "before").unwrap();
+        let pre = service.bugkill_snapshot(repo_path).await.unwrap();
+
+        std::fs::write(repo.path().join("notes.txt"), "attempt edit").unwrap();
+        let post = service.bugkill_snapshot(repo_path).await.unwrap();
+        let changes = crate::services::compute_attempt_changes(
+            &post.tracked,
+            &post.untracked,
+            &pre.untracked,
+        );
+        assert!(changes.commit_paths.is_empty());
+        assert_eq!(changes.modified_preexisting_untracked, ["notes.txt"]);
+
+        service
+            .improve_abort_cleanup(repo_path, &changes, &pre)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("notes.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(git(repo.path(), &["status", "--porcelain"]), "?? notes.txt");
+    }
+
+    fn improve_test_finding() -> ReviewFinding {
+        ReviewFinding {
+            category: "Correctness".to_string(),
+            severity: ReviewSeverity::High,
+            file: "seed.txt".to_string(),
+            start_line: Some(1),
+            line: Some(1),
+            title: "Preserve the seed value".to_string(),
+            explanation: "The value must remain stable across retries.".to_string(),
+            suggestion: Some("Write the corrected value.".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn improve_apply_handoff_contains_only_local_checkpoint_instructions() {
+        let repo = initialized_temp_repo();
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+
+        let handoff = service
+            .prepare_improve_apply(repo.path().to_str().unwrap(), &improve_test_finding())
+            .await
+            .expect("handoff");
+
+        assert_eq!(handoff.command.binary, PathBuf::from("git"));
+        assert_eq!(handoff.command.cwd, repo.path());
+        assert_eq!(handoff.command.args[0], "--prompt");
+        let prompt = &handoff.command.args[1];
+        assert!(prompt.contains("Location: seed.txt:1"));
+        assert!(prompt.contains("Preserve the seed value"));
+        assert!(
+            prompt.contains("Do not create a pull request, post comments, push, or commit"),
+            "Improve must not expose a GitHub write path: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn improve_commit_attempt_checkpoints_only_attempt_paths() {
+        let repo = initialized_temp_repo();
+        std::fs::write(repo.path().join("seed.txt"), "improved").unwrap();
+        std::fs::write(repo.path().join("ambient.txt"), "leave me dirty").unwrap();
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default());
+        let changes = AttemptChanges {
+            all: vec!["seed.txt".to_string()],
+            commit_paths: vec!["seed.txt".to_string()],
+            modified_preexisting_untracked: Vec::new(),
+        };
+
+        let sha = service
+            .improve_commit_attempt(
+                repo.path().to_str().unwrap(),
+                &changes,
+                2,
+                &improve_test_finding(),
+            )
+            .await
+            .expect("checkpoint commit");
+
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            git(repo.path(), &["log", "-1", "--format=%s"]),
+            "improve: checkpoint #2 — Preserve the seed value"
+        );
+        assert_eq!(git(repo.path(), &["show", "HEAD:seed.txt"]), "improved");
+        assert_eq!(
+            git(repo.path(), &["status", "--porcelain"]),
+            "?? ambient.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn improve_commit_attempt_reports_no_change_and_commit_failures() {
+        let repo = initialized_temp_repo();
+        let empty = AttemptChanges {
+            all: Vec::new(),
+            commit_paths: Vec::new(),
+            modified_preexisting_untracked: Vec::new(),
+        };
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default());
+        assert_eq!(
+            service
+                .improve_commit_attempt(
+                    repo.path().to_str().unwrap(),
+                    &empty,
+                    1,
+                    &improve_test_finding(),
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "nothing to commit for this improvement."
+        );
+
+        std::fs::write(repo.path().join("seed.txt"), "changed").unwrap();
+        let failing = dashboard_with_failing_git(&repo, "commit", "commit blocked");
+        let changes = AttemptChanges {
+            all: vec!["seed.txt".to_string()],
+            commit_paths: vec!["seed.txt".to_string()],
+            modified_preexisting_untracked: Vec::new(),
+        };
+        let error = failing
+            .improve_commit_attempt(
+                repo.path().to_str().unwrap(),
+                &changes,
+                1,
+                &improve_test_finding(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("commit blocked"));
     }
 
     #[tokio::test]

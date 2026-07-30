@@ -27,7 +27,7 @@ use crate::config::schema::{
 };
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
-use crate::errors::user_friendly_message;
+use crate::errors::{user_friendly_message, WisetreeError};
 use crate::files::service::{open_terminal, open_url};
 use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
@@ -47,10 +47,10 @@ use crate::services::{
     DashboardService, DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff,
     DevelopPlanPrompt, DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation,
     ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan,
-    FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult, OpencodeModel, PrState,
-    ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
-    ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdateSource,
+    FixPreparation, FixVerdict, ImprovePreparation, JudgeResult, MultiSourceUpdateResult,
+    OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation,
+    ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus,
+    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::image_upload::{ImageAttachment, ImageStorage};
@@ -62,8 +62,8 @@ use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BugkillRequest, BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
-    DevelopRequest, ExplainPullRequestRequest, FixPullRequestRequest, MergePullRequestRequest,
-    ReviewPullRequestRequest, UpdatePullRequestRequest,
+    DevelopRequest, ExplainPullRequestRequest, FixPullRequestRequest, ImproveRequest,
+    MergePullRequestRequest, ReviewPullRequestRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
@@ -71,6 +71,7 @@ use crate::tui::screens::delete::{
 use crate::tui::screens::develop_pr::{DevelopAction, DevelopPullRequestScreen, DevelopStep};
 use crate::tui::screens::explain_pr::{ExplainAction, ExplainPullRequestScreen, ExplainStep};
 use crate::tui::screens::fix_pr::{FixAction, FixPullRequestScreen, FixRowOutcome, FixStep};
+use crate::tui::screens::improve_pr::{ImproveAction, ImprovePullRequestScreen};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
 #[cfg(test)]
@@ -212,6 +213,20 @@ enum AppEvent {
     },
     /// "Review Pull Request": sync + diff fetch + per-file split finished.
     ReviewPrPrepared(Result<Box<ReviewPreparation>, String>),
+    /// "Improve": validate and build the local three-dot review input.
+    ImprovePrepared(Result<Box<ImprovePreparation>, String>),
+    ImproveApplyReady {
+        index: usize,
+        result: Result<Box<(BugkillSnapshot, FixApplyHandoff)>, String>,
+    },
+    ImproveCommitted {
+        index: usize,
+        result: Result<ImproveCommitOutcome, String>,
+    },
+    ImproveAborted {
+        index: usize,
+        result: Result<(), String>,
+    },
     /// One per-file scan (or a single-finding revision) returned.
     ReviewPrScanned {
         /// File index the scan belongs to — guards against a stale result.
@@ -381,6 +396,11 @@ enum BugkillCommitOutcome {
     },
 }
 
+enum ImproveCommitOutcome {
+    NoChanges,
+    Committed { sha: String },
+}
+
 struct MergePrDetailsPayload {
     title: String,
     body: String,
@@ -542,6 +562,8 @@ pub struct App {
     next_fix_operation_id: u64,
     active_fix_operation_id: Option<u64>,
     review_pr: Option<ReviewPullRequestScreen>,
+    improve_pr: Option<ImprovePullRequestScreen>,
+    improve_apply_watch: Option<AiTurnWatcher>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
     develop_pr: Option<DevelopPullRequestScreen>,
     next_develop_operation_id: u64,
@@ -720,6 +742,8 @@ impl App {
             next_fix_operation_id: 0,
             active_fix_operation_id: None,
             review_pr: None,
+            improve_pr: None,
+            improve_apply_watch: None,
             bugkill_pr: None,
             develop_pr: None,
             next_develop_operation_id: 0,
@@ -921,6 +945,48 @@ impl App {
                     if let Some((exited, step)) = fix_tick {
                         self.on_fix_tick(exited, step, &tx);
                     }
+                    let improve_status = self
+                        .improve_pr
+                        .as_mut()
+                        .map(|screen| (screen.tick_pty(), screen.applying(), screen.autonomous()));
+                    match improve_status {
+                        Some((true, true, true)) => {
+                            let turn = self
+                                .improve_apply_watch
+                                .as_mut()
+                                .map(AiTurnWatcher::check_now)
+                                .unwrap_or(AiTurn::Working);
+                            if matches!(turn, AiTurn::Working) {
+                                // A PTY exit without a completed turn is an
+                                // interruption, never an approval to commit.
+                                self.fail_improve_apply(
+                                    "AI session exited before completing the improvement."
+                                        .to_string(),
+                                    &tx,
+                                );
+                            } else {
+                                self.on_improve_turn(turn, &tx);
+                            }
+                        }
+                        Some((false, true, true)) => {
+                            if let Some(turn) = self
+                                .improve_apply_watch
+                                .as_mut()
+                                .and_then(AiTurnWatcher::poll)
+                            {
+                                self.on_improve_turn(turn, &tx);
+                            }
+                        }
+                        _ => self.improve_apply_watch = None,
+                    }
+                    // Same for the Bugkill PTYs. The Investigating TUI never
+                    // exits on its own, so completion comes from the turn
+                    // watcher polling the selected harness; an early PTY exit
+                    // there means the user quit the AI CLI (or it crashed). A
+                    // Fixing exit is likewise not trusted as "done" —
+                    // `on_bugkill_fix_pty_exited` re-checks the database so an
+                    // interrupted / early-quit AI CLI can't commit a
+                    // half-applied fix.
                     let bugkill_tick = self
                         .bugkill_pr
                         .as_mut()
@@ -964,6 +1030,7 @@ impl App {
             || self.bugkill_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.develop_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.fix_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.improve_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -1268,6 +1335,22 @@ impl App {
                 if let Some(review_pr) = self.review_pr.as_mut() {
                     review_pr.tick = self.tick;
                     review_pr.render(frame, panel);
+                }
+            }
+            Screen::ImprovePullRequest => {
+                let panel = self.render_framed_panel_fill(frame, area);
+                if self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(ImprovePullRequestScreen::owns_interaction)
+                {
+                    if let Some(improve_pr) = self.improve_pr.as_mut() {
+                        improve_pr.render(frame, panel);
+                    }
+                } else if let Some(review_pr) = self.review_pr.as_mut() {
+                    review_pr.render(frame, panel);
+                } else if let Some(improve_pr) = self.improve_pr.as_mut() {
+                    improve_pr.render(frame, panel);
                 }
             }
             Screen::BugkillPullRequest => {
@@ -1659,6 +1742,14 @@ impl App {
                     };
                 }
             }
+            Screen::ImprovePullRequest => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    };
+                }
+            }
             Screen::BugkillPullRequest => {
                 if let Some(screen) = self.bugkill_pr.as_mut() {
                     match direction {
@@ -1703,6 +1794,10 @@ impl App {
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             Screen::DevelopPullRequest => self
                 .develop_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            Screen::ImprovePullRequest => self
+                .improve_pr
                 .as_mut()
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             _ => false,
@@ -1834,6 +1929,7 @@ impl App {
             Screen::ExplainPullRequest => self.handle_explain_pr_key(key, tx),
             Screen::FixPullRequest => self.handle_fix_pr_key(key, tx),
             Screen::ReviewPullRequest => self.handle_review_pr_key(key, tx),
+            Screen::ImprovePullRequest => self.handle_improve_pr_key(key, tx),
             Screen::BugkillPullRequest => self.handle_bugkill_key(key, tx),
             Screen::DevelopPullRequest => self.handle_develop_key(key, tx),
             Screen::UpdateBranch => {
@@ -2247,6 +2343,28 @@ impl App {
                     .map(|screen| screen.handle_mouse_click(position))
                     .unwrap_or(ReviewAction::Continue);
                 self.apply_review_action(action, tx);
+            }
+            Screen::ImprovePullRequest => {
+                if self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(ImprovePullRequestScreen::owns_interaction)
+                    || self.review_pr.is_none()
+                {
+                    let action = self
+                        .improve_pr
+                        .as_mut()
+                        .map(|screen| screen.handle_mouse_click(position))
+                        .unwrap_or(ImproveAction::Continue);
+                    self.apply_improve_action(action, tx);
+                } else {
+                    let action = self
+                        .review_pr
+                        .as_mut()
+                        .map(|screen| screen.handle_mouse_click(position))
+                        .unwrap_or(ReviewAction::Continue);
+                    self.apply_review_action(action, tx);
+                }
             }
             Screen::BugkillPullRequest => {
                 let action = self
@@ -2955,6 +3073,485 @@ impl App {
 
     // ── "Review Pull Request" orchestration ────────────────────────────
 
+    // ── "Improve" entry ───────────────────────────────────────────────
+
+    fn start_improve_flow(
+        &mut self,
+        request: ImproveRequest,
+        _tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let config = self.current_dashboard_config();
+        self.improve_pr = Some(ImprovePullRequestScreen::new(
+            request,
+            config.ai.review.clone(),
+            config.ai.fix.clone(),
+        ));
+        self.screen = Screen::ImprovePullRequest;
+    }
+
+    fn handle_improve_pr_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if !self
+            .improve_pr
+            .as_ref()
+            .is_some_and(ImprovePullRequestScreen::owns_interaction)
+            && self.review_pr.is_some()
+        {
+            self.handle_review_pr_key(key, tx);
+            return;
+        }
+        let action = self
+            .improve_pr
+            .as_mut()
+            .map(|screen| screen.handle_key(key))
+            .unwrap_or(ImproveAction::Continue);
+        self.apply_improve_action(action, tx);
+    }
+
+    fn apply_improve_action(
+        &mut self,
+        action: ImproveAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match action {
+            ImproveAction::Continue => {}
+            ImproveAction::Cancelled => {
+                let preparing = self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(ImprovePullRequestScreen::preparing);
+                let worktree_path = self
+                    .improve_pr
+                    .take()
+                    .map(|screen| screen.request().worktree_path.clone());
+                if preparing {
+                    self.show_toast(
+                        ToastVariant::Info,
+                        "Improve discovery cancelled before any changes were made.".to_string(),
+                    );
+                }
+                self.back_to_dashboard_action_menu(worktree_path, tx);
+            }
+            ImproveAction::Done => self.finish_improve_flow(tx),
+            // The discovery and apply pipeline is introduced by the next
+            // implementation section. This section only prepares its local,
+            // GitHub-free input.
+            ImproveAction::Confirmed => {
+                let Some(screen) = self.improve_pr.as_mut() else {
+                    return;
+                };
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_preparing();
+                kick_off_prepare_improve(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    tx.clone(),
+                );
+            }
+            ImproveAction::Other => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.show_other_input();
+                }
+            }
+            ImproveAction::Skip => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.record_skipped();
+                }
+                self.advance_improve_finding(tx);
+            }
+            ImproveAction::Edit => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.show_edit();
+                }
+            }
+            ImproveAction::Apply => {
+                let Some(screen) = self.improve_pr.as_mut() else {
+                    return;
+                };
+                let Some(finding) = screen.current_finding() else {
+                    return;
+                };
+                let index = screen.current_index();
+                let worktree_path = screen.request().worktree_path.clone();
+                screen.start_applying();
+                kick_off_improve_apply(
+                    self.git_root.clone(),
+                    self.current_dashboard_config(),
+                    worktree_path,
+                    finding,
+                    index,
+                    tx.clone(),
+                );
+            }
+            ImproveAction::ApplyReady => self.finish_improve_apply(tx),
+            ImproveAction::AbortApply => {
+                self.fail_improve_apply(
+                    "Apply cancelled before a checkpoint was created.".to_string(),
+                    tx,
+                );
+            }
+            ImproveAction::Revise(feedback) => self.revise_improve_finding(feedback, tx),
+        }
+    }
+
+    fn begin_improve_finding_review(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some((finding, current, total)) = self.review_pr.as_ref().and_then(|discovery| {
+            discovery
+                .current_finding()
+                .map(|finding| (finding, discovery.current_index(), discovery.findings_len()))
+        }) else {
+            if let Some(improve) = self.improve_pr.as_mut() {
+                improve.enter_done();
+            }
+            return;
+        };
+        if let Some(improve) = self.improve_pr.as_mut() {
+            improve.show_finding(finding, current, total);
+        }
+        if self
+            .improve_pr
+            .as_ref()
+            .is_some_and(ImprovePullRequestScreen::autonomous)
+        {
+            self.apply_improve_action(ImproveAction::Apply, tx);
+        }
+    }
+
+    fn advance_improve_finding(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let more = self
+            .review_pr
+            .as_mut()
+            .is_some_and(|screen| screen.advance_finding());
+        if more {
+            self.begin_improve_finding_review(tx);
+        } else {
+            self.review_pr = None;
+            if let Some(screen) = self.improve_pr.as_mut() {
+                screen.enter_done();
+            }
+        }
+    }
+
+    fn finish_improve_flow(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let path = self
+            .improve_pr
+            .take()
+            .map(|screen| screen.request().worktree_path.clone());
+        self.review_pr = None;
+        self.back_to_dashboard_action_menu(path, tx);
+        if let Some(watch) = self.dashboard_watch.as_ref() {
+            watch.refresh();
+        }
+    }
+
+    fn revise_improve_finding(&mut self, feedback: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(improve) = self.improve_pr.as_ref() else {
+            return;
+        };
+        let Some(finding) = improve.current_finding() else {
+            return;
+        };
+        let index = improve.current_index();
+        let Some(review) = self.review_pr.as_ref() else {
+            return;
+        };
+        let Some(file) = review.file_for(&finding) else {
+            return;
+        };
+        let request = ReviewReviseRequest {
+            worktree_path: review.request().worktree_path.clone(),
+            file,
+            finding,
+            mode: if review_feedback_needs_expanded_context(&feedback) {
+                ReviewRevisionMode::Expanded
+            } else {
+                ReviewRevisionMode::Focused
+            },
+            feedback,
+            attachments: Vec::new(),
+            index,
+        };
+        if let Some(improve) = self.improve_pr.as_mut() {
+            improve.start_preparing();
+        }
+        kick_off_revise_review_finding(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request,
+            tx.clone(),
+        );
+    }
+
+    fn finish_improve_apply(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.improve_apply_watch = None;
+        let Some(screen) = self.improve_pr.as_mut() else {
+            return;
+        };
+        if !screen.applying() {
+            return;
+        }
+        let Some(finding) = screen.current_finding() else {
+            return;
+        };
+        let Some(pre) = screen.pre_snapshot() else {
+            return;
+        };
+        let index = screen.current_index();
+        let worktree_path = screen.request().worktree_path.clone();
+        screen.finish_apply();
+        screen.begin_commit();
+        kick_off_improve_commit(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            worktree_path,
+            finding,
+            pre,
+            index,
+            tx.clone(),
+        );
+    }
+
+    /// Returns whether cleanup was dispatched. A caller must not advance to
+    /// the next finding until that cleanup event settles, otherwise a new
+    /// attempt could absorb the old one's dirty paths.
+    fn abort_improve_apply(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) -> bool {
+        self.improve_apply_watch = None;
+        let Some(screen) = self.improve_pr.as_mut() else {
+            return false;
+        };
+        screen.disarm_autonomous();
+        let index = screen.current_index();
+        let pre = screen.pre_snapshot();
+        let worktree_path = screen.request().worktree_path.clone();
+        screen.finish_apply();
+        let Some(pre) = pre else {
+            // The user cancelled while the snapshot/handoff task was still
+            // pending, before an AI process could have changed the tree.
+            return false;
+        };
+        screen.begin_abort();
+        kick_off_improve_abort(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            worktree_path,
+            pre,
+            index,
+            tx.clone(),
+        );
+        true
+    }
+
+    fn fail_improve_apply(&mut self, message: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if let Some(screen) = self.improve_pr.as_mut() {
+            screen.disarm_autonomous();
+            screen.record_failed(message);
+        }
+        if !self.abort_improve_apply(tx) {
+            self.advance_improve_finding(tx);
+        }
+    }
+
+    fn on_improve_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match turn {
+            AiTurn::Working => {}
+            AiTurn::Finished { .. } => self.finish_improve_apply(tx),
+            AiTurn::Failed { message } => {
+                self.fail_improve_apply(
+                    format!("AI CLI reported an error: {}", truncate_error(&message)),
+                    tx,
+                );
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Improve apply failed: {}", truncate_error(&message)),
+                );
+            }
+        }
+    }
+
+    fn apply_improve_apply_ready(
+        &mut self,
+        index: usize,
+        result: Result<Box<(BugkillSnapshot, FixApplyHandoff)>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self
+            .improve_pr
+            .as_ref()
+            .is_some_and(|s| s.current_index() == index && s.applying())
+        {
+            return;
+        }
+        match result {
+            Ok(payload) => {
+                let (snapshot, handoff) = *payload;
+                let mut spawn_failed = false;
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    if screen.autonomous() {
+                        self.improve_apply_watch =
+                            Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
+                    }
+                    screen.set_pre_snapshot(snapshot);
+                    spawn_failed = !screen.spawn_opencode_pty(
+                        handoff.command.binary,
+                        handoff.command.args,
+                        handoff.command.cwd,
+                        handoff.harness.renders_inline(),
+                    );
+                }
+                if spawn_failed {
+                    self.fail_improve_apply(
+                        "Could not start the Improve AI session.".to_string(),
+                        tx,
+                    );
+                    self.show_toast(
+                        ToastVariant::Error,
+                        "Could not start the Improve AI session.".to_string(),
+                    );
+                }
+            }
+            Err(message) => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.disarm_autonomous();
+                    screen.record_failed(format!(
+                        "Could not start apply: {}",
+                        truncate_error(&message)
+                    ));
+                    screen.finish_apply();
+                }
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!(
+                        "Could not start Improve apply: {}",
+                        truncate_error(&message)
+                    ),
+                );
+                self.advance_improve_finding(tx);
+            }
+        }
+    }
+
+    fn apply_improve_committed(
+        &mut self,
+        index: usize,
+        result: Result<ImproveCommitOutcome, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self
+            .improve_pr
+            .as_ref()
+            .is_some_and(|s| s.current_index() == index && s.committing())
+        {
+            return;
+        }
+        match result {
+            Ok(ImproveCommitOutcome::Committed { sha }) => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.finish_commit();
+                    screen.record_applied(sha.clone());
+                }
+                self.show_toast(
+                    ToastVariant::Success,
+                    format!("Improve checkpoint committed: {}", &sha[..sha.len().min(8)]),
+                );
+            }
+            Ok(ImproveCommitOutcome::NoChanges) => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.finish_commit();
+                    screen.record_addressed();
+                }
+                self.show_toast(
+                    ToastVariant::Info,
+                    "No changes needed; improvement already addressed.".to_string(),
+                );
+            }
+            Err(message) => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.disarm_autonomous();
+                    screen.finish_commit();
+                    screen.record_failed(truncate_error(&message));
+                }
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("Improve checkpoint failed: {}", truncate_error(&message)),
+                );
+                self.advance_improve_finding(tx);
+                return;
+            }
+        }
+        self.advance_improve_finding(tx);
+    }
+
+    fn apply_improve_prepared(
+        &mut self,
+        result: Result<Box<ImprovePreparation>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.improve_pr.is_none() {
+            return;
+        }
+        let prepared = match result {
+            Ok(preparation) => match *preparation {
+                ImprovePreparation::Ready { base_ref, files, skipped, .. } if files.is_empty() => {
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.set_reviewed_range(base_ref);
+                        screen.record_skipped_files(&skipped);
+                        screen.enter_done();
+                    }
+                    return;
+                }
+                ImprovePreparation::Ready { base_ref, files, scan_mode, context, skipped } => {
+                    let Some(request) = self.improve_pr.as_ref().map(|screen| screen.request().clone()) else {
+                        return;
+                    };
+                    let mut discovery = ReviewPullRequestScreen::new_improve(
+                        request,
+                        self.current_dashboard_config().ai.review.clone(),
+                    );
+                    discovery.set_scan_mode(scan_mode);
+                    discovery.set_review_context(context);
+                    discovery.set_files(files, String::new(), String::new(), String::new());
+                    discovery.record_skipped_files(&skipped);
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.set_reviewed_range(base_ref);
+                        screen.record_skipped_files(&skipped);
+                    }
+                    self.review_pr = Some(discovery);
+                    self.start_review_scans(tx);
+                    return;
+                }
+                ImprovePreparation::NoChanges => {
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.enter_done();
+                    }
+                    return;
+                }
+                ImprovePreparation::AiNotConfigured => (
+                    ToastVariant::Warning,
+                    "Configure Review discovery models and the Fix apply model in Settings → Dashboard → ai before improving.".to_string(),
+                ),
+                ImprovePreparation::AiUnavailable => (
+                    ToastVariant::Error,
+                    "A configured Improve AI harness is unavailable or incompatible with its model.".to_string(),
+                ),
+                ImprovePreparation::DirtyWorktree => (
+                    ToastVariant::Warning,
+                    "Improve requires a clean worktree. Commit, stash, or remove local changes first.".to_string(),
+                ),
+                ImprovePreparation::BaseRefUnresolved => (
+                    ToastVariant::Error,
+                    "Improve could not resolve this worktree's base branch. Set an upstream or fetch a local base ref, then retry.".to_string(),
+                ),
+            },
+            Err(message) => (ToastVariant::Error, format!("Could not prepare Improve: {}", truncate_error(&message))),
+        };
+        let worktree_path = self
+            .improve_pr
+            .take()
+            .map(|screen| screen.request().worktree_path.clone());
+        self.show_toast(prepared.0, prepared.1);
+        self.back_to_dashboard_action_menu(worktree_path, tx);
+    }
+
     fn start_review_pr_flow(
         &mut self,
         request: ReviewPullRequestRequest,
@@ -3231,7 +3828,11 @@ impl App {
             let context = screen.review_context();
             let candidates = screen.begin_verification();
             if candidates.is_empty() {
-                screen.enter_decision();
+                if screen.is_improve() {
+                    self.begin_improve_finding_review(tx);
+                } else {
+                    screen.enter_decision();
+                }
                 return;
             }
             let config = self.current_dashboard_config();
@@ -3251,6 +3852,9 @@ impl App {
             }
         } else {
             screen.enter_done();
+            if screen.is_improve() {
+                self.begin_improve_finding_review(tx);
+            }
         }
     }
 
@@ -3507,6 +4111,57 @@ impl App {
         if !self.review_at_index(index) {
             return;
         }
+        if self.improve_pr.is_some() {
+            match result {
+                Ok(mut findings) if !findings.is_empty() => {
+                    let mut revised = findings.remove(0);
+                    if let Some(old) = self.improve_pr.as_ref().and_then(|s| s.current_finding()) {
+                        revised.file = old.file;
+                    }
+                    if let Some(improve) = self.improve_pr.as_mut() {
+                        improve.show_revised(revised);
+                    }
+                }
+                _ if mode == ReviewRevisionMode::Focused => {
+                    // The normal Review revision handler retries with expanded
+                    // context. Keep the same guarded index and feedback here.
+                    let request = self.review_pr.as_ref().and_then(|review| {
+                        let finding = self.improve_pr.as_ref()?.current_finding()?;
+                        Some(ReviewReviseRequest {
+                            worktree_path: review.request().worktree_path.clone(),
+                            file: review.file_for(&finding)?,
+                            finding,
+                            mode: ReviewRevisionMode::Expanded,
+                            feedback,
+                            attachments: Vec::new(),
+                            index,
+                        })
+                    });
+                    if let Some(request) = request {
+                        kick_off_revise_review_finding(
+                            self.git_root.clone(),
+                            self.current_dashboard_config(),
+                            request,
+                            tx.clone(),
+                        );
+                        return;
+                    }
+                    if let Some(improve) = self.improve_pr.as_mut() {
+                        improve.revision_failed();
+                    }
+                }
+                _ => {
+                    if let Some(improve) = self.improve_pr.as_mut() {
+                        improve.revision_failed();
+                    }
+                    self.show_toast(
+                        ToastVariant::Warning,
+                        "The revision was malformed; kept the current improvement.".to_string(),
+                    );
+                }
+            }
+            return;
+        }
         if let (Some(screen), Some(telemetry)) = (self.review_pr.as_mut(), telemetry) {
             screen.record_scan_telemetry(telemetry);
         }
@@ -3569,6 +4224,7 @@ impl App {
         index: usize,
         result: Result<ReviewVerification, String>,
         telemetry: Option<ReviewScanTelemetry>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
@@ -3586,7 +4242,18 @@ impl App {
             return;
         }
         if screen.finish_verification() {
-            screen.enter_decision();
+            if screen.is_improve() {
+                // Improve normally has its companion decision screen. Keep
+                // the discovery state terminal in isolated/test callers that
+                // only construct the read-only discovery screen.
+                if self.improve_pr.is_some() {
+                    self.begin_improve_finding_review(tx);
+                } else if let Some(screen) = self.review_pr.as_mut() {
+                    screen.enter_done();
+                }
+            } else {
+                screen.enter_decision();
+            }
         } else {
             screen.enter_done();
         }
@@ -5642,6 +6309,9 @@ impl App {
             DashboardAction::ReviewPullRequest(request) => {
                 self.start_review_pr_flow(*request, tx);
             }
+            DashboardAction::Improve(request) => {
+                self.start_improve_flow(*request, tx);
+            }
             DashboardAction::Bugkill(request) => {
                 self.start_bugkill_flow(*request, tx);
             }
@@ -6859,6 +7529,39 @@ impl App {
                 self.apply_fix_pr_committed(index, result, tx)
             }
             AppEvent::ReviewPrPrepared(result) => self.apply_review_pr_prepared(result, tx),
+            AppEvent::ImprovePrepared(result) => self.apply_improve_prepared(result, tx),
+            AppEvent::ImproveApplyReady { index, result } => {
+                self.apply_improve_apply_ready(index, result, tx)
+            }
+            AppEvent::ImproveCommitted { index, result } => {
+                self.apply_improve_committed(index, result, tx)
+            }
+            AppEvent::ImproveAborted { index, result } => {
+                if self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(|s| s.current_index() == index && s.aborting())
+                {
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.finish_abort();
+                    }
+                    match result {
+                        Ok(()) => self.show_toast(
+                            ToastVariant::Info,
+                            "Improve attempt cancelled; its uncommitted changes were removed."
+                                .to_string(),
+                        ),
+                        Err(message) => self.show_toast(
+                            ToastVariant::Error,
+                            format!(
+                                "Could not clean up Improve attempt: {}",
+                                truncate_error(&message)
+                            ),
+                        ),
+                    }
+                    self.advance_improve_finding(tx);
+                }
+            }
             AppEvent::ReviewPrScanned {
                 file_index,
                 retry,
@@ -6876,7 +7579,7 @@ impl App {
                 index,
                 result,
                 telemetry,
-            } => self.apply_review_pr_verified(index, result, telemetry),
+            } => self.apply_review_pr_verified(index, result, telemetry, tx),
             AppEvent::ReviewPrGapAudited { result, telemetry } => {
                 self.apply_review_pr_gap_audited(result, telemetry, tx)
             }
@@ -7778,6 +8481,13 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::ImprovePullRequest => {
+                // Only reachable through `start_improve_flow`, which seeds
+                // `improve_pr` before flipping the screen.
+                if self.improve_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
             Screen::BugkillPullRequest => {
                 // Only reachable through `start_bugkill_flow`, which seeds
                 // `bugkill_pr` before flipping the screen.
@@ -7835,6 +8545,7 @@ impl App {
         self.update_pr = None;
         self.explain_pr = None;
         self.fix_pr = None;
+        self.improve_pr = None;
         self.bugkill_pr = None;
         self.develop_pr = None;
         self.active_develop_operation_id = None;
@@ -9738,6 +10449,139 @@ fn kick_off_prepare_review(
     });
 }
 
+fn kick_off_prepare_improve(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ImprovePrepared(Err(
+            "Could not resolve git root for Improve.".to_string(),
+        )));
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .prepare_improve(&worktree_path)
+            .await
+            .map(Box::new)
+            .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ImprovePrepared(result));
+    });
+}
+
+fn kick_off_improve_apply(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    finding: ReviewFinding,
+    index: usize,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ImproveApplyReady {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = async {
+            let snapshot = service.bugkill_snapshot(&worktree_path).await?;
+            let handoff = service
+                .prepare_improve_apply(&worktree_path, &finding)
+                .await?;
+            Ok::<_, crate::errors::WisetreeError>(Box::new((snapshot, handoff)))
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ImproveApplyReady { index, result });
+    });
+}
+
+fn kick_off_improve_commit(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    finding: ReviewFinding,
+    pre: BugkillSnapshot,
+    index: usize,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ImproveCommitted {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = async {
+            let post = service.bugkill_snapshot(&worktree_path).await?;
+            let changes = compute_attempt_changes(&post.tracked, &post.untracked, &pre.untracked);
+            if changes.commit_paths.is_empty() {
+                service
+                    .improve_abort_cleanup(&worktree_path, &changes, &pre)
+                    .await?;
+                return Ok(ImproveCommitOutcome::NoChanges);
+            }
+            let sha = match service
+                .improve_commit_attempt(&worktree_path, &changes, index + 1, &finding)
+                .await
+            {
+                Ok(sha) => sha,
+                Err(commit_error) => {
+                    service
+                        .improve_abort_cleanup(&worktree_path, &changes, &pre)
+                        .await
+                        .map_err(|cleanup_error| WisetreeError::other(format!(
+                            "{commit_error}; additionally could not clean up the failed attempt: {cleanup_error}"
+                        )))?;
+                    return Err(commit_error);
+                }
+            };
+            Ok(ImproveCommitOutcome::Committed { sha })
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ImproveCommitted { index, result });
+    });
+}
+
+fn kick_off_improve_abort(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    pre: BugkillSnapshot,
+    index: usize,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ImproveAborted {
+            index,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = async {
+            let post = service.bugkill_snapshot(&worktree_path).await?;
+            let changes = compute_attempt_changes(&post.tracked, &post.untracked, &pre.untracked);
+            service
+                .improve_abort_cleanup(&worktree_path, &changes, &pre)
+                .await
+        }
+        .await
+        .map_err(|err| user_friendly_message(&err));
+        let _ = tx.send(AppEvent::ImproveAborted { index, result });
+    });
+}
+
 fn kick_off_scan_review_file(
     git_root: Option<String>,
     config: DashboardConfig,
@@ -11301,6 +12145,312 @@ mod tests {
         app
     }
 
+    fn improve_scan_test_app(mode: ReviewScanMode, paths: &[&str]) -> App {
+        let request = ImproveRequest {
+            branch: "improve-retries".to_string(),
+            worktree_path: "/tmp/improve-retries".to_string(),
+            number: None,
+            title: None,
+        };
+        let model = crate::config::schema::AiModelConfig {
+            model: "opencode/test".to_string(),
+            thinking: "max".to_string(),
+            harness: Default::default(),
+        };
+        let ai = crate::config::schema::AiReviewConfig {
+            strong: model.clone(),
+            balanced: model.clone(),
+            utility: model,
+        };
+        let files = paths
+            .iter()
+            .map(|path| ReviewFile {
+                path: (*path).to_string(),
+                annotated_diff: "@@ -1 +1 @@\n     1 +changed".to_string(),
+                full_content: None,
+                commentable_lines: std::collections::BTreeSet::from([1]),
+                existing_comments: String::new(),
+                existing_keys: Vec::new(),
+            })
+            .collect();
+        let mut screen = ReviewPullRequestScreen::new_improve(request, ai);
+        screen.set_scan_mode(mode);
+        screen.set_files(files, String::new(), String::new(), String::new());
+        screen.begin_scan_phase();
+
+        let mut app = App::new(AppMode::Dashboard, false);
+        app.screen = Screen::ImprovePullRequest;
+        app.review_pr = Some(screen);
+        app
+    }
+
+    #[test]
+    fn improve_finding_view_is_rendered_after_discovery_handoff() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.phase = InitPhase::Ready;
+        let mut improve = ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        );
+        improve.show_finding(
+            ReviewFinding {
+                category: "Code Smell".to_string(),
+                severity: crate::services::ReviewSeverity::High,
+                file: "src/lib.rs".to_string(),
+                start_line: Some(4),
+                line: Some(4),
+                title: "Avoid duplicate work".to_string(),
+                explanation: "The operation runs twice.".to_string(),
+                suggestion: Some("Cache the result.".to_string()),
+            },
+            0,
+            1,
+        );
+        app.improve_pr = Some(improve);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Proposed improvement"));
+        assert!(rendered.contains("Improve #1 of 1"));
+    }
+
+    #[test]
+    fn improve_revision_feedback_accepts_bracketed_paste_without_submitting() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.phase = InitPhase::Ready;
+        let mut improve = ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        );
+        improve.show_finding(
+            ReviewFinding {
+                category: "Code Smell".to_string(),
+                severity: crate::services::ReviewSeverity::High,
+                file: "src/lib.rs".to_string(),
+                start_line: Some(4),
+                line: Some(4),
+                title: "Avoid duplicate work".to_string(),
+                explanation: "The operation runs twice.".to_string(),
+                suggestion: Some("Cache the result.".to_string()),
+            },
+            0,
+            1,
+        );
+        improve.show_other_input();
+        app.improve_pr = Some(improve);
+
+        app.handle_paste("prefer a local cache\n".to_string(), &app_event_tx());
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("prefer a local cache"));
+        assert!(app.improve_pr.as_ref().unwrap().current_finding().is_some());
+    }
+
+    #[test]
+    fn improve_autonomous_starts_remaining_findings_and_disarms_on_failure() {
+        let finding = |title: &str, line| ReviewFinding {
+            category: "Code Smell".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(line),
+            title: title.to_string(),
+            explanation: "The operation runs twice.".to_string(),
+            suggestion: Some("Cache the result.".to_string()),
+        };
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.review_pr
+            .as_mut()
+            .unwrap()
+            .record_scan_result(vec![finding("First", 1), finding("Second", 2)]);
+        app.improve_pr = Some(ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        ));
+        let tx = app_event_tx();
+
+        app.begin_improve_finding_review(&tx);
+        assert!(!app.improve_pr.as_ref().unwrap().applying());
+
+        app.handle_improve_pr_key(key(KeyCode::Char(' ')), &tx);
+        assert!(app.improve_pr.as_ref().unwrap().applying());
+
+        app.on_improve_turn(
+            AiTurn::Failed {
+                message: "interrupted".to_string(),
+            },
+            &tx,
+        );
+        let screen = app.improve_pr.as_ref().unwrap();
+        assert!(!screen.autonomous());
+        assert!(!screen.applying());
+        assert_eq!(screen.current_index(), 1);
+    }
+
+    #[test]
+    fn improve_commit_handlers_finalize_manual_results_and_ignore_stale_events() {
+        let finding = |title: &str, line| ReviewFinding {
+            category: "Correctness".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: Some(line),
+            line: Some(line),
+            title: title.to_string(),
+            explanation: "Keep the local result correct.".to_string(),
+            suggestion: Some("Use the local value.".to_string()),
+        };
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.review_pr.as_mut().unwrap().record_scan_result(vec![
+            finding("First checkpoint", 1),
+            finding("Already correct", 2),
+        ]);
+        app.improve_pr = Some(ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        ));
+        let tx = app_event_tx();
+        app.begin_improve_finding_review(&tx);
+
+        // Manual mode does not need a watcher: the explicit completion path
+        // starts the checkpoint, and a matching event advances exactly once.
+        let screen = app.improve_pr.as_mut().unwrap();
+        screen.start_applying();
+        screen.finish_apply();
+        screen.begin_commit();
+        app.apply_improve_committed(
+            0,
+            Ok(ImproveCommitOutcome::Committed {
+                sha: "0123456789abcdef".to_string(),
+            }),
+            &tx,
+        );
+        assert_eq!(app.improve_pr.as_ref().unwrap().current_index(), 1);
+        assert!(!app.improve_pr.as_ref().unwrap().committing());
+
+        // An old completion cannot overwrite the active finding.
+        app.apply_improve_committed(0, Ok(ImproveCommitOutcome::NoChanges), &tx);
+        assert_eq!(app.improve_pr.as_ref().unwrap().current_index(), 1);
+
+        let screen = app.improve_pr.as_mut().unwrap();
+        screen.start_applying();
+        screen.finish_apply();
+        screen.begin_commit();
+        app.apply_improve_committed(1, Ok(ImproveCommitOutcome::NoChanges), &tx);
+        assert_eq!(
+            app.improve_pr
+                .as_mut()
+                .unwrap()
+                .handle_key(key(KeyCode::Enter)),
+            ImproveAction::Done
+        );
+    }
+
+    #[test]
+    fn improve_abort_event_cleans_up_before_advancing_and_rejects_stale_results() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.review_pr
+            .as_mut()
+            .unwrap()
+            .record_scan_result(vec![ReviewFinding {
+                category: "Correctness".to_string(),
+                severity: crate::services::ReviewSeverity::High,
+                file: "src/lib.rs".to_string(),
+                start_line: Some(1),
+                line: Some(1),
+                title: "Interrupted change".to_string(),
+                explanation: "The session stopped early.".to_string(),
+                suggestion: None,
+            }]);
+        app.improve_pr = Some(ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        ));
+        let tx = app_event_tx();
+        app.begin_improve_finding_review(&tx);
+        let screen = app.improve_pr.as_mut().unwrap();
+        screen.start_applying();
+        screen.set_pre_snapshot(BugkillSnapshot {
+            tracked: Vec::new(),
+            untracked: Vec::new(),
+            untracked_contents: Vec::new(),
+        });
+        screen.finish_apply();
+        screen.begin_abort();
+
+        app.handle_app_event(
+            AppEvent::ImproveAborted {
+                index: 99,
+                result: Ok(()),
+            },
+            &tx,
+        );
+        assert!(app.improve_pr.as_ref().unwrap().aborting());
+
+        app.handle_app_event(
+            AppEvent::ImproveAborted {
+                index: 0,
+                result: Ok(()),
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.improve_pr
+                .as_mut()
+                .unwrap()
+                .handle_key(key(KeyCode::Enter)),
+            ImproveAction::Done
+        );
+        assert!(!app.improve_pr.as_ref().unwrap().aborting());
+    }
+
     fn review_test_telemetry(scan: &str) -> ReviewScanTelemetry {
         ReviewScanTelemetry {
             scan: scan.to_string(),
@@ -11638,6 +12788,119 @@ mod tests {
                 crate::tui::screens::review_pr::ReviewStep::Done
             );
         }
+    }
+
+    #[test]
+    fn improve_retry_exhaustion_settles_and_rejects_stale_scan_events() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["tests/unit_test.rs"]);
+        app.improve_pr = Some(ImprovePullRequestScreen::new(
+            ImproveRequest {
+                branch: "improve-retries".to_string(),
+                worktree_path: "/tmp/improve-retries".to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiReviewConfig::default(),
+            crate::config::schema::AiFixConfig::default(),
+        ));
+        app.review_pr.as_mut().unwrap().take_next_scan_file();
+        let tx = app_event_tx();
+        for (retry, raw_output) in [
+            (ReviewScanRetry::Initial, Some("bad output".to_string())),
+            (ReviewScanRetry::Reformat, Some("still bad".to_string())),
+            (ReviewScanRetry::Full, None),
+        ] {
+            app.apply_review_pr_scanned(
+                0,
+                retry,
+                Err("malformed".to_string()),
+                None,
+                raw_output,
+                &tx,
+            );
+        }
+        let screen = app.review_pr.as_ref().unwrap();
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+        assert!(screen.is_improve());
+        assert_eq!(screen.scan_telemetry_len(), 0);
+        assert_eq!(
+            app.improve_pr
+                .as_mut()
+                .unwrap()
+                .handle_key(key(KeyCode::Enter)),
+            ImproveAction::Done
+        );
+
+        app.apply_review_pr_scanned(
+            0,
+            ReviewScanRetry::Full,
+            Ok(Vec::new()),
+            Some(review_test_telemetry("stale")),
+            None,
+            &tx,
+        );
+        assert_eq!(app.review_pr.as_ref().unwrap().scan_telemetry_len(), 0);
+    }
+
+    #[test]
+    fn improve_verification_replaces_or_rejects_before_ending_discovery() {
+        let finding = |title: &str| ReviewFinding {
+            category: "Security".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: title.to_string(),
+            explanation: "Missing authorization.".to_string(),
+            suggestion: Some("authorize();".to_string()),
+        };
+        let tx = app_event_tx();
+
+        let mut revised = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = revised.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![finding("Original")]);
+        assert!(screen.finish_scanning());
+        assert_eq!(screen.begin_verification().len(), 1);
+        revised.apply_review_pr_verified(
+            0,
+            Ok(ReviewVerification::Revise {
+                reason: "Narrowed the claim.".to_string(),
+                finding: finding("Revised"),
+            }),
+            None,
+            &tx,
+        );
+        let screen = revised.review_pr.as_ref().unwrap();
+        assert_eq!(screen.findings_len(), 1);
+        assert_eq!(screen.current_finding().unwrap().title, "Revised");
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+
+        let mut rejected = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let screen = rejected.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![finding("False positive")]);
+        screen.finish_scanning();
+        screen.begin_verification();
+        rejected.apply_review_pr_verified(
+            0,
+            Ok(ReviewVerification::RejectedFalsePositive {
+                reason: "Existing guard.".to_string(),
+            }),
+            None,
+            &tx,
+        );
+        let screen = rejected.review_pr.as_ref().unwrap();
+        assert_eq!(screen.findings_len(), 0);
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+        drop(tx);
     }
 
     fn notification_config(ai_status_ok: bool, pr_checks_ok: bool) -> NotificationsConfig {

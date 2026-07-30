@@ -56,7 +56,7 @@ use crate::services::dashboard::{
 };
 use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::image_upload::ImageAttachment;
-use crate::tui::screens::dashboard::ReviewPullRequestRequest;
+use crate::tui::screens::dashboard::{ImproveRequest, ReviewPullRequestRequest};
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
 use crate::tui::widgets::spinner::spinner_frame;
 use crate::tui::widgets::{
@@ -248,10 +248,20 @@ pub enum ReviewAction {
     Done,
 }
 
+/// Discovery is shared by Review and Improve. Improve deliberately stops at
+/// the verified finding set: its later local-implementation walkthrough must
+/// never expose Review's PR-comment controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewWorkflow {
+    Review,
+    Improve,
+}
+
 pub struct ReviewPullRequestScreen {
     request: ReviewPullRequestRequest,
     /// Resolved `ai.review` profiles, shown on the confirm panel's AI table.
     ai: AiReviewConfig,
+    workflow: ReviewWorkflow,
     confirm: Option<ConfirmationModal>,
     phase_message: String,
     /// True only during the per-file scan phase, so the Working view shows
@@ -341,10 +351,37 @@ pub struct ReviewPullRequestScreen {
 
 impl ReviewPullRequestScreen {
     pub fn new(request: ReviewPullRequestRequest, ai: AiReviewConfig) -> Self {
+        Self::with_workflow(request, ai, ReviewWorkflow::Review)
+    }
+
+    /// Construct the shared discovery dashboard for a local Improve run.
+    /// The synthetic PR fields are never rendered or used for mutation.
+    pub fn new_improve(request: ImproveRequest, ai: AiReviewConfig) -> Self {
+        Self::with_workflow(
+            ReviewPullRequestRequest {
+                number: request.number.unwrap_or_default(),
+                title: request
+                    .title
+                    .unwrap_or_else(|| "Local worktree".to_string()),
+                url: String::new(),
+                branch: request.branch,
+                worktree_path: request.worktree_path,
+            },
+            ai,
+            ReviewWorkflow::Improve,
+        )
+    }
+
+    fn with_workflow(
+        request: ReviewPullRequestRequest,
+        ai: AiReviewConfig,
+        workflow: ReviewWorkflow,
+    ) -> Self {
         Self {
             confirm: Some(build_confirm(&request)),
             request,
             ai,
+            workflow,
             phase_message: String::new(),
             scanning: false,
             owner: String::new(),
@@ -424,6 +461,9 @@ impl ReviewPullRequestScreen {
     /// any scan event arriving outside this window.
     pub fn scan_phase_active(&self) -> bool {
         self.scanning
+    }
+    pub fn is_improve(&self) -> bool {
+        self.workflow == ReviewWorkflow::Improve
     }
     pub fn findings_len(&self) -> usize {
         self.findings.len()
@@ -535,7 +575,12 @@ impl ReviewPullRequestScreen {
         };
         let files = self.files.len();
         self.phase_message = format!(
-            "Reviewing {files} changed file{}{combined}",
+            "{} {files} changed file{}{combined}",
+            if self.is_improve() {
+                "Improving"
+            } else {
+                "Reviewing"
+            },
             if files == 1 { "" } else { "s" },
         );
     }
@@ -941,9 +986,14 @@ impl ReviewPullRequestScreen {
             self.stage = PipelineStage::Verify;
             self.verification_total = candidates.len();
             self.phase_message = format!(
-                "Double-checking {} high-risk finding{} before you review",
+                "Double-checking {} high-risk finding{} before {}",
                 candidates.len(),
                 if candidates.len() == 1 { "" } else { "s" },
+                if self.is_improve() {
+                    "improvement"
+                } else {
+                    "you review"
+                },
             );
         }
         candidates
@@ -1740,9 +1790,14 @@ impl ReviewPullRequestScreen {
             .block(build_detail_lines(&self.request))
             .steps(&REVIEW_STEPS)
             .ai_roles(vec![
-                AiRoleRow::from_config("strong", colors::NAVY, &self.ai.strong, "Read-only"),
+                AiRoleRow::from_config("strong", colors::DARK_NAVY, &self.ai.strong, "Read-only"),
                 AiRoleRow::from_config("balanced", colors::NAVY, &self.ai.balanced, "Read-only"),
-                AiRoleRow::from_config("utility", colors::NAVY, &self.ai.utility, "Read-only"),
+                AiRoleRow::from_config(
+                    "utility",
+                    colors::LIGHT_NAVY,
+                    &self.ai.utility,
+                    "Read-only",
+                ),
             ])
             .modal(self.confirm.as_ref())
             .render(frame, area);
@@ -1831,7 +1886,11 @@ impl ReviewPullRequestScreen {
             .title(Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
-                    "Under review",
+                    if self.is_improve() {
+                        "Improvement scan"
+                    } else {
+                        "Under review"
+                    },
                     Style::default()
                         .fg(colors::NAVY)
                         .add_modifier(Modifier::BOLD),
@@ -1995,7 +2054,11 @@ impl ReviewPullRequestScreen {
         let counts = self.severity_counts();
         let total: usize = counts.iter().sum();
         let mut spans = vec![Span::styled(
-            "Findings  ".to_string(),
+            if self.is_improve() {
+                "Improvements  ".to_string()
+            } else {
+                "Findings  ".to_string()
+            },
             Style::default().fg(colors::EMPHASIS),
         )];
         if total == 0 {

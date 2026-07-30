@@ -44,12 +44,12 @@ pub use dashboard::{
     DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff, DevelopPlanPrompt,
     DevelopPreflight, DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation,
     ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan,
-    FixPreparation, FixVerdict, MergeStatus, PrState, PullRequest, PullRequestDetails,
-    ReviewBenchmarkOutcome, ReviewComment, ReviewContext, ReviewFile, ReviewFinding,
-    ReviewPreparation, ReviewScanAttempt, ReviewScanMode, ReviewSeverity, ReviewSkippedFile,
-    ReviewStatus, ReviewSummaryAttempt, ReviewVerification, ReviewVerificationAttempt,
-    ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdatePullRequestOutcome,
-    AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
+    FixPreparation, FixVerdict, ImprovePreparation, MergeStatus, PrState, PullRequest,
+    PullRequestDetails, ReviewBenchmarkOutcome, ReviewComment, ReviewContext, ReviewFile,
+    ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewScanMode, ReviewSeverity,
+    ReviewSkippedFile, ReviewStatus, ReviewSummaryAttempt, ReviewVerification,
+    ReviewVerificationAttempt, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
+    UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };
 pub use develop::{parse_plan_transcript, summarize_transcript, DevelopPlan, PlanSection};
 pub use opencode_models::{
