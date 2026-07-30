@@ -906,35 +906,12 @@ impl App {
                             self.fix_apply_watch = None;
                         }
                     }
-                    // Same for the Bugkill PTYs. The Investigating TUI never
-                    // exits on its own, so completion comes from the turn
-                    // watcher polling the selected harness; an early PTY exit
-                    // there means the user quit the AI CLI (or it crashed). A
-                    // Fixing exit is likewise not trusted as "done" —
-                    // `on_bugkill_fix_pty_exited` re-checks the database so an
-                    // interrupted / early-quit AI CLI can't commit a
-                    // half-applied fix.
-                    let bugkill_exited = self
+                    let bugkill_tick = self
                         .bugkill_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(None), screen.step()));
-                    match bugkill_exited {
-                        Some((Some(_), screens::bugkill_pr::BugkillStep::Investigating)) => {
-                            self.on_bugkill_investigation_pty_exited(&tx)
-                        }
-                        Some((Some(_), screens::bugkill_pr::BugkillStep::Fixing)) => {
-                            self.on_bugkill_fix_pty_exited(&tx)
-                        }
-                        Some((None, screens::bugkill_pr::BugkillStep::Investigating)) => {
-                            if let Some(turn) = self
-                                .bugkill_investigation
-                                .as_mut()
-                                .and_then(AiTurnWatcher::poll)
-                            {
-                                self.on_bugkill_turn(turn, &tx);
-                            }
-                        }
-                        _ => {}
+                    if let Some((exited, step)) = bugkill_tick {
+                        self.on_bugkill_tick(exited, step, &tx);
                     }
                     // Same for the Develop TUIs. Both live steps are watched
                     // through opencode's database: a completed Planning turn
@@ -3736,6 +3713,41 @@ impl App {
             },
             tx.clone(),
         );
+    }
+
+    /// One tick of the Bugkill PTYs. Neither the Investigating nor the Fixing
+    /// TUI exits on its own, so for both live steps the turn watcher polling
+    /// the selected harness is the primary completion signal — without it the
+    /// user has to finalize every finished turn by hand (Enter → Yes). An
+    /// early PTY exit means the user quit the AI CLI (or it crashed) and is
+    /// never trusted as "done": both exit handlers re-check the harness state
+    /// first, so an interrupted session can't commit a half-applied fix.
+    fn on_bugkill_tick(
+        &mut self,
+        exited: Option<i32>,
+        step: screens::bugkill_pr::BugkillStep,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        use screens::bugkill_pr::BugkillStep;
+        match (exited, step) {
+            (Some(_), BugkillStep::Investigating) => self.on_bugkill_investigation_pty_exited(tx),
+            (Some(_), BugkillStep::Fixing) => self.on_bugkill_fix_pty_exited(tx),
+            (None, BugkillStep::Investigating) => {
+                if let Some(turn) = self
+                    .bugkill_investigation
+                    .as_mut()
+                    .and_then(AiTurnWatcher::poll)
+                {
+                    self.on_bugkill_turn(turn, tx);
+                }
+            }
+            (None, BugkillStep::Fixing) => {
+                if let Some(turn) = self.bugkill_fixing.as_mut().and_then(AiTurnWatcher::poll) {
+                    self.on_bugkill_fix_turn(turn, tx);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// opencode finished (exited or the user confirmed): scan the worktree
@@ -12773,6 +12785,84 @@ mod tests {
         );
         // No commit/scan work was kicked off (that path emits AppEvents).
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn bugkill_fixing_tick_finishes_the_attempt_without_a_manual_confirm() {
+        // The Fixing TUI never exits on its own, so a finished turn on disk
+        // has to be picked up by the tick poll. Without it the only way out is
+        // the manual finalize modal (Enter → Yes), which leaves the user
+        // staring at an AI CLI that is visibly done. A turn that is still
+        // Working (tool call in flight, or the user pressed Esc to send an
+        // extra prompt) must keep the attempt open.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("repo-save");
+        std::fs::create_dir(&worktree).expect("worktree dir");
+        let session = tmp.path().join("claude/project/session.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).expect("session dir");
+        std::fs::write(
+            &session,
+            format!(
+                "{{\"type\":\"user\",\"promptId\":\"p\",\"cwd\":\"{}\"}}\n\
+                 {{\"type\":\"assistant\",\"message\":{{\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"text\",\"text\":\"editing\"}}]}}}}",
+                worktree.display()
+            ),
+        )
+        .expect("write session");
+
+        let mut app = initialized_menu_app();
+        app.screen = Screen::BugkillPullRequest;
+        app.bugkill_pr = Some(BugkillPullRequestScreen::new(
+            BugkillRequest {
+                branch: "fix/save-crash".into(),
+                worktree_path: worktree.display().to_string(),
+                number: None,
+                title: None,
+            },
+            crate::config::schema::AiBugkillConfig::default(),
+        ));
+        app.bugkill_pr.as_mut().unwrap().start_fixing();
+        app.bugkill_fixing = Some(AiTurnWatcher::with_paths(
+            AiHarness::ClaudeCode,
+            &worktree,
+            crate::services::AiStatusPaths {
+                claude_projects: Some(tmp.path().join("claude")),
+                ..Default::default()
+            },
+            std::time::SystemTime::now() - Duration::from_secs(1),
+        ));
+
+        // PTY still alive (`None`), turn still Working → nothing happens.
+        app.on_bugkill_tick(None, screens::bugkill_pr::BugkillStep::Fixing, &tx);
+        assert!(
+            app.bugkill_fixing.is_some(),
+            "an unfinished turn must keep the Fixing attempt open"
+        );
+
+        std::fs::write(
+            &session,
+            format!(
+                "{}\n{{\"type\":\"assistant\",\"message\":{{\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"fix applied\"}}]}}}}",
+                std::fs::read_to_string(&session).unwrap()
+            ),
+        )
+        .expect("append session");
+        // `poll` is rate-limited to one check per second; the tick loop runs
+        // far faster, so wait out the period the same way the real loop does.
+        std::thread::sleep(Duration::from_millis(1100));
+
+        app.on_bugkill_tick(None, screens::bugkill_pr::BugkillStep::Fixing, &tx);
+
+        assert!(
+            app.bugkill_fixing.is_none(),
+            "a finished turn must complete the attempt from the tick, with no Enter → Yes"
+        );
+        assert_eq!(
+            app.bugkill_pr.as_ref().unwrap().error(),
+            None,
+            "a finished turn is not an early exit"
+        );
     }
 
     #[test]
