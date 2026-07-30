@@ -8,6 +8,8 @@ You are planning ONE development task in the current working directory for an au
 TASK_DESCRIPTION
 ```
 
+Any image attachments are supplied separately by the CLI. Inspect them when they are relevant to the task or feedback; do not expect image bytes or paths in the text above.
+
 - The branch's base ref, for context only (may be `(none resolved)`): `BASE_REF`
 
 - The current plan being revised, in the same block format you must emit (empty on a first run):

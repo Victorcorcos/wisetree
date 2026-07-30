@@ -194,6 +194,7 @@ pub struct DevelopPullRequestScreen {
     input_generation: u64,
     describe_warning: bool,
     task_description: String,
+    task_attachments: Vec<ImageAttachment>,
     // ── preflight results ──────────────────────────────────────────────
     base_ref: Option<String>,
     resume_variant: Option<ResumeVariant>,
@@ -203,7 +204,7 @@ pub struct DevelopPullRequestScreen {
     plan: Option<DevelopPlan>,
     /// Set while a revision is pending: the rejected plan's contract block
     /// + the user's feedback, replayed verbatim on a corrective retry.
-    revision: Option<(String, String)>,
+    revision: Option<(String, String, Vec<ImageAttachment>)>,
     // ── plan review ────────────────────────────────────────────────────
     review_focus: usize,
     review_scroll: u16,
@@ -253,6 +254,7 @@ impl DevelopPullRequestScreen {
             input_generation: 0,
             describe_warning: false,
             task_description: String::new(),
+            task_attachments: Vec::new(),
             base_ref: None,
             resume_variant: None,
             resume_focus: 0,
@@ -341,7 +343,18 @@ impl DevelopPullRequestScreen {
     }
     /// The pending revision context (previous plan contract + feedback),
     /// replayed on the corrective retry of a revision run.
-    pub fn revision(&self) -> Option<(String, String)> {
+    pub fn attachments_for_run(&self) -> Vec<ImageAttachment> {
+        let mut attachments = self.task_attachments.clone();
+        if let Some((_, _, revision_attachments)) = &self.revision {
+            for attachment in revision_attachments {
+                if !attachments.iter().any(|item| item.id == attachment.id) {
+                    attachments.push(attachment.clone());
+                }
+            }
+        }
+        attachments
+    }
+    pub fn revision(&self) -> Option<(String, String, Vec<ImageAttachment>)> {
         self.revision.clone()
     }
     pub fn plan_corrective(&self) -> bool {
@@ -467,6 +480,7 @@ impl DevelopPullRequestScreen {
     pub fn apply_resume(&mut self) {
         if let Some(plan) = self.stashed_resume.take() {
             self.task_description = plan.task_description.clone();
+            self.task_attachments = plan.attachments.clone();
             self.plan = Some(plan);
         }
     }
@@ -474,6 +488,18 @@ impl DevelopPullRequestScreen {
     /// A parsed plan arrived from the planning run: adopt it and clear the
     /// pending revision context.
     pub fn set_plan(&mut self, plan: DevelopPlan) {
+        let mut plan = plan;
+        let revision_attachments = self
+            .revision
+            .as_ref()
+            .map(|(_, _, attachments)| attachments.as_slice())
+            .unwrap_or_default();
+        for attachment in self.task_attachments.iter().chain(revision_attachments) {
+            if !plan.attachments.iter().any(|item| item.id == attachment.id) {
+                plan.attachments.push(attachment.clone());
+            }
+        }
+        self.task_attachments = plan.attachments.clone();
         self.plan = Some(plan);
         self.revision = None;
     }
@@ -874,13 +900,20 @@ impl DevelopPullRequestScreen {
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
                 // Validation is pure code: nothing reaches the AI empty.
-                if text.trim().is_empty() {
+                let attachments = input.attachments().to_vec();
+                let description = text.replace('\u{fffc}', "").trim().to_string();
+                if description.is_empty() && attachments.is_empty() {
                     self.describe_warning = true;
                     return DevelopAction::Continue;
                 }
                 self.describe_warning = false;
+                self.task_attachments = attachments;
                 self.input = None;
-                DevelopAction::TaskSubmitted(text.trim().to_string())
+                DevelopAction::TaskSubmitted(if description.is_empty() {
+                    "See the attached image.".to_string()
+                } else {
+                    description
+                })
             }
             InputOutcome::Cancelled => DevelopAction::Cancelled,
             InputOutcome::Pending => {
@@ -1006,10 +1039,16 @@ impl DevelopPullRequestScreen {
         }
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
-                let trimmed = text.trim().to_string();
-                if trimmed.is_empty() {
+                let trimmed = text.replace('\u{fffc}', "").trim().to_string();
+                let attachments = input.attachments().to_vec();
+                if trimmed.is_empty() && attachments.is_empty() {
                     return DevelopAction::Continue;
                 }
+                let feedback = if trimmed.is_empty() {
+                    "See the attached image.".to_string()
+                } else {
+                    trimmed
+                };
                 self.input = None;
                 // Stash the rejected plan + feedback so a corrective retry
                 // replays the identical revision context.
@@ -1018,8 +1057,8 @@ impl DevelopPullRequestScreen {
                     .as_ref()
                     .map(crate::services::develop::render_plan_contract)
                     .unwrap_or_default();
-                self.revision = Some((contract, trimmed.clone()));
-                DevelopAction::PlanRejected(trimmed)
+                self.revision = Some((contract, feedback.clone(), attachments));
+                DevelopAction::PlanRejected(feedback)
             }
             // Esc goes back to the question, not to the dashboard.
             InputOutcome::Cancelled => {
@@ -2424,6 +2463,7 @@ mod tests {
     fn plan() -> DevelopPlan {
         DevelopPlan {
             task_description: "Add CSV export".to_string(),
+            attachments: Vec::new(),
             complexity: 5,
             overview: None,
             sections: vec![section(1, "Data model"), section(2, "CLI flag")],
@@ -2761,6 +2801,7 @@ mod tests {
         s.set_task_description("Add CSV export".to_string());
         s.set_plan(DevelopPlan {
             task_description: "Add CSV export".to_string(),
+            attachments: Vec::new(),
             complexity: 8,
             overview: None,
             sections,
@@ -2840,9 +2881,10 @@ mod tests {
             other => panic!("expected PlanRejected, got {other:?}"),
         }
         // The rejected plan + feedback are stashed for the revision run.
-        let (contract, feedback) = s.revision().expect("revision stashed");
+        let (contract, feedback, attachments) = s.revision().expect("revision stashed");
         assert!(contract.contains("==== SECTION ===="));
         assert_eq!(feedback, "split section 2");
+        assert!(attachments.is_empty());
         // A revised plan arriving re-enters review — the loop repeats.
         s.set_plan(plan());
         s.enter_plan_review();

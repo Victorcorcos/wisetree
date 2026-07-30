@@ -4508,7 +4508,7 @@ impl App {
         let Some(operation_id) = self.active_develop_operation_id else {
             return;
         };
-        let (worktree_path, description, base_ref, revision) = {
+        let (worktree_path, description, base_ref, revision, attachments) = {
             let Some(screen) = self.develop_pr.as_mut() else {
                 return;
             };
@@ -4517,6 +4517,7 @@ impl App {
                 screen.task_description().to_string(),
                 screen.base_ref().map(str::to_string),
                 screen.revision(),
+                screen.attachments_for_run(),
             )
         };
         let generation = self.next_develop_generation();
@@ -4532,6 +4533,7 @@ impl App {
                 task_description: description,
                 base_ref,
                 revision,
+                attachments,
                 corrective,
             },
             operation_id,
@@ -4549,7 +4551,16 @@ impl App {
         let Some(operation_id) = self.active_develop_operation_id else {
             return;
         };
-        let (_next, section, sections_block, outline, check_failure, worktree_path, description) = {
+        let (
+            _next,
+            section,
+            sections_block,
+            outline,
+            check_failure,
+            worktree_path,
+            description,
+            attachments,
+        ) = {
             let Some(screen) = self.develop_pr.as_mut() else {
                 return;
             };
@@ -4566,6 +4577,7 @@ impl App {
                 screen.check_failure(),
                 screen.request().worktree_path.clone(),
                 screen.task_description().to_string(),
+                screen.attachments_for_run(),
             )
         };
         let generation = self.next_develop_generation();
@@ -4583,6 +4595,7 @@ impl App {
                 outline,
                 section,
                 check_failure,
+                attachments,
             },
             operation_id,
             generation,
@@ -10126,7 +10139,8 @@ struct DevelopPreparePlanRequest {
     worktree_path: String,
     task_description: String,
     base_ref: Option<String>,
-    revision: Option<(String, String)>,
+    revision: Option<(String, String, Vec<ImageAttachment>)>,
+    attachments: Vec<ImageAttachment>,
     corrective: bool,
 }
 
@@ -10184,7 +10198,7 @@ fn kick_off_develop_prepare_plan(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let (previous_plan, feedback) = match &req.revision {
-            Some((plan, feedback)) => (Some(plan.as_str()), Some(feedback.as_str())),
+            Some((plan, feedback, _)) => (Some(plan.as_str()), Some(feedback.as_str())),
             None => (None, None),
         };
         let result = service
@@ -10194,6 +10208,7 @@ fn kick_off_develop_prepare_plan(
                 req.base_ref.as_deref(),
                 previous_plan,
                 feedback,
+                &req.attachments,
                 corrective,
             )
             .map(Box::new)
@@ -10217,6 +10232,7 @@ struct DevelopPrepareImplementRequest {
     outline: String,
     section: Option<usize>,
     check_failure: Option<String>,
+    attachments: Vec<ImageAttachment>,
 }
 
 fn kick_off_develop_prepare_implement(
@@ -10253,6 +10269,7 @@ fn kick_off_develop_prepare_implement(
                 &req.sections,
                 &req.outline,
                 req.check_failure.as_deref(),
+                &req.attachments,
             )
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
@@ -11781,6 +11798,7 @@ mod tests {
     fn develop_plan() -> DevelopPlan {
         DevelopPlan {
             task_description: "Add CSV export".to_string(),
+            attachments: Vec::new(),
             complexity: 5,
             overview: None,
             sections: vec![
@@ -14047,6 +14065,7 @@ mod tests {
     fn single_section_plan() -> DevelopPlan {
         DevelopPlan {
             task_description: "Add CSV export".to_string(),
+            attachments: Vec::new(),
             complexity: 3,
             overview: None,
             sections: vec![PlanSection {
@@ -14724,6 +14743,7 @@ mod tests {
                 task_description: "add csv export".into(),
                 base_ref: None,
                 revision: None,
+                attachments: Vec::new(),
                 corrective: false,
             },
             1,
@@ -14739,6 +14759,7 @@ mod tests {
                 outline: "outline".into(),
                 section: None,
                 check_failure: None,
+                attachments: Vec::new(),
             },
             1,
         )

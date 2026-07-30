@@ -10,6 +10,8 @@
 //! mutation, and the implement AI receives only the section(s) it must build
 //! — progress tracking (checkboxes, the tracker table) is done in Rust.
 
+use crate::tui::image_upload::ImageAttachment;
+
 /// The rendered plan file — harness-owned output at the worktree root.
 pub const PLAN_FILE: &str = "PLAN.md";
 
@@ -37,6 +39,9 @@ pub struct PlanSection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevelopPlan {
     pub task_description: String,
+    /// Durable image references supplied with the task or plan feedback.
+    /// They are rendered into PLAN.md so Resume retains multimodal context.
+    pub attachments: Vec<ImageAttachment>,
     /// Fibonacci-style complexity estimate in points.
     pub complexity: u8,
     /// A Mermaid `mindmap` body (raw, unfenced) surveying the whole task,
@@ -165,6 +170,7 @@ pub fn parse_plan_transcript(transcript: &str) -> Option<DevelopPlan> {
     }
     Some(DevelopPlan {
         task_description,
+        attachments: Vec::new(),
         complexity,
         overview,
         sections,
@@ -275,6 +281,8 @@ const OVERVIEW_HEADING: &str = "## Overview";
 const SECTIONS_HEADING: &str = "## Implementation Sections";
 const TRACKER_HEADING: &str = "## Progress Tracker";
 const NOTES_HEADING: &str = "## Section Notes";
+const ATTACHMENTS_HEADING: &str = "## Image Attachments";
+const ATTACHMENTS_PREFIX: &str = "<!-- wisetree:image-attachments:";
 const DONE_SUFFIX: &str = " ✅";
 const ESCAPED_DONE_SUFFIX: &str = " ✅<!-- wisetree:section-name -->";
 
@@ -328,6 +336,13 @@ pub fn render_plan_md(plan: &DevelopPlan) -> String {
         for note in &plan.notes {
             out.push_str(&format!("- {note}\n"));
         }
+    }
+    if !plan.attachments.is_empty() {
+        let encoded = serde_json::to_string(&plan.attachments)
+            .expect("ImageAttachment serialization cannot fail");
+        out.push_str(&format!(
+            "\n{ATTACHMENTS_HEADING}\n\n{ATTACHMENTS_PREFIX}{encoded} -->\n"
+        ));
     }
     out
 }
@@ -424,8 +439,15 @@ pub fn parse_plan_md(content: &str) -> Option<DevelopPlan> {
         }
     }
 
+    let attachments = lines
+        .iter()
+        .find_map(|line| line.trim().strip_prefix(ATTACHMENTS_PREFIX))
+        .map(|encoded| serde_json::from_str(encoded.trim_end_matches(" -->")).ok())
+        .unwrap_or(Some(Vec::new()))?;
+
     Some(DevelopPlan {
         task_description,
+        attachments,
         complexity,
         overview,
         sections,
@@ -664,6 +686,7 @@ mod tests {
     fn plan() -> DevelopPlan {
         DevelopPlan {
             task_description: "Add CSV export.\nWith a --csv flag.".to_string(),
+            attachments: Vec::new(),
             complexity: 5,
             overview: None,
             sections: vec![
@@ -890,6 +913,20 @@ CRITERIA: - c";
         let rendered = render_plan_md(&plan);
         let parsed = parse_plan_md(&rendered).expect("round-trip parses");
         assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn render_then_parse_preserves_image_attachments() {
+        let mut plan = plan();
+        plan.attachments.push(ImageAttachment {
+            id: "abc".to_string(),
+            filename: "abc.png".to_string(),
+            mime_type: "image/png".to_string(),
+            path: std::path::PathBuf::from("/durable/uploads/abc.png"),
+        });
+        let rendered = render_plan_md(&plan);
+        assert!(rendered.contains("wisetree:image-attachments"));
+        assert_eq!(parse_plan_md(&rendered), Some(plan));
     }
 
     #[test]

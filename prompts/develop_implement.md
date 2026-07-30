@@ -8,6 +8,8 @@ You are implementing part of an approved development plan in the current working
 TASK_DESCRIPTION
 ```
 
+Any image attachments are supplied separately by the CLI. Inspect them when they are relevant to this task or the sections below; do not expect image bytes or paths in the text above.
+
 - The plan outline — one line per section so you know where your work sits. `done` = already implemented (its code is in the worktree), `THIS RUN` = yours now, `later` = owned by a future run:
 
 ```

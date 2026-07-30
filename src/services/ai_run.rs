@@ -43,6 +43,8 @@ pub struct AiRunRequest {
     /// Optional OpenCode session title used to correlate its own token
     /// telemetry. Other harnesses must report usage themselves.
     pub session_title: Option<String>,
+    /// Image files passed as native CLI attachments, never prompt text.
+    pub attachments: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,7 +219,14 @@ impl AiRunner {
                 args
             }
         };
-        // Keep the prompt as the sole payload argument. The individual CLI
+        for attachment in &request.attachments {
+            let path = attachment.to_string_lossy().to_string();
+            match harness {
+                AiHarness::OpenCode => args.extend(["--file".into(), path]),
+                AiHarness::Codex | AiHarness::ClaudeCode => args.extend(["--image".into(), path]),
+            }
+        }
+        // Keep the prompt as the sole textual payload argument. The individual CLI
         // syntaxes above intentionally place it directly after their prompt flag.
         debug_assert!(args.iter().any(|arg| arg == &request.prompt));
         Ok(AiCommand {
@@ -585,6 +594,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             activity_limit: 2,
             session_title: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -602,6 +612,26 @@ mod tests {
                     .count(),
                 1
             );
+        }
+    }
+
+    #[test]
+    fn image_attachments_are_native_arguments_not_prompt_bytes() {
+        for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
+            let runner = AiRunner::default().with_binary(harness, PathBuf::from("true"));
+            let mut req = request(harness, AiRunMode::Interactive);
+            req.attachments = vec![PathBuf::from("/tmp/screenshot.png")];
+            let command = runner.command(&req).unwrap();
+            let flag = if harness == AiHarness::OpenCode {
+                "--file"
+            } else {
+                "--image"
+            };
+            assert!(command
+                .args
+                .windows(2)
+                .any(|args| args == [flag, "/tmp/screenshot.png"]));
+            assert!(!req.prompt.contains("screenshot.png"));
         }
     }
 
