@@ -24,7 +24,43 @@ Development: symlink the binary and rebuild to test changes without reinstalling
 ln -sf "$PWD/target/release/wisetree" /opt/homebrew/bin/wisetree
 ```
 
-Git hooks in `githooks/` auto-run `cargo fmt`, `cargo clippy --fix`, and tests on push. Enable once with `git config core.hooksPath githooks`.
+## CI Gates (MANDATORY — this repo has no git hooks)
+
+There are **no `pre-commit` / `pre-push` hooks**: nothing runs automatically on commit or push.
+CI is therefore the first thing that ever checks the code, and a red CI blocks the PR.
+**You are responsible for producing code that already passes every gate below.**
+
+CI (`.github/workflows/ci.yml`, on Ubuntu **and** macOS, with `RUSTFLAGS: -D warnings`) runs, in order:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --all-targets
+cargo test --all-features
+# reviewer benchmark deterministic gates
+cargo run --quiet --bin reviewer_corpus -- check benchmarks/reviewer/corpus.public.json
+cargo run --quiet --bin reviewer_benchmark -- benchmarks/reviewer/corpus.json benchmarks/reviewer/captured/pipeline.fixture.json benchmarks/reviewer/captured/skill.fixture.json
+cargo run --quiet --bin reviewer_superiority -- check-status benchmarks/reviewer/superiority-status.json
+```
+
+### What this means when you write code
+
+- **Formatting is not optional.** Run `cargo fmt --all` before you call a change done. Never hand-format; let rustfmt decide.
+- **Zero warnings.** `-D warnings` covers both rustc warnings and clippy lints. Unused imports, unused variables, dead code, needless clones, `redundant_closure`, etc. all fail CI exactly like a compile error. Do not silence them with blanket `#[allow(...)]` — fix the cause; a targeted `#[allow]` needs a comment justifying it.
+- **All targets, all features.** Tests, benches, examples and the extra `reviewer_*` binaries are compiled too. A warning that only appears in a `#[cfg(test)]` module still fails CI.
+- **Tests must pass and must be real.** The suite drives actual git repos in tempdirs — no mocks. New behavior needs a test; changed behavior needs its test updated.
+- **Benchmark fixtures are checked in.** If you touch the reviewer pipeline/skill, regenerate and commit the fixtures under `benchmarks/reviewer/` so the deterministic gates still pass.
+- **Both OSes.** Avoid macOS-only or Linux-only assumptions (path separators, `/opt/homebrew`, GNU-vs-BSD CLI flags, case-sensitive filesystems).
+
+### Before finishing a task, run
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```
+
+Fix everything they report before reporting the work done. If you cannot run them, say so explicitly instead of implying they passed.
 
 ## Architecture
 
