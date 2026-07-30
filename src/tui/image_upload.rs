@@ -1,0 +1,406 @@
+//! Validation and durable storage for images attached to TUI text inputs.
+//!
+//! Screens retain [`ImageAttachment`] values with their draft state. The
+//! bytes themselves are content-addressed and stored outside a worktree, so a
+//! resumed flow can continue to pass the path to an AI harness without placing
+//! binary data in a prompt or leaving untracked files behind.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::constants::image_uploads_dir;
+
+/// A durable reference to an image uploaded from a clipboard or dropped file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAttachment {
+    /// BLAKE3 digest of the original image bytes.
+    pub id: String,
+    /// Content-addressed filename, suitable for displaying or passing to a CLI.
+    pub filename: String,
+    pub mime_type: String,
+    pub path: PathBuf,
+}
+
+/// Image data returned by a platform clipboard reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardImage {
+    pub bytes: Vec<u8>,
+}
+
+/// The result relevant to prompt attachment handling from a clipboard reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardRead {
+    Empty,
+    Image(ClipboardImage),
+}
+
+#[derive(Debug, Error)]
+pub enum ImageUploadError {
+    #[error("No image was found in the clipboard.")]
+    EmptyClipboard,
+    #[error("No image path was provided.")]
+    EmptyPath,
+    #[error("The dropped item is not a file: {}", .0.display())]
+    NotAFile(PathBuf),
+    #[error("Could not read image {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("This image format is not supported. Use PNG, JPEG, GIF, WebP, BMP, ICO, or TIFF.")]
+    UnsupportedFormat,
+    #[error("The image is corrupt or cannot be decoded.")]
+    CorruptImage,
+    #[error("Could not store the image: {0}")]
+    Storage(#[source] std::io::Error),
+    #[error("Invalid file URI: {0}")]
+    InvalidFileUri(String),
+}
+
+/// Content-addressed image storage. A custom root is useful for tests and
+/// keeps this component independent from any one TUI screen.
+#[derive(Debug, Clone)]
+pub struct ImageStorage {
+    root: PathBuf,
+}
+
+impl Default for ImageStorage {
+    fn default() -> Self {
+        Self::new(image_uploads_dir())
+    }
+}
+
+impl ImageStorage {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Store clipboard bytes after confirming they are a supported, decodable image.
+    pub fn ingest_clipboard(
+        &self,
+        clipboard: ClipboardRead,
+    ) -> Result<ImageAttachment, ImageUploadError> {
+        match clipboard {
+            ClipboardRead::Empty => Err(ImageUploadError::EmptyClipboard),
+            ClipboardRead::Image(image) => self.ingest_bytes(&image.bytes),
+        }
+    }
+
+    /// Copy a dropped local image into durable Wisetree-owned storage.
+    pub fn ingest_file(&self, path: impl AsRef<Path>) -> Result<ImageAttachment, ImageUploadError> {
+        let path = path.as_ref();
+        let metadata = fs::metadata(path).map_err(|source| ImageUploadError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(ImageUploadError::NotAFile(path.to_path_buf()));
+        }
+        let bytes = fs::read(path).map_err(|source| ImageUploadError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        self.ingest_bytes(&bytes)
+    }
+
+    /// Process every dropped path independently; callers can show failures
+    /// while retaining valid attachments from the same terminal paste/drop.
+    pub fn ingest_dropped_paths(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Vec<Result<ImageAttachment, ImageUploadError>> {
+        paths
+            .into_iter()
+            .map(|path| self.ingest_file(path))
+            .collect()
+    }
+
+    pub fn ingest_bytes(&self, bytes: &[u8]) -> Result<ImageAttachment, ImageUploadError> {
+        let (extension, mime_type) = identify_image(bytes)?;
+        let id = blake3::hash(bytes).to_hex().to_string();
+        let filename = format!("{id}.{extension}");
+        let path = self.root.join(&filename);
+
+        fs::create_dir_all(&self.root).map_err(ImageUploadError::Storage)?;
+        if !path.exists() {
+            let temporary = self
+                .root
+                .join(format!(".{filename}.tmp-{}", std::process::id()));
+            fs::write(&temporary, bytes).map_err(ImageUploadError::Storage)?;
+            if let Err(error) = fs::rename(&temporary, &path) {
+                let _ = fs::remove_file(&temporary);
+                return Err(ImageUploadError::Storage(error));
+            }
+        }
+
+        // Ensure an existing content-addressed file still is a usable reference.
+        fs::File::open(&path).map_err(ImageUploadError::Storage)?;
+        Ok(ImageAttachment {
+            id,
+            filename,
+            mime_type: mime_type.to_string(),
+            path,
+        })
+    }
+}
+
+fn identify_image(bytes: &[u8]) -> Result<(&'static str, &'static str), ImageUploadError> {
+    // Structural checks reject truncated/corrupt clipboard blobs without a
+    // heavyweight decoder dependency in the TUI input path.
+    let detected = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        valid_png(bytes).then_some(("png", "image/png"))
+    } else if bytes.starts_with(b"\xff\xd8") {
+        (bytes.len() >= 4 && bytes.ends_with(b"\xff\xd9")).then_some(("jpg", "image/jpeg"))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        (bytes.len() >= 14 && bytes.last() == Some(&0x3b)).then_some(("gif", "image/gif"))
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        (bytes.len() >= 12
+            && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8 == bytes.len())
+        .then_some(("webp", "image/webp"))
+    } else if bytes.starts_with(b"BM") {
+        (bytes.len() >= 26
+            && u32::from_le_bytes(bytes[2..6].try_into().unwrap()) as usize <= bytes.len()
+            && u32::from_le_bytes(bytes[14..18].try_into().unwrap()) >= 12)
+            .then_some(("bmp", "image/bmp"))
+    } else if bytes.starts_with(&[0, 0, 1, 0]) {
+        (bytes.len() >= 22).then_some(("ico", "image/x-icon"))
+    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        valid_tiff(bytes).then_some(("tiff", "image/tiff"))
+    } else {
+        return Err(ImageUploadError::UnsupportedFormat);
+    };
+    detected.ok_or(ImageUploadError::CorruptImage)
+}
+
+fn valid_png(bytes: &[u8]) -> bool {
+    let mut offset = 8;
+    let mut first = true;
+    while offset + 12 <= bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind = &bytes[offset + 4..offset + 8];
+        if first && (kind != b"IHDR" || length != 13) {
+            return false;
+        }
+        let Some(next) = offset.checked_add(12 + length) else {
+            return false;
+        };
+        if next > bytes.len() {
+            return false;
+        }
+        if kind == b"IEND" {
+            return length == 0 && next == bytes.len();
+        }
+        first = false;
+        offset = next;
+    }
+    false
+}
+
+fn valid_tiff(bytes: &[u8]) -> bool {
+    bytes.len() >= 8
+        && match &bytes[..2] {
+            b"II" => (u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize) < bytes.len(),
+            b"MM" => (u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize) < bytes.len(),
+            _ => false,
+        }
+}
+
+/// Parse a terminal-provided file list. It accepts newline-separated paths,
+/// shell quotes/backslash escaping, and percent-encoded `file://` URIs.
+pub fn parse_dropped_paths(value: &str) -> Result<Vec<PathBuf>, ImageUploadError> {
+    let mut paths = Vec::new();
+    for line in value.lines().filter(|line| !line.trim().is_empty()) {
+        for token in shell_tokens(line)? {
+            paths.push(file_uri_to_path(&token)?);
+        }
+    }
+    if paths.is_empty() {
+        Err(ImageUploadError::EmptyPath)
+    } else {
+        Ok(paths)
+    }
+}
+
+fn shell_tokens(input: &str) -> Result<Vec<String>, ImageUploadError> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            token.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                token.push(ch);
+            }
+        } else if ch.is_whitespace() && quote.is_none() {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(ch);
+        }
+    }
+    if escaped {
+        token.push('\\');
+    }
+    if quote.is_some() {
+        return Err(ImageUploadError::InvalidFileUri(
+            "unterminated quoted path".to_string(),
+        ));
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+fn file_uri_to_path(value: &str) -> Result<PathBuf, ImageUploadError> {
+    let Some(rest) = value.strip_prefix("file://") else {
+        return Ok(PathBuf::from(value));
+    };
+    let path = if let Some(path) = rest.strip_prefix('/') {
+        format!("/{path}")
+    } else if let Some(path) = rest.strip_prefix("localhost/") {
+        format!("/{path}")
+    } else {
+        return Err(ImageUploadError::InvalidFileUri(value.to_string()));
+    };
+    Ok(PathBuf::from(percent_decode(&path).ok_or_else(|| {
+        ImageUploadError::InvalidFileUri(value.to_string())
+    })?))
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let mut output = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let high = (*bytes.get(i + 1)? as char).to_digit(16)?;
+            let low = (*bytes.get(i + 2)? as char).to_digit(16)?;
+            output.push((high * 16 + low) as u8);
+            i += 3;
+        } else {
+            output.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // A valid 1×1 PNG.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\rIDATx\x9cc\xf8\xcf\xc0\xf0\x1f\0\x05\0\x01\xff\x89\x99=\x1d\0\0\0\0IEND\xaeB`\x82";
+
+    #[test]
+    fn clipboard_results_are_validated_and_stored_once() {
+        let storage = ImageStorage::new(tempdir().unwrap().path().join("uploads"));
+        assert!(matches!(
+            storage.ingest_clipboard(ClipboardRead::Empty),
+            Err(ImageUploadError::EmptyClipboard)
+        ));
+        let first = storage
+            .ingest_clipboard(ClipboardRead::Image(ClipboardImage {
+                bytes: PNG.to_vec(),
+            }))
+            .unwrap();
+        let second = storage.ingest_bytes(PNG).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.mime_type, "image/png");
+        assert!(first.path.is_file());
+        assert_eq!(fs::read_dir(storage.root()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn parses_quoted_escaped_and_file_uri_paths() {
+        assert_eq!(
+            parse_dropped_paths("'/tmp/a b.png' /tmp/c\\ d.png\nfile:///tmp/e%20f.png").unwrap(),
+            vec![
+                PathBuf::from("/tmp/a b.png"),
+                PathBuf::from("/tmp/c d.png"),
+                PathBuf::from("/tmp/e f.png")
+            ]
+        );
+        assert!(matches!(
+            parse_dropped_paths("file://example.com/a.png"),
+            Err(ImageUploadError::InvalidFileUri(_))
+        ));
+    }
+
+    #[test]
+    fn bad_drop_does_not_discard_good_ones() {
+        let dir = tempdir().unwrap();
+        let good = dir.path().join("good.png");
+        fs::write(&good, PNG).unwrap();
+        let results = ImageStorage::new(dir.path().join("uploads"))
+            .ingest_dropped_paths(vec![good, dir.path().to_path_buf()]);
+        assert!(results[0].is_ok());
+        assert!(matches!(results[1], Err(ImageUploadError::NotAFile(_))));
+    }
+
+    #[test]
+    fn corrupt_and_unwritable_storage_fail() {
+        let dir = tempdir().unwrap();
+        let storage = ImageStorage::new(dir.path().join("uploads"));
+        assert!(matches!(
+            storage.ingest_bytes(b"\x89PNG\r\n\x1a\nnot an image"),
+            Err(ImageUploadError::CorruptImage)
+        ));
+        let root_file = dir.path().join("not-a-directory");
+        fs::write(&root_file, "x").unwrap();
+        assert!(matches!(
+            ImageStorage::new(root_file).ingest_bytes(PNG),
+            Err(ImageUploadError::Storage(_))
+        ));
+    }
+
+    #[test]
+    fn recognizes_the_explicit_supported_formats() {
+        let formats: &[(&[u8], &str)] = &[
+            (PNG, "image/png"),
+            (b"\xff\xd8\xff\xd9", "image/jpeg"),
+            (b"GIF89a\0\0\0\0\0\0\0;", "image/gif"),
+            (b"RIFF\x04\0\0\0WEBP", "image/webp"),
+            (
+                b"BM\x1a\0\0\0\0\0\0\0\0\0\0\0\x0c\0\0\0\0\0\0\0\0\0\0\0",
+                "image/bmp",
+            ),
+            (
+                &[
+                    0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 32, 0, 0, 0, 0, 0, 22, 0, 0, 0,
+                ],
+                "image/x-icon",
+            ),
+            (b"II*\0\x08\0\0\0\0", "image/tiff"),
+        ];
+        for (bytes, mime_type) in formats {
+            assert_eq!(identify_image(bytes).unwrap().1, *mime_type);
+        }
+    }
+}

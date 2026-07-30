@@ -17,6 +17,11 @@ pub const APP_STATE_FILE_NAME: &str = "state.json";
 /// Subdirectory under `~/.wisetree/` that stores per-repository shared caches.
 pub const CACHE_DIR_NAME: &str = "cache";
 
+/// Subdirectory under the global cache used for images attached to prompts.
+/// It deliberately lives outside worktrees so uploads never become untracked
+/// project files.
+pub const IMAGE_UPLOADS_DIR_NAME: &str = "uploads";
+
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 
@@ -72,6 +77,11 @@ pub fn app_state_file() -> PathBuf {
 /// Path to the cache root (`~/.wisetree/cache/`).
 pub fn global_cache_dir() -> PathBuf {
     global_config_dir().join(CACHE_DIR_NAME)
+}
+
+/// Path to Wisetree-owned prompt image storage (`~/.wisetree/cache/uploads/`).
+pub fn image_uploads_dir() -> PathBuf {
+    global_cache_dir().join(IMAGE_UPLOADS_DIR_NAME)
 }
 
 /// Path to the dashboard PR cache (`~/.wisetree/dashboard_pr_cache.json`).
