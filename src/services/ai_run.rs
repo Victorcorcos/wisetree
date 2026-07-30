@@ -43,6 +43,9 @@ pub struct AiRunRequest {
     /// Optional OpenCode session title used to correlate its own token
     /// telemetry. Other harnesses must report usage themselves.
     pub session_title: Option<String>,
+    /// Image files delivered to the harness. Image bytes never enter the
+    /// prompt; see [`attachment_delivery`] for how each CLI receives them.
+    pub attachments: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +106,16 @@ impl AiRunner {
             ));
         }
         let effort = request.config.thinking.trim();
+        // Harnesses without a native attachment flag receive the paths as a
+        // readable trailer instead, so the prompt is resolved before the
+        // per-CLI syntaxes below embed it.
+        let delivery = attachment_delivery(harness, request.mode);
+        let prompt = match delivery {
+            AttachmentDelivery::Flag(_) => request.prompt.clone(),
+            AttachmentDelivery::PromptPaths { mention } => {
+                append_attachment_paths(&request.prompt, &request.attachments, mention)
+            }
+        };
         let mut args = match (harness, request.mode) {
             (AiHarness::OpenCode, AiRunMode::Interactive) => {
                 // opencode's interactive TUI exposes no `--variant` flag, so the
@@ -110,12 +123,7 @@ impl AiRunner {
                 // (keyed by this same `provider/model`) before launch — see
                 // `seed_opencode_tui_variant`.
                 seed_opencode_tui_variant(&model, effort);
-                let mut args = vec![
-                    "--prompt".into(),
-                    request.prompt.clone(),
-                    "-m".into(),
-                    model,
-                ];
+                let mut args = vec!["--prompt".into(), prompt.clone(), "-m".into(), model];
                 if request.permission == AiPermission::Plan {
                     args.extend(["--agent".into(), "plan".into()]);
                 }
@@ -123,7 +131,7 @@ impl AiRunner {
                 args
             }
             (AiHarness::OpenCode, AiRunMode::Captured) => {
-                let mut args = vec!["run".into(), request.prompt.clone(), "-m".into(), model];
+                let mut args = vec!["run".into(), prompt.clone(), "-m".into(), model];
                 if request.permission == AiPermission::Plan {
                     args.extend(["--agent".into(), "plan".into()]);
                 }
@@ -147,7 +155,7 @@ impl AiRunner {
                     "--no-alt-screen".into(),
                     "--model".into(),
                     model,
-                    request.prompt.clone(),
+                    prompt.clone(),
                 ];
                 if request.permission == AiPermission::Plan {
                     args.extend(["--sandbox".into(), "read-only".into()]);
@@ -171,12 +179,7 @@ impl AiRunner {
                 args
             }
             (AiHarness::Codex, AiRunMode::Captured) => {
-                let mut args = vec![
-                    "exec".into(),
-                    "--model".into(),
-                    model,
-                    request.prompt.clone(),
-                ];
+                let mut args = vec!["exec".into(), "--model".into(), model, prompt.clone()];
                 if request.permission == AiPermission::Plan {
                     args.extend(["--sandbox".into(), "read-only".into()]);
                 } else {
@@ -194,7 +197,7 @@ impl AiRunner {
                 args
             }
             (AiHarness::ClaudeCode, AiRunMode::Interactive) => {
-                let mut args = vec!["--model".into(), model, request.prompt.clone()];
+                let mut args = vec!["--model".into(), model, prompt.clone()];
                 args.extend(permission_args(request.permission));
                 if !effort.is_empty() {
                     args.extend(["--effort".into(), effort.into()]);
@@ -204,7 +207,7 @@ impl AiRunner {
             (AiHarness::ClaudeCode, AiRunMode::Captured) => {
                 let mut args = vec![
                     "-p".into(),
-                    request.prompt.clone(),
+                    prompt.clone(),
                     "--model".into(),
                     model,
                     "--output-format".into(),
@@ -217,9 +220,14 @@ impl AiRunner {
                 args
             }
         };
-        // Keep the prompt as the sole payload argument. The individual CLI
+        if let AttachmentDelivery::Flag(flag) = delivery {
+            for attachment in &request.attachments {
+                args.extend([flag.to_string(), attachment.to_string_lossy().to_string()]);
+            }
+        }
+        // Keep the prompt as the sole textual payload argument. The individual CLI
         // syntaxes above intentionally place it directly after their prompt flag.
-        debug_assert!(args.iter().any(|arg| arg == &request.prompt));
+        debug_assert!(args.iter().any(|arg| arg == &prompt));
         Ok(AiCommand {
             binary,
             args: std::mem::take(&mut args),
@@ -351,6 +359,60 @@ impl AiRunner {
             message,
         )
     }
+}
+
+/// How one harness accepts image attachments in one run mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentDelivery {
+    /// The CLI has a native attachment flag, repeated once per image.
+    Flag(&'static str),
+    /// The CLI has no attachment flag here, so the absolute paths ride along
+    /// in the prompt, written in that harness's own file-reference syntax.
+    PromptPaths { mention: &'static str },
+}
+
+/// Attachment support is per-command, not per-harness, and both `claude` and
+/// `opencode` accept unknown flags silently — an unsupported flag would drop
+/// the images with no error at all. Every entry below is verified against the
+/// CLI's own `--help`.
+fn attachment_delivery(harness: AiHarness, mode: AiRunMode) -> AttachmentDelivery {
+    match (harness, mode) {
+        // `opencode run` has `-f, --file`; the root TUI command it launches in
+        // interactive mode does not. There, `--prompt` pre-fills the composer,
+        // so the paths are written as `@` mentions — opencode's documented way
+        // to reference a file, since a bare path in prompt text is not
+        // attached.
+        (AiHarness::OpenCode, AiRunMode::Captured) => AttachmentDelivery::Flag("--file"),
+        (AiHarness::OpenCode, AiRunMode::Interactive) => {
+            AttachmentDelivery::PromptPaths { mention: "@" }
+        }
+        // `-i, --image` exists on both the root `codex` command and `codex exec`.
+        (AiHarness::Codex, _) => AttachmentDelivery::Flag("--image"),
+        // Claude Code has no image flag in any mode; its documented path is to
+        // name the file in the prompt and let it read the image itself.
+        (AiHarness::ClaudeCode, _) => AttachmentDelivery::PromptPaths { mention: "" },
+    }
+}
+
+/// Append the attachment paths as a readable trailer. The prompt stays a
+/// single literal argument and never carries image bytes.
+fn append_attachment_paths(prompt: &str, attachments: &[PathBuf], mention: &str) -> String {
+    if attachments.is_empty() {
+        return prompt.to_string();
+    }
+    let mut out = String::from(prompt.trim_end());
+    out.push_str(
+        "\n\n- Image attachments for this request. Read each one before you begin and treat \
+         it as part of the description above:\n\n",
+    );
+    for (index, attachment) in attachments.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {mention}{}\n",
+            index + 1,
+            attachment.display()
+        ));
+    }
+    out
 }
 
 fn permission_args(permission: AiPermission) -> Vec<String> {
@@ -585,6 +647,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             activity_limit: 2,
             session_title: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -602,6 +665,100 @@ mod tests {
                     .count(),
                 1
             );
+        }
+    }
+
+    /// Every (harness, mode) pair either emits a flag its CLI really has, or
+    /// falls back to prompt paths. Nothing may be attached with a flag the
+    /// command would silently ignore.
+    #[test]
+    fn image_attachments_reach_every_harness_by_a_supported_route() {
+        let cases = [
+            (AiHarness::OpenCode, AiRunMode::Captured, Some("--file")),
+            (AiHarness::OpenCode, AiRunMode::Interactive, None),
+            (AiHarness::Codex, AiRunMode::Captured, Some("--image")),
+            (AiHarness::Codex, AiRunMode::Interactive, Some("--image")),
+            (AiHarness::ClaudeCode, AiRunMode::Captured, None),
+            (AiHarness::ClaudeCode, AiRunMode::Interactive, None),
+        ];
+        for (harness, mode, flag) in cases {
+            let runner = AiRunner::default().with_binary(harness, PathBuf::from("true"));
+            let mut req = request(harness, mode);
+            req.attachments = vec![PathBuf::from("/tmp/screenshot.png")];
+            let command = runner.command(&req).unwrap();
+            let prompt_arg = command
+                .args
+                .iter()
+                .find(|arg| arg.starts_with(&req.prompt))
+                .expect("the prompt is always one argument");
+
+            match flag {
+                Some(flag) => {
+                    assert!(
+                        command
+                            .args
+                            .windows(2)
+                            .any(|args| args == [flag, "/tmp/screenshot.png"]),
+                        "{harness:?}/{mode:?} should attach with {flag}"
+                    );
+                    // A native flag carries the image, so the prompt is untouched.
+                    assert_eq!(prompt_arg, &req.prompt);
+                }
+                None => {
+                    assert!(
+                        !command
+                            .args
+                            .iter()
+                            .any(|arg| arg == "--image" || arg == "--file"),
+                        "{harness:?}/{mode:?} has no attachment flag and must not invent one"
+                    );
+                    // opencode needs its `@` mention syntax; a bare path in
+                    // prompt text is not attached. Claude Code reads a plain
+                    // path with its own file tools.
+                    let expected = if harness == AiHarness::OpenCode {
+                        "@/tmp/screenshot.png"
+                    } else {
+                        "/tmp/screenshot.png"
+                    };
+                    assert!(
+                        prompt_arg.contains(expected),
+                        "{harness:?}/{mode:?} must reference the image as {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_prompt_without_attachments_is_never_rewritten() {
+        for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
+            for mode in [AiRunMode::Interactive, AiRunMode::Captured] {
+                let runner = AiRunner::default().with_binary(harness, PathBuf::from("true"));
+                let req = request(harness, mode);
+                let command = runner.command(&req).unwrap();
+                assert!(command.args.iter().any(|arg| arg == &req.prompt));
+            }
+        }
+    }
+
+    #[test]
+    fn image_paths_with_shell_syntax_remain_single_literal_arguments() {
+        let attachment = PathBuf::from("/tmp/image; touch should-not-run.png");
+        let path = attachment.to_string_lossy().to_string();
+        for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
+            for mode in [AiRunMode::Interactive, AiRunMode::Captured] {
+                let runner = AiRunner::default().with_binary(harness, PathBuf::from("true"));
+                let mut req = request(harness, mode);
+                req.attachments = vec![attachment.clone()];
+                let command = runner.command(&req).unwrap();
+                // Either the flag's value or the prompt trailer holds the path
+                // verbatim, and in both cases it is one argv entry — the `;`
+                // can never be seen by a shell.
+                assert!(command
+                    .args
+                    .iter()
+                    .any(|arg| arg == &path || arg.contains(&path)));
+            }
         }
     }
 

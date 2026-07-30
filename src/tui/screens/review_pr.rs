@@ -55,6 +55,7 @@ use crate::services::dashboard::{
     ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile, ReviewVerification,
 };
 use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
+use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::ReviewPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
 use crate::tui::widgets::spinner::spinner_frame;
@@ -233,7 +234,7 @@ pub enum ReviewAction {
     /// Decision: skip this finding, move on.
     Skip,
     /// OtherInput submitted — revise the current finding with this feedback.
-    Revise(String),
+    Revise(String, Vec<ImageAttachment>),
     /// Ctrl+S in the explanation textarea — copy its full text to the OS
     /// clipboard.
     CopyToClipboard(String),
@@ -328,6 +329,7 @@ pub struct ReviewPullRequestScreen {
     /// the bottom and leave the reverse direction feeling dead.
     decision_max_scroll: Cell<u16>,
     other_input: Option<InputPrompt>,
+    input_generation: u64,
     // ── results ─────────────────────────────────────────────────────────
     summary_rows: Vec<SummaryRow>,
     scan_telemetry: Vec<ReviewScanTelemetry>,
@@ -382,6 +384,7 @@ impl ReviewPullRequestScreen {
             decision_scroll: 0,
             decision_max_scroll: Cell::new(0),
             other_input: None,
+            input_generation: 0,
             summary_rows: Vec::new(),
             scan_telemetry: Vec::new(),
             telemetry_reported: false,
@@ -1107,9 +1110,45 @@ impl ReviewPullRequestScreen {
     pub fn show_other_input(&mut self) {
         self.other_input = Some(
             InputPrompt::new("Tell the AI what to change about this comment:")
+                .multiline()
                 .with_placeholder("e.g. soften the tone; target the helper instead"),
         );
+        self.input_generation = self.input_generation.wrapping_add(1);
         self.step = ReviewStep::OtherInput;
+    }
+
+    /// Identity of the active textarea. The App uses this to ensure a slow
+    /// clipboard read cannot attach an image to another finding's draft.
+    pub fn attachment_input_generation(&self) -> Option<u64> {
+        let input = self
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.input.as_ref())
+            .or(self.other_input.as_ref());
+        input
+            .filter(|input| input.accepts_attachments())
+            .map(|_| self.input_generation)
+    }
+
+    pub fn insert_attachment(&mut self, generation: u64, attachment: ImageAttachment) -> bool {
+        if generation != self.input_generation {
+            return false;
+        }
+        if let Some(input) = self.edit.as_mut().and_then(|edit| edit.input.as_mut()) {
+            return input.insert_attachment(attachment);
+        }
+        self.other_input
+            .as_mut()
+            .is_some_and(|input| input.insert_attachment(attachment))
+    }
+
+    pub fn handle_paste(&mut self, text: &str) -> ReviewAction {
+        if let Some(input) = self.edit.as_mut().and_then(|edit| edit.input.as_mut()) {
+            input.paste(text);
+        } else if let Some(input) = self.other_input.as_mut() {
+            input.paste(text);
+        }
+        ReviewAction::Continue
     }
 
     pub fn start_posting(&mut self) {
@@ -1391,7 +1430,9 @@ impl ReviewPullRequestScreen {
             }
             match input.handle_key(key) {
                 InputOutcome::Submitted(text) => {
-                    let text = text.trim().to_string();
+                    let text = visible_attachment_references(&text, input.attachments())
+                        .trim()
+                        .to_string();
                     match edit.row {
                         EditRow::Title => edit.draft.title = text,
                         EditRow::Explanation => edit.draft.explanation = text,
@@ -1423,7 +1464,10 @@ impl ReviewPullRequestScreen {
                 EditRow::Suggestion => edit.toggle_suggestion(),
                 _ => {}
             },
-            KeyCode::Enter => Self::activate_edit_row(edit),
+            KeyCode::Enter => {
+                self.input_generation = self.input_generation.wrapping_add(1);
+                Self::activate_edit_row(edit)
+            }
             KeyCode::Char('s') | KeyCode::Char('S') => self.save_edit(),
             KeyCode::Esc => self.enter_decision(),
             _ => {}
@@ -1472,12 +1516,20 @@ impl ReviewPullRequestScreen {
         };
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
-                let trimmed = text.trim().to_string();
-                if trimmed.is_empty() {
+                let attachments = input.attachments().to_vec();
+                let trimmed = text.replace('\u{fffc}', "").trim().to_string();
+                if trimmed.is_empty() && attachments.is_empty() {
                     return ReviewAction::Continue;
                 }
                 self.other_input = None;
-                ReviewAction::Revise(trimmed)
+                ReviewAction::Revise(
+                    if trimmed.is_empty() {
+                        "See the attached image.".to_string()
+                    } else {
+                        trimmed
+                    },
+                    attachments,
+                )
             }
             // Cancel returns to the Decision view with the same finding.
             InputOutcome::Cancelled => {
@@ -2395,6 +2447,25 @@ impl ReviewPullRequestScreen {
         };
         frame.render_widget(Paragraph::new(footer).style(muted_dim()), chunks[2]);
     }
+}
+
+/// Image bytes are only meaningful to an AI harness. A locally edited review
+/// explanation is posted as text, so preserve a durable, visible reference
+/// instead of silently dropping its attachment marker.
+fn visible_attachment_references(text: &str, attachments: &[ImageAttachment]) -> String {
+    let mut attachments = attachments.iter();
+    text.chars()
+        .map(|character| {
+            if character == '\u{fffc}' {
+                attachments
+                    .next()
+                    .map(|attachment| format!("[Attached image: {}]", attachment.filename))
+                    .unwrap_or_default()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Append the finished run's complete row list to `~/.wisetree/`. Skipped
@@ -4068,7 +4139,43 @@ mod tests {
         screen.handle_key(key(KeyCode::Char('o')));
         assert_eq!(
             screen.handle_key(key(KeyCode::Enter)),
-            ReviewAction::Revise("no".to_string())
+            ReviewAction::Revise("no".to_string(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn other_input_forwards_only_its_own_image_attachment() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "s".into());
+        screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::High)]);
+        screen.finish_scanning();
+        screen.enter_decision();
+        screen.show_other_input();
+        let generation = screen.attachment_input_generation().unwrap();
+        let attachment = ImageAttachment {
+            id: "image-id".to_string(),
+            filename: "image-id.png".to_string(),
+            mime_type: "image/png".to_string(),
+            path: "/tmp/image-id.png".into(),
+        };
+        assert!(screen.insert_attachment(generation, attachment.clone()));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ReviewAction::Revise("See the attached image.".to_string(), vec![attachment])
+        );
+    }
+
+    #[test]
+    fn edited_explanation_keeps_a_visible_attachment_reference() {
+        let attachment = ImageAttachment {
+            id: "image-id".to_string(),
+            filename: "image-id.png".to_string(),
+            mime_type: "image/png".to_string(),
+            path: "/tmp/image-id.png".into(),
+        };
+        assert_eq!(
+            visible_attachment_references("Before \u{fffc} after", &[attachment]),
+            "Before [Attached image: image-id.png] after"
         );
     }
 

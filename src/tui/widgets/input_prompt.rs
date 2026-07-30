@@ -33,7 +33,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::messages::colors;
+use crate::messages::{colors, HINT_IMAGE_ATTACHMENTS};
+use crate::tui::image_upload::ImageAttachment;
 use crate::tui::widgets::select_prompt::branded_line;
 
 pub enum InputOutcome {
@@ -47,6 +48,12 @@ type Validator = Box<dyn Fn(&str) -> Option<String>>;
 /// Total height of the bordered multiline input box (borders included).
 const MULTILINE_BOX_ROWS: u16 = 8;
 
+/// A single Unicode scalar reserved for an attached image. Keeping it in the
+/// editable value means the existing cursor and line-editing model can treat
+/// an attachment as one atomic item, while the renderer substitutes a useful
+/// label instead of ever displaying image bytes.
+const ATTACHMENT_MARKER: char = '\u{fffc}';
+
 pub struct InputPrompt {
     pub label: String,
     pub placeholder: String,
@@ -57,6 +64,9 @@ pub struct InputPrompt {
     pub footer_spacer: bool,
     /// Multiline mode: Enter submits, Ctrl+J inserts a newline.
     multiline: bool,
+    /// Attachments in document order. Each has one corresponding
+    /// [`ATTACHMENT_MARKER`] in `value`.
+    attachments: Vec<ImageAttachment>,
     /// Grow the multiline box to fill the area it's rendered into, instead of
     /// the fixed [`MULTILINE_BOX_ROWS`] height.
     expand: bool,
@@ -73,6 +83,7 @@ impl InputPrompt {
             cursor: 0,
             footer_spacer: false,
             multiline: false,
+            attachments: Vec::new(),
             expand: false,
             validator: None,
         }
@@ -130,6 +141,41 @@ impl InputPrompt {
         self.multiline
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+    }
+
+    /// Whether this prompt is a textarea and can therefore accept image
+    /// attachments. Single-line inputs deliberately retain their old behavior.
+    pub fn accepts_attachments(&self) -> bool {
+        self.multiline
+    }
+
+    /// Insert an image as one editable item at the cursor. The attachment is
+    /// kept separately from text so callers can later pass its durable path to
+    /// an AI harness without leaking bytes into the prompt.
+    pub fn insert_attachment(&mut self, attachment: ImageAttachment) -> bool {
+        if !self.multiline {
+            return false;
+        }
+        if self.cursor > self.char_len() {
+            self.cursor = self.char_len();
+        }
+        let position = self
+            .value
+            .chars()
+            .take(self.cursor)
+            .filter(|&c| c == ATTACHMENT_MARKER)
+            .count();
+        let byte = self.byte_offset(self.cursor);
+        self.value.insert(byte, ATTACHMENT_MARKER);
+        self.attachments.insert(position, attachment);
+        self.cursor += 1;
+        self.error = None;
+        true
+    }
+
+    /// Durable image references in their order within the textarea.
+    pub fn attachments(&self) -> &[ImageAttachment] {
+        &self.attachments
     }
 
     fn char_len(&self) -> usize {
@@ -203,7 +249,7 @@ impl InputPrompt {
         }
         let end = self.byte_offset(self.cursor);
         let start = self.byte_offset(self.cursor - 1);
-        self.value.drain(start..end);
+        self.remove_range(start..end);
         self.cursor -= 1;
     }
 
@@ -213,7 +259,7 @@ impl InputPrompt {
         }
         let start = self.byte_offset(self.cursor);
         let end = self.byte_offset(self.cursor + 1);
-        self.value.drain(start..end);
+        self.remove_range(start..end);
     }
 
     fn delete_word_left(&mut self) {
@@ -224,7 +270,7 @@ impl InputPrompt {
         }
         let start = self.byte_offset(self.cursor);
         let end = self.byte_offset(original);
-        self.value.drain(start..end);
+        self.remove_range(start..end);
     }
 
     fn kill_to_start(&mut self) {
@@ -232,7 +278,7 @@ impl InputPrompt {
             return;
         }
         let end = self.byte_offset(self.cursor);
-        self.value.drain(..end);
+        self.remove_range(0..end);
         self.cursor = 0;
     }
 
@@ -241,7 +287,26 @@ impl InputPrompt {
     fn kill_to_end(&mut self) {
         let start = self.byte_offset(self.cursor);
         let end = self.byte_offset(self.line_end());
-        self.value.drain(start..end);
+        self.remove_range(start..end);
+    }
+
+    /// Remove text and any attachment records represented inside this byte
+    /// range. All callers derive the bounds from character indices, so they
+    /// always fall on valid UTF-8 boundaries.
+    fn remove_range(&mut self, range: std::ops::Range<usize>) {
+        let before_markers = self.value[..range.start]
+            .chars()
+            .filter(|&c| c == ATTACHMENT_MARKER)
+            .count();
+        let removed_markers = self.value[range.clone()]
+            .chars()
+            .filter(|&c| c == ATTACHMENT_MARKER)
+            .count();
+        if removed_markers > 0 {
+            self.attachments
+                .drain(before_markers..before_markers + removed_markers);
+        }
+        self.value.drain(range);
     }
 
     /// Char index of the start of the line the cursor is on.
@@ -374,12 +439,14 @@ impl InputPrompt {
                 // convention the way Ctrl+L (clear screen) is.
                 KeyCode::Backspace if ctrl => {
                     self.value.clear();
+                    self.attachments.clear();
                     self.cursor = 0;
                     self.error = None;
                     return InputOutcome::Pending;
                 }
                 KeyCode::Char('r') | KeyCode::Char('R') if ctrl => {
                     self.value.clear();
+                    self.attachments.clear();
                     self.cursor = 0;
                     self.error = None;
                     return InputOutcome::Pending;
@@ -463,7 +530,7 @@ impl InputPrompt {
                         if self.cursor != original {
                             let start = self.byte_offset(original);
                             let end = self.byte_offset(self.cursor);
-                            self.value.drain(start..end);
+                            self.remove_range(start..end);
                             self.cursor = original;
                         }
                     }
@@ -581,10 +648,12 @@ impl InputPrompt {
         }
 
         let hint_text = if self.multiline {
-            "Enter submits · Esc cancels · Ctrl+J newline · Ctrl+S copy all · Ctrl+A line \
-             start · Ctrl+E line end · Ctrl+K clear to line end · Ctrl+R clear all"
+            format!(
+                "Enter submits · Esc cancels · Ctrl+J newline · Ctrl+S copy all · Ctrl+A line \
+                 start · Ctrl+E line end · Ctrl+K clear to line end · Ctrl+R clear all · {HINT_IMAGE_ATTACHMENTS}"
+            )
         } else {
-            "Press Enter to confirm, Esc to cancel"
+            "Press Enter to confirm, Esc to cancel".to_string()
         };
         let hint = Paragraph::new(hint_text).style(
             Style::default()
@@ -645,10 +714,34 @@ impl InputPrompt {
             } else {
                 Style::default()
             };
-            rows.last_mut()
-                .expect("rows never empty")
-                .push(Span::styled(c.to_string(), style));
-            col += 1;
+            if c == ATTACHMENT_MARKER {
+                let attachment_index = chars[..i]
+                    .iter()
+                    .filter(|&&item| item == ATTACHMENT_MARKER)
+                    .count();
+                let label = self
+                    .attachments
+                    .get(attachment_index)
+                    .map(|attachment| {
+                        format!("[Image {}: {}]", attachment_index + 1, attachment.filename)
+                    })
+                    .unwrap_or_else(|| "[Image]".to_string());
+                for label_char in label.chars() {
+                    if col >= width {
+                        rows.push(Vec::new());
+                        col = 0;
+                    }
+                    rows.last_mut()
+                        .expect("rows never empty")
+                        .push(Span::styled(label_char.to_string(), style));
+                    col += 1;
+                }
+            } else {
+                rows.last_mut()
+                    .expect("rows never empty")
+                    .push(Span::styled(c.to_string(), style));
+                col += 1;
+            }
         }
         if cursor == chars.len() {
             if col >= width {
@@ -685,15 +778,25 @@ impl InputPrompt {
         let chars: Vec<char> = self.value.chars().collect();
         let cursor = self.cursor.min(chars.len());
 
-        let before: String = chars[..cursor].iter().collect();
+        let before = self.display_chars(&chars[..cursor], 0);
         let mut spans: Vec<Span<'_>> = Vec::with_capacity(3);
         if !before.is_empty() {
             spans.push(Span::raw(before));
         }
         if cursor < chars.len() {
-            let at = chars[cursor].to_string();
+            let at = self.display_char(
+                chars[cursor],
+                chars[..cursor]
+                    .iter()
+                    .filter(|&&c| c == ATTACHMENT_MARKER)
+                    .count(),
+            );
             spans.push(Span::styled(at, cursor_style));
-            let after: String = chars[cursor + 1..].iter().collect();
+            let attachment_offset = chars[..=cursor]
+                .iter()
+                .filter(|&&c| c == ATTACHMENT_MARKER)
+                .count();
+            let after = self.display_chars(&chars[cursor + 1..], attachment_offset);
             if !after.is_empty() {
                 spans.push(Span::raw(after));
             }
@@ -703,6 +806,33 @@ impl InputPrompt {
             spans.push(Span::styled(" ", cursor_style));
         }
         Line::from(spans)
+    }
+
+    fn display_chars(&self, chars: &[char], attachment_offset: usize) -> String {
+        let mut attachment_index = attachment_offset;
+        chars
+            .iter()
+            .map(|&c| {
+                let displayed = self.display_char(c, attachment_index);
+                if c == ATTACHMENT_MARKER {
+                    attachment_index += 1;
+                }
+                displayed
+            })
+            .collect()
+    }
+
+    fn display_char(&self, c: char, attachment_index: usize) -> String {
+        if c == ATTACHMENT_MARKER {
+            self.attachments
+                .get(attachment_index)
+                .map(|attachment| {
+                    format!("[Image {}: {}]", attachment_index + 1, attachment.filename)
+                })
+                .unwrap_or_else(|| "[Image]".to_string())
+        } else {
+            c.to_string()
+        }
     }
 }
 

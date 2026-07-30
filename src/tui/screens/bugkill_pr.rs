@@ -46,6 +46,7 @@ use crate::config::schema::AiBugkillConfig;
 use crate::messages::colors;
 use crate::services::bugkill::{render_investigation_md, BugHypothesis, EvidenceQuality};
 use crate::services::{BugkillSnapshot, BugkillUnverdicted, ParsedInvestigation};
+use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::BugkillRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
@@ -160,8 +161,10 @@ pub struct BugkillPullRequestScreen {
     working_locked: bool,
     // ── bug description / Other input ───────────────────────────────────
     input: Option<InputPrompt>,
+    input_generation: u64,
     describe_warning: bool,
     bug_description: String,
+    bug_attachments: Vec<ImageAttachment>,
     // ── preflight results ───────────────────────────────────────────────
     base_ref: Option<String>,
     resume_variant: Option<ResumeVariant>,
@@ -179,6 +182,7 @@ pub struct BugkillPullRequestScreen {
     attempt_sha: Option<String>,
     /// The user's "Other" text, threaded back as feedback on a retry.
     attempt_feedback: Option<String>,
+    attempt_feedback_attachments: Vec<ImageAttachment>,
     /// Full change-set of the last committed attempt (for rollback cleanup
     /// notes and the Done page's files-changed list).
     attempt_changes: Vec<String>,
@@ -218,8 +222,10 @@ impl BugkillPullRequestScreen {
             phase_message: String::new(),
             working_locked: false,
             input: None,
+            input_generation: 0,
             describe_warning: false,
             bug_description: String::new(),
+            bug_attachments: Vec::new(),
             base_ref: None,
             resume_variant: None,
             resume_focus: 0,
@@ -232,6 +238,7 @@ impl BugkillPullRequestScreen {
             current_attempt: None,
             attempt_sha: None,
             attempt_feedback: None,
+            attempt_feedback_attachments: Vec::new(),
             attempt_changes: Vec::new(),
             attempt_modified_untracked: Vec::new(),
             pre_snapshot: None,
@@ -264,6 +271,24 @@ impl BugkillPullRequestScreen {
     pub fn bug_description(&self) -> &str {
         &self.bug_description
     }
+
+    /// Identity of the currently focused textarea. App uses it to discard an
+    /// asynchronous clipboard read after this draft has been replaced.
+    pub fn attachment_input_generation(&self) -> Option<u64> {
+        self.input
+            .as_ref()
+            .filter(|input| input.accepts_attachments())
+            .map(|_| self.input_generation)
+    }
+
+    pub fn insert_attachment(&mut self, generation: u64, attachment: ImageAttachment) -> bool {
+        if generation != self.input_generation {
+            return false;
+        }
+        self.input
+            .as_mut()
+            .is_some_and(|input| input.insert_attachment(attachment))
+    }
     pub fn base_ref(&self) -> Option<&str> {
         self.base_ref.as_deref()
     }
@@ -275,6 +300,12 @@ impl BugkillPullRequestScreen {
     }
     pub fn attempt_feedback(&self) -> Option<String> {
         self.attempt_feedback.clone()
+    }
+    pub fn bug_attachments(&self) -> Vec<ImageAttachment> {
+        self.bug_attachments.clone()
+    }
+    pub fn attempt_feedback_attachments(&self) -> Vec<ImageAttachment> {
+        self.attempt_feedback_attachments.clone()
     }
     pub fn attempt_sha(&self) -> Option<String> {
         self.attempt_sha.clone()
@@ -302,7 +333,12 @@ impl BugkillPullRequestScreen {
     /// The rendered `BUG_INVESTIGATION.md` for the current model — the App
     /// rewrites the file with this after every mutation.
     pub fn render_investigation(&self) -> String {
-        render_investigation_md(&self.bug_description, &self.hypotheses, &self.notes)
+        render_investigation_md(
+            &self.bug_description,
+            &self.hypotheses,
+            &self.notes,
+            &self.bug_attachments,
+        )
     }
     /// Expanded steps want the whole bottom region; Working / ResumePrompt
     /// render in a sized panel. Done fills too so its closing details get
@@ -340,6 +376,7 @@ impl BugkillPullRequestScreen {
             .multiline()
             .expand_to_fill(),
         );
+        self.input_generation = self.input_generation.wrapping_add(1);
         self.step = BugkillStep::DescribeBug;
     }
 
@@ -393,6 +430,7 @@ impl BugkillPullRequestScreen {
     pub fn apply_resume(&mut self) -> Option<BugkillUnverdicted> {
         let (investigation, unverdicted) = self.stashed_resume.take()?;
         self.bug_description = investigation.bug_description;
+        self.bug_attachments = investigation.attachments;
         self.hypotheses = investigation.hypotheses;
         self.notes = investigation.notes;
         unverdicted
@@ -409,6 +447,7 @@ impl BugkillPullRequestScreen {
     pub fn enter_select(&mut self) -> bool {
         self.current_attempt = None;
         self.attempt_feedback = None;
+        self.attempt_feedback_attachments.clear();
         self.pre_snapshot = None;
         self.detail_scroll = 0;
         if self.hypotheses.iter().any(|h| h.worked == Some(true)) {
@@ -614,12 +653,14 @@ impl BugkillPullRequestScreen {
                 .multiline()
                 .expand_to_fill(),
         );
+        self.input_generation = self.input_generation.wrapping_add(1);
         self.step = BugkillStep::OtherInput;
     }
 
     /// Judge said NOT_FIXED: offer Retry with feedback / Roll back.
-    pub fn show_retry_prompt(&mut self, feedback: String) {
+    pub fn show_retry_prompt(&mut self, feedback: String, attachments: Vec<ImageAttachment>) {
         self.attempt_feedback = Some(feedback);
+        self.attempt_feedback_attachments = attachments;
         self.retry_focus = 0;
         self.step = BugkillStep::RetryPrompt;
     }
@@ -737,13 +778,20 @@ impl BugkillPullRequestScreen {
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
                 // Validation is pure code: nothing reaches the AI empty.
-                if text.trim().is_empty() {
+                let attachments = input.attachments().to_vec();
+                let description = text.replace('\u{fffc}', "").trim().to_string();
+                if description.is_empty() && attachments.is_empty() {
                     self.describe_warning = true;
                     return BugkillAction::Continue;
                 }
                 self.describe_warning = false;
+                self.bug_attachments = attachments;
                 self.input = None;
-                BugkillAction::DescriptionSubmitted(text.trim().to_string())
+                BugkillAction::DescriptionSubmitted(if description.is_empty() {
+                    "See the attached image.".to_string()
+                } else {
+                    description
+                })
             }
             InputOutcome::Cancelled => BugkillAction::Cancelled,
             InputOutcome::Pending => {
@@ -1011,12 +1059,18 @@ impl BugkillPullRequestScreen {
         }
         match input.handle_key(key) {
             InputOutcome::Submitted(text) => {
-                let trimmed = text.trim().to_string();
-                if trimmed.is_empty() {
+                let attachments = input.attachments().to_vec();
+                let trimmed = text.replace('\u{fffc}', "").trim().to_string();
+                if trimmed.is_empty() && attachments.is_empty() {
                     return BugkillAction::Continue;
                 }
+                self.attempt_feedback_attachments = attachments;
                 self.input = None;
-                BugkillAction::OtherSubmitted(trimmed)
+                BugkillAction::OtherSubmitted(if trimmed.is_empty() {
+                    "See the attached image.".to_string()
+                } else {
+                    trimmed
+                })
             }
             // Esc goes back to the question, not to the dashboard.
             InputOutcome::Cancelled => {
@@ -2433,6 +2487,7 @@ mod tests {
             bug_description: "old bug".to_string(),
             hypotheses: vec![hypothesis(1, 4)],
             notes: vec![],
+            attachments: vec![],
         };
         let mut s = screen();
         s.show_resume_prompt(parsed.clone(), None);
@@ -2470,6 +2525,7 @@ mod tests {
             bug_description: "old bug".to_string(),
             hypotheses: vec![committed, hypothesis(2, 3)],
             notes: vec![],
+            attachments: vec![],
         };
         let mut s = screen();
         s.show_resume_prompt(
@@ -2755,7 +2811,7 @@ mod tests {
     #[test]
     fn retry_prompt_offers_both_paths_and_keeps_feedback() {
         let mut s = screen_on_verdict();
-        s.show_retry_prompt("still broken on save".to_string());
+        s.show_retry_prompt("still broken on save".to_string(), vec![]);
         assert_eq!(s.step(), BugkillStep::RetryPrompt);
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
