@@ -72,6 +72,8 @@ pub const HINT_ARROW_KEYS: &str = "Use ↑↓ arrow keys to navigate";
 pub const HINT_ENTER_SELECT: &str = "Press Enter to select";
 pub const HINT_ESC_CANCEL: &str = "Press Esc to cancel";
 pub const HINT_CTRL_C_EXIT: &str = "Press Ctrl+C to exit";
+pub const HINT_IMAGE_ATTACHMENTS: &str =
+    "Ctrl+V paste image · drop image files · Backspace/Delete remove image";
 
 // Loading states
 pub const LOADING_GIT_INFO: &str = "Loading git information...";

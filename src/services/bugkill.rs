@@ -5,6 +5,8 @@
 //! and `App` owns the async orchestration, so everything in this module is
 //! unit-testable with plain strings.
 
+use crate::tui::image_upload::ImageAttachment;
+
 /// How solid the evidence behind a hypothesis is. Order matters only for
 /// display; the consistency clamps in [`normalize_hypotheses`] key off
 /// `Confirmed` / `Speculative` explicitly.
@@ -256,10 +258,16 @@ pub fn render_investigation_md(
     bug_description: &str,
     hypotheses: &[BugHypothesis],
     notes: &[String],
+    attachments: &[ImageAttachment],
 ) -> String {
     let mut out = String::from("# Bug Investigation\n\n## Bug Description\n\n");
     out.push_str(bug_description.trim());
     out.push_str("\n\n");
+    if !attachments.is_empty() {
+        out.push_str("<!-- wisetree-bug-attachments: ");
+        out.push_str(&serde_json::to_string(attachments).expect("image attachments serialize"));
+        out.push_str(" -->\n\n");
+    }
     out.push_str(RANKED_CAUSES_HEADING);
     out.push_str("\n\n");
     out.push_str(TABLE_HEADER);
@@ -299,6 +307,7 @@ pub struct ParsedInvestigation {
     pub bug_description: String,
     pub hypotheses: Vec<BugHypothesis>,
     pub notes: Vec<String>,
+    pub attachments: Vec<ImageAttachment>,
 }
 
 /// Resume parser. Accepts a file iff it contains the
@@ -384,10 +393,21 @@ pub fn parse_investigation_md(content: &str) -> Option<ParsedInvestigation> {
         }
     }
 
+    let attachments = lines[..heading_idx]
+        .iter()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("<!-- wisetree-bug-attachments: ")
+                .and_then(|value| value.strip_suffix(" -->"))
+                .and_then(|value| serde_json::from_str(value).ok())
+        })
+        .unwrap_or_default();
+
     Some(ParsedInvestigation {
         bug_description,
         hypotheses,
         notes,
+        attachments,
     })
 }
 
@@ -833,7 +853,7 @@ SOLUTION: s";
     #[test]
     fn render_then_parse_round_trips() {
         let (description, hypotheses, notes) = full_model();
-        let rendered = render_investigation_md(&description, &hypotheses, &notes);
+        let rendered = render_investigation_md(&description, &hypotheses, &notes, &[]);
         let parsed = parse_investigation_md(&rendered).expect("round-trip parses");
         assert_eq!(parsed.bug_description, description);
         assert_eq!(parsed.hypotheses, hypotheses);
@@ -843,7 +863,7 @@ SOLUTION: s";
     #[test]
     fn render_omits_attempt_notes_when_empty() {
         let (description, hypotheses, _) = full_model();
-        let rendered = render_investigation_md(&description, &hypotheses, &[]);
+        let rendered = render_investigation_md(&description, &hypotheses, &[], &[]);
         assert!(!rendered.contains("## Attempt Notes"));
         let parsed = parse_investigation_md(&rendered).expect("parses");
         assert!(parsed.notes.is_empty());
@@ -852,7 +872,7 @@ SOLUTION: s";
     #[test]
     fn render_escapes_pipes_and_newlines_in_cells() {
         let (description, hypotheses, notes) = full_model();
-        let rendered = render_investigation_md(&description, &hypotheses, &notes);
+        let rendered = render_investigation_md(&description, &hypotheses, &notes, &[]);
         assert!(rendered.contains("save\\|path"));
         assert!(rendered.contains("second line"));
         assert!(rendered.contains("<br>"));
@@ -861,7 +881,7 @@ SOLUTION: s";
     #[test]
     fn parser_accepts_all_three_star_glyphs() {
         let (description, hypotheses, _) = full_model();
-        let rendered = render_investigation_md(&description, &hypotheses[..1], &[]);
+        let rendered = render_investigation_md(&description, &hypotheses[..1], &[], &[]);
         for glyph in ["⭐", "★"] {
             let variant = rendered.replace("⭐️", glyph);
             let parsed = parse_investigation_md(&variant).expect("parses");
@@ -872,7 +892,7 @@ SOLUTION: s";
     #[test]
     fn parser_rejects_renamed_or_extra_columns() {
         let (description, hypotheses, _) = full_model();
-        let rendered = render_investigation_md(&description, &hypotheses, &[]);
+        let rendered = render_investigation_md(&description, &hypotheses, &[], &[]);
         let renamed = rendered.replace("| Worked? |", "| Success? |");
         assert_eq!(parse_investigation_md(&renamed), None);
         let extra = rendered
@@ -884,7 +904,7 @@ SOLUTION: s";
     #[test]
     fn parser_rejects_invalid_status_cells_and_bad_rows() {
         let (description, hypotheses, _) = full_model();
-        let rendered = render_investigation_md(&description, &hypotheses[..1], &[]);
+        let rendered = render_investigation_md(&description, &hypotheses[..1], &[], &[]);
         let bad_status = rendered.replace("| 🔴 |", "| maybe |");
         assert_eq!(parse_investigation_md(&bad_status), None);
         let no_number = rendered.replace("**1. ", "**");

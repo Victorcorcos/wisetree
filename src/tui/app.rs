@@ -45,13 +45,15 @@ use crate::services::{
     AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
     BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
     DashboardService, DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff,
-    DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome,
-    ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
-    JudgeResult, MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile,
-    ReviewFinding, ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification,
-    Shell, ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    DevelopPlanPrompt, DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation,
+    ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan,
+    FixPreparation, FixVerdict, JudgeResult, MultiSourceUpdateResult, OpencodeModel, PrState,
+    ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation, ReviewScanMode,
+    ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
+use crate::tui::image_upload::{ImageAttachment, ImageStorage};
 use crate::tui::router::Screen;
 use crate::tui::screens;
 use crate::tui::screens::ai_model_picker::{AiModelPickerAction, AiModelPickerScreen};
@@ -145,6 +147,10 @@ enum AppEvent {
         success_message: String,
         error: Option<String>,
     },
+    ClipboardPasteFinished {
+        target: ImagePasteTarget,
+        result: Result<ClipboardPaste, String>,
+    },
     WisePresetDiscovered(Result<WisePresetDiscovery, String>),
     MergePrDetailsLoaded(Result<MergePrDetailsPayload, String>),
     MergePrFinished(Result<u64, MergePrFailure>),
@@ -218,8 +224,7 @@ enum AppEvent {
     /// An "Other" revision of the current finding returned.
     ReviewPrRevised {
         index: usize,
-        mode: ReviewRevisionMode,
-        feedback: String,
+        revision: (ReviewRevisionMode, String, Vec<ImageAttachment>),
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
     },
@@ -347,6 +352,22 @@ enum AppEvent {
         result: Result<std::collections::HashMap<String, Vec<String>>, String>,
     },
     ShellIntegrationDetected(ShellIntegrationStatus),
+}
+
+/// The focused textarea that initiated a clipboard image read. Its generation
+/// prevents a slow platform clipboard call from mutating a later draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImagePasteTarget {
+    Develop(u64),
+    Bugkill(u64),
+    Fix(u64),
+    Review(u64),
+}
+
+enum ClipboardPaste {
+    #[cfg(target_os = "macos")]
+    Image(ImageAttachment),
+    Text(String),
 }
 
 /// Outcome of the post-attempt scan + commit task: either the fix AI made
@@ -1388,6 +1409,16 @@ impl App {
 
         self.mouse_selection = None;
 
+        if (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER))
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        {
+            if let Some(target) = self.image_paste_target() {
+                kick_off_clipboard_paste(target, tx.clone());
+            }
+            return;
+        }
+
         match self.phase {
             InitPhase::Errored => self.handle_error_key(key, tx),
             InitPhase::Ready => self.handle_screen_key(key, tx),
@@ -1405,6 +1436,14 @@ impl App {
         self.mouse_selection = None;
         if !matches!(self.phase, InitPhase::Ready) {
             return;
+        }
+        if let Some(target) = self.image_paste_target() {
+            if let Some(attachments) = ingest_dropped_images(&text) {
+                for attachment in attachments {
+                    self.insert_image_attachment(target, attachment);
+                }
+                return;
+            }
         }
         if matches!(self.screen, Screen::BugkillPullRequest) {
             let action = self
@@ -1426,11 +1465,155 @@ impl App {
             self.apply_develop_action(action, tx);
             return;
         }
+        if matches!(self.screen, Screen::FixPullRequest) {
+            let action = self
+                .fix_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(FixAction::Continue);
+            self.apply_fix_action(action, tx);
+            return;
+        }
+        if matches!(self.screen, Screen::ReviewPullRequest) {
+            let action = self
+                .review_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(ReviewAction::Continue);
+            self.apply_review_action(action, tx);
+            return;
+        }
         for ch in text.chars() {
             if ch.is_control() {
                 continue;
             }
             self.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), tx);
+        }
+    }
+
+    fn image_paste_target(&self) -> Option<ImagePasteTarget> {
+        match self.screen {
+            Screen::DevelopPullRequest => self
+                .develop_pr
+                .as_ref()
+                .and_then(DevelopPullRequestScreen::attachment_input_generation)
+                .map(ImagePasteTarget::Develop),
+            Screen::BugkillPullRequest => self
+                .bugkill_pr
+                .as_ref()
+                .and_then(BugkillPullRequestScreen::attachment_input_generation)
+                .map(ImagePasteTarget::Bugkill),
+            Screen::FixPullRequest => self
+                .fix_pr
+                .as_ref()
+                .and_then(FixPullRequestScreen::attachment_input_generation)
+                .map(ImagePasteTarget::Fix),
+            Screen::ReviewPullRequest => self
+                .review_pr
+                .as_ref()
+                .and_then(ReviewPullRequestScreen::attachment_input_generation)
+                .map(ImagePasteTarget::Review),
+            _ => None,
+        }
+    }
+
+    fn insert_image_attachment(
+        &mut self,
+        target: ImagePasteTarget,
+        attachment: ImageAttachment,
+    ) -> bool {
+        match target {
+            ImagePasteTarget::Develop(generation) if self.screen == Screen::DevelopPullRequest => {
+                self.develop_pr
+                    .as_mut()
+                    .is_some_and(|screen| screen.insert_attachment(generation, attachment))
+            }
+            ImagePasteTarget::Bugkill(generation) if self.screen == Screen::BugkillPullRequest => {
+                self.bugkill_pr
+                    .as_mut()
+                    .is_some_and(|screen| screen.insert_attachment(generation, attachment))
+            }
+            ImagePasteTarget::Fix(generation) if self.screen == Screen::FixPullRequest => self
+                .fix_pr
+                .as_mut()
+                .is_some_and(|screen| screen.insert_attachment(generation, attachment)),
+            ImagePasteTarget::Review(generation) if self.screen == Screen::ReviewPullRequest => {
+                self.review_pr
+                    .as_mut()
+                    .is_some_and(|screen| screen.insert_attachment(generation, attachment))
+            }
+            _ => false,
+        }
+    }
+
+    fn paste_text_into_target(
+        &mut self,
+        target: ImagePasteTarget,
+        text: &str,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match target {
+            ImagePasteTarget::Develop(generation)
+                if self.screen == Screen::DevelopPullRequest
+                    && self
+                        .develop_pr
+                        .as_ref()
+                        .and_then(DevelopPullRequestScreen::attachment_input_generation)
+                        == Some(generation) =>
+            {
+                let action = self
+                    .develop_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_paste(text))
+                    .unwrap_or(DevelopAction::Continue);
+                self.apply_develop_action(action, tx);
+            }
+            ImagePasteTarget::Bugkill(generation)
+                if self.screen == Screen::BugkillPullRequest
+                    && self
+                        .bugkill_pr
+                        .as_ref()
+                        .and_then(BugkillPullRequestScreen::attachment_input_generation)
+                        == Some(generation) =>
+            {
+                let action = self
+                    .bugkill_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_paste(text))
+                    .unwrap_or(BugkillAction::Continue);
+                self.apply_bugkill_action(action, tx);
+            }
+            ImagePasteTarget::Fix(generation)
+                if self.screen == Screen::FixPullRequest
+                    && self
+                        .fix_pr
+                        .as_ref()
+                        .and_then(FixPullRequestScreen::attachment_input_generation)
+                        == Some(generation) =>
+            {
+                let action = self
+                    .fix_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_paste(text))
+                    .unwrap_or(FixAction::Continue);
+                self.apply_fix_action(action, tx);
+            }
+            ImagePasteTarget::Review(generation)
+                if self.screen == Screen::ReviewPullRequest
+                    && self
+                        .review_pr
+                        .as_ref()
+                        .and_then(ReviewPullRequestScreen::attachment_input_generation)
+                        == Some(generation) =>
+            {
+                let action = self
+                    .review_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_paste(text))
+                    .unwrap_or(ReviewAction::Continue);
+                self.apply_review_action(action, tx);
+            }
+            _ => {}
         }
     }
 
@@ -2584,9 +2767,9 @@ impl App {
                 }
                 self.advance_fix(tx);
             }
-            FixAction::Replan(feedback) => {
+            FixAction::Replan(feedback, attachments) => {
                 let previous_plan = self.fix_pr.as_ref().and_then(|s| s.previous_plan_text());
-                self.plan_current_fix(tx, Some(feedback), previous_plan);
+                self.plan_current_fix(tx, Some((feedback, attachments)), previous_plan);
             }
             FixAction::ApplyReady => self.on_fix_apply_done(tx),
             FixAction::Done => {
@@ -2602,7 +2785,7 @@ impl App {
     fn plan_current_fix(
         &mut self,
         tx: &mpsc::UnboundedSender<AppEvent>,
-        feedback: Option<String>,
+        feedback: Option<(String, Vec<ImageAttachment>)>,
         previous_plan: Option<String>,
     ) {
         let Some(screen) = self.fix_pr.as_mut() else {
@@ -2616,6 +2799,9 @@ impl App {
         let worktree_path = screen.request().worktree_path.clone();
         let history = screen.history_text();
         let operation_id = self.active_fix_operation_id.unwrap_or_default();
+        let (feedback, attachments) = feedback
+            .map(|(feedback, attachments)| (Some(feedback), attachments))
+            .unwrap_or_default();
         screen.start_planning(index + 1, total);
         kick_off_plan_comment(
             self.git_root.clone(),
@@ -2626,6 +2812,7 @@ impl App {
                 feedback,
                 previous_plan,
                 history,
+                attachments,
                 index,
                 operation_id,
             },
@@ -2828,7 +3015,7 @@ impl App {
                 }
                 self.advance_review_finding(tx);
             }
-            ReviewAction::Revise(feedback) => {
+            ReviewAction::Revise(feedback, attachments) => {
                 let Some(screen) = self.review_pr.as_mut() else {
                     return;
                 };
@@ -2851,6 +3038,7 @@ impl App {
                         ReviewRevisionMode::Focused
                     },
                     feedback,
+                    attachments,
                     index: screen.current_index(),
                 };
                 screen.start_revising();
@@ -3310,12 +3498,12 @@ impl App {
     fn apply_review_pr_revised(
         &mut self,
         index: usize,
-        mode: ReviewRevisionMode,
-        feedback: String,
+        revision: (ReviewRevisionMode, String, Vec<ImageAttachment>),
         result: Result<Vec<ReviewFinding>, String>,
         telemetry: Option<ReviewScanTelemetry>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
+        let (mode, feedback, attachments) = revision;
         if !self.review_at_index(index) {
             return;
         }
@@ -3347,6 +3535,7 @@ impl App {
                             file,
                             finding,
                             feedback: feedback.clone(),
+                            attachments: attachments.clone(),
                             mode: ReviewRevisionMode::Expanded,
                             index,
                         })
@@ -3565,7 +3754,7 @@ impl App {
                 }
             }
             BugkillAction::ForceInvestigationDone => self.force_bugkill_investigation_done(tx),
-            BugkillAction::AttemptFix => self.start_bugkill_attempt(None, tx),
+            BugkillAction::AttemptFix => self.start_bugkill_attempt(None, Vec::new(), tx),
             BugkillAction::AbortFix => {
                 let Some(screen) = self.bugkill_pr.as_mut() else {
                     return;
@@ -3609,6 +3798,7 @@ impl App {
                     return;
                 };
                 let worktree_path = screen.request().worktree_path.clone();
+                let attachments = screen.attempt_feedback_attachments();
                 screen.start_working("Judging the outcome...", false);
                 kick_off_bugkill_judge(
                     self.git_root.clone(),
@@ -3616,6 +3806,7 @@ impl App {
                     worktree_path,
                     row,
                     text,
+                    attachments,
                     tx.clone(),
                 );
             }
@@ -3626,8 +3817,12 @@ impl App {
                 // Re-enter the fix phase for the same row, without reverting:
                 // the previous edits stay committed and the retry's edits are
                 // folded into the same attempt commit via --amend.
-                let feedback = self.bugkill_pr.as_ref().and_then(|s| s.attempt_feedback());
-                self.start_bugkill_attempt(feedback, tx);
+                let (feedback, feedback_attachments) = self
+                    .bugkill_pr
+                    .as_ref()
+                    .map(|s| (s.attempt_feedback(), s.attempt_feedback_attachments()))
+                    .unwrap_or_default();
+                self.start_bugkill_attempt(feedback, feedback_attachments, tx);
             }
             BugkillAction::Done => {
                 self.bugkill_pr = None;
@@ -3652,14 +3847,18 @@ impl App {
         let worktree_path = screen.request().worktree_path.clone();
         let description = screen.bug_description().to_string();
         let base_ref = screen.base_ref().map(str::to_string);
+        let attachments = screen.bug_attachments();
         screen.start_working("Preparing the investigation...", false);
         kick_off_bugkill_prepare_investigate(
             self.git_root.clone(),
             self.current_dashboard_config(),
-            worktree_path,
-            description,
-            base_ref,
-            corrective,
+            BugkillPrepareInvestigateRequest {
+                worktree_path,
+                description,
+                base_ref,
+                attachments,
+                corrective,
+            },
             tx.clone(),
         );
     }
@@ -3670,6 +3869,7 @@ impl App {
     fn start_bugkill_attempt(
         &mut self,
         feedback: Option<String>,
+        feedback_attachments: Vec<ImageAttachment>,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         let Some(screen) = self.bugkill_pr.as_mut() else {
@@ -3683,6 +3883,12 @@ impl App {
         };
         let worktree_path = screen.request().worktree_path.clone();
         let bug_description = screen.bug_description().to_string();
+        let mut attachments = screen.bug_attachments();
+        for attachment in feedback_attachments {
+            if !attachments.iter().any(|item| item.id == attachment.id) {
+                attachments.push(attachment);
+            }
+        }
         screen.start_working("Preparing the fix...", false);
         kick_off_bugkill_prepare_fix(
             self.git_root.clone(),
@@ -3693,6 +3899,7 @@ impl App {
                 row,
                 row_index,
                 feedback,
+                attachments,
             },
             tx.clone(),
         );
@@ -4177,7 +4384,9 @@ impl App {
             }
             Ok(verdict) => match verdict.result {
                 JudgeResult::Fixed => self.apply_bugkill_action(BugkillAction::VerdictYes, tx),
-                JudgeResult::NotFixed => screen.show_retry_prompt(user_text),
+                JudgeResult::NotFixed => {
+                    screen.show_retry_prompt(user_text, screen.attempt_feedback_attachments())
+                }
                 JudgeResult::Unclear => {
                     let note = if verdict.reason.trim().is_empty() {
                         "The judge could not tell — please answer Yes or No.".to_string()
@@ -4390,7 +4599,7 @@ impl App {
         let Some(operation_id) = self.active_develop_operation_id else {
             return;
         };
-        let (worktree_path, description, base_ref, revision) = {
+        let (worktree_path, description, base_ref, revision, attachments) = {
             let Some(screen) = self.develop_pr.as_mut() else {
                 return;
             };
@@ -4399,6 +4608,7 @@ impl App {
                 screen.task_description().to_string(),
                 screen.base_ref().map(str::to_string),
                 screen.revision(),
+                screen.attachments_for_run(),
             )
         };
         let generation = self.next_develop_generation();
@@ -4414,6 +4624,7 @@ impl App {
                 task_description: description,
                 base_ref,
                 revision,
+                attachments,
                 corrective,
             },
             operation_id,
@@ -4431,7 +4642,16 @@ impl App {
         let Some(operation_id) = self.active_develop_operation_id else {
             return;
         };
-        let (_next, section, sections_block, outline, check_failure, worktree_path, description) = {
+        let (
+            _next,
+            section,
+            sections_block,
+            outline,
+            check_failure,
+            worktree_path,
+            description,
+            attachments,
+        ) = {
             let Some(screen) = self.develop_pr.as_mut() else {
                 return;
             };
@@ -4448,6 +4668,7 @@ impl App {
                 screen.check_failure(),
                 screen.request().worktree_path.clone(),
                 screen.task_description().to_string(),
+                screen.attachments_for_run(),
             )
         };
         let generation = self.next_develop_generation();
@@ -4465,6 +4686,7 @@ impl App {
                 outline,
                 section,
                 check_failure,
+                attachments,
             },
             operation_id,
             generation,
@@ -6571,6 +6793,17 @@ impl App {
                     self.show_toast(ToastVariant::Error, format!("Clipboard copy failed: {err}"))
                 }
             },
+            AppEvent::ClipboardPasteFinished { target, result } => match result {
+                #[cfg(target_os = "macos")]
+                Ok(ClipboardPaste::Image(attachment)) => {
+                    self.insert_image_attachment(target, attachment);
+                }
+                Ok(ClipboardPaste::Text(text)) => self.paste_text_into_target(target, &text, tx),
+                Err(error) => self.show_toast(
+                    ToastVariant::Error,
+                    format!("Clipboard paste failed: {error}"),
+                ),
+            },
             AppEvent::WisePresetDiscovered(result) => self.apply_wise_preset_discovery(result),
             AppEvent::MergePrDetailsLoaded(result) => self.apply_merge_pr_details(result, tx),
             AppEvent::MergePrFinished(result) => self.apply_merge_pr_finished(result, tx),
@@ -6635,11 +6868,10 @@ impl App {
             } => self.apply_review_pr_scanned(file_index, retry, result, telemetry, raw_output, tx),
             AppEvent::ReviewPrRevised {
                 index,
-                mode,
-                feedback,
+                revision,
                 result,
                 telemetry,
-            } => self.apply_review_pr_revised(index, mode, feedback, result, telemetry, tx),
+            } => self.apply_review_pr_revised(index, revision, result, telemetry, tx),
             AppEvent::ReviewPrVerified {
                 index,
                 result,
@@ -7613,6 +7845,7 @@ impl App {
     }
 
     fn back_to_menu(&mut self) {
+        kick_off_image_upload_cleanup(self.git_root.clone());
         self.clear_screen_state();
         self.screen = Screen::Menu;
         self.pending_delete_path = None;
@@ -8293,6 +8526,35 @@ impl App {
     }
 }
 
+fn kick_off_image_upload_cleanup(git_root: Option<String>) {
+    let Some(git_root) = git_root else {
+        return;
+    };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let output = std::process::Command::new("git")
+                .args(["-C", &git_root, "worktree", "list", "--porcelain"])
+                .output();
+            let worktrees = output
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .into_iter()
+                .flat_map(|output| {
+                    output
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("worktree ").map(PathBuf::from))
+                        .collect::<Vec<_>>()
+                });
+            let _ = ImageStorage::default().cleanup_unreferenced_in_worktrees(worktrees);
+        })
+        .await;
+    });
+}
+
 struct InitOutcome {
     git_root: Option<String>,
     result: Result<WorktreeService, String>,
@@ -8670,6 +8932,196 @@ fn kick_off_clipboard_copy(
     });
 }
 
+/// Read the system clipboard off the UI thread. Image data takes precedence;
+/// text is only returned when the clipboard does not contain an image, so a
+/// sentence mentioning `screenshot.png` is never treated as an upload.
+fn kick_off_clipboard_paste(target: ImagePasteTarget, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(read_clipboard_paste)
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+        let _ = tx.send(AppEvent::ClipboardPasteFinished { target, result });
+    });
+}
+
+fn read_clipboard_paste() -> Result<ClipboardPaste, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // The pasteboard's own PNG data is preferred, and a TIFF-only
+        // pasteboard (what `NSImage` hands back for many sources) is converted
+        // to PNG here. Emitting the raw TIFF would produce a file that none of
+        // OpenCode, Codex, or Claude Code accepts.
+        let image_script = r#"
+            ObjC.import('AppKit');
+            const board = $.NSPasteboard.generalPasteboard;
+            let data = board.dataForType($.NSPasteboardTypePNG);
+            if (!data || !data.length) {
+                const tiff = board.dataForType($.NSPasteboardTypeTIFF);
+                const rep = tiff && tiff.length
+                    ? $.NSBitmapImageRep.imageRepWithData(tiff)
+                    : null;
+                if (rep) {
+                    data = rep.representationUsingTypeProperties(
+                        $.NSBitmapImageFileTypePNG,
+                        $.NSDictionary.dictionary
+                    );
+                }
+            }
+            if (data && data.length) {
+                console.log(ObjC.unwrap(data.base64EncodedStringWithOptions(0)));
+            }
+        "#;
+        let output = std::process::Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", image_script])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() && !output.stdout.is_empty() {
+            let bytes = decode_base64(
+                std::str::from_utf8(&output.stdout).map_err(|error| error.to_string())?,
+            )?;
+            return ImageStorage::default()
+                .ingest_bytes(&bytes)
+                .map(ClipboardPaste::Image)
+                .map_err(|error| error.to_string());
+        }
+        let text = std::process::Command::new("pbpaste")
+            .output()
+            .map_err(|error| error.to_string())?;
+        String::from_utf8(text.stdout)
+            .map(ClipboardPaste::Text)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    read_text_clipboard()
+        .map(ClipboardPaste::Text)
+        .map_err(|_| "image clipboard paste is unavailable on this platform".to_string())
+}
+
+/// Platforms without native image clipboard support still use their ordinary
+/// text clipboard provider. This preserves Ctrl+V for text while returning a
+/// short capability error when an image-only clipboard cannot be read.
+#[cfg(not(target_os = "macos"))]
+fn read_text_clipboard() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    let candidates: &[(&str, &[&str])] = &[(
+        "powershell",
+        &["-NoProfile", "-Command", "Get-Clipboard -Raw"],
+    )];
+    #[cfg(not(target_os = "windows"))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+    ];
+
+    for (program, args) in candidates {
+        let Ok(output) = std::process::Command::new(program).args(*args).output() else {
+            continue;
+        };
+        if output.status.success() {
+            return String::from_utf8(output.stdout).map_err(|error| error.to_string());
+        }
+    }
+    Err("no supported text clipboard tool found".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut group = [0u8; 4];
+    let mut len = 0usize;
+    for byte in value.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        group[len] = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 64,
+            _ => return Err("clipboard image is not valid base64".to_string()),
+        };
+        len += 1;
+        if len == 4 {
+            if group[0] == 64 || group[1] == 64 || (group[2] == 64 && group[3] != 64) {
+                return Err("clipboard image is not valid base64".to_string());
+            }
+            output.push((group[0] << 2) | (group[1] >> 4));
+            if group[2] != 64 {
+                output.push((group[1] << 4) | (group[2] >> 2));
+            }
+            if group[3] != 64 {
+                output.push((group[2] << 6) | group[3]);
+            }
+            len = 0;
+        }
+    }
+    (len == 0 && !output.is_empty())
+        .then_some(output)
+        .ok_or_else(|| "clipboard image is not valid base64".to_string())
+}
+
+/// Terminal drag/drop sends a bracketed-paste string containing absolute
+/// paths or `file://` URIs. Only consume it when every parsed item is such a
+/// path and at least one is a valid image; everything else remains ordinary
+/// text paste (including prose that merely names an image file).
+fn ingest_dropped_images(text: &str) -> Option<Vec<ImageAttachment>> {
+    ingest_dropped_images_with_storage(text, &ImageStorage::default())
+}
+
+fn ingest_dropped_images_with_storage(
+    text: &str,
+    storage: &ImageStorage,
+) -> Option<Vec<ImageAttachment>> {
+    let paths = crate::tui::image_upload::parse_dropped_paths(text).ok()?;
+    if !paths.iter().all(|path| path.is_absolute()) {
+        return None;
+    }
+    let attachments: Vec<_> = storage
+        .ingest_dropped_paths(paths)
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+    (!attachments.is_empty()).then_some(attachments)
+}
+
+#[cfg(test)]
+mod image_paste_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    // A valid 1×1 PNG, matching the image-storage test fixture.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\rIDATx\x9cc\xf8\xcf\xc0\xf0\x1f\0\x05\0\x01\xff\x89\x99=\x1d\0\0\0\0IEND\xaeB`\x82";
+
+    #[test]
+    fn dropped_image_paths_and_file_uris_insert_every_image() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.png");
+        let second = dir.path().join("second.png");
+        fs::write(&first, PNG).unwrap();
+        fs::write(&second, PNG).unwrap();
+        let storage = ImageStorage::new(dir.path().join("uploads"));
+
+        let dropped = format!("{}\nfile://{}", first.display(), second.display());
+        let attachments = ingest_dropped_images_with_storage(&dropped, &storage).unwrap();
+
+        assert_eq!(attachments.len(), 2);
+        assert!(attachments
+            .iter()
+            .all(|attachment| attachment.path.is_file()));
+    }
+
+    #[test]
+    fn prose_that_mentions_an_image_filename_stays_text() {
+        let storage = ImageStorage::new(tempdir().unwrap().path().join("uploads"));
+        assert!(
+            ingest_dropped_images_with_storage("See screenshot.png for details", &storage)
+                .is_none()
+        );
+    }
+}
+
 fn kick_off_fetch_pr_details(
     git_root: Option<String>,
     config: DashboardConfig,
@@ -8892,6 +9344,7 @@ struct FixPlanRequest {
     /// Comments + replies + fixes already resolved earlier this run, so the
     /// model can interpret a comment that refers back to them.
     history: Option<String>,
+    attachments: Vec<ImageAttachment>,
     index: usize,
     operation_id: u64,
 }
@@ -8980,6 +9433,7 @@ fn kick_off_plan_comment(
                 req.feedback.as_deref(),
                 req.previous_plan.as_deref(),
                 req.history.as_deref(),
+                &req.attachments,
             )
             .await
             .map_err(|err| user_friendly_message(&err));
@@ -9199,6 +9653,7 @@ struct ReviewReviseRequest {
     file: ReviewFile,
     finding: ReviewFinding,
     feedback: String,
+    attachments: Vec<ImageAttachment>,
     mode: ReviewRevisionMode,
     index: usize,
 }
@@ -9414,11 +9869,11 @@ fn kick_off_revise_review_finding(
     let index = req.index;
     let mode = req.mode;
     let feedback = req.feedback.clone();
+    let attachments = req.attachments.clone();
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ReviewPrRevised {
             index,
-            mode,
-            feedback,
+            revision: (mode, feedback, attachments),
             result: Err("Could not resolve git root.".to_string()),
             telemetry: None,
         });
@@ -9432,14 +9887,14 @@ fn kick_off_revise_review_finding(
                 &req.file,
                 &req.finding,
                 &req.feedback,
+                &req.attachments,
                 req.mode,
             )
             .await;
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrRevised {
             index,
-            mode,
-            feedback,
+            revision: (mode, feedback, attachments),
             result,
             telemetry: Some(attempt.telemetry),
         });
@@ -9656,6 +10111,15 @@ struct BugkillPrepareFixRequest {
     row: BugHypothesis,
     row_index: usize,
     feedback: Option<String>,
+    attachments: Vec<ImageAttachment>,
+}
+
+struct BugkillPrepareInvestigateRequest {
+    worktree_path: String,
+    description: String,
+    base_ref: Option<String>,
+    attachments: Vec<ImageAttachment>,
+    corrective: bool,
 }
 
 /// Inputs for the post-attempt scan + harness commit.
@@ -9716,12 +10180,10 @@ fn kick_off_bugkill_discard(
 fn kick_off_bugkill_prepare_investigate(
     git_root: Option<String>,
     config: DashboardConfig,
-    worktree_path: String,
-    bug_description: String,
-    base_ref: Option<String>,
-    corrective: bool,
+    req: BugkillPrepareInvestigateRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let corrective = req.corrective;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::BugkillInvestigateReady {
             corrective,
@@ -9735,10 +10197,11 @@ fn kick_off_bugkill_prepare_investigate(
         let service = DashboardService::new(root, config);
         let result = service
             .prepare_bugkill_investigate(
-                &worktree_path,
-                &bug_description,
-                base_ref.as_deref(),
-                corrective,
+                &req.worktree_path,
+                &req.description,
+                req.base_ref.as_deref(),
+                &req.attachments,
+                req.corrective,
             )
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
@@ -9771,6 +10234,7 @@ fn kick_off_bugkill_prepare_fix(
                     &req.bug_description,
                     &req.row,
                     req.feedback.as_deref(),
+                    &req.attachments,
                 )
                 .await?;
             Ok::<_, crate::errors::WisetreeError>(Box::new((snapshot, handoff)))
@@ -9857,6 +10321,7 @@ fn kick_off_bugkill_judge(
     worktree_path: String,
     row: BugHypothesis,
     user_text: String,
+    attachments: Vec<ImageAttachment>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -9869,7 +10334,7 @@ fn kick_off_bugkill_judge(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let result = service
-            .bugkill_judge(&worktree_path, &row, &user_text)
+            .bugkill_judge(&worktree_path, &row, &user_text, &attachments)
             .await
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::BugkillJudged { user_text, result });
@@ -9905,7 +10370,8 @@ struct DevelopPreparePlanRequest {
     worktree_path: String,
     task_description: String,
     base_ref: Option<String>,
-    revision: Option<(String, String)>,
+    revision: Option<(String, String, Vec<ImageAttachment>)>,
+    attachments: Vec<ImageAttachment>,
     corrective: bool,
 }
 
@@ -9963,18 +10429,19 @@ fn kick_off_develop_prepare_plan(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let (previous_plan, feedback) = match &req.revision {
-            Some((plan, feedback)) => (Some(plan.as_str()), Some(feedback.as_str())),
+            Some((plan, feedback, _)) => (Some(plan.as_str()), Some(feedback.as_str())),
             None => (None, None),
         };
         let result = service
-            .prepare_develop_plan(
-                &req.worktree_path,
-                &req.task_description,
-                req.base_ref.as_deref(),
+            .prepare_develop_plan(DevelopPlanPrompt {
+                worktree_path: &req.worktree_path,
+                task_description: &req.task_description,
+                base_ref: req.base_ref.as_deref(),
                 previous_plan,
                 feedback,
+                attachments: &req.attachments,
                 corrective,
-            )
+            })
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::DevelopPlanReady {
@@ -9996,6 +10463,7 @@ struct DevelopPrepareImplementRequest {
     outline: String,
     section: Option<usize>,
     check_failure: Option<String>,
+    attachments: Vec<ImageAttachment>,
 }
 
 fn kick_off_develop_prepare_implement(
@@ -10032,6 +10500,7 @@ fn kick_off_develop_prepare_implement(
                 &req.sections,
                 &req.outline,
                 req.check_failure.as_deref(),
+                &req.attachments,
             )
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
@@ -10967,8 +11436,11 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.apply_review_pr_revised(
             0,
-            ReviewRevisionMode::Focused,
-            "use more context".to_string(),
+            (
+                ReviewRevisionMode::Focused,
+                "use more context".to_string(),
+                Vec::new(),
+            ),
             Err("malformed".to_string()),
             None,
             &tx,
@@ -10977,7 +11449,7 @@ mod tests {
         assert!(matches!(
             event,
             AppEvent::ReviewPrRevised {
-                mode: ReviewRevisionMode::Expanded,
+                revision: (ReviewRevisionMode::Expanded, _, _),
                 ..
             }
         ));
@@ -11567,6 +12039,7 @@ mod tests {
     fn develop_plan() -> DevelopPlan {
         DevelopPlan {
             task_description: "Add CSV export".to_string(),
+            attachments: Vec::new(),
             complexity: 5,
             overview: None,
             sections: vec![
@@ -14203,6 +14676,7 @@ mod tests {
     fn single_section_plan() -> DevelopPlan {
         DevelopPlan {
             task_description: "Add CSV export".to_string(),
+            attachments: Vec::new(),
             complexity: 3,
             overview: None,
             sections: vec![PlanSection {
@@ -14880,6 +15354,7 @@ mod tests {
                 task_description: "add csv export".into(),
                 base_ref: None,
                 revision: None,
+                attachments: Vec::new(),
                 corrective: false,
             },
             1,
@@ -14895,6 +15370,7 @@ mod tests {
                 outline: "outline".into(),
                 section: None,
                 check_failure: None,
+                attachments: Vec::new(),
             },
             1,
         )
