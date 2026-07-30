@@ -93,34 +93,18 @@ After installation, confirm the binary is on your `$PATH`:
 wisetree --version
 ```
 
-### Enable the local git hooks (contributors)
+### Pre-submit checks (contributors)
 
-This repository ships tracked hooks in `githooks/` that auto-apply Rust fixes after commits and mirror the CI checks before code is pushed.
-
-After cloning, enable repo-local hooks once:
+This repository ships **no git hooks** — commits and pushes are never slowed down by local checks. CI is the gate instead, so run the same commands yourself before opening a PR:
 
 ```rb
-git config core.hooksPath githooks
-```
-
-From that point on, every `git commit` runs the local auto-fix commands and creates a follow-up fix commit when they change tracked files:
-
-```rb
-cargo fix --all-targets --all-features
-cargo clippy --fix --all-targets --all-features
 cargo fmt --all
-```
-
-Every `git push` then runs these checks locally and blocks the push if any of them fail:
-
-```rb
-cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-targets
 cargo test --all-features
 ```
 
-If the push hook reports an offense, fix it locally, commit it, and push again. This keeps formatting, lint, build, and test failures from reaching CI.
+CI runs these on Ubuntu and macOS with `RUSTFLAGS=-D warnings`, plus the deterministic reviewer benchmark gates. Any warning is a failure. See `AGENTS.md` for the full gate list and the rules AI agents must follow when changing code.
 
 ### Local development workflow
 
