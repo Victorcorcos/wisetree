@@ -10239,7 +10239,7 @@ fn kick_off_revise_review_finding(
 /// Candidates verified together in one call: same file (its evidence is the
 /// bulk of the prompt) and same model routing, capped so a heavily flagged
 /// file still asks for a manageable number of verdicts per call.
-const REVIEW_VERIFY_BATCH: usize = 6;
+const REVIEW_VERIFY_BATCH: usize = 12;
 
 /// One verifier call's worth of work: the file under review, whether it
 /// routes to the strong model, and the candidates paired with their
@@ -11572,7 +11572,12 @@ mod tests {
             .iter()
             .flat_map(|(_, _, findings)| findings.iter().map(|(index, _)| *index))
             .collect::<Vec<_>>();
-        assert_eq!(indices.len(), REVIEW_VERIFY_BATCH + 3);
+        assert_eq!(
+            indices,
+            (0..REVIEW_VERIFY_BATCH + 1)
+                .chain([100, 101])
+                .collect::<Vec<_>>()
+        );
     }
 
     fn review_scan_test_app(mode: ReviewScanMode, paths: &[&str]) -> App {

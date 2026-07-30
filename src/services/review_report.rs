@@ -13,17 +13,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::constants::review_report_file;
+use crate::services::review_telemetry::ReviewScanTelemetry;
 use crate::tui::widgets::SummaryRow;
 
 const REVIEW_REPORT_RUNS_MAX: usize = 5;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct ReviewReportHistory {
     runs: Vec<ReviewReportRun>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReviewReportRun {
     completed_at_ms: u64,
@@ -32,6 +33,10 @@ struct ReviewReportRun {
     failed: usize,
     warned: usize,
     rows: Vec<ReviewReportRow>,
+    /// Per-call data is retained alongside the human-readable rows so runs
+    /// can be compared without correlating two separate history files.
+    #[serde(default)]
+    scans: Vec<ReviewScanTelemetry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,8 +73,13 @@ impl From<&SummaryRow> for ReviewReportRow {
 
 /// Append one finished review run to the bounded history. Best-effort: a
 /// report that cannot be written never disturbs the run that produced it.
-pub fn persist_review_report(pull_request: u64, posted: usize, rows: &[SummaryRow]) {
-    let _ = persist_review_report_at(&review_report_file(), pull_request, posted, rows);
+pub fn persist_review_report(
+    pull_request: u64,
+    posted: usize,
+    rows: &[SummaryRow],
+    scans: &[ReviewScanTelemetry],
+) {
+    let _ = persist_review_report_at(&review_report_file(), pull_request, posted, rows, scans);
 }
 
 fn persist_review_report_at(
@@ -77,6 +87,7 @@ fn persist_review_report_at(
     pull_request: u64,
     posted: usize,
     rows: &[SummaryRow],
+    scans: &[ReviewScanTelemetry],
 ) -> std::io::Result<()> {
     let mut history = fs::read_to_string(path)
         .ok()
@@ -90,6 +101,7 @@ fn persist_review_report_at(
         failed,
         warned,
         rows: rows.iter().map(ReviewReportRow::from).collect(),
+        scans: scans.to_vec(),
     });
     if history.runs.len() > REVIEW_REPORT_RUNS_MAX {
         let remove = history.runs.len() - REVIEW_REPORT_RUNS_MAX;
@@ -139,7 +151,27 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested").join("review_report.json");
 
-        persist_review_report_at(&path, 42, 1, &rows()).unwrap();
+        let scans = vec![crate::services::review_telemetry::ReviewScanTelemetry {
+            scan: "gap-audit".to_string(),
+            scan_role: "gap-audit".to_string(),
+            retry_role: "initial".to_string(),
+            model_profile: "strong".to_string(),
+            model: "openai/gpt-5.6-sol".to_string(),
+            thinking: "high".to_string(),
+            harness: "opencode".to_string(),
+            prompt_bytes: 1024,
+            usage: crate::services::review_telemetry::ReviewTokenUsage {
+                uncached_input: Some(100),
+                cache_read: Some(200),
+                cache_write: Some(0),
+                output: Some(10),
+                reasoning: Some(5),
+                cost_usd: None,
+            },
+            duration_ms: 1,
+            findings: 0,
+        }];
+        persist_review_report_at(&path, 42, 1, &rows(), &scans).unwrap();
 
         let json = fs::read_to_string(&path).unwrap();
         let history: ReviewReportHistory = serde_json::from_str(&json).unwrap();
@@ -155,6 +187,13 @@ mod tests {
         assert_eq!(run.rows[2].detail.as_deref(), Some("timed out"));
         assert!(json.contains("completedAtMs"));
         assert!(json.contains("pullRequest"));
+        assert_eq!(run.scans, scans);
+        assert!(json.contains("scanRole"));
+        assert!(json.contains("retryRole"));
+        assert!(json.contains("modelProfile"));
+        assert!(json.contains("promptBytes"));
+        assert!(json.contains("uncachedInput"));
+        assert!(json.contains("cacheRead"));
     }
 
     #[test]
@@ -163,7 +202,7 @@ mod tests {
         let path = dir.path().join("review_report.json");
 
         for number in 1..=(REVIEW_REPORT_RUNS_MAX as u64 + 3) {
-            persist_review_report_at(&path, number, 0, &rows()).unwrap();
+            persist_review_report_at(&path, number, 0, &rows(), &[]).unwrap();
         }
 
         let json = fs::read_to_string(&path).unwrap();

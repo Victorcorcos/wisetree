@@ -87,6 +87,12 @@ Rules: `CATEGORY`, `SEVERITY`, `FILE`, `LINE`, `START_LINE`, and `TITLE` are sin
 REPO_CONTEXT
 ```
 
+- Cross-group relationship edges for this focused group (empty when none):
+
+```
+RELATIONSHIP_EDGES
+```
+
 - Files under review:
 
 ```
@@ -99,7 +105,7 @@ FILE_PATH
 FILE_DIFF
 ```
 
-- Compact keys for review comments already posted on these files (do NOT re-raise anything these already cover; empty when none):
+- Structured Wisetree finding keys already posted on these files (do NOT re-raise anything these already cover; empty when none):
 
 ```
 EXISTING_COMMENTS
