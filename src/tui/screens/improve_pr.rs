@@ -540,7 +540,7 @@ impl ImprovePullRequestScreen {
             .ai_roles(vec![
                 AiRoleRow::from_config(
                     "review strong",
-                    colors::NAVY,
+                    colors::DARK_NAVY,
                     &self.review_ai.strong,
                     "Read-only",
                 ),
@@ -552,7 +552,7 @@ impl ImprovePullRequestScreen {
                 ),
                 AiRoleRow::from_config(
                     "review utility",
-                    colors::NAVY,
+                    colors::LIGHT_NAVY,
                     &self.review_ai.utility,
                     "Read-only",
                 ),

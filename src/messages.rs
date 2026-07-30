@@ -135,9 +135,18 @@ pub mod colors {
     /// the soft-blue Fix button next to it while staying legible on the
     /// brown background.
     pub const NAVY: Color = Color::Rgb(0x4d, 0x7c, 0xfe);
-    /// Teal accent reserved for the local "Improve" command and its
+    /// Dark navy `#3658b5` — the stronger Review role accent.
+    pub const DARK_NAVY: Color = Color::Rgb(0x36, 0x58, 0xb5);
+    /// Light navy `#83a2ff` — the softer Review role accent.
+    pub const LIGHT_NAVY: Color = Color::Rgb(0x83, 0xa2, 0xff);
+    /// Mint `#3ddc97` — a blue-green that sits in the empty arc between the
+    /// yellow-greens ([`GREEN`], [`DARK_GREEN`]) and [`TEAL`]. Keeps the
+    /// "Improve" command in the quality/health color family without reading
+    /// as Merge or Bugkill, and stays clear of the crowded blue band.
+    pub const MINT: Color = Color::Rgb(0x3d, 0xdc, 0x97);
+    /// Mint accent reserved for the local "Improve" command and its
     /// confirmation screen.
-    pub const IMPROVE: Color = TEAL;
+    pub const IMPROVE: Color = MINT;
 
     // ── Background colors ───────────────────────────────────────────────
 
