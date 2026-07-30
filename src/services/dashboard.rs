@@ -1391,6 +1391,9 @@ pub struct BugkillSnapshot {
     /// `(path, content hash)` for every untracked file, excluding
     /// `BUG_INVESTIGATION.md`.
     pub untracked: Vec<(String, String)>,
+    /// Original bytes for untracked files. Improve uses these to restore an
+    /// attempt that modified a user-owned untracked file without committing it.
+    pub untracked_contents: Vec<(String, Vec<u8>)>,
 }
 
 /// An attempt row recovered from `BUG_INVESTIGATION.md` that was committed
@@ -4740,10 +4743,53 @@ impl DashboardService {
         let cwd = PathBuf::from(worktree_path);
         let status = self.bugkill_git_status(&cwd).await?;
         let untracked = hash_untracked(&cwd, &status.untracked).await;
+        let mut untracked_contents = Vec::new();
+        for path in &status.untracked {
+            if path != INVESTIGATION_FILE {
+                if let Ok(contents) = tokio::fs::read(cwd.join(path)).await {
+                    untracked_contents.push((path.clone(), contents));
+                }
+            }
+        }
         Ok(BugkillSnapshot {
             tracked: status.tracked,
             untracked,
+            untracked_contents,
         })
+    }
+
+    /// Discard one Improve attempt while preserving pre-existing untracked
+    /// files that the AI modified. Those files are never committed, but must
+    /// be restored to their pre-attempt contents rather than deleted.
+    pub async fn improve_abort_cleanup(
+        &self,
+        worktree_path: &str,
+        changes: &AttemptChanges,
+        pre: &BugkillSnapshot,
+    ) -> Result<()> {
+        let ordinary_paths = changes
+            .all
+            .iter()
+            .filter(|path| !changes.modified_preexisting_untracked.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.bugkill_abort_cleanup(worktree_path, &ordinary_paths)
+            .await?;
+
+        let cwd = PathBuf::from(worktree_path);
+        for path in &changes.modified_preexisting_untracked {
+            let Some((_, contents)) = pre
+                .untracked_contents
+                .iter()
+                .find(|(pre_path, _)| pre_path == path)
+            else {
+                return Err(WisetreeError::other(format!(
+                    "could not restore pre-existing untracked file `{path}`."
+                )));
+            };
+            tokio::fs::write(cwd.join(path), contents).await?;
+        }
+        Ok(())
     }
 
     /// Commit one applied attempt — the harness, never the AI. Stages each
@@ -15937,6 +15983,35 @@ so the intent reads clearly.
             .unwrap_err();
 
         assert!(error.to_string().contains("HEAD resolution failed"));
+    }
+
+    #[tokio::test]
+    async fn improve_cleanup_restores_modified_preexisting_untracked_files() {
+        let repo = initialized_temp_repo();
+        let repo_path = repo.path().to_str().unwrap();
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default());
+        std::fs::write(repo.path().join("notes.txt"), "before").unwrap();
+        let pre = service.bugkill_snapshot(repo_path).await.unwrap();
+
+        std::fs::write(repo.path().join("notes.txt"), "attempt edit").unwrap();
+        let post = service.bugkill_snapshot(repo_path).await.unwrap();
+        let changes = crate::services::compute_attempt_changes(
+            &post.tracked,
+            &post.untracked,
+            &pre.untracked,
+        );
+        assert!(changes.commit_paths.is_empty());
+        assert_eq!(changes.modified_preexisting_untracked, ["notes.txt"]);
+
+        service
+            .improve_abort_cleanup(repo_path, &changes, &pre)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("notes.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(git(repo.path(), &["status", "--porcelain"]), "?? notes.txt");
     }
 
     #[tokio::test]

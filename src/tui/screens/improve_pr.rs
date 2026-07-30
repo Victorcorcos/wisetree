@@ -167,6 +167,8 @@ pub struct ImprovePullRequestScreen {
     edit: Option<EditState>,
     autonomous: bool,
     applying: bool,
+    committing: bool,
+    aborting: bool,
     ai_done: bool,
     pty: Option<PtyView>,
     pty_focused: bool,
@@ -192,6 +194,8 @@ impl ImprovePullRequestScreen {
             edit: None,
             autonomous: false,
             applying: false,
+            committing: false,
+            aborting: false,
             ai_done: false,
             pty: None,
             pty_focused: false,
@@ -220,6 +224,9 @@ impl ImprovePullRequestScreen {
                 KeyCode::Enter | KeyCode::Esc => ImproveAction::Done,
                 _ => ImproveAction::Continue,
             };
+        }
+        if self.committing || self.aborting {
+            return ImproveAction::Continue;
         }
         if self.applying {
             if self.pty.is_some() && matches!(key.code, KeyCode::Tab) {
@@ -475,6 +482,8 @@ impl ImprovePullRequestScreen {
     pub fn start_applying(&mut self) {
         self.preparing = true;
         self.applying = true;
+        self.committing = false;
+        self.aborting = false;
         self.ai_done = false;
         self.pty = None;
         self.pty_focused = false;
@@ -492,10 +501,16 @@ impl ImprovePullRequestScreen {
         args: Vec<String>,
         cwd: PathBuf,
         renders_inline: bool,
-    ) {
+    ) -> bool {
         match PtyView::spawn(&binary, &args, Some(&cwd), &[], renders_inline) {
-            Ok(pty) => self.pty = Some(pty),
-            Err(_) => self.applying = false,
+            Ok(pty) => {
+                self.pty = Some(pty);
+                true
+            }
+            Err(_) => {
+                self.applying = false;
+                false
+            }
         }
     }
     pub fn tick_pty(&mut self) -> bool {
@@ -513,8 +528,26 @@ impl ImprovePullRequestScreen {
         self.applying = false;
         self.pty = None;
     }
+    pub fn begin_commit(&mut self) {
+        self.committing = true;
+    }
+    pub fn finish_commit(&mut self) {
+        self.committing = false;
+    }
+    pub fn begin_abort(&mut self) {
+        self.aborting = true;
+    }
+    pub fn finish_abort(&mut self) {
+        self.aborting = false;
+    }
     pub fn applying(&self) -> bool {
         self.applying
+    }
+    pub fn committing(&self) -> bool {
+        self.committing
+    }
+    pub fn aborting(&self) -> bool {
+        self.aborting
     }
     /// Once Improve has a finding, is applying it, or has finished, it owns
     /// the frame and input. Review remains the discovery data source only.
@@ -527,6 +560,8 @@ impl ImprovePullRequestScreen {
 
     pub fn show_finding(&mut self, finding: ReviewFinding, current: usize, total: usize) {
         self.preparing = false;
+        self.committing = false;
+        self.aborting = false;
         self.finding = Some(finding);
         self.current = current;
         self.total = total;
@@ -559,6 +594,8 @@ impl ImprovePullRequestScreen {
     pub fn enter_done(&mut self) {
         self.preparing = false;
         self.applying = false;
+        self.committing = false;
+        self.aborting = false;
         self.finding = None;
         self.done = true;
         self.done_scroll = 0;
@@ -895,6 +932,25 @@ mod tests {
         assert_eq!(
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Skip
+        );
+    }
+
+    #[test]
+    fn commit_or_cleanup_in_flight_blocks_a_second_apply() {
+        let mut screen = screen();
+        screen.show_finding(finding(), 0, 1);
+        screen.start_applying();
+        screen.finish_apply();
+        screen.begin_commit();
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ImproveAction::Continue
+        );
+        screen.finish_commit();
+        screen.begin_abort();
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ImproveAction::Continue
         );
     }
 

@@ -27,7 +27,7 @@ use crate::config::schema::{
 };
 use crate::config::service::ConfigService;
 use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
-use crate::errors::user_friendly_message;
+use crate::errors::{user_friendly_message, WisetreeError};
 use crate::files::service::{open_terminal, open_url};
 use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
@@ -945,7 +945,11 @@ impl App {
                             if matches!(turn, AiTurn::Working) {
                                 // A PTY exit without a completed turn is an
                                 // interruption, never an approval to commit.
-                                self.abort_improve_apply(&tx);
+                                self.fail_improve_apply(
+                                    "AI session exited before completing the improvement."
+                                        .to_string(),
+                                    &tx,
+                                );
                             } else {
                                 self.on_improve_turn(turn, &tx);
                             }
@@ -3005,14 +3009,10 @@ impl App {
             }
             ImproveAction::ApplyReady => self.finish_improve_apply(tx),
             ImproveAction::AbortApply => {
-                if let Some(screen) = self.improve_pr.as_mut() {
-                    screen.disarm_autonomous();
-                    screen.record_failed(
-                        "Apply cancelled before a checkpoint was created.".to_string(),
-                    );
-                }
-                self.abort_improve_apply(tx);
-                self.advance_improve_finding(tx);
+                self.fail_improve_apply(
+                    "Apply cancelled before a checkpoint was created.".to_string(),
+                    tx,
+                );
             }
             ImproveAction::Revise(feedback) => self.revise_improve_finding(feedback, tx),
         }
@@ -3110,6 +3110,9 @@ impl App {
         let Some(screen) = self.improve_pr.as_mut() else {
             return;
         };
+        if !screen.applying() {
+            return;
+        }
         let Some(finding) = screen.current_finding() else {
             return;
         };
@@ -3119,6 +3122,7 @@ impl App {
         let index = screen.current_index();
         let worktree_path = screen.request().worktree_path.clone();
         screen.finish_apply();
+        screen.begin_commit();
         kick_off_improve_commit(
             self.git_root.clone(),
             self.current_dashboard_config(),
@@ -3130,10 +3134,13 @@ impl App {
         );
     }
 
-    fn abort_improve_apply(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+    /// Returns whether cleanup was dispatched. A caller must not advance to
+    /// the next finding until that cleanup event settles, otherwise a new
+    /// attempt could absorb the old one's dirty paths.
+    fn abort_improve_apply(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) -> bool {
         self.improve_apply_watch = None;
         let Some(screen) = self.improve_pr.as_mut() else {
-            return;
+            return false;
         };
         screen.disarm_autonomous();
         let index = screen.current_index();
@@ -3143,8 +3150,9 @@ impl App {
         let Some(pre) = pre else {
             // The user cancelled while the snapshot/handoff task was still
             // pending, before an AI process could have changed the tree.
-            return;
+            return false;
         };
+        screen.begin_abort();
         kick_off_improve_abort(
             self.git_root.clone(),
             self.current_dashboard_config(),
@@ -3153,6 +3161,17 @@ impl App {
             index,
             tx.clone(),
         );
+        true
+    }
+
+    fn fail_improve_apply(&mut self, message: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if let Some(screen) = self.improve_pr.as_mut() {
+            screen.disarm_autonomous();
+            screen.record_failed(message);
+        }
+        if !self.abort_improve_apply(tx) {
+            self.advance_improve_finding(tx);
+        }
     }
 
     fn on_improve_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -3160,15 +3179,10 @@ impl App {
             AiTurn::Working => {}
             AiTurn::Finished { .. } => self.finish_improve_apply(tx),
             AiTurn::Failed { message } => {
-                if let Some(screen) = self.improve_pr.as_mut() {
-                    screen.disarm_autonomous();
-                    screen.record_failed(format!(
-                        "AI CLI reported an error: {}",
-                        truncate_error(&message)
-                    ));
-                }
-                self.abort_improve_apply(tx);
-                self.advance_improve_finding(tx);
+                self.fail_improve_apply(
+                    format!("AI CLI reported an error: {}", truncate_error(&message)),
+                    tx,
+                );
                 self.show_toast(
                     ToastVariant::Error,
                     format!("Improve apply failed: {}", truncate_error(&message)),
@@ -3181,6 +3195,7 @@ impl App {
         &mut self,
         index: usize,
         result: Result<Box<(BugkillSnapshot, FixApplyHandoff)>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         if !self
             .improve_pr
@@ -3192,23 +3207,38 @@ impl App {
         match result {
             Ok(payload) => {
                 let (snapshot, handoff) = *payload;
+                let mut spawn_failed = false;
                 if let Some(screen) = self.improve_pr.as_mut() {
                     if screen.autonomous() {
                         self.improve_apply_watch =
                             Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                     }
                     screen.set_pre_snapshot(snapshot);
-                    screen.spawn_opencode_pty(
+                    spawn_failed = !screen.spawn_opencode_pty(
                         handoff.command.binary,
                         handoff.command.args,
                         handoff.command.cwd,
                         handoff.harness.renders_inline(),
                     );
                 }
+                if spawn_failed {
+                    self.fail_improve_apply(
+                        "Could not start the Improve AI session.".to_string(),
+                        tx,
+                    );
+                    self.show_toast(
+                        ToastVariant::Error,
+                        "Could not start the Improve AI session.".to_string(),
+                    );
+                }
             }
             Err(message) => {
                 if let Some(screen) = self.improve_pr.as_mut() {
                     screen.disarm_autonomous();
+                    screen.record_failed(format!(
+                        "Could not start apply: {}",
+                        truncate_error(&message)
+                    ));
                     screen.finish_apply();
                 }
                 self.show_toast(
@@ -3218,6 +3248,7 @@ impl App {
                         truncate_error(&message)
                     ),
                 );
+                self.advance_improve_finding(tx);
             }
         }
     }
@@ -3231,13 +3262,14 @@ impl App {
         if !self
             .improve_pr
             .as_ref()
-            .is_some_and(|s| s.current_index() == index)
+            .is_some_and(|s| s.current_index() == index && s.committing())
         {
             return;
         }
         match result {
             Ok(ImproveCommitOutcome::Committed { sha }) => {
                 if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.finish_commit();
                     screen.record_applied(sha.clone());
                 }
                 self.show_toast(
@@ -3247,6 +3279,7 @@ impl App {
             }
             Ok(ImproveCommitOutcome::NoChanges) => {
                 if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.finish_commit();
                     screen.record_addressed();
                 }
                 self.show_toast(
@@ -3257,9 +3290,9 @@ impl App {
             Err(message) => {
                 if let Some(screen) = self.improve_pr.as_mut() {
                     screen.disarm_autonomous();
+                    screen.finish_commit();
                     screen.record_failed(truncate_error(&message));
                 }
-                self.abort_improve_apply(tx);
                 self.show_toast(
                     ToastVariant::Error,
                     format!("Improve checkpoint failed: {}", truncate_error(&message)),
@@ -7187,7 +7220,7 @@ impl App {
             AppEvent::ReviewPrPrepared(result) => self.apply_review_pr_prepared(result, tx),
             AppEvent::ImprovePrepared(result) => self.apply_improve_prepared(result, tx),
             AppEvent::ImproveApplyReady { index, result } => {
-                self.apply_improve_apply_ready(index, result)
+                self.apply_improve_apply_ready(index, result, tx)
             }
             AppEvent::ImproveCommitted { index, result } => {
                 self.apply_improve_committed(index, result, tx)
@@ -7196,8 +7229,11 @@ impl App {
                 if self
                     .improve_pr
                     .as_ref()
-                    .is_some_and(|s| s.current_index() == index)
+                    .is_some_and(|s| s.current_index() == index && s.aborting())
                 {
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.finish_abort();
+                    }
                     match result {
                         Ok(()) => self.show_toast(
                             ToastVariant::Info,
@@ -7212,6 +7248,7 @@ impl App {
                             ),
                         ),
                     }
+                    self.advance_improve_finding(tx);
                 }
             }
             AppEvent::ReviewPrScanned {
@@ -9954,11 +9991,26 @@ fn kick_off_improve_commit(
             let post = service.bugkill_snapshot(&worktree_path).await?;
             let changes = compute_attempt_changes(&post.tracked, &post.untracked, &pre.untracked);
             if changes.commit_paths.is_empty() {
+                service
+                    .improve_abort_cleanup(&worktree_path, &changes, &pre)
+                    .await?;
                 return Ok(ImproveCommitOutcome::NoChanges);
             }
-            let sha = service
+            let sha = match service
                 .improve_commit_attempt(&worktree_path, &changes, index + 1, &finding)
-                .await?;
+                .await
+            {
+                Ok(sha) => sha,
+                Err(commit_error) => {
+                    service
+                        .improve_abort_cleanup(&worktree_path, &changes, &pre)
+                        .await
+                        .map_err(|cleanup_error| WisetreeError::other(format!(
+                            "{commit_error}; additionally could not clean up the failed attempt: {cleanup_error}"
+                        )))?;
+                    return Err(commit_error);
+                }
+            };
             Ok(ImproveCommitOutcome::Committed { sha })
         }
         .await
@@ -9988,7 +10040,7 @@ fn kick_off_improve_abort(
             let post = service.bugkill_snapshot(&worktree_path).await?;
             let changes = compute_attempt_changes(&post.tracked, &post.untracked, &pre.untracked);
             service
-                .bugkill_abort_cleanup(&worktree_path, &changes.all)
+                .improve_abort_cleanup(&worktree_path, &changes, &pre)
                 .await
         }
         .await
