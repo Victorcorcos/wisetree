@@ -102,7 +102,7 @@ TEST_FILE_INVENTORY
 FULL_DIFF
 ```
 
-- Compact existing-comment keys grouped by file:
+- Structured Wisetree finding keys already posted, grouped by file:
 
 ```
 EXISTING_COMMENTS

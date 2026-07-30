@@ -66,6 +66,8 @@ pub(crate) fn relationship_groups(
 
     let mut visited = vec![false; files.len()];
     let mut raw_groups = Vec::<Vec<usize>>::new();
+    let mut current = Vec::new();
+    let mut bytes = 0usize;
     for start in 0..files.len() {
         if visited[start] {
             continue;
@@ -83,8 +85,6 @@ pub(crate) fn relationship_groups(
             }
         }
         component.sort_unstable();
-        let mut current = Vec::new();
-        let mut bytes = 0usize;
         for index in component {
             let next = files[index].bytes;
             if !current.is_empty() && bytes.saturating_add(next) > focus_bytes {
@@ -98,9 +98,9 @@ pub(crate) fn relationship_groups(
                 bytes = 0;
             }
         }
-        if !current.is_empty() {
-            raw_groups.push(current);
-        }
+    }
+    if !current.is_empty() {
+        raw_groups.push(current);
     }
 
     let mut owner = vec![usize::MAX; files.len()];
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_cross_directory_references_and_separates_same_directory_noise() {
+    fn groups_cross_directory_references_before_filling_the_remaining_budget() {
         let files = [
             file(
                 "api/user_controller.rs",
@@ -347,7 +347,7 @@ mod tests {
             file("domain/user_service.rs", "pub struct UserService;", 10),
             file("api/unrelated.rs", "pub fn health() {}", 10),
         ];
-        let groups = relationship_groups(&files, 100);
+        let groups = relationship_groups(&files, 20);
         assert_eq!(groups[0].indices, vec![0, 1]);
         assert_eq!(groups[1].indices, vec![2]);
     }
@@ -403,6 +403,26 @@ mod tests {
     }
 
     #[test]
+    fn packs_unrelated_files_to_the_focus_budget_without_dropping_tail_files() {
+        let files = [
+            file("src/one.rs", "", 25),
+            file("src/two.rs", "", 25),
+            file("src/three.rs", "", 25),
+            file("src/tail.rs", "", 25),
+        ];
+        let groups = relationship_groups(&files, 75);
+        assert_eq!(groups[0].indices, vec![0, 1, 2]);
+        assert_eq!(groups[1].indices, vec![3]);
+        assert_eq!(
+            groups
+                .into_iter()
+                .flat_map(|group| group.indices)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
     fn high_degree_utility_does_not_merge_weak_neighbors() {
         let mut owned = Vec::new();
         for index in 0..12 {
@@ -410,7 +430,7 @@ mod tests {
         }
         let files = owned
             .iter()
-            .map(|(path, evidence)| file(path, evidence, 1))
+            .map(|(path, evidence)| file(path, evidence, 60))
             .collect::<Vec<_>>();
         let groups = relationship_groups(&files, 100);
         assert!(groups.len() > 1);
