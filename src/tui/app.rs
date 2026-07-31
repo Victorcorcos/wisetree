@@ -1348,6 +1348,7 @@ impl App {
                         improve_pr.render(frame, panel);
                     }
                 } else if let Some(review_pr) = self.review_pr.as_mut() {
+                    review_pr.tick = self.tick;
                     review_pr.render(frame, panel);
                 } else if let Some(improve_pr) = self.improve_pr.as_mut() {
                     improve_pr.render(frame, panel);
@@ -12185,6 +12186,19 @@ mod tests {
         app.screen = Screen::ImprovePullRequest;
         app.review_pr = Some(screen);
         app
+    }
+
+    #[test]
+    fn improve_scan_forwards_app_tick_to_review_progress() {
+        let mut app = improve_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        app.phase = InitPhase::Ready;
+        app.tick = 1;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        assert_eq!(app.review_pr.as_ref().unwrap().tick, 1);
     }
 
     #[test]
