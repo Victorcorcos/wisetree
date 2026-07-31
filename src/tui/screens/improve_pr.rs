@@ -23,8 +23,9 @@ use crate::tui::screens::update_pr::{
 };
 use crate::tui::widgets::PtyView;
 use crate::tui::widgets::{
-    labeled_line, AiRoleRow, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
-    OptionsGroup, OptionsGroupItem, PrConfirmView,
+    labeled_line, render_scrollable_summary_table, summary_row_counts, AiRoleRow,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, OptionsGroup, OptionsGroupItem,
+    PrConfirmView, Status, StatusIndicator, SummaryRow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,11 +43,45 @@ pub enum ImproveAction {
     Done,
 }
 
+/// What happened to one reviewed item, mapped to the Status column of the
+/// shared summary table (short label + color, detail in the last column).
+#[derive(Clone, PartialEq, Eq)]
+enum OutcomeKind {
+    /// Fix applied and committed; the detail carries the short SHA.
+    Applied,
+    /// The code already satisfied the finding — nothing to commit.
+    Addressed,
+    /// The user skipped the finding.
+    Skipped,
+    /// A file the reviewer never read; the detail carries the reason.
+    SkippedFile,
+    /// Apply/commit broke; the detail carries the message.
+    Failed,
+}
+
 #[derive(Clone)]
 struct ImproveOutcome {
     item: String,
-    status: String,
-    color: ratatui::style::Color,
+    kind: OutcomeKind,
+    detail: Option<String>,
+}
+
+impl ImproveOutcome {
+    fn row(&self) -> SummaryRow {
+        let item = self.item.clone();
+        let detail = self.detail.clone();
+        match self.kind {
+            OutcomeKind::Applied => SummaryRow::with_note(item, "Applied", colors::SUCCESS, detail),
+            OutcomeKind::Addressed => {
+                SummaryRow::with_note(item, "No change", colors::INFO, detail)
+            }
+            OutcomeKind::Skipped => SummaryRow::with_status(item, "Skipped", colors::WARNING, None),
+            OutcomeKind::SkippedFile => {
+                SummaryRow::with_warning(item, "Skipped", colors::WARNING, detail)
+            }
+            OutcomeKind::Failed => SummaryRow::with_status(item, "Failed", colors::ERROR, detail),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -232,11 +267,27 @@ impl ImprovePullRequestScreen {
         if self.done {
             return match key.code {
                 KeyCode::Up => {
-                    self.done_scroll = self.done_scroll.saturating_sub(1);
+                    self.handle_mouse_scroll_up(1);
                     ImproveAction::Continue
                 }
                 KeyCode::Down => {
-                    self.done_scroll = self.done_scroll.saturating_add(1).min(self.done_max_scroll);
+                    self.handle_mouse_scroll_down(1);
+                    ImproveAction::Continue
+                }
+                KeyCode::PageUp => {
+                    self.handle_mouse_scroll_up(10);
+                    ImproveAction::Continue
+                }
+                KeyCode::PageDown => {
+                    self.handle_mouse_scroll_down(10);
+                    ImproveAction::Continue
+                }
+                KeyCode::Home => {
+                    self.done_scroll = 0;
+                    ImproveAction::Continue
+                }
+                KeyCode::End => {
+                    self.done_scroll = self.done_max_scroll;
                     ImproveAction::Continue
                 }
                 KeyCode::Enter | KeyCode::Esc => ImproveAction::Done,
@@ -727,24 +778,25 @@ impl ImprovePullRequestScreen {
         self.outcomes
             .extend(skipped.iter().map(|file| ImproveOutcome {
                 item: format!("Skipped file: {}", file.path),
-                status: format!("Skipped ({})", file.reason),
-                color: colors::MUTED,
+                kind: OutcomeKind::SkippedFile,
+                detail: Some(file.reason.to_string()),
             }));
     }
     pub fn record_applied(&mut self, sha: String) {
-        self.record_current_outcome(
-            format!("Applied ({})", &sha[..sha.len().min(8)]),
-            colors::SUCCESS,
-        );
+        let short = sha[..sha.len().min(8)].to_string();
+        self.record_current_outcome(OutcomeKind::Applied, Some(format!("commit {short}")));
     }
     pub fn record_addressed(&mut self) {
-        self.record_current_outcome("Already addressed".to_string(), colors::MUTED);
+        self.record_current_outcome(
+            OutcomeKind::Addressed,
+            Some("already addressed".to_string()),
+        );
     }
     pub fn record_skipped(&mut self) {
-        self.record_current_outcome("Skipped".to_string(), colors::MUTED);
+        self.record_current_outcome(OutcomeKind::Skipped, None);
     }
     pub fn record_failed(&mut self, message: String) {
-        self.record_current_outcome(format!("Failed: {message}"), colors::ERROR);
+        self.record_current_outcome(OutcomeKind::Failed, Some(message));
     }
     pub fn enter_done(&mut self) {
         self.preparing = false;
@@ -757,12 +809,12 @@ impl ImprovePullRequestScreen {
         self.done_max_scroll = 0;
     }
 
-    fn record_current_outcome(&mut self, status: String, color: ratatui::style::Color) {
+    fn record_current_outcome(&mut self, kind: OutcomeKind, detail: Option<String>) {
         if let Some(finding) = self.finding.as_ref() {
             self.outcomes.push(ImproveOutcome {
                 item: format!("{} — {}", finding.descriptor(), finding.title),
-                status,
-                color,
+                kind,
+                detail,
             });
         }
     }
@@ -907,60 +959,72 @@ impl ImprovePullRequestScreen {
     }
 
     fn render_done(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let rows: Vec<SummaryRow> = self.outcomes.iter().map(ImproveOutcome::row).collect();
+        // Files the reviewer never got to read are withheld work, not broken
+        // work — the headline counts them apart from hard failures, as Review
+        // does on its own Done page.
+        let (failed, withheld) = summary_row_counts(&rows);
         let applied = self
             .outcomes
             .iter()
-            .filter(|outcome| outcome.status.starts_with("Applied"))
+            .filter(|outcome| matches!(outcome.kind, OutcomeKind::Applied))
             .count();
-        let mut lines = vec![
-            Line::from(Span::styled(
-                "Improve complete",
-                Style::default()
-                    .fg(colors::IMPROVE)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!(
-                "{} checkpoint commit(s) created. Every result is retained below.",
-                applied
-            )),
-            Line::default(),
-        ];
-        if let Some(range) = &self.reviewed_range {
-            lines.push(Line::from(Span::styled(
-                range.clone(),
-                Style::default().fg(colors::MUTED),
-            )));
-            lines.push(Line::default());
-        }
-        if self.outcomes.is_empty() {
-            lines.push(Line::from("No reviewable improvements were found."));
-        } else {
-            for outcome in &self.outcomes {
-                lines.push(Line::from(Span::styled(
-                    outcome.item.clone(),
-                    Style::default().fg(colors::WHITE),
-                )));
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", outcome.status),
-                    Style::default().fg(outcome.color),
-                )));
+        let (status, headline) = if failed > 0 || withheld > 0 {
+            let mut parts = Vec::new();
+            if failed > 0 {
+                parts.push(format!("{failed} failure(s)"));
             }
+            if withheld > 0 {
+                parts.push(format!("{withheld} skipped"));
+            }
+            (
+                if failed > 0 {
+                    Status::Error
+                } else {
+                    Status::Info
+                },
+                format!("Finished with {} — see below.", parts.join(" · ")),
+            )
+        } else if self.outcomes.is_empty() {
+            (
+                Status::Success,
+                "No issues found — the code looks good!".to_string(),
+            )
+        } else {
+            (
+                Status::Success,
+                format!("Applied {applied} improvement(s) as checkpoint commit(s)!"),
+            )
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        StatusIndicator::new(status, headline)
+            .without_spinner()
+            .render(frame, chunks[0]);
+        if rows.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No reviewable improvements were found.").style(muted_dim()),
+                chunks[1],
+            );
+            self.done_max_scroll = 0;
+        } else {
+            self.done_max_scroll =
+                render_scrollable_summary_table(&rows, self.done_scroll, frame, chunks[1]);
         }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "↑/↓ scroll · Enter/Esc return to dashboard",
-            Style::default().fg(colors::MUTED),
-        )));
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Improve results ");
-        let inner = block.inner(area);
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        self.done_max_scroll = paragraph
-            .line_count(inner.width)
-            .saturating_sub(inner.height.into()) as u16;
         self.done_scroll = self.done_scroll.min(self.done_max_scroll);
-        frame.render_widget(paragraph.block(block).scroll((self.done_scroll, 0)), area);
+        let footer = match (self.done_max_scroll > 0, self.reviewed_range.as_deref()) {
+            (true, Some(range)) => format!("↑/↓ · PgUp/PgDn scroll · Enter/Esc continue · {range}"),
+            (true, None) => "↑/↓ · PgUp/PgDn scroll · Enter/Esc continue".to_string(),
+            (false, Some(range)) => format!("Press Enter or Esc to continue · {range}"),
+            (false, None) => "Press Enter or Esc to continue".to_string(),
+        };
+        frame.render_widget(Paragraph::new(footer).style(muted_dim()), chunks[2]);
     }
     pub fn current_index(&self) -> usize {
         self.current
@@ -1546,23 +1610,42 @@ mod tests {
         screen.enter_done();
 
         let wide = render(&mut screen, 100, 20);
-        assert!(wide.contains("Improve complete"));
-        assert!(wide.contains("checkpoint commit"));
-        assert!(wide.contains("Applied (12345678)"));
-        assert!(wide.contains("Already addressed"));
+        assert!(wide.contains("[ERROR]"));
+        assert!(wide.contains("1 failure(s)"));
+        assert!(wide.contains("1 skipped"));
+        assert!(wide.contains("Command"));
+        assert!(wide.contains("Status"));
+        assert!(wide.contains("Failure"));
+        assert!(wide.contains("Applied"));
+        assert!(wide.contains("commit 12345678"));
+        assert!(wide.contains("No change"));
         assert!(wide.contains("Skipped"));
-        assert!(wide.contains("Failed:"));
+        assert!(wide.contains("Failed"));
 
         screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let narrow = render(&mut screen, 36, 8);
-        assert!(narrow.contains("Improve results"));
+        assert!(narrow.contains("showing"));
         for _ in 0..40 {
             screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             render(&mut screen, 36, 8);
         }
         let bottom = screen.done_scroll;
+        assert!(bottom > 0, "the table must scroll when the rows overflow");
         screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(screen.done_scroll, bottom);
+
+        // Page + Home/End move the same viewport, as on Review's scrollable pages.
+        screen.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, 0);
+        screen.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, bottom);
+        screen.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, 0);
+        screen.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, bottom);
+        screen.handle_mouse_scroll_up(1);
+        assert_eq!(screen.done_scroll, bottom - 1);
+
         assert_eq!(
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Done
