@@ -949,35 +949,10 @@ impl App {
                         .improve_pr
                         .as_mut()
                         .map(|screen| (screen.tick_pty(), screen.applying(), screen.autonomous()));
-                    match improve_status {
-                        Some((true, true, true)) => {
-                            let turn = self
-                                .improve_apply_watch
-                                .as_mut()
-                                .map(AiTurnWatcher::check_now)
-                                .unwrap_or(AiTurn::Working);
-                            if matches!(turn, AiTurn::Working) {
-                                // A PTY exit without a completed turn is an
-                                // interruption, never an approval to commit.
-                                self.fail_improve_apply(
-                                    "AI session exited before completing the improvement."
-                                        .to_string(),
-                                    &tx,
-                                );
-                            } else {
-                                self.on_improve_turn(turn, &tx);
-                            }
-                        }
-                        Some((false, true, true)) => {
-                            if let Some(turn) = self
-                                .improve_apply_watch
-                                .as_mut()
-                                .and_then(AiTurnWatcher::poll)
-                            {
-                                self.on_improve_turn(turn, &tx);
-                            }
-                        }
-                        _ => self.improve_apply_watch = None,
+                    if let Some((exited, applying, autonomous)) = improve_status {
+                        self.on_improve_tick(exited, applying, autonomous, &tx);
+                    } else {
+                        self.improve_apply_watch = None;
                     }
                     // Same for the Bugkill PTYs. The Investigating TUI never
                     // exits on its own, so completion comes from the turn
@@ -3371,6 +3346,48 @@ impl App {
         }
     }
 
+    fn on_improve_tick(
+        &mut self,
+        exited: bool,
+        applying: bool,
+        autonomous: bool,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match (exited, applying) {
+            (true, true) => {
+                let turn = self
+                    .improve_apply_watch
+                    .as_mut()
+                    .map(AiTurnWatcher::check_now)
+                    .unwrap_or(AiTurn::Working);
+                if matches!(turn, AiTurn::Working) {
+                    // A PTY exit without a completed turn is an interruption,
+                    // never an approval to commit. Manual mode retains its
+                    // explicit completion fallback; autonomous mode advances.
+                    self.improve_apply_watch = None;
+                    if autonomous {
+                        self.fail_improve_apply(
+                            "AI session exited before completing the improvement.".to_string(),
+                            tx,
+                        );
+                    }
+                } else {
+                    self.on_improve_turn(turn, tx);
+                }
+            }
+            (false, true) => {
+                if let Some(turn) = self
+                    .improve_apply_watch
+                    .as_mut()
+                    .and_then(AiTurnWatcher::poll)
+                {
+                    self.on_improve_turn(turn, tx);
+                }
+            }
+            _ => self.improve_apply_watch = None,
+        }
+    }
+
     fn apply_improve_apply_ready(
         &mut self,
         index: usize,
@@ -3389,10 +3406,11 @@ impl App {
                 let (snapshot, handoff) = *payload;
                 let mut spawn_failed = false;
                 if let Some(screen) = self.improve_pr.as_mut() {
-                    if screen.autonomous() {
-                        self.improve_apply_watch =
-                            Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
-                    }
+                    // Apply/Other/Skip remains a manual decision, but detecting
+                    // that the selected AI finished should never require a
+                    // second confirmation from the user.
+                    self.improve_apply_watch =
+                        Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
                     screen.set_pre_snapshot(snapshot);
                     spawn_failed = !screen.spawn_opencode_pty(
                         handoff.command.binary,
@@ -11975,11 +11993,11 @@ fn reset_global_config() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{AiFixConfig, WorktreeConfig};
+    use crate::config::schema::{AiFixConfig, AiReviewConfig, WorktreeConfig};
     use crate::config::service::ConfigService;
     use crate::services::{
         AiStatusReport, DevelopPlan, DevelopPreflight, PlanSection, PullRequest, ReviewComment,
-        ReviewerSummary,
+        ReviewSeverity, ReviewerSummary,
     };
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
@@ -12199,6 +12217,63 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).unwrap();
 
         assert_eq!(app.review_pr.as_ref().unwrap().tick, 1);
+    }
+
+    #[tokio::test]
+    async fn manual_improve_apply_advances_when_the_ai_turn_finishes() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("repo-improve");
+        fs::create_dir(&worktree).expect("worktree dir");
+        let projects = finished_claude_turn(tmp.path(), &worktree, "improvement applied");
+        let request = ImproveRequest {
+            branch: "improve-retries".to_string(),
+            worktree_path: worktree.display().to_string(),
+            number: None,
+            title: None,
+        };
+        let mut screen = ImprovePullRequestScreen::new(
+            request,
+            AiReviewConfig::default(),
+            AiFixConfig::default(),
+        );
+        screen.show_finding(
+            ReviewFinding {
+                category: "Correctness".to_string(),
+                severity: ReviewSeverity::High,
+                file: "src/lib.rs".to_string(),
+                start_line: Some(4),
+                line: Some(4),
+                title: "Avoid duplicate work".to_string(),
+                explanation: "The operation runs twice.".to_string(),
+                suggestion: Some("Cache the result.".to_string()),
+            },
+            0,
+            1,
+        );
+        screen.start_applying();
+        screen.set_pre_snapshot(BugkillSnapshot::default());
+        assert!(!screen.autonomous());
+
+        let mut app = initialized_menu_app();
+        app.screen = Screen::ImprovePullRequest;
+        app.improve_pr = Some(screen);
+        app.improve_apply_watch = Some(AiTurnWatcher::with_paths(
+            AiHarness::ClaudeCode,
+            &worktree,
+            crate::services::AiStatusPaths {
+                claude_projects: Some(projects),
+                ..Default::default()
+            },
+            std::time::SystemTime::now() - Duration::from_secs(1),
+        ));
+
+        app.on_improve_tick(false, true, false, &tx);
+
+        let screen = app.improve_pr.as_ref().unwrap();
+        assert!(!screen.applying());
+        assert!(screen.committing());
+        assert!(app.improve_apply_watch.is_none());
     }
 
     #[test]
