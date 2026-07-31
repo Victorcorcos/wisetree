@@ -149,6 +149,7 @@ const REVIEW_DIRECTORY_INVENTORY_MAX_BYTES: usize = 2 * 1024;
 /// Full new-side files at or below this cap are attached to scan inputs.
 const REVIEW_FILE_INLINE_MAX_BYTES: usize = 16 * 1024;
 const REVIEW_SYMBOL_SOURCE_MAX_BYTES: usize = 1024 * 1024;
+const GIT_EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// Small files are clearer as one numbered view. Larger files only retain that
 /// view when the diff changes enough of the file to make the full context pay
 /// for itself.
@@ -3520,9 +3521,15 @@ impl DashboardService {
     }
 
     /// Prepare Improve's local discovery input. Unlike Review this never
-    /// syncs, fetches, or consults GitHub: it reviews precisely the committed
-    /// three-dot range from the worktree's resolved base ref to `HEAD`.
-    pub async fn prepare_improve(&self, worktree_path: &str) -> Result<ImprovePreparation> {
+    /// syncs, fetches, or consults GitHub. The default reviews the committed
+    /// three-dot range from the resolved base ref to `HEAD`; full scan treats
+    /// every tracked source and test file as new so the same review pipeline
+    /// inspects the entire current tree.
+    pub async fn prepare_improve(
+        &self,
+        worktree_path: &str,
+        full_scan: bool,
+    ) -> Result<ImprovePreparation> {
         if !self.config.ai.review.has_discovery_models()
             || self.config.ai.fix.apply.model.trim().is_empty()
         {
@@ -3582,11 +3589,19 @@ impl DashboardService {
             return Ok(ImprovePreparation::DirtyWorktree);
         }
 
-        let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await
-        else {
-            return Ok(ImprovePreparation::BaseRefUnresolved);
+        let (base_ref, range) = if full_scan {
+            (
+                "full worktree".to_string(),
+                format!("{GIT_EMPTY_TREE}..HEAD"),
+            )
+        } else {
+            let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await
+            else {
+                return Ok(ImprovePreparation::BaseRefUnresolved);
+            };
+            let range = format!("{base_ref}...HEAD");
+            (base_ref, range)
         };
-        let range = format!("{base_ref}...HEAD");
         let diff = time::timeout(
             REVIEW_FETCH_TIMEOUT,
             run_command(
@@ -3598,11 +3613,13 @@ impl DashboardService {
         .await
         .map_err(|_| WisetreeError::other("local Improve diff timed out"))?
         .map_err(WisetreeError::other)?;
-        let parsed = parse_review_diff(&diff);
+        let mut parsed = parse_review_diff(&diff);
+        if full_scan {
+            parsed.retain(|file| full_scan_skip_reason(&file.path).is_none());
+        }
         if parsed.is_empty() {
             return Ok(ImprovePreparation::NoChanges);
         }
-        let mut parsed = parsed;
         apply_project_test_patterns(&cwd, &mut parsed).await;
         let (mut files, skipped) = partition_reviewable_files(parsed);
         attach_review_file_contents(&cwd, &mut files).await;
@@ -8761,6 +8778,48 @@ pub(crate) fn review_skip_reason(path: &str) -> Option<&'static str> {
     }
     if name.contains(".generated.") || name.ends_with(".pb.go") || name.ends_with("_pb2.py") {
         return Some("generated code");
+    }
+    None
+}
+
+/// Full Scan inventories the repository rather than reviewing a user-selected
+/// diff, so it can discard files that are useful repository context but are
+/// not application or test code. Changed-file Review deliberately does not
+/// use these broader exclusions.
+fn full_scan_skip_reason(path: &str) -> Option<&'static str> {
+    if let Some(reason) = review_skip_reason(path) {
+        return Some(reason);
+    }
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let mut parts = lower.split('/');
+    if parts
+        .clone()
+        .any(|part| matches!(part, ".github" | ".gitlab" | "docs" | "doc"))
+    {
+        return Some("repository metadata or documentation");
+    }
+    let name = parts.next_back().unwrap_or_default();
+    if matches!(
+        name,
+        ".gitignore"
+            | ".gitattributes"
+            | ".gitmodules"
+            | ".editorconfig"
+            | ".dockerignore"
+            | ".npmignore"
+            | ".prettierignore"
+            | ".eslintignore"
+            | ".stylelintignore"
+            | ".rgignore"
+            | "license"
+            | "license.txt"
+            | "copying"
+            | "notice"
+    ) || matches!(
+        Path::new(name).extension().and_then(|value| value.to_str()),
+        Some("md" | "mdx" | "rst" | "adoc")
+    ) {
+        return Some("repository metadata or documentation");
     }
     None
 }
@@ -14714,7 +14773,7 @@ so the intent reads clearly.
         git(&repo, &["commit", "-q", "-m", "change"]);
 
         let prepared = improve_service(&repo, DashboardConfig::default())
-            .prepare_improve(repo.to_str().unwrap())
+            .prepare_improve(repo.to_str().unwrap(), false)
             .await
             .expect("prepare");
         match prepared {
@@ -14736,13 +14795,60 @@ so the intent reads clearly.
     }
 
     #[tokio::test]
+    async fn prepare_improve_full_scan_reviews_all_code_and_discards_unrelated_files() {
+        let (_tmp, repo) = improve_repo();
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
+        std::fs::write(repo.join("feature.rs"), "pub fn feature() {}\n").unwrap();
+        std::fs::write(
+            repo.join("tests/feature_test.rs"),
+            "#[test]\nfn feature() {}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("Gemfile.lock"), "LOCKED\n").unwrap();
+        std::fs::write(repo.join("README.md"), "# Project\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(repo.join("node_modules/pkg/index.js"), "export {};\n").unwrap();
+        git(&repo, &["add", "-f", "."]);
+        git(&repo, &["commit", "-q", "-m", "feature"]);
+
+        let prepared = improve_service(&repo, DashboardConfig::default())
+            .prepare_improve(repo.to_str().unwrap(), true)
+            .await
+            .expect("prepare full scan");
+        let ImprovePreparation::Ready {
+            base_ref, files, ..
+        } = prepared
+        else {
+            panic!("expected ready full scan, got {prepared:?}");
+        };
+        assert_eq!(base_ref, "full worktree");
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"app.rs"), "{paths:?}");
+        assert!(paths.contains(&"feature.rs"), "{paths:?}");
+        assert!(paths.contains(&"tests/feature_test.rs"), "{paths:?}");
+        for discarded in [
+            ".gitignore",
+            "Gemfile.lock",
+            "README.md",
+            "node_modules/pkg/index.js",
+        ] {
+            assert!(!paths.contains(&discarded), "{discarded} in {paths:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn prepare_improve_rejects_missing_models_or_harnesses() {
         let (_tmp, repo) = improve_repo();
         let mut config = DashboardConfig::default();
         config.ai.fix.apply.model.clear();
         assert_eq!(
             improve_service(&repo, config)
-                .prepare_improve(repo.to_str().unwrap())
+                .prepare_improve(repo.to_str().unwrap(), false)
                 .await
                 .unwrap(),
             ImprovePreparation::AiNotConfigured
@@ -14750,7 +14856,7 @@ so the intent reads clearly.
         assert_eq!(
             improve_service(&repo, DashboardConfig::default())
                 .with_opencode_binary(repo.join("missing-ai"))
-                .prepare_improve(repo.to_str().unwrap())
+                .prepare_improve(repo.to_str().unwrap(), false)
                 .await
                 .unwrap(),
             ImprovePreparation::AiUnavailable
@@ -14763,7 +14869,7 @@ so the intent reads clearly.
         std::fs::write(repo.join("dirty.txt"), "dirty\n").unwrap();
         assert_eq!(
             improve_service(&repo, DashboardConfig::default())
-                .prepare_improve(repo.to_str().unwrap())
+                .prepare_improve(repo.to_str().unwrap(), false)
                 .await
                 .unwrap(),
             ImprovePreparation::DirtyWorktree
@@ -14777,7 +14883,7 @@ so the intent reads clearly.
         git(tmp.path(), &["commit", "-q", "-m", "initial"]);
         assert_eq!(
             improve_service(tmp.path(), DashboardConfig::default())
-                .prepare_improve(tmp.path().to_str().unwrap())
+                .prepare_improve(tmp.path().to_str().unwrap(), false)
                 .await
                 .unwrap(),
             ImprovePreparation::BaseRefUnresolved
@@ -14789,7 +14895,7 @@ so the intent reads clearly.
         let (_tmp, repo) = improve_repo();
         assert_eq!(
             improve_service(&repo, DashboardConfig::default())
-                .prepare_improve(repo.to_str().unwrap())
+                .prepare_improve(repo.to_str().unwrap(), false)
                 .await
                 .unwrap(),
             ImprovePreparation::NoChanges
@@ -14800,7 +14906,7 @@ so the intent reads clearly.
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "binary"]);
         match improve_service(&repo, DashboardConfig::default())
-            .prepare_improve(repo.to_str().unwrap())
+            .prepare_improve(repo.to_str().unwrap(), false)
             .await
             .unwrap()
         {

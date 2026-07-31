@@ -22,7 +22,7 @@ use crate::tui::screens::update_pr::key_event_to_pty_bytes;
 use crate::tui::widgets::PtyView;
 use crate::tui::widgets::{
     labeled_line, AiRoleRow, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
-    PrConfirmView,
+    OptionsGroup, OptionsGroupItem, PrConfirmView,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +166,7 @@ pub struct ImprovePullRequestScreen {
     other: Option<crate::tui::widgets::InputPrompt>,
     edit: Option<EditState>,
     autonomous: bool,
+    full_scan: bool,
     applying: bool,
     committing: bool,
     aborting: bool,
@@ -198,6 +199,7 @@ impl ImprovePullRequestScreen {
             other: None,
             edit: None,
             autonomous: false,
+            full_scan: false,
             applying: false,
             committing: false,
             aborting: false,
@@ -218,6 +220,10 @@ impl ImprovePullRequestScreen {
 
     pub fn request(&self) -> &ImproveRequest {
         &self.request
+    }
+
+    pub fn full_scan(&self) -> bool {
+        self.full_scan
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ImproveAction {
@@ -340,6 +346,10 @@ impl ImprovePullRequestScreen {
                 KeyCode::Esc => ImproveAction::Skip,
                 _ => ImproveAction::Continue,
             };
+        }
+        if matches!(key.code, KeyCode::Char(' ')) {
+            self.full_scan = !self.full_scan;
+            return ImproveAction::Continue;
         }
         match self.confirm.handle_key(key) {
             ConfirmationOutcome::Confirmed => ImproveAction::Confirmed,
@@ -563,6 +573,15 @@ impl ImprovePullRequestScreen {
                     "Edit files",
                 ),
             ])
+            .options(Some(
+                OptionsGroup::new(vec![OptionsGroupItem::new(
+                    self.full_scan,
+                    "⚠️ Full Scan",
+                    "scan all tracked application and test code, not only this branch's changes; \
+                     dependency, generated, lock, and repository metadata files are excluded.",
+                )])
+                .with_hint("Toggle"),
+            ))
             .modal((!self.preparing).then_some(&self.confirm))
             .render(frame, area);
     }
@@ -1048,6 +1067,26 @@ mod tests {
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Confirmed
         );
+    }
+
+    #[test]
+    fn full_scan_is_explained_unchecked_and_toggled_with_space() {
+        let mut screen = screen();
+        let initial = render(&mut screen, 110, 40);
+        assert!(initial.contains("Full Scan"), "{initial}");
+        assert!(initial.contains("☐"), "{initial}");
+        assert!(
+            initial.contains("all tracked application and test code"),
+            "{initial}"
+        );
+        assert!(!screen.full_scan());
+
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            ImproveAction::Continue
+        );
+        assert!(screen.full_scan());
+        assert!(render(&mut screen, 110, 40).contains("☒"));
     }
 
     fn finding() -> ReviewFinding {

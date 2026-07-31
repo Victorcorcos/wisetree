@@ -3140,11 +3140,13 @@ impl App {
                     return;
                 };
                 let worktree_path = screen.request().worktree_path.clone();
+                let full_scan = screen.full_scan();
                 screen.start_preparing();
                 kick_off_prepare_improve(
                     self.git_root.clone(),
                     self.current_dashboard_config(),
                     worktree_path,
+                    full_scan,
                     tx.clone(),
                 );
             }
@@ -10453,6 +10455,7 @@ fn kick_off_prepare_improve(
     git_root: Option<String>,
     config: DashboardConfig,
     worktree_path: String,
+    full_scan: bool,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -10464,7 +10467,7 @@ fn kick_off_prepare_improve(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let result = service
-            .prepare_improve(&worktree_path)
+            .prepare_improve(&worktree_path, full_scan)
             .await
             .map(Box::new)
             .map_err(|err| user_friendly_message(&err));
