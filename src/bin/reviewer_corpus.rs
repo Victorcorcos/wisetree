@@ -208,7 +208,14 @@ fn controlled_case(template: &Template, shape: &str) -> Case {
 
 fn historical_case(commit: &str, category: &str, severity: &str) -> Result<Case> {
     let diff_output = Command::new("git")
-        .args(["show", "-R", "--format=", "--unified=3", commit])
+        .args([
+            "show",
+            "-R",
+            "--format=",
+            "--unified=3",
+            "--full-index",
+            commit,
+        ])
         .output()
         .with_context(|| format!("could not read historical commit {commit}"))?;
     if !diff_output.status.success() {
