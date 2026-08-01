@@ -4525,15 +4525,116 @@ impl SettingsScreen {
         );
     }
 
+    /// Build the wrapped "Current free models:" chip row as one or more
+    /// `Line`s, breaking to a new (indented) line whenever the next chip
+    /// would overflow `width`. Used both to size the chip row's layout slot
+    /// and to render it, so wrapping never clips chips off the right edge.
+    fn free_model_chip_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let muted_style = Style::default().fg(colors::MUTED);
+        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
+        let info_style = Style::default().fg(colors::INFO);
+
+        let prefix_spans: Vec<Span<'static>> = vec![
+            Span::styled("  ↳ ", muted_style),
+            Span::styled("Current free models: ", info_style),
+        ];
+        let prefix_width: usize = prefix_spans.iter().map(|s| s.content.chars().count()).sum();
+
+        let models = match &self.free_models {
+            None => {
+                let mut spans = prefix_spans;
+                spans.push(Span::styled("(loading from opencode)…", dim_muted_style));
+                return vec![Line::from(spans)];
+            }
+            Some(Err(message)) => {
+                let mut spans = prefix_spans;
+                spans.push(Span::styled(
+                    format!("(unavailable: {message})"),
+                    Style::default().fg(colors::ERROR),
+                ));
+                return vec![Line::from(spans)];
+            }
+            Some(Ok(models)) if models.is_empty() => {
+                let mut spans = prefix_spans;
+                spans.push(Span::styled("(none)", dim_muted_style));
+                return vec![Line::from(spans)];
+            }
+            Some(Ok(models)) => models,
+        };
+
+        let focused_chip = self
+            .ai_settings_editor
+            .as_ref()
+            .and_then(|e| match e.selection {
+                AiSettingsSelection::FreeModels(i) => Some(i),
+                _ => None,
+            });
+        let active = self
+            .ai_settings_editor
+            .as_ref()
+            .map(|e| {
+                AiSettingsEditor::slot(e.last_rect)
+                    .get(&e.ai)
+                    .model
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
+
+        let usable_width = (width as usize).max(prefix_width + 4);
+        let indent = " ".repeat(prefix_width);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut current: Vec<Span<'static>> = prefix_spans;
+        let mut current_width = prefix_width;
+
+        for (i, model) in models.iter().enumerate() {
+            let is_focused = focused_chip == Some(i);
+            let is_active = !active.is_empty() && active == *model;
+            let (left, right) = if is_focused { ("[", "]") } else { (" ", " ") };
+            let mut chip_style = if is_focused {
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active {
+                Style::default().fg(colors::SUCCESS)
+            } else {
+                Style::default().fg(colors::EMPHASIS)
+            };
+            if !is_focused && !is_active {
+                chip_style = chip_style.add_modifier(Modifier::DIM);
+            }
+
+            let chip_width = 2 + model.chars().count();
+            let is_line_start = current_width <= indent.chars().count();
+
+            if !is_line_start && current_width + 1 + chip_width > usable_width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current = vec![Span::styled(indent.clone(), muted_style)];
+                current_width = indent.chars().count();
+            } else if !is_line_start {
+                current.push(Span::styled(" ", muted_style));
+                current_width += 1;
+            }
+
+            current.push(Span::styled(left.to_string(), chip_style));
+            current.push(Span::styled(model.clone(), chip_style));
+            current.push(Span::styled(right.to_string(), chip_style));
+            current_width += chip_width;
+        }
+        lines.push(Line::from(current));
+        lines
+    }
+
     /// Render the shared "Current free models:" chip row beneath the AI
     /// Settings slots, plus a per-state action hint. The cursor sits in
     /// `AiSettingsSelection::FreeModels(i)`; the focused chip lights up ACCENT
     /// and a chip matching the targeted slot's model lights up SUCCESS. Enter
-    /// stages the focused chip into the most-recently-focused command.
+    /// stages the focused chip into the most-recently-focused command. Long
+    /// model lists wrap across multiple lines instead of clipping.
     fn render_ai_settings_free_models(&self, frame: &mut Frame, chips_area: Rect, hint_area: Rect) {
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
-        let info_style = Style::default().fg(colors::INFO);
 
         let focused_chip = self
             .ai_settings_editor
@@ -4543,61 +4644,8 @@ impl SettingsScreen {
                 _ => None,
             });
 
-        let mut spans: Vec<Span> = vec![
-            Span::styled("  ↳ ", muted_style),
-            Span::styled("Current free models: ", info_style),
-        ];
-        match &self.free_models {
-            None => {
-                spans.push(Span::styled("(loading from opencode)…", dim_muted_style));
-            }
-            Some(Err(message)) => {
-                spans.push(Span::styled(
-                    format!("(unavailable: {message})"),
-                    Style::default().fg(colors::ERROR),
-                ));
-            }
-            Some(Ok(models)) if models.is_empty() => {
-                spans.push(Span::styled("(none)", dim_muted_style));
-            }
-            Some(Ok(models)) => {
-                let active = self
-                    .ai_settings_editor
-                    .as_ref()
-                    .map(|e| {
-                        AiSettingsEditor::slot(e.last_rect)
-                            .get(&e.ai)
-                            .model
-                            .trim()
-                            .to_string()
-                    })
-                    .unwrap_or_default();
-                for (i, model) in models.iter().enumerate() {
-                    if i > 0 {
-                        spans.push(Span::styled(" ", muted_style));
-                    }
-                    let is_focused = focused_chip == Some(i);
-                    let is_active = !active.is_empty() && active == *model;
-                    let (left, right) = if is_focused { ("[", "]") } else { (" ", " ") };
-                    let mut chip_style = if is_focused {
-                        Style::default()
-                            .fg(colors::ACCENT)
-                            .add_modifier(Modifier::BOLD)
-                    } else if is_active {
-                        Style::default().fg(colors::SUCCESS)
-                    } else {
-                        Style::default().fg(colors::EMPHASIS)
-                    };
-                    if !is_focused && !is_active {
-                        chip_style = chip_style.add_modifier(Modifier::DIM);
-                    }
-                    spans.push(Span::styled(left.to_string(), chip_style));
-                    spans.push(Span::styled(model.clone(), chip_style));
-                    spans.push(Span::styled(right.to_string(), chip_style));
-                }
-            }
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), chips_area);
+        let lines = self.free_model_chip_lines(chips_area.width);
+        frame.render_widget(Paragraph::new(lines), chips_area);
 
         let action_hint = match &self.free_models {
             Some(Ok(models)) if !models.is_empty() && focused_chip.is_some() => {
@@ -4636,17 +4684,21 @@ impl SettingsScreen {
         // Each visible slot occupies a 3-row rectangle plus a 1-row hint.
         const SLOT_ROW_HEIGHT: u16 = 4;
 
+        // The free-model chip row wraps instead of clipping, so it can span
+        // more than one terminal row once enough models are cached.
+        let chip_row_height = self.free_model_chip_lines(area.width).len().max(1) as u16;
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),            // title
-                Constraint::Length(1),            // description
-                Constraint::Min(SLOT_ROW_HEIGHT), // scrollable slot rectangles
-                Constraint::Length(1),            // scroll indicator
-                Constraint::Length(1),            // chips line
-                Constraint::Length(1),            // chip-action hint
-                Constraint::Length(3),            // Save
-                Constraint::Length(1),            // bottom hint
+                Constraint::Length(1),               // title
+                Constraint::Length(1),               // description
+                Constraint::Min(SLOT_ROW_HEIGHT),    // scrollable slot rectangles
+                Constraint::Length(1),               // scroll indicator
+                Constraint::Length(chip_row_height), // chips line(s)
+                Constraint::Length(1),               // chip-action hint
+                Constraint::Length(3),               // Save
+                Constraint::Length(1),               // bottom hint
             ])
             .split(area);
 
