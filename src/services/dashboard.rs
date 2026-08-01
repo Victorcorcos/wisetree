@@ -15179,11 +15179,17 @@ so the intent reads clearly.
             ),
         )
         .unwrap();
-        make_executable(&gh_path);
-
-        let out = run_gh_command(&gh_path, &["pr", "diff", "1"], Some(dir.path()))
-            .await
-            .expect("should succeed after retries");
+        // Execute through the shell instead of directly. On macOS, directly
+        // spawning a just-written script can intermittently fail with ETXTBSY
+        // while the filesystem still considers it busy.
+        let script = gh_path.to_str().expect("temporary path is UTF-8");
+        let out = run_gh_command(
+            std::path::Path::new("/bin/sh"),
+            &[script, "pr", "diff", "1"],
+            Some(dir.path()),
+        )
+        .await
+        .expect("should succeed after retries");
         assert_eq!(out, "diff --git a/x b/x");
         assert_eq!(
             std::fs::read_to_string(&counter_path).unwrap(),
@@ -15210,11 +15216,14 @@ so the intent reads clearly.
             ),
         )
         .unwrap();
-        make_executable(&gh_path);
-
-        let err = run_gh_command(&gh_path, &["pr", "diff", "1"], Some(dir.path()))
-            .await
-            .expect_err("permanent failure should surface");
+        let script = gh_path.to_str().expect("temporary path is UTF-8");
+        let err = run_gh_command(
+            std::path::Path::new("/bin/sh"),
+            &[script, "pr", "diff", "1"],
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("permanent failure should surface");
         assert!(err.contains("HTTP 404"), "unexpected error: {err}");
         assert_eq!(
             std::fs::read_to_string(&counter_path).unwrap(),
