@@ -37,8 +37,8 @@ pub use pr_confirm::{
 pub use pty_view::PtyView;
 pub use scrollbar::render_vertical_scrollbar;
 pub use select_prompt::{
-    branded_line, branded_spans, SelectOption, SelectOutcome, SelectPrompt, SelectStyle,
-    SELECT_CURSOR,
+    branded_line, branded_spans, fuzzy_matches, SelectOption, SelectOutcome, SelectPrompt,
+    SelectStyle, SELECT_CURSOR,
 };
 pub use spinner::{spinner_frame, Spinner, SPINNER_FRAMES};
 pub use status_indicator::{Status, StatusIndicator};

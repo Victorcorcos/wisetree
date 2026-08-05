@@ -658,7 +658,7 @@ pub fn branded_spans(text: &str, base_style: Style, brand_style: Style) -> Vec<S
 /// Fuzzy match a single lowercase `needle` against a lowercase `haystack`:
 /// a substring hit wins outright, otherwise the needle's characters only have
 /// to appear in order (so "gpt56" still finds "gpt-5.6").
-fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
+pub fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }

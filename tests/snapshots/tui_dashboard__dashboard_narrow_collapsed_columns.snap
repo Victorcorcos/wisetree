@@ -1,11 +1,10 @@
 ---
 source: tests/tui_dashboard.rs
-assertion_line: 1129
 expression: "dump_lines(72, 20, |f| screen.render(f, f.area()))"
 ---
 Refreshed just now - 3 worktrees, 0 dirty, 1 PR open
 
-Search: type to filter...
+Search:  type to filter...
 
 Worktree        Branch        Status         A/B
    repo         main          Mother         =0

@@ -17,8 +17,9 @@ use crate::services::{
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
-    code_spans, code_style, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
-    SelectOption, SelectOutcome, SelectPrompt, Status, StatusIndicator,
+    code_spans, code_style, fuzzy_matches, ConfirmationChoice, ConfirmationModal,
+    ConfirmationOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status,
+    StatusIndicator,
 };
 
 const SELECT_MARKER: &str = " ➤ ";
@@ -469,7 +470,9 @@ pub struct DashboardScreen {
     loading: bool,
     error: Option<String>,
     mode: DashboardMode,
-    query: String,
+    /// The always-on search field. Reusing [`InputPrompt`] gives it the same
+    /// block cursor and readline shortcuts as every other input.
+    search: Box<InputPrompt>,
     action_select: Option<SelectPrompt<ActionChoice>>,
     action_target: Option<usize>,
     /// PR command buttons shown in the action menu's "Pull Request
@@ -538,7 +541,7 @@ impl DashboardScreen {
             loading: true,
             error: None,
             mode: DashboardMode::Table,
-            query: String::new(),
+            search: Box::new(InputPrompt::new("Search: ").with_placeholder("type to filter...")),
             action_select: None,
             action_target: None,
             pr_commands: Vec::new(),
@@ -675,9 +678,8 @@ impl DashboardScreen {
 
         match key.code {
             KeyCode::Esc => {
-                if !self.query.is_empty() {
-                    self.query.clear();
-                    self.selected = 0;
+                if !self.query().is_empty() {
+                    self.set_query("");
                     DashboardAction::Continue
                 } else {
                     DashboardAction::Back
@@ -713,35 +715,43 @@ impl DashboardScreen {
                 self.open_action_menu(index);
                 DashboardAction::Continue
             }
-            KeyCode::Backspace | KeyCode::Delete => {
-                // Backspace on an empty search jumps directly to the delete
-                // confirmation for the highlighted worktree. While the user is
-                // typing into the search box, Backspace edits the query.
-                if self.query.is_empty() {
-                    if let Some(index) = self.selected_row_index() {
-                        let row = &self.rows[index];
-                        if row.worktree.is_main {
-                            return DashboardAction::MotherWorktreeProtected;
-                        }
-                        return DashboardAction::JumpToDelete(row.worktree.path.clone());
+            // Backspace on an empty search jumps directly to the delete
+            // confirmation for the highlighted worktree. While the user is
+            // typing into the search box, Backspace edits the query.
+            KeyCode::Backspace | KeyCode::Delete if self.query().is_empty() => {
+                if let Some(index) = self.selected_row_index() {
+                    let row = &self.rows[index];
+                    if row.worktree.is_main {
+                        return DashboardAction::MotherWorktreeProtected;
                     }
-                    return DashboardAction::Continue;
+                    return DashboardAction::JumpToDelete(row.worktree.path.clone());
                 }
-                self.query.pop();
-                self.selected = 0;
                 DashboardAction::Continue
             }
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.query.push(c);
-                self.selected = 0;
+            // Everything else is text editing or cursor movement in the search
+            // field — Esc/Enter/↑/↓/Tab/Ctrl+R already returned above.
+            _ => {
+                let before = self.search.value.clone();
+                self.search.handle_key(key);
+                if self.search.value != before {
+                    self.selected = 0;
+                }
                 DashboardAction::Continue
             }
-            _ => DashboardAction::Continue,
         }
+    }
+
+    /// Current search text.
+    fn query(&self) -> &str {
+        &self.search.value
+    }
+
+    /// Replace the search text (cursor lands at the end) and reset the
+    /// selection to the first match.
+    fn set_query(&mut self, query: impl Into<String>) {
+        self.search.value = query.into();
+        self.search.cursor = self.search.value.chars().count();
+        self.selected = 0;
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -1577,12 +1587,13 @@ impl DashboardScreen {
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
-        let query = self.query.trim().to_ascii_lowercase();
+        let query = self.query().to_ascii_lowercase();
+        let tokens: Vec<&str> = query.split_whitespace().collect();
         self.rows
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                if query.is_empty() || self.row_matches_query(row, &query) {
+                if tokens.is_empty() || self.row_matches_query(row, &tokens) {
                     Some(index)
                 } else {
                     None
@@ -1591,7 +1602,10 @@ impl DashboardScreen {
             .collect()
     }
 
-    fn row_matches_query(&self, row: &DashboardRow, query: &str) -> bool {
+    /// A row matches when *every* query word matches at least one of its
+    /// columns, so "feature dirty" narrows instead of widening, and each word
+    /// matches fuzzily (substring, else in-order characters).
+    fn row_matches_query(&self, row: &DashboardRow, tokens: &[&str]) -> bool {
         let mut haystacks = vec![
             row.worktree.path.to_ascii_lowercase(),
             fold_home(&row.worktree.path).to_ascii_lowercase(),
@@ -1638,9 +1652,11 @@ impl DashboardScreen {
             haystacks.push(pr.title.to_ascii_lowercase());
             haystacks.push(pr.url.to_ascii_lowercase());
         }
-        haystacks
-            .into_iter()
-            .any(|haystack| haystack.contains(query))
+        tokens.iter().all(|token| {
+            haystacks
+                .iter()
+                .any(|haystack| fuzzy_matches(haystack, token))
+        })
     }
 
     fn selected_row_index(&self) -> Option<usize> {
@@ -1692,19 +1708,16 @@ impl DashboardScreen {
                 .fg(colors::INFO)
                 .add_modifier(Modifier::BOLD),
         )];
-        if self.query.is_empty() {
-            spans.push(Span::styled(
-                "type to filter...",
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            ));
-        } else {
-            spans.push(Span::styled(
-                self.query.clone(),
-                Style::default().fg(colors::EMPHASIS),
-            ));
-        }
+        // The field itself (text, placeholder and block cursor) comes from
+        // `InputPrompt`, so it looks and edits like every other input.
+        let field_style = Style::default().fg(colors::EMPHASIS);
+        spans.extend(
+            self.search
+                .inline_line()
+                .spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.into_owned(), field_style.patch(span.style))),
+        );
         Line::from(spans)
     }
 
@@ -4242,11 +4255,94 @@ mod tests {
             named_row("/tmp/repo-b", "feature-b", false, None, None),
         ]);
         // Only the row whose branch matches the query is "displayed".
-        screen.query = "feature-a".to_string();
+        screen.set_query("feature-a");
         assert_eq!(
             screen.update_all_branch_targets(),
             vec![("/tmp/repo-a".to_string(), "feature-a".to_string())]
         );
+    }
+
+    fn search_screen() -> DashboardScreen {
+        screen_with_rows(vec![
+            named_row("/tmp/repo-a", "feature-alpha", false, None, None),
+            named_row("/tmp/repo-b", "feature-beta", false, None, None),
+        ])
+    }
+
+    fn plain_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn type_search(screen: &mut DashboardScreen, text: &str) {
+        for c in text.chars() {
+            screen.handle_key(plain_key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn every_search_word_must_match_and_matching_is_fuzzy() {
+        let mut screen = search_screen();
+        // Words may arrive in any order and across different columns.
+        type_search(&mut screen, "alpha repo-a");
+        assert_eq!(screen.filtered_indices(), vec![0]);
+
+        // A word that matches nothing filters the row out, even though the
+        // other word matches.
+        screen.set_query("alpha nonsense");
+        assert!(screen.filtered_indices().is_empty());
+
+        // Characters only need to appear in order.
+        screen.set_query("ftbeta");
+        assert_eq!(screen.filtered_indices(), vec![1]);
+    }
+
+    #[test]
+    fn search_field_supports_cursor_movement_and_readline_shortcuts() {
+        let mut screen = search_screen();
+        type_search(&mut screen, "feature beta");
+
+        // Arrows move the text cursor, so edits land mid-string.
+        screen.handle_key(plain_key(KeyCode::Left));
+        screen.handle_key(plain_key(KeyCode::Char('X')));
+        assert_eq!(screen.query(), "feature betXa");
+
+        // Ctrl+W drops the word before the cursor.
+        screen.handle_key(ctrl_key(KeyCode::Char('w')));
+        assert_eq!(screen.query(), "feature a");
+
+        // Ctrl+A / Ctrl+E jump to the edges.
+        screen.handle_key(ctrl_key(KeyCode::Char('a')));
+        screen.handle_key(plain_key(KeyCode::Char('Y')));
+        assert_eq!(screen.query(), "Yfeature a");
+        screen.handle_key(ctrl_key(KeyCode::Char('e')));
+        screen.handle_key(plain_key(KeyCode::Char('Z')));
+        assert_eq!(screen.query(), "Yfeature aZ");
+
+        // Ctrl+U kills to the start.
+        screen.handle_key(ctrl_key(KeyCode::Char('u')));
+        assert_eq!(screen.query(), "");
+    }
+
+    #[test]
+    fn backspace_still_jumps_to_delete_only_while_the_search_is_empty() {
+        let mut screen = search_screen();
+        type_search(&mut screen, "alpha");
+        // With text in the field, Backspace edits it.
+        assert!(matches!(
+            screen.handle_key(plain_key(KeyCode::Backspace)),
+            DashboardAction::Continue
+        ));
+        assert_eq!(screen.query(), "alph");
+
+        screen.set_query("");
+        match screen.handle_key(plain_key(KeyCode::Backspace)) {
+            DashboardAction::JumpToDelete(path) => assert_eq!(path, "/tmp/repo-a"),
+            other => panic!("expected JumpToDelete, got {other:?}"),
+        }
     }
 
     #[test]
