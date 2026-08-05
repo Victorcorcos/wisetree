@@ -451,7 +451,7 @@ fn select_numeric_jump_when_not_searchable() {
 fn select_searchable_filters_and_resets_selection() {
     let mut s = SelectPrompt::new("Pick", opts(&["alpha", "beta", "gamma"])).searchable();
     s.handle_key(key(KeyCode::Char('a')));
-    assert_eq!(s.query, "a");
+    assert_eq!(s.query(), "a");
     let label = match s.handle_key(key(KeyCode::Enter)) {
         SelectOutcome::Selected(_, v) => v,
         _ => panic!("expected select"),
@@ -464,7 +464,7 @@ fn select_searchable_esc_clears_query_first_then_cancels() {
     let mut s = SelectPrompt::new("Pick", opts(&["a", "b"])).searchable();
     s.handle_key(key(KeyCode::Char('a')));
     matches!(s.handle_key(key(KeyCode::Esc)), SelectOutcome::Pending);
-    assert!(s.query.is_empty());
+    assert!(s.query().is_empty());
     matches!(s.handle_key(key(KeyCode::Esc)), SelectOutcome::Cancelled);
 }
 
