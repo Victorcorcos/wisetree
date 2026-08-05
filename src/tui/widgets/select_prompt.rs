@@ -163,25 +163,28 @@ impl<T: Clone> SelectPrompt<T> {
         if !self.searchable || self.query.is_empty() {
             return (0..self.options.len()).collect();
         }
-        let q = self.query.to_lowercase();
-        let number_idx: Option<usize> = q.trim().parse::<usize>().ok().and_then(|n| {
-            if n >= 1 && n <= self.options.len() {
-                Some(n - 1)
-            } else {
-                None
-            }
-        });
+        let tokens: Vec<&str> = self.query.split_whitespace().collect();
+        if tokens.is_empty() {
+            return (0..self.options.len()).collect();
+        }
         self.options
             .iter()
             .enumerate()
             .filter_map(|(i, o)| {
-                let label_match = o.label.to_lowercase().contains(&q);
-                let desc_match = self.search_description
-                    && o.description
-                        .as_ref()
-                        .is_some_and(|d| d.to_lowercase().contains(&q));
-                let number_match = number_idx == Some(i);
-                (label_match || desc_match || number_match).then_some(i)
+                // The row's number, label and (optionally) description form one
+                // haystack, so a query like "gpt-5.6 sol openai" — or "4024" —
+                // matches the row exactly as the user reads it on screen.
+                let mut haystack = format!("{}. {}", i + 1, o.label);
+                if self.search_description {
+                    if let Some(desc) = &o.description {
+                        haystack.push_str(&format!(" ({desc})"));
+                    }
+                }
+                let haystack = haystack.to_lowercase();
+                tokens
+                    .iter()
+                    .all(|token| fuzzy_matches(&haystack, &token.to_lowercase()))
+                    .then_some(i)
             })
             .collect()
     }
@@ -651,9 +654,83 @@ pub fn branded_spans(text: &str, base_style: Style, brand_style: Style) -> Vec<S
     spans
 }
 
+/// Fuzzy match a single lowercase `needle` against a lowercase `haystack`:
+/// a substring hit wins outright, otherwise the needle's characters only have
+/// to appear in order (so "gpt56" still finds "gpt-5.6").
+fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.contains(needle) {
+        return true;
+    }
+    let mut chars = haystack.chars();
+    needle.chars().all(|c| chars.any(|h| h == c))
+}
+
 fn contains_position(area: Rect, position: Position) -> bool {
     position.x >= area.left()
         && position.x < area.right()
         && position.y >= area.top()
         && position.y < area.bottom()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_prompt() -> SelectPrompt<usize> {
+        let mut options: Vec<SelectOption<usize>> = (0..4023)
+            .map(|i| SelectOption::new(format!("Model {i}"), i).with_description("Filler"))
+            .collect();
+        options.push(SelectOption::new("GPT-5.6 Sol", 4023).with_description("OpenAI"));
+        options.push(SelectOption::new("Claude Opus 5", 4024).with_description("Anthropic"));
+        SelectPrompt::new("Select AI model:", options).search_description()
+    }
+
+    #[test]
+    fn multi_word_query_matches_label_and_provider() {
+        let mut prompt = model_prompt();
+        prompt.query = "gpt-5.6 sol openai".to_string();
+        assert_eq!(prompt.filtered_indices(), vec![4023]);
+    }
+
+    #[test]
+    fn query_words_match_in_any_order() {
+        let mut prompt = model_prompt();
+        prompt.query = "anthropic opus".to_string();
+        assert_eq!(prompt.filtered_indices(), vec![4024]);
+    }
+
+    #[test]
+    fn row_number_is_searchable() {
+        let mut prompt = model_prompt();
+        prompt.query = "4024 sol".to_string();
+        assert_eq!(prompt.filtered_indices(), vec![4023]);
+    }
+
+    #[test]
+    fn characters_only_need_to_appear_in_order() {
+        let mut prompt = model_prompt();
+        prompt.query = "gpt56".to_string();
+        assert_eq!(prompt.filtered_indices(), vec![4023]);
+    }
+
+    #[test]
+    fn description_stays_out_of_the_haystack_without_the_flag() {
+        let mut prompt = SelectPrompt::new(
+            "Pick:",
+            vec![SelectOption::new("GPT-5.6 Sol", 0).with_description("OpenAI")],
+        )
+        .searchable();
+        prompt.query = "openai".to_string();
+        assert!(prompt.filtered_indices().is_empty());
+    }
+
+    #[test]
+    fn unmatched_query_filters_everything_out() {
+        let mut prompt = model_prompt();
+        prompt.query = "zzzz".to_string();
+        assert!(prompt.filtered_indices().is_empty());
+    }
 }
