@@ -20,8 +20,18 @@ use super::{OpencodeTurn, OpencodeTurnWatcher};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AiTurn {
     Working,
-    Finished { transcript: String },
-    Failed { message: String },
+    /// The provider rejected the current turn because a temporary usage
+    /// allowance was exhausted. The interactive CLI remains usable, so PR
+    /// workflows must keep its PTY alive for a follow-up prompt after reset.
+    UsageLimited {
+        message: String,
+    },
+    Finished {
+        transcript: String,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 const POLL_PERIOD: Duration = Duration::from_millis(1000);
@@ -117,9 +127,32 @@ impl From<OpencodeTurn> for AiTurn {
         match turn {
             OpencodeTurn::Working => Self::Working,
             OpencodeTurn::Finished { transcript } => Self::Finished { transcript },
+            OpencodeTurn::Failed { message } if is_usage_limit_error(&message) => {
+                Self::UsageLimited { message }
+            }
             OpencodeTurn::Failed { message } => Self::Failed { message },
         }
     }
+}
+
+/// Provider-neutral recognition of temporary account/rate allowances. Keep
+/// this deliberately narrower than generic "token limit" wording: context
+/// window failures require changing the prompt/session and are not cured by
+/// waiting in the existing PTY.
+fn is_usage_limit_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("usage limit")
+        || message.contains("session limit")
+        || message.contains("weekly limit")
+        || message.contains("rate limit")
+        || message.contains("rate_limit")
+        || message.contains("ratelimit")
+        || message.contains("quota exceeded")
+        || message.contains("exceeded your current quota")
+        || message.contains("insufficient_quota")
+        || message.contains("too many requests")
+        || message.contains("http 429")
+        || (message.contains("limit") && message.contains("reset"))
 }
 
 #[derive(Clone, Copy)]
@@ -186,6 +219,7 @@ impl JsonlTurnWatcher {
             .and_then(|turn| match turn {
                 AiTurn::Finished { transcript } => Some(transcript),
                 AiTurn::Working => read_assistant_text(self.harness, &file).ok(),
+                AiTurn::UsageLimited { .. } => read_assistant_text(self.harness, &file).ok(),
                 AiTurn::Failed { .. } => read_assistant_text(self.harness, &file).ok(),
             })
     }
@@ -380,6 +414,9 @@ fn codex_turn(lines: &[Value]) -> AiTurn {
         }
     }
     if let Some(message) = failure {
+        if is_usage_limit_error(&message) {
+            return AiTurn::UsageLimited { message };
+        }
         return AiTurn::Failed { message };
     }
     if !active || !completed {
@@ -441,7 +478,7 @@ fn claude_turn(lines: &[Value]) -> AiTurn {
         if line.get("type").and_then(Value::as_str) == Some("user")
             && line.get("promptId").is_some()
         {
-            state = Some(Ok(false));
+            state = Some(Ok(ClaudeTurnState::Working));
         }
         if line.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -449,26 +486,39 @@ fn claude_turn(lines: &[Value]) -> AiTurn {
         if line.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
             let message = claude_line_text(line)
                 .unwrap_or_else(|| "Claude Code reported an API error.".to_string());
-            state = Some(Err(message));
+            state = Some(if is_usage_limit_error(&message) {
+                Ok(ClaudeTurnState::UsageLimited(message))
+            } else {
+                Err(message)
+            });
             continue;
         }
         match line.pointer("/message/stop_reason").and_then(Value::as_str) {
-            Some("tool_use") => state = Some(Ok(false)),
+            Some("tool_use") => state = Some(Ok(ClaudeTurnState::Working)),
             Some("error") | Some("aborted") => {
                 state = Some(Err("Claude Code aborted the turn.".to_string()))
             }
-            Some(_) if claude_line_text(line).is_some() => state = Some(Ok(true)),
-            Some(_) => state = Some(Ok(false)),
+            Some(_) if claude_line_text(line).is_some() => {
+                state = Some(Ok(ClaudeTurnState::Finished))
+            }
+            Some(_) => state = Some(Ok(ClaudeTurnState::Working)),
             None => {}
         }
     }
     match state {
-        Some(Ok(false)) | None => AiTurn::Working,
+        Some(Ok(ClaudeTurnState::Working)) | None => AiTurn::Working,
+        Some(Ok(ClaudeTurnState::UsageLimited(message))) => AiTurn::UsageLimited { message },
         Some(Err(message)) => AiTurn::Failed { message },
-        Some(Ok(true)) => AiTurn::Finished {
+        Some(Ok(ClaudeTurnState::Finished)) => AiTurn::Finished {
             transcript: claude_text(lines),
         },
     }
+}
+
+enum ClaudeTurnState {
+    Working,
+    UsageLimited(String),
+    Finished,
 }
 
 fn claude_line_text(line: &Value) -> Option<String> {
@@ -618,8 +668,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_quota_error_is_not_overwritten_by_task_complete() {
-        let lines = vec![
+    fn codex_usage_limit_pauses_until_a_followup_turn_completes() {
+        let mut lines = vec![
             serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
             serde_json::json!({
                 "type": "event_msg",
@@ -633,8 +683,25 @@ mod tests {
 
         assert_eq!(
             codex_turn(&lines),
-            AiTurn::Failed {
+            AiTurn::UsageLimited {
                 message: "You've hit your usage limit".to_string()
+            }
+        );
+
+        lines.extend([
+            serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": "continued after reset"
+                }
+            }),
+        ]);
+        assert_eq!(
+            codex_turn(&lines),
+            AiTurn::Finished {
+                transcript: "continued after reset".to_string()
             }
         );
     }
@@ -743,8 +810,8 @@ mod tests {
     }
 
     #[test]
-    fn claude_api_limit_is_a_failure_with_the_provider_message() {
-        let lines = vec![
+    fn claude_api_limit_pauses_until_a_followup_turn_completes() {
+        let mut lines = vec![
             serde_json::json!({"type": "user", "promptId": "p"}),
             serde_json::json!({
                 "type": "assistant",
@@ -762,9 +829,45 @@ mod tests {
 
         assert_eq!(
             claude_turn(&lines),
-            AiTurn::Failed {
+            AiTurn::UsageLimited {
                 message: "You've hit your weekly limit · resets 6am".to_string()
             }
         );
+
+        lines.extend([
+            serde_json::json!({"type": "user", "promptId": "continued"}),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "done after reset"}]
+                }
+            }),
+        ]);
+        assert_eq!(
+            claude_turn(&lines),
+            AiTurn::Finished {
+                transcript: "You've hit your weekly limit · resets 6am\n\ndone after reset"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn opencode_usage_limit_maps_to_the_non_terminal_state() {
+        let turn = AiTurn::from(OpencodeTurn::Failed {
+            message: "Provider returned HTTP 429: Too Many Requests".to_string(),
+        });
+
+        assert!(matches!(turn, AiTurn::UsageLimited { .. }));
+        assert!(matches!(
+            AiTurn::from(OpencodeTurn::Failed {
+                message: "model unavailable".to_string()
+            }),
+            AiTurn::Failed { .. }
+        ));
+        assert!(!is_usage_limit_error(
+            "This model's context token limit was exceeded"
+        ));
     }
 }

@@ -2783,7 +2783,7 @@ impl App {
     /// gate alone would keep re-polling (and re-erroring) every second.
     fn on_explain_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
-            AiTurn::Working => {}
+            AiTurn::Working | AiTurn::UsageLimited { .. } => {}
             AiTurn::Finished { .. } => {
                 self.explain_draft = None;
                 self.on_explain_ready_to_review(tx);
@@ -3053,7 +3053,7 @@ impl App {
     /// error as a Failed row and advances to the next comment.
     fn on_fix_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
-            AiTurn::Working => {}
+            AiTurn::Working | AiTurn::UsageLimited { .. } => {}
             AiTurn::Finished { .. } => {
                 self.fix_apply_watch = None;
                 self.on_fix_apply_done(tx);
@@ -3353,7 +3353,7 @@ impl App {
 
     fn on_improve_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
-            AiTurn::Working => {}
+            AiTurn::Working | AiTurn::UsageLimited { .. } => {}
             AiTurn::Finished { .. } => self.finish_improve_apply(tx),
             AiTurn::Failed { message } => {
                 self.fail_improve_apply(
@@ -4636,7 +4636,7 @@ impl App {
     /// turn scans + commits the attempt; a failed turn surfaces the error.
     fn on_bugkill_fix_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
-            AiTurn::Working => {}
+            AiTurn::Working | AiTurn::UsageLimited { .. } => {}
             AiTurn::Finished { .. } => self.on_bugkill_fix_done(tx),
             AiTurn::Failed { message } => {
                 self.bugkill_fixing = None;
@@ -4860,7 +4860,7 @@ impl App {
     /// or Failed, keep waiting on Working.
     fn on_bugkill_turn(&mut self, turn: AiTurn, tx: &mpsc::UnboundedSender<AppEvent>) {
         match turn {
-            AiTurn::Working => {}
+            AiTurn::Working | AiTurn::UsageLimited { .. } => {}
             AiTurn::Finished { transcript } => self.finish_bugkill_investigation(transcript, tx),
             AiTurn::Failed { message } => {
                 self.bugkill_investigation = None;
@@ -5367,7 +5367,7 @@ impl App {
         let turn = turn.into();
         let step = self.develop_pr.as_ref().map(|s| s.step());
         match (step, turn) {
-            (_, AiTurn::Working) => {}
+            (_, AiTurn::Working | AiTurn::UsageLimited { .. }) => {}
             (Some(DevelopStep::Planning), AiTurn::Finished { transcript }) => {
                 self.finish_develop_plan(transcript, tx)
             }
@@ -6625,7 +6625,7 @@ impl App {
 
     fn on_update_conflict_turn(&mut self, turn: AiTurn) {
         match turn {
-            AiTurn::Working => return,
+            AiTurn::Working | AiTurn::UsageLimited { .. } => return,
             AiTurn::Finished { transcript } if !transcript.trim().is_empty() => {
                 if let Some(screen) = self.update_pr.as_mut() {
                     screen.mark_ai_done_verified();
@@ -16399,55 +16399,24 @@ mod tests {
     }
 
     #[test]
-    fn planning_ai_limit_failure_waits_for_an_explicit_retry() {
+    fn planning_ai_limit_keeps_the_current_workflow_waiting() {
         with_home(|home| {
             let repo = develop_repo(home);
             let (mut app, tx, mut rx) = app_with_active_develop_flow(&repo);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+            app.on_develop_turn(
+                AiTurn::UsageLimited {
+                    message: "You've hit your weekly limit · resets 6am".to_string(),
+                },
+                &tx,
+            );
 
-            runtime.block_on(async {
-                app.on_develop_turn(
-                    AiTurn::Failed {
-                        message: "You've hit your weekly limit · resets 6am".to_string(),
-                    },
-                    &tx,
-                );
-
-                let screen = app.develop_pr.as_ref().unwrap();
-                assert!(screen.error().is_some_and(
-                    |error| error.contains("You've hit your weekly limit · resets 6am")
-                ));
-                assert!(
-                    rx.try_recv().is_err(),
-                    "failure must not spend another call"
-                );
-
-                let action =
-                    app.develop_pr
-                        .as_mut()
-                        .unwrap()
-                        .handle_key(crossterm::event::KeyEvent::new(
-                            crossterm::event::KeyCode::Enter,
-                            crossterm::event::KeyModifiers::NONE,
-                        ));
-                app.apply_develop_action(action, &tx);
-
-                let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-                    .await
-                    .expect("manual retry should prepare a new plan")
-                    .expect("channel should stay open");
-                assert!(matches!(
-                    event,
-                    AppEvent::DevelopPlanReady {
-                        operation_id: 1,
-                        corrective: false,
-                        ..
-                    }
-                ));
-            });
+            let screen = app.develop_pr.as_ref().unwrap();
+            assert_eq!(screen.step(), DevelopStep::Planning);
+            assert!(screen.error().is_none());
+            assert!(
+                rx.try_recv().is_err(),
+                "a usage limit must neither fail nor restart the current run"
+            );
         });
     }
 
