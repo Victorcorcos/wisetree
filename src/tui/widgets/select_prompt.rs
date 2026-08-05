@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::messages::colors;
+use crate::tui::widgets::input_prompt::InputPrompt;
 
 pub const SELECT_CURSOR: &str = "➤ ";
 const BOXED_SELECT_CURSOR: &str = " ➤ ";
@@ -96,7 +97,10 @@ pub struct SelectPrompt<T: Clone> {
     pub label: String,
     pub options: Vec<SelectOption<T>>,
     pub selected: usize,
-    pub query: String,
+    /// The search field. Reusing [`InputPrompt`] gives the filter the same
+    /// block cursor and readline shortcuts (Ctrl+W/A/E/U/K, Ctrl/Alt+arrows,
+    /// …) as the worktree-name field. Read the text with [`Self::query`].
+    search: Box<InputPrompt>,
     pub searchable: bool,
     /// When `true`, the search filter also matches an option's `description`
     /// (not just its `label`). Lets the AI model picker filter by provider
@@ -114,7 +118,7 @@ impl<T: Clone> SelectPrompt<T> {
             label: label.into(),
             options,
             selected: 0,
-            query: String::new(),
+            search: Box::new(InputPrompt::new("Search: ").with_placeholder("type to filter...")),
             searchable: false,
             search_description: false,
             style: SelectStyle::Plain,
@@ -159,29 +163,49 @@ impl<T: Clone> SelectPrompt<T> {
         self
     }
 
-    fn filtered_indices(&self) -> Vec<usize> {
-        if !self.searchable || self.query.is_empty() {
+    /// Current search text.
+    pub fn query(&self) -> &str {
+        &self.search.value
+    }
+
+    /// Replace the search text (cursor lands at the end) and reset the
+    /// selection to the first match.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        self.search.value = query.into();
+        self.search.cursor = self.search.value.chars().count();
+        self.selected = 0;
+    }
+
+    /// Indices of the options that survive the current search, in display
+    /// order. Callers that mirror the rendered list (to map `selected` back to
+    /// an original option) must use this rather than re-implementing it.
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        if !self.searchable || self.query().is_empty() {
             return (0..self.options.len()).collect();
         }
-        let q = self.query.to_lowercase();
-        let number_idx: Option<usize> = q.trim().parse::<usize>().ok().and_then(|n| {
-            if n >= 1 && n <= self.options.len() {
-                Some(n - 1)
-            } else {
-                None
-            }
-        });
+        let query = self.query().to_lowercase();
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        if tokens.is_empty() {
+            return (0..self.options.len()).collect();
+        }
         self.options
             .iter()
             .enumerate()
             .filter_map(|(i, o)| {
-                let label_match = o.label.to_lowercase().contains(&q);
-                let desc_match = self.search_description
-                    && o.description
-                        .as_ref()
-                        .is_some_and(|d| d.to_lowercase().contains(&q));
-                let number_match = number_idx == Some(i);
-                (label_match || desc_match || number_match).then_some(i)
+                // The row's number, label and (optionally) description form one
+                // haystack, so a query like "gpt-5.6 sol openai" — or "4024" —
+                // matches the row exactly as the user reads it on screen.
+                let mut haystack = format!("{}. {}", i + 1, o.label);
+                if self.search_description {
+                    if let Some(desc) = &o.description {
+                        haystack.push_str(&format!(" ({desc})"));
+                    }
+                }
+                let haystack = haystack.to_lowercase();
+                tokens
+                    .iter()
+                    .all(|token| fuzzy_matches(&haystack, token))
+                    .then_some(i)
             })
             .collect()
     }
@@ -191,9 +215,8 @@ impl<T: Clone> SelectPrompt<T> {
 
         match key.code {
             KeyCode::Esc => {
-                if self.searchable && !self.query.is_empty() {
-                    self.query.clear();
-                    self.selected = 0;
+                if self.searchable && !self.query().is_empty() {
+                    self.set_query("");
                     return SelectOutcome::Pending;
                 }
                 return SelectOutcome::Cancelled;
@@ -231,21 +254,12 @@ impl<T: Clone> SelectPrompt<T> {
         }
 
         if self.searchable {
-            match key.code {
-                KeyCode::Backspace | KeyCode::Delete => {
-                    self.query.pop();
-                    self.selected = 0;
-                }
-                KeyCode::Char(c)
-                    if !c.is_control()
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    self.query.push(c);
-                    self.selected = 0;
-                }
-                _ => {}
+            // Esc/Enter/Up/Down already returned above, so everything that
+            // reaches the field is text editing or cursor movement.
+            let before = self.search.value.clone();
+            self.search.handle_key(key);
+            if self.search.value != before {
+                self.selected = 0;
             }
             return SelectOutcome::Pending;
         }
@@ -439,29 +453,19 @@ impl<T: Clone> SelectPrompt<T> {
         idx += 1;
 
         if self.searchable {
-            let line = Line::from(vec![
-                Span::styled(
-                    "Search: ",
-                    Style::default().fg(colors::MUTED).bg(colors::MENU_BG),
-                ),
-                Span::styled(
-                    self.query.clone(),
-                    Style::default()
-                        .fg(colors::MENU_SELECTION_FG)
-                        .bg(colors::MENU_BG),
-                ),
-                if self.query.is_empty() {
-                    Span::styled(
-                        "type to filter...",
-                        Style::default()
-                            .fg(colors::MUTED)
-                            .bg(colors::MENU_BG)
-                            .add_modifier(Modifier::DIM),
-                    )
-                } else {
-                    Span::raw("")
-                },
-            ]);
+            // The field itself (text, placeholder and block cursor) comes from
+            // `InputPrompt`, so it looks and edits like every other input.
+            let field_style = Style::default()
+                .fg(colors::MENU_SELECTION_FG)
+                .bg(colors::MENU_BG);
+            let mut spans = vec![Span::styled(
+                "Search: ",
+                Style::default().fg(colors::MUTED).bg(colors::MENU_BG),
+            )];
+            spans.extend(self.search.inline_line().spans.into_iter().map(|span| {
+                Span::styled(span.content.into_owned(), field_style.patch(span.style))
+            }));
+            let line = Line::from(spans);
             frame.render_widget(Paragraph::new(line).style(panel_style), chunks[idx]);
             idx += 1;
             idx += 1;
@@ -651,9 +655,184 @@ pub fn branded_spans(text: &str, base_style: Style, brand_style: Style) -> Vec<S
     spans
 }
 
+/// Fuzzy match a single lowercase `needle` against a lowercase `haystack`:
+/// a substring hit wins outright, otherwise the needle's characters only have
+/// to appear in order (so "gpt56" still finds "gpt-5.6").
+fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.contains(needle) {
+        return true;
+    }
+    let mut chars = haystack.chars();
+    needle.chars().all(|c| chars.any(|h| h == c))
+}
+
 fn contains_position(area: Rect, position: Position) -> bool {
     position.x >= area.left()
         && position.x < area.right()
         && position.y >= area.top()
         && position.y < area.bottom()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_prompt() -> SelectPrompt<usize> {
+        let mut options: Vec<SelectOption<usize>> = (0..4023)
+            .map(|i| SelectOption::new(format!("Model {i}"), i).with_description("Filler"))
+            .collect();
+        options.push(SelectOption::new("GPT-5.6 Sol", 4023).with_description("OpenAI"));
+        options.push(SelectOption::new("Claude Opus 5", 4024).with_description("Anthropic"));
+        SelectPrompt::new("Select AI model:", options).search_description()
+    }
+
+    #[test]
+    fn multi_word_query_matches_label_and_provider() {
+        let mut prompt = model_prompt();
+        prompt.set_query("gpt-5.6 sol openai");
+        assert_eq!(prompt.filtered_indices(), vec![4023]);
+    }
+
+    #[test]
+    fn query_words_match_in_any_order() {
+        let mut prompt = model_prompt();
+        prompt.set_query("anthropic opus");
+        assert_eq!(prompt.filtered_indices(), vec![4024]);
+    }
+
+    #[test]
+    fn row_number_is_searchable() {
+        let mut prompt = model_prompt();
+        prompt.set_query("4024 sol");
+        assert_eq!(prompt.filtered_indices(), vec![4023]);
+    }
+
+    #[test]
+    fn characters_only_need_to_appear_in_order() {
+        let mut prompt = model_prompt();
+        prompt.set_query("gpt56");
+        assert_eq!(prompt.filtered_indices(), vec![4023]);
+    }
+
+    #[test]
+    fn description_stays_out_of_the_haystack_without_the_flag() {
+        let mut prompt = SelectPrompt::new(
+            "Pick:",
+            vec![SelectOption::new("GPT-5.6 Sol", 0).with_description("OpenAI")],
+        )
+        .searchable();
+        prompt.set_query("openai");
+        assert!(prompt.filtered_indices().is_empty());
+    }
+
+    #[test]
+    fn unmatched_query_filters_everything_out() {
+        let mut prompt = model_prompt();
+        prompt.set_query("zzzz");
+        assert!(prompt.filtered_indices().is_empty());
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn type_str<T: Clone>(prompt: &mut SelectPrompt<T>, text: &str) {
+        for c in text.chars() {
+            prompt.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn typing_filters_and_resets_the_selection() {
+        let mut prompt = model_prompt();
+        prompt.selected = 7;
+        type_str(&mut prompt, "sol");
+        assert_eq!(prompt.query(), "sol");
+        assert_eq!(prompt.selected, 0);
+        assert_eq!(prompt.filtered_indices(), vec![4023]);
+    }
+
+    #[test]
+    fn arrows_move_the_text_cursor_so_edits_land_mid_string() {
+        let mut prompt = model_prompt();
+        type_str(&mut prompt, "gpt sol");
+        prompt.handle_key(key(KeyCode::Left));
+        prompt.handle_key(key(KeyCode::Left));
+        prompt.handle_key(key(KeyCode::Char('X')));
+        assert_eq!(prompt.query(), "gpt sXol");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_previous_word() {
+        let mut prompt = model_prompt();
+        type_str(&mut prompt, "gpt-5.6 sol openai");
+        prompt.handle_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(prompt.query(), "gpt-5.6 sol ");
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_jump_to_the_line_edges() {
+        let mut prompt = model_prompt();
+        type_str(&mut prompt, "sol");
+        prompt.handle_key(ctrl(KeyCode::Char('a')));
+        prompt.handle_key(key(KeyCode::Char('X')));
+        assert_eq!(prompt.query(), "Xsol");
+        prompt.handle_key(ctrl(KeyCode::Char('e')));
+        prompt.handle_key(key(KeyCode::Char('Y')));
+        assert_eq!(prompt.query(), "XsolY");
+    }
+
+    #[test]
+    fn ctrl_arrows_jump_whole_words() {
+        let mut prompt = model_prompt();
+        type_str(&mut prompt, "gpt sol");
+        prompt.handle_key(ctrl(KeyCode::Left));
+        prompt.handle_key(key(KeyCode::Char('X')));
+        assert_eq!(prompt.query(), "gpt Xsol");
+        prompt.handle_key(ctrl(KeyCode::Right));
+        prompt.handle_key(key(KeyCode::Char('Y')));
+        assert_eq!(prompt.query(), "gpt XsolY");
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_k_kill_to_the_edges() {
+        let mut prompt = model_prompt();
+        type_str(&mut prompt, "gpt sol");
+        prompt.handle_key(ctrl(KeyCode::Char('a')));
+        prompt.handle_key(ctrl(KeyCode::Char('k')));
+        assert_eq!(prompt.query(), "");
+
+        type_str(&mut prompt, "gpt sol");
+        prompt.handle_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(prompt.query(), "");
+    }
+
+    #[test]
+    fn navigation_and_selection_keys_still_beat_the_search_field() {
+        let mut prompt = model_prompt();
+        type_str(&mut prompt, "model");
+        prompt.handle_key(key(KeyCode::Down));
+        assert_eq!(prompt.selected, 1);
+        assert!(matches!(
+            prompt.handle_key(key(KeyCode::Enter)),
+            SelectOutcome::Selected(1, 1)
+        ));
+        // Esc clears the query first, then cancels.
+        assert!(matches!(
+            prompt.handle_key(key(KeyCode::Esc)),
+            SelectOutcome::Pending
+        ));
+        assert_eq!(prompt.query(), "");
+        assert!(matches!(
+            prompt.handle_key(key(KeyCode::Esc)),
+            SelectOutcome::Cancelled
+        ));
+    }
 }

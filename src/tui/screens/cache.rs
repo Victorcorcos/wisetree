@@ -366,19 +366,7 @@ impl CacheScreen {
     fn selected_entry_info(&self) -> Option<&CacheEntryInfo> {
         let overview = self.overview.as_ref()?;
         let select = self.select.as_ref()?;
-        let filtered = if select.searchable && !select.query.is_empty() {
-            let query = select.query.to_lowercase();
-            select
-                .options
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, option)| {
-                    option.label.to_lowercase().contains(&query).then_some(idx)
-                })
-                .collect::<Vec<_>>()
-        } else {
-            (0..select.options.len()).collect::<Vec<_>>()
-        };
+        let filtered = select.filtered_indices();
         let original = *filtered.get(select.selected)?;
         let selected_pattern = &select.options.get(original)?.value;
         overview
