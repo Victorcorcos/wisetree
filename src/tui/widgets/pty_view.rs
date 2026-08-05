@@ -42,11 +42,6 @@ const SCROLLBACK_ROWS: usize = 5000;
 /// their own scroll region (see [`PtyView::wheel_up`]).
 const PAGE_UP: &[u8] = b"\x1b[5~";
 const PAGE_DOWN: &[u8] = b"\x1b[6~";
-/// How long to hold a lone `Esc` while checking whether crossterm has split an
-/// SGR mouse report into individual key events. Normal PTY rendering runs
-/// every 16 ms, so a real Escape key is still delivered promptly.
-const FRAGMENTED_MOUSE_INPUT_TIMEOUT: Duration = Duration::from_millis(50);
-
 /// Reply to an `OSC 10` (query default foreground) request: a light gray,
 /// matching a dark terminal theme. Terminated with ST (`ESC \`).
 const OSC10_FG_REPLY: &[u8] = b"\x1b]10;rgb:c7c7/c7c7/c7c7\x1b\\";
@@ -88,12 +83,6 @@ pub struct PtyView {
     ///
     /// [`AiHarness::renders_inline`]: crate::config::schema::AiHarness::renders_inline
     renders_inline: bool,
-    /// Crossterm can occasionally split one macOS wheel report into ordinary
-    /// key events during continuous scrolling (crossterm#668): `Esc`, `[`,
-    /// `<`, `6`, `5`, ... . Without reassembly, the normal keyboard path sends
-    /// those fragments to an inline child, where Codex treats the leading
-    /// `Esc` as an interrupt and inserts the printable tail into its composer.
-    fragmented_mouse_input: FragmentedMouseInput,
 }
 
 impl PtyView {
@@ -205,7 +194,6 @@ impl PtyView {
             last_size: (DEFAULT_ROWS, DEFAULT_COLS),
             last_area: Cell::new(Rect::default()),
             renders_inline,
-            fragmented_mouse_input: FragmentedMouseInput::default(),
         })
     }
 
@@ -256,30 +244,13 @@ impl PtyView {
     }
 
     pub fn send_input(&mut self, bytes: &[u8]) {
-        if !self.renders_inline {
-            self.write_input(bytes);
-            return;
-        }
-
-        let now = Instant::now();
-        if let Some(stale) = self.fragmented_mouse_input.take_stale(now) {
-            self.write_input(&stale);
-        }
-        if let Some(filtered) = self.fragmented_mouse_input.filter(bytes, now) {
-            self.write_input(&filtered);
-        }
+        self.write_input(bytes);
     }
 
     fn write_input(&mut self, bytes: &[u8]) {
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.write_all(bytes);
             let _ = writer.flush();
-        }
-    }
-
-    fn flush_stale_fragmented_mouse_input(&mut self) {
-        if let Some(stale) = self.fragmented_mouse_input.take_stale(Instant::now()) {
-            self.write_input(&stale);
         }
     }
 
@@ -461,10 +432,6 @@ impl PtyView {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        // A genuine standalone Escape key has no following SGR fragments.
-        // Release it after the short disambiguation window even if the user
-        // provides no further input.
-        self.flush_stale_fragmented_mouse_input();
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -563,128 +530,6 @@ fn terminal_query_reply(chunk: &[u8]) -> Option<Vec<u8>> {
         reply.extend_from_slice(OSC11_BG_REPLY);
     }
     (!reply.is_empty()).then_some(reply)
-}
-
-#[derive(Debug, Default)]
-struct FragmentedMouseInput {
-    candidate: Vec<u8>,
-    updated_at: Option<Instant>,
-}
-
-impl FragmentedMouseInput {
-    /// Filter keyboard-path bytes while retaining normal keys byte-for-byte.
-    ///
-    /// A complete terminal control sequence such as an arrow key arrives in
-    /// one call and is forwarded immediately. Only a *lone* Escape starts a
-    /// candidate, matching crossterm's broken wheel-event shape. If the
-    /// following key events form a complete SGR mouse report, the report is
-    /// discarded; if they diverge, every buffered byte is released unchanged.
-    fn filter(&mut self, bytes: &[u8], now: Instant) -> Option<Vec<u8>> {
-        if self.candidate.is_empty() {
-            if bytes == b"\x1b" {
-                self.candidate.push(0x1b);
-                self.updated_at = Some(now);
-                return None;
-            }
-            return Some(bytes.to_vec());
-        }
-
-        self.candidate.extend_from_slice(bytes);
-        self.updated_at = Some(now);
-        match sgr_mouse_sequence_status(&self.candidate) {
-            SgrMouseSequenceStatus::Prefix => None,
-            SgrMouseSequenceStatus::Complete => {
-                self.clear();
-                None
-            }
-            SgrMouseSequenceStatus::Invalid => {
-                self.updated_at = None;
-                Some(std::mem::take(&mut self.candidate))
-            }
-        }
-    }
-
-    fn take_stale(&mut self, now: Instant) -> Option<Vec<u8>> {
-        let updated_at = self.updated_at?;
-        if now.saturating_duration_since(updated_at) < FRAGMENTED_MOUSE_INPUT_TIMEOUT {
-            return None;
-        }
-        self.updated_at = None;
-        Some(std::mem::take(&mut self.candidate))
-    }
-
-    fn clear(&mut self) {
-        self.candidate.clear();
-        self.updated_at = None;
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SgrMouseSequenceStatus {
-    Prefix,
-    Complete,
-    Invalid,
-}
-
-/// Recognize an SGR mouse report (`ESC [ < Cb ; Cx ; Cy M`) incrementally.
-///
-/// This intentionally accepts the optional semicolon before the final `M` /
-/// `m` that crossterm also accepts. A small length cap ensures a malicious or
-/// accidental `Esc[<...` prefix cannot hold input indefinitely.
-fn sgr_mouse_sequence_status(bytes: &[u8]) -> SgrMouseSequenceStatus {
-    const INTRODUCER: &[u8] = b"\x1b[<";
-    const MAX_REPORT_LEN: usize = 32;
-
-    if bytes.len() > MAX_REPORT_LEN {
-        return SgrMouseSequenceStatus::Invalid;
-    }
-    if bytes.len() < INTRODUCER.len() {
-        return if INTRODUCER.starts_with(bytes) {
-            SgrMouseSequenceStatus::Prefix
-        } else {
-            SgrMouseSequenceStatus::Invalid
-        };
-    }
-    if !bytes.starts_with(INTRODUCER) {
-        return SgrMouseSequenceStatus::Invalid;
-    }
-
-    let body = &bytes[INTRODUCER.len()..];
-    if matches!(body.last(), Some(b'M' | b'm')) {
-        let mut parameters = &body[..body.len() - 1];
-        if parameters.last() == Some(&b';') {
-            parameters = &parameters[..parameters.len() - 1];
-        }
-        let fields: Vec<&[u8]> = parameters.split(|byte| *byte == b';').collect();
-        return if fields.len() == 3
-            && fields
-                .iter()
-                .all(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
-        {
-            SgrMouseSequenceStatus::Complete
-        } else {
-            SgrMouseSequenceStatus::Invalid
-        };
-    }
-
-    if body
-        .iter()
-        .any(|byte| !byte.is_ascii_digit() && *byte != b';')
-    {
-        return SgrMouseSequenceStatus::Invalid;
-    }
-    let fields: Vec<&[u8]> = body.split(|byte| *byte == b';').collect();
-    let valid_prefix = fields.len() <= 4
-        && fields.iter().enumerate().all(|(index, field)| {
-            (!field.is_empty() && field.iter().all(u8::is_ascii_digit))
-                || (field.is_empty() && index + 1 == fields.len())
-        })
-        && (fields.len() < 4 || fields.last().is_some_and(|field| field.is_empty()));
-    if valid_prefix {
-        SgrMouseSequenceStatus::Prefix
-    } else {
-        SgrMouseSequenceStatus::Invalid
-    }
 }
 
 /// Encode a mouse event as an xterm mouse report for the child terminal.
@@ -838,109 +683,6 @@ mod tests {
 
     fn sgr(bytes: Option<Vec<u8>>) -> String {
         String::from_utf8(bytes.expect("expected a mouse report")).unwrap()
-    }
-
-    #[test]
-    fn fragmented_mouse_input_discards_crossterms_leaked_wheel_keys() {
-        // Exact shape reported by crossterm#668 and reproduced in Codex:
-        // one ScrollDown report becomes Esc + one printable KeyEvent per byte.
-        let mut filter = FragmentedMouseInput::default();
-        let mut now = Instant::now();
-        for byte in b"\x1b[<65;96;8M" {
-            assert_eq!(
-                filter.filter(&[*byte], now),
-                None,
-                "no fragment may reach the child"
-            );
-            now += Duration::from_millis(1);
-        }
-        assert!(filter.candidate.is_empty(), "complete report is discarded");
-        assert!(filter.updated_at.is_none());
-    }
-
-    #[test]
-    fn fragmented_mouse_input_preserves_real_escape_and_control_keys() {
-        let mut filter = FragmentedMouseInput::default();
-        let now = Instant::now();
-
-        // A complete arrow-key report was parsed normally by crossterm and
-        // must never be mistaken for its fragmented-mouse failure mode.
-        assert_eq!(filter.filter(b"\x1b[A", now), Some(b"\x1b[A".to_vec()));
-
-        // A standalone Escape is delayed only for the disambiguation window,
-        // then forwarded unchanged.
-        assert_eq!(filter.filter(b"\x1b", now), None);
-        assert_eq!(
-            filter.take_stale(now + FRAGMENTED_MOUSE_INPUT_TIMEOUT),
-            Some(vec![0x1b])
-        );
-
-        // A candidate that diverges from `ESC[<...` is released byte-for-byte.
-        assert_eq!(filter.filter(b"\x1b", now), None);
-        assert_eq!(filter.filter(b"[", now), None);
-        assert_eq!(filter.filter(b"A", now), Some(b"\x1b[A".to_vec()));
-    }
-
-    #[test]
-    fn fragmented_wheel_keys_do_not_reach_a_real_inline_child() {
-        let Some(sh) = resolve_on_path("sh") else {
-            return;
-        };
-        // Read exactly one raw byte after announcing readiness. If the leaked
-        // report is not filtered, this prints 27 (Escape); the correct first
-        // byte is the sentinel `z` (122).
-        let script = "stty raw -echo; printf 'ready\\r\\n'; head -c 1 | od -An -tu1";
-        let mut pty = PtyView::spawn(
-            &sh,
-            &["-c".to_string(), script.to_string()],
-            None,
-            &[],
-            true,
-        )
-        .expect("spawn sh");
-
-        let ready_deadline = Instant::now() + Duration::from_millis(2000);
-        while Instant::now() < ready_deadline {
-            if pty
-                .parser
-                .lock()
-                .unwrap()
-                .screen()
-                .contents()
-                .contains("ready")
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            pty.parser
-                .lock()
-                .unwrap()
-                .screen()
-                .contents()
-                .contains("ready"),
-            "child never became ready"
-        );
-
-        for byte in b"\x1b[<65;96;8M" {
-            pty.send_input(&[*byte]);
-        }
-        pty.send_input(b"z");
-
-        let output_deadline = Instant::now() + Duration::from_millis(2000);
-        let mut contents = String::new();
-        while Instant::now() < output_deadline {
-            contents = pty.parser.lock().unwrap().screen().contents();
-            if contents.contains("122") {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            contents.contains("122"),
-            "expected sentinel byte 122; leaked input reached child: {contents:?}"
-        );
     }
 
     #[test]
