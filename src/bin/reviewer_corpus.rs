@@ -213,7 +213,7 @@ fn historical_case(commit: &str, category: &str, severity: &str) -> Result<Case>
             "-R",
             "--format=",
             "--unified=3",
-            "--abbrev=7",
+            "--full-index",
             commit,
         ])
         .output()

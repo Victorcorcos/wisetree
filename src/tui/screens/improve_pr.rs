@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::schema::{AiFixConfig, AiReviewConfig};
@@ -18,11 +18,14 @@ use crate::services::dashboard::{ReviewFinding, ReviewSeverity};
 use crate::services::BugkillSnapshot;
 use crate::services::ReviewSkippedFile;
 use crate::tui::screens::dashboard::ImproveRequest;
-use crate::tui::screens::update_pr::key_event_to_pty_bytes;
+use crate::tui::screens::update_pr::{
+    button_paragraph, key_event_to_pty_bytes, render_pty_scrollbar,
+};
 use crate::tui::widgets::PtyView;
 use crate::tui::widgets::{
-    labeled_line, AiRoleRow, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
-    PrConfirmView,
+    labeled_line, render_scrollable_summary_table, summary_row_counts, AiRoleRow,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, OptionsGroup, OptionsGroupItem,
+    PrConfirmView, Status, StatusIndicator, SummaryRow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,11 +43,45 @@ pub enum ImproveAction {
     Done,
 }
 
+/// What happened to one reviewed item, mapped to the Status column of the
+/// shared summary table (short label + color, detail in the last column).
+#[derive(Clone, PartialEq, Eq)]
+enum OutcomeKind {
+    /// Fix applied and committed; the detail carries the short SHA.
+    Applied,
+    /// The code already satisfied the finding — nothing to commit.
+    Addressed,
+    /// The user skipped the finding.
+    Skipped,
+    /// A file the reviewer never read; the detail carries the reason.
+    SkippedFile,
+    /// Apply/commit broke; the detail carries the message.
+    Failed,
+}
+
 #[derive(Clone)]
 struct ImproveOutcome {
     item: String,
-    status: String,
-    color: ratatui::style::Color,
+    kind: OutcomeKind,
+    detail: Option<String>,
+}
+
+impl ImproveOutcome {
+    fn row(&self) -> SummaryRow {
+        let item = self.item.clone();
+        let detail = self.detail.clone();
+        match self.kind {
+            OutcomeKind::Applied => SummaryRow::with_note(item, "Applied", colors::SUCCESS, detail),
+            OutcomeKind::Addressed => {
+                SummaryRow::with_note(item, "No change", colors::INFO, detail)
+            }
+            OutcomeKind::Skipped => SummaryRow::with_status(item, "Skipped", colors::WARNING, None),
+            OutcomeKind::SkippedFile => {
+                SummaryRow::with_warning(item, "Skipped", colors::WARNING, detail)
+            }
+            OutcomeKind::Failed => SummaryRow::with_status(item, "Failed", colors::ERROR, detail),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -166,6 +203,7 @@ pub struct ImprovePullRequestScreen {
     other: Option<crate::tui::widgets::InputPrompt>,
     edit: Option<EditState>,
     autonomous: bool,
+    full_scan: bool,
     applying: bool,
     committing: bool,
     aborting: bool,
@@ -198,6 +236,7 @@ impl ImprovePullRequestScreen {
             other: None,
             edit: None,
             autonomous: false,
+            full_scan: false,
             applying: false,
             committing: false,
             aborting: false,
@@ -220,15 +259,35 @@ impl ImprovePullRequestScreen {
         &self.request
     }
 
+    pub fn full_scan(&self) -> bool {
+        self.full_scan
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> ImproveAction {
         if self.done {
             return match key.code {
                 KeyCode::Up => {
-                    self.done_scroll = self.done_scroll.saturating_sub(1);
+                    self.handle_mouse_scroll_up(1);
                     ImproveAction::Continue
                 }
                 KeyCode::Down => {
-                    self.done_scroll = self.done_scroll.saturating_add(1).min(self.done_max_scroll);
+                    self.handle_mouse_scroll_down(1);
+                    ImproveAction::Continue
+                }
+                KeyCode::PageUp => {
+                    self.handle_mouse_scroll_up(10);
+                    ImproveAction::Continue
+                }
+                KeyCode::PageDown => {
+                    self.handle_mouse_scroll_down(10);
+                    ImproveAction::Continue
+                }
+                KeyCode::Home => {
+                    self.done_scroll = 0;
+                    ImproveAction::Continue
+                }
+                KeyCode::End => {
+                    self.done_scroll = self.done_max_scroll;
                     ImproveAction::Continue
                 }
                 KeyCode::Enter | KeyCode::Esc => ImproveAction::Done,
@@ -252,6 +311,26 @@ impl ImprovePullRequestScreen {
                 return ImproveAction::Continue;
             }
             return match key.code {
+                KeyCode::PageUp => {
+                    self.handle_mouse_scroll_up(10);
+                    ImproveAction::Continue
+                }
+                KeyCode::PageDown => {
+                    self.handle_mouse_scroll_down(10);
+                    ImproveAction::Continue
+                }
+                KeyCode::Home => {
+                    if let Some(pty) = self.pty.as_mut() {
+                        pty.scroll_to_top();
+                    }
+                    ImproveAction::Continue
+                }
+                KeyCode::End => {
+                    if let Some(pty) = self.pty.as_mut() {
+                        pty.scroll_to_bottom();
+                    }
+                    ImproveAction::Continue
+                }
                 KeyCode::Enter => {
                     self.ai_done = true;
                     ImproveAction::ApplyReady
@@ -341,6 +420,10 @@ impl ImprovePullRequestScreen {
                 _ => ImproveAction::Continue,
             };
         }
+        if matches!(key.code, KeyCode::Char(' ')) {
+            self.full_scan = !self.full_scan;
+            return ImproveAction::Continue;
+        }
         match self.confirm.handle_key(key) {
             ConfirmationOutcome::Confirmed => ImproveAction::Confirmed,
             ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
@@ -393,24 +476,7 @@ impl ImprovePullRequestScreen {
             return;
         }
         if self.applying {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(if self.pty_focused {
-                    " AI Activity · inner focused "
-                } else {
-                    " AI Activity · outer focused "
-                });
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            if let Some(pty) = self.pty.as_mut() {
-                pty.render(frame, inner);
-            } else {
-                frame.render_widget(
-                    Paragraph::new("Preparing the Fix apply model...")
-                        .style(Style::default().fg(colors::MUTED)),
-                    inner,
-                );
-            }
+            self.render_applying(frame, area);
             return;
         }
         if self.preparing {
@@ -451,8 +517,8 @@ impl ImprovePullRequestScreen {
                 .constraints([
                     Constraint::Length(1),
                     Constraint::Min(5),
+                    Constraint::Length(3),
                     Constraint::Length(2),
-                    Constraint::Length(1),
                 ])
                 .split(area);
             frame.render_widget(
@@ -477,54 +543,47 @@ impl ImprovePullRequestScreen {
             );
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(" Proposed improvement ");
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(colors::LIGHT_MINT))
+                .title(Line::from(Span::styled(
+                    " Proposed improvement ",
+                    Style::default()
+                        .fg(colors::LIGHT_MINT)
+                        .add_modifier(Modifier::BOLD),
+                )));
             let inner = block.inner(chunks[1]);
             frame.render_widget(block, chunks[1]);
-            let paragraph = Paragraph::new(format!(
-                "Location: {}\n\n{}\n\nSuggested change:\n{}",
-                finding.descriptor(),
-                finding.explanation,
-                finding
-                    .suggestion
-                    .as_deref()
-                    .unwrap_or("Implement the smallest safe correction.")
-            ))
-            .wrap(Wrap { trim: false });
+            let paragraph = Paragraph::new(build_improvement_lines(finding, inner.width as usize))
+                .wrap(Wrap { trim: false });
             self.finding_max_scroll = paragraph
                 .line_count(inner.width)
                 .saturating_sub(inner.height.into()) as u16;
             self.finding_scroll = self.finding_scroll.min(self.finding_max_scroll);
             frame.render_widget(paragraph.scroll((self.finding_scroll, 0)), inner);
-            let names = [" Apply ", " Edit ", " Other ", " Skip "];
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(names.map(|s| Constraint::Length(s.len() as u16 + 2)))
-                .split(chunks[2]);
-            self.finding_action_areas = Some([cols[0], cols[1], cols[2], cols[3]]);
-            for (i, name) in names.into_iter().enumerate() {
-                frame.render_widget(
-                    Paragraph::new(name).style(
-                        Style::default()
-                            .fg(if self.selected == i as u8 {
-                                colors::WHITE
-                            } else {
-                                colors::MUTED
-                            })
-                            .add_modifier(if self.selected == i as u8 {
-                                Modifier::REVERSED
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ),
-                    cols[i],
-                );
-            }
+            self.finding_action_areas = Some(render_button_row(
+                frame,
+                chunks[2],
+                [
+                    ("  Apply  ", colors::SUCCESS, self.selected == 0),
+                    ("  Edit  ", colors::INFO, self.selected == 1),
+                    ("  Other  ", colors::IMPROVE, self.selected == 2),
+                    ("  Skip  ", colors::WARNING, self.selected == 3),
+                ],
+            ));
             frame.render_widget(
-                Paragraph::new(format!(
-                    "Space: autonomous remaining improvements [{}]",
-                    if self.autonomous { "on" } else { "off" }
-                ))
-                .style(Style::default().fg(colors::MUTED)),
+                Paragraph::new(vec![
+                    decision_shortcuts(),
+                    Line::from(vec![
+                        Span::styled("Space ", Style::default().fg(colors::IMPROVE)),
+                        Span::styled(
+                            format!(
+                                "Autonomous remaining improvements [{}]",
+                                if self.autonomous { "on" } else { "off" }
+                            ),
+                            muted_dim(),
+                        ),
+                    ]),
+                ]),
                 chunks[3],
             );
             return;
@@ -563,6 +622,15 @@ impl ImprovePullRequestScreen {
                     "Edit files",
                 ),
             ])
+            .options(Some(
+                OptionsGroup::new(vec![OptionsGroupItem::new(
+                    self.full_scan,
+                    "⚠️ Full Scan",
+                    "scan all tracked application and test code, not only this branch's changes; \
+                     dependency, generated, lock, and repository metadata files are excluded.",
+                )])
+                .with_hint("Toggle"),
+            ))
             .modal((!self.preparing).then_some(&self.confirm))
             .render(frame, area);
     }
@@ -710,24 +778,25 @@ impl ImprovePullRequestScreen {
         self.outcomes
             .extend(skipped.iter().map(|file| ImproveOutcome {
                 item: format!("Skipped file: {}", file.path),
-                status: format!("Skipped ({})", file.reason),
-                color: colors::MUTED,
+                kind: OutcomeKind::SkippedFile,
+                detail: Some(file.reason.to_string()),
             }));
     }
     pub fn record_applied(&mut self, sha: String) {
-        self.record_current_outcome(
-            format!("Applied ({})", &sha[..sha.len().min(8)]),
-            colors::SUCCESS,
-        );
+        let short = sha[..sha.len().min(8)].to_string();
+        self.record_current_outcome(OutcomeKind::Applied, Some(format!("commit {short}")));
     }
     pub fn record_addressed(&mut self) {
-        self.record_current_outcome("Already addressed".to_string(), colors::MUTED);
+        self.record_current_outcome(
+            OutcomeKind::Addressed,
+            Some("already addressed".to_string()),
+        );
     }
     pub fn record_skipped(&mut self) {
-        self.record_current_outcome("Skipped".to_string(), colors::MUTED);
+        self.record_current_outcome(OutcomeKind::Skipped, None);
     }
     pub fn record_failed(&mut self, message: String) {
-        self.record_current_outcome(format!("Failed: {message}"), colors::ERROR);
+        self.record_current_outcome(OutcomeKind::Failed, Some(message));
     }
     pub fn enter_done(&mut self) {
         self.preparing = false;
@@ -740,71 +809,222 @@ impl ImprovePullRequestScreen {
         self.done_max_scroll = 0;
     }
 
-    fn record_current_outcome(&mut self, status: String, color: ratatui::style::Color) {
+    fn record_current_outcome(&mut self, kind: OutcomeKind, detail: Option<String>) {
         if let Some(finding) = self.finding.as_ref() {
             self.outcomes.push(ImproveOutcome {
                 item: format!("{} — {}", finding.descriptor(), finding.title),
-                status,
-                color,
+                kind,
+                detail,
             });
         }
     }
 
-    fn render_done(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let applied = self
-            .outcomes
-            .iter()
-            .filter(|outcome| outcome.status.starts_with("Applied"))
-            .count();
-        let mut lines = vec![
-            Line::from(Span::styled(
-                "Improve complete",
+    fn render_applying(&mut self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let finding = self.finding.as_ref();
+        let title = finding.map_or("Improvement", |finding| finding.title.as_str());
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "Applying improvement #{} of {}",
+                        self.current + 1,
+                        self.total
+                    ),
+                    Style::default()
+                        .fg(colors::IMPROVE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ·  ", muted_dim()),
+                Span::styled(sanitize_row(title), Style::default().fg(colors::EMPHASIS)),
+            ])),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(progress_bar_line(self.current, self.total, chunks[1].width)),
+            chunks[1],
+        );
+        self.render_ai_activity(frame, chunks[2]);
+        self.render_ai_shortcuts(frame, chunks[3]);
+    }
+
+    fn render_ai_activity(&mut self, frame: &mut Frame, area: Rect) {
+        let pty_alive = self.pty.is_some();
+        let focused_inner = pty_alive && self.pty_focused;
+        let focus_color = if focused_inner {
+            colors::IMPROVE
+        } else {
+            colors::LIGHT_MINT
+        };
+        let mut title = vec![
+            Span::raw(" "),
+            Span::styled(
+                "AI Activity",
                 Style::default()
                     .fg(colors::IMPROVE)
                     .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!(
-                "{} checkpoint commit(s) created. Every result is retained below.",
-                applied
-            )),
-            Line::default(),
+            ),
         ];
-        if let Some(range) = &self.reviewed_range {
-            lines.push(Line::from(Span::styled(
-                range.clone(),
-                Style::default().fg(colors::MUTED),
-            )));
-            lines.push(Line::default());
+        if pty_alive {
+            title.push(Span::styled(" · ", muted_dim()));
+            title.push(Span::styled(
+                if focused_inner {
+                    "inner focused"
+                } else {
+                    "outer focused"
+                },
+                Style::default()
+                    .fg(focus_color)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
-        if self.outcomes.is_empty() {
-            lines.push(Line::from("No reviewable improvements were found."));
-        } else {
-            for outcome in &self.outcomes {
-                lines.push(Line::from(Span::styled(
-                    outcome.item.clone(),
-                    Style::default().fg(colors::WHITE),
-                )));
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", outcome.status),
-                    Style::default().fg(outcome.color),
-                )));
-            }
-        }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "↑/↓ scroll · Enter/Esc return to dashboard",
-            Style::default().fg(colors::MUTED),
-        )));
+        title.push(Span::raw(" "));
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Improve results ");
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(focus_color))
+            .title(Line::from(title));
         let inner = block.inner(area);
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        self.done_max_scroll = paragraph
-            .line_count(inner.width)
-            .saturating_sub(inner.height.into()) as u16;
+        frame.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        if let Some(pty) = self.pty.as_mut() {
+            pty.resize(inner.height, inner.width);
+            pty.render(frame, inner);
+            render_pty_scrollbar(frame, inner, pty);
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "Launching the configured AI to apply this improvement...",
+                    muted_dim(),
+                )),
+                inner,
+            );
+        }
+    }
+
+    fn render_ai_shortcuts(&self, frame: &mut Frame, area: Rect) {
+        let focused_inner = self.pty.is_some() && self.pty_focused;
+        let separator = Span::styled("  ·  ", muted_dim());
+        let mut spans = vec![
+            Span::styled("Focus: ", muted_dim()),
+            Span::styled(
+                if focused_inner {
+                    "Inner (AI CLI)"
+                } else {
+                    "Outer (wisetree)"
+                },
+                Style::default()
+                    .fg(if focused_inner {
+                        colors::IMPROVE
+                    } else {
+                        colors::LIGHT_MINT
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            separator.clone(),
+            Span::styled("Tab ", Style::default().fg(colors::IMPROVE)),
+            Span::styled(
+                if focused_inner {
+                    "Switch to Wisetree"
+                } else {
+                    "Switch to AI CLI"
+                },
+                muted_dim(),
+            ),
+        ];
+        if !focused_inner {
+            spans.extend([
+                separator.clone(),
+                Span::styled("PgUp/PgDn ", Style::default().fg(colors::INFO)),
+                Span::styled("Scroll", muted_dim()),
+                separator.clone(),
+                Span::styled("Enter ", Style::default().fg(colors::SUCCESS)),
+                Span::styled("Mark applied", muted_dim()),
+                separator,
+                Span::styled("Esc ", Style::default().fg(colors::ERROR)),
+                Span::styled("Cancel", muted_dim()),
+            ]);
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn render_done(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let rows: Vec<SummaryRow> = self.outcomes.iter().map(ImproveOutcome::row).collect();
+        // Files the reviewer never got to read are withheld work, not broken
+        // work — the headline counts them apart from hard failures, as Review
+        // does on its own Done page.
+        let (failed, withheld) = summary_row_counts(&rows);
+        let applied = self
+            .outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome.kind, OutcomeKind::Applied))
+            .count();
+        let (status, headline) = if failed > 0 || withheld > 0 {
+            let mut parts = Vec::new();
+            if failed > 0 {
+                parts.push(format!("{failed} failure(s)"));
+            }
+            if withheld > 0 {
+                parts.push(format!("{withheld} skipped"));
+            }
+            (
+                if failed > 0 {
+                    Status::Error
+                } else {
+                    Status::Info
+                },
+                format!("Finished with {} — see below.", parts.join(" · ")),
+            )
+        } else if self.outcomes.is_empty() {
+            (
+                Status::Success,
+                "No issues found — the code looks good!".to_string(),
+            )
+        } else {
+            (
+                Status::Success,
+                format!("Applied {applied} improvement(s) as checkpoint commit(s)!"),
+            )
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        StatusIndicator::new(status, headline)
+            .without_spinner()
+            .render(frame, chunks[0]);
+        if rows.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No reviewable improvements were found.").style(muted_dim()),
+                chunks[1],
+            );
+            self.done_max_scroll = 0;
+        } else {
+            self.done_max_scroll =
+                render_scrollable_summary_table(&rows, self.done_scroll, frame, chunks[1]);
+        }
         self.done_scroll = self.done_scroll.min(self.done_max_scroll);
-        frame.render_widget(paragraph.block(block).scroll((self.done_scroll, 0)), area);
+        let footer = match (self.done_max_scroll > 0, self.reviewed_range.as_deref()) {
+            (true, Some(range)) => format!("↑/↓ · PgUp/PgDn scroll · Enter/Esc continue · {range}"),
+            (true, None) => "↑/↓ · PgUp/PgDn scroll · Enter/Esc continue".to_string(),
+            (false, Some(range)) => format!("Press Enter or Esc to continue · {range}"),
+            (false, None) => "Press Enter or Esc to continue".to_string(),
+        };
+        frame.render_widget(Paragraph::new(footer).style(muted_dim()), chunks[2]);
     }
     pub fn current_index(&self) -> usize {
         self.current
@@ -1010,6 +1230,178 @@ fn build_confirm(request: &ImproveRequest) -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Cancel)
 }
 
+fn render_button_row<const N: usize>(
+    frame: &mut Frame,
+    area: Rect,
+    buttons: [(&str, Color, bool); N],
+) -> [Rect; N] {
+    let mut constraints = Vec::with_capacity(N * 2 + 1);
+    constraints.push(Constraint::Min(0));
+    for (index, (label, _, _)) in buttons.iter().enumerate() {
+        if index > 0 {
+            constraints.push(Constraint::Length(2));
+        }
+        constraints.push(Constraint::Length(label.chars().count() as u16 + 2));
+    }
+    constraints.push(Constraint::Min(0));
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+    let mut rects = [Rect::default(); N];
+    for (index, (label, color, focused)) in buttons.iter().enumerate() {
+        let rect = chunks[1 + index * 2];
+        frame.render_widget(button_paragraph(label, *color, *focused), rect);
+        rects[index] = rect;
+    }
+    rects
+}
+
+fn build_improvement_lines(finding: &ReviewFinding, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("[{}] [{}]: ", finding.category, finding.severity.label()),
+                Style::default()
+                    .fg(severity_color(finding.severity))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                sanitize_row(&finding.title),
+                Style::default()
+                    .fg(colors::WHITE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Location  ", muted_dim()),
+            Span::styled(
+                sanitize_row(&finding.descriptor()),
+                Style::default().fg(colors::EMPHASIS),
+            ),
+        ]),
+    ];
+    if !finding.explanation.trim().is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Why this matters",
+            Style::default()
+                .fg(colors::LIGHT_MINT)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(finding.explanation.lines().map(|line| {
+            Line::from(Span::styled(
+                sanitize_row(line),
+                Style::default().fg(colors::WHITE),
+            ))
+        }));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("| ", Style::default().fg(colors::IMPROVE)),
+        Span::styled(
+            "Suggested change",
+            Style::default()
+                .fg(colors::LIGHT_MINT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let suggestion = finding
+        .suggestion
+        .as_deref()
+        .unwrap_or("Implement the smallest safe correction.");
+    for line in suggestion.lines() {
+        push_suggestion_bar(&mut lines, line, width);
+    }
+    lines
+}
+
+fn push_suggestion_bar(lines: &mut Vec<Line<'static>>, raw: &str, width: usize) {
+    let style = Style::default()
+        .fg(colors::DIFF_ADD_FG)
+        .bg(colors::DIFF_ADD_BG);
+    let chars: Vec<char> = sanitize_row(raw).chars().collect();
+    if width == 0 {
+        lines.push(Line::from(Span::styled(
+            chars.iter().collect::<String>(),
+            style,
+        )));
+        return;
+    }
+    let mut start = 0;
+    loop {
+        let end = (start + width).min(chars.len());
+        let mut segment: String = chars[start..end].iter().collect();
+        segment.extend(std::iter::repeat(' ').take(width - (end - start)));
+        lines.push(Line::from(Span::styled(segment, style)));
+        start = end;
+        if start >= chars.len() {
+            break;
+        }
+    }
+}
+
+fn decision_shortcuts() -> Line<'static> {
+    let separator = Span::styled("  ·  ", muted_dim());
+    Line::from(vec![
+        Span::styled("<- -> ", Style::default().fg(colors::INFO)),
+        Span::styled("Switch", muted_dim()),
+        separator.clone(),
+        Span::styled("Up/Down ", Style::default().fg(colors::INFO)),
+        Span::styled("Scroll", muted_dim()),
+        separator.clone(),
+        Span::styled("Enter ", Style::default().fg(colors::SUCCESS)),
+        Span::styled("Choose", muted_dim()),
+        separator,
+        Span::styled("Esc ", Style::default().fg(colors::WARNING)),
+        Span::styled("Skip", muted_dim()),
+    ])
+}
+
+fn progress_bar_line(done: usize, total: usize, width: u16) -> Line<'static> {
+    if total == 0 {
+        return Line::default();
+    }
+    let done = done.min(total);
+    let suffix = format!("  {done}/{total} · {}%", done * 100 / total);
+    let bar_width = (width as usize)
+        .saturating_sub(suffix.chars().count())
+        .min(32);
+    let filled = ((bar_width * done + total / 2) / total).min(bar_width);
+    Line::from(vec![
+        Span::styled("█".repeat(filled), Style::default().fg(colors::IMPROVE)),
+        Span::styled("░".repeat(bar_width - filled), muted_dim()),
+        Span::styled(suffix, Style::default().fg(colors::EMPHASIS)),
+    ])
+}
+
+fn severity_color(severity: ReviewSeverity) -> Color {
+    match severity {
+        ReviewSeverity::Critical => colors::ERROR,
+        ReviewSeverity::High => colors::ACCENT,
+        ReviewSeverity::Medium => colors::WARNING,
+        ReviewSeverity::Low => colors::INFO,
+    }
+}
+
+fn sanitize_row(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\t' => sanitized.push_str("    "),
+            character if character.is_control() => {}
+            character => sanitized.push(character),
+        }
+    }
+    sanitized
+}
+
+fn muted_dim() -> Style {
+    Style::default()
+        .fg(colors::MUTED)
+        .add_modifier(Modifier::DIM)
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1048,6 +1440,26 @@ mod tests {
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Confirmed
         );
+    }
+
+    #[test]
+    fn full_scan_is_explained_unchecked_and_toggled_with_space() {
+        let mut screen = screen();
+        let initial = render(&mut screen, 110, 40);
+        assert!(initial.contains("Full Scan"), "{initial}");
+        assert!(initial.contains("☐"), "{initial}");
+        assert!(
+            initial.contains("all tracked application and test code"),
+            "{initial}"
+        );
+        assert!(!screen.full_scan());
+
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            ImproveAction::Continue
+        );
+        assert!(screen.full_scan());
+        assert!(render(&mut screen, 110, 40).contains("☒"));
     }
 
     fn finding() -> ReviewFinding {
@@ -1198,23 +1610,42 @@ mod tests {
         screen.enter_done();
 
         let wide = render(&mut screen, 100, 20);
-        assert!(wide.contains("Improve complete"));
-        assert!(wide.contains("checkpoint commit"));
-        assert!(wide.contains("Applied (12345678)"));
-        assert!(wide.contains("Already addressed"));
+        assert!(wide.contains("[ERROR]"));
+        assert!(wide.contains("1 failure(s)"));
+        assert!(wide.contains("1 skipped"));
+        assert!(wide.contains("Command"));
+        assert!(wide.contains("Status"));
+        assert!(wide.contains("Failure"));
+        assert!(wide.contains("Applied"));
+        assert!(wide.contains("commit 12345678"));
+        assert!(wide.contains("No change"));
         assert!(wide.contains("Skipped"));
-        assert!(wide.contains("Failed:"));
+        assert!(wide.contains("Failed"));
 
         screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let narrow = render(&mut screen, 36, 8);
-        assert!(narrow.contains("Improve results"));
+        assert!(narrow.contains("showing"));
         for _ in 0..40 {
             screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             render(&mut screen, 36, 8);
         }
         let bottom = screen.done_scroll;
+        assert!(bottom > 0, "the table must scroll when the rows overflow");
         screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(screen.done_scroll, bottom);
+
+        // Page + Home/End move the same viewport, as on Review's scrollable pages.
+        screen.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, 0);
+        screen.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, bottom);
+        screen.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, 0);
+        screen.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(screen.done_scroll, bottom);
+        screen.handle_mouse_scroll_up(1);
+        assert_eq!(screen.done_scroll, bottom - 1);
+
         assert_eq!(
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Done
@@ -1232,7 +1663,8 @@ mod tests {
     fn finding_content_scrolls_without_overshooting_the_wrapped_tail() {
         let mut screen = screen();
         let mut long = finding();
-        long.explanation = format!("{}\ntail marker", "word ".repeat(200));
+        long.explanation = "word ".repeat(200);
+        long.suggestion = Some("tail marker".into());
         screen.show_finding(long, 0, 1);
 
         assert!(!render(&mut screen, 48, 10).contains("tail marker"));
@@ -1245,6 +1677,41 @@ mod tests {
         screen.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         render(&mut screen, 48, 10);
         assert_eq!(screen.finding_scroll, bottom);
+    }
+
+    #[test]
+    fn finding_uses_structured_preview_and_native_buttons() {
+        let mut screen = screen();
+        screen.show_finding(finding(), 0, 2);
+
+        let rendered = render(&mut screen, 100, 20);
+
+        assert!(rendered.contains("[Code Smell] [High]: Avoid duplicate work"));
+        assert!(rendered.contains("Why this matters"));
+        assert!(rendered.contains("Suggested change"));
+        assert!(rendered.contains("Apply"));
+        assert!(rendered.contains("Edit"));
+        assert!(rendered.contains("Other"));
+        assert!(rendered.contains("Switch"));
+    }
+
+    #[test]
+    fn applying_view_tracks_progress_and_explains_focus_and_scrolling() {
+        let mut screen = screen();
+        screen.show_finding(finding(), 1, 4);
+        screen.start_applying();
+
+        let rendered = render(&mut screen, 110, 20);
+
+        assert!(rendered.contains("Applying improvement #2 of 4"));
+        assert!(rendered.contains("1/4 · 25%"));
+        assert!(rendered.contains("AI Activity"));
+        assert!(rendered.contains("Focus: Outer (wisetree)"));
+        assert!(rendered.contains("PgUp/PgDn Scroll"));
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            ImproveAction::Continue
+        );
     }
 
     #[test]

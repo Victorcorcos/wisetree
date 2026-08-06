@@ -146,6 +146,8 @@ pub mod colors {
     /// "Improve" command in the quality/health color family without reading
     /// as Merge or Bugkill, and stays clear of the crowded blue band.
     pub const MINT: Color = Color::Rgb(0x3d, 0xdc, 0x97);
+    /// Light mint `#8aebc1` — borders and secondary emphasis for Improve.
+    pub const LIGHT_MINT: Color = Color::Rgb(0x8a, 0xeb, 0xc1);
     /// Mint accent reserved for the local "Improve" command and its
     /// confirmation screen.
     pub const IMPROVE: Color = MINT;

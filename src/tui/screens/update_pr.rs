@@ -1970,7 +1970,7 @@ fn terminal_error_lines(text: &str) -> Vec<String> {
 /// content length left the thumb floating `height - 1` rows short of the
 /// bottom even when fully scrolled down.) `viewport_content_length = height`
 /// keeps the thumb sized to the visible fraction of the content.
-fn render_pty_scrollbar(frame: &mut Frame, inner: Rect, pty: &PtyView) {
+pub(crate) fn render_pty_scrollbar(frame: &mut Frame, inner: Rect, pty: &PtyView) {
     // vt100's offset is "rows back from the live tail" (0 = bottom), which is
     // exactly the tail-anchored model the shared scrollbar expects.
     crate::tui::widgets::render_vertical_scrollbar(
