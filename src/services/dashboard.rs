@@ -2374,7 +2374,9 @@ impl DashboardService {
         )
         .await?;
         if let Err(err) = fetch {
-            return Ok(UpdatePullRequestOutcome::FetchFailed(err));
+            if fetch_failure_blocks_base(&err, base_ref) {
+                return Ok(UpdatePullRequestOutcome::FetchFailed(err));
+            }
         }
 
         // 2. recheck behind
@@ -2581,14 +2583,18 @@ impl DashboardService {
             run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd)),
         )
         .await?;
-        if let Err(err) = fetch {
-            return Ok(UpdateBranchOutcome::FetchFailed(err));
-        }
+        let fetch_error = fetch.err();
 
         let Some(base_ref) = resolve_base_ref_with_binary(&self.git_binary, &cwd, None).await
         else {
             return Ok(UpdateBranchOutcome::NoBaseRef);
         };
+
+        if let Some(err) = fetch_error {
+            if fetch_failure_blocks_base(&err, &base_ref) {
+                return Ok(UpdateBranchOutcome::FetchFailed(err));
+            }
+        }
 
         let merge = with_timeout(
             "git merge",
@@ -6228,6 +6234,27 @@ fn branch_name_from_ref(base_ref: &str) -> &str {
 
 fn remote_name_from_ref(base_ref: &str) -> Option<&str> {
     base_ref.split_once('/').map(|(remote, _)| remote)
+}
+
+/// `git fetch --all` exits non-zero when *any* remote fails, even when the
+/// remote we actually need fetched fine — a teammate's fork that was deleted
+/// or turned private is enough to block the whole update. Git names every
+/// broken remote on an `error: could not fetch <remote>` line, so the failure
+/// only blocks us when `base_ref`'s remote is one of them (or when git gave
+/// us no such line and we cannot tell what broke).
+fn fetch_failure_blocks_base(stderr: &str, base_ref: &str) -> bool {
+    let failed: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("error: could not fetch "))
+        .map(str::trim)
+        .collect();
+    if failed.is_empty() {
+        return true;
+    }
+    match remote_name_from_ref(base_ref) {
+        Some(remote) => failed.contains(&remote),
+        None => false,
+    }
 }
 
 fn summarize_notice_text(message: &str) -> String {
@@ -10939,6 +10966,44 @@ pub fn resolve_dashboard_columns(
 mod tests {
     use super::*;
     use crate::services::develop::{render_plan_md, PlanSection};
+
+    const DEAD_REMOTE_FETCH_STDERR: &str = "ERROR: Repository not found.\n\
+fatal: Could not read from remote repository.\n\n\
+Please make sure you have the correct access rights\n\
+and the repository exists.\n\
+error: could not fetch gustavo";
+
+    #[test]
+    fn fetch_failure_on_unrelated_remote_does_not_block_update() {
+        assert!(!fetch_failure_blocks_base(
+            DEAD_REMOTE_FETCH_STDERR,
+            "upstream/master"
+        ));
+    }
+
+    #[test]
+    fn fetch_failure_on_base_remote_blocks_update() {
+        assert!(fetch_failure_blocks_base(
+            DEAD_REMOTE_FETCH_STDERR,
+            "gustavo/master"
+        ));
+    }
+
+    #[test]
+    fn fetch_failure_without_named_remote_blocks_update() {
+        assert!(fetch_failure_blocks_base(
+            "fatal: not a git repository",
+            "upstream/master"
+        ));
+    }
+
+    #[test]
+    fn fetch_failure_does_not_block_local_base_ref() {
+        assert!(!fetch_failure_blocks_base(
+            DEAD_REMOTE_FETCH_STDERR,
+            "master"
+        ));
+    }
 
     #[test]
     fn login_shell_check_uses_login_mode_for_supported_shell() {

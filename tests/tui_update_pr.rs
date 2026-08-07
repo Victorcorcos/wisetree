@@ -319,6 +319,53 @@ async fn pipeline_returns_merged_cleanly_when_no_conflicts() {
 }
 
 #[tokio::test]
+async fn pipeline_merges_when_an_unrelated_remote_cannot_be_fetched() {
+    let fx = Fixture::new();
+    // A teammate's fork that was deleted (or turned private) makes
+    // `git fetch --all` exit non-zero even though `origin` fetched fine.
+    let missing = fx.src.parent().unwrap().join("deleted-fork.git");
+    git(
+        &fx.src,
+        &["remote", "add", "teammate", missing.to_str().unwrap()],
+    );
+    fx.advance_main("FEATURE.md", "doc\n");
+    let stub = fx.write_opencode_stub("#!/bin/sh\nexit 0\n");
+    let service = fx.ai_service().with_opencode_binary(stub);
+
+    let outcome = service
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
+        .await
+        .expect("update should succeed");
+
+    assert_eq!(outcome, UpdatePullRequestOutcome::MergedCleanly);
+    assert!(fx.src.join("FEATURE.md").exists());
+}
+
+#[tokio::test]
+async fn pipeline_reports_fetch_failure_when_the_base_remote_is_unreachable() {
+    let fx = Fixture::new();
+    fx.advance_main("FEATURE.md", "doc\n");
+    // Break `origin` itself — the remote the base ref lives on.
+    let missing = fx.src.parent().unwrap().join("deleted-origin.git");
+    git(
+        &fx.src,
+        &["remote", "set-url", "origin", missing.to_str().unwrap()],
+    );
+    let stub = fx.write_opencode_stub("#!/bin/sh\nexit 0\n");
+    let service = fx.ai_service().with_opencode_binary(stub);
+
+    let outcome = service
+        .update_pull_request(fx.src.to_str().unwrap(), "origin/main", true)
+        .await
+        .expect("update should succeed");
+
+    assert!(
+        matches!(outcome, UpdatePullRequestOutcome::FetchFailed(_)),
+        "expected FetchFailed, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn pipeline_returns_conflicts_require_ai_when_ai_model_is_blank() {
     let fx = Fixture::new();
     // Conflict: same file edited on both sides.
