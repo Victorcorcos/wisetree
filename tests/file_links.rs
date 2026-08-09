@@ -321,6 +321,72 @@ async fn seed_if_present_copies_when_source_exists() {
 }
 
 #[tokio::test]
+async fn literal_pattern_links_only_the_exact_directory() {
+    let (_root, source, target, cache) = dirs();
+    fs::create_dir_all(source.join("node_modules/package/node_modules/dependency")).unwrap();
+
+    let report = link_patterns(
+        &source,
+        &target,
+        &cache,
+        &link_config(LinkStrategy::SeedIfPresent),
+    )
+    .await;
+
+    assert_eq!(report.linked.len(), 1, "report: {report:?}");
+    assert_eq!(report.linked[0].pattern, "node_modules");
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert!(is_link(&target.join("node_modules")));
+    assert!(cache
+        .join("entries/node_modules/package/node_modules/dependency")
+        .is_dir());
+}
+
+#[tokio::test]
+async fn literal_pattern_repairs_legacy_nested_cache_metadata() {
+    let (_root, source, target, cache) = dirs();
+    let canonical_source = source.canonicalize().unwrap();
+    fs::create_dir_all(source.join("node_modules/package/node_modules/dependency")).unwrap();
+    fs::create_dir_all(cache.join("entries/node_modules/package/node_modules")).unwrap();
+    fs::write(
+        cache.join("metadata.json"),
+        serde_json::to_string_pretty(&json!({
+            "gitRoot": canonical_source.display().to_string(),
+            "createdAt": now_unix_ms(),
+            "patterns": ["node_modules", "node_modules/package/node_modules"],
+            "users": [],
+            "entryLastSeen": {
+                "node_modules": 1,
+                "node_modules/package/node_modules": 1
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = link_patterns(
+        &source,
+        &target,
+        &cache,
+        &link_config(LinkStrategy::SeedIfPresent),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(cache.join("metadata.json")).unwrap()).unwrap();
+
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert_eq!(metadata["patterns"], json!(["node_modules"]));
+    assert_eq!(
+        metadata["entryLastSeen"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["node_modules"]
+    );
+}
+
+#[tokio::test]
 async fn glob_patterns_match_multiple_directories() {
     let (_root, source, target, cache) = dirs();
     // Create a monorepo-like layout with several node_modules dirs.

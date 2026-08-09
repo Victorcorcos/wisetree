@@ -11,7 +11,6 @@ use walkdir::WalkDir;
 use crate::config::schema::{LinkStrategy, WorktreeConfig};
 use crate::constants::global_cache_dir;
 use crate::errors::{Result, WisetreeError};
-use crate::files::patterns::normalize_patterns;
 use crate::utils::path::{repository_base_name, resolve_template, TemplateVariables};
 
 const METADATA_FILE_NAME: &str = "metadata.json";
@@ -79,6 +78,13 @@ impl CacheMetadata {
     fn remove_pattern(&mut self, pattern: &str) {
         self.patterns.retain(|existing| existing != pattern);
         self.entry_last_seen.remove(pattern);
+    }
+
+    fn remove_descendant_patterns(&mut self, parent: &str) {
+        self.patterns
+            .retain(|pattern| !is_strict_descendant(pattern, parent));
+        self.entry_last_seen
+            .retain(|pattern, _| !is_strict_descendant(pattern, parent));
     }
 }
 
@@ -201,6 +207,9 @@ pub async fn link_patterns(
     }
 
     register_user(&mut metadata, target_dir);
+    for pattern in &materialized_patterns {
+        metadata.remove_descendant_patterns(pattern);
+    }
     for pattern in materialized_patterns {
         metadata.record_pattern_seen(&pattern, seen_at);
     }
@@ -599,8 +608,8 @@ async fn process_pattern(
 
 fn expand_source_patterns(base_dir: &Path, patterns: &[String]) -> Vec<String> {
     let mut results = BTreeSet::new();
-    for pattern in normalize_patterns(patterns) {
-        let normalized = clean_relative_pattern(&pattern);
+    for pattern in patterns {
+        let normalized = clean_relative_pattern(pattern);
         if normalized.is_empty() {
             continue;
         }
@@ -637,8 +646,8 @@ fn expand_source_patterns(base_dir: &Path, patterns: &[String]) -> Vec<String> {
 
 fn expand_target_patterns(base_dir: &Path, patterns: &[String]) -> Result<Vec<String>> {
     let mut results = BTreeSet::new();
-    for pattern in normalize_patterns(patterns) {
-        let normalized = clean_relative_pattern(&pattern);
+    for pattern in patterns {
+        let normalized = clean_relative_pattern(pattern);
         if normalized.is_empty() {
             continue;
         }
@@ -714,6 +723,10 @@ fn clean_relative_pattern(pattern: &str) -> String {
 
 fn is_glob_pattern(pattern: &str) -> bool {
     pattern.contains('*') || pattern.contains('?') || pattern.contains('[') || pattern.contains('{')
+}
+
+fn is_strict_descendant(pattern: &str, parent: &str) -> bool {
+    pattern != parent && Path::new(pattern).starts_with(parent)
 }
 
 fn copy_directory_into_cache(source_dir: &Path, target_dir: &Path) -> Result<()> {
