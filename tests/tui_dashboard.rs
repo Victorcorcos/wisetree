@@ -432,11 +432,13 @@ fn backspace_while_typing_only_edits_search_query() {
 }
 
 #[test]
-fn action_menu_no_longer_exposes_delete_choice() {
+fn action_menu_exposes_delete_worktree_choice() {
     let mut screen = ready_screen(true);
+    screen.handle_key(key(KeyCode::Down));
     screen.handle_key(key(KeyCode::Enter));
-    let dumped = dump(120, 14, |f| screen.render(f, f.area()));
-    assert!(!dumped.contains("Delete this worktree"));
+    assert!(screen
+        .general_command_labels()
+        .contains(&"Delete worktree".to_string()));
 }
 
 #[test]
@@ -1179,6 +1181,31 @@ fn action_menu_renders_general_and_pull_request_sections() {
         dumped.contains("Close"),
         "expected a Close button: {dumped}"
     );
+}
+
+#[test]
+fn delete_worktree_action_jumps_to_delete_for_selected_row() {
+    let mut screen = ready_screen(true);
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Enter));
+    for character in "Delete worktree".chars() {
+        screen.handle_key(key(KeyCode::Char(character)));
+    }
+
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DashboardAction::JumpToDelete("/tmp/repo-bug".into())
+    );
+}
+
+#[test]
+fn action_menu_hides_delete_worktree_for_main_row() {
+    let mut screen = ready_screen(true);
+    screen.handle_key(key(KeyCode::Enter));
+
+    assert!(!screen
+        .general_command_labels()
+        .contains(&"Delete worktree".to_string()));
 }
 
 #[test]
