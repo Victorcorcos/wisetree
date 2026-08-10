@@ -45,6 +45,7 @@ enum ActionChoice {
     Navigate,
     OpenWithCommand,
     CopyPath,
+    DeleteWorktree,
     OpenPullRequest,
     ExplainPullRequest,
     FixPullRequest,
@@ -1054,7 +1055,7 @@ impl DashboardScreen {
     /// Build the searchable "General Commands" list — every action that
     /// isn't a pull-request operation. PR actions live in their own
     /// button row built by [`Self::build_pr_commands`].
-    fn build_action_select(&self) -> SelectPrompt<ActionChoice> {
+    fn build_action_select(&self, row: &DashboardRow) -> SelectPrompt<ActionChoice> {
         let mut options = Vec::new();
         if self.is_from_wrapper {
             options.push(SelectOption::new(
@@ -1072,6 +1073,12 @@ impl DashboardScreen {
             options.push(SelectOption::new(
                 "Copy path to clipboard",
                 ActionChoice::CopyPath,
+            ));
+        }
+        if !row.worktree.is_main {
+            options.push(SelectOption::new(
+                "Delete worktree",
+                ActionChoice::DeleteWorktree,
             ));
         }
         // Pull the worktree's base branch into it locally: fetch the remote
@@ -1243,7 +1250,7 @@ impl DashboardScreen {
     /// both land on identical menu state.
     fn open_action_menu(&mut self, index: usize) {
         let row = self.rows[index].clone();
-        self.action_select = Some(self.build_action_select());
+        self.action_select = Some(self.build_action_select(&row));
         self.pr_commands = self.build_pr_commands(&row);
         self.action_pr_focus = None;
         self.last_pr_focus = 0;
@@ -1442,6 +1449,7 @@ impl DashboardScreen {
         let row = &self.rows[index];
         let path = row.worktree.path.clone();
         let branch = row.worktree.branch.clone();
+        let is_main = row.worktree.is_main;
         let pr_url = row.pull_request.as_ref().map(|pr| pr.url.clone());
         let merge_request = build_merge_request(row);
         let update_request = build_update_request(row);
@@ -1466,6 +1474,14 @@ impl DashboardScreen {
             ActionChoice::CopyPath => {
                 self.mode = DashboardMode::Table;
                 DashboardAction::CopyPath(path)
+            }
+            ActionChoice::DeleteWorktree => {
+                self.mode = DashboardMode::Table;
+                if is_main {
+                    DashboardAction::MotherWorktreeProtected
+                } else {
+                    DashboardAction::JumpToDelete(path)
+                }
             }
             ActionChoice::OpenPullRequest => {
                 self.mode = DashboardMode::Table;
@@ -3900,7 +3916,7 @@ mod tests {
     fn general_commands_exclude_pull_request_actions() {
         let screen = DashboardScreen::new(true, true, true, Vec::new(), Vec::new(), true);
         let labels: Vec<String> = screen
-            .build_action_select()
+            .build_action_select(&row(None, None))
             .options
             .iter()
             .map(|opt| opt.label.clone())
