@@ -246,10 +246,12 @@ These capabilities are implemented in `wisetree` and are especially useful once 
 
 ### Configuration
 
-`wisetree` loads the **first** of these it finds; the two files are never merged:
+`wisetree` loads the **first** of these it finds; the files are never merged.
+When run inside a child worktree, the mother worktree is checked first:
 
-1. `.wisetree.json` at the repo root (project-local, commit it to share with the team).
-2. `~/.wisetree/settings.json` (global, your personal defaults — auto-created on first run).
+1. `.wisetree.json` in the mother worktree (project-local, commit it to share with the team).
+2. `.wisetree.json` in the current worktree.
+3. `~/.wisetree/settings.json` (global, your personal defaults — auto-created on first run).
 
 Any field you omit falls back to the built-in default below, not to the global file.
 
@@ -331,7 +333,7 @@ Every AI slot under `dashboard.ai` stores `model`, `thinking`, and `harness`. Th
 
 Install and authenticate the selected binary before starting a workflow. Wisetree uses each CLI's existing authentication; it never stores provider credentials. Claude Code captured workflows require version `2.1.214` or newer. Codex and Claude Code run without approval prompts or CLI sandbox enforcement, so use Wisetree only with repositories and instructions you trust. The confirmation screen shows the resolved role, model, thinking level, harness, and effective permission policy before any AI command launches.
 
-Settings saves to the active configuration source: a project `.wisetree.json` when it is active, otherwise `~/.wisetree/settings.json`. These sources are selected, not merged. AI metering is reported by the selected harness when it exposes usage; OpenCode session telemetry is correlated by session title. Dashboard AI Status is independent of workflow execution and metering: it only reads local Claude Code, OpenCode, Codex CLI, and Gemini CLI state/session files to report activity.
+Settings saves to the active configuration source: the mother `.wisetree.json`, then the current worktree’s `.wisetree.json`, otherwise `~/.wisetree/settings.json`. These sources are selected, not merged. AI metering is reported by the selected harness when it exposes usage; OpenCode session telemetry is correlated by session title. Dashboard AI Status is independent of workflow execution and metering: it only reads local Claude Code, OpenCode, Codex CLI, and Gemini CLI state/session files to report activity.
 
 # 📟 Wisetree CLI
 

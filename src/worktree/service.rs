@@ -45,6 +45,7 @@ pub struct WorktreeService {
     git_service: GitService,
     config_service: ConfigService,
     git_root: Option<PathBuf>,
+    mother_worktree_path: Option<PathBuf>,
 }
 
 impl WorktreeService {
@@ -55,6 +56,7 @@ impl WorktreeService {
             git_service: GitService::new(git_root.clone()),
             config_service: ConfigService::new(),
             git_root,
+            mother_worktree_path: None,
         }
     }
 
@@ -74,6 +76,11 @@ impl WorktreeService {
         &mut self.config_service
     }
 
+    /// Return the main/mother worktree path discovered during initialization.
+    pub fn mother_worktree_path(&self) -> Option<&Path> {
+        self.mother_worktree_path.as_deref()
+    }
+
     /// Validate the directory is a git repo and load configuration. Must be
     /// called before `create_worktree` / `delete_worktree`.
     pub async fn initialize(&mut self) -> Result<()> {
@@ -83,8 +90,11 @@ impl WorktreeService {
             ));
         }
 
-        let project_path = self.git_root.as_deref();
-        self.config_service.load(project_path)?;
+        let child_path = self.effective_git_root();
+        let mother_path = self.git_service.main_worktree_path().await?;
+        self.mother_worktree_path = Some(mother_path.clone());
+        self.config_service
+            .load_for_worktree(&mother_path, &child_path)?;
         Ok(())
     }
 

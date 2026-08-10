@@ -325,8 +325,9 @@ Run 'wisetree' and select \"Setup Shell Integration\" to enable quick directory 
 After setup, just run 'wisetree' to quickly change to any worktree directory.\n\n\
 Configuration:\n  \
 The tool looks for configuration files in the following order:\n  \
-1. .wisetree.json in current directory\n  \
-2. ~/.wisetree/settings.json (global config)\n\n\
+1. .wisetree.json in the mother worktree\n  \
+2. .wisetree.json in the current worktree\n  \
+3. ~/.wisetree/settings.json (global config)\n\n\
 For more information, visit: https://github.com/victorcorcos/wisetree\n"
     )
 }

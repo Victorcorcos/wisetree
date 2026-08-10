@@ -86,6 +86,51 @@ fn local_config_takes_precedence_over_global() {
 }
 
 #[test]
+fn mother_config_takes_precedence_over_child_then_global() {
+    with_home(|home| {
+        let mother = tempfile::tempdir().expect("mother tempdir");
+        let child = tempfile::tempdir().expect("child tempdir");
+        let mother_path = mother.path().join(".wisetree.json");
+        let child_path = child.path().join(".wisetree.json");
+        let global_path = home.path().join(".wisetree").join("settings.json");
+        fs::create_dir_all(global_path.parent().unwrap()).unwrap();
+
+        for (path, terminal_command) in [
+            (&mother_path, "from-mother"),
+            (&child_path, "from-child"),
+            (&global_path, "from-global"),
+        ] {
+            let config = WorktreeConfig {
+                terminal_command: terminal_command.into(),
+                ..WorktreeConfig::default()
+            };
+            fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        }
+
+        let mut svc = ConfigService::new();
+        let loaded = svc
+            .load_for_worktree(mother.path(), child.path())
+            .expect("load mother config");
+        assert_eq!(loaded.terminal_command, "from-mother");
+        assert_eq!(svc.config_path(), Some(mother_path.as_path()));
+
+        fs::remove_file(&mother_path).unwrap();
+        let loaded = svc
+            .load_for_worktree(mother.path(), child.path())
+            .expect("load child config");
+        assert_eq!(loaded.terminal_command, "from-child");
+        assert_eq!(svc.config_path(), Some(child_path.as_path()));
+
+        fs::remove_file(&child_path).unwrap();
+        let loaded = svc
+            .load_for_worktree(mother.path(), child.path())
+            .expect("load global config");
+        assert_eq!(loaded.terminal_command, "from-global");
+        assert_eq!(svc.config_path(), Some(global_path.as_path()));
+    });
+}
+
+#[test]
 fn falls_back_to_global_when_no_local() {
     with_home(|home| {
         let project = tempfile::tempdir().expect("project tempdir");
