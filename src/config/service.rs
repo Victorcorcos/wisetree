@@ -1,8 +1,7 @@
 //! `ConfigService` — discovery, load, save, reset.
 //!
-//! Resolution order matches the upstream behaviour: project-local
-//! `.wisetree.json` first, then `~/.wisetree/settings.json`, falling back to
-//! `WorktreeConfig::default()`.
+//! Resolution order is project-local `.wisetree.json` first, then
+//! `~/.wisetree/settings.json`, falling back to `WorktreeConfig::default()`.
 
 use std::env;
 use std::fs;
@@ -76,6 +75,28 @@ impl ConfigService {
         self.ensure_global_config()?;
 
         if let Some(path) = self.find_config_file(project_path)? {
+            return self.load_from_path(path);
+        }
+
+        self.warnings.clear();
+        Ok(self.config.clone())
+    }
+
+    /// Load configuration for a worktree, preferring the mother worktree's
+    /// local file over the current worktree's local file and the global file.
+    pub fn load_for_worktree(
+        &mut self,
+        mother_path: &Path,
+        child_path: &Path,
+    ) -> Result<WorktreeConfig> {
+        self.ensure_global_config()?;
+
+        let candidates = [
+            mother_path.join(LOCAL_CONFIG_FILE_NAME),
+            child_path.join(LOCAL_CONFIG_FILE_NAME),
+            global_config_file(),
+        ];
+        if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
             return self.load_from_path(path);
         }
 

@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tempfile::TempDir;
 use wisetree::config::{LinkStrategy, WorktreeConfig};
+use wisetree::constants::LOCAL_CONFIG_FILE_NAME;
 use wisetree::git::types::WorktreeCreateOptions;
 use wisetree::worktree::WorktreeService;
 
@@ -149,6 +150,83 @@ async fn create_worktree_from_child_uses_mother_path_as_anchor() {
                 .join("feat-b");
             assert_eq!(second.worktree_path, expected);
             assert!(second.worktree_path.exists());
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(body);
+    });
+}
+
+#[tokio::test]
+async fn create_worktree_from_child_uses_mother_config_over_child_config() {
+    with_isolated_home(|| {
+        let body = async {
+            let fx = build_fixture();
+            let mother_config = WorktreeConfig {
+                worktree_copy_patterns: Vec::new(),
+                post_create_cmd: vec!["echo mother > config-source.txt".into()],
+                ..WorktreeConfig::default()
+            };
+            fs::write(
+                fx.repo.join(LOCAL_CONFIG_FILE_NAME),
+                serde_json::to_string_pretty(&mother_config).unwrap(),
+            )
+            .unwrap();
+
+            let mut mother_svc = WorktreeService::new(Some(fx.repo.clone()));
+            mother_svc.initialize().await.expect("init mother");
+            let first = mother_svc
+                .create_worktree(
+                    &WorktreeCreateOptions {
+                        name: "feat-a".into(),
+                        source_branch: "main".into(),
+                        new_branch: "feat-a".into(),
+                        base_path: String::new(),
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .expect("create first worktree");
+
+            let child_config = WorktreeConfig {
+                worktree_copy_patterns: Vec::new(),
+                post_create_cmd: vec!["echo child > config-source.txt".into()],
+                ..WorktreeConfig::default()
+            };
+            fs::write(
+                first.worktree_path.join(LOCAL_CONFIG_FILE_NAME),
+                serde_json::to_string_pretty(&child_config).unwrap(),
+            )
+            .unwrap();
+
+            let mut child_svc = WorktreeService::new(Some(first.worktree_path.clone()));
+            child_svc.initialize().await.expect("init child");
+            assert_eq!(
+                child_svc.config_service().config_path(),
+                Some(fx.repo.join(LOCAL_CONFIG_FILE_NAME).as_path())
+            );
+            assert_eq!(
+                child_svc.config_service().config().post_create_cmd,
+                mother_config.post_create_cmd
+            );
+
+            let second = child_svc
+                .create_worktree(
+                    &WorktreeCreateOptions {
+                        name: "feat-b".into(),
+                        source_branch: "main".into(),
+                        new_branch: "feat-b".into(),
+                        base_path: first.worktree_path.to_string_lossy().into_owned(),
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .expect("create second worktree");
+
+            assert_eq!(
+                fs::read_to_string(second.worktree_path.join("config-source.txt")).unwrap(),
+                "mother\n"
+            );
         };
         tokio::runtime::Runtime::new().unwrap().block_on(body);
     });

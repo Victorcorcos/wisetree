@@ -4,7 +4,7 @@
 //! path handoff used by shell integration.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8833,6 +8833,33 @@ impl App {
     }
 
     fn local_config_path(&self) -> Option<PathBuf> {
+        if let Some(service) = self.worktree_service.as_ref() {
+            if let Some(mother_path) = service.mother_worktree_path() {
+                let mother_config = mother_path.join(LOCAL_CONFIG_FILE_NAME);
+                if mother_config.exists() {
+                    return Some(mother_config);
+                }
+
+                if let Some(child_path) = self.git_root.as_deref() {
+                    let child_config = Path::new(child_path).join(LOCAL_CONFIG_FILE_NAME);
+                    if child_config.exists() {
+                        return Some(child_config);
+                    }
+                }
+
+                // When neither local file exists, the mother path is the
+                // preferred local destination for an explicit local-config
+                // action (such as Setup Project Config).
+                return Some(mother_config);
+            }
+
+            if let Some(path) = service.config_service().config_path() {
+                if path != global_config_file().as_path() {
+                    return Some(path.to_path_buf());
+                }
+            }
+        }
+
         self.git_root
             .as_ref()
             .map(|root| PathBuf::from(root).join(LOCAL_CONFIG_FILE_NAME))
