@@ -49,9 +49,9 @@ use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::DevelopRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    code_span, labeled_line, render_summary_table, spinner_frame, AiRoleRow, ConfirmationChoice,
-    ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup,
-    OptionsGroupItem, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
+    abort_run_modal, code_span, labeled_line, render_summary_table, spinner_frame, AiRoleRow,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt,
+    OptionsGroup, OptionsGroupItem, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -214,6 +214,9 @@ pub struct DevelopPullRequestScreen {
     pty: Option<PtyView>,
     pty_focused: bool,
     finalize_confirm: Option<ConfirmationModal>,
+    /// Esc on a step that would tear the whole run down goes through this
+    /// confirmation first (Cancel preselected).
+    abort_confirm: Option<ConfirmationModal>,
     /// True while the `Planning` run is the corrective retry — a second
     /// parse failure surfaces the error instead of retrying again.
     plan_corrective: bool,
@@ -268,6 +271,7 @@ impl DevelopPullRequestScreen {
             pty: None,
             pty_focused: false,
             finalize_confirm: None,
+            abort_confirm: None,
             plan_corrective: false,
             current_section: None,
             pending_summary: None,
@@ -521,6 +525,7 @@ impl DevelopPullRequestScreen {
         self.pty = None;
         self.pty_focused = false;
         self.finalize_confirm = None;
+        self.abort_confirm = None;
     }
 
     /// Completion detection missed on a user-forced continue: tell the user
@@ -583,6 +588,7 @@ impl DevelopPullRequestScreen {
         self.pty = None;
         self.pty_focused = false;
         self.finalize_confirm = None;
+        self.abort_confirm = None;
     }
 
     /// Stash the run's closing summary (distilled from the transcript by the
@@ -792,13 +798,13 @@ impl DevelopPullRequestScreen {
             }
             return DevelopAction::Cancelled;
         }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_key(key);
+        }
         match self.step {
             DevelopStep::Confirm => self.handle_confirm_key(key),
             DevelopStep::DescribeTask => self.handle_describe_key(key),
-            DevelopStep::Working => match key.code {
-                KeyCode::Esc => DevelopAction::Cancelled,
-                _ => DevelopAction::Continue,
-            },
+            DevelopStep::Working => self.handle_quiet_phase_key(key),
             DevelopStep::Planning => self.handle_planning_key(key),
             DevelopStep::ResumePrompt => self.handle_resume_key(key),
             DevelopStep::PlanReview => self.handle_review_key(key),
@@ -806,12 +812,58 @@ impl DevelopPullRequestScreen {
             DevelopStep::Implementing => self.handle_implementing_key(key),
             // Verifying is a quiet phase the harness drives; only Esc (pause)
             // is honored so a stray key can't abandon a running check.
-            DevelopStep::Verifying => match key.code {
-                KeyCode::Esc => DevelopAction::Cancelled,
-                _ => DevelopAction::Continue,
-            },
+            DevelopStep::Verifying => self.handle_quiet_phase_key(key),
             DevelopStep::CheckFailed => self.handle_check_failed_key(key),
             DevelopStep::Done => DevelopAction::Done,
+        }
+    }
+
+    /// Working / Verifying: the harness drives, so only Esc is honored — and
+    /// only through the abort confirmation, since it kills the whole run.
+    fn handle_quiet_phase_key(&mut self, key: KeyEvent) -> DevelopAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                DevelopAction::Continue
+            }
+            _ => DevelopAction::Continue,
+        }
+    }
+
+    /// Esc asked to abandon the run; only a deliberate Yes actually cancels.
+    fn handle_abort_modal_key(&mut self, key: KeyEvent) -> DevelopAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_key called with no modal open");
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => DevelopAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                DevelopAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                DevelopAction::Continue
+            }
+        }
+    }
+
+    fn handle_abort_modal_click(&mut self, position: Position) -> DevelopAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_click called with no modal open");
+        match modal.handle_mouse_click(position) {
+            ConfirmationOutcome::Pending => DevelopAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                DevelopAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                DevelopAction::Continue
+            }
         }
     }
 
@@ -839,7 +891,10 @@ impl DevelopPullRequestScreen {
                 _ => DevelopAction::Cancelled,
             },
             // Esc pauses (progress preserved) — never a silent mark-done.
-            KeyCode::Esc => DevelopAction::Cancelled,
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                DevelopAction::Continue
+            }
             _ => DevelopAction::Continue,
         }
     }
@@ -978,7 +1033,10 @@ impl DevelopPullRequestScreen {
                 self.finalize_confirm = Some(build_plan_continue_modal());
                 DevelopAction::Continue
             }
-            KeyCode::Esc => DevelopAction::Cancelled,
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                DevelopAction::Continue
+            }
             _ => DevelopAction::Continue,
         }
     }
@@ -1024,7 +1082,10 @@ impl DevelopPullRequestScreen {
                 }
             }
             // The plan file stays on disk for a later Resume.
-            KeyCode::Esc => DevelopAction::Cancelled,
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                DevelopAction::Continue
+            }
             _ => DevelopAction::Continue,
         }
     }
@@ -1108,7 +1169,10 @@ impl DevelopPullRequestScreen {
             }
             // Pause: edits stay in the worktree, PLAN.md keeps the progress
             // already marked — running Develop again offers Resume.
-            KeyCode::Esc => DevelopAction::Cancelled,
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                DevelopAction::Continue
+            }
             _ => DevelopAction::Continue,
         }
     }
@@ -1135,6 +1199,9 @@ impl DevelopPullRequestScreen {
     pub fn handle_mouse_click(&mut self, position: Position) -> DevelopAction {
         if self.error.is_some() {
             return DevelopAction::Continue;
+        }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_click(position);
         }
         match self.step {
             DevelopStep::Confirm => {
@@ -1241,6 +1308,9 @@ impl DevelopPullRequestScreen {
             }
             DevelopStep::CheckFailed => self.render_check_failed(frame, area),
             DevelopStep::Done => self.render_done(frame, area),
+        }
+        if let Some(modal) = self.abort_confirm.as_ref() {
+            modal.render(frame, area);
         }
     }
 
@@ -2383,6 +2453,13 @@ fn build_confirm(request: &DevelopRequest) -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Cancel)
 }
 
+fn build_abort_modal() -> ConfirmationModal {
+    abort_run_modal(
+        "Abort the develop run?",
+        "The run stops here; work already written to the worktree stays put.",
+    )
+}
+
 /// Enter during `Implementing`: has opencode finished the run?
 fn build_finalize_modal(single_section: bool) -> ConfirmationModal {
     ConfirmationModal::new()
@@ -2672,7 +2749,10 @@ mod tests {
         assert!(dump.contains("AI Activity"), "{dump}");
         assert!(dump.contains("Continue now"), "{dump}");
         assert!(dump.contains("Cancel planning"), "{dump}");
-        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
+        // Esc asks first; only Yes actually pauses the run.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Continue);
+        s.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Cancelled);
     }
 
     #[test]
@@ -3009,7 +3089,10 @@ mod tests {
         );
         let mut s = screen_on_review();
         s.begin_implement_run(Some(0));
-        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
+        // Esc asks first; only Yes actually pauses the run.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Continue);
+        s.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Cancelled);
     }
 
     #[test]
@@ -3041,7 +3124,10 @@ mod tests {
         assert!(dump.contains("cargo test"), "{dump}");
         // Stray keys are ignored; only Esc pauses.
         assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Continue);
-        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
+        // Esc asks first; only Yes actually pauses the run.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Continue);
+        s.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Cancelled);
     }
 
     #[test]
@@ -3074,8 +3160,10 @@ mod tests {
         );
         s.handle_key(key(KeyCode::Right));
         assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Cancelled);
-        // Esc also pauses.
-        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Cancelled);
+        // Esc asks first; only Yes actually pauses the run.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), DevelopAction::Continue);
+        s.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), DevelopAction::Cancelled);
     }
 
     #[test]

@@ -60,7 +60,7 @@ use crate::tui::screens::dashboard::{ImproveRequest, ReviewPullRequestRequest};
 use crate::tui::screens::update_pr::{button_paragraph, contains_position};
 use crate::tui::widgets::spinner::spinner_frame;
 use crate::tui::widgets::{
-    labeled_line, render_scrollable_summary_table, summary_row_counts, AiRoleRow,
+    abort_run_modal, labeled_line, render_scrollable_summary_table, summary_row_counts, AiRoleRow,
     ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt,
     PrConfirmView, Status, StatusIndicator, SummaryRow,
 };
@@ -328,6 +328,9 @@ pub struct ReviewPullRequestScreen {
     post_all: bool,
     /// Confirmation floating over Decision while **Post all** awaits a yes.
     post_all_confirm: Option<ConfirmationModal>,
+    /// Esc while the scan is running would abandon the whole review, so it
+    /// goes through this confirmation first (Cancel preselected).
+    abort_confirm: Option<ConfirmationModal>,
     /// Live state of the deterministic edit form; `Some` only on
     /// `EditFinding`.
     edit: Option<EditState>,
@@ -415,6 +418,7 @@ impl ReviewPullRequestScreen {
             decision_button_rects: Cell::new([Rect::default(); 5]),
             post_all: false,
             post_all_confirm: None,
+            abort_confirm: None,
             edit: None,
             summary_button: SummaryButton::Comment,
             summary_button_rects: Cell::new([Rect::default(); 3]),
@@ -1352,6 +1356,9 @@ impl ReviewPullRequestScreen {
         if self.error.is_some() {
             return ReviewAction::Cancelled;
         }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_key(key);
+        }
         match self.step {
             ReviewStep::Confirm => {
                 let Some(dialog) = self.confirm.as_mut() else {
@@ -1366,7 +1373,10 @@ impl ReviewPullRequestScreen {
                 }
             }
             ReviewStep::Working => match key.code {
-                KeyCode::Esc => ReviewAction::Cancelled,
+                KeyCode::Esc => {
+                    self.abort_confirm = Some(build_abort_modal());
+                    ReviewAction::Continue
+                }
                 _ => ReviewAction::Continue,
             },
             ReviewStep::Decision => self.handle_decision_key(key),
@@ -1623,9 +1633,49 @@ impl ReviewPullRequestScreen {
         }
     }
 
+    /// Esc asked to abandon the run; only a deliberate Yes actually cancels.
+    fn handle_abort_modal_key(&mut self, key: KeyEvent) -> ReviewAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_key called with no modal open");
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => ReviewAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                ReviewAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                ReviewAction::Continue
+            }
+        }
+    }
+
+    fn handle_abort_modal_click(&mut self, position: Position) -> ReviewAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_click called with no modal open");
+        match modal.handle_mouse_click(position) {
+            ConfirmationOutcome::Pending => ReviewAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                ReviewAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                ReviewAction::Continue
+            }
+        }
+    }
+
     pub fn handle_mouse_click(&mut self, position: Position) -> ReviewAction {
         if self.error.is_some() {
             return ReviewAction::Continue;
+        }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_click(position);
         }
         match self.step {
             ReviewStep::Confirm => {
@@ -1781,6 +1831,9 @@ impl ReviewPullRequestScreen {
             ReviewStep::OtherInput => self.render_other(frame, area),
             ReviewStep::Summary => self.render_summary(frame, area),
             ReviewStep::Done => self.render_done(frame, area),
+        }
+        if let Some(modal) = self.abort_confirm.as_ref() {
+            modal.render(frame, area);
         }
     }
 
@@ -2777,6 +2830,13 @@ fn build_confirm(request: &ReviewPullRequestRequest) -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Cancel)
 }
 
+fn build_abort_modal() -> ConfirmationModal {
+    abort_run_modal(
+        "Abort the review run?",
+        "The scan stops and the findings found so far are discarded.",
+    )
+}
+
 fn build_post_all_confirm(remaining: usize) -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title(format!("Post all {remaining} remaining findings?"))
@@ -3181,6 +3241,35 @@ mod tests {
         assert_eq!(
             screen.handle_key(key(KeyCode::Enter)),
             ReviewAction::Confirmed
+        );
+    }
+
+    #[test]
+    fn esc_while_scanning_asks_before_aborting_the_run() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.start_preparing();
+        // Esc no longer kills the scan outright — it opens the modal.
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), ReviewAction::Continue);
+        assert_eq!(
+            screen.abort_confirm.as_ref().unwrap().selected(),
+            ConfirmationChoice::Cancel
+        );
+        // Cancel is preselected, so a bare Enter keeps the scan alive.
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ReviewAction::Continue
+        );
+        assert!(screen.abort_confirm.is_none());
+        assert_eq!(screen.step(), ReviewStep::Working);
+        // Esc → Yes → the run really aborts.
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), ReviewAction::Continue);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Left)),
+            ReviewAction::Continue
+        );
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ReviewAction::Cancelled
         );
     }
 

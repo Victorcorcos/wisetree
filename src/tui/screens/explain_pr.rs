@@ -42,7 +42,7 @@ use crate::tui::screens::update_pr::{
     ai_activity_event_to_line, button_paragraph, contains_position, key_event_to_pty_bytes,
 };
 use crate::tui::widgets::{
-    code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    abort_run_modal, code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
     ConfirmationModal, ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator,
     SummaryRow,
 };
@@ -114,6 +114,9 @@ pub struct ExplainPullRequestScreen {
     pty_focused: bool,
     /// Overlay confirming the draft is ready, opened by Enter on outer focus.
     finalize_confirm: Option<ConfirmationModal>,
+    /// Esc on outer focus would abandon the whole explain run, so it goes
+    /// through this confirmation first (Cancel preselected).
+    abort_confirm: Option<ConfirmationModal>,
     /// Drafted title, body, and labels parsed from `pull_request.md`,
     /// populated when the App transitions us into Review.
     draft_title: Option<String>,
@@ -155,6 +158,7 @@ impl ExplainPullRequestScreen {
             pty: None,
             pty_focused: false,
             finalize_confirm: None,
+            abort_confirm: None,
             draft_title: None,
             draft_body: None,
             draft_labels: Vec::new(),
@@ -243,6 +247,7 @@ impl ExplainPullRequestScreen {
         self.pty = None;
         self.pty_focused = false;
         self.finalize_confirm = None;
+        self.abort_confirm = None;
     }
 
     /// Spawn the opencode subprocess inside the embedded PTY. Failure to
@@ -308,6 +313,7 @@ impl ExplainPullRequestScreen {
         self.review_button = ReviewButton::Submit;
         self.pty = None;
         self.finalize_confirm = None;
+        self.abort_confirm = None;
         self.error = None;
         self.step = ExplainStep::Review;
     }
@@ -532,6 +538,9 @@ impl ExplainPullRequestScreen {
         if self.error.is_some() {
             return ExplainAction::Cancelled;
         }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_key(key);
+        }
         match self.step {
             ExplainStep::Loading => match key.code {
                 KeyCode::Esc => ExplainAction::Cancelled,
@@ -594,8 +603,12 @@ impl ExplainPullRequestScreen {
                 self.finalize_confirm = Some(build_finalize_modal());
                 ExplainAction::Continue
             }
-            // Esc on outer focus → abort the explain entirely.
-            KeyCode::Esc => ExplainAction::Cancelled,
+            // Esc on outer focus → abort the explain entirely, once the
+            // user confirms they really mean it.
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                ExplainAction::Continue
+            }
             _ => ExplainAction::Continue,
         }
     }
@@ -618,6 +631,43 @@ impl ExplainPullRequestScreen {
         }
     }
 
+    /// Esc asked to abandon the run; only a deliberate Yes actually cancels.
+    fn handle_abort_modal_key(&mut self, key: KeyEvent) -> ExplainAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_key called with no modal open");
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => ExplainAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                ExplainAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                ExplainAction::Continue
+            }
+        }
+    }
+
+    fn handle_abort_modal_click(&mut self, position: Position) -> ExplainAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_click called with no modal open");
+        match modal.handle_mouse_click(position) {
+            ConfirmationOutcome::Pending => ExplainAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                ExplainAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                ExplainAction::Continue
+            }
+        }
+    }
+
     pub fn handle_mouse_click(&mut self, position: Position) -> ExplainAction {
         if self.error.is_some()
             || matches!(
@@ -626,6 +676,9 @@ impl ExplainPullRequestScreen {
             )
         {
             return ExplainAction::Continue;
+        }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_click(position);
         }
         match self.step {
             ExplainStep::Explaining => {
@@ -733,6 +786,9 @@ impl ExplainPullRequestScreen {
             ExplainStep::Explaining => self.render_explaining(frame, area),
             ExplainStep::Review => self.render_review(frame, area),
             ExplainStep::Confirm => self.render_confirm(frame, area),
+        }
+        if let Some(modal) = self.abort_confirm.as_ref() {
+            modal.render(frame, area);
         }
     }
 
@@ -1164,6 +1220,13 @@ fn build_confirm(request: &ExplainPullRequestRequest) -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Cancel)
 }
 
+fn build_abort_modal() -> ConfirmationModal {
+    abort_run_modal(
+        "Abort the explain run?",
+        "The AI stops and no pull request description is drafted.",
+    )
+}
+
 fn build_finalize_modal() -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title("Draft ready?")
@@ -1415,12 +1478,28 @@ mod tests {
     }
 
     #[test]
-    fn explaining_esc_cancels() {
+    fn explaining_esc_confirms_before_cancelling() {
         let mut screen = ExplainPullRequestScreen::new(create_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_explaining();
+        // Esc asks first; Cancel is preselected so Enter alone keeps going.
         assert_eq!(
             screen.handle_key(key(KeyCode::Esc)),
+            ExplainAction::Continue
+        );
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ExplainAction::Continue
+        );
+        assert_eq!(screen.step(), ExplainStep::Explaining);
+        // Esc → Yes → the run really aborts.
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Esc)),
+            ExplainAction::Continue
+        );
+        screen.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
             ExplainAction::Cancelled
         );
     }

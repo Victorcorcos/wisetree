@@ -50,7 +50,7 @@ use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::BugkillRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    abort_run_modal, code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
     ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, PrConfirmView, PtyView,
     Status, StatusIndicator, SummaryRow,
 };
@@ -195,6 +195,9 @@ pub struct BugkillPullRequestScreen {
     pty: Option<PtyView>,
     pty_focused: bool,
     finalize_confirm: Option<ConfirmationModal>,
+    /// Esc on a step that would tear the whole run down goes through this
+    /// confirmation first (Cancel preselected).
+    abort_confirm: Option<ConfirmationModal>,
     /// True while the `Investigating` PTY run is the corrective retry —
     /// a second parse failure surfaces the error instead of retrying again.
     investigate_corrective: bool,
@@ -246,6 +249,7 @@ impl BugkillPullRequestScreen {
             pty: None,
             pty_focused: false,
             finalize_confirm: None,
+            abort_confirm: None,
             investigate_corrective: false,
             verdict_focus: 0,
             verdict_note: None,
@@ -497,6 +501,7 @@ impl BugkillPullRequestScreen {
         self.pty = None;
         self.pty_focused = false;
         self.finalize_confirm = None;
+        self.abort_confirm = None;
     }
 
     pub fn investigate_corrective(&self) -> bool {
@@ -523,6 +528,7 @@ impl BugkillPullRequestScreen {
         self.pty = None;
         self.pty_focused = false;
         self.finalize_confirm = None;
+        self.abort_confirm = None;
     }
 
     /// Spawn the selected AI harness inside the embedded PTY. A spawn failure surfaces as
@@ -724,6 +730,9 @@ impl BugkillPullRequestScreen {
         if self.error.is_some() {
             return BugkillAction::Cancelled;
         }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_key(key);
+        }
         match self.step {
             BugkillStep::Confirm => {
                 let Some(dialog) = self.confirm.as_mut() else {
@@ -739,7 +748,10 @@ impl BugkillPullRequestScreen {
             }
             BugkillStep::DescribeBug => self.handle_describe_key(key),
             BugkillStep::Working => match key.code {
-                KeyCode::Esc if !self.working_locked => BugkillAction::Cancelled,
+                KeyCode::Esc if !self.working_locked => {
+                    self.abort_confirm = Some(build_abort_modal());
+                    BugkillAction::Continue
+                }
                 _ => BugkillAction::Continue,
             },
             BugkillStep::Investigating => self.handle_investigating_key(key),
@@ -857,7 +869,10 @@ impl BugkillPullRequestScreen {
                 }
             }
             // The investigation file stays on disk for a later Resume.
-            KeyCode::Esc => BugkillAction::Cancelled,
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                BugkillAction::Continue
+            }
             _ => BugkillAction::Continue,
         }
     }
@@ -928,8 +943,48 @@ impl BugkillPullRequestScreen {
                 self.finalize_confirm = Some(build_investigate_continue_modal());
                 BugkillAction::Continue
             }
-            KeyCode::Esc => BugkillAction::Cancelled,
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                BugkillAction::Continue
+            }
             _ => BugkillAction::Continue,
+        }
+    }
+
+    /// Esc asked to abandon the run; only a deliberate Yes actually cancels.
+    fn handle_abort_modal_key(&mut self, key: KeyEvent) -> BugkillAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_key called with no modal open");
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => BugkillAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                BugkillAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                BugkillAction::Continue
+            }
+        }
+    }
+
+    fn handle_abort_modal_click(&mut self, position: Position) -> BugkillAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_click called with no modal open");
+        match modal.handle_mouse_click(position) {
+            ConfirmationOutcome::Pending => BugkillAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                BugkillAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                BugkillAction::Continue
+            }
         }
     }
 
@@ -1104,6 +1159,9 @@ impl BugkillPullRequestScreen {
         if self.error.is_some() {
             return BugkillAction::Continue;
         }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_click(position);
+        }
         match self.step {
             BugkillStep::Confirm => {
                 let Some(dialog) = self.confirm.as_mut() else {
@@ -1189,6 +1247,9 @@ impl BugkillPullRequestScreen {
             BugkillStep::OtherInput => self.render_other(frame, area),
             BugkillStep::RetryPrompt => self.render_retry_prompt(frame, area),
             BugkillStep::Done => self.render_done(frame, area),
+        }
+        if let Some(modal) = self.abort_confirm.as_ref() {
+            modal.render(frame, area);
         }
     }
 
@@ -2225,6 +2286,13 @@ fn build_confirm(request: &BugkillRequest) -> ConfirmationModal {
         .with_selected(ConfirmationChoice::Cancel)
 }
 
+fn build_abort_modal() -> ConfirmationModal {
+    abort_run_modal(
+        "Abort the bugkill run?",
+        "The investigation stops here and no further fix is attempted.",
+    )
+}
+
 fn build_finalize_modal() -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title("Fix applied?")
@@ -2546,6 +2614,25 @@ mod tests {
     // ── Select ──────────────────────────────────────────────────────────
 
     #[test]
+    fn esc_while_working_asks_before_aborting_and_stays_locked_when_locked() {
+        let mut s = screen();
+        s.start_working("Syncing the branch...", false);
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Continue);
+        assert_eq!(
+            s.abort_confirm.as_ref().unwrap().selected(),
+            ConfirmationChoice::Cancel
+        );
+        // Cancel is preselected → a bare Enter keeps the run alive.
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Continue);
+        assert!(s.abort_confirm.is_none());
+        assert_eq!(s.step(), BugkillStep::Working);
+        // A locked phase still swallows Esc outright — no modal at all.
+        s.start_working("Rolling back the attempt...", true);
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Continue);
+        assert!(s.abort_confirm.is_none());
+    }
+
+    #[test]
     fn select_skips_ineligible_rows_and_attempts_on_enter() {
         let mut failed = hypothesis(2, 3);
         failed.implemented = true;
@@ -2558,7 +2645,10 @@ mod tests {
         s.handle_key(key(KeyCode::Up));
         assert_eq!(s.selected, 0);
         assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::AttemptFix);
-        assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Cancelled);
+        // Esc asks before abandoning the run.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Continue);
+        s.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Cancelled);
     }
 
     #[test]
@@ -2625,7 +2715,14 @@ mod tests {
         assert!(dump.contains("Continue now"), "{dump}");
         // No fix-step affordances leak in.
         assert!(!dump.contains("Fix applied"), "{dump}");
-        assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Cancelled);
+        // Esc asks first; Cancel is preselected so Enter alone keeps going.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Continue);
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Continue);
+        assert_eq!(s.step(), BugkillStep::Investigating);
+        // Esc → Yes → the run really aborts.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), BugkillAction::Continue);
+        s.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), BugkillAction::Cancelled);
     }
 
     #[test]

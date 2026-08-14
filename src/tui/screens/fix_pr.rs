@@ -41,9 +41,9 @@ use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::FixPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup, OptionsGroupItem, PrConfirmView,
-    PtyView, Status, StatusIndicator, SummaryRow,
+    abort_run_modal, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup,
+    OptionsGroupItem, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +103,9 @@ struct FixHistoryEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixAction {
     Continue,
-    /// Esc / No on Confirm, or Esc during Applying — abort and return to the
-    /// dashboard. The PTY (if any) is torn down via `Drop`.
+    /// Esc / No on Confirm, or a confirmed abort during Working / Applying —
+    /// abort and return to the dashboard. The PTY (if any) is torn down via
+    /// `Drop`.
     Cancelled,
     /// Confirm panel accepted — start the fix pipeline.
     Confirmed,
@@ -168,6 +169,10 @@ pub struct FixPullRequestScreen {
     pty: Option<PtyView>,
     pty_focused: bool,
     finalize_confirm: Option<ConfirmationModal>,
+    /// Esc during Working / Applying aborts the whole run (the remaining
+    /// comments are lost), so it goes through this confirmation first.
+    /// Cancel is preselected — Enter alone can't kill the loop.
+    abort_confirm: Option<ConfirmationModal>,
     // ── results ─────────────────────────────────────────────────────────
     summary_rows: Vec<SummaryRow>,
     error: Option<String>,
@@ -200,6 +205,7 @@ impl FixPullRequestScreen {
             pty: None,
             pty_focused: false,
             finalize_confirm: None,
+            abort_confirm: None,
             summary_rows: Vec::new(),
             error: None,
             step: FixStep::Confirm,
@@ -413,6 +419,7 @@ impl FixPullRequestScreen {
         self.pty = None;
         self.pty_focused = false;
         self.finalize_confirm = None;
+        self.abort_confirm = None;
     }
 
     /// Spawn opencode inside the embedded PTY. A spawn failure surfaces as an
@@ -595,6 +602,9 @@ impl FixPullRequestScreen {
         if self.error.is_some() {
             return FixAction::Cancelled;
         }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_key(key);
+        }
         match self.step {
             FixStep::Confirm => {
                 // Space flips the Autonomous toggle before the modal sees the
@@ -616,7 +626,10 @@ impl FixPullRequestScreen {
                 }
             }
             FixStep::Working => match key.code {
-                KeyCode::Esc => FixAction::Cancelled,
+                KeyCode::Esc => {
+                    self.abort_confirm = Some(build_abort_modal());
+                    FixAction::Continue
+                }
                 _ => FixAction::Continue,
             },
             FixStep::Decision => self.handle_decision_key(key),
@@ -737,8 +750,30 @@ impl FixPullRequestScreen {
                 self.finalize_confirm = Some(build_finalize_modal());
                 FixAction::Continue
             }
-            KeyCode::Esc => FixAction::Cancelled,
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal());
+                FixAction::Continue
+            }
             _ => FixAction::Continue,
+        }
+    }
+
+    /// Esc asked to abort the run; only a deliberate Yes actually cancels.
+    fn handle_abort_modal_key(&mut self, key: KeyEvent) -> FixAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_key called with no modal open");
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => FixAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                FixAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                FixAction::Continue
+            }
         }
     }
 
@@ -776,6 +811,9 @@ impl FixPullRequestScreen {
     pub fn handle_mouse_click(&mut self, position: Position) -> FixAction {
         if self.error.is_some() {
             return FixAction::Continue;
+        }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_click(position);
         }
         match self.step {
             FixStep::Confirm => {
@@ -824,6 +862,24 @@ impl FixPullRequestScreen {
                 FixAction::Continue
             }
             FixStep::Working | FixStep::OtherInput | FixStep::Done => FixAction::Continue,
+        }
+    }
+
+    fn handle_abort_modal_click(&mut self, position: Position) -> FixAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_click called with no modal open");
+        match modal.handle_mouse_click(position) {
+            ConfirmationOutcome::Pending => FixAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                FixAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                FixAction::Continue
+            }
         }
     }
 
@@ -888,6 +944,9 @@ impl FixPullRequestScreen {
             FixStep::OtherInput => self.render_other(frame, area),
             FixStep::Applying => self.render_applying(frame, area),
             FixStep::Done => self.render_done(frame, area),
+        }
+        if let Some(modal) = self.abort_confirm.as_ref() {
+            modal.render(frame, area);
         }
     }
 
@@ -1324,6 +1383,13 @@ fn build_confirm(request: &FixPullRequestRequest) -> ConfirmationModal {
         .with_cancel_text("No")
         .with_color_value(colors::CYAN)
         .with_selected(ConfirmationChoice::Cancel)
+}
+
+fn build_abort_modal() -> ConfirmationModal {
+    abort_run_modal(
+        "Abort the fix run?",
+        "The remaining review comments won't be resolved.",
+    )
 }
 
 fn build_finalize_modal() -> ConfirmationModal {
@@ -2038,6 +2104,47 @@ mod tests {
             screen.handle_key(key(KeyCode::Enter)),
             FixAction::ApplyReady
         );
+    }
+
+    #[test]
+    fn esc_while_applying_asks_before_aborting_the_run() {
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
+        screen.set_groups(
+            vec![group("a.rs", 10), group("b.rs", 20)],
+            "o".into(),
+            "r".into(),
+        );
+        screen.show_decision(plan());
+        screen.start_applying();
+        // Esc no longer kills the loop outright — it opens the modal.
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), FixAction::Continue);
+        assert!(screen.abort_confirm.is_some());
+        // Cancel is preselected, so a bare Enter keeps the run alive.
+        assert_eq!(
+            screen.abort_confirm.as_ref().unwrap().selected(),
+            ConfirmationChoice::Cancel
+        );
+        assert_eq!(screen.handle_key(key(KeyCode::Enter)), FixAction::Continue);
+        assert!(screen.abort_confirm.is_none());
+        assert_eq!(screen.step(), FixStep::Applying);
+        // Reopen and pick Yes → the run aborts.
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), FixAction::Continue);
+        assert_eq!(screen.handle_key(key(KeyCode::Left)), FixAction::Continue);
+        assert_eq!(screen.handle_key(key(KeyCode::Enter)), FixAction::Cancelled);
+    }
+
+    #[test]
+    fn esc_while_working_asks_before_aborting_the_run() {
+        let mut screen = FixPullRequestScreen::new(request(), test_ai());
+        screen.set_groups(vec![group("a.rs", 10)], "o".into(), "r".into());
+        screen.start_planning(1, 1);
+        assert_eq!(screen.step(), FixStep::Working);
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), FixAction::Continue);
+        assert!(screen.abort_confirm.is_some());
+        // Esc inside the modal dismisses the modal, not the run.
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), FixAction::Continue);
+        assert!(screen.abort_confirm.is_none());
+        assert_eq!(screen.step(), FixStep::Working);
     }
 
     #[test]

@@ -7457,16 +7457,12 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
         let Some(first) = surviving.first() else {
             continue;
         };
-        // A thread is handled only when our own resolution reply is its *last*
-        // word — nobody, not even the reviewer, responded after it. If the
-        // reviewer followed up ("you changed the wrong function"), the thread is
-        // pending again and must be re-analysed with the whole discussion. This
-        // replaces the old `isOutdated`-based skip, which dropped any outdated
-        // thread we'd ever replied to and so swallowed reviewer follow-ups.
-        if surviving
-            .last()
-            .is_some_and(|c| c.viewer_did_author && is_resolution_reply(&c.body))
-        {
+        // A thread is handled when our own comment is its *last* word — our
+        // resolution reply, or any other note we typed, means the ball is not
+        // in our court. If the reviewer followed up ("you changed the wrong
+        // function"), the thread is pending again and must be re-analysed with
+        // the whole discussion, even when we authored comments in the middle.
+        if surviving.last().is_some_and(|c| c.viewer_did_author) {
             continue;
         }
         let file = first.path.clone();
@@ -10704,9 +10700,7 @@ fn format_commit_message(
 const ALREADY_RESOLVED_REPLY: &str = "The current code already addresses this — \
     on a closer look against the comment, no change was needed here. Thanks for the feedback!";
 
-/// Prefix of the reply [`format_reply`] posts after committing a fix. Shared
-/// with [`is_resolution_reply`] so the thread filter recognises our own
-/// resolution reply when deciding whether a thread is still pending.
+/// Prefix of the reply [`format_reply`] posts after committing a fix.
 const ADDRESSED_REPLY_PREFIX: &str = "Addressed in ";
 
 /// Build the reply posted to the reviewer after a fix is committed.
@@ -10720,16 +10714,6 @@ fn format_reply(commit_url: &str, plan: &FixPlan) -> String {
         }
     };
     format!("{ADDRESSED_REPLY_PREFIX}{commit_url} — {summary}. Thanks for the feedback!")
-}
-
-/// True when `body` is one of the resolution replies the Fix loop posts to mark
-/// a thread handled: the post-commit "Addressed in <url> …" reply or the
-/// "already addresses this — no change needed" reply. The thread filter skips a
-/// thread only when such a reply is its most recent comment; if the reviewer
-/// responded afterwards, the thread is pending again and gets re-analysed.
-fn is_resolution_reply(body: &str) -> bool {
-    let body = body.trim();
-    body.starts_with(ADDRESSED_REPLY_PREFIX) || body == ALREADY_RESOLVED_REPLY
 }
 
 /// Reply to a reviewer: an inline thread reply when the group has an anchor
@@ -14112,10 +14096,10 @@ so the intent reads clearly.
     }
 
     #[test]
-    fn group_review_feedback_keeps_thread_ending_in_non_resolution_viewer_comment() {
-        // A viewer comment that is *not* one of our resolution replies (e.g. a
-        // human note typed from the same account) must not be mistaken for a
-        // handled thread — it is kept for analysis.
+    fn group_review_feedback_skips_thread_ending_in_any_viewer_comment() {
+        // Our own comment closing the thread — even a freeform note typed by
+        // hand, not one of the Fix loop's resolution replies — means the ball
+        // is not in our court, so the thread is skipped.
         let json = r#"{ "data": { "repository": { "pullRequest": {
             "reviewThreads": { "nodes": [
               { "isResolved": false, "comments": { "nodes": [
@@ -14126,8 +14110,7 @@ so the intent reads clearly.
             "reviews": { "nodes": [] }
         } } } }"#;
         let groups = parse_and_group_review_feedback(json).expect("parse ok");
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].comments.len(), 2);
+        assert!(groups.is_empty());
     }
 
     #[test]
@@ -14353,19 +14336,6 @@ so the intent reads clearly.
             "Addressed in https://github.com/o/r/pull/42/changes/abc123 — \
              extract retry delay into a named constant. Thanks for the feedback!"
         );
-    }
-
-    #[test]
-    fn is_resolution_reply_matches_our_replies_only() {
-        // Both replies the Fix loop posts to mark a thread handled.
-        assert!(is_resolution_reply(&format_reply(
-            "https://x/commit/abc",
-            &sample_plan()
-        )));
-        assert!(is_resolution_reply(ALREADY_RESOLVED_REPLY));
-        // A reviewer follow-up or an arbitrary viewer note is not a resolution.
-        assert!(!is_resolution_reply("You changed the wrong function!"));
-        assert!(!is_resolution_reply("good point, let me think about it"));
     }
 
     // ── Fix pipeline: prompt substitution ──────────────────────────────

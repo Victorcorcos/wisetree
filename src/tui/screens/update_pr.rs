@@ -35,7 +35,7 @@ use crate::messages::colors;
 use crate::services::dashboard::{AiActivityEvent, AiActivitySeverity, AiToolResultStatus};
 use crate::tui::screens::dashboard::UpdatePullRequestRequest;
 use crate::tui::widgets::{
-    code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    abort_run_modal, code_span, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
     ConfirmationModal, ConfirmationOutcome, PrConfirmView, PtyView, Status, StatusIndicator,
     SummaryRow,
 };
@@ -149,6 +149,11 @@ pub struct UpdatePullRequestScreen {
     /// Activity panel). The embedded opencode PTY keeps running
     /// underneath either way because `App::tick_pty` ticks every frame.
     finalize_confirm: Option<ConfirmationModal>,
+    /// Esc on a step where it would discard the AI's work and leave the
+    /// update goes through this confirmation first (Cancel preselected).
+    abort_confirm: Option<ConfirmationModal>,
+    /// What the pending `abort_confirm` should do once confirmed.
+    abort_intent: Option<AbortIntent>,
     /// `true` when this screen drives a *push-only* flow (the dashboard's
     /// "Push Pull Request" action) instead of the full fetch/merge/push
     /// update. Changes the confirm prompt + steps preview and routes the
@@ -218,6 +223,8 @@ impl UpdatePullRequestScreen {
             pty: None,
             pty_focused: false,
             finalize_confirm: None,
+            abort_confirm: None,
+            abort_intent: None,
             push_only: false,
             local_only: false,
             terminal_active: false,
@@ -886,7 +893,11 @@ impl UpdatePullRequestScreen {
                 TermButton::Accept => UpdateAction::TerminalAccept,
                 TermButton::Discard => UpdateAction::TerminalDiscard,
             },
-            KeyCode::Esc => UpdateAction::TerminalDiscard,
+            KeyCode::Esc => {
+                self.abort_confirm = Some(build_abort_modal(AbortIntent::TerminalDiscard));
+                self.abort_intent = Some(AbortIntent::TerminalDiscard);
+                UpdateAction::Continue
+            }
             _ => UpdateAction::Continue,
         }
     }
@@ -894,6 +905,9 @@ impl UpdatePullRequestScreen {
     pub fn handle_key(&mut self, key: KeyEvent) -> UpdateAction {
         if self.error.is_some() {
             return UpdateAction::Cancelled;
+        }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_key(key);
         }
         if matches!(self.step, UpdateStep::Loading) {
             return match key.code {
@@ -987,7 +1001,12 @@ impl UpdatePullRequestScreen {
                     AiButton::Cancel => UpdateAction::AiCancel,
                 },
                 KeyCode::Char('c') | KeyCode::Char('C') => UpdateAction::AiComplete,
-                KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Esc => UpdateAction::AiCancel,
+                KeyCode::Char('x') | KeyCode::Char('X') => UpdateAction::AiCancel,
+                KeyCode::Esc => {
+                    self.abort_confirm = Some(build_abort_modal(AbortIntent::AiCancel));
+                    self.abort_intent = Some(AbortIntent::AiCancel);
+                    UpdateAction::Continue
+                }
                 _ => UpdateAction::Continue,
             };
         }
@@ -1011,9 +1030,61 @@ impl UpdatePullRequestScreen {
         }
     }
 
+    /// Esc asked to walk away from the in-flight update; only a deliberate
+    /// Yes runs the discard the Esc used to trigger outright.
+    fn handle_abort_modal_key(&mut self, key: KeyEvent) -> UpdateAction {
+        let (outcome, intent) = {
+            let (modal, intent) = self
+                .abort_confirm
+                .as_mut()
+                .zip(self.abort_intent)
+                .expect("handle_abort_modal_key called with no modal open");
+            (modal.handle_key(key), intent)
+        };
+        self.resolve_abort_outcome(outcome, intent)
+    }
+
+    fn handle_abort_modal_click(&mut self, position: Position) -> UpdateAction {
+        let (outcome, intent) = {
+            let (modal, intent) = self
+                .abort_confirm
+                .as_mut()
+                .zip(self.abort_intent)
+                .expect("handle_abort_modal_click called with no modal open");
+            (modal.handle_mouse_click(position), intent)
+        };
+        self.resolve_abort_outcome(outcome, intent)
+    }
+
+    fn resolve_abort_outcome(
+        &mut self,
+        outcome: ConfirmationOutcome,
+        intent: AbortIntent,
+    ) -> UpdateAction {
+        match outcome {
+            ConfirmationOutcome::Pending => UpdateAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                self.abort_intent = None;
+                match intent {
+                    AbortIntent::AiCancel => UpdateAction::AiCancel,
+                    AbortIntent::TerminalDiscard => UpdateAction::TerminalDiscard,
+                }
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                self.abort_intent = None;
+                UpdateAction::Continue
+            }
+        }
+    }
+
     pub fn handle_mouse_click(&mut self, position: Position) -> UpdateAction {
         if self.error.is_some() || matches!(self.step, UpdateStep::Loading) {
             return UpdateAction::Continue;
+        }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_click(position);
         }
         if matches!(self.step, UpdateStep::CommitPush) {
             if self.commit_push_done {
@@ -1139,6 +1210,9 @@ impl UpdatePullRequestScreen {
             UpdateStep::Updating => self.render_updating(frame, area),
             UpdateStep::Confirm => self.render_confirm(frame, area),
             UpdateStep::CommitPush => self.render_commit_push(frame, area),
+        }
+        if let Some(modal) = self.abort_confirm.as_ref() {
+            modal.render(frame, area);
         }
     }
 
@@ -2515,6 +2589,29 @@ pub(crate) fn key_event_to_pty_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+/// What a confirmed Esc-abort should do — the two exits differ in what they
+/// throw away, so the modal has to remember which one asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortIntent {
+    /// Discard the AI's merge resolution and abort the merge.
+    AiCancel,
+    /// Discard the recovery terminal's changes.
+    TerminalDiscard,
+}
+
+fn build_abort_modal(intent: AbortIntent) -> ConfirmationModal {
+    match intent {
+        AbortIntent::AiCancel => abort_run_modal(
+            "Abort the update?",
+            "The merge is aborted and the AI's conflict resolution is discarded.",
+        ),
+        AbortIntent::TerminalDiscard => abort_run_modal(
+            "Discard and leave?",
+            "The changes made in the recovery terminal are thrown away.",
+        ),
+    }
+}
+
 /// Build the finalize-confirmation modal that opens when the user
 /// presses Enter on the outer focus while opencode is streaming. Yes is
 /// preselected so a careful confirmation flow (Enter → modal → Enter)
@@ -2805,14 +2902,26 @@ mod tests {
     }
 
     #[test]
-    fn esc_after_ai_done_returns_ai_cancel() {
+    fn esc_after_ai_done_confirms_before_the_ai_cancel() {
         let mut screen = UpdatePullRequestScreen::new(sample_request(), test_ai());
         screen.set_base_ref("upstream/main".to_string());
         screen.start_updating();
         screen.mark_ai_active();
         screen.mark_ai_done();
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(screen.handle_key(esc), UpdateAction::AiCancel);
+        // Esc asks first; Cancel is preselected so Enter alone changes nothing.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.handle_key(esc), UpdateAction::Continue);
+        assert_eq!(screen.handle_key(enter), UpdateAction::Continue);
+        // Esc → Yes → the discard the Esc used to trigger outright.
+        assert_eq!(screen.handle_key(esc), UpdateAction::Continue);
+        screen.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(screen.handle_key(enter), UpdateAction::AiCancel);
+        // 'x' stays an immediate cancel — it can't be pressed by accident.
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            UpdateAction::AiCancel
+        );
     }
 
     #[test]
@@ -3321,9 +3430,13 @@ mod tests {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(screen.handle_key(enter), UpdateAction::TerminalAccept);
 
-        // Esc always discards regardless of focused button.
+        // Esc discards regardless of focused button — after confirming.
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(screen.handle_key(esc), UpdateAction::TerminalDiscard);
+        assert_eq!(screen.handle_key(esc), UpdateAction::Continue);
+        assert_eq!(screen.handle_key(enter), UpdateAction::Continue);
+        assert_eq!(screen.handle_key(esc), UpdateAction::Continue);
+        screen.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(screen.handle_key(enter), UpdateAction::TerminalDiscard);
     }
 
     #[test]

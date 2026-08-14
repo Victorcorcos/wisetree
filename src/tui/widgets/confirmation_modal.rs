@@ -311,6 +311,19 @@ impl ConfirmationModal {
     }
 }
 
+/// The shared "are you sure you want to abort?" modal every PR command puts
+/// in front of an Esc that would tear down an in-progress run. Cancel is
+/// preselected on purpose: a reflexive Enter must never kill the run.
+pub fn abort_run_modal(title: impl Into<String>, subtitle: impl Into<String>) -> ConfirmationModal {
+    ConfirmationModal::new()
+        .with_title(title)
+        .with_subtitle(subtitle)
+        .with_confirm_text("Yes")
+        .with_cancel_text("Cancel")
+        .with_color_value(colors::ERROR)
+        .with_selected(ConfirmationChoice::Cancel)
+}
+
 fn button_width(label: &str) -> u16 {
     // Border (2) + 2-cell padding each side (4) + label.
     label.chars().count() as u16 + 6

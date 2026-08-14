@@ -23,7 +23,7 @@ use crate::tui::screens::update_pr::{
 };
 use crate::tui::widgets::PtyView;
 use crate::tui::widgets::{
-    labeled_line, render_scrollable_summary_table, summary_row_counts, AiRoleRow,
+    abort_run_modal, labeled_line, render_scrollable_summary_table, summary_row_counts, AiRoleRow,
     ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, OptionsGroup, OptionsGroupItem,
     PrConfirmView, Status, StatusIndicator, SummaryRow,
 };
@@ -195,6 +195,9 @@ pub struct ImprovePullRequestScreen {
     review_ai: AiReviewConfig,
     fix_ai: AiFixConfig,
     confirm: ConfirmationModal,
+    /// Esc while the discovery is preparing would abandon the whole run, so
+    /// it goes through this confirmation first (Cancel preselected).
+    abort_confirm: Option<ConfirmationModal>,
     preparing: bool,
     finding: Option<ReviewFinding>,
     current: usize,
@@ -225,6 +228,7 @@ impl ImprovePullRequestScreen {
     pub fn new(request: ImproveRequest, review_ai: AiReviewConfig, fix_ai: AiFixConfig) -> Self {
         Self {
             confirm: build_confirm(&request),
+            abort_confirm: None,
             request,
             review_ai,
             fix_ai,
@@ -264,6 +268,9 @@ impl ImprovePullRequestScreen {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ImproveAction {
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_key(key);
+        }
         if self.done {
             return match key.code {
                 KeyCode::Up => {
@@ -341,7 +348,8 @@ impl ImprovePullRequestScreen {
         }
         if self.preparing {
             return if matches!(key.code, KeyCode::Esc) {
-                ImproveAction::Cancelled
+                self.abort_confirm = Some(build_abort_modal());
+                ImproveAction::Continue
             } else {
                 ImproveAction::Continue
             };
@@ -433,7 +441,47 @@ impl ImprovePullRequestScreen {
         }
     }
 
+    /// Esc asked to abandon the run; only a deliberate Yes actually cancels.
+    fn handle_abort_modal_key(&mut self, key: KeyEvent) -> ImproveAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_key called with no modal open");
+        match modal.handle_key(key) {
+            ConfirmationOutcome::Pending => ImproveAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                ImproveAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                ImproveAction::Continue
+            }
+        }
+    }
+
+    fn handle_abort_modal_click(&mut self, position: Position) -> ImproveAction {
+        let modal = self
+            .abort_confirm
+            .as_mut()
+            .expect("handle_abort_modal_click called with no modal open");
+        match modal.handle_mouse_click(position) {
+            ConfirmationOutcome::Pending => ImproveAction::Continue,
+            ConfirmationOutcome::Confirmed => {
+                self.abort_confirm = None;
+                ImproveAction::Cancelled
+            }
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                self.abort_confirm = None;
+                ImproveAction::Continue
+            }
+        }
+    }
+
     pub fn handle_mouse_click(&mut self, position: Position) -> ImproveAction {
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_click(position);
+        }
         if self.preparing || self.applying || self.committing || self.aborting || self.done {
             return ImproveAction::Continue;
         }
@@ -471,6 +519,13 @@ impl ImprovePullRequestScreen {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        self.render_step(frame, area);
+        if let Some(modal) = self.abort_confirm.as_ref() {
+            modal.render(frame, area);
+        }
+    }
+
+    fn render_step(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
         if self.done {
             self.render_done(frame, area);
             return;
@@ -1217,6 +1272,13 @@ impl ImprovePullRequestScreen {
     }
 }
 
+fn build_abort_modal() -> ConfirmationModal {
+    abort_run_modal(
+        "Abort the improve run?",
+        "The discovery stops and no findings are reviewed.",
+    )
+}
+
 fn build_confirm(request: &ImproveRequest) -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title("Start Improve?")
@@ -1723,8 +1785,23 @@ mod tests {
             screen.handle_mouse_click(Position { x: 69, y: 0 }),
             ImproveAction::Continue
         );
+        // Esc asks first; Cancel is preselected so Enter alone keeps going.
         assert_eq!(
             screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ImproveAction::Continue
+        );
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ImproveAction::Continue
+        );
+        // Esc → Yes → the run really aborts.
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ImproveAction::Continue
+        );
+        screen.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Cancelled
         );
 
