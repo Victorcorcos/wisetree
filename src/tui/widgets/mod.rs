@@ -27,7 +27,9 @@ pub use bulk_confirm_dialog::{
 };
 pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
-pub use confirmation_modal::{ConfirmationChoice, ConfirmationModal, ConfirmationOutcome};
+pub use confirmation_modal::{
+    abort_run_modal, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+};
 pub use input_prompt::{InputOutcome, InputPrompt};
 pub use options_group::{OptionsGroup, OptionsGroupItem};
 pub use pr_confirm::{

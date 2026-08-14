@@ -41,9 +41,9 @@ use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::FixPullRequestRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup, OptionsGroupItem, PrConfirmView,
-    PtyView, Status, StatusIndicator, SummaryRow,
+    abort_run_modal, labeled_line, render_summary_table, AiRoleRow, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup,
+    OptionsGroupItem, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,6 +602,9 @@ impl FixPullRequestScreen {
         if self.error.is_some() {
             return FixAction::Cancelled;
         }
+        if self.abort_confirm.is_some() {
+            return self.handle_abort_modal_key(key);
+        }
         match self.step {
             FixStep::Confirm => {
                 // Space flips the Autonomous toggle before the modal sees the
@@ -622,18 +625,13 @@ impl FixPullRequestScreen {
                     ConfirmationOutcome::Pending => FixAction::Continue,
                 }
             }
-            FixStep::Working => {
-                if self.abort_confirm.is_some() {
-                    return self.handle_abort_modal_key(key);
+            FixStep::Working => match key.code {
+                KeyCode::Esc => {
+                    self.abort_confirm = Some(build_abort_modal());
+                    FixAction::Continue
                 }
-                match key.code {
-                    KeyCode::Esc => {
-                        self.abort_confirm = Some(build_abort_modal());
-                        FixAction::Continue
-                    }
-                    _ => FixAction::Continue,
-                }
-            }
+                _ => FixAction::Continue,
+            },
             FixStep::Decision => self.handle_decision_key(key),
             FixStep::OtherInput => self.handle_other_key(key),
             FixStep::Applying => self.handle_applying_key(key),
@@ -711,9 +709,6 @@ impl FixPullRequestScreen {
     }
 
     fn handle_applying_key(&mut self, key: KeyEvent) -> FixAction {
-        if self.abort_confirm.is_some() {
-            return self.handle_abort_modal_key(key);
-        }
         if self.finalize_confirm.is_some() {
             return self.handle_finalize_modal_key(key);
         }
@@ -1391,13 +1386,10 @@ fn build_confirm(request: &FixPullRequestRequest) -> ConfirmationModal {
 }
 
 fn build_abort_modal() -> ConfirmationModal {
-    ConfirmationModal::new()
-        .with_title("Abort the fix run?")
-        .with_subtitle("The remaining review comments won't be resolved.")
-        .with_confirm_text("Yes")
-        .with_cancel_text("Cancel")
-        .with_color_value(colors::ERROR)
-        .with_selected(ConfirmationChoice::Cancel)
+    abort_run_modal(
+        "Abort the fix run?",
+        "The remaining review comments won't be resolved.",
+    )
 }
 
 fn build_finalize_modal() -> ConfirmationModal {
