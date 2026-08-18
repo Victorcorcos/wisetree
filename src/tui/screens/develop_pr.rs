@@ -2422,7 +2422,10 @@ fn render_text_panel(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, s
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(colors::MUTED))
             .thumb_style(Style::default().fg(colors::INFO));
-        let mut state = ScrollbarState::new(total_rows as usize)
+        // Ratatui's content length is the number of valid scroll positions,
+        // not the number of rendered rows. This makes `max_scroll` the final
+        // position, so the thumb reaches the bottom with the last rows shown.
+        let mut state = ScrollbarState::new(max_scroll.saturating_add(1) as usize)
             .viewport_content_length(inner.height as usize)
             .position(scroll as usize);
         frame.render_stateful_widget(scrollbar, inner, &mut state);
@@ -2497,6 +2500,7 @@ mod tests {
     use crate::services::develop::{parse_plan_md, PlanSection};
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::layout::Position;
     use ratatui::Terminal;
 
@@ -2552,11 +2556,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn render_dump(screen: &mut DevelopPullRequestScreen, w: u16, h: u16) -> String {
+    fn render_buffer(screen: &mut DevelopPullRequestScreen, w: u16, h: u16) -> Buffer {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| screen.render(f, f.area())).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_dump(screen: &mut DevelopPullRequestScreen, w: u16, h: u16) -> String {
+        let buffer = render_buffer(screen, w, h);
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -2915,6 +2923,26 @@ mod tests {
         assert!(
             bottom.contains("tail marker 6"),
             "scrolling should reveal the last section:\n{bottom}"
+        );
+    }
+
+    #[test]
+    fn plan_review_scrollbar_reaches_the_bottom_with_the_last_section() {
+        let mut s = wrapping_plan_on_review();
+        for _ in 0..40 {
+            s.handle_key(key(KeyCode::PageDown));
+        }
+
+        let buffer = render_buffer(&mut s, 100, 20);
+        let bottom_arrow = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].symbol() == "▼")
+            .expect("overflowing plan should render a bottom scrollbar arrow");
+
+        assert_eq!(
+            buffer[(bottom_arrow.0, bottom_arrow.1 - 1)].symbol(),
+            "█",
+            "at the last section, the scrollbar thumb should touch the bottom arrow"
         );
     }
 
