@@ -32,6 +32,7 @@ use crate::services::bugkill::{
     ParsedInvestigation, INVESTIGATION_FILE,
 };
 use crate::services::develop::{parse_plan_md, DevelopPlan, PLAN_FILE};
+use crate::services::guides;
 use crate::services::review_telemetry::{
     opencode_usage_for_title, review_scan_title, ReviewScanTelemetry, ReviewTokenUsage,
 };
@@ -174,6 +175,10 @@ const BUGKILL_FIELD_MAX_BYTES: usize = 8_000;
 const DEVELOP_TASK_MAX_BYTES: usize = 16_000;
 const DEVELOP_FEEDBACK_MAX_BYTES: usize = 8_000;
 const DEVELOP_PLAN_MAX_BYTES: usize = 48_000;
+/// Byte cap for the repository guide index shared by the Develop and Bugkill
+/// prompts. The index carries headers only — never a guide's body, which the
+/// AI reads from disk on demand — so a small cap is plenty.
+const GUIDES_MAX_BYTES: usize = 4_000;
 /// How long the post-section check command may run before it is killed and
 /// reported as a failure. A full test suite is slower than a git op, so this
 /// gets a generous leash.
@@ -4864,7 +4869,8 @@ impl DashboardService {
             ));
         }
         let cwd = PathBuf::from(worktree_path);
-        let mut prompt = build_bug_investigate_prompt(bug_description, base_ref);
+        let mut prompt =
+            build_bug_investigate_prompt(bug_description, base_ref, &guides::index_for(&cwd));
         if corrective {
             prompt = format!(
                 "{prompt}\n\nYour previous output could not be parsed. Reply with ONLY the \
@@ -4907,7 +4913,7 @@ impl DashboardService {
             ));
         }
         let cwd = PathBuf::from(worktree_path);
-        let prompt = build_bug_fix_prompt(bug_description, row, feedback);
+        let prompt = build_bug_fix_prompt(bug_description, row, feedback, &guides::index_for(&cwd));
         let command = self.ai_runner().command(&AiRunRequest {
             slot: "dashboard.ai.bugkill.fix".to_string(),
             config: slot.clone(),
@@ -5288,8 +5294,13 @@ impl DashboardService {
             ));
         }
         let cwd = PathBuf::from(worktree_path);
-        let mut prompt =
-            build_develop_plan_prompt(task_description, base_ref, previous_plan, feedback);
+        let mut prompt = build_develop_plan_prompt(
+            task_description,
+            base_ref,
+            previous_plan,
+            feedback,
+            &guides::index_for(&cwd),
+        );
         if corrective {
             prompt = format!(
                 "{prompt}\n\nYour previous output could not be parsed. Reply with ONLY the \
@@ -5347,6 +5358,7 @@ impl DashboardService {
             outline,
             self.config.develop.check_command.trim(),
             check_failure,
+            &guides::index_for(&cwd),
         );
         Self::ensure_develop_attachments(attachments)?;
         let command = self.develop_runner().command(&AiRunRequest {
@@ -7629,9 +7641,20 @@ fn truncate_bugkill_field(text: &str, max_bytes: usize) -> String {
 }
 
 /// Render `prompts/bug_investigate.md` for the one-shot investigation call.
-fn build_bug_investigate_prompt(bug_description: &str, base_ref: Option<&str>) -> String {
+/// `guides` is the repository's guide index (see [`crate::services::guides`]),
+/// substituted before any user-supplied field so a bug description can never
+/// forge one.
+fn build_bug_investigate_prompt(
+    bug_description: &str,
+    base_ref: Option<&str>,
+    guides: &str,
+) -> String {
     const PROMPT: &str = include_str!("../../prompts/bug_investigate.md");
     PROMPT
+        .replace(
+            "REPOSITORY_GUIDES",
+            &truncate_bugkill_field(guides, GUIDES_MAX_BYTES),
+        )
         .replace(
             "BUG_DESCRIPTION",
             &truncate_bugkill_field(bug_description, BUGKILL_DESCRIPTION_MAX_BYTES),
@@ -7646,9 +7669,14 @@ fn build_bug_fix_prompt(
     bug_description: &str,
     row: &BugHypothesis,
     feedback: Option<&str>,
+    guides: &str,
 ) -> String {
     const PROMPT: &str = include_str!("../../prompts/bug_fix.md");
     PROMPT
+        .replace(
+            "REPOSITORY_GUIDES",
+            &truncate_bugkill_field(guides, GUIDES_MAX_BYTES),
+        )
         .replace(
             "BUG_DESCRIPTION",
             &truncate_bugkill_field(bug_description, BUGKILL_DESCRIPTION_MAX_BYTES),
@@ -7693,9 +7721,14 @@ fn build_develop_plan_prompt(
     base_ref: Option<&str>,
     previous_plan: Option<&str>,
     feedback: Option<&str>,
+    guides: &str,
 ) -> String {
     const PROMPT: &str = include_str!("../../prompts/develop_plan.md");
     PROMPT
+        .replace(
+            "REPOSITORY_GUIDES",
+            &truncate_bugkill_field(guides, GUIDES_MAX_BYTES),
+        )
         .replace(
             "TASK_DESCRIPTION",
             &truncate_bugkill_field(task_description, DEVELOP_TASK_MAX_BYTES),
@@ -7724,6 +7757,7 @@ fn build_develop_implement_prompt(
     outline: &str,
     check_command: &str,
     check_failure: Option<&str>,
+    guides: &str,
 ) -> String {
     const PROMPT: &str = include_str!("../../prompts/develop_implement.md");
     let check_command = if check_command.is_empty() {
@@ -7732,6 +7766,10 @@ fn build_develop_implement_prompt(
         check_command.to_string()
     };
     PROMPT
+        .replace(
+            "REPOSITORY_GUIDES",
+            &truncate_bugkill_field(guides, GUIDES_MAX_BYTES),
+        )
         .replace(
             "TASK_DESCRIPTION",
             &truncate_bugkill_field(task_description, DEVELOP_TASK_MAX_BYTES),
@@ -11023,14 +11061,67 @@ error: could not fetch gustavo";
 
     #[test]
     fn develop_plan_prompt_renders_first_run_with_unresolved_base() {
-        let prompt = build_develop_plan_prompt("Add dashboard filtering", None, None, None);
+        let prompt = build_develop_plan_prompt(
+            "Add dashboard filtering",
+            None,
+            None,
+            None,
+            guides::NO_GUIDES,
+        );
 
         assert!(prompt.contains("Add dashboard filtering"));
         assert!(prompt.contains("(none resolved)"));
+        assert!(prompt.contains(guides::NO_GUIDES));
+        assert!(!prompt.contains("REPOSITORY_GUIDES"));
         assert!(!prompt.contains("TASK_DESCRIPTION"));
         assert!(!prompt.contains("BASE_REF"));
         assert!(!prompt.contains("PREVIOUS_PLAN"));
         assert!(!prompt.contains("USER_FEEDBACK"));
+    }
+
+    #[test]
+    fn every_ai_command_prompt_carries_the_repository_guide_index() {
+        let index = guides::render_index(&[guides::Guide {
+            name: "auth-permissions".to_string(),
+            when: "touching authentication or permission levels".to_string(),
+            applies_to: vec!["app/policies/**".to_string()],
+            display_path: ".wisetree/guides/auth.md".to_string(),
+            age_days: Some(12),
+        }]);
+        let row = BugHypothesis {
+            number: 1,
+            description: "the cause".to_string(),
+            ranking: 5,
+            quality: crate::services::bugkill::EvidenceQuality::Confirmed,
+            solution: "the fix".to_string(),
+            implemented: false,
+            worked: None,
+        };
+
+        let prompts = [
+            build_develop_plan_prompt("task", None, None, None, &index),
+            build_develop_implement_prompt("task", "s", "o", "", None, &index),
+            build_bug_investigate_prompt("bug", None, &index),
+            build_bug_fix_prompt("bug", &row, None, &index),
+        ];
+
+        for prompt in prompts {
+            assert!(prompt.contains("auth-permissions"), "{prompt}");
+            assert!(prompt.contains(".wisetree/guides/auth.md"), "{prompt}");
+            assert!(prompt.contains("updated 12 days ago"), "{prompt}");
+            assert!(prompt.contains("CODE WINS"), "{prompt}");
+            assert!(!prompt.contains("REPOSITORY_GUIDES"), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn the_guide_index_is_capped_before_it_reaches_the_prompt() {
+        let oversized = "🔐".repeat(GUIDES_MAX_BYTES);
+
+        let prompt = build_develop_plan_prompt("task", None, None, None, &oversized);
+
+        assert!(prompt.contains(&truncate_bugkill_field(&oversized, GUIDES_MAX_BYTES)));
+        assert!(!prompt.contains(&oversized));
     }
 
     #[test]
@@ -11040,6 +11131,7 @@ error: could not fetch gustavo";
             Some("origin/main"),
             Some("## Section 1\nImplement the filter"),
             Some("Keep the existing keyboard shortcut"),
+            guides::NO_GUIDES,
         );
 
         assert!(prompt.contains("Add dashboard filtering"));
@@ -11063,6 +11155,7 @@ error: could not fetch gustavo";
             Some("main"),
             Some(&oversized_plan),
             Some(&oversized_feedback),
+            guides::NO_GUIDES,
         );
 
         let expected_task = truncate_bugkill_field(&oversized_task, DEVELOP_TASK_MAX_BYTES);
@@ -17068,6 +17161,7 @@ so the intent reads clearly.
             "1. A — THIS RUN",
             "cargo test --all",
             Some("assertion failed: left == right"),
+            guides::NO_GUIDES,
         );
         assert!(with_check.contains("cargo test --all"), "{with_check}");
         assert!(
@@ -17076,7 +17170,8 @@ so the intent reads clearly.
         );
 
         // No check configured → a clear placeholder, no empty CHECK_COMMAND.
-        let no_check = build_develop_implement_prompt("task", "s", "o", "", None);
+        let no_check =
+            build_develop_implement_prompt("task", "s", "o", "", None, guides::NO_GUIDES);
         assert!(
             no_check.contains("no automated check configured"),
             "{no_check}"
@@ -17093,6 +17188,7 @@ so the intent reads clearly.
             "Section 1: done\nSection 2: THIS RUN\nSection 3: later",
             "cargo test --all",
             Some("previous check failure"),
+            guides::NO_GUIDES,
         );
 
         assert!(prompt.contains("Implement task"));

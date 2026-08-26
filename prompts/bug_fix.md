@@ -20,6 +20,12 @@ CAUSE_DESCRIPTION
 SOLUTION
 ```
 
+- This repository's implementation guides, to read on demand before you write code:
+
+```
+REPOSITORY_GUIDES
+```
+
 - The user's feedback on your previous attempt at this same fix (empty on a first attempt):
 
 ```

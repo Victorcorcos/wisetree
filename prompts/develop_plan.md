@@ -12,6 +12,12 @@ Any image attachments arrive either as native CLI attachments or as a list of fi
 
 - The branch's base ref, for context only (may be `(none resolved)`): `BASE_REF`
 
+- This repository's implementation guides, to read on demand while you investigate:
+
+```
+REPOSITORY_GUIDES
+```
+
 - The current plan being revised, in the same block format you must emit (empty on a first run):
 
 ```

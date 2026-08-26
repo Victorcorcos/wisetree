@@ -10,6 +10,12 @@ BUG_DESCRIPTION
 
 - The branch's base ref, for context only (may be `(none resolved)`): `BASE_REF`
 
+- This repository's implementation guides, to read on demand while you investigate:
+
+```
+REPOSITORY_GUIDES
+```
+
 ## How to investigate
 
 1. Explore the codebase and trace the path from the relevant input or entry point to the failure point the bug describes.
