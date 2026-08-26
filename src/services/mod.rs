@@ -8,6 +8,7 @@ pub mod app_state;
 pub mod bugkill;
 pub mod dashboard;
 pub mod develop;
+pub mod guides;
 pub mod opencode_models;
 pub mod opencode_turn;
 pub mod presets;

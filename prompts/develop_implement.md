@@ -22,6 +22,12 @@ PLAN_OUTLINE
 SECTIONS
 ```
 
+- This repository's implementation guides, to read on demand before you write code:
+
+```
+REPOSITORY_GUIDES
+```
+
 - The check the harness runs after you stop (your work must make it pass):
 
 ```
