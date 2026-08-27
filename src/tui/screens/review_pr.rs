@@ -43,7 +43,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell as TableCell, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Frame;
 
 use crate::config::schema::AiReviewConfig;
@@ -1955,6 +1957,11 @@ impl ReviewPullRequestScreen {
         if inner.height == 0 || inner.width == 0 {
             return;
         }
+        if inner.height >= 7 {
+            self.render_scan_contents_with_legend(frame, inner);
+            return;
+        }
+
         // Activity fills the top; the findings tally is pinned to the bottom
         // row so it stays put as scans come and go.
         let rows = Layout::default()
@@ -1964,6 +1971,87 @@ impl ReviewPullRequestScreen {
         let activity = self.activity_lines(rows[0].height as usize, inner.width as usize);
         frame.render_widget(Paragraph::new(activity), rows[0]);
         frame.render_widget(Paragraph::new(self.findings_tally_line()), rows[1]);
+    }
+
+    /// Shared Review/Improve scan layout: live activity at the top, the same
+    /// centered severity legend in the middle, and the running tally below.
+    fn render_scan_contents_with_legend(&self, frame: &mut Frame, area: Rect) {
+        const LEGEND_HEIGHT: u16 = 5;
+        const MAX_ACTIVITY_ROWS: u16 = 4;
+
+        let activity_height = (self
+            .activity_lines(MAX_ACTIVITY_ROWS as usize, area.width as usize)
+            .len() as u16)
+            .clamp(1, MAX_ACTIVITY_ROWS);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(activity_height),
+                Constraint::Min(0),
+                Constraint::Length(LEGEND_HEIGHT),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let activity = self.activity_lines(activity_height as usize, area.width as usize);
+        frame.render_widget(Paragraph::new(activity), rows[0]);
+        self.render_severity_legend(frame, rows[2]);
+        frame.render_widget(Paragraph::new(self.findings_tally_line()), rows[4]);
+    }
+
+    fn render_severity_legend(&self, frame: &mut Frame, area: Rect) {
+        const PRIORITY_WIDTH: u16 = 11;
+        const MEANING_WIDTH: u16 = 31;
+        const COLUMN_SPACING: u16 = 2;
+
+        let header = Row::new(["Priority", "Meaning"]).style(
+            Style::default()
+                .fg(colors::GRAY_DARK)
+                .add_modifier(Modifier::BOLD),
+        );
+        let rows = [
+            (
+                ReviewSeverity::Critical,
+                "Critical",
+                "Breaks behavior or security",
+            ),
+            (ReviewSeverity::High, "High", "Likely bug or major problem"),
+            (
+                ReviewSeverity::Medium,
+                "Medium",
+                "Real issue with limited impact",
+            ),
+            (ReviewSeverity::Low, "Low", "Small improvement"),
+        ]
+        .into_iter()
+        .map(|(severity, label, meaning)| {
+            Row::new(vec![
+                TableCell::from(format!("{} {label}", severity.emoji()))
+                    .style(Style::default().fg(severity_color(severity))),
+                TableCell::from(meaning).style(Style::default().fg(colors::EMPHASIS)),
+            ])
+        });
+
+        let table_width = (PRIORITY_WIDTH + MEANING_WIDTH + COLUMN_SPACING).min(area.width);
+        let left_pad = area.width.saturating_sub(table_width) / 2;
+        let table_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(left_pad),
+                Constraint::Length(table_width),
+                Constraint::Min(0),
+            ])
+            .split(area)[1];
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(PRIORITY_WIDTH),
+                Constraint::Length(MEANING_WIDTH),
+            ],
+        )
+        .header(header)
+        .column_spacing(COLUMN_SPACING);
+        frame.render_widget(table, table_area);
     }
 
     /// The pipeline stages paired with each one's current state. `Audit` is a
@@ -2106,14 +2194,12 @@ impl ReviewPullRequestScreen {
     fn findings_tally_line(&self) -> Line<'static> {
         let counts = self.severity_counts();
         let total: usize = counts.iter().sum();
-        let mut spans = vec![Span::styled(
-            if self.is_improve() {
-                "Improvements  ".to_string()
-            } else {
-                "Findings  ".to_string()
-            },
-            Style::default().fg(colors::EMPHASIS),
-        )];
+        let tally_label = if self.is_improve() {
+            "Improvements: "
+        } else {
+            "Findings: "
+        };
+        let mut spans = vec![Span::styled(tally_label.to_string(), muted_dim())];
         if total == 0 {
             spans.push(Span::styled("none surfaced yet".to_string(), muted_dim()));
             return Line::from(spans);
@@ -2124,7 +2210,10 @@ impl ReviewPullRequestScreen {
             (ReviewSeverity::Medium, counts[2]),
             (ReviewSeverity::Low, counts[3]),
         ];
-        for (severity, count) in by_severity {
+        for (index, (severity, count)) in by_severity.into_iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled("  ·  ".to_string(), muted_dim()));
+            }
             let style = if count == 0 {
                 muted_dim()
             } else {
@@ -2133,11 +2222,12 @@ impl ReviewPullRequestScreen {
                     .add_modifier(Modifier::BOLD)
             };
             spans.push(Span::styled(
-                format!("{} {count}  ", severity.emoji()),
+                format!("{} {} {count}", severity.emoji(), severity.label()),
                 style,
             ));
         }
-        spans.push(Span::styled(format!("· {total} total"), muted_dim()));
+        spans.push(Span::styled("  ·  ".to_string(), muted_dim()));
+        spans.push(Span::styled(format!("Total {total}"), muted_dim()));
         Line::from(spans)
     }
 
@@ -3757,7 +3847,7 @@ mod tests {
     }
 
     #[test]
-    fn scanning_dashboard_breaks_findings_down_by_severity() {
+    fn review_scan_reuses_severity_legend_and_named_tally() {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
         screen.begin_scan_phase();
@@ -3769,13 +3859,49 @@ mod tests {
         ]);
         // One Critical, two Low, three total — broken out per severity.
         assert_eq!(screen.severity_counts(), [1, 0, 0, 2]);
-        let dump = render_dump(&mut screen, 80, 12);
-        // The severity tally with colored circles replaces "N finding(s) so far".
-        assert!(dump.contains("Findings"), "{dump}");
-        assert!(dump.contains("🔴"), "{dump}");
-        assert!(dump.contains("⚪"), "{dump}");
-        assert!(dump.contains("· 3 total"), "{dump}");
+        let dump = render_dump(&mut screen, 100, 24);
+        assert!(dump.contains("Priority"), "{dump}");
+        assert!(dump.contains("Meaning"), "{dump}");
+        assert!(dump.contains("🔴  Critical"), "{dump}");
+        assert!(dump.contains("Breaks behavior or security"), "{dump}");
+        assert!(dump.contains("⚪  Low"), "{dump}");
+        assert!(dump.contains("Small improvement"), "{dump}");
+        assert!(dump.contains("Findings: 🔴  Critical 1"), "{dump}");
+        assert!(dump.contains("⚪  Low 2"), "{dump}");
+        assert!(dump.contains("Total 3"), "{dump}");
         assert!(!dump.contains("finding(s) so far"), "{dump}");
+    }
+
+    #[test]
+    fn improve_scan_explains_severity_markers_in_a_centered_table() {
+        let mut screen = ReviewPullRequestScreen::new_improve(
+            ImproveRequest {
+                branch: "improve-scan".to_string(),
+                worktree_path: "/tmp/improve-scan".to_string(),
+                number: None,
+                title: None,
+            },
+            test_ai(),
+        );
+        screen.set_files(
+            vec![file("a.rs")],
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        screen.begin_scan_phase();
+        screen.take_next_scan_file();
+        screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::Critical)]);
+
+        let dump = render_dump(&mut screen, 100, 24);
+        assert!(dump.contains("Priority"), "{dump}");
+        assert!(dump.contains("Meaning"), "{dump}");
+        assert!(dump.contains("🔴  Critical"), "{dump}");
+        assert!(dump.contains("Breaks behavior or security"), "{dump}");
+        assert!(dump.contains("⚪  Low"), "{dump}");
+        assert!(dump.contains("Small improvement"), "{dump}");
+        assert!(dump.contains("Improvements: 🔴  Critical 1"), "{dump}");
+        assert!(dump.contains("Total 1"), "{dump}");
     }
 
     #[test]
