@@ -1957,8 +1957,8 @@ impl ReviewPullRequestScreen {
         if inner.height == 0 || inner.width == 0 {
             return;
         }
-        if self.is_improve() && inner.height >= 7 {
-            self.render_improvement_scan_contents(frame, inner);
+        if inner.height >= 7 {
+            self.render_scan_contents_with_legend(frame, inner);
             return;
         }
 
@@ -1973,7 +1973,9 @@ impl ReviewPullRequestScreen {
         frame.render_widget(Paragraph::new(self.findings_tally_line()), rows[1]);
     }
 
-    fn render_improvement_scan_contents(&self, frame: &mut Frame, area: Rect) {
+    /// Shared Review/Improve scan layout: live activity at the top, the same
+    /// centered severity legend in the middle, and the running tally below.
+    fn render_scan_contents_with_legend(&self, frame: &mut Frame, area: Rect) {
         const LEGEND_HEIGHT: u16 = 5;
         const MAX_ACTIVITY_ROWS: u16 = 4;
 
@@ -2192,14 +2194,12 @@ impl ReviewPullRequestScreen {
     fn findings_tally_line(&self) -> Line<'static> {
         let counts = self.severity_counts();
         let total: usize = counts.iter().sum();
-        let mut spans = vec![if self.is_improve() {
-            Span::styled("Improvements: ".to_string(), muted_dim())
+        let tally_label = if self.is_improve() {
+            "Improvements: "
         } else {
-            Span::styled(
-                "Findings  ".to_string(),
-                Style::default().fg(colors::EMPHASIS),
-            )
-        }];
+            "Findings: "
+        };
+        let mut spans = vec![Span::styled(tally_label.to_string(), muted_dim())];
         if total == 0 {
             spans.push(Span::styled("none surfaced yet".to_string(), muted_dim()));
             return Line::from(spans);
@@ -2211,7 +2211,7 @@ impl ReviewPullRequestScreen {
             (ReviewSeverity::Low, counts[3]),
         ];
         for (index, (severity, count)) in by_severity.into_iter().enumerate() {
-            if self.is_improve() && index > 0 {
+            if index > 0 {
                 spans.push(Span::styled("  ·  ".to_string(), muted_dim()));
             }
             let style = if count == 0 {
@@ -2222,20 +2222,12 @@ impl ReviewPullRequestScreen {
                     .add_modifier(Modifier::BOLD)
             };
             spans.push(Span::styled(
-                if self.is_improve() {
-                    format!("{} {} {count}", severity.emoji(), severity.label())
-                } else {
-                    format!("{} {count}  ", severity.emoji())
-                },
+                format!("{} {} {count}", severity.emoji(), severity.label()),
                 style,
             ));
         }
-        if self.is_improve() {
-            spans.push(Span::styled("  ·  ".to_string(), muted_dim()));
-            spans.push(Span::styled(format!("Total {total}"), muted_dim()));
-        } else {
-            spans.push(Span::styled(format!("· {total} total"), muted_dim()));
-        }
+        spans.push(Span::styled("  ·  ".to_string(), muted_dim()));
+        spans.push(Span::styled(format!("Total {total}"), muted_dim()));
         Line::from(spans)
     }
 
@@ -3855,7 +3847,7 @@ mod tests {
     }
 
     #[test]
-    fn scanning_dashboard_breaks_findings_down_by_severity() {
+    fn review_scan_reuses_severity_legend_and_named_tally() {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         screen.set_files(vec![file("a.rs")], "o".into(), "r".into(), "sha".into());
         screen.begin_scan_phase();
@@ -3867,12 +3859,16 @@ mod tests {
         ]);
         // One Critical, two Low, three total — broken out per severity.
         assert_eq!(screen.severity_counts(), [1, 0, 0, 2]);
-        let dump = render_dump(&mut screen, 80, 12);
-        // The severity tally with colored circles replaces "N finding(s) so far".
-        assert!(dump.contains("Findings"), "{dump}");
-        assert!(dump.contains("🔴"), "{dump}");
-        assert!(dump.contains("⚪"), "{dump}");
-        assert!(dump.contains("· 3 total"), "{dump}");
+        let dump = render_dump(&mut screen, 100, 24);
+        assert!(dump.contains("Priority"), "{dump}");
+        assert!(dump.contains("Meaning"), "{dump}");
+        assert!(dump.contains("🔴  Critical"), "{dump}");
+        assert!(dump.contains("Breaks behavior or security"), "{dump}");
+        assert!(dump.contains("⚪  Low"), "{dump}");
+        assert!(dump.contains("Small improvement"), "{dump}");
+        assert!(dump.contains("Findings: 🔴  Critical 1"), "{dump}");
+        assert!(dump.contains("⚪  Low 2"), "{dump}");
+        assert!(dump.contains("Total 3"), "{dump}");
         assert!(!dump.contains("finding(s) so far"), "{dump}");
     }
 
