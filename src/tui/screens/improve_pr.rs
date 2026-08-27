@@ -784,12 +784,12 @@ impl ImprovePullRequestScreen {
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) {
         if self.done {
             self.done_scroll = self.done_scroll.saturating_sub(lines);
-        } else if self.finding.is_some() && self.edit.is_none() && self.other.is_none() {
-            self.finding_scroll = self.finding_scroll.saturating_sub(lines);
         } else if self.applying {
             if let Some(pty) = self.pty.as_mut() {
                 pty.wheel_up(lines);
             }
+        } else if self.finding.is_some() && self.edit.is_none() && self.other.is_none() {
+            self.finding_scroll = self.finding_scroll.saturating_sub(lines);
         }
     }
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) {
@@ -798,15 +798,15 @@ impl ImprovePullRequestScreen {
                 .done_scroll
                 .saturating_add(lines)
                 .min(self.done_max_scroll);
+        } else if self.applying {
+            if let Some(pty) = self.pty.as_mut() {
+                pty.wheel_down(lines);
+            }
         } else if self.finding.is_some() && self.edit.is_none() && self.other.is_none() {
             self.finding_scroll = self
                 .finding_scroll
                 .saturating_add(lines)
                 .min(self.finding_max_scroll);
-        } else if self.applying {
-            if let Some(pty) = self.pty.as_mut() {
-                pty.wheel_down(lines);
-            }
         }
     }
     pub fn set_reviewed_range(&mut self, base_ref: String) {
@@ -1761,6 +1761,8 @@ mod tests {
     fn applying_view_tracks_progress_and_explains_focus_and_scrolling() {
         let mut screen = screen();
         screen.show_finding(finding(), 1, 4);
+        screen.finding_scroll = 7;
+        screen.finding_max_scroll = 20;
         screen.start_applying();
 
         let rendered = render(&mut screen, 110, 20);
@@ -1773,6 +1775,11 @@ mod tests {
         assert_eq!(
             screen.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
             ImproveAction::Continue
+        );
+        screen.handle_mouse_scroll_down(3);
+        assert_eq!(
+            screen.finding_scroll, 7,
+            "applying scroll must target the visible PTY, not the retained finding"
         );
     }
 
