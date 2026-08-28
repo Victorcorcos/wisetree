@@ -15,8 +15,11 @@ use ratatui::Frame;
 use crate::config::schema::{AiFixConfig, AiReviewConfig};
 use crate::messages::colors;
 use crate::services::dashboard::{ReviewFinding, ReviewSeverity};
-use crate::services::BugkillSnapshot;
 use crate::services::ReviewSkippedFile;
+use crate::services::{
+    save_improve_run, BugkillSnapshot, ImproveCheckpointIdentity, ImproveItemState, ImproveRun,
+    ReviewFile,
+};
 use crate::tui::screens::dashboard::ImproveRequest;
 use crate::tui::screens::update_pr::{
     button_paragraph, key_event_to_pty_bytes, render_pty_scrollbar,
@@ -40,6 +43,7 @@ pub enum ImproveAction {
     Revise(String),
     ApplyReady,
     AbortApply,
+    DiscardInterrupted,
     Done,
 }
 
@@ -222,6 +226,15 @@ pub struct ImprovePullRequestScreen {
     finding_max_scroll: u16,
     finding_action_areas: Option<[Rect; 4]>,
     reviewed_range: Option<String>,
+    state_path: Option<PathBuf>,
+    run: Option<ImproveRun>,
+    new_run_base_ref: Option<String>,
+    new_run_head_sha: Option<String>,
+    resumed_dirty_attempt: bool,
+    recovery_selected: u8,
+    discarding_recovery: bool,
+    pending_failure: Option<String>,
+    recovery_action_areas: Option<[Rect; 2]>,
 }
 
 impl ImprovePullRequestScreen {
@@ -256,6 +269,15 @@ impl ImprovePullRequestScreen {
             finding_max_scroll: 0,
             finding_action_areas: None,
             reviewed_range: None,
+            state_path: None,
+            run: None,
+            new_run_base_ref: None,
+            new_run_head_sha: None,
+            resumed_dirty_attempt: false,
+            recovery_selected: 0,
+            discarding_recovery: false,
+            pending_failure: None,
+            recovery_action_areas: None,
         }
     }
 
@@ -298,6 +320,24 @@ impl ImprovePullRequestScreen {
                     ImproveAction::Continue
                 }
                 KeyCode::Enter | KeyCode::Esc => ImproveAction::Done,
+                _ => ImproveAction::Continue,
+            };
+        }
+        if self.resumed_dirty_attempt && !self.aborting {
+            return match key.code {
+                KeyCode::Left | KeyCode::BackTab => {
+                    self.recovery_selected = (self.recovery_selected + 1) % 2;
+                    ImproveAction::Continue
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    self.recovery_selected = (self.recovery_selected + 1) % 2;
+                    ImproveAction::Continue
+                }
+                KeyCode::Enter => match self.recovery_selected {
+                    0 => ImproveAction::DiscardInterrupted,
+                    _ => ImproveAction::Cancelled,
+                },
+                KeyCode::Esc => ImproveAction::Cancelled,
                 _ => ImproveAction::Continue,
             };
         }
@@ -482,6 +522,19 @@ impl ImprovePullRequestScreen {
         if self.abort_confirm.is_some() {
             return self.handle_abort_modal_click(position);
         }
+        if self.resumed_dirty_attempt && !self.aborting {
+            let Some(areas) = self.recovery_action_areas else {
+                return ImproveAction::Continue;
+            };
+            let Some(selected) = areas.iter().position(|area| area.contains(position)) else {
+                return ImproveAction::Continue;
+            };
+            self.recovery_selected = selected as u8;
+            return match selected {
+                0 => ImproveAction::DiscardInterrupted,
+                _ => ImproveAction::Cancelled,
+            };
+        }
         if self.preparing || self.applying || self.committing || self.aborting || self.done {
             return ImproveAction::Continue;
         }
@@ -528,6 +581,10 @@ impl ImprovePullRequestScreen {
     fn render_step(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
         if self.done {
             self.render_done(frame, area);
+            return;
+        }
+        if self.resumed_dirty_attempt && !self.aborting {
+            self.render_recovery(frame, area);
             return;
         }
         if self.applying {
@@ -812,6 +869,305 @@ impl ImprovePullRequestScreen {
     pub fn set_reviewed_range(&mut self, base_ref: String) {
         self.reviewed_range = Some(format!("reviewing {base_ref}...HEAD"));
     }
+
+    pub fn set_new_run_context(&mut self, state_path: PathBuf, base_ref: String, head_sha: String) {
+        self.state_path = Some(state_path);
+        self.new_run_base_ref = Some(base_ref);
+        self.new_run_head_sha = Some(head_sha);
+    }
+
+    pub fn freeze_discovery(
+        &mut self,
+        files: Vec<ReviewFile>,
+        skipped: &[ReviewSkippedFile],
+        findings: Vec<ReviewFinding>,
+    ) -> Result<(), String> {
+        if self.run.is_some() {
+            return Ok(());
+        }
+        let base_ref = self
+            .new_run_base_ref
+            .clone()
+            .ok_or_else(|| "Improve persistence is missing the reviewed base.".to_string())?;
+        let head_sha = self
+            .new_run_head_sha
+            .clone()
+            .ok_or_else(|| "Improve persistence is missing the initial HEAD.".to_string())?;
+        let run = ImproveRun::new(
+            self.request.branch.clone(),
+            base_ref,
+            head_sha,
+            self.full_scan,
+            files,
+            skipped,
+            findings,
+        );
+        self.run = Some(run);
+        self.persist_run()
+    }
+
+    pub fn restore_run(&mut self, state_path: PathBuf, run: ImproveRun, dirty: bool) {
+        self.reviewed_range = Some(format!("reviewing {}...HEAD", run.base_ref));
+        self.full_scan = run.full_scan;
+        self.state_path = Some(state_path);
+        let current = run.next_index();
+        self.resumed_dirty_attempt = dirty
+            && current.is_some_and(|index| {
+                matches!(run.items[index].state, ImproveItemState::Applying { .. })
+            });
+        self.pre_snapshot = current.and_then(|index| match &run.items[index].state {
+            ImproveItemState::Applying { snapshot, .. } => Some(snapshot.clone()),
+            _ => None,
+        });
+        self.outcomes = run
+            .items
+            .iter()
+            .filter_map(|item| {
+                let item_label = format!("{} — {}", item.finding.descriptor(), item.finding.title);
+                match &item.state {
+                    ImproveItemState::Applied { commit_sha } => Some(ImproveOutcome {
+                        item: item_label,
+                        kind: OutcomeKind::Applied,
+                        detail: Some(format!("commit {}", &commit_sha[..commit_sha.len().min(8)])),
+                    }),
+                    ImproveItemState::Addressed => Some(ImproveOutcome {
+                        item: item_label,
+                        kind: OutcomeKind::Addressed,
+                        detail: Some("already addressed".to_string()),
+                    }),
+                    ImproveItemState::Skipped => Some(ImproveOutcome {
+                        item: item_label,
+                        kind: OutcomeKind::Skipped,
+                        detail: None,
+                    }),
+                    ImproveItemState::Failed { message } => Some(ImproveOutcome {
+                        item: item_label,
+                        kind: OutcomeKind::Failed,
+                        detail: Some(message.clone()),
+                    }),
+                    ImproveItemState::Pending | ImproveItemState::Applying { .. } => None,
+                }
+            })
+            .collect();
+        self.outcomes
+            .extend(run.skipped_files.iter().map(|file| ImproveOutcome {
+                item: format!("Skipped file: {}", file.path),
+                kind: OutcomeKind::SkippedFile,
+                detail: Some(file.reason.clone()),
+            }));
+        self.run = Some(run);
+    }
+
+    pub fn run(&self) -> Option<&ImproveRun> {
+        self.run.as_ref()
+    }
+
+    pub fn persistence_configured(&self) -> bool {
+        self.state_path.is_some()
+    }
+
+    pub fn resume_snapshot(&self) -> Option<BugkillSnapshot> {
+        let item = self.run.as_ref()?.items.get(self.current)?;
+        match &item.state {
+            ImproveItemState::Applying { snapshot, .. } => Some(snapshot.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn expected_baseline_head(&self) -> Option<String> {
+        let run = self.run.as_ref()?;
+        if let Some(ImproveItemState::Applying {
+            baseline_head_sha, ..
+        }) = run.items.get(self.current).map(|item| &item.state)
+        {
+            return Some(baseline_head_sha.clone());
+        }
+        Some(run.current_head_sha.clone())
+    }
+
+    pub fn begin_persisted_attempt(
+        &mut self,
+        snapshot: BugkillSnapshot,
+        baseline_head_sha: String,
+    ) -> Result<String, String> {
+        let Some(run) = self.run.as_mut() else {
+            self.pre_snapshot = Some(snapshot);
+            return Ok("unpersisted-attempt".to_string());
+        };
+        if let Some(finding) = self.finding.clone() {
+            if let Some(item) = run.items.get_mut(self.current) {
+                item.finding = finding;
+            }
+        }
+        let attempt_id = run
+            .begin_attempt(self.current, baseline_head_sha, snapshot.clone())
+            .ok_or_else(|| "Improve finding no longer exists.".to_string())?;
+        self.pre_snapshot = Some(snapshot);
+        self.persist_run()?;
+        Ok(attempt_id)
+    }
+
+    pub fn current_checkpoint_identity(&self) -> Option<ImproveCheckpointIdentity> {
+        let Some(run) = self.run.as_ref() else {
+            return self
+                .pre_snapshot
+                .as_ref()
+                .map(|_| ImproveCheckpointIdentity {
+                    run_id: "unpersisted-run".to_string(),
+                    finding_id: format!("unpersisted-finding-{}", self.current + 1),
+                    attempt_id: "unpersisted-attempt".to_string(),
+                });
+        };
+        let item = run.items.get(self.current)?;
+        let attempt_id = match &item.state {
+            ImproveItemState::Applying { attempt_id, .. } => attempt_id.clone(),
+            _ => return None,
+        };
+        Some(ImproveCheckpointIdentity {
+            run_id: run.id.clone(),
+            finding_id: item.id.clone(),
+            attempt_id,
+        })
+    }
+
+    pub fn resumed_dirty_attempt(&self) -> bool {
+        self.resumed_dirty_attempt
+    }
+
+    pub fn clear_resumed_dirty_attempt(&mut self) {
+        self.resumed_dirty_attempt = false;
+    }
+
+    pub fn begin_recovery_discard(&mut self) {
+        self.discarding_recovery = true;
+    }
+
+    pub fn discarding_recovery(&self) -> bool {
+        self.discarding_recovery
+    }
+
+    pub fn finish_recovery_discard(&mut self) -> Result<(), String> {
+        self.discarding_recovery = false;
+        self.resumed_dirty_attempt = false;
+        self.pre_snapshot = None;
+        let run = self
+            .run
+            .as_mut()
+            .ok_or_else(|| "Improve run is unavailable.".to_string())?;
+        let item = run
+            .items
+            .get_mut(self.current)
+            .ok_or_else(|| "Improve finding no longer exists.".to_string())?;
+        item.state = ImproveItemState::Pending;
+        self.persist_run()
+    }
+
+    pub fn prepare_failure(&mut self, message: String) {
+        self.pending_failure = Some(message);
+    }
+
+    pub fn has_pending_failure(&self) -> bool {
+        self.pending_failure.is_some()
+    }
+
+    pub fn finalize_pending_failure(&mut self) -> Result<(), String> {
+        let Some(message) = self.pending_failure.take() else {
+            return Ok(());
+        };
+        self.record_failed(message)
+    }
+
+    pub fn recover_after_cleanup_failure(&mut self) {
+        self.pending_failure = None;
+        self.resumed_dirty_attempt = true;
+    }
+
+    fn render_recovery(&mut self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(7),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let finding = self.finding.as_ref();
+        let title = finding.map_or("interrupted improvement", |finding| finding.title.as_str());
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Interrupted Improve attempt",
+                    Style::default()
+                        .fg(colors::WARNING)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::default(),
+                Line::from(format!(
+                    "Finding #{} of {}: {title}",
+                    self.current + 1,
+                    self.total
+                )),
+                Line::default(),
+                Line::from(
+                    "Uncommitted changes remain, but Wisetree cannot distinguish prior AI edits from user edits made after interruption. Back up & reset preserves all current edits in Git metadata, restores the pre-attempt snapshot, and lets you safely retry this same finding with the current configured model.",
+                ),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(colors::WARNING))
+                    .title(" Resume Improve "),
+            )
+            .wrap(Wrap { trim: false }),
+            chunks[0],
+        );
+        self.recovery_action_areas = Some(render_button_row(
+            frame,
+            chunks[1],
+            [
+                (
+                    "  Back up & reset  ",
+                    colors::WARNING,
+                    self.recovery_selected == 0,
+                ),
+                ("  Cancel  ", colors::ERROR, self.recovery_selected == 1),
+            ],
+        ));
+        frame.render_widget(
+            Paragraph::new("←/→ choose · Enter confirm · Esc leave changes untouched")
+                .style(muted_dim()),
+            chunks[2],
+        );
+    }
+
+    fn persist_current_state(&mut self, state: ImproveItemState) -> Result<(), String> {
+        let Some(run) = self.run.as_mut() else {
+            return Ok(());
+        };
+        let item = run
+            .items
+            .get_mut(self.current)
+            .ok_or_else(|| "Improve finding no longer exists.".to_string())?;
+        item.finding = self
+            .finding
+            .clone()
+            .ok_or_else(|| "Improve finding is unavailable.".to_string())?;
+        item.state = state;
+        self.persist_run()
+    }
+
+    fn persist_run(&self) -> Result<(), String> {
+        let path = self
+            .state_path
+            .as_ref()
+            .ok_or_else(|| "Improve state path is unavailable.".to_string())?;
+        let run = self
+            .run
+            .as_ref()
+            .ok_or_else(|| "Improve run is unavailable.".to_string())?;
+        save_improve_run(path, run).map_err(|error| error.to_string())
+    }
     pub fn preparing(&self) -> bool {
         self.preparing
     }
@@ -823,6 +1179,14 @@ impl ImprovePullRequestScreen {
         self.finding = Some(finding);
         self.current = current;
         self.total = total;
+        self.pre_snapshot = self
+            .run
+            .as_ref()
+            .and_then(|run| run.items.get(current))
+            .and_then(|item| match &item.state {
+                ImproveItemState::Applying { snapshot, .. } => Some(snapshot.clone()),
+                _ => None,
+            });
         self.selected = 0;
         self.edit = None;
         self.finding_scroll = 0;
@@ -837,21 +1201,28 @@ impl ImprovePullRequestScreen {
                 detail: Some(file.reason.to_string()),
             }));
     }
-    pub fn record_applied(&mut self, sha: String) {
+    pub fn record_applied(&mut self, sha: String) -> Result<(), String> {
         let short = sha[..sha.len().min(8)].to_string();
         self.record_current_outcome(OutcomeKind::Applied, Some(format!("commit {short}")));
+        if let Some(run) = self.run.as_mut() {
+            run.current_head_sha = sha.clone();
+        }
+        self.persist_current_state(ImproveItemState::Applied { commit_sha: sha })
     }
-    pub fn record_addressed(&mut self) {
+    pub fn record_addressed(&mut self) -> Result<(), String> {
         self.record_current_outcome(
             OutcomeKind::Addressed,
             Some("already addressed".to_string()),
         );
+        self.persist_current_state(ImproveItemState::Addressed)
     }
-    pub fn record_skipped(&mut self) {
+    pub fn record_skipped(&mut self) -> Result<(), String> {
         self.record_current_outcome(OutcomeKind::Skipped, None);
+        self.persist_current_state(ImproveItemState::Skipped)
     }
-    pub fn record_failed(&mut self, message: String) {
-        self.record_current_outcome(OutcomeKind::Failed, Some(message));
+    pub fn record_failed(&mut self, message: String) -> Result<(), String> {
+        self.record_current_outcome(OutcomeKind::Failed, Some(message.clone()));
+        self.persist_current_state(ImproveItemState::Failed { message })
     }
     pub fn enter_done(&mut self) {
         self.preparing = false;
@@ -1466,6 +1837,8 @@ fn muted_dim() -> Style {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1501,6 +1874,45 @@ mod tests {
         assert_eq!(
             screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ImproveAction::Confirmed
+        );
+    }
+
+    #[test]
+    fn dirty_resumed_attempt_requires_backup_reset_or_cancel() {
+        let mut screen = screen();
+        let finding = finding();
+        let mut run = ImproveRun::new(
+            "feature/improve".to_string(),
+            "main".to_string(),
+            "a".repeat(40),
+            false,
+            vec![ReviewFile {
+                path: finding.file.clone(),
+                annotated_diff: String::new(),
+                full_content: None,
+                commentable_lines: BTreeSet::new(),
+                existing_comments: String::new(),
+                existing_keys: Vec::new(),
+            }],
+            &[],
+            vec![finding.clone()],
+        );
+        run.begin_attempt(0, "a".repeat(40), BugkillSnapshot::default())
+            .unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        screen.restore_run(temp.path().join("run.json"), run, true);
+        screen.show_finding(finding, 0, 1);
+
+        let rendered = render(&mut screen, 100, 20);
+        assert!(rendered.contains("Interrupted Improve attempt"));
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ImproveAction::DiscardInterrupted
+        );
+        screen.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ImproveAction::Cancelled
         );
     }
 
@@ -1663,12 +2075,14 @@ mod tests {
             reason: "generated file",
         }]);
         screen.show_finding(finding(), 0, 3);
-        screen.record_applied("1234567890abcdef".into());
-        screen.record_addressed();
-        screen.record_skipped();
-        screen.record_failed(
-            "a deliberately long failure that remains visible after scrolling".into(),
-        );
+        screen.record_applied("1234567890abcdef".into()).unwrap();
+        screen.record_addressed().unwrap();
+        screen.record_skipped().unwrap();
+        screen
+            .record_failed(
+                "a deliberately long failure that remains visible after scrolling".into(),
+            )
+            .unwrap();
         screen.enter_done();
 
         let wide = render(&mut screen, 100, 20);

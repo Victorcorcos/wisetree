@@ -2628,6 +2628,7 @@ dependencies = [
  "tokio",
  "vt100",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

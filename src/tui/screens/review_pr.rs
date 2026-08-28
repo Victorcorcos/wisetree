@@ -474,11 +474,32 @@ impl ReviewPullRequestScreen {
     pub fn findings_len(&self) -> usize {
         self.findings.len()
     }
+    pub fn findings(&self) -> Vec<ReviewFinding> {
+        self.findings.clone()
+    }
+    pub fn review_files(&self) -> Vec<ReviewFile> {
+        self.files.clone()
+    }
+    pub fn skipped_files(&self) -> &[ReviewSkippedFile] {
+        &self.skipped_files
+    }
     pub fn current_index(&self) -> usize {
         self.current
     }
     pub fn current_finding(&self) -> Option<ReviewFinding> {
         self.findings.get(self.current).cloned()
+    }
+    pub fn restore_improve_run(
+        &mut self,
+        files: Vec<ReviewFile>,
+        findings: Vec<ReviewFinding>,
+        current: usize,
+    ) {
+        self.files = files;
+        self.findings = findings;
+        self.current = current.min(self.findings.len());
+        self.scanning = false;
+        self.step = ReviewStep::Decision;
     }
     /// The scanned file a finding belongs to — an "Other" revision derives
     /// its focused hunk and optional inlined content from this snapshot.
@@ -1269,6 +1290,14 @@ impl ReviewPullRequestScreen {
     pub fn advance_finding(&mut self) -> bool {
         self.current += 1;
         self.current < self.findings.len()
+    }
+
+    pub fn select_finding(&mut self, index: usize) -> bool {
+        if index >= self.findings.len() {
+            return false;
+        }
+        self.current = index;
+        true
     }
 
     /// Walkthrough finished with posted comments: show the assembled summary

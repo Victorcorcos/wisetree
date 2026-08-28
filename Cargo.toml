@@ -42,8 +42,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "fs", "signal", "test-util"] }
+tempfile = "3.14"
 vt100 = "0.15"
 walkdir = "2.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 # Vendored, patched vt100 so inline AI harnesses (codex/claude) capture their
 # scroll-region transcript into scrollback. See third_party/vt100/PATCHES.md.
@@ -54,7 +58,6 @@ vt100 = { path = "third_party/vt100" }
 assert_cmd = "2.0"
 insta = "1.41"
 predicates = "3.1"
-tempfile = "3.14"
 
 [profile.release]
 lto = true

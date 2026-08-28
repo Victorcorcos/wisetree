@@ -47,10 +47,10 @@ use crate::services::{
     DashboardService, DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff,
     DevelopPlanPrompt, DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation,
     ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan,
-    FixPreparation, FixVerdict, ImprovePreparation, JudgeResult, MultiSourceUpdateResult,
-    OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation,
-    ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus,
-    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    FixPreparation, FixVerdict, ImproveCheckpointIdentity, ImprovePreparation, JudgeResult,
+    MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding,
+    ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell,
+    ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::image_upload::{ImageAttachment, ImageStorage};
@@ -399,6 +399,22 @@ enum BugkillCommitOutcome {
 enum ImproveCommitOutcome {
     NoChanges,
     Committed { sha: String },
+}
+
+struct ImproveApplyRequest {
+    worktree_path: String,
+    finding: ReviewFinding,
+    index: usize,
+    resume_snapshot: Option<BugkillSnapshot>,
+    continuing: bool,
+}
+
+struct ImproveCommitRequest {
+    worktree_path: String,
+    finding: ReviewFinding,
+    pre: BugkillSnapshot,
+    index: usize,
+    identity: ImproveCheckpointIdentity,
 }
 
 struct MergePrDetailsPayload {
@@ -3132,8 +3148,19 @@ impl App {
                 }
             }
             ImproveAction::Skip => {
-                if let Some(screen) = self.improve_pr.as_mut() {
-                    screen.record_skipped();
+                if let Some(Err(message)) = self
+                    .improve_pr
+                    .as_mut()
+                    .map(ImprovePullRequestScreen::record_skipped)
+                {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Could not save Improve progress: {}",
+                            truncate_error(&message)
+                        ),
+                    );
+                    return;
                 }
                 self.advance_improve_finding(tx);
             }
@@ -3151,13 +3178,23 @@ impl App {
                 };
                 let index = screen.current_index();
                 let worktree_path = screen.request().worktree_path.clone();
+                let resume_snapshot = screen.resume_snapshot();
+                let continuing = resume_snapshot.is_some();
                 screen.start_applying();
+                if let Some(snapshot) = resume_snapshot.as_ref() {
+                    screen.set_pre_snapshot(snapshot.clone());
+                    screen.clear_resumed_dirty_attempt();
+                }
                 kick_off_improve_apply(
                     self.git_root.clone(),
                     self.current_dashboard_config(),
-                    worktree_path,
-                    finding,
-                    index,
+                    ImproveApplyRequest {
+                        worktree_path,
+                        finding,
+                        index,
+                        resume_snapshot,
+                        continuing,
+                    },
                     tx.clone(),
                 );
             }
@@ -3168,12 +3205,53 @@ impl App {
                     tx,
                 );
             }
+            ImproveAction::DiscardInterrupted => {
+                if let Some(screen) = self.improve_pr.as_mut() {
+                    screen.begin_recovery_discard();
+                }
+                if !self.abort_improve_apply(tx) {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        "Could not recover the interrupted Improve snapshot.".to_string(),
+                    );
+                }
+            }
             ImproveAction::Revise(feedback) => self.revise_improve_finding(feedback, tx),
         }
     }
 
     fn begin_improve_finding_review(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
-        let Some((finding, current, total)) = self.review_pr.as_ref().and_then(|discovery| {
+        let should_freeze = self
+            .improve_pr
+            .as_ref()
+            .is_some_and(|screen| screen.run().is_none() && screen.persistence_configured());
+        if should_freeze {
+            let discovery = self.review_pr.as_ref().map(|screen| {
+                (
+                    screen.review_files(),
+                    screen.skipped_files().to_vec(),
+                    screen.findings(),
+                )
+            });
+            let Some((files, skipped, findings)) = discovery else {
+                return;
+            };
+            let persist_result = self
+                .improve_pr
+                .as_mut()
+                .map(|screen| screen.freeze_discovery(files, &skipped, findings));
+            if let Some(Err(message)) = persist_result {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!(
+                        "Could not save Improve progress: {}",
+                        truncate_error(&message)
+                    ),
+                );
+                return;
+            }
+        }
+        let Some((mut finding, current, total)) = self.review_pr.as_ref().and_then(|discovery| {
             discovery
                 .current_finding()
                 .map(|finding| (finding, discovery.current_index(), discovery.findings_len()))
@@ -3183,6 +3261,14 @@ impl App {
             }
             return;
         };
+        if let Some(saved) = self
+            .improve_pr
+            .as_ref()
+            .and_then(|screen| screen.run())
+            .and_then(|run| run.items.get(current))
+        {
+            finding = saved.finding.clone();
+        }
         if let Some(improve) = self.improve_pr.as_mut() {
             improve.show_finding(finding, current, total);
         }
@@ -3203,6 +3289,21 @@ impl App {
         if more {
             self.begin_improve_finding_review(tx);
         } else {
+            let retry_index = self
+                .improve_pr
+                .as_ref()
+                .and_then(|screen| screen.run())
+                .and_then(|run| run.next_index());
+            if let Some(index) = retry_index {
+                if self
+                    .review_pr
+                    .as_mut()
+                    .is_some_and(|screen| screen.select_finding(index))
+                {
+                    self.begin_improve_finding_review(tx);
+                    return;
+                }
+            }
             self.review_pr = None;
             if let Some(screen) = self.improve_pr.as_mut() {
                 screen.enter_done();
@@ -3275,16 +3376,26 @@ impl App {
             return;
         };
         let index = screen.current_index();
+        let Some(identity) = screen.current_checkpoint_identity() else {
+            self.fail_improve_apply(
+                "Improve attempt identity was not persisted.".to_string(),
+                tx,
+            );
+            return;
+        };
         let worktree_path = screen.request().worktree_path.clone();
         screen.finish_apply();
         screen.begin_commit();
         kick_off_improve_commit(
             self.git_root.clone(),
             self.current_dashboard_config(),
-            worktree_path,
-            finding,
-            pre,
-            index,
+            ImproveCommitRequest {
+                worktree_path,
+                finding,
+                pre,
+                index,
+                identity,
+            },
             tx.clone(),
         );
     }
@@ -3301,6 +3412,7 @@ impl App {
         let index = screen.current_index();
         let pre = screen.pre_snapshot();
         let worktree_path = screen.request().worktree_path.clone();
+        let backup_before_cleanup = screen.discarding_recovery();
         screen.finish_apply();
         let Some(pre) = pre else {
             // The user cancelled while the snapshot/handoff task was still
@@ -3314,6 +3426,7 @@ impl App {
             worktree_path,
             pre,
             index,
+            backup_before_cleanup,
             tx.clone(),
         );
         true
@@ -3322,9 +3435,23 @@ impl App {
     fn fail_improve_apply(&mut self, message: String, tx: &mpsc::UnboundedSender<AppEvent>) {
         if let Some(screen) = self.improve_pr.as_mut() {
             screen.disarm_autonomous();
-            screen.record_failed(message);
+            screen.prepare_failure(message);
         }
         if !self.abort_improve_apply(tx) {
+            let persist_error = self
+                .improve_pr
+                .as_mut()
+                .and_then(|screen| screen.finalize_pending_failure().err());
+            if let Some(message) = persist_error {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!(
+                        "Could not save Improve progress: {}",
+                        truncate_error(&message)
+                    ),
+                );
+                return;
+            }
             self.advance_improve_finding(tx);
         }
     }
@@ -3406,6 +3533,21 @@ impl App {
                 let (snapshot, handoff) = *payload;
                 let mut spawn_failed = false;
                 if let Some(screen) = self.improve_pr.as_mut() {
+                    let baseline_head = screen.expected_baseline_head().unwrap_or_default();
+                    if let Err(message) =
+                        screen.begin_persisted_attempt(snapshot.clone(), baseline_head)
+                    {
+                        screen.finish_apply();
+                        self.show_toast(
+                            ToastVariant::Error,
+                            format!(
+                                "Could not save Improve attempt: {}",
+                                truncate_error(&message)
+                            ),
+                        );
+                        return;
+                    }
+                    screen.clear_resumed_dirty_attempt();
                     // Apply/Other/Skip remains a manual decision, but detecting
                     // that the selected AI finished should never require a
                     // second confirmation from the user.
@@ -3431,13 +3573,44 @@ impl App {
                 }
             }
             Err(message) => {
+                let interrupted = self
+                    .improve_pr
+                    .as_ref()
+                    .is_some_and(|screen| screen.pre_snapshot().is_some());
+                if interrupted {
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.finish_apply();
+                        screen.recover_after_cleanup_failure();
+                    }
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Could not restart Improve apply: {}",
+                            truncate_error(&message)
+                        ),
+                    );
+                    return;
+                }
+                let mut persist_error = None;
                 if let Some(screen) = self.improve_pr.as_mut() {
                     screen.disarm_autonomous();
-                    screen.record_failed(format!(
-                        "Could not start apply: {}",
-                        truncate_error(&message)
-                    ));
+                    persist_error = screen
+                        .record_failed(format!(
+                            "Could not start apply: {}",
+                            truncate_error(&message)
+                        ))
+                        .err();
                     screen.finish_apply();
+                }
+                if let Some(error) = persist_error {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Could not save Improve progress: {}",
+                            truncate_error(&error)
+                        ),
+                    );
+                    return;
                 }
                 self.show_toast(
                     ToastVariant::Error,
@@ -3466,9 +3639,20 @@ impl App {
         }
         match result {
             Ok(ImproveCommitOutcome::Committed { sha }) => {
+                let mut persist_error = None;
                 if let Some(screen) = self.improve_pr.as_mut() {
                     screen.finish_commit();
-                    screen.record_applied(sha.clone());
+                    persist_error = screen.record_applied(sha.clone()).err();
+                }
+                if let Some(message) = persist_error {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Could not save Improve checkpoint: {}",
+                            truncate_error(&message)
+                        ),
+                    );
+                    return;
                 }
                 self.show_toast(
                     ToastVariant::Success,
@@ -3476,9 +3660,20 @@ impl App {
                 );
             }
             Ok(ImproveCommitOutcome::NoChanges) => {
+                let mut persist_error = None;
                 if let Some(screen) = self.improve_pr.as_mut() {
                     screen.finish_commit();
-                    screen.record_addressed();
+                    persist_error = screen.record_addressed().err();
+                }
+                if let Some(message) = persist_error {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Could not save Improve progress: {}",
+                            truncate_error(&message)
+                        ),
+                    );
+                    return;
                 }
                 self.show_toast(
                     ToastVariant::Info,
@@ -3486,10 +3681,21 @@ impl App {
                 );
             }
             Err(message) => {
+                let mut persist_error = None;
                 if let Some(screen) = self.improve_pr.as_mut() {
                     screen.disarm_autonomous();
                     screen.finish_commit();
-                    screen.record_failed(truncate_error(&message));
+                    persist_error = screen.record_failed(truncate_error(&message)).err();
+                }
+                if let Some(error) = persist_error {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!(
+                            "Could not save Improve progress: {}",
+                            truncate_error(&error)
+                        ),
+                    );
+                    return;
                 }
                 self.show_toast(
                     ToastVariant::Error,
@@ -3520,7 +3726,15 @@ impl App {
                     }
                     return;
                 }
-                ImprovePreparation::Ready { base_ref, files, scan_mode, context, skipped } => {
+                ImprovePreparation::Ready {
+                    base_ref,
+                    head_sha,
+                    state_path,
+                    files,
+                    scan_mode,
+                    context,
+                    skipped,
+                } => {
                     let Some(request) = self.improve_pr.as_ref().map(|screen| screen.request().clone()) else {
                         return;
                     };
@@ -3533,11 +3747,43 @@ impl App {
                     discovery.set_files(files, String::new(), String::new(), String::new());
                     discovery.record_skipped_files(&skipped);
                     if let Some(screen) = self.improve_pr.as_mut() {
-                        screen.set_reviewed_range(base_ref);
+                        screen.set_reviewed_range(base_ref.clone());
+                        screen.set_new_run_context(state_path, base_ref, head_sha);
                         screen.record_skipped_files(&skipped);
                     }
                     self.review_pr = Some(discovery);
                     self.start_review_scans(tx);
+                    return;
+                }
+                ImprovePreparation::Resume {
+                    state_path,
+                    run,
+                    dirty,
+                } => {
+                    let Some(current) = run.next_index() else {
+                        return;
+                    };
+                    let Some(request) = self
+                        .improve_pr
+                        .as_ref()
+                        .map(|screen| screen.request().clone())
+                    else {
+                        return;
+                    };
+                    let mut discovery = ReviewPullRequestScreen::new_improve(
+                        request,
+                        self.current_dashboard_config().ai.review.clone(),
+                    );
+                    discovery.restore_improve_run(run.files.clone(), run.findings(), current);
+                    if let Some(screen) = self.improve_pr.as_mut() {
+                        screen.restore_run(state_path, run, dirty);
+                    }
+                    self.review_pr = Some(discovery);
+                    self.begin_improve_finding_review(tx);
+                    self.show_toast(
+                        ToastVariant::Info,
+                        format!("Resumed Improve at finding #{}.", current + 1),
+                    );
                     return;
                 }
                 ImprovePreparation::NoChanges => {
@@ -3561,6 +3807,10 @@ impl App {
                 ImprovePreparation::BaseRefUnresolved => (
                     ToastVariant::Error,
                     "Improve could not resolve this worktree's base branch. Set an upstream or fetch a local base ref, then retry.".to_string(),
+                ),
+                ImprovePreparation::StaleRun(message) => (
+                    ToastVariant::Warning,
+                    format!("Cannot resume Improve: {message}"),
                 ),
             },
             Err(message) => (ToastVariant::Error, format!("Could not prepare Improve: {}", truncate_error(&message))),
@@ -7563,22 +7813,70 @@ impl App {
                     .as_ref()
                     .is_some_and(|s| s.current_index() == index && s.aborting())
                 {
+                    let recovery_discard = self
+                        .improve_pr
+                        .as_ref()
+                        .is_some_and(ImprovePullRequestScreen::discarding_recovery);
                     if let Some(screen) = self.improve_pr.as_mut() {
                         screen.finish_abort();
                     }
                     match result {
+                        Ok(()) if recovery_discard => {
+                            let persist_error = self
+                                .improve_pr
+                                .as_mut()
+                                .and_then(|screen| screen.finish_recovery_discard().err());
+                            if let Some(message) = persist_error {
+                                self.show_toast(
+                                    ToastVariant::Error,
+                                    format!(
+                                        "Could not save recovered Improve state: {}",
+                                        truncate_error(&message)
+                                    ),
+                                );
+                            } else {
+                                self.show_toast(
+                                    ToastVariant::Info,
+                                    "Interrupted changes were backed up in Git metadata, then discarded; the finding is ready to retry."
+                                        .to_string(),
+                                );
+                            }
+                            return;
+                        }
                         Ok(()) => self.show_toast(
                             ToastVariant::Info,
                             "Improve attempt cancelled; its uncommitted changes were removed."
                                 .to_string(),
                         ),
-                        Err(message) => self.show_toast(
+                        Err(message) => {
+                            if let Some(screen) = self.improve_pr.as_mut() {
+                                screen.recover_after_cleanup_failure();
+                            }
+                            self.show_toast(
+                                ToastVariant::Error,
+                                format!(
+                                    "Could not clean up Improve attempt: {}",
+                                    truncate_error(&message)
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                    let persist_error = self.improve_pr.as_mut().and_then(|screen| {
+                        screen
+                            .has_pending_failure()
+                            .then(|| screen.finalize_pending_failure().err())
+                            .flatten()
+                    });
+                    if let Some(message) = persist_error {
+                        self.show_toast(
                             ToastVariant::Error,
                             format!(
-                                "Could not clean up Improve attempt: {}",
+                                "Could not save Improve progress: {}",
                                 truncate_error(&message)
                             ),
-                        ),
+                        );
+                        return;
                     }
                     self.advance_improve_finding(tx);
                 }
@@ -10524,11 +10822,16 @@ fn kick_off_prepare_improve(
 fn kick_off_improve_apply(
     git_root: Option<String>,
     config: DashboardConfig,
-    worktree_path: String,
-    finding: ReviewFinding,
-    index: usize,
+    request: ImproveApplyRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let ImproveApplyRequest {
+        worktree_path,
+        finding,
+        index,
+        resume_snapshot,
+        continuing,
+    } = request;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ImproveApplyReady {
             index,
@@ -10539,9 +10842,12 @@ fn kick_off_improve_apply(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let result = async {
-            let snapshot = service.bugkill_snapshot(&worktree_path).await?;
+            let snapshot = match resume_snapshot {
+                Some(snapshot) => snapshot,
+                None => service.bugkill_snapshot(&worktree_path).await?,
+            };
             let handoff = service
-                .prepare_improve_apply(&worktree_path, &finding)
+                .prepare_improve_apply(&worktree_path, &finding, continuing)
                 .await?;
             Ok::<_, crate::errors::WisetreeError>(Box::new((snapshot, handoff)))
         }
@@ -10554,12 +10860,16 @@ fn kick_off_improve_apply(
 fn kick_off_improve_commit(
     git_root: Option<String>,
     config: DashboardConfig,
-    worktree_path: String,
-    finding: ReviewFinding,
-    pre: BugkillSnapshot,
-    index: usize,
+    request: ImproveCommitRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let ImproveCommitRequest {
+        worktree_path,
+        finding,
+        pre,
+        index,
+        identity,
+    } = request;
     let Some(root) = git_root.map(PathBuf::from) else {
         let _ = tx.send(AppEvent::ImproveCommitted {
             index,
@@ -10579,7 +10889,13 @@ fn kick_off_improve_commit(
                 return Ok(ImproveCommitOutcome::NoChanges);
             }
             let sha = match service
-                .improve_commit_attempt(&worktree_path, &changes, index + 1, &finding)
+                .improve_commit_attempt(
+                    &worktree_path,
+                    &changes,
+                    index + 1,
+                    &finding,
+                    &identity,
+                )
                 .await
             {
                 Ok(sha) => sha,
@@ -10607,6 +10923,7 @@ fn kick_off_improve_abort(
     worktree_path: String,
     pre: BugkillSnapshot,
     index: usize,
+    backup_before_cleanup: bool,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -10619,6 +10936,11 @@ fn kick_off_improve_abort(
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
         let result = async {
+            if backup_before_cleanup {
+                service
+                    .improve_backup_interrupted_attempt(&worktree_path)
+                    .await?;
+            }
             let post = service.bugkill_snapshot(&worktree_path).await?;
             let changes = compute_attempt_changes(&post.tracked, &post.untracked, &pre.untracked);
             service

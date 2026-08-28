@@ -9,6 +9,7 @@ pub mod bugkill;
 pub mod dashboard;
 pub mod develop;
 pub mod guides;
+pub mod improve_run;
 pub mod opencode_models;
 pub mod opencode_turn;
 pub mod presets;
@@ -53,6 +54,11 @@ pub use dashboard::{
     UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
 };
 pub use develop::{parse_plan_transcript, summarize_transcript, DevelopPlan, PlanSection};
+pub use improve_run::{
+    archive_improve_run, clear_improve_run, load_improve_run, resolve_improve_state_path,
+    save_improve_run, ImproveCheckpointIdentity, ImproveItemState, ImproveRun, ImproveRunItem,
+    ImproveSkippedFile,
+};
 pub use opencode_models::{
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,
 };
