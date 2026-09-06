@@ -1,0 +1,18 @@
+# Bug Investigation
+
+## Bug Description
+
+Running the Fix Pull Request command for `oxeanbits/dpms-api-norway` PR #1132 from `/Users/victorcorcos/Desktop/repositories/dpms-api-norway.worktree/duv4091_BACKEND_save_workorders_in_equinor_during_authorization` reports "No unresolved review comments to fix on this PR." even though unresolved, unanswered `@oxeanbot` inline comments remain. One example is `Lint/UnusedMethodArgument: Unused method argument - timeout.` on `spec/support/equinor_transport_double.rb:13` (the reported location was line 10).
+
+Expected behavior: Fix discovers every pending review thread on the PR, including threads beyond GitHub's first GraphQL page, and offers each actionable group for planning and application.
+
+Actual behavior: Fix inspects only the first 100 review threads. On this PR, all threads in that first page end with a comment from the current viewer and are filtered as handled, so Fix returns `NoComments` without inspecting the remaining 76 pending threads.
+
+Reproduction was inferred from the command entry point and confirmed against the live PR. The resolved base ref is `upstream/main` at `44088f571575ae0968cfcee3291be33eb290daea`.
+
+## Ranked Causes and Solutions
+
+| Description | Ranking | Quality | Solution |
+|-------------|---------|---------|----------|
+| **1. Fix does not paginate the `reviewThreads` GraphQL connection.**<br><br>`build_fix_feedback_query` in `src/services/dashboard.rs` requests `reviewThreads(first: 100)` without `pageInfo`, an `after` cursor, or a fetch loop. `prepare_fix` executes that query once and returns `NoComments` when parsing that one response yields no groups. Live GraphQL reproduction against PR #1132 confirmed page 1 has exactly 100 threads, `hasNextPage: true`, and zero threads pending after the existing last-viewer-comment filter. Page 2 has 76 threads and all 76 are pending by the same filter. The cited `Lint/UnusedMethodArgument` thread is unresolved, current, unanswered, and present on page 2. | ⭐️⭐️⭐️⭐️⭐️ | confirmed | Add cursor pagination to the Fix feedback fetch. Make the query accept an optional review-thread cursor and return `pageInfo`; have `prepare_fix` repeatedly call GitHub until `hasNextPage` is false, then parse and combine all pages before deciding `NoComments`. Preserve thread order and existing grouping/filter semantics across page boundaries, including merging same-file/same-line groups that land on different pages. Add a regression test with a first page containing only handled threads and `hasNextPage: true`, followed by a second page containing the unanswered lint thread; assert Fix returns `Ready` with that thread rather than `NoComments`. |
+| **2. Other nested feedback connections are also hard-capped.**<br><br>The same query requests only the first 50 comments in each thread and the first 100 PR-level reviews. This did not cause the reported failure because the cited thread has one comment and is omitted by top-level thread pagination. However, a thread with more than 50 replies could be classified using a stale "last" comment, and a PR with more than 100 submitted reviews could omit later summary feedback. | ⭐️⭐️ | inferred | After fixing the confirmed top-level pagination bug, either document these intentional safety bounds or paginate them as separate GraphQL connections. If full completeness is required, fetch all review summaries with cursors and fetch additional comments for any thread whose comment connection reports another page, then feed the complete ordered data into the same parser. Cover boundary cases where the decisive reviewer follow-up is beyond comment 50 and where actionable summary feedback is beyond review 100. |

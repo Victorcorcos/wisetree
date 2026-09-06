@@ -679,6 +679,78 @@ pub struct ReviewComment {
     pub viewer_did_author: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct FixConnection<T> {
+    #[serde(default)]
+    nodes: Vec<T>,
+    #[serde(rename = "pageInfo", default)]
+    page_info: FixPageInfo,
+}
+
+impl<T> Default for FixConnection<T> {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            page_info: FixPageInfo::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FixPageInfo {
+    #[serde(rename = "hasNextPage", default)]
+    has_next_page: bool,
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixThread {
+    id: Option<String>,
+    #[serde(rename = "isResolved", default)]
+    is_resolved: bool,
+    comments: FixConnection<FixRawComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixRawComment {
+    #[serde(rename = "databaseId")]
+    database_id: Option<u64>,
+    path: Option<String>,
+    line: Option<u64>,
+    #[serde(rename = "originalLine")]
+    original_line: Option<u64>,
+    #[serde(rename = "isMinimized", default)]
+    is_minimized: bool,
+    #[serde(rename = "viewerDidAuthor", default)]
+    viewer_did_author: bool,
+    #[serde(default)]
+    body: String,
+    author: Option<FixAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixReview {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    body: String,
+    author: Option<FixAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixAuthor {
+    #[serde(default)]
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixGraphqlError {
+    #[serde(default)]
+    message: String,
+}
+
 /// A group of inline review comments that target the same file + line. The
 /// whole group is judged by one planning call and resolved as a single unit
 /// (Apply / Other / Skip). `file` / `line` may still be `None` for a comment
@@ -3050,20 +3122,8 @@ impl DashboardService {
             ));
         };
 
-        // One GraphQL call returns every inline review thread (with the
-        // resolved/outdated/minimized flags we filter on) plus every PR-level
-        // review summary body, which is folded into its own group.
-        let query = build_fix_feedback_query(&owner, &repo, number);
-        let arg = format!("query={query}");
-        let output = time::timeout(
-            FIX_FETCH_TIMEOUT,
-            run_gh_command(&self.gh_binary, &["api", "graphql", "-f", &arg], Some(&cwd)),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("gh api graphql timed out after 15s"))?
-        .map_err(WisetreeError::other)?;
-
-        let groups = parse_and_group_review_feedback(&output).map_err(WisetreeError::other)?;
+        let (threads, reviews) = self.fetch_fix_feedback(&cwd, &owner, &repo, number).await?;
+        let groups = group_review_feedback(threads, reviews);
         if groups.is_empty() {
             return Ok(FixPreparation::NoComments);
         }
@@ -3072,6 +3132,78 @@ impl DashboardService {
             owner,
             repo,
         })
+    }
+
+    async fn fetch_fix_feedback(
+        &self,
+        cwd: &Path,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<(Vec<FixThread>, Vec<FixReview>)> {
+        let mut threads = Vec::new();
+        let mut cursor = None;
+        loop {
+            let query = build_fix_threads_query(owner, repo, number, cursor.as_deref());
+            let output = self.run_fix_graphql(cwd, &query).await?;
+            let mut page: FixConnection<FixThread> =
+                parse_fix_connection(&output, "/data/repository/pullRequest/reviewThreads")
+                    .map_err(WisetreeError::other)?;
+            for thread in &mut page.nodes {
+                self.fetch_remaining_fix_comments(cwd, thread).await?;
+            }
+            threads.extend(page.nodes);
+            if !page.page_info.has_next_page {
+                break;
+            }
+            cursor = Some(required_fix_cursor(page.page_info).map_err(WisetreeError::other)?);
+        }
+
+        let mut reviews = Vec::new();
+        let mut cursor = None;
+        loop {
+            let query = build_fix_reviews_query(owner, repo, number, cursor.as_deref());
+            let output = self.run_fix_graphql(cwd, &query).await?;
+            let page: FixConnection<FixReview> =
+                parse_fix_connection(&output, "/data/repository/pullRequest/reviews")
+                    .map_err(WisetreeError::other)?;
+            reviews.extend(page.nodes);
+            if !page.page_info.has_next_page {
+                break;
+            }
+            cursor = Some(required_fix_cursor(page.page_info).map_err(WisetreeError::other)?);
+        }
+
+        Ok((threads, reviews))
+    }
+
+    async fn fetch_remaining_fix_comments(&self, cwd: &Path, thread: &mut FixThread) -> Result<()> {
+        let mut page_info = std::mem::take(&mut thread.comments.page_info);
+        while page_info.has_next_page {
+            let thread_id = thread.id.as_deref().ok_or_else(|| {
+                WisetreeError::other("GitHub omitted the id for a paginated review thread")
+            })?;
+            let cursor = required_fix_cursor(page_info).map_err(WisetreeError::other)?;
+            let query = build_fix_thread_comments_query(thread_id, &cursor);
+            let output = self.run_fix_graphql(cwd, &query).await?;
+            let page: FixConnection<FixRawComment> =
+                parse_fix_connection(&output, "/data/node/comments")
+                    .map_err(WisetreeError::other)?;
+            thread.comments.nodes.extend(page.nodes);
+            page_info = page.page_info;
+        }
+        Ok(())
+    }
+
+    async fn run_fix_graphql(&self, cwd: &Path, query: &str) -> Result<String> {
+        let arg = format!("query={query}");
+        time::timeout(
+            FIX_FETCH_TIMEOUT,
+            run_gh_command(&self.gh_binary, &["api", "graphql", "-f", &arg], Some(cwd)),
+        )
+        .await
+        .map_err(|_| WisetreeError::other("gh api graphql timed out after 15s"))?
+        .map_err(WisetreeError::other)
     }
 
     /// Judge + plan one comment group with a single captured (non-interactive)
@@ -7592,22 +7724,86 @@ fn build_explain_prompt(
 
 // ── "Fix Pull Request" helpers (deterministic, unit-tested) ────────────
 
-/// Build the GraphQL query for the Fix loop. It returns, in one round-trip:
-/// every inline review thread (with the `isResolved` / `isOutdated` flags we
-/// filter on, plus each comment's `isMinimized` and `viewerDidAuthor` flags),
-/// and every PR-level review summary body (the text left when submitting a
-/// review, not anchored to a line). Both feed `parse_and_group_review_feedback`.
-fn build_fix_feedback_query(owner: &str, repo: &str, number: u64) -> String {
+fn fix_cursor(cursor: Option<&str>) -> String {
+    cursor.map_or_else(
+        || "null".to_string(),
+        |cursor| format!("\"{}\"", escape_graphql_string(cursor)),
+    )
+}
+
+fn build_fix_threads_query(owner: &str, repo: &str, number: u64, cursor: Option<&str>) -> String {
     format!(
         "query {{ repository(owner: \"{}\", name: \"{}\") {{ pullRequest(number: {}) {{ \
-         reviewThreads(first: 100) {{ nodes {{ isResolved \
-         comments(first: 50) {{ nodes {{ databaseId path line originalLine isMinimized \
-         viewerDidAuthor body author {{ login }} }} }} }} }} \
-         reviews(first: 100) {{ nodes {{ state body author {{ login }} }} }} }} }} }}",
+         reviewThreads(first: 100, after: {}) {{ pageInfo {{ hasNextPage endCursor }} \
+         nodes {{ id isResolved comments(first: 100) {{ pageInfo {{ hasNextPage endCursor }} \
+         nodes {{ databaseId path line originalLine isMinimized viewerDidAuthor body \
+         author {{ login }} }} }} }} }} }} }} }}",
         escape_graphql_string(owner),
         escape_graphql_string(repo),
-        number
+        number,
+        fix_cursor(cursor),
     )
+}
+
+fn build_fix_thread_comments_query(thread_id: &str, cursor: &str) -> String {
+    format!(
+        "query {{ node(id: \"{}\") {{ ... on PullRequestReviewThread {{ \
+         comments(first: 100, after: \"{}\") {{ pageInfo {{ hasNextPage endCursor }} \
+         nodes {{ databaseId path line originalLine isMinimized viewerDidAuthor body \
+         author {{ login }} }} }} }} }} }}",
+        escape_graphql_string(thread_id),
+        escape_graphql_string(cursor),
+    )
+}
+
+fn build_fix_reviews_query(owner: &str, repo: &str, number: u64, cursor: Option<&str>) -> String {
+    format!(
+        "query {{ repository(owner: \"{}\", name: \"{}\") {{ pullRequest(number: {}) {{ \
+         reviews(first: 100, after: {}) {{ pageInfo {{ hasNextPage endCursor }} \
+         nodes {{ state body author {{ login }} }} }} }} }} }}",
+        escape_graphql_string(owner),
+        escape_graphql_string(repo),
+        number,
+        fix_cursor(cursor),
+    )
+}
+
+fn parse_fix_response(body: &str) -> std::result::Result<serde_json::Value, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid gh response: {e}"))?;
+    if let Some(errors) = value.get("errors") {
+        let errors: Vec<FixGraphqlError> = serde_json::from_value(errors.clone())
+            .map_err(|e| format!("invalid GraphQL errors: {e}"))?;
+        let joined = errors
+            .into_iter()
+            .map(|error| error.message)
+            .filter(|message| !message.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !joined.is_empty() {
+            return Err(joined);
+        }
+    }
+    Ok(value)
+}
+
+fn parse_fix_connection<T: serde::de::DeserializeOwned>(
+    body: &str,
+    pointer: &str,
+) -> std::result::Result<FixConnection<T>, String> {
+    let value = parse_fix_response(body)?;
+    let connection = value
+        .pointer(pointer)
+        .ok_or_else(|| format!("missing GraphQL connection at {pointer}"))?;
+    serde_json::from_value(connection.clone())
+        .map_err(|e| format!("invalid GraphQL connection at {pointer}: {e}"))
+}
+
+fn required_fix_cursor(page_info: FixPageInfo) -> std::result::Result<String, String> {
+    page_info
+        .end_cursor
+        .filter(|cursor| !cursor.is_empty())
+        .ok_or_else(|| "GitHub reported another feedback page without an end cursor".to_string())
 }
 
 /// Parse the review-feedback GraphQL response and group the survivors.
@@ -7626,94 +7822,25 @@ fn build_fix_feedback_query(owner: &str, repo: &str, number: u64) -> String {
 /// replied to in-thread, so every submitted, non-empty one is folded into a
 /// single group (file / line / reply id all `None`) appended last. The planning
 /// AI judges them together and any reply goes back as one general PR comment.
+#[cfg(test)]
 fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<CommentGroup>, String> {
-    #[derive(Deserialize)]
-    struct Resp {
-        data: Option<RespData>,
-        errors: Option<Vec<GhErr>>,
-    }
-    #[derive(Deserialize)]
-    struct RespData {
-        repository: Option<Repo>,
-    }
-    #[derive(Deserialize)]
-    struct Repo {
-        #[serde(rename = "pullRequest")]
-        pull_request: Option<Pr>,
-    }
-    #[derive(Deserialize)]
-    struct Pr {
-        #[serde(rename = "reviewThreads")]
-        review_threads: Conn<Thread>,
-        reviews: Option<Conn<Review>>,
-    }
-    #[derive(Deserialize)]
-    struct Conn<T> {
-        #[serde(default = "Vec::new")]
-        nodes: Vec<T>,
-    }
-    #[derive(Deserialize)]
-    struct Thread {
-        #[serde(rename = "isResolved", default)]
-        is_resolved: bool,
-        comments: Conn<RawComment>,
-    }
-    #[derive(Deserialize)]
-    struct RawComment {
-        #[serde(rename = "databaseId")]
-        database_id: Option<u64>,
-        path: Option<String>,
-        line: Option<u64>,
-        #[serde(rename = "originalLine")]
-        original_line: Option<u64>,
-        #[serde(rename = "isMinimized", default)]
-        is_minimized: bool,
-        #[serde(rename = "viewerDidAuthor", default)]
-        viewer_did_author: bool,
-        #[serde(default)]
-        body: String,
-        author: Option<Author>,
-    }
-    /// A submitted PR-level review. `body` is the summary text; `state` is one
-    /// of APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING.
-    #[derive(Deserialize)]
-    struct Review {
-        #[serde(default)]
-        state: String,
-        #[serde(default)]
-        body: String,
-        author: Option<Author>,
-    }
-    #[derive(Deserialize)]
-    struct Author {
-        #[serde(default)]
-        login: String,
-    }
-    #[derive(Deserialize)]
-    struct GhErr {
-        #[serde(default)]
-        message: String,
-    }
-
-    let resp: Resp = serde_json::from_str(body).map_err(|e| format!("invalid gh response: {e}"))?;
-    if let Some(errors) = resp.errors {
-        let joined = errors
-            .into_iter()
-            .map(|e| e.message)
-            .filter(|m| !m.is_empty())
-            .collect::<Vec<_>>()
-            .join("; ");
-        if !joined.is_empty() {
-            return Err(joined);
-        }
-    }
-    let pr = resp
-        .data
-        .and_then(|d| d.repository)
-        .and_then(|r| r.pull_request)
+    let value = parse_fix_response(body)?;
+    let threads = value
+        .pointer("/data/repository/pullRequest/reviewThreads")
         .ok_or_else(|| "missing pull request in response".to_string())?;
+    let threads: FixConnection<FixThread> = serde_json::from_value(threads.clone())
+        .map_err(|e| format!("invalid review threads: {e}"))?;
+    let reviews: FixConnection<FixReview> = value
+        .pointer("/data/repository/pullRequest/reviews")
+        .map(|reviews| serde_json::from_value(reviews.clone()))
+        .transpose()
+        .map_err(|e| format!("invalid reviews: {e}"))?
+        .unwrap_or_default();
+    Ok(group_review_feedback(threads.nodes, reviews.nodes))
+}
 
-    let login = |a: &Option<Author>| -> String {
+fn group_review_feedback(threads: Vec<FixThread>, reviews: Vec<FixReview>) -> Vec<CommentGroup> {
+    let login = |a: &Option<FixAuthor>| -> String {
         a.as_ref()
             .map(|a| a.login.clone())
             .filter(|l| !l.is_empty())
@@ -7723,11 +7850,11 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
     let mut groups: Vec<CommentGroup> = Vec::new();
     let mut index: HashMap<(String, u64), usize> = HashMap::new();
 
-    for thread in pr.review_threads.nodes {
+    for thread in threads {
         if thread.is_resolved {
             continue;
         }
-        let surviving: Vec<RawComment> = thread
+        let surviving: Vec<FixRawComment> = thread
             .comments
             .nodes
             .into_iter()
@@ -7783,7 +7910,7 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
     // planning call. PENDING reviews aren't submitted yet and DISMISSED ones
     // were explicitly retracted, so both are excluded along with empty bodies.
     let mut summaries: Vec<ReviewComment> = Vec::new();
-    for review in pr.reviews.map(|c| c.nodes).unwrap_or_default() {
+    for review in reviews {
         let state = review.state.to_ascii_uppercase();
         if state == "PENDING" || state == "DISMISSED" || review.body.trim().is_empty() {
             continue;
@@ -7805,7 +7932,7 @@ fn parse_and_group_review_feedback(body: &str) -> std::result::Result<Vec<Commen
         });
     }
 
-    Ok(groups)
+    groups
 }
 
 /// Read a generous window of the targeted file around `line`, numbered so the
@@ -14794,6 +14921,81 @@ so the intent reads clearly.
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_fix_fetches_every_thread_comment_and_review_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gh_path = dir.path().join("fake-gh.sh");
+        let git_path = dir.path().join("fake-git.sh");
+        let opencode_path = dir.path().join("fake-opencode.sh");
+        std::fs::write(&git_path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&opencode_path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            &gh_path,
+            r##"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s' '{"url":"https://github.com/oxeanbits/dpms-api-norway/pull/1132"}'
+  exit 0
+fi
+case "$*" in
+  *'reviewThreads(first: 100, after: null)'*)
+    printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":"threads-1"},"nodes":[{"id":"handled","isResolved":false,"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"databaseId":1,"path":"handled.rb","line":1,"isMinimized":false,"viewerDidAuthor":false,"body":"old request","author":{"login":"reviewer"}},{"databaseId":2,"path":"handled.rb","line":1,"isMinimized":false,"viewerDidAuthor":true,"body":"addressed","author":{"login":"me"}}]}}]}}}}}'
+    ;;
+  *'reviewThreads(first: 100, after: "threads-1")'*)
+    printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"lint","isResolved":false,"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"databaseId":3,"path":"spec/support/equinor_transport_double.rb","line":13,"isMinimized":false,"viewerDidAuthor":false,"body":"Lint/UnusedMethodArgument: Unused method argument - `timeout`.","author":{"login":"oxeanbot"}}]}},{"id":"long-thread","isResolved":false,"comments":{"pageInfo":{"hasNextPage":true,"endCursor":"comments-1"},"nodes":[{"databaseId":4,"path":"app/service.rb","line":9,"isMinimized":false,"viewerDidAuthor":false,"body":"change this","author":{"login":"reviewer"}},{"databaseId":5,"path":"app/service.rb","line":9,"isMinimized":false,"viewerDidAuthor":true,"body":"addressed","author":{"login":"me"}}]}}]}}}}}'
+    ;;
+  *'node(id: "long-thread")'*'comments(first: 100, after: "comments-1")'*)
+    printf '%s' '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"databaseId":6,"path":"app/service.rb","line":9,"isMinimized":false,"viewerDidAuthor":false,"body":"This still needs work.","author":{"login":"reviewer"}}]}}}}'
+    ;;
+  *'reviews(first: 100, after: null)'*)
+    printf '%s' '{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":true,"endCursor":"reviews-1"},"nodes":[]}}}}}'
+    ;;
+  *'reviews(first: 100, after: "reviews-1")'*)
+    printf '%s' '{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"state":"CHANGES_REQUESTED","body":"Add an integration test.","author":{"login":"reviewer"}}]}}}}}'
+    ;;
+  *'reviewThreads(first: 100) {'*)
+    printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"databaseId":1,"path":"handled.rb","line":1,"isMinimized":false,"viewerDidAuthor":false,"body":"old request","author":{"login":"reviewer"}},{"databaseId":2,"path":"handled.rb","line":1,"isMinimized":false,"viewerDidAuthor":true,"body":"addressed","author":{"login":"me"}}]} }],"pageInfo":{"hasNextPage":true,"endCursor":"threads-1"}},"reviews":{"nodes":[]}}}}}'
+    ;;
+  *)
+    printf 'unexpected gh invocation: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+"##,
+        )
+        .unwrap();
+        make_executable(&git_path);
+        make_executable(&opencode_path);
+        make_executable(&gh_path);
+
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_git_binary(git_path)
+            .with_gh_binary(gh_path)
+            .with_opencode_binary(opencode_path);
+        let preparation = service
+            .prepare_fix(dir.path().to_str().unwrap(), 1132)
+            .await
+            .expect("all feedback pages");
+        let FixPreparation::Ready { groups, .. } = preparation else {
+            panic!("expected pending feedback after pagination, got {preparation:?}");
+        };
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(
+            groups[0].descriptor(),
+            "spec/support/equinor_transport_double.rb:13"
+        );
+        assert!(groups[0].combined_text().contains("UnusedMethodArgument"));
+        assert!(groups[1].combined_text().contains("This still needs work."));
+        assert_eq!(
+            groups[2].combined_text(),
+            "@reviewer: Add an integration test."
+        );
     }
 
     #[cfg(unix)]
