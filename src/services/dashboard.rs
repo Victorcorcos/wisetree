@@ -7945,7 +7945,7 @@ async fn read_code_window(cwd: &Path, file: &str, line: Option<u64>) -> String {
     let total = lines.len();
     let (start, end) = match line {
         Some(l) if l >= 1 => {
-            let l0 = (l as usize).saturating_sub(1);
+            let l0 = (l as usize).saturating_sub(1).min(total.saturating_sub(1));
             let start = l0.saturating_sub(FIX_CODE_WINDOW_RADIUS);
             let end = (l0 + FIX_CODE_WINDOW_RADIUS + 1).min(total);
             (start, end)
@@ -14763,6 +14763,24 @@ so the intent reads clearly.
     fn group_review_feedback_surfaces_graphql_errors() {
         let json = r#"{ "errors": [ { "message": "Could not resolve to a Repository." } ] }"#;
         assert!(parse_and_group_review_feedback(json).is_err());
+    }
+
+    #[tokio::test]
+    async fn code_window_anchors_stale_review_line_at_end_of_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = (1..=76)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(dir.path().join("target.rb"), content)
+            .await
+            .expect("fixture file");
+
+        let window = read_code_window(dir.path(), "target.rb", Some(123)).await;
+
+        assert!(window.starts_with("   36 | line 36\n"));
+        assert!(window.ends_with("   76 | line 76\n"));
+        assert_eq!(window.lines().count(), 41);
     }
 
     // ── Fix pipeline: commit + reply formatting ────────────────────────
