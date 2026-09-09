@@ -5,15 +5,16 @@ use std::process::Command;
 
 use once_cell::sync::Lazy;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use wisetree::config::schema::DashboardConfig;
 use wisetree::services::{
-    build_corrective_plan_prompt, build_split_plan_prompt, describe_snapshot_changes,
-    inventory_diff, parse_materialization, parse_numstat_totals, parse_publication,
+    build_corrective_plan_prompt, build_split_open_prompt, build_split_plan_prompt,
+    compose_split_body, describe_snapshot_changes, final_split_title, inventory_diff,
+    parse_materialization, parse_numstat_totals, parse_publication, parse_split_draft,
     parse_split_plan, patch_for_units, provisional_split_title, render_publication,
-    render_split_plan, validate_split_manifest, ChangeUnit, ChangeUnitKind, DashboardService,
-    SplitIdentity, SplitPlan, SplitPreflight, SplitPublication, SplitPublishedPullRequest,
-    SplitRepositorySnapshot, SplitResponsibility,
+    render_split_plan, validate_split_body, validate_split_manifest, validate_split_publication,
+    ChangeUnit, ChangeUnitKind, DashboardService, SplitIdentity, SplitPlan, SplitPreflight,
+    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
 };
 
 mod support;
@@ -183,6 +184,127 @@ fn publication_record_round_trips_complete_verified_identity() {
     assert_eq!(parse_publication(&rendered).unwrap(), Some(publication));
     assert!(rendered.contains("Expected base"));
     assert!(rendered.contains("title applied") || rendered.contains("yes"));
+}
+
+fn published_stack() -> SplitPublication {
+    SplitPublication {
+        repository: "owner/repo".into(),
+        trunk: "main".into(),
+        source_branch: "duv4091_change".into(),
+        stack_link_completed: true,
+        status: "published, verified, and provisionally titled".into(),
+        diagnostics: None,
+        pull_requests: (1..=3)
+            .map(|order| SplitPublishedPullRequest {
+                order,
+                branch: if order == 3 {
+                    "duv4091_change".into()
+                } else {
+                    format!("duv4091_change.{order}_layer")
+                },
+                expected_base: match order {
+                    1 => "main".into(),
+                    2 => "duv4091_change.1_layer".into(),
+                    _ => "duv4091_change.2_layer".into(),
+                },
+                number: 40 + order as u64,
+                url: format!("https://github.com/owner/repo/pull/{}", 40 + order),
+                provisional_title: format!("DUV-4091 Change ({order}/3)"),
+                provisional_title_applied: true,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn split_draft_contract_prompt_and_title_keep_ai_out_of_bookkeeping() {
+    let responsibility = SplitResponsibility {
+        order: 1,
+        name: "Foundation".into(),
+        branch_slug: "foundation".into(),
+        rationale: "Introduces the shared contract.".into(),
+        units: vec!["CU0001".into()],
+        test_units: vec!["CU0001".into()],
+        paths: vec!["tests/a.rs".into()],
+    };
+    let prompt = build_split_open_prompt(
+        &responsibility,
+        "DUV-4091",
+        "commit",
+        "diff",
+        "# Description ✍️",
+    );
+    assert!(prompt.contains("Do not create branches, commits, pushes, files"));
+    assert!(prompt.contains("Do not run git or gh"));
+    assert!(!prompt.contains("https://github.com/owner/repo/pull/41"));
+
+    let draft = parse_split_draft(
+        r#"{"title_summary":"2. DUV-4091 Add the contract (9/9)","description_content":"Adds the contract and explains how to test it."}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        final_split_title("duv4091_change", &draft.title_summary, 2, 3).unwrap(),
+        "DUV-4091 Add the contract (2/3)"
+    );
+    assert!(parse_split_draft(
+        r#"{"title_summary":"x","description_content":"See https://example.test"}"#
+    )
+    .is_err());
+}
+
+#[test]
+fn split_body_is_deterministic_and_preserves_non_description_template_sections() {
+    let publication = published_stack();
+    let template = "# Description ✍️\n\nplaceholder\n\n# Overview 🔍\n\nkeep overview\n\n# Test Guidance 🦮\n\nkeep tests\n\n# Custom\n\nkeep custom";
+    let body = compose_split_body(
+        template,
+        "This layer introduces the shared contract.",
+        &publication.pull_requests,
+        2,
+    )
+    .unwrap();
+    validate_split_body(&body, &publication.pull_requests, 2).unwrap();
+    assert!(body.contains("1. https://github.com/owner/repo/pull/41\n"));
+    assert!(body.contains("2. https://github.com/owner/repo/pull/42 **(current PR)**"));
+    assert!(body.contains("3. https://github.com/owner/repo/pull/43 **(future PR)**"));
+    assert!(body.find("### Split Plan 📋").unwrap() < body.find("This layer").unwrap());
+    assert!(body.contains("keep overview"));
+    assert!(body.contains("keep tests"));
+    assert!(body.contains("keep custom"));
+    assert!(!body.contains("placeholder"));
+
+    assert!(compose_split_body(
+        "# Description\n\na\n# Description ✍️\n\nb",
+        "prose",
+        &publication.pull_requests,
+        1,
+    )
+    .is_err());
+    let without = compose_split_body(
+        "# Overview\n\nmedia stays",
+        "prose",
+        &publication.pull_requests,
+        1,
+    )
+    .unwrap();
+    assert!(without.starts_with("# Description ✍️\n\n### Split Plan 📋"));
+    assert!(without.contains("# Overview\n\nmedia stays"));
+}
+
+#[test]
+fn publication_gate_rejects_missing_or_misordered_canonical_urls() {
+    let mut preflight = fixture();
+    preflight.identity.repository = "owner/repo".into();
+    preflight.identity.source_branch = "duv4091_change".into();
+    let plan = parse_split_plan(valid_response(), &preflight).unwrap();
+    let mut publication = published_stack();
+    publication.pull_requests.truncate(2);
+    publication.pull_requests[1].branch = "duv4091_change".into();
+    assert!(validate_split_publication(&preflight, &plan, &publication).is_ok());
+    publication.pull_requests.swap(0, 1);
+    assert!(validate_split_publication(&preflight, &plan, &publication).is_err());
+    publication.pull_requests[0].url = "https://github.com/owner/repo/pull/999".into();
+    assert!(validate_split_publication(&preflight, &plan, &publication).is_err());
 }
 
 #[test]
@@ -466,6 +588,116 @@ exit 1
             .count(),
         3
     );
+
+    // A barrier inside the fake provider proves that all three captured jobs
+    // are launched before the service awaits any one result. A serialized
+    // implementation cannot get past this barrier.
+    let barrier = fixture.repo.parent().unwrap().join("split-draft-started");
+    fs::create_dir_all(&barrier).unwrap();
+    let ai_log = fixture.repo.parent().unwrap().join("split-draft-ai.log");
+    let ai_path = fixture.repo.parent().unwrap().join("split-draft-ai.sh");
+    fs::write(
+        &ai_path,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'opencode 1.0\n'; exit 0; fi
+printf '%s\n' "$PWD" >> "{log}"
+touch "{barrier}/$$"
+i=0
+while [ "$(find "{barrier}" -type f | wc -l | tr -d ' ')" -lt 3 ]; do
+  i=$((i + 1))
+  if [ "$i" -gt 200 ]; then printf 'drafts were serialized' >&2; exit 1; fi
+  sleep 0.01
+done
+printf '%s\n' '{{"title_summary":"Focused layer metadata","description_content":"Explains this layer responsibility and its focused test guidance."}}'
+"#,
+            log = ai_log.display(),
+            barrier = barrier.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&ai_path);
+    let metadata_gh_log = fixture.repo.parent().unwrap().join("split-metadata-gh.log");
+    let metadata_gh = fixture.repo.parent().unwrap().join("split-metadata-gh.sh");
+    fs::write(
+        &metadata_gh,
+        format!(
+            r##"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then printf '%s' '{{"title":"provisional","body":"# Overview 🔍\n\n![old](https://github.com/example/repo/assets/old)"}}'; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi
+exit 1
+"##,
+            log = metadata_gh_log.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&metadata_gh);
+    let drafting_service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
+        .with_ai_binary(wisetree::config::schema::AiHarness::OpenCode, ai_path)
+        .with_gh_binary(metadata_gh);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_cancel_tx, cancel_rx) = oneshot::channel();
+    let result = drafting_service
+        .draft_and_apply_split_metadata(
+            &preflight,
+            &plan,
+            &publication,
+            17,
+            4,
+            progress_tx,
+            cancel_rx,
+        )
+        .await;
+    if let Err(error) = &result {
+        let cache = fs::read_dir(fixture.source.join(".wisetree/split_drafts"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        panic!(
+            "{error}; ai log={:?}; barrier={:?}; cache={cache:?}",
+            fs::read_to_string(&ai_log),
+            fs::read_dir(&barrier)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+    }
+    let records = result.unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(records.iter().all(|record| record.applied));
+    assert_eq!(fs::read_to_string(&ai_log).unwrap().lines().count(), 3);
+    let progress = std::iter::from_fn(|| progress_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(progress.iter().all(|event| event.operation_id == 17));
+    assert!(progress.iter().all(|event| event.generation == 4));
+    assert!(progress
+        .iter()
+        .any(|event| event.layer == 3 && event.pr_number == 43));
+    let metadata_calls = fs::read_to_string(metadata_gh_log).unwrap();
+    assert_eq!(
+        metadata_calls
+            .lines()
+            .filter(|line| line.starts_with("pr edit "))
+            .count(),
+        3
+    );
+
+    // Valid drafts and successful mutations are stable cache hits.
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_cancel_tx, cancel_rx) = oneshot::channel();
+    drafting_service
+        .draft_and_apply_split_metadata(
+            &preflight,
+            &plan,
+            &publication,
+            17,
+            5,
+            progress_tx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&ai_log).unwrap().lines().count(), 3);
 
     assert_eq!(
         git_stdout(&fixture.source, &["rev-parse", "HEAD"]),

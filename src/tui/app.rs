@@ -50,9 +50,9 @@ use crate::services::{
     FixPreparation, FixVerdict, ImproveCheckpointIdentity, ImprovePreparation, JudgeResult,
     MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding,
     ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell,
-    ShellIntegrationStatus, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
-    SplitPublication, SplitRepositorySnapshot, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
-    UpdateSource,
+    ShellIntegrationStatus, SplitDraftProgress, SplitDraftRecord, SplitPlan, SplitPlanResult,
+    SplitPreflight, SplitPreflightRequest, SplitPublication, SplitRepositorySnapshot,
+    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::image_upload::{ImageAttachment, ImageStorage};
@@ -375,6 +375,12 @@ enum AppEvent {
         operation_id: u64,
         generation: u64,
         result: Result<Box<SplitPublication>, String>,
+    },
+    SplitDraftProgress(SplitDraftProgress),
+    SplitDrafted {
+        operation_id: u64,
+        generation: u64,
+        result: Result<Vec<SplitDraftRecord>, String>,
     },
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
@@ -5515,6 +5521,9 @@ impl App {
             SplitAction::RetryPublication => {
                 self.start_split_approval(tx);
             }
+            SplitAction::RetryDrafting => {
+                self.start_split_drafting(tx);
+            }
             SplitAction::Approved => {
                 self.start_split_approval(tx);
             }
@@ -5689,6 +5698,7 @@ impl App {
         operation_id: u64,
         generation: u64,
         result: Result<Box<SplitPublication>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
         if !self.split_event_is_current(operation_id, generation) {
             return;
@@ -5698,10 +5708,71 @@ impl App {
                 if let Some(screen) = self.split_pr.as_mut() {
                     screen.mark_approved(*publication);
                 }
+                self.start_split_drafting(tx);
             }
             Err(message) => {
                 if let Some(screen) = self.split_pr.as_mut() {
                     screen.set_publication_error(message);
+                }
+            }
+        }
+    }
+
+    fn start_split_drafting(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if let Some(cancel) = self.split_cancel.take() {
+            let _ = cancel.send(());
+        }
+        let Some(operation_id) = self.active_split_operation_id else {
+            return;
+        };
+        let Some((preflight, plan, publication)) = self.split_pr.as_ref().and_then(|screen| {
+            let (preflight, plan, _) = screen.approval_payload()?;
+            Some((
+                preflight.clone(),
+                plan.clone(),
+                screen.publication()?.clone(),
+            ))
+        }) else {
+            return;
+        };
+        if let Some(screen) = self.split_pr.as_mut() {
+            screen.resume_drafting();
+        }
+        let generation = self.next_split_generation();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.split_cancel = Some(cancel_tx);
+        kick_off_split_drafting(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            preflight,
+            plan,
+            publication,
+            operation_id,
+            generation,
+            cancel_rx,
+            tx.clone(),
+        );
+    }
+
+    fn apply_split_drafted(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        result: Result<Vec<SplitDraftRecord>, String>,
+    ) {
+        if !self.split_event_is_current(operation_id, generation) {
+            return;
+        }
+        self.split_cancel = None;
+        match result {
+            Ok(records) => {
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.finish_drafting(records);
+                }
+            }
+            Err(message) => {
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.set_drafting_error(message);
                 }
             }
         }
@@ -8318,7 +8389,19 @@ impl App {
                 operation_id,
                 generation,
                 result,
-            } => self.apply_split_approved(operation_id, generation, result),
+            } => self.apply_split_approved(operation_id, generation, result, tx),
+            AppEvent::SplitDraftProgress(progress) => {
+                if self.split_event_is_current(progress.operation_id, progress.generation) {
+                    if let Some(screen) = self.split_pr.as_mut() {
+                        screen.update_draft_progress(progress);
+                    }
+                }
+            }
+            AppEvent::SplitDrafted {
+                operation_id,
+                generation,
+                result,
+            } => self.apply_split_drafted(operation_id, generation, result),
             AppEvent::BugkillFileWriteFailed(err) => self.show_toast(
                 ToastVariant::Warning,
                 format!("Could not write BUG_INVESTIGATION.md: {err}"),
@@ -12083,6 +12166,56 @@ fn kick_off_split_approval(
         .map(Box::new)
         .map_err(|error| user_friendly_message(&error));
         let _ = tx.send(AppEvent::SplitApproved {
+            operation_id,
+            generation,
+            result,
+        });
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kick_off_split_drafting(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    preflight: SplitPreflight,
+    plan: SplitPlan,
+    publication: SplitPublication,
+    operation_id: u64,
+    generation: u64,
+    cancel: oneshot::Receiver<()>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::SplitDrafted {
+            operation_id,
+            generation,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let event_tx = tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let _ = event_tx.send(AppEvent::SplitDraftProgress(progress));
+            }
+        });
+        let result = service
+            .draft_and_apply_split_metadata(
+                &preflight,
+                &plan,
+                &publication,
+                operation_id,
+                generation,
+                progress_tx,
+                cancel,
+            )
+            .await
+            .map_err(|error| user_friendly_message(&error));
+        let _ = forwarder.await;
+        let _ = tx.send(AppEvent::SplitDrafted {
             operation_id,
             generation,
             result,

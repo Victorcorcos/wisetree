@@ -6,7 +6,8 @@ use ratatui::Terminal;
 use wisetree::config::schema::{AiHarness, AiModelConfig, AiSplitConfig};
 use wisetree::messages::colors;
 use wisetree::services::{
-    parse_split_plan, ChangeUnit, ChangeUnitKind, SplitIdentity, SplitPlanResult, SplitPreflight,
+    parse_split_plan, ChangeUnit, ChangeUnitKind, SplitDraft, SplitDraftJobStatus,
+    SplitDraftProgress, SplitDraftRecord, SplitIdentity, SplitPlanResult, SplitPreflight,
     SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot,
 };
 use wisetree::tui::screens::dashboard::SplitRequest;
@@ -333,26 +334,71 @@ fn publication_progress_and_verified_stack_are_visible() {
     let (progress, _) = render(&mut screen, 100, 20);
     assert!(progress.contains("materializing, publishing, and verifying"));
 
-    screen.mark_approved(SplitPublication {
+    let publication = SplitPublication {
         repository: "acme/repo".into(),
         trunk: "main".into(),
         source_branch: "feature/large-change".into(),
         stack_link_completed: true,
         status: "published, verified, and provisionally titled".into(),
         diagnostics: None,
-        pull_requests: vec![SplitPublishedPullRequest {
-            order: 1,
-            branch: "feature/large-change.1_foundation".into(),
-            expected_base: "main".into(),
-            number: 91,
-            url: "https://github.com/acme/repo/pull/91".into(),
-            provisional_title: "Feature Large Change (1/2)".into(),
-            provisional_title_applied: true,
-        }],
+        pull_requests: vec![
+            SplitPublishedPullRequest {
+                order: 1,
+                branch: "feature/large-change.1_foundation".into(),
+                expected_base: "main".into(),
+                number: 91,
+                url: "https://github.com/acme/repo/pull/91".into(),
+                provisional_title: "Feature Large Change (1/2)".into(),
+                provisional_title_applied: true,
+            },
+            SplitPublishedPullRequest {
+                order: 2,
+                branch: "feature/large-change".into(),
+                expected_base: "feature/large-change.1_foundation".into(),
+                number: 92,
+                url: "https://github.com/acme/repo/pull/92".into(),
+                provisional_title: "Feature Large Change (2/2)".into(),
+                provisional_title_applied: true,
+            },
+        ],
+    };
+    screen.mark_approved(publication);
+    screen.update_draft_progress(SplitDraftProgress {
+        operation_id: 7,
+        generation: 4,
+        layer: 1,
+        pr_number: 91,
+        status: SplitDraftJobStatus::Drafted,
+        activity: Some("draft one complete".into()),
+        error: None,
     });
+    let (drafting, _) = render(&mut screen, 100, 20);
+    assert!(drafting.contains("1/2 completed"), "{drafting}");
+    assert!(drafting.contains("PR #91 · Drafted"), "{drafting}");
+    assert!(drafting.contains("AI Activity"), "{drafting}");
+    screen.handle_key(key(KeyCode::Down));
+    let (selected, _) = render(&mut screen, 100, 20);
+    assert!(selected.contains("Launching the selected drafting AI"));
+
+    screen.finish_drafting(vec![SplitDraftRecord {
+        job_id: "source-layer-1-pr-91".into(),
+        source_head: "source-sha".into(),
+        order: 1,
+        pr_number: 91,
+        pr_url: "https://github.com/acme/repo/pull/91".into(),
+        correction_attempted: false,
+        draft: Some(SplitDraft {
+            title_summary: "Foundation".into(),
+            description_content: "Details".into(),
+        }),
+        final_title: Some("Foundation (1/2)".into()),
+        final_body: Some("body".into()),
+        applied: true,
+        error: None,
+    }]);
+    assert_eq!(screen.step(), SplitStep::Complete);
     let (done, _) = render(&mut screen, 100, 20);
-    assert!(done.contains("Published and verified 1 stacked pull requests"));
-    assert!(done.contains("#91 feature/large-change.1_foundation → main"));
+    assert!(done.contains("Published and verified 2 stacked pull requests"));
 
     screen.set_publication_error("push rejected exactly".into());
     assert_eq!(

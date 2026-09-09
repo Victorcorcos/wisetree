@@ -47,14 +47,17 @@ use crate::services::reviewer_tests::{
     build_coverage_ledger, ReviewCoverageInput, ReviewCoverageLedger,
 };
 use crate::services::split::{
-    build_corrective_plan_prompt, build_plan_prompt as build_split_plan_prompt,
+    build_corrective_plan_prompt, build_corrective_split_open_prompt,
+    build_plan_prompt as build_split_plan_prompt, build_split_open_prompt, compose_split_body,
     describe_snapshot_changes, inventory_diff, normalized_patch, parse_materialization,
-    parse_numstat_totals, parse_publication, patch_for_units, provisional_split_title,
-    render_materialization, render_publication, render_split_plan, split_branch_name,
-    validate_manifest as validate_split_manifest, SplitIdentity, SplitMaterialization,
+    parse_numstat_totals, parse_publication, parse_split_draft, patch_for_units,
+    provisional_split_title, render_materialization, render_publication, render_split_plan,
+    split_branch_name, split_draft_cache_path, split_draft_job_id,
+    validate_manifest as validate_split_manifest, validate_split_publication, SplitDraftJobStatus,
+    SplitDraftProgress, SplitDraftRecord, SplitIdentity, SplitMaterialization,
     SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
     SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY,
-    SPLIT_PLAN_FILE,
+    SPLIT_DRAFT_DIRECTORY, SPLIT_PLAN_FILE,
 };
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 use crate::worktree::WorktreeService;
@@ -83,6 +86,7 @@ const BASE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const EXPLAIN_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPLAIN_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 const EXPLAIN_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+const SPLIT_DRAFT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Soft cap on the embedded diff size inside the AI prompt. opencode
 /// receives the whole prompt as a single argv entry, so an unbounded diff
 /// risks exceeding the OS argument-length limit and failing to spawn.
@@ -661,6 +665,14 @@ pub struct ExplainSubmitRequest {
     /// Labels the PR already has on GitHub (update path only). When non-empty,
     /// `--add-label` is omitted from `gh pr edit` so existing labels are preserved.
     pub existing_labels: Vec<String>,
+}
+
+#[derive(Clone)]
+struct SplitDraftRequest {
+    record: SplitDraftRecord,
+    prompt: String,
+    worktree_path: PathBuf,
+    source_worktree: String,
 }
 
 /// Outcome of submitting the drafted PR (`submit_pull_request`): either a
@@ -6489,6 +6501,466 @@ impl DashboardService {
         Ok(publication)
     }
 
+    /// Draft every verified layer concurrently, validate and cache every
+    /// contract, then apply all complete metadata updates concurrently. No
+    /// GitHub mutation occurs until the entire draft generation is valid.
+    // Frozen publication inputs and event/cancellation channels are kept
+    // explicit at this async boundary so a job cannot consult mutable UI state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn draft_and_apply_split_metadata(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+        publication: &SplitPublication,
+        operation_id: u64,
+        generation: u64,
+        progress: mpsc::UnboundedSender<SplitDraftProgress>,
+        mut cancel: oneshot::Receiver<()>,
+    ) -> Result<Vec<SplitDraftRecord>> {
+        validate_split_publication(preflight, plan, publication)?;
+        let source = Path::new(&preflight.worktree_path);
+        let document = tokio::fs::read_to_string(source.join(SPLIT_PLAN_FILE)).await?;
+        if parse_publication(&document)?.as_ref() != Some(publication) {
+            return Err(WisetreeError::validation(
+                "Split drafting requires the canonical publication to be persisted first.",
+            ));
+        }
+        let materialization = parse_materialization(&document)?.ok_or_else(|| {
+            WisetreeError::validation("Split drafting requires verified materialized layers.")
+        })?;
+        if materialization.layers.len() != plan.responsibilities.len() {
+            return Err(WisetreeError::validation(
+                "Split drafting requires every materialized layer.",
+            ));
+        }
+        tokio::fs::create_dir_all(source.join(SPLIT_DRAFT_DIRECTORY)).await?;
+        let template = read_pr_template(source).await;
+        let ticket = split_ticket(&preflight.identity.source_branch).unwrap_or_default();
+        let mut records = Vec::with_capacity(publication.pull_requests.len());
+        let mut requests = Vec::new();
+        for (index, pull_request) in publication.pull_requests.iter().enumerate() {
+            let responsibility = &plan.responsibilities[index];
+            let layer = &materialization.layers[index];
+            if layer.order != responsibility.order
+                || layer.order != pull_request.order
+                || layer.branch != pull_request.branch
+                || !layer.ready_for_publication
+            {
+                return Err(WisetreeError::validation(format!(
+                    "Split layer {} identities do not match across plan, worktree, and publication.",
+                    index + 1
+                )));
+            }
+            let job_id = split_draft_job_id(
+                &preflight.identity.source_head,
+                pull_request.order,
+                pull_request.number,
+            );
+            let cache_path = split_draft_cache_path(&preflight.worktree_path, &job_id);
+            let cached = match tokio::fs::read_to_string(&cache_path).await {
+                Ok(json) => serde_json::from_str::<SplitDraftRecord>(&json).ok(),
+                Err(_) => None,
+            }
+            .filter(|record| {
+                record.job_id == job_id
+                    && record.source_head == preflight.identity.source_head
+                    && record.order == pull_request.order
+                    && record.pr_number == pull_request.number
+                    && record.pr_url == pull_request.url
+                    && record.draft.as_ref().is_some_and(|draft| {
+                        serde_json::to_string(draft)
+                            .ok()
+                            .and_then(|json| parse_split_draft(&json).ok())
+                            .is_some()
+                    })
+            });
+            if let Some(record) = cached {
+                records.push(record);
+                continue;
+            }
+            let worktree_path = PathBuf::from(&layer.worktree_path);
+            let range = format!("{}..{}", layer.parent_sha, layer.commit_sha);
+            let diff = run_command(
+                &self.git_binary,
+                &["diff", "--no-ext-diff", &range],
+                Some(&worktree_path),
+            )
+            .await
+            .map_err(WisetreeError::other)?;
+            let log = run_command(
+                &self.git_binary,
+                &["log", &range, "--reverse", "--format=### %s%n%n%b"],
+                Some(&worktree_path),
+            )
+            .await
+            .map_err(WisetreeError::other)?;
+            let actual_head = run_command(
+                &self.git_binary,
+                &["rev-parse", "HEAD"],
+                Some(&worktree_path),
+            )
+            .await
+            .map_err(WisetreeError::other)?;
+            if actual_head != layer.commit_sha || diff.trim().is_empty() {
+                return Err(WisetreeError::validation(format!(
+                    "Split layer {} no longer has its verified parent-to-child evidence.",
+                    layer.order
+                )));
+            }
+            let record = SplitDraftRecord {
+                job_id,
+                source_head: preflight.identity.source_head.clone(),
+                order: pull_request.order,
+                pr_number: pull_request.number,
+                pr_url: pull_request.url.clone(),
+                correction_attempted: false,
+                draft: None,
+                final_title: None,
+                final_body: None,
+                applied: false,
+                error: None,
+            };
+            let prompt = build_split_open_prompt(responsibility, &ticket, &log, &diff, &template);
+            requests.push(SplitDraftRequest {
+                record,
+                prompt,
+                worktree_path,
+                source_worktree: preflight.worktree_path.clone(),
+            });
+        }
+
+        let mut drafting = JoinSet::new();
+        let mut cancel_senders = Vec::new();
+        for request in requests {
+            let service = self.clone();
+            let progress = progress.clone();
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            cancel_senders.push(cancel_tx);
+            drafting.spawn(async move {
+                service
+                    .run_one_split_draft(request, operation_id, generation, progress, cancel_rx)
+                    .await
+            });
+        }
+        while !drafting.is_empty() {
+            tokio::select! {
+                _ = &mut cancel => {
+                    for sender in cancel_senders.drain(..) {
+                        let _ = sender.send(());
+                    }
+                    drafting.abort_all();
+                    return Err(WisetreeError::validation("Split drafting was cancelled."));
+                }
+                joined = drafting.join_next() => {
+                    let record = joined
+                        .ok_or_else(|| WisetreeError::other("Split draft task disappeared."))?
+                        .map_err(|error| WisetreeError::other(error.to_string()))?;
+                    records.push(record?);
+                }
+            }
+        }
+        records.sort_by_key(|record| record.order);
+        if let Some(failed) = records.iter().find(|record| record.draft.is_none()) {
+            return Err(WisetreeError::validation(format!(
+                "Split draft for PR #{} failed; valid drafts were cached and will be reused.",
+                failed.pr_number
+            )));
+        }
+
+        let total = records.len();
+        for record in &mut records {
+            let draft = record.draft.as_ref().expect("all drafts validated");
+            record.final_title = Some(crate::services::split::final_split_title(
+                &preflight.identity.source_branch,
+                &draft.title_summary,
+                record.order,
+                total,
+            )?);
+            record.final_body = Some(compose_split_body(
+                &template,
+                &draft.description_content,
+                &publication.pull_requests,
+                record.order,
+            )?);
+            self.save_split_draft_record(preflight, record).await?;
+        }
+
+        let mut applying = JoinSet::new();
+        for record in records.iter().filter(|record| !record.applied).cloned() {
+            let service = self.clone();
+            let progress = progress.clone();
+            let preflight = preflight.clone();
+            applying.spawn(async move {
+                service
+                    .apply_one_split_draft(&preflight, record, operation_id, generation, progress)
+                    .await
+            });
+        }
+        let mut applied = records
+            .into_iter()
+            .filter(|record| record.applied)
+            .map(|record| (record.order, record))
+            .collect::<BTreeMap<_, _>>();
+        while let Some(joined) = applying.join_next().await {
+            let record = joined.map_err(|error| WisetreeError::other(error.to_string()))??;
+            applied.insert(record.order, record);
+        }
+        let records = applied.into_values().collect::<Vec<_>>();
+        if let Some(failed) = records.iter().find(|record| !record.applied) {
+            return Err(WisetreeError::validation(format!(
+                "Split metadata update for PR #{} failed; successful updates were retained.",
+                failed.pr_number
+            )));
+        }
+        Ok(records)
+    }
+
+    async fn run_one_split_draft(
+        &self,
+        request: SplitDraftRequest,
+        operation_id: u64,
+        generation: u64,
+        progress: mpsc::UnboundedSender<SplitDraftProgress>,
+        cancel: oneshot::Receiver<()>,
+    ) -> Result<SplitDraftRecord> {
+        let mut record = request.record;
+        send_split_progress(
+            &progress,
+            operation_id,
+            generation,
+            &record,
+            SplitDraftJobStatus::Drafting,
+            None,
+            None,
+        );
+        let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
+        let activity_progress = progress.clone();
+        let activity_record = record.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(line) = activity_rx.recv().await {
+                send_split_progress(
+                    &activity_progress,
+                    operation_id,
+                    generation,
+                    &activity_record,
+                    SplitDraftJobStatus::Drafting,
+                    Some(line),
+                    None,
+                );
+            }
+        });
+        let run = self
+            .ai_runner()
+            .run_captured(
+                &AiRunRequest {
+                    slot: "dashboard.ai.split.open".to_string(),
+                    config: self.config.ai.split.open.clone(),
+                    prompt: request.prompt.clone(),
+                    cwd: request.worktree_path.clone(),
+                    mode: AiRunMode::Captured,
+                    permission: AiPermission::Plan,
+                    timeout: SPLIT_DRAFT_TIMEOUT,
+                    activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+                    session_title: Some(format!("wisetree split PR {}", record.pr_number)),
+                    attachments: Vec::new(),
+                },
+                Some(activity_tx),
+                cancel,
+            )
+            .await;
+        forwarder.abort();
+        let draft = match run {
+            Err(error) => Err(error),
+            Ok(run) => match parse_split_draft(&run.transcript) {
+                Ok(draft) => Ok(draft),
+                Err(first_error) => {
+                    record.correction_attempted = true;
+                    send_split_progress(
+                        &progress,
+                        operation_id,
+                        generation,
+                        &record,
+                        SplitDraftJobStatus::Correcting,
+                        None,
+                        Some(first_error.to_string()),
+                    );
+                    let (_unused_cancel_tx, correction_cancel) = oneshot::channel();
+                    self.ai_runner()
+                        .run_captured(
+                            &AiRunRequest {
+                                slot: "dashboard.ai.split.open".to_string(),
+                                config: self.config.ai.split.open.clone(),
+                                prompt: build_corrective_split_open_prompt(
+                                    &request.prompt,
+                                    &first_error.to_string(),
+                                ),
+                                cwd: request.worktree_path.clone(),
+                                mode: AiRunMode::Captured,
+                                permission: AiPermission::Plan,
+                                timeout: SPLIT_DRAFT_TIMEOUT,
+                                activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+                                session_title: Some(format!(
+                                    "wisetree split PR {} correction",
+                                    record.pr_number
+                                )),
+                                attachments: Vec::new(),
+                            },
+                            None,
+                            correction_cancel,
+                        )
+                        .await
+                        .and_then(|run| parse_split_draft(&run.transcript))
+                }
+            },
+        };
+        match draft {
+            Ok(draft) => {
+                record.draft = Some(draft);
+                record.error = None;
+                send_split_progress(
+                    &progress,
+                    operation_id,
+                    generation,
+                    &record,
+                    SplitDraftJobStatus::Drafted,
+                    None,
+                    None,
+                );
+            }
+            Err(error) => {
+                record.error = Some(error.to_string());
+                send_split_progress(
+                    &progress,
+                    operation_id,
+                    generation,
+                    &record,
+                    SplitDraftJobStatus::Failed,
+                    None,
+                    record.error.clone(),
+                );
+            }
+        }
+        self.save_split_draft_record_path(&request.source_worktree, &record)
+            .await?;
+        Ok(record)
+    }
+
+    async fn apply_one_split_draft(
+        &self,
+        preflight: &SplitPreflight,
+        mut record: SplitDraftRecord,
+        operation_id: u64,
+        generation: u64,
+        progress: mpsc::UnboundedSender<SplitDraftProgress>,
+    ) -> Result<SplitDraftRecord> {
+        send_split_progress(
+            &progress,
+            operation_id,
+            generation,
+            &record,
+            SplitDraftJobStatus::Applying,
+            None,
+            None,
+        );
+        let title = record
+            .final_title
+            .as_deref()
+            .expect("validated final title");
+        let body = record.final_body.as_deref().expect("validated final body");
+        let view = run_command(
+            &self.gh_binary,
+            &["pr", "view", &record.pr_url, "--json", "title,body"],
+            Some(Path::new(&preflight.worktree_path)),
+        )
+        .await;
+        let result = match view {
+            Ok(raw) => serde_json::from_str::<SplitCurrentMetadata>(&raw)
+                .map_err(|error| format!("invalid current PR metadata: {error}"))
+                .map(|current| {
+                    let preserved = preserve_media(&current.body, body);
+                    if current.title == title && current.body == preserved {
+                        None
+                    } else {
+                        Some(preserved)
+                    }
+                }),
+            Err(error) => Err(error),
+        };
+        let result = match result {
+            Ok(None) => Ok(()),
+            Ok(Some(preserved_body)) => run_command(
+                &self.gh_binary,
+                &[
+                    "pr",
+                    "edit",
+                    &record.pr_url,
+                    "--title",
+                    title,
+                    "--body",
+                    &preserved_body,
+                ],
+                Some(Path::new(&preflight.worktree_path)),
+            )
+            .await
+            .map(|_| ()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                record.applied = true;
+                record.error = None;
+                send_split_progress(
+                    &progress,
+                    operation_id,
+                    generation,
+                    &record,
+                    SplitDraftJobStatus::Applied,
+                    None,
+                    None,
+                );
+            }
+            Err(error) => {
+                record.error = Some(error);
+                send_split_progress(
+                    &progress,
+                    operation_id,
+                    generation,
+                    &record,
+                    SplitDraftJobStatus::Failed,
+                    None,
+                    record.error.clone(),
+                );
+            }
+        }
+        self.save_split_draft_record(preflight, &record).await?;
+        Ok(record)
+    }
+
+    async fn save_split_draft_record(
+        &self,
+        preflight: &SplitPreflight,
+        record: &SplitDraftRecord,
+    ) -> Result<()> {
+        self.save_split_draft_record_path(&preflight.worktree_path, record)
+            .await
+    }
+
+    async fn save_split_draft_record_path(
+        &self,
+        worktree: &str,
+        record: &SplitDraftRecord,
+    ) -> Result<()> {
+        let path = split_draft_cache_path(worktree, &record.job_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let json = serde_json::to_vec_pretty(record)?;
+        let temporary = path.with_extension("json.tmp");
+        tokio::fs::write(&temporary, json).await?;
+        tokio::fs::rename(temporary, path).await?;
+        Ok(())
+    }
+
     async fn materialize_new_split_layer(
         git: &crate::git::service::GitService,
         responsibility: &crate::services::split::SplitResponsibility,
@@ -7909,6 +8381,44 @@ struct SplitPublishedPrMetadata {
     is_draft: bool,
     head_ref_name: String,
     base_ref_name: String,
+}
+
+#[derive(Deserialize)]
+struct SplitCurrentMetadata {
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+fn split_ticket(branch: &str) -> Option<String> {
+    static TICKET: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)([a-z]+)-?(\d+)").expect("static ticket regex"));
+    let captures = TICKET.captures(branch)?;
+    Some(format!(
+        "{}-{}",
+        captures.get(1)?.as_str().to_ascii_uppercase(),
+        captures.get(2)?.as_str()
+    ))
+}
+
+fn send_split_progress(
+    progress: &mpsc::UnboundedSender<SplitDraftProgress>,
+    operation_id: u64,
+    generation: u64,
+    record: &SplitDraftRecord,
+    status: SplitDraftJobStatus,
+    activity: Option<String>,
+    error: Option<String>,
+) {
+    let _ = progress.send(SplitDraftProgress {
+        operation_id,
+        generation,
+        layer: record.order,
+        pr_number: record.pr_number,
+        status,
+        activity,
+        error,
+    });
 }
 
 fn parse_split_published_pr(body: &str, branch: &str) -> Result<SplitPublishedPrMetadata> {
