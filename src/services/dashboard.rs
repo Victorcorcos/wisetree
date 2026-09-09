@@ -831,7 +831,7 @@ pub enum FixPreparation {
     AiNotConfigured,
     /// `ai.model` set but `opencode` is not on PATH.
     AiUnavailable,
-    /// `git pull --ff-only` failed (divergence / network). stderr included.
+    /// Branch synchronization failed (divergence / network). stderr included.
     SyncFailed(String),
 }
 
@@ -995,7 +995,7 @@ pub enum ReviewPreparation {
     AiNotConfigured,
     /// A Review discovery profile is configured but `opencode` is not on PATH.
     AiUnavailable,
-    /// `git pull --ff-only` or the PR lookup failed. stderr included.
+    /// Branch synchronization or the PR lookup failed. stderr included.
     SyncFailed(String),
 }
 
@@ -3062,7 +3062,7 @@ impl DashboardService {
     /// Sync the PR branch, then fetch, filter, and group its review comments.
     ///
     /// No AI here. The branch is already checked out in this worktree (that's
-    /// why "Fix" is offered), so we sync it with a fast-forward-only pull
+    /// why "Fix" is offered), so we sync it with a fast-forward-only merge
     /// rather than `gh pr checkout`, which could switch branches inside the
     /// worktree. Resolved and minimized threads are dropped, as are outdated
     /// threads we already replied to; surviving inline comments are grouped by
@@ -3082,15 +3082,9 @@ impl DashboardService {
         }
         let cwd = PathBuf::from(worktree_path);
 
-        // Sync the branch with its upstream so fixes land on the latest PR
-        // state and the final push updates the branch reviewers see.
-        let pull = time::timeout(
-            FIX_SYNC_TIMEOUT,
-            run_command(&self.git_binary, &["pull", "--ff-only"], Some(&cwd)),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("git pull --ff-only timed out after 60s"))?;
-        if let Err(err) = pull {
+        // Sync the branch with its origin counterpart so fixes land on the
+        // latest PR state and the final push updates the branch reviewers see.
+        if let Err(err) = sync_pr_branch(&self.git_binary, &cwd, FIX_SYNC_TIMEOUT).await {
             return Ok(FixPreparation::SyncFailed(err));
         }
 
@@ -3580,15 +3574,9 @@ impl DashboardService {
         }
         let cwd = PathBuf::from(worktree_path);
 
-        // Sync the branch with its upstream so the AI reads worktree files
-        // matching the PR head it is reviewing.
-        let pull = time::timeout(
-            REVIEW_SYNC_TIMEOUT,
-            run_command(&self.git_binary, &["pull", "--ff-only"], Some(&cwd)),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("git pull --ff-only timed out after 60s"))?;
-        if let Err(err) = pull {
+        // Sync the branch with its origin counterpart so the AI reads worktree
+        // files matching the PR head it is reviewing.
+        if let Err(err) = sync_pr_branch(&self.git_binary, &cwd, REVIEW_SYNC_TIMEOUT).await {
             return Ok(ReviewPreparation::SyncFailed(err));
         }
 
@@ -7519,6 +7507,34 @@ async fn current_branch_name(git_binary: &Path, cwd: &Path) -> Option<String> {
     .ok()
     .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty() && s != "HEAD")
+}
+
+/// Fetch and merge exactly the checked-out PR branch from origin. Keeping the
+/// merge separate prevents duplicate or stale `branch.<name>.merge` values
+/// from making `git pull` select multiple merge heads.
+async fn sync_pr_branch(
+    git_binary: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let branch = current_branch_name(git_binary, cwd).await.ok_or_else(|| {
+        "could not resolve the checked-out branch for synchronization.".to_string()
+    })?;
+    let tracking_ref = format!("refs/remotes/origin/{branch}");
+    let refspec = format!("+refs/heads/{branch}:{tracking_ref}");
+    time::timeout(timeout, async {
+        run_command(git_binary, &["fetch", "origin", &refspec], Some(cwd)).await?;
+        run_command(
+            git_binary,
+            &["merge", "--ff-only", &tracking_ref],
+            Some(cwd),
+        )
+        .await?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "branch synchronization timed out after 60s".to_string())??;
+    Ok(())
 }
 
 /// True when the row's branch is behind its base — either the PR's
@@ -14948,7 +14964,11 @@ so the intent reads clearly.
         let gh_path = dir.path().join("fake-gh.sh");
         let git_path = dir.path().join("fake-git.sh");
         let opencode_path = dir.path().join("fake-opencode.sh");
-        std::fs::write(&git_path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            &git_path,
+            "#!/bin/sh\nif [ \"$1\" = \"rev-parse\" ]; then\n  printf 'main\\n'\nfi\nexit 0\n",
+        )
+        .unwrap();
         std::fs::write(&opencode_path, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::write(
             &gh_path,
@@ -15013,6 +15033,63 @@ esac
         assert_eq!(
             groups[2].combined_text(),
             "@reviewer: Add an integration test."
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_fix_ignores_multiple_configured_merge_targets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        let work = dir.path().join("work");
+        let gh_path = dir.path().join("fake-gh.sh");
+        let opencode_path = dir.path().join("fake-opencode.sh");
+        let remote_str = remote.to_str().unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        git(dir.path(), &["init", "-q", "--bare", remote_str]);
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("file.txt"), "initial\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "initial"]);
+        git(&work, &["branch", "other"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+        git(&work, &["push", "-q", "origin", "other"]);
+        git(
+            &work,
+            &["config", "--add", "branch.main.merge", "refs/heads/other"],
+        );
+
+        std::fs::write(&opencode_path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            &gh_path,
+            r##"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s' '{"url":"https://github.com/example/repo/pull/42"}'
+  exit 0
+fi
+printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+"##,
+        )
+        .unwrap();
+        make_executable(&opencode_path);
+        make_executable(&gh_path);
+
+        let service = DashboardService::new(work.clone(), DashboardConfig::default())
+            .with_gh_binary(gh_path)
+            .with_opencode_binary(opencode_path);
+
+        assert_eq!(
+            service
+                .prepare_fix(work.to_str().unwrap(), 42)
+                .await
+                .unwrap(),
+            FixPreparation::NoComments
         );
     }
 
@@ -15289,7 +15366,7 @@ esac
         git(&work, &["push", "-q", "origin", "main"]);
 
         // The reviewer's worktree: a clone with a feature branch checked out
-        // (as it would be after `git pull --ff-only` synced the PR head).
+        // (as it would be after branch synchronization reached the PR head).
         git(
             tmp.path(),
             &["clone", "-q", remote_str, local.to_str().unwrap()],
