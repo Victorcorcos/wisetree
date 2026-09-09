@@ -399,6 +399,19 @@ fn publication_progress_and_verified_stack_are_visible() {
     assert_eq!(screen.step(), SplitStep::Complete);
     let (done, _) = render(&mut screen, 100, 20);
     assert!(done.contains("Published and verified 2 stacked pull requests"));
+    assert!(
+        done.contains("https://github.com/acme/repo/pull/91"),
+        "{done}"
+    );
+    assert!(done.contains("feature/large-change.1_foundation"), "{done}");
+    assert!(
+        done.contains("Source: +8 -2 = 10 changed lines · MAX 10"),
+        "{done}"
+    );
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::Finished
+    );
 
     screen.set_publication_error("push rejected exactly".into());
     assert_eq!(

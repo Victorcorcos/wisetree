@@ -50,14 +50,15 @@ use crate::services::split::{
     build_corrective_plan_prompt, build_corrective_split_open_prompt,
     build_plan_prompt as build_split_plan_prompt, build_split_open_prompt, compose_split_body,
     describe_snapshot_changes, inventory_diff, normalized_patch, parse_materialization,
-    parse_numstat_totals, parse_publication, parse_split_draft, patch_for_units,
-    provisional_split_title, render_materialization, render_publication, render_split_plan,
-    split_branch_name, split_draft_cache_path, split_draft_job_id,
-    validate_manifest as validate_split_manifest, validate_split_publication, SplitDraftJobStatus,
-    SplitDraftProgress, SplitDraftRecord, SplitIdentity, SplitMaterialization,
-    SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
-    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY,
-    SPLIT_DRAFT_DIRECTORY, SPLIT_PLAN_FILE,
+    parse_numstat_totals, parse_publication, parse_split_draft, parse_split_drafting,
+    parse_split_run, patch_for_units, provisional_split_title, render_materialization,
+    render_publication, render_split_drafting, render_split_plan, split_branch_name,
+    split_draft_cache_path, split_draft_job_id, validate_manifest as validate_split_manifest,
+    validate_split_publication, SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord,
+    SplitDraftingRecord, SplitIdentity, SplitMaterialization, SplitMaterializedLayer, SplitPlan,
+    SplitPlanResult, SplitPreflight, SplitPreflightRequest, SplitPublication,
+    SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY, SPLIT_DRAFT_DIRECTORY,
+    SPLIT_PLAN_FILE,
 };
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 use crate::worktree::WorktreeService;
@@ -5581,25 +5582,28 @@ impl DashboardService {
             return Err(WisetreeError::validation("Split MAX must be positive."));
         }
         let cwd = PathBuf::from(&request.worktree_path);
-        let runner = self.ai_runner();
-        for (slot, config) in [
-            ("dashboard.ai.split.plan", &self.config.ai.split.plan),
-            ("dashboard.ai.split.open", &self.config.ai.split.open),
-        ] {
-            runner
-                .preflight(&AiRunRequest {
-                    slot: slot.to_string(),
-                    config: config.clone(),
-                    prompt: String::new(),
-                    cwd: cwd.clone(),
-                    mode: AiRunMode::Captured,
-                    permission: AiPermission::Plan,
-                    timeout: Duration::from_secs(1),
-                    activity_limit: 1,
-                    session_title: None,
-                    attachments: Vec::new(),
-                })
-                .await?;
+        let has_persisted_run = cwd.join(SPLIT_PLAN_FILE).is_file();
+        if !has_persisted_run {
+            let runner = self.ai_runner();
+            for (slot, config) in [
+                ("dashboard.ai.split.plan", &self.config.ai.split.plan),
+                ("dashboard.ai.split.open", &self.config.ai.split.open),
+            ] {
+                runner
+                    .preflight(&AiRunRequest {
+                        slot: slot.to_string(),
+                        config: config.clone(),
+                        prompt: String::new(),
+                        cwd: cwd.clone(),
+                        mode: AiRunMode::Captured,
+                        permission: AiPermission::Plan,
+                        timeout: Duration::from_secs(1),
+                        activity_limit: 1,
+                        session_title: None,
+                        attachments: Vec::new(),
+                    })
+                    .await?;
+            }
         }
         let status = run_command(
             &self.git_binary,
@@ -5611,7 +5615,11 @@ impl DashboardService {
         let dirty = status
             .split('\0')
             .filter(|entry| !entry.is_empty())
-            .filter(|entry| entry.get(3..) != Some(SPLIT_PLAN_FILE))
+            .filter(|entry| {
+                entry.get(3..).map_or(true, |path| {
+                    path != SPLIT_PLAN_FILE && !path.starts_with(SPLIT_DRAFT_DIRECTORY)
+                })
+            })
             .collect::<Vec<_>>();
         if !dirty.is_empty() {
             return Err(WisetreeError::validation(format!(
@@ -5662,14 +5670,16 @@ impl DashboardService {
                 ))
             })?;
         }
-        if let Ok(output) =
-            run_command(&self.gh_binary, &["stack", "view", "--json"], Some(&cwd)).await
-        {
-            let trimmed = output.trim();
-            if !trimmed.is_empty() && !matches!(trimmed, "null" | "[]" | "{}") {
-                return Err(WisetreeError::validation(
-                    "The source branch already belongs to an active GitHub stack. Unstack it or select an unstacked branch before using Split.",
-                ));
+        if !has_persisted_run {
+            if let Ok(output) =
+                run_command(&self.gh_binary, &["stack", "view", "--json"], Some(&cwd)).await
+            {
+                let trimmed = output.trim();
+                if !trimmed.is_empty() && !matches!(trimmed, "null" | "[]" | "{}") {
+                    return Err(WisetreeError::validation(
+                        "The source branch already belongs to an active GitHub stack. Unstack it or select an unstacked branch before using Split.",
+                    ));
+                }
             }
         }
 
@@ -5989,7 +5999,12 @@ impl DashboardService {
         let existing = tokio::fs::read_to_string(&plan_path)
             .await
             .unwrap_or_default();
-        if parse_materialization(&existing)?.is_none() {
+        let already_approved = parse_split_run(&existing)?.is_some_and(|record| {
+            record.identity == preflight.identity
+                && record.plan == *plan
+                && record.status != "awaiting approval"
+        });
+        if parse_materialization(&existing)?.is_none() && !already_approved {
             let current = self.snapshot_split_repository(preflight).await?;
             let changes = describe_snapshot_changes(expected, &current);
             if !changes.is_empty() {
@@ -6629,6 +6644,18 @@ impl DashboardService {
             });
         }
 
+        let mut checkpoint_records = records.clone();
+        checkpoint_records.extend(requests.iter().map(|request| request.record.clone()));
+        checkpoint_records.sort_by_key(|record| record.order);
+        self.save_split_drafting_state(
+            preflight,
+            plan,
+            &checkpoint_records,
+            false,
+            "drafting PR metadata",
+        )
+        .await?;
+
         let mut drafting = JoinSet::new();
         let mut cancel_senders = Vec::new();
         for request in requests {
@@ -6660,6 +6687,8 @@ impl DashboardService {
             }
         }
         records.sort_by_key(|record| record.order);
+        self.save_split_drafting_state(preflight, plan, &records, false, "drafts cached")
+            .await?;
         if let Some(failed) = records.iter().find(|record| record.draft.is_none()) {
             return Err(WisetreeError::validation(format!(
                 "Split draft for PR #{} failed; valid drafts were cached and will be reused.",
@@ -6706,6 +6735,19 @@ impl DashboardService {
             applied.insert(record.order, record);
         }
         let records = applied.into_values().collect::<Vec<_>>();
+        let complete = records.iter().all(|record| record.applied);
+        self.save_split_drafting_state(
+            preflight,
+            plan,
+            &records,
+            complete,
+            if complete {
+                "complete"
+            } else {
+                "metadata update incomplete"
+            },
+        )
+        .await?;
         if let Some(failed) = records.iter().find(|record| !record.applied) {
             return Err(WisetreeError::validation(format!(
                 "Split metadata update for PR #{} failed; successful updates were retained.",
@@ -6961,6 +7003,35 @@ impl DashboardService {
         Ok(())
     }
 
+    async fn save_split_drafting_state(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+        records: &[SplitDraftRecord],
+        completed: bool,
+        status: &str,
+    ) -> Result<()> {
+        let plan_path = Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE);
+        let existing = tokio::fs::read_to_string(&plan_path).await?;
+        let materialization = parse_materialization(&existing)?.ok_or_else(|| {
+            WisetreeError::validation("Split metadata checkpoint is missing materialization.")
+        })?;
+        let publication = parse_publication(&existing)?.ok_or_else(|| {
+            WisetreeError::validation("Split metadata checkpoint is missing publication.")
+        })?;
+        let mut document = render_split_plan(preflight, plan, status);
+        document.push_str(&render_materialization(&materialization)?);
+        document.push_str(&render_publication(&publication)?);
+        document.push_str(&render_split_drafting(&SplitDraftingRecord {
+            records: records.to_vec(),
+            completed,
+        })?);
+        let temporary = plan_path.with_extension("md.tmp");
+        tokio::fs::write(&temporary, document).await?;
+        tokio::fs::rename(temporary, plan_path).await?;
+        Ok(())
+    }
+
     async fn materialize_new_split_layer(
         git: &crate::git::service::GitService,
         responsibility: &crate::services::split::SplitResponsibility,
@@ -7172,10 +7243,14 @@ impl DashboardService {
             .await
             .unwrap_or_default();
         let publication = parse_publication(&existing)?;
+        let drafting = parse_split_drafting(&existing)?;
         let mut document = render_split_plan(preflight, plan, status);
         document.push_str(&render_materialization(materialization)?);
         if let Some(publication) = publication {
             document.push_str(&render_publication(&publication)?);
+        }
+        if let Some(drafting) = drafting {
+            document.push_str(&render_split_drafting(&drafting)?);
         }
         tokio::fs::write(plan_path, document).await?;
         Ok(())
@@ -7191,6 +7266,13 @@ impl DashboardService {
         let mut document = render_split_plan(preflight, plan, &publication.status);
         document.push_str(&render_materialization(materialization)?);
         document.push_str(&render_publication(publication)?);
+        if let Some(drafting) = parse_split_drafting(
+            &tokio::fs::read_to_string(Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE))
+                .await
+                .unwrap_or_default(),
+        )? {
+            document.push_str(&render_split_drafting(&drafting)?);
+        }
         tokio::fs::write(
             Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE),
             document,
@@ -7216,12 +7298,16 @@ impl DashboardService {
             .unwrap_or_default();
         let materialization = parse_materialization(&existing)?;
         let publication = parse_publication(&existing)?;
+        let drafting = parse_split_drafting(&existing)?;
         let mut document = render_split_plan(preflight, plan, status);
         if let Some(materialization) = materialization {
             document.push_str(&render_materialization(&materialization)?);
         }
         if let Some(publication) = publication {
             document.push_str(&render_publication(&publication)?);
+        }
+        if let Some(drafting) = drafting {
+            document.push_str(&render_split_drafting(&drafting)?);
         }
         tokio::fs::write(plan_path, document).await?;
         Ok(())

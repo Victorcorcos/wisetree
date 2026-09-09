@@ -40,19 +40,20 @@ use crate::services::{
     compute_attempt_changes, default_dashboard_warning, detect_shell_integration,
     develop_commit_subject, fetch_claude_effort_levels, fetch_codex_reasoning_levels,
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models,
-    install_shell_integration, parse_plan_transcript, parse_pull_request_md,
-    resolve_dashboard_columns, summarize_transcript, AiStatus, AiTurn, AiTurnWatcher,
-    AttemptChanges, BugHypothesis, BugkillPreflightOutcome, BugkillResumeState, BugkillSnapshot,
-    BugkillVerdict, CheckStatus, CommentGroup, DashboardNoticeLevel, DashboardRow,
-    DashboardService, DashboardUpdate, DashboardWatch, DevelopCheckOutcome, DevelopHandoff,
-    DevelopPlanPrompt, DevelopPreflightOutcome, DevelopResumeState, ExplainPreparation,
-    ExplainSubmitOutcome, ExplainSubmitRequest, FixApplyHandoff, FixCommitOutcome, FixPlan,
-    FixPreparation, FixVerdict, ImproveCheckpointIdentity, ImprovePreparation, JudgeResult,
-    MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding,
-    ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell,
-    ShellIntegrationStatus, SplitDraftProgress, SplitDraftRecord, SplitPlan, SplitPlanResult,
-    SplitPreflight, SplitPreflightRequest, SplitPublication, SplitRepositorySnapshot,
-    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    install_shell_integration, parse_plan_transcript, parse_publication, parse_pull_request_md,
+    parse_split_drafting, resolve_dashboard_columns, summarize_transcript, validate_split_resume,
+    AiStatus, AiTurn, AiTurnWatcher, AttemptChanges, BugHypothesis, BugkillPreflightOutcome,
+    BugkillResumeState, BugkillSnapshot, BugkillVerdict, CheckStatus, CommentGroup,
+    DashboardNoticeLevel, DashboardRow, DashboardService, DashboardUpdate, DashboardWatch,
+    DevelopCheckOutcome, DevelopHandoff, DevelopPlanPrompt, DevelopPreflightOutcome,
+    DevelopResumeState, ExplainPreparation, ExplainSubmitOutcome, ExplainSubmitRequest,
+    FixApplyHandoff, FixCommitOutcome, FixPlan, FixPreparation, FixVerdict,
+    ImproveCheckpointIdentity, ImprovePreparation, JudgeResult, MultiSourceUpdateResult,
+    OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation,
+    ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus,
+    SplitDraftProgress, SplitDraftRecord, SplitPlan, SplitPlanResult, SplitPreflight,
+    SplitPreflightRequest, SplitPublication, SplitRepositorySnapshot, UpdateBranchOutcome,
+    UpdatePhase, UpdateProgress, UpdateSource, SPLIT_PLAN_FILE,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::image_upload::{ImageAttachment, ImageStorage};
@@ -5503,6 +5504,12 @@ impl App {
                     .map(|screen| screen.request().worktree_path.clone());
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
+            SplitAction::Finished => {
+                self.split_pr = None;
+                self.active_split_operation_id = None;
+                self.active_split_generation = None;
+                self.enter_screen(Screen::Dashboard, tx);
+            }
             SplitAction::Confirmed(max) => {
                 self.start_split_preflight(max, tx);
             }
@@ -5647,8 +5654,60 @@ impl App {
         }
         match result {
             Ok(preflight) => {
+                let document = std::fs::read_to_string(
+                    Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE),
+                );
+                let resume = match document.as_deref() {
+                    Ok(document) => validate_split_resume(document, &preflight),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(WisetreeError::other(error.to_string())),
+                };
+                let resume = match resume {
+                    Ok(resume) => resume,
+                    Err(error) => {
+                        if let Some(screen) = self.split_pr.as_mut() {
+                            screen.set_preflight(*preflight);
+                            screen.set_planning_error(error.to_string(), false);
+                        }
+                        return;
+                    }
+                };
                 if let Some(screen) = self.split_pr.as_mut() {
-                    screen.set_preflight(*preflight);
+                    screen.set_preflight((*preflight).clone());
+                }
+                if let Some(record) = resume {
+                    let snapshot = SplitRepositorySnapshot {
+                        status: String::new(),
+                        head: preflight.identity.source_head.clone(),
+                        refs: String::new(),
+                        files: Vec::new(),
+                    };
+                    if let Some(screen) = self.split_pr.as_mut() {
+                        screen.show_plan(SplitPlanResult {
+                            plan: record.plan,
+                            snapshot,
+                        });
+                    }
+                    if record.status == "awaiting approval" {
+                        return;
+                    }
+                    if record.status == "complete" {
+                        if let Ok(document) = document {
+                            let publication = parse_publication(&document).ok().flatten();
+                            let drafting = parse_split_drafting(&document).ok().flatten();
+                            if let (Some(publication), Some(drafting)) = (publication, drafting) {
+                                if drafting.completed {
+                                    if let Some(screen) = self.split_pr.as_mut() {
+                                        screen.mark_approved(publication);
+                                        screen.finish_drafting(drafting.records);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    self.start_split_approval(tx);
+                    return;
                 }
                 self.start_split_planning(false, tx);
             }

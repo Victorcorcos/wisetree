@@ -11,10 +11,12 @@ use wisetree::services::{
     build_corrective_plan_prompt, build_split_open_prompt, build_split_plan_prompt,
     compose_split_body, describe_snapshot_changes, final_split_title, inventory_diff,
     parse_materialization, parse_numstat_totals, parse_publication, parse_split_draft,
-    parse_split_plan, patch_for_units, provisional_split_title, render_publication,
-    render_split_plan, validate_split_body, validate_split_manifest, validate_split_publication,
-    ChangeUnit, ChangeUnitKind, DashboardService, SplitIdentity, SplitPlan, SplitPreflight,
-    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
+    parse_split_drafting, parse_split_plan, parse_split_run, patch_for_units,
+    provisional_split_title, render_publication, render_split_drafting, render_split_plan,
+    validate_split_body, validate_split_manifest, validate_split_publication,
+    validate_split_resume, ChangeUnit, ChangeUnitKind, DashboardService, SplitDraftRecord,
+    SplitDraftingRecord, SplitIdentity, SplitPlan, SplitPreflight, SplitPublication,
+    SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
 };
 
 mod support;
@@ -159,6 +161,67 @@ fn provisional_titles_normalize_ticket_and_ticketless_branches() {
         "Feature Improve Cache Health (2/3)"
     );
     assert_eq!(provisional_split_title("duv-4091", 1, 2), "DUV-4091 (1/2)");
+}
+
+#[test]
+fn durable_run_and_drafting_records_drive_exact_resume() {
+    let preflight = fixture();
+    let plan = parse_split_plan(valid_response(), &preflight).unwrap();
+    let mut document = render_split_plan(&preflight, &plan, "awaiting approval");
+    let run = parse_split_run(&document).unwrap().unwrap();
+    assert_eq!(run.identity, preflight.identity);
+    assert_eq!(run.units, preflight.units);
+    assert_eq!(run.plan, plan);
+    assert_eq!(run.status, "awaiting approval");
+    assert!(validate_split_resume(&document, &preflight).is_ok());
+
+    let record = SplitDraftRecord {
+        job_id: "head-layer-1-pr-41".into(),
+        source_head: "head".into(),
+        order: 1,
+        pr_number: 41,
+        pr_url: "https://github.com/owner/repo/pull/41".into(),
+        correction_attempted: false,
+        draft: None,
+        final_title: None,
+        final_body: None,
+        applied: false,
+        error: Some("retry this PR only".into()),
+    };
+    document.push_str(
+        &render_split_drafting(&SplitDraftingRecord {
+            records: vec![record.clone()],
+            completed: false,
+        })
+        .unwrap(),
+    );
+    let drafting = parse_split_drafting(&document).unwrap().unwrap();
+    assert_eq!(drafting.records, vec![record]);
+    assert!(!drafting.completed);
+    assert!(document.contains("retry resumes cached work"));
+
+    let mut mismatch = preflight.clone();
+    mismatch.identity.max += 1;
+    let error = validate_split_resume(&document, &mismatch)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("does not match the live repository"),
+        "{error}"
+    );
+    assert!(
+        error.contains("did not touch recorded artifacts"),
+        "{error}"
+    );
+
+    let corrupt = document.replace(
+        "<!-- wisetree-split-run {",
+        "<!-- wisetree-split-run not-json{",
+    );
+    assert!(parse_split_run(&corrupt)
+        .unwrap_err()
+        .to_string()
+        .contains("record is corrupt"));
 }
 
 #[test]
