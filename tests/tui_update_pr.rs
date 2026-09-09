@@ -103,6 +103,7 @@ fn sh_quote(path: &Path) -> String {
 fn blank_ai() -> wisetree::config::schema::AiConfig {
     use wisetree::config::schema::{
         AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiModelConfig, AiReviewConfig,
+        AiSplitConfig,
     };
     AiConfig {
         explain: AiModelConfig::default(),
@@ -124,6 +125,10 @@ fn blank_ai() -> wisetree::config::schema::AiConfig {
         develop: AiDevelopConfig {
             plan: AiModelConfig::default(),
             implement: AiModelConfig::default(),
+        },
+        split: AiSplitConfig {
+            plan: AiModelConfig::default(),
+            open: AiModelConfig::default(),
         },
     }
 }

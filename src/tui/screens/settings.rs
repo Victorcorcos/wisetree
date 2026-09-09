@@ -22,7 +22,8 @@ use ratatui::Frame;
 
 use crate::config::schema::{
     AiBugkillConfig, AiConfig, AiDevelopConfig, AiFixConfig, AiHarness, AiModelConfig,
-    AiReviewConfig, DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig,
+    AiReviewConfig, AiSplitConfig, DashboardConfig, LinkStrategy, NotificationsConfig,
+    WorktreeConfig,
 };
 use crate::messages::{colors, UPDATE_CHECKING, UPDATE_CHECK_MENU};
 use crate::services::{MultiSourceUpdateResult, UpdateSource};
@@ -1171,6 +1172,10 @@ fn normalize_ai(ai: &AiConfig) -> AiConfig {
             plan: clean(&ai.develop.plan),
             implement: clean(&ai.develop.implement),
         },
+        split: AiSplitConfig {
+            plan: clean(&ai.split.plan),
+            open: clean(&ai.split.open),
+        },
     }
 }
 
@@ -1190,10 +1195,12 @@ pub enum AiSlot {
     BugkillJudge,
     DevelopPlan,
     DevelopImplement,
+    SplitPlan,
+    SplitOpen,
 }
 
 impl AiSlot {
-    pub const ALL: [AiSlot; 12] = [
+    pub const ALL: [AiSlot; 14] = [
         AiSlot::Explain,
         AiSlot::FixPlan,
         AiSlot::FixApply,
@@ -1206,6 +1213,8 @@ impl AiSlot {
         AiSlot::BugkillJudge,
         AiSlot::DevelopPlan,
         AiSlot::DevelopImplement,
+        AiSlot::SplitPlan,
+        AiSlot::SplitOpen,
     ];
 
     fn label(self) -> &'static str {
@@ -1222,6 +1231,8 @@ impl AiSlot {
             AiSlot::BugkillJudge => "bugkill_judge",
             AiSlot::DevelopPlan => "develop_plan",
             AiSlot::DevelopImplement => "develop_implement",
+            AiSlot::SplitPlan => "split_plan",
+            AiSlot::SplitOpen => "split_open",
         }
     }
 
@@ -1254,6 +1265,12 @@ impl AiSlot {
             AiSlot::DevelopImplement => {
                 "Implements the approved plan section by section (Develop · implement)"
             }
+            AiSlot::SplitPlan => {
+                "Plans semantic boundaries for the stacked PRs — pick a stronger model (Split · plan)"
+            }
+            AiSlot::SplitOpen => {
+                "Drafts one stacked PR title + description (Split · open)"
+            }
         }
     }
 
@@ -1271,6 +1288,8 @@ impl AiSlot {
             AiSlot::BugkillJudge => &ai.bugkill.judge,
             AiSlot::DevelopPlan => &ai.develop.plan,
             AiSlot::DevelopImplement => &ai.develop.implement,
+            AiSlot::SplitPlan => &ai.split.plan,
+            AiSlot::SplitOpen => &ai.split.open,
         }
     }
 
@@ -1288,13 +1307,15 @@ impl AiSlot {
             AiSlot::BugkillJudge => &mut ai.bugkill.judge,
             AiSlot::DevelopPlan => &mut ai.develop.plan,
             AiSlot::DevelopImplement => &mut ai.develop.implement,
+            AiSlot::SplitPlan => &mut ai.split.plan,
+            AiSlot::SplitOpen => &mut ai.split.open,
         }
     }
 }
 
-/// The twelve leaf models in slot order — used by the dashboard `ai` summary and
+/// The fourteen leaf models in slot order — used by the dashboard `ai` summary and
 /// the AI Settings editor.
-fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 12] {
+fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 14] {
     [
         &ai.explain,
         &ai.fix.plan,
@@ -1308,6 +1329,8 @@ fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 12] {
         &ai.bugkill.judge,
         &ai.develop.plan,
         &ai.develop.implement,
+        &ai.split.plan,
+        &ai.split.open,
     ]
 }
 
@@ -6431,6 +6454,10 @@ mod tests {
                         plan: AiModelConfig::default(),
                         implement: AiModelConfig::default(),
                     },
+                    split: AiSplitConfig {
+                        plan: AiModelConfig::default(),
+                        open: AiModelConfig::default(),
+                    },
                 },
                 ..DashboardConfig::default()
             },
@@ -6844,6 +6871,59 @@ mod tests {
     }
 
     #[test]
+    fn split_roles_render_and_save_independently() {
+        let mut screen = ai_settings_screen(vec![]);
+        let plan_idx = AiSlot::ALL
+            .iter()
+            .position(|slot| *slot == AiSlot::SplitPlan)
+            .unwrap();
+        focus_ai_slot(&mut screen, plan_idx);
+        assert_selected_slot_metadata(
+            &screen,
+            "Split · plan",
+            "Plans semantic boundaries for the stacked PRs",
+        );
+        screen.apply_ai_selection("openai/custom-planner".to_string(), "max".to_string());
+
+        let open_idx = AiSlot::ALL
+            .iter()
+            .position(|slot| *slot == AiSlot::SplitOpen)
+            .unwrap();
+        focus_ai_slot(&mut screen, open_idx);
+        assert_selected_slot_metadata(
+            &screen,
+            "Split · open",
+            "Drafts one stacked PR title + description",
+        );
+        screen.apply_ai_selection("openai/custom-writer".to_string(), "low".to_string());
+        screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::Save;
+
+        match screen.handle_ai_settings(key(KeyCode::Enter)) {
+            SettingsAction::SaveDashboard(cfg) => {
+                assert_eq!(cfg.ai.split.plan.model, "openai/custom-planner");
+                assert_eq!(cfg.ai.split.plan.thinking, "max");
+                assert_eq!(cfg.ai.split.open.model, "openai/custom-writer");
+                assert_eq!(cfg.ai.split.open.thinking, "low");
+            }
+            other => panic!("expected SaveDashboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clearing_one_split_role_normalizes_only_that_role() {
+        let mut ai = AiConfig::default();
+        let untouched = ai.split.open.clone();
+        ai.split.plan.model = "  ".to_string();
+        ai.split.plan.thinking = "high".to_string();
+        ai.split.plan.harness = AiHarness::Codex;
+
+        let normalized = normalize_ai(&ai);
+
+        assert_eq!(normalized.split.plan, AiModelConfig::default());
+        assert_eq!(normalized.split.open, untouched);
+    }
+
+    #[test]
     fn apply_ai_selection_targets_focused_slot() {
         let mut screen = ai_settings_screen(vec![]);
         focus_ai_slot(&mut screen, 6); // update
@@ -6892,7 +6972,7 @@ mod tests {
             .join("\n")
     }
 
-    /// At a terminal height too short for all ten slots, the focused (first)
+    /// At a terminal height too short for all slots, the focused (first)
     /// slot's model text must stay visible — this is the bug report: on a
     /// short terminal the top rectangle rendered with an empty interior
     /// because the layout let a `Length` constraint get silently squeezed.
@@ -6934,7 +7014,7 @@ mod tests {
     #[test]
     fn ai_settings_tall_terminal_shows_all_slots_unscrolled() {
         let screen = ai_settings_screen(vec![]);
-        let dump = render_dump(&screen, 100, 60);
+        let dump = render_dump(&screen, 100, 70);
         for slot in AiSlot::ALL {
             assert!(
                 dump.contains(slot.label()),
