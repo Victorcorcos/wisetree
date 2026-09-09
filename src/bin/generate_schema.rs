@@ -59,6 +59,13 @@ fn build_schema() -> Value {
                     "plan": ai_leaf("openai/gpt-5.6-sol", "high"),
                     "implement": ai_leaf("openai/gpt-5.6-terra", "medium")
                 }
+            },
+            "split": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "plan": ai_leaf("openai/gpt-5.6-sol", "high"),
+                    "open": ai_leaf("openai/gpt-5.6-luna", "low")
+                }
             }
         }
     });

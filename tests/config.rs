@@ -39,6 +39,70 @@ fn defaults_match_upstream() {
     assert_eq!(cfg.terminal_command, "");
     assert!(!cfg.delete_branch_with_worktree);
     assert_eq!(cfg.notifications, NotificationsConfig::default());
+    assert_eq!(cfg.dashboard.ai.split.plan.model, "openai/gpt-5.6-sol");
+    assert_eq!(cfg.dashboard.ai.split.plan.thinking, "high");
+    assert_eq!(cfg.dashboard.ai.split.open.model, "openai/gpt-5.6-luna");
+    assert_eq!(cfg.dashboard.ai.split.open.thinking, "low");
+}
+
+#[test]
+fn split_ai_roles_round_trip_independently() {
+    let raw = r#"{
+      "dashboard": { "ai": { "split": {
+        "plan": {
+          "model": "openai/planner", "thinking": "high", "harness": "codex"
+        },
+        "open": {
+          "model": "anthropic/writer", "thinking": "low", "harness": "claudeCode"
+        }
+      } } }
+    }"#;
+
+    let configured: WorktreeConfig = serde_json::from_str(raw).unwrap();
+    assert_eq!(configured.dashboard.ai.split.plan.model, "openai/planner");
+    assert_eq!(configured.dashboard.ai.split.plan.thinking, "high");
+    assert_eq!(configured.dashboard.ai.split.plan.harness, AiHarness::Codex);
+    assert_eq!(configured.dashboard.ai.split.open.model, "anthropic/writer");
+    assert_eq!(configured.dashboard.ai.split.open.thinking, "low");
+    assert_eq!(
+        configured.dashboard.ai.split.open.harness,
+        AiHarness::ClaudeCode
+    );
+
+    let serialized = serde_json::to_string(&configured).unwrap();
+    assert_eq!(
+        serde_json::from_str::<WorktreeConfig>(&serialized).unwrap(),
+        configured
+    );
+}
+
+#[test]
+fn legacy_flat_ai_seeds_both_split_roles() {
+    let configured: WorktreeConfig = serde_json::from_str(
+        r#"{ "dashboard": { "ai": {
+          "model": "legacy/model", "thinking": "max"
+        } } }"#,
+    )
+    .unwrap();
+
+    for role in [
+        &configured.dashboard.ai.split.plan,
+        &configured.dashboard.ai.split.open,
+    ] {
+        assert_eq!(role.model, "legacy/model");
+        assert_eq!(role.thinking, "max");
+        assert_eq!(role.harness, AiHarness::OpenCode);
+    }
+}
+
+#[test]
+fn split_ai_rejects_unknown_fields() {
+    for raw in [
+        r#"{ "dashboard": { "ai": { "split": { "bogus": {} } } } }"#,
+        r#"{ "dashboard": { "ai": { "split": { "plan": { "bogus": true } } } } }"#,
+    ] {
+        assert!(serde_json::from_str::<WorktreeConfig>(raw).is_err());
+    }
 }
 
 #[test]
@@ -361,6 +425,26 @@ fn incompatible_ai_harness_fails_loading_with_slot_and_choices() {
 }
 
 #[test]
+fn incompatible_split_harness_fails_loading_before_workflow() {
+    with_home(|_home| {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join(".wisetree.json"),
+            r#"{ "dashboard": { "ai": { "split": { "open": {
+              "model": "anthropic/claude", "harness": "codex"
+            } } } } }"#,
+        )
+        .unwrap();
+
+        let err = ConfigService::new().load(Some(project.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("dashboard.ai.split.open.harness"),
+            "{err}"
+        );
+    });
+}
+
+#[test]
 fn blank_model_cannot_select_a_non_opencode_harness() {
     with_home(|_home| {
         let project = tempfile::tempdir().unwrap();
@@ -406,6 +490,8 @@ fn checked_in_schema_covers_all_nested_ai_slots_and_harnesses() {
         &ai["properties"]["bugkill"]["properties"]["judge"],
         &ai["properties"]["develop"]["properties"]["plan"],
         &ai["properties"]["develop"]["properties"]["implement"],
+        &ai["properties"]["split"]["properties"]["plan"],
+        &ai["properties"]["split"]["properties"]["open"],
     ] {
         assert_eq!(slot["additionalProperties"], false);
         assert_eq!(

@@ -286,6 +286,20 @@ fn default_develop_implement_ai() -> AiModelConfig {
         harness: AiHarness::OpenCode,
     }
 }
+fn default_split_plan_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "openai/gpt-5.6-sol".to_string(),
+        thinking: "high".to_string(),
+        harness: AiHarness::OpenCode,
+    }
+}
+fn default_split_open_ai() -> AiModelConfig {
+    AiModelConfig {
+        model: "openai/gpt-5.6-luna".to_string(),
+        thinking: "low".to_string(),
+        harness: AiHarness::OpenCode,
+    }
+}
 
 /// Per-step models for the two-phase "Fix Pull Request" pipeline. `plan` judges
 /// and plans each review comment with a non-interactive `opencode run` (so it
@@ -431,6 +445,27 @@ impl Default for AiDevelopConfig {
     }
 }
 
+/// Per-role models for the "Split" pipeline. `plan` finds semantic boundaries
+/// for the stacked pull requests; `open` drafts one pull request's title and
+/// description after the stack has been created deterministically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiSplitConfig {
+    #[serde(default = "default_split_plan_ai")]
+    pub plan: AiModelConfig,
+    #[serde(default = "default_split_open_ai")]
+    pub open: AiModelConfig,
+}
+
+impl Default for AiSplitConfig {
+    fn default() -> Self {
+        Self {
+            plan: default_split_plan_ai(),
+            open: default_split_open_ai(),
+        }
+    }
+}
+
 /// Per-command AI model + thinking strength for the opencode-assisted flows.
 /// Each command (or sub-step) selects its own model so a planning step can use
 /// a stronger model than, say, the PR-drafting step. Persisted as a nested
@@ -453,6 +488,10 @@ impl Default for AiDevelopConfig {
 ///     "investigate": { "model": "openai/gpt-5.6-sol", "thinking": "medium" },
 ///     "fix": { "model": "openai/gpt-5.6-terra", "thinking": "high" },
 ///     "judge": { "model": "openai/gpt-5.6-terra", "thinking": "medium" }
+///   },
+///   "split": {
+///     "plan": { "model": "openai/gpt-5.6-sol", "thinking": "high" },
+///     "open": { "model": "openai/gpt-5.6-luna", "thinking": "low" }
 ///   }
 /// }
 /// ```
@@ -480,6 +519,8 @@ pub struct AiConfig {
     pub bugkill: AiBugkillConfig,
     /// Drives the "Develop" plan → implement pipeline.
     pub develop: AiDevelopConfig,
+    /// Drives semantic stack planning and per-PR prose drafting for "Split".
+    pub split: AiSplitConfig,
 }
 
 impl Default for AiConfig {
@@ -491,6 +532,7 @@ impl Default for AiConfig {
             update: default_update_ai(),
             bugkill: AiBugkillConfig::default(),
             develop: AiDevelopConfig::default(),
+            split: AiSplitConfig::default(),
         }
     }
 }
@@ -524,6 +566,8 @@ impl<'de> Deserialize<'de> for AiConfig {
             bugkill: Option<AiBugkillConfig>,
             #[serde(default)]
             develop: Option<AiDevelopConfig>,
+            #[serde(default)]
+            split: Option<AiSplitConfig>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -575,6 +619,13 @@ impl<'de> Deserialize<'de> for AiConfig {
                     implement: l.clone(),
                 },
                 None => AiDevelopConfig::default(),
+            }),
+            split: raw.split.unwrap_or_else(|| match &legacy {
+                Some(l) => AiSplitConfig {
+                    plan: l.clone(),
+                    open: l.clone(),
+                },
+                None => AiSplitConfig::default(),
             }),
         })
     }
@@ -819,6 +870,8 @@ impl WorktreeConfig {
                 "dashboard.ai.develop.implement",
                 &self.dashboard.ai.develop.implement,
             ),
+            ("dashboard.ai.split.plan", &self.dashboard.ai.split.plan),
+            ("dashboard.ai.split.open", &self.dashboard.ai.split.open),
         ];
 
         for (path, slot) in slots {
@@ -893,6 +946,8 @@ mod ai_config_tests {
             &ai.bugkill.judge,
             &ai.develop.plan,
             &ai.develop.implement,
+            &ai.split.plan,
+            &ai.split.open,
         ] {
             assert_eq!(leaf.model, "opencode/deepseek-v4-flash-free");
             assert_eq!(leaf.thinking, "max");
@@ -959,6 +1014,10 @@ mod ai_config_tests {
         assert_eq!(ai.develop.plan.thinking, "high");
         assert_eq!(ai.develop.implement.model, "openai/gpt-5.6-terra");
         assert_eq!(ai.develop.implement.thinking, "medium");
+        assert_eq!(ai.split.plan.model, "openai/gpt-5.6-sol");
+        assert_eq!(ai.split.plan.thinking, "high");
+        assert_eq!(ai.split.open.model, "openai/gpt-5.6-luna");
+        assert_eq!(ai.split.open.thinking, "low");
     }
 
     #[test]
@@ -993,6 +1052,8 @@ mod ai_config_tests {
             &ai.bugkill.judge,
             &ai.develop.plan,
             &ai.develop.implement,
+            &ai.split.plan,
+            &ai.split.open,
         ] {
             assert_eq!(leaf.model, "legacy/model");
             assert_eq!(leaf.thinking, "low");
@@ -1049,6 +1110,7 @@ mod ai_config_tests {
         assert!(serialized.contains("\"update\""));
         assert!(serialized.contains("\"bugkill\""));
         assert!(serialized.contains("\"develop\""));
+        assert!(serialized.contains("\"split\""));
         let reparsed: AiConfig = serde_json::from_str(&serialized).unwrap();
         assert_eq!(ai, reparsed);
     }

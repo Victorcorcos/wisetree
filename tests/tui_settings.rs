@@ -201,6 +201,16 @@ fn ready_with_link_settings(
     SettingsScreen::new(cfg, "/tmp/.wisetree.json".into())
 }
 
+fn enter_ai_settings(s: &mut SettingsScreen) {
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), SettingsStep::Dashboard);
+    assert_eq!(
+        s.handle_key(key(KeyCode::Enter)),
+        SettingsAction::FetchFreeModels
+    );
+    assert_eq!(s.step(), SettingsStep::AiSettings);
+}
+
 // Menu order: Dashboard(0), Notifications(1), Copy Patterns(2),
 // Ignore Patterns(3), Link Patterns(4), Link Strategy(5), Link Cache Dir(6),
 // Post-Create Commands(7), Terminal Command(8), Path Template(9),
@@ -230,6 +240,62 @@ fn menu_renders_with_config_path() {
     assert!(dumped.contains("Copy Settings"));
     assert!(dumped.contains("Check for Updates"));
     assert!(dumped.contains("Dashboard"));
+}
+
+#[test]
+fn split_ai_roles_are_separate_scrollable_settings_entries() {
+    let mut s = ready();
+    enter_ai_settings(&mut s);
+
+    for _ in 0..12 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    let plan = dump(110, 25, |f| s.render(f, f.area()));
+    assert!(plan.contains("split_plan"), "{plan}");
+    assert!(
+        plan.contains("Plans semantic boundaries for the stacked PRs"),
+        "{plan}"
+    );
+    assert!(plan.contains("above"), "{plan}");
+
+    s.handle_key(key(KeyCode::Down));
+    let open = dump(110, 25, |f| s.render(f, f.area()));
+    assert!(open.contains("split_open"), "{open}");
+    assert!(
+        open.contains("Drafts one stacked PR title + description"),
+        "{open}"
+    );
+}
+
+#[test]
+fn split_ai_roles_save_and_reopen_independently() {
+    let mut s = ready();
+    enter_ai_settings(&mut s);
+    for _ in 0..12 {
+        s.handle_key(key(KeyCode::Down));
+    }
+
+    s.apply_ai_selection("openai/split-planner".into(), "high".into());
+    s.handle_key(key(KeyCode::Down));
+    s.apply_ai_selection("openai/split-writer".into(), "low".into());
+    s.handle_key(key(KeyCode::Tab));
+    let saved = match s.handle_key(key(KeyCode::Enter)) {
+        SettingsAction::SaveDashboard(config) => *config,
+        other => panic!("expected SaveDashboard, got {other:?}"),
+    };
+    assert_eq!(saved.ai.split.plan.model, "openai/split-planner");
+    assert_eq!(saved.ai.split.open.model, "openai/split-writer");
+
+    s.mark_dashboard_saved(saved);
+    enter_ai_settings(&mut s);
+    for _ in 0..12 {
+        s.handle_key(key(KeyCode::Down));
+    }
+    let reopened_plan = dump(110, 25, |f| s.render(f, f.area()));
+    assert!(reopened_plan.contains("openai/split-planner"));
+    s.handle_key(key(KeyCode::Down));
+    let reopened_open = dump(110, 25, |f| s.render(f, f.area()));
+    assert!(reopened_open.contains("openai/split-writer"));
 }
 
 #[test]
