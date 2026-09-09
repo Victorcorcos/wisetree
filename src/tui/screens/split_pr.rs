@@ -1,0 +1,455 @@
+//! Mutation-free entry screen for the Split pull-request command.
+
+use std::cell::Cell;
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Frame;
+
+use crate::config::schema::{AiModelConfig, AiSplitConfig};
+use crate::messages::colors;
+use crate::tui::screens::dashboard::SplitRequest;
+use crate::tui::widgets::{
+    spinner_frame, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+};
+
+const DEFAULT_MAX: &str = "1000";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitStep {
+    Confirm,
+    Preflight,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitAction {
+    Continue,
+    Cancelled,
+    Confirmed(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitFocus {
+    Max,
+    Buttons,
+}
+
+pub struct SplitPullRequestScreen {
+    request: SplitRequest,
+    ai: AiSplitConfig,
+    step: SplitStep,
+    max_input: String,
+    confirmed_max: Option<u64>,
+    focus: SplitFocus,
+    confirm: ConfirmationModal,
+    error: Option<String>,
+    scroll: u16,
+    max_scroll: Cell<u16>,
+    max_rect: Cell<Rect>,
+    pub tick: usize,
+}
+
+impl SplitPullRequestScreen {
+    pub fn new(request: SplitRequest, ai: AiSplitConfig) -> Self {
+        Self {
+            request,
+            ai,
+            step: SplitStep::Confirm,
+            max_input: DEFAULT_MAX.to_string(),
+            confirmed_max: None,
+            focus: SplitFocus::Max,
+            confirm: ConfirmationModal::new()
+                .with_title("Start Split preflight?")
+                .with_subtitle(
+                    "No branches, worktrees, commits, AI sessions, pushes, or pull requests are created before confirmation.",
+                )
+                .with_confirm_text("Confirm")
+                .with_cancel_text("Cancel")
+                .with_color_value(colors::SPLIT)
+                .with_selected(ConfirmationChoice::Cancel),
+            error: None,
+            scroll: 0,
+            max_scroll: Cell::new(0),
+            max_rect: Cell::new(Rect::default()),
+            tick: 0,
+        }
+    }
+
+    pub fn request(&self) -> &SplitRequest {
+        &self.request
+    }
+
+    pub fn step(&self) -> SplitStep {
+        self.step
+    }
+
+    pub fn max_input(&self) -> &str {
+        &self.max_input
+    }
+
+    pub fn set_max_input(&mut self, value: impl Into<String>) {
+        self.max_input = value.into();
+        self.error = None;
+    }
+
+    pub fn confirmed_max(&self) -> Option<u64> {
+        self.confirmed_max
+    }
+
+    /// Section 3 owns the live git/GitHub checks. This transition marks the
+    /// exact boundary where that preflight begins without mutating anything.
+    pub fn start_preflight(&mut self, max: u64) {
+        self.confirmed_max = Some(max);
+        self.step = SplitStep::Preflight;
+        self.error = None;
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> SplitAction {
+        if self.step != SplitStep::Confirm {
+            return SplitAction::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => return SplitAction::Cancelled,
+            KeyCode::PageUp => {
+                self.scroll = self.scroll.saturating_sub(5);
+                return SplitAction::Continue;
+            }
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_add(5).min(self.max_scroll.get());
+                return SplitAction::Continue;
+            }
+            KeyCode::Home => {
+                self.scroll = 0;
+                return SplitAction::Continue;
+            }
+            KeyCode::End => {
+                self.scroll = self.max_scroll.get();
+                return SplitAction::Continue;
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
+                self.focus = match self.focus {
+                    SplitFocus::Max => SplitFocus::Buttons,
+                    SplitFocus::Buttons => SplitFocus::Max,
+                };
+                return SplitAction::Continue;
+            }
+            _ => {}
+        }
+
+        if self.focus == SplitFocus::Max {
+            match key.code {
+                KeyCode::Char(character) => {
+                    self.max_input.push(character);
+                    self.error = None;
+                }
+                KeyCode::Backspace | KeyCode::Delete => {
+                    self.max_input.pop();
+                    self.error = None;
+                }
+                KeyCode::Enter => self.focus = SplitFocus::Buttons,
+                _ => {}
+            }
+            return SplitAction::Continue;
+        }
+
+        let outcome = self.confirm.handle_key(key);
+        self.apply_confirmation(outcome)
+    }
+
+    pub fn handle_mouse_click(&mut self, position: Position) -> SplitAction {
+        if self.step != SplitStep::Confirm {
+            return SplitAction::Continue;
+        }
+        if contains(self.max_rect.get(), position) {
+            self.focus = SplitFocus::Max;
+            return SplitAction::Continue;
+        }
+        let outcome = self.confirm.handle_mouse_click(position);
+        if outcome != ConfirmationOutcome::Pending {
+            self.focus = SplitFocus::Buttons;
+        }
+        self.apply_confirmation(outcome)
+    }
+
+    pub fn handle_mouse_scroll_up(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    pub fn handle_mouse_scroll_down(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_add(lines).min(self.max_scroll.get());
+    }
+
+    fn apply_confirmation(&mut self, outcome: ConfirmationOutcome) -> SplitAction {
+        match outcome {
+            ConfirmationOutcome::Confirmed => match self.validate() {
+                Ok(max) => SplitAction::Confirmed(max),
+                Err(message) => {
+                    self.error = Some(message);
+                    SplitAction::Continue
+                }
+            },
+            ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
+                SplitAction::Cancelled
+            }
+            ConfirmationOutcome::Pending => SplitAction::Continue,
+        }
+    }
+
+    fn validate(&self) -> Result<u64, String> {
+        let max = self
+            .max_input
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "MAX must be a positive integer that fits in 64 bits.".to_string())?;
+        let missing = [
+            ("dashboard.ai.split.plan", &self.ai.plan),
+            ("dashboard.ai.split.open", &self.ai.open),
+        ]
+        .into_iter()
+        .filter_map(|(name, config)| config.model.trim().is_empty().then_some(name))
+        .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(max)
+        } else {
+            Err(format!(
+                "Configure {} in .wisetree.json before starting Split.",
+                missing.join(" and ")
+            ))
+        }
+    }
+
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        match self.step {
+            SplitStep::Confirm => self.render_confirm(frame, area),
+            SplitStep::Preflight => frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        spinner_frame(self.tick).to_string(),
+                        Style::default().fg(colors::SPLIT),
+                    ),
+                    Span::raw(" Revalidating the worktree, base, diff, and source pull request..."),
+                ])),
+                area,
+            ),
+        }
+    }
+
+    fn render_confirm(&self, frame: &mut Frame, area: Rect) {
+        let modal_height = 12.min(area.height.saturating_sub(1));
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(modal_height)])
+            .split(area);
+        let width = chunks[0].width.saturating_sub(2).max(1) as usize;
+        let lines = self.confirm_lines(width);
+        let max_scroll = (lines.len() as u16).saturating_sub(chunks[0].height);
+        self.max_scroll.set(max_scroll);
+        let scroll = self.scroll.min(max_scroll);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), chunks[0]);
+
+        let visible_max_line = self.max_line_index(width) as u16;
+        self.max_rect.set(
+            if visible_max_line >= scroll
+                && visible_max_line < scroll.saturating_add(chunks[0].height)
+            {
+                Rect::new(
+                    chunks[0].x,
+                    chunks[0].y + visible_max_line - scroll,
+                    chunks[0].width,
+                    1,
+                )
+            } else {
+                Rect::default()
+            },
+        );
+        self.confirm.render(frame, chunks[1]);
+    }
+
+    fn confirm_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "Split this branch into stacked pull requests?",
+            Style::default()
+                .fg(colors::SPLIT)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+        push_wrapped(
+            &mut lines,
+            &format!("Branch: {}", self.request.branch),
+            width,
+        );
+        push_wrapped(
+            &mut lines,
+            &format!("Worktree: {}", self.request.worktree_path),
+            width,
+        );
+        push_wrapped(
+            &mut lines,
+            &format!(
+                "Base context: {}{}",
+                self.request.base_ref.as_deref().unwrap_or("(not resolved)"),
+                self.request
+                    .pr_base_ref
+                    .as_deref()
+                    .map(|base| format!(" (GitHub base: {base})"))
+                    .unwrap_or_default()
+            ),
+            width,
+        );
+        let top_pr = match (
+            self.request.number,
+            self.request.title.as_deref(),
+            self.request.url.as_deref(),
+        ) {
+            (Some(number), title, url) => format!(
+                "Top PR: reuse #{}{}{}",
+                number,
+                title.map(|value| format!(" — {value}")).unwrap_or_default(),
+                url.map(|value| format!(" ({value})")).unwrap_or_default()
+            ),
+            _ => "Top PR: create a new top pull request for this branch".to_string(),
+        };
+        push_wrapped(&mut lines, &top_pr, width);
+        lines.push(Line::default());
+        lines.push(section_line("Complete sequence before mutation"));
+        for (index, step) in [
+            "Deterministically revalidate the live worktree, base, committed diff, and source PR.",
+            "Ask the planning AI for an SRP plan organized by semantic responsibility.",
+            "Show the plan in an Approve/Reject loop; rejection feedback regenerates one proposal.",
+            "Materialize the approved stack as local branches and worktrees.",
+            "Verify every parent-to-child diff against MAX and check stack integrity.",
+            "Publish the stack with `gh stack link`, reusing the active source PR as the top PR when present.",
+            "Run the drafting AI concurrently once for each resulting pull request.",
+            "Compose titles, Split Plan links, descriptions, and suffixes deterministically.",
+            "Apply the final PR metadata and report every branch, worktree, and pull request.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            push_wrapped(&mut lines, &format!("{}. {step}", index + 1), width);
+        }
+        lines.push(Line::default());
+        lines.push(section_line("AI roles"));
+        push_ai_role(
+            &mut lines,
+            "plan",
+            &self.ai.plan,
+            "once per proposal",
+            width,
+        );
+        push_ai_role(
+            &mut lines,
+            "open",
+            &self.ai.open,
+            "once per resulting PR (concurrently)",
+            width,
+        );
+        lines.push(Line::default());
+        lines.push(section_line("Review-size limit"));
+        push_wrapped(
+            &mut lines,
+            "MAX is additions plus deletions, including tests, in each parent-to-child pull-request diff.",
+            width,
+        );
+        let max_style = if self.focus == SplitFocus::Max {
+            Style::default()
+                .fg(colors::SPLIT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(colors::EMPHASIS)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("MAX: {}", self.max_input),
+            max_style,
+        )));
+        if let Some(error) = &self.error {
+            push_wrapped_styled(&mut lines, error, width, Style::default().fg(colors::ERROR));
+        }
+        lines.push(Line::from(Span::styled(
+            "Tab/↑/↓ focus · PgUp/PgDn scroll · Esc cancel",
+            Style::default()
+                .fg(colors::MUTED)
+                .add_modifier(Modifier::DIM),
+        )));
+        lines
+    }
+
+    fn max_line_index(&self, width: usize) -> usize {
+        self.confirm_lines(width)
+            .iter()
+            .position(|line| line.to_string().starts_with("MAX:"))
+            .unwrap_or(0)
+    }
+}
+
+fn section_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(colors::SPLIT)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn push_ai_role(
+    lines: &mut Vec<Line<'static>>,
+    role: &str,
+    config: &AiModelConfig,
+    frequency: &str,
+    width: usize,
+) {
+    let model = if config.model.trim().is_empty() {
+        "(not configured)"
+    } else {
+        config.model.trim()
+    };
+    let thinking = if config.thinking.trim().is_empty() {
+        "default"
+    } else {
+        config.thinking.trim()
+    };
+    push_wrapped(
+        lines,
+        &format!(
+            "{role}: {model} · {thinking} thinking · {} · {frequency}",
+            config.harness.display_name()
+        ),
+        width,
+    );
+}
+
+fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
+    push_wrapped_styled(lines, text, width, Style::default().fg(colors::EMPHASIS));
+}
+
+fn push_wrapped_styled(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    let width = width.max(1);
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(Line::from(Span::styled(current, style)));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(Span::styled(current, style)));
+    }
+}
+
+fn contains(area: Rect, position: Position) -> bool {
+    position.x >= area.left()
+        && position.x < area.right()
+        && position.y >= area.top()
+        && position.y < area.bottom()
+}
