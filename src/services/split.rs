@@ -13,6 +13,7 @@ use crate::errors::{Result, WisetreeError};
 
 pub const SPLIT_DIRECTORY: &str = ".wisetree";
 pub const SPLIT_PLAN_FILE: &str = ".wisetree/split_plan.md";
+const MATERIALIZATION_MARKER: &str = "<!-- wisetree-split-materialization ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitPreflightRequest {
@@ -104,6 +105,163 @@ pub struct SplitRepositorySnapshot {
 pub struct SplitPlanResult {
     pub plan: SplitPlan,
     pub snapshot: SplitRepositorySnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitMaterializedLayer {
+    pub order: usize,
+    pub responsibility: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub parent_branch: String,
+    pub parent_sha: String,
+    pub commit_sha: String,
+    pub tree_sha: String,
+    pub units: Vec<String>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub ready_for_publication: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitMaterialization {
+    pub source_branch: String,
+    pub source_head: String,
+    pub base_sha: String,
+    pub layers: Vec<SplitMaterializedLayer>,
+}
+
+pub fn split_branch_name(source: &str, order: usize, slug: &str) -> String {
+    format!("{source}.{order}_{slug}")
+}
+
+/// Select complete atomic changes and individual zero-context hunks from the
+/// frozen base-to-source diff. IDs are assigned with the same traversal used
+/// by [`inventory_diff`], so the AI never handles patch text.
+pub fn patch_for_units(diff: &str, selected: &BTreeSet<String>) -> Result<String> {
+    let mut output = String::new();
+    let mut next_id = 1usize;
+    let mut found = BTreeSet::new();
+    for raw_block in diff.split("diff --git ").skip(1) {
+        let block = format!("diff --git {raw_block}");
+        let hunk_offsets = block
+            .match_indices("\n@@ ")
+            .map(|(offset, _)| offset + 1)
+            .collect::<Vec<_>>();
+        let atomic = block.lines().any(|line| {
+            line.starts_with("Binary files ")
+                || line == "GIT binary patch"
+                || line.starts_with("rename from ")
+                || line.starts_with("old mode ")
+                || line.starts_with("new mode ")
+        }) || hunk_offsets.is_empty();
+        if atomic {
+            let id = format!("CU{next_id:04}");
+            next_id += 1;
+            if selected.contains(&id) {
+                output.push_str(&block);
+                if !block.ends_with('\n') {
+                    output.push('\n');
+                }
+                found.insert(id);
+            }
+            continue;
+        }
+
+        let header_end = hunk_offsets[0];
+        let mut chosen = Vec::new();
+        for (index, start) in hunk_offsets.iter().copied().enumerate() {
+            let end = hunk_offsets.get(index + 1).copied().unwrap_or(block.len());
+            let id = format!("CU{next_id:04}");
+            next_id += 1;
+            if selected.contains(&id) {
+                chosen.push(&block[start..end]);
+                found.insert(id);
+            }
+        }
+        if !chosen.is_empty() {
+            output.push_str(&block[..header_end]);
+            for hunk in chosen {
+                output.push_str(hunk);
+            }
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+    }
+    if &found != selected {
+        let missing = selected.difference(&found).cloned().collect::<Vec<_>>();
+        return Err(WisetreeError::validation(format!(
+            "Split could not reconstruct selected change units: {}.",
+            missing.join(", ")
+        )));
+    }
+    Ok(output)
+}
+
+/// Ignore object hashes and line offsets when comparing a selected source
+/// patch with Git's parent-to-child rendering after earlier layers shifted
+/// line numbers. All paths, metadata, and changed bytes remain significant.
+pub fn normalized_patch(patch: &str) -> String {
+    let normalized = patch
+        .lines()
+        .filter(|line| !line.starts_with("index "))
+        .map(|line| {
+            if line.starts_with("@@ ") {
+                "@@".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalized.trim_end().to_string()
+}
+
+pub fn parse_materialization(document: &str) -> Result<Option<SplitMaterialization>> {
+    let Some(start) = document.find(MATERIALIZATION_MARKER) else {
+        return Ok(None);
+    };
+    let json_start = start + MATERIALIZATION_MARKER.len();
+    let json_end = document[json_start..]
+        .find(" -->")
+        .map(|offset| json_start + offset)
+        .ok_or_else(|| WisetreeError::validation("Split materialization record is truncated."))?;
+    serde_json::from_str(&document[json_start..json_end])
+        .map(Some)
+        .map_err(Into::into)
+}
+
+pub fn render_materialization(materialization: &SplitMaterialization) -> Result<String> {
+    let mut output = String::from(
+        "\n## Materialized stack (bottom to top)\n\n| Layer | Responsibility | Parent | Parent commit | Branch | Worktree | Commit | Tree | + | - | Ready |\n| ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |\n",
+    );
+    for layer in &materialization.layers {
+        output.push_str(&format!(
+            "| {} | {} | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | {} | {} | {} |\n",
+            layer.order,
+            layer.responsibility,
+            layer.parent_branch,
+            layer.parent_sha,
+            layer.branch,
+            layer.worktree_path,
+            layer.commit_sha,
+            layer.tree_sha,
+            layer.additions,
+            layer.deletions,
+            if layer.ready_for_publication {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+        output.push_str(&format!("\nAssigned units: {}\n", layer.units.join(", ")));
+    }
+    output.push_str(&format!(
+        "\n{MATERIALIZATION_MARKER}{} -->\n",
+        serde_json::to_string(materialization)?
+    ));
+    Ok(output)
 }
 
 pub fn inventory_diff(diff: &str) -> Result<Vec<ChangeUnit>> {

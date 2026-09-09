@@ -4,6 +4,10 @@
 //! (`create_worktree`, `delete_worktree`, `delete_branch`) land in Section 6.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 use crate::errors::{handle_git_error, Result, WisetreeError};
 use crate::git::exec::{
@@ -297,6 +301,127 @@ impl GitService {
         )
         .await;
         result.success
+    }
+
+    pub async fn validate_branch_name(&self, branch_name: &str) -> Result<()> {
+        let result = execute_git_command(
+            &["check-ref-format", "--branch", branch_name],
+            Some(&self.git_root),
+        )
+        .await;
+        if result.success {
+            Ok(())
+        } else {
+            Err(WisetreeError::validation(format!(
+                "Invalid Split branch name `{branch_name}`: {}",
+                result.stderr
+            )))
+        }
+    }
+
+    pub async fn resolve_at(&self, cwd: &Path, revision: &str) -> Result<String> {
+        let result = execute_git_command(&["rev-parse", revision], Some(cwd)).await;
+        if result.success {
+            Ok(result.stdout)
+        } else {
+            Err(handle_git_error(&result.stderr, "resolve revision"))
+        }
+    }
+
+    pub async fn diff_at(&self, cwd: &Path, range: &str) -> Result<String> {
+        let result = execute_git_command(
+            &[
+                "diff",
+                "--binary",
+                "--full-index",
+                "--find-renames",
+                "--unified=0",
+                "--no-color",
+                "--no-ext-diff",
+                range,
+            ],
+            Some(cwd),
+        )
+        .await;
+        if result.success {
+            Ok(result.stdout)
+        } else {
+            Err(handle_git_error(&result.stderr, "read Split diff"))
+        }
+    }
+
+    pub async fn numstat_at(&self, cwd: &Path, range: &str) -> Result<String> {
+        let result = execute_git_command(
+            &["diff", "--numstat", "-z", "--find-renames", range],
+            Some(cwd),
+        )
+        .await;
+        if result.success {
+            Ok(result.stdout)
+        } else {
+            Err(handle_git_error(&result.stderr, "read Split line counts"))
+        }
+    }
+
+    pub async fn apply_patch_to_index(&self, cwd: &Path, patch: &str) -> Result<()> {
+        let mut command = Command::new("git");
+        command
+            .args(["apply", "--index", "--binary", "--unidiff-zero", "-"])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(WisetreeError::from)?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| WisetreeError::other("could not open git apply stdin"))?
+            .write_all(patch.as_bytes())
+            .await?;
+        let output = child.wait_with_output().await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(WisetreeError::validation(format!(
+                "git apply rejected the selected hunks: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    pub async fn staged_paths(&self, cwd: &Path) -> Result<Vec<String>> {
+        let result = execute_git_command(
+            &["diff", "--cached", "--name-only", "-z", "--find-renames"],
+            Some(cwd),
+        )
+        .await;
+        if !result.success {
+            return Err(handle_git_error(&result.stderr, "list staged paths"));
+        }
+        Ok(result
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    pub async fn commit_split_layer(&self, cwd: &Path, subject: &str) -> Result<String> {
+        let result = execute_git_command(&["commit", "-m", subject], Some(cwd)).await;
+        if !result.success {
+            return Err(handle_git_error(&result.stderr, "commit Split layer"));
+        }
+        self.resolve_at(cwd, "HEAD").await
+    }
+
+    pub async fn is_ancestor(&self, cwd: &Path, ancestor: &str, descendant: &str) -> bool {
+        execute_git_command(
+            &["merge-base", "--is-ancestor", ancestor, descendant],
+            Some(cwd),
+        )
+        .await
+        .success
     }
 
     pub async fn worktree_exists(&self, worktree_path: &str) -> Result<bool> {

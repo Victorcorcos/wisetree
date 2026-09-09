@@ -24,6 +24,7 @@ use crate::errors::{handle_git_error, Result, WisetreeError};
 use crate::files::{strip_ansi, ActivityKind};
 use crate::git::exec::execute_git_command;
 use crate::git::lock::{git_lock_path, retry_on_git_lock};
+use crate::git::types::WorktreeCreateOptions;
 use crate::git::types::{BranchStatus, GitWorktree};
 use crate::services::ai_status::{AiStatusIndex, AiStatusPaths, AiStatusReport, AiStatusService};
 use crate::services::bugkill::{
@@ -47,12 +48,14 @@ use crate::services::reviewer_tests::{
 };
 use crate::services::split::{
     build_corrective_plan_prompt, build_plan_prompt as build_split_plan_prompt,
-    describe_snapshot_changes, inventory_diff, parse_numstat_totals, render_split_plan,
-    validate_manifest as validate_split_manifest, SplitIdentity, SplitPlan, SplitPlanResult,
-    SplitPreflight, SplitPreflightRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY,
-    SPLIT_PLAN_FILE,
+    describe_snapshot_changes, inventory_diff, normalized_patch, parse_materialization,
+    parse_numstat_totals, patch_for_units, render_materialization, render_split_plan,
+    split_branch_name, validate_manifest as validate_split_manifest, SplitIdentity,
+    SplitMaterialization, SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight,
+    SplitPreflightRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY, SPLIT_PLAN_FILE,
 };
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
+use crate::worktree::WorktreeService;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// `gh api graphql` may include the network round-trip — give it more headroom
@@ -5976,7 +5979,481 @@ impl DashboardService {
                 changes.join(", ")
             )));
         }
-        self.save_split_plan(preflight, plan, "approved").await
+        let plan_path = Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE);
+        let existing = tokio::fs::read_to_string(&plan_path)
+            .await
+            .unwrap_or_default();
+        if parse_materialization(&existing)?.is_none() {
+            self.save_split_plan(preflight, plan, "approved").await?;
+        }
+        self.materialize_split_stack(preflight, plan).await
+    }
+
+    /// Build and verify the local lower layers. The selected source worktree
+    /// is used only for immutable reads and for the durable progress record.
+    pub async fn materialize_split_stack(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+    ) -> Result<()> {
+        crate::services::split::parse_split_plan(&serde_json::to_string(plan)?, preflight)?;
+        let source = PathBuf::from(&preflight.worktree_path);
+        self.verify_split_source(preflight, &source).await?;
+        let source_status = self.split_source_status(&source).await?;
+        let range = format!(
+            "{}..{}",
+            preflight.identity.base_sha, preflight.identity.source_head
+        );
+        let frozen_diff = run_command(
+            &self.git_binary,
+            &[
+                "diff",
+                "--binary",
+                "--full-index",
+                "--find-renames",
+                "--unified=0",
+                "--no-color",
+                "--no-ext-diff",
+                &range,
+            ],
+            Some(&source),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        if inventory_diff(&frozen_diff)? != preflight.units {
+            return Err(WisetreeError::validation(
+                "Split source diff no longer matches the approved change-unit inventory.",
+            ));
+        }
+
+        let plan_path = source.join(SPLIT_PLAN_FILE);
+        let document = tokio::fs::read_to_string(&plan_path)
+            .await
+            .unwrap_or_default();
+        let mut materialization =
+            parse_materialization(&document)?.unwrap_or_else(|| SplitMaterialization {
+                source_branch: preflight.identity.source_branch.clone(),
+                source_head: preflight.identity.source_head.clone(),
+                base_sha: preflight.identity.base_sha.clone(),
+                layers: Vec::new(),
+            });
+        if materialization.source_branch != preflight.identity.source_branch
+            || materialization.source_head != preflight.identity.source_head
+            || materialization.base_sha != preflight.identity.base_sha
+        {
+            return Err(WisetreeError::validation(
+                "Existing Split artifacts belong to a different source identity.",
+            ));
+        }
+
+        let mut worktrees = WorktreeService::new(Some(source.clone()));
+        worktrees.initialize().await?;
+        let git = worktrees.git_service();
+        let mut parent_branch = preflight.identity.base_ref.clone();
+        let mut parent_sha = preflight.identity.base_sha.clone();
+        let lower_count = plan.responsibilities.len() - 1;
+
+        for responsibility in plan.responsibilities.iter().take(lower_count) {
+            let order = responsibility.order;
+            let branch = split_branch_name(
+                &preflight.identity.source_branch,
+                order,
+                &responsibility.branch_slug,
+            );
+            git.validate_branch_name(&branch).await.map_err(|error| {
+                WisetreeError::validation(format!("Split layer {order}: {error}"))
+            })?;
+            let name = branch.replace('/', "-");
+            let path = worktrees
+                .split_worktree_path(&name, &branch, &parent_branch)
+                .await?;
+            let path_string = path.to_string_lossy().into_owned();
+            let selected = responsibility
+                .units
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let expected_patch = patch_for_units(&frozen_diff, &selected)?;
+
+            if let Some(recorded) = materialization.layers.get(order - 1) {
+                self.verify_recorded_split_layer(
+                    git,
+                    recorded,
+                    responsibility,
+                    &branch,
+                    &path_string,
+                    &parent_branch,
+                    &parent_sha,
+                    &expected_patch,
+                    preflight.identity.max,
+                )
+                .await
+                .map_err(|error| {
+                    WisetreeError::validation(format!("Split layer {order}: {error}"))
+                })?;
+                parent_branch = branch;
+                parent_sha = recorded.commit_sha.clone();
+                continue;
+            }
+            if materialization.layers.len() != order - 1 {
+                return Err(WisetreeError::validation(format!(
+                    "Split layer {order}: persisted layers are not consecutive."
+                )));
+            }
+            if git.branch_exists(&branch).await || git.worktree_exists(&path_string).await? {
+                return Err(WisetreeError::validation(format!(
+                    "Split layer {order}: branch `{branch}` or worktree `{path_string}` collides with an unrecorded artifact."
+                )));
+            }
+
+            let options = WorktreeCreateOptions {
+                name,
+                source_branch: parent_branch.clone(),
+                new_branch: branch.clone(),
+                base_path: String::new(),
+            };
+            let outcome = match worktrees.create_split_worktree(&options).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if git.worktree_exists(&path_string).await.unwrap_or(false) {
+                        let _ = worktrees.delete_worktree(&path_string, true).await;
+                        let _ = git.delete_branch(&branch, true).await;
+                    }
+                    return Err(WisetreeError::validation(format!(
+                        "Split layer {order}: {error}"
+                    )));
+                }
+            };
+            let allowed_paths = preflight
+                .units
+                .iter()
+                .filter(|unit| selected.contains(&unit.id))
+                .flat_map(|unit| [Some(unit.path.clone()), unit.old_path.clone()])
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            let layer_result = Self::materialize_new_split_layer(
+                git,
+                responsibility,
+                &outcome.worktree_path,
+                &parent_sha,
+                &expected_patch,
+                &allowed_paths,
+                preflight.identity.max,
+            )
+            .await;
+            let (commit_sha, tree_sha, additions, deletions) = match layer_result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = worktrees.delete_worktree(&path_string, true).await;
+                    let _ = git.delete_branch(&branch, true).await;
+                    return Err(WisetreeError::validation(format!(
+                        "Split layer {order} could not be materialized; revise the approved plan: {error}"
+                    )));
+                }
+            };
+            materialization.layers.push(SplitMaterializedLayer {
+                order,
+                responsibility: responsibility.name.clone(),
+                branch: branch.clone(),
+                worktree_path: path_string,
+                parent_branch: parent_branch.clone(),
+                parent_sha: parent_sha.clone(),
+                commit_sha: commit_sha.clone(),
+                tree_sha,
+                units: responsibility.units.clone(),
+                additions,
+                deletions,
+                ready_for_publication: true,
+            });
+            self.save_split_materialization(preflight, plan, &materialization)
+                .await?;
+            parent_branch = branch;
+            parent_sha = commit_sha;
+        }
+
+        let top = plan.responsibilities.last().expect("validated Split plan");
+        let top_units = top.units.iter().cloned().collect::<BTreeSet<_>>();
+        let expected_top = patch_for_units(&frozen_diff, &top_units)?;
+        let actual_top = git
+            .diff_at(
+                &source,
+                &format!("{}..{}", parent_sha, preflight.identity.source_head),
+            )
+            .await?;
+        if normalized_patch(&actual_top) != normalized_patch(&expected_top) {
+            return Err(WisetreeError::validation(format!(
+                "Split top layer {} does not represent exactly its assigned units; revise the plan.",
+                top.order
+            )));
+        }
+        let (top_additions, top_deletions) = parse_numstat_totals(
+            &git.numstat_at(
+                &source,
+                &format!("{parent_sha}..{}", preflight.identity.source_head),
+            )
+            .await?,
+        );
+        if top_additions.saturating_add(top_deletions) > preflight.identity.max {
+            return Err(WisetreeError::validation(format!(
+                "Split top layer {} is {} changed lines (+{top_additions} -{top_deletions}), exceeding MAX {}.",
+                top.order,
+                top_additions + top_deletions,
+                preflight.identity.max
+            )));
+        }
+        self.verify_split_source(preflight, &source).await?;
+        if self.split_source_status(&source).await? != source_status {
+            return Err(WisetreeError::validation(
+                "Split stopped because the selected source worktree or index changed during materialization.",
+            ));
+        }
+        let top_record = SplitMaterializedLayer {
+            order: top.order,
+            responsibility: top.name.clone(),
+            branch: preflight.identity.source_branch.clone(),
+            worktree_path: preflight.worktree_path.clone(),
+            parent_branch,
+            parent_sha,
+            commit_sha: preflight.identity.source_head.clone(),
+            tree_sha: git
+                .resolve_at(
+                    &source,
+                    &format!("{}^{{tree}}", preflight.identity.source_head),
+                )
+                .await?,
+            units: top.units.clone(),
+            additions: top_additions,
+            deletions: top_deletions,
+            ready_for_publication: true,
+        };
+        match materialization.layers.get(lower_count) {
+            Some(recorded) if recorded == &top_record => {}
+            Some(_) => {
+                return Err(WisetreeError::validation(format!(
+                    "Split top layer {} recorded identity no longer matches.",
+                    top.order
+                )));
+            }
+            None => materialization.layers.push(top_record),
+        }
+        self.save_split_materialization(preflight, plan, &materialization)
+            .await
+    }
+
+    async fn materialize_new_split_layer(
+        git: &crate::git::service::GitService,
+        responsibility: &crate::services::split::SplitResponsibility,
+        path: &Path,
+        parent_sha: &str,
+        expected_patch: &str,
+        allowed_paths: &BTreeSet<String>,
+        max: u64,
+    ) -> Result<(String, String, u64, u64)> {
+        if git.resolve_at(path, "HEAD").await? != parent_sha {
+            return Err(WisetreeError::validation(
+                "created worktree has the wrong parent",
+            ));
+        }
+        if !git.staged_paths(path).await?.is_empty() {
+            return Err(WisetreeError::validation(
+                "copy/link setup unexpectedly staged files",
+            ));
+        }
+        git.apply_patch_to_index(path, expected_patch).await?;
+        let staged = git.staged_paths(path).await?;
+        if staged.is_empty() {
+            return Err(WisetreeError::validation("selected units staged no files"));
+        }
+        // Every staged path must occur in the deterministic patch. This also
+        // excludes copied files, caches, the plan, and unrelated pre-existing files.
+        if staged
+            .iter()
+            .any(|staged_path| !allowed_paths.contains(staged_path))
+        {
+            return Err(WisetreeError::validation(format!(
+                "unexpected staged files: {}",
+                staged.join(", ")
+            )));
+        }
+        let subject = format!("split: {}", responsibility.name);
+        let commit_sha = git.commit_split_layer(path, &subject).await?;
+        let tree_sha = git
+            .resolve_at(path, &format!("{commit_sha}^{{tree}}"))
+            .await?;
+        if !git.is_ancestor(path, parent_sha, &commit_sha).await
+            || git.resolve_at(path, &format!("{commit_sha}^")).await? != parent_sha
+        {
+            return Err(WisetreeError::validation(
+                "created commit has the wrong ancestry",
+            ));
+        }
+        let actual = git
+            .diff_at(path, &format!("{parent_sha}..{commit_sha}"))
+            .await?;
+        if normalized_patch(&actual) != normalized_patch(expected_patch) {
+            return Err(WisetreeError::validation(
+                "parent-to-child diff does not match the assigned change units",
+            ));
+        }
+        let counts = parse_numstat_totals(
+            &git.numstat_at(path, &format!("{parent_sha}..{commit_sha}"))
+                .await?,
+        );
+        if counts.0.saturating_add(counts.1) > max {
+            return Err(WisetreeError::validation(format!(
+                "verified diff is {} changed lines (+{} -{}), exceeding MAX {max}",
+                counts.0 + counts.1,
+                counts.0,
+                counts.1
+            )));
+        }
+        Ok((commit_sha, tree_sha, counts.0, counts.1))
+    }
+
+    // Collision recovery deliberately checks every frozen identity as an
+    // explicit value so it cannot accidentally consult mutable live state.
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_recorded_split_layer(
+        &self,
+        git: &crate::git::service::GitService,
+        recorded: &SplitMaterializedLayer,
+        responsibility: &crate::services::split::SplitResponsibility,
+        branch: &str,
+        worktree_path: &str,
+        parent_branch: &str,
+        parent_sha: &str,
+        expected_patch: &str,
+        max: u64,
+    ) -> Result<()> {
+        let order = responsibility.order;
+        if recorded.order != order
+            || recorded.responsibility != responsibility.name
+            || recorded.branch != branch
+            || recorded.worktree_path != worktree_path
+            || recorded.parent_branch != parent_branch
+            || recorded.parent_sha != parent_sha
+            || recorded.units != responsibility.units
+            || !recorded.ready_for_publication
+        {
+            return Err(WisetreeError::validation(format!(
+                "Split layer {order}: recorded artifact identity does not match the approved plan."
+            )));
+        }
+        let branch_sha = git.resolve_at(Path::new(worktree_path), branch).await?;
+        let head_sha = git.resolve_at(Path::new(worktree_path), "HEAD").await?;
+        let tree_sha = git
+            .resolve_at(
+                Path::new(worktree_path),
+                &format!("{}^{{tree}}", recorded.commit_sha),
+            )
+            .await?;
+        if branch_sha != recorded.commit_sha
+            || head_sha != recorded.commit_sha
+            || tree_sha != recorded.tree_sha
+        {
+            return Err(WisetreeError::validation(format!(
+                "Split layer {order}: recorded branch or worktree moved."
+            )));
+        }
+        let matching_worktree = git.list_worktrees().await?.into_iter().any(|worktree| {
+            worktree.path == worktree_path
+                && worktree.branch == branch
+                && worktree.commit == recorded.commit_sha
+        });
+        if !matching_worktree
+            || !git
+                .is_ancestor(Path::new(worktree_path), parent_sha, &recorded.commit_sha)
+                .await
+            || git
+                .resolve_at(
+                    Path::new(worktree_path),
+                    &format!("{}^", recorded.commit_sha),
+                )
+                .await?
+                != parent_sha
+        {
+            return Err(WisetreeError::validation(format!(
+                "Split layer {order}: recorded worktree or ancestry is invalid."
+            )));
+        }
+        let range = format!("{parent_sha}..{}", recorded.commit_sha);
+        let actual = git.diff_at(Path::new(worktree_path), &range).await?;
+        let counts = parse_numstat_totals(&git.numstat_at(Path::new(worktree_path), &range).await?);
+        if normalized_patch(&actual) != normalized_patch(expected_patch)
+            || counts != (recorded.additions, recorded.deletions)
+            || counts.0.saturating_add(counts.1) > max
+        {
+            return Err(WisetreeError::validation(format!(
+                "Split layer {order}: recorded tree or verified counts no longer match."
+            )));
+        }
+        Ok(())
+    }
+
+    async fn verify_split_source(&self, preflight: &SplitPreflight, source: &Path) -> Result<()> {
+        let branch = run_command(
+            &self.git_binary,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            Some(source),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        let head = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(source))
+            .await
+            .map_err(WisetreeError::other)?;
+        let base = run_command(
+            &self.git_binary,
+            &["rev-parse", &preflight.identity.base_ref],
+            Some(source),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        if branch != preflight.identity.source_branch
+            || head != preflight.identity.source_head
+            || base != preflight.identity.base_sha
+        {
+            return Err(WisetreeError::validation(
+                "Split source branch, HEAD, or resolved base changed after approval.",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn split_source_status(&self, source: &Path) -> Result<Vec<String>> {
+        let status = run_command(
+            &self.git_binary,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            Some(source),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        Ok(status
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .filter(|entry| entry.get(3..) != Some(SPLIT_PLAN_FILE))
+            .map(str::to_string)
+            .collect())
+    }
+
+    async fn save_split_materialization(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+        materialization: &SplitMaterialization,
+    ) -> Result<()> {
+        let status = if materialization.layers.len() == plan.responsibilities.len() {
+            "materialized and verified"
+        } else {
+            "materializing verified layers"
+        };
+        let mut document = render_split_plan(preflight, plan, status);
+        document.push_str(&render_materialization(materialization)?);
+        tokio::fs::write(
+            Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE),
+            document,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Render and persist the validated proposal. The AI never receives write
@@ -5988,13 +6465,18 @@ impl DashboardService {
         status: &str,
     ) -> Result<()> {
         crate::services::split::parse_split_plan(&serde_json::to_string(plan)?, preflight)?;
-        tokio::fs::create_dir_all(Path::new(&preflight.worktree_path).join(SPLIT_DIRECTORY))
-            .await?;
-        tokio::fs::write(
-            Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE),
-            render_split_plan(preflight, plan, status),
-        )
-        .await?;
+        let directory = Path::new(&preflight.worktree_path).join(SPLIT_DIRECTORY);
+        let plan_path = Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE);
+        tokio::fs::create_dir_all(&directory).await?;
+        let existing = tokio::fs::read_to_string(&plan_path)
+            .await
+            .unwrap_or_default();
+        let materialization = parse_materialization(&existing)?;
+        let mut document = render_split_plan(preflight, plan, status);
+        if let Some(materialization) = materialization {
+            document.push_str(&render_materialization(&materialization)?);
+        }
+        tokio::fs::write(plan_path, document).await?;
         Ok(())
     }
 
