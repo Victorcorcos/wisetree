@@ -53,6 +53,7 @@ enum ActionChoice {
     ImprovePullRequest,
     BugkillPullRequest,
     DevelopPullRequest,
+    SplitPullRequest,
     MergePullRequest,
     UpdatePullRequest,
     PushPullRequest,
@@ -216,6 +217,20 @@ pub struct DevelopRequest {
     pub title: Option<String>,
 }
 
+/// Context captured when an eligible dashboard row enters the Split flow.
+/// The later preflight revalidates every value before publishing anything;
+/// this payload exists only to render the initial, mutation-free overview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitRequest {
+    pub branch: String,
+    pub worktree_path: String,
+    pub base_ref: Option<String>,
+    pub pr_base_ref: Option<String>,
+    pub number: Option<u64>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+}
+
 /// Status filter for the bulk-delete buttons row rendered above the
 /// footer. The button caption matches the status-column label exactly so
 /// the two surfaces stay in lockstep.
@@ -372,6 +387,10 @@ pub enum DashboardAction {
     /// implement it section by section with the AI. Offered on every
     /// non-mother worktree — no PR required.
     Develop(Box<DevelopRequest>),
+    /// Plan and publish a large branch as a stack of single-responsibility
+    /// pull requests. Offered only when the dashboard has a resolved,
+    /// non-empty committed diff and no terminal PR.
+    Split(Box<SplitRequest>),
     /// Push the branch's local commits to origin (`git push origin HEAD`).
     /// Offered when the PR is Open and the branch is ahead-but-not-behind —
     /// the "merged-but-not-pushed" state a failed push can leave behind.
@@ -1172,6 +1191,13 @@ impl DashboardScreen {
                 color: colors::ORANGE,
             });
         }
+        if build_split_request(row).is_some() {
+            commands.push(PrCommand {
+                label: "Split",
+                choice: ActionChoice::SplitPullRequest,
+                color: colors::SPLIT,
+            });
+        }
         // Update when the branch is behind its base (merge_status or local
         // behind count) or when GitHub reports the PR as conflicting (`Dirty`)
         // — both need an AI-assisted base merge. Mutually exclusive with Push.
@@ -1383,6 +1409,7 @@ impl DashboardScreen {
                 KeyCode::Char('i') | KeyCode::Char('I') => &[ActionChoice::ImprovePullRequest],
                 KeyCode::Char('b') | KeyCode::Char('B') => &[ActionChoice::BugkillPullRequest],
                 KeyCode::Char('d') | KeyCode::Char('D') => &[ActionChoice::DevelopPullRequest],
+                KeyCode::Char('s') | KeyCode::Char('S') => &[ActionChoice::SplitPullRequest],
                 KeyCode::Char('u') | KeyCode::Char('U') => &[
                     ActionChoice::UpdatePullRequest,
                     ActionChoice::PushPullRequest,
@@ -1456,6 +1483,7 @@ impl DashboardScreen {
         let improve_request = build_improve_request(row);
         let bugkill_request = build_bugkill_request(row);
         let develop_request = build_develop_request(row);
+        let split_request = build_split_request(row);
         let push_request = build_push_request(row);
         let close_request = build_close_request(row);
         self.reset_action_menu();
@@ -1532,6 +1560,12 @@ impl DashboardScreen {
                 self.mode = DashboardMode::Table;
                 develop_request
                     .map(|request| DashboardAction::Develop(Box::new(request)))
+                    .unwrap_or(DashboardAction::Continue)
+            }
+            ActionChoice::SplitPullRequest => {
+                self.mode = DashboardMode::Table;
+                split_request
+                    .map(|request| DashboardAction::Split(Box::new(request)))
                     .unwrap_or(DashboardAction::Continue)
             }
             ActionChoice::PushPullRequest => {
@@ -3387,6 +3421,44 @@ fn build_develop_request(row: &DashboardRow) -> Option<DevelopRequest> {
         worktree_path: row.worktree.path.clone(),
         number: pr.map(|pr| pr.number),
         title: pr.map(|pr| pr.title.clone()),
+    })
+}
+
+/// Split requires a real line-level diff against a base the dashboard could
+/// resolve. A later preflight repeats these checks against live git/GitHub
+/// state; the row gate only keeps obviously ineligible commands out of the UI.
+fn build_split_request(row: &DashboardRow) -> Option<SplitRequest> {
+    if row.worktree.is_main {
+        return None;
+    }
+    let status = row.worktree.branch_status.as_ref()?;
+    let base_ref = status
+        .upstream_branch
+        .as_ref()
+        .filter(|base| !base.trim().is_empty())?;
+    let changed_lines = status
+        .insertions
+        .unwrap_or(0)
+        .saturating_add(status.deletions.unwrap_or(0));
+    // `git diff <base>` also sees uncommitted working-tree edits. Require an
+    // ahead commit as well so dirty-only rows never enter a PR split flow.
+    if status.ahead == 0 || changed_lines == 0 {
+        return None;
+    }
+
+    let pr = match row.pull_request.as_ref() {
+        Some(pr) if pr_accepts_lifecycle_commands(pr.state) => Some(pr),
+        Some(_) => return None,
+        None => None,
+    };
+    Some(SplitRequest {
+        branch: row.worktree.branch.clone(),
+        worktree_path: row.worktree.path.clone(),
+        base_ref: Some(base_ref.clone()),
+        pr_base_ref: pr.and_then(|pr| pr.base_ref_name.clone()),
+        number: pr.map(|pr| pr.number),
+        title: pr.map(|pr| pr.title.clone()),
+        url: pr.map(|pr| pr.url.clone()),
     })
 }
 

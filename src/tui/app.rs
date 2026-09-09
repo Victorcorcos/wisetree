@@ -63,7 +63,7 @@ use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
     BugkillRequest, BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
     DevelopRequest, ExplainPullRequestRequest, FixPullRequestRequest, ImproveRequest,
-    MergePullRequestRequest, ReviewPullRequestRequest, UpdatePullRequestRequest,
+    MergePullRequestRequest, ReviewPullRequestRequest, SplitRequest, UpdatePullRequestRequest,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
@@ -84,6 +84,7 @@ use crate::tui::screens::setup::{SetupAction, SetupScreen, SetupStep};
 use crate::tui::screens::setup_project::{
     SetupProjectAction, SetupProjectPresetValues, SetupProjectScreen, SetupProjectStep,
 };
+use crate::tui::screens::split_pr::{SplitAction, SplitPullRequestScreen};
 use crate::tui::screens::update_branch::UpdateBranchScreen;
 use crate::tui::screens::update_pr::{UpdateAction, UpdatePullRequestScreen, UpdateStep};
 use crate::tui::selection::{
@@ -582,6 +583,7 @@ pub struct App {
     improve_apply_watch: Option<AiTurnWatcher>,
     bugkill_pr: Option<BugkillPullRequestScreen>,
     develop_pr: Option<DevelopPullRequestScreen>,
+    split_pr: Option<SplitPullRequestScreen>,
     next_develop_operation_id: u64,
     active_develop_operation_id: Option<u64>,
     next_develop_generation: u64,
@@ -762,6 +764,7 @@ impl App {
             improve_apply_watch: None,
             bugkill_pr: None,
             develop_pr: None,
+            split_pr: None,
             next_develop_operation_id: 0,
             active_develop_operation_id: None,
             next_develop_generation: 0,
@@ -1390,6 +1393,13 @@ impl App {
                     develop_pr.render(frame, panel);
                 }
             }
+            Screen::SplitPullRequest => {
+                let panel = self.render_framed_panel_fill(frame, area);
+                if let Some(split_pr) = self.split_pr.as_mut() {
+                    split_pr.tick = self.tick;
+                    split_pr.render(frame, panel);
+                }
+            }
             Screen::UpdateBranch => {
                 let h = self
                     .update_branch
@@ -1758,6 +1768,14 @@ impl App {
                     };
                 }
             }
+            Screen::SplitPullRequest => {
+                if let Some(screen) = self.split_pr.as_mut() {
+                    match direction {
+                        ScrollDirection::Up => screen.handle_mouse_scroll_up(lines),
+                        ScrollDirection::Down => screen.handle_mouse_scroll_down(lines),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1924,6 +1942,7 @@ impl App {
             Screen::ImprovePullRequest => self.handle_improve_pr_key(key, tx),
             Screen::BugkillPullRequest => self.handle_bugkill_key(key, tx),
             Screen::DevelopPullRequest => self.handle_develop_key(key, tx),
+            Screen::SplitPullRequest => self.handle_split_key(key, tx),
             Screen::UpdateBranch => {
                 if let Some(screen) = self.update_branch.as_mut() {
                     screen.handle_key(key);
@@ -2373,6 +2392,14 @@ impl App {
                     .map(|screen| screen.handle_mouse_click(position))
                     .unwrap_or(DevelopAction::Continue);
                 self.apply_develop_action(action, tx);
+            }
+            Screen::SplitPullRequest => {
+                let action = self
+                    .split_pr
+                    .as_mut()
+                    .map(|screen| screen.handle_mouse_click(position))
+                    .unwrap_or(SplitAction::Continue);
+                self.apply_split_action(action, tx);
             }
             Screen::UpdateBranch => {}
             Screen::AiModelPicker => {
@@ -5384,6 +5411,43 @@ impl App {
         self.screen = Screen::DevelopPullRequest;
     }
 
+    // ── "Split" orchestration ──────────────────────────────────────────
+
+    fn start_split_flow(&mut self, request: SplitRequest, _tx: &mpsc::UnboundedSender<AppEvent>) {
+        let ai = self.current_dashboard_config().ai.split.clone();
+        self.split_pr = Some(SplitPullRequestScreen::new(request, ai));
+        self.screen = Screen::SplitPullRequest;
+    }
+
+    fn handle_split_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let action = self
+            .split_pr
+            .as_mut()
+            .map(|screen| screen.handle_key(key))
+            .unwrap_or(SplitAction::Continue);
+        self.apply_split_action(action, tx);
+    }
+
+    fn apply_split_action(&mut self, action: SplitAction, tx: &mpsc::UnboundedSender<AppEvent>) {
+        match action {
+            SplitAction::Continue => {}
+            SplitAction::Cancelled => {
+                let worktree_path = self
+                    .split_pr
+                    .take()
+                    .map(|screen| screen.request().worktree_path.clone());
+                self.back_to_dashboard_action_menu(worktree_path, tx);
+            }
+            SplitAction::Confirmed(max) => {
+                // Section 3 attaches the live, stale-row-safe preflight to
+                // this state transition. Confirmation itself is mutation-free.
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.start_preflight(max);
+                }
+            }
+        }
+    }
+
     fn next_develop_operation_id(&mut self) -> u64 {
         self.next_develop_operation_id = self.next_develop_operation_id.wrapping_add(1);
         self.next_develop_operation_id
@@ -6588,6 +6652,9 @@ impl App {
             }
             DashboardAction::Develop(request) => {
                 self.start_develop_flow(*request, tx);
+            }
+            DashboardAction::Split(request) => {
+                self.start_split_flow(*request, tx);
             }
             DashboardAction::PushPullRequest(request) => {
                 self.start_push_pr_flow(*request, tx);
@@ -8821,6 +8888,13 @@ impl App {
                     self.back_to_menu();
                 }
             }
+            Screen::SplitPullRequest => {
+                // Only reachable through `start_split_flow`, which seeds the
+                // mutation-free confirmation screen before routing here.
+                if self.split_pr.is_none() {
+                    self.back_to_menu();
+                }
+            }
             Screen::UpdateBranch => {
                 // Only reachable through `start_update_branch_flow`,
                 // which seeds `update_branch` before flipping the
@@ -8867,6 +8941,7 @@ impl App {
         self.improve_pr = None;
         self.bugkill_pr = None;
         self.develop_pr = None;
+        self.split_pr = None;
         self.active_develop_operation_id = None;
         self.develop_watch = None;
         self.update_branch = None;

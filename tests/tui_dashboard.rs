@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::backend::TestBackend;
+use ratatui::layout::Position;
 use ratatui::Terminal;
 
 use std::collections::BTreeMap;
@@ -110,6 +111,18 @@ fn row_with_pr_state(path: &str, branch: &str, is_clean: bool, state: PrState) -
     if let Some(pr) = row.pull_request.as_mut() {
         pr.state = state;
     }
+    row
+}
+
+fn split_eligible_row(path: &str, branch: &str) -> DashboardRow {
+    let mut row = row(path, branch, true);
+    row.worktree.branch_status = Some(BranchStatus {
+        ahead: 2,
+        behind: 0,
+        upstream_branch: Some("upstream/main".into()),
+        insertions: Some(1200),
+        deletions: Some(80),
+    });
     row
 }
 
@@ -1466,6 +1479,138 @@ fn action_menu_never_offers_improve_for_mother_worktree() {
     screen.handle_key(key(KeyCode::Enter));
     let labels = screen.pr_command_labels();
     assert!(!labels.iter().any(|label| label == "Improve"), "{labels:?}");
+}
+
+#[test]
+fn split_is_offered_only_for_a_resolved_non_empty_non_terminal_diff() {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(vec![
+        row("/tmp/repo", "main", true),
+        split_eligible_row("/tmp/repo-split", "split-me"),
+    ]);
+    assert!(open_action_menu_for_second_row(&mut screen)
+        .iter()
+        .any(|label| label == "Split"));
+
+    for mut ineligible in [
+        split_eligible_row("/tmp/mother", "main"),
+        split_eligible_row("/tmp/empty", "empty"),
+        split_eligible_row("/tmp/unresolved", "unresolved"),
+        split_eligible_row("/tmp/dirty-only", "dirty-only"),
+    ] {
+        if ineligible.worktree.branch == "main" {
+            ineligible.worktree.is_main = true;
+        } else if ineligible.worktree.branch == "empty" {
+            let status = ineligible.worktree.branch_status.as_mut().unwrap();
+            status.insertions = Some(0);
+            status.deletions = Some(0);
+        } else if ineligible.worktree.branch == "unresolved" {
+            ineligible
+                .worktree
+                .branch_status
+                .as_mut()
+                .unwrap()
+                .upstream_branch = None;
+        } else {
+            ineligible.worktree.branch_status.as_mut().unwrap().ahead = 0;
+        }
+        let mut candidate =
+            DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false);
+        candidate.set_rows(vec![ineligible]);
+        candidate.handle_key(key(KeyCode::Enter));
+        assert!(!candidate
+            .pr_command_labels()
+            .iter()
+            .any(|label| label == "Split"));
+    }
+}
+
+#[test]
+fn split_shortcut_carries_active_pr_and_base_context() {
+    for state in [PrState::Open, PrState::Draft] {
+        let mut source = split_eligible_row("/tmp/repo-split", "split-me");
+        let mut pr = row_with_pr_state("/tmp/unused", "unused", true, state)
+            .pull_request
+            .unwrap();
+        pr.number = 91;
+        pr.title = "Large responsibility mix".into();
+        pr.url = "https://github.com/example/repo/pull/91".into();
+        pr.base_ref_name = Some("release".into());
+        source.pull_request = Some(pr);
+        let mut screen =
+            DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false);
+        screen.set_rows(vec![source]);
+        screen.handle_key(key(KeyCode::Enter));
+        screen.handle_key(key(KeyCode::Tab));
+        match screen.handle_key(key(KeyCode::Char('s'))) {
+            DashboardAction::Split(request) => {
+                assert_eq!(request.branch, "split-me");
+                assert_eq!(request.worktree_path, "/tmp/repo-split");
+                assert_eq!(request.base_ref.as_deref(), Some("upstream/main"));
+                assert_eq!(request.pr_base_ref.as_deref(), Some("release"));
+                assert_eq!(request.number, Some(91));
+                assert_eq!(request.title.as_deref(), Some("Large responsibility mix"));
+                assert_eq!(
+                    request.url.as_deref(),
+                    Some("https://github.com/example/repo/pull/91")
+                );
+            }
+            other => panic!("expected Split, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn split_is_hidden_for_closed_and_merged_source_prs() {
+    for state in [PrState::Closed, PrState::Merged] {
+        let mut source = split_eligible_row("/tmp/repo-split", "split-me");
+        source.pull_request = row_with_pr_state("/tmp/x", "x", true, state).pull_request;
+        let mut screen =
+            DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false);
+        screen.set_rows(vec![source]);
+        screen.handle_key(key(KeyCode::Enter));
+        assert!(!screen
+            .pr_command_labels()
+            .iter()
+            .any(|label| label == "Split"));
+    }
+}
+
+#[test]
+fn clicking_split_dispatches_the_same_request_and_uses_split_color() {
+    let mut screen =
+        DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false);
+    screen.set_rows(vec![split_eligible_row("/tmp/repo-split", "split-me")]);
+    screen.handle_key(key(KeyCode::Enter));
+
+    let backend = TestBackend::new(120, 18);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| screen.render(frame, frame.area()))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let position = (0..buffer.area.height)
+        .find_map(|y| {
+            (0..buffer.area.width.saturating_sub(4)).find_map(|x| {
+                let symbols = (x..x + 5)
+                    .map(|column| buffer[(column, y)].symbol())
+                    .collect::<String>();
+                (symbols == "Split").then(|| Position::new(x, y))
+            })
+        })
+        .expect("Split button rendered");
+    assert_eq!(buffer[(position.x, position.y)].fg, colors::SPLIT);
+    assert!(matches!(
+        screen.handle_mouse_click(position),
+        DashboardAction::Split(_)
+    ));
 }
 
 // ---- "Update Pull Request" visibility ----------------------------------

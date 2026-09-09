@@ -151,6 +151,9 @@ pub mod colors {
     /// Mint accent reserved for the local "Improve" command and its
     /// confirmation screen.
     pub const IMPROVE: Color = MINT;
+    /// Split pink `#f92672` — reserved for the Split pull-request command.
+    /// It is deliberately distinct from the brighter destructive/error pink.
+    pub const SPLIT: Color = Color::Rgb(0xf9, 0x26, 0x72);
 
     // ── Background colors ───────────────────────────────────────────────
 
