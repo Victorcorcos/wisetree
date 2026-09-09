@@ -7,7 +7,7 @@ use wisetree::config::schema::{AiHarness, AiModelConfig, AiSplitConfig};
 use wisetree::messages::colors;
 use wisetree::services::{
     parse_split_plan, ChangeUnit, ChangeUnitKind, SplitIdentity, SplitPlanResult, SplitPreflight,
-    SplitRepositorySnapshot,
+    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot,
 };
 use wisetree::tui::screens::dashboard::SplitRequest;
 use wisetree::tui::screens::split_pr::{SplitAction, SplitPullRequestScreen, SplitStep};
@@ -323,5 +323,40 @@ fn review_buttons_are_clickable_and_second_contract_failure_requires_explicit_re
     assert_eq!(
         screen.handle_key(key(KeyCode::Enter)),
         SplitAction::RetryPlanning
+    );
+}
+
+#[test]
+fn publication_progress_and_verified_stack_are_visible() {
+    let mut screen = review_screen();
+    screen.start_approving();
+    let (progress, _) = render(&mut screen, 100, 20);
+    assert!(progress.contains("materializing, publishing, and verifying"));
+
+    screen.mark_approved(SplitPublication {
+        repository: "acme/repo".into(),
+        trunk: "main".into(),
+        source_branch: "feature/large-change".into(),
+        stack_link_completed: true,
+        status: "published, verified, and provisionally titled".into(),
+        diagnostics: None,
+        pull_requests: vec![SplitPublishedPullRequest {
+            order: 1,
+            branch: "feature/large-change.1_foundation".into(),
+            expected_base: "main".into(),
+            number: 91,
+            url: "https://github.com/acme/repo/pull/91".into(),
+            provisional_title: "Feature Large Change (1/2)".into(),
+            provisional_title_applied: true,
+        }],
+    });
+    let (done, _) = render(&mut screen, 100, 20);
+    assert!(done.contains("Published and verified 1 stacked pull requests"));
+    assert!(done.contains("#91 feature/large-change.1_foundation → main"));
+
+    screen.set_publication_error("push rejected exactly".into());
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::RetryPublication
     );
 }

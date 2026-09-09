@@ -49,10 +49,12 @@ use crate::services::reviewer_tests::{
 use crate::services::split::{
     build_corrective_plan_prompt, build_plan_prompt as build_split_plan_prompt,
     describe_snapshot_changes, inventory_diff, normalized_patch, parse_materialization,
-    parse_numstat_totals, patch_for_units, render_materialization, render_split_plan,
-    split_branch_name, validate_manifest as validate_split_manifest, SplitIdentity,
-    SplitMaterialization, SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight,
-    SplitPreflightRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY, SPLIT_PLAN_FILE,
+    parse_numstat_totals, parse_publication, patch_for_units, provisional_split_title,
+    render_materialization, render_publication, render_split_plan, split_branch_name,
+    validate_manifest as validate_split_manifest, SplitIdentity, SplitMaterialization,
+    SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
+    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY,
+    SPLIT_PLAN_FILE,
 };
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 use crate::worktree::WorktreeService;
@@ -5971,19 +5973,19 @@ impl DashboardService {
         plan: &SplitPlan,
         expected: &SplitRepositorySnapshot,
     ) -> Result<()> {
-        let current = self.snapshot_split_repository(preflight).await?;
-        let changes = describe_snapshot_changes(expected, &current);
-        if !changes.is_empty() {
-            return Err(WisetreeError::validation(format!(
-                "Split proposal is stale because repository state changed: {}.",
-                changes.join(", ")
-            )));
-        }
         let plan_path = Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE);
         let existing = tokio::fs::read_to_string(&plan_path)
             .await
             .unwrap_or_default();
         if parse_materialization(&existing)?.is_none() {
+            let current = self.snapshot_split_repository(preflight).await?;
+            let changes = describe_snapshot_changes(expected, &current);
+            if !changes.is_empty() {
+                return Err(WisetreeError::validation(format!(
+                    "Split proposal is stale because repository state changed: {}.",
+                    changes.join(", ")
+                )));
+            }
             self.save_split_plan(preflight, plan, "approved").await?;
         }
         self.materialize_split_stack(preflight, plan).await
@@ -6240,6 +6242,253 @@ impl DashboardService {
             .await
     }
 
+    /// Publish the fully verified local chain with GitHub's native stack
+    /// linker, then resolve and verify every resulting pull request before
+    /// any drafting AI is allowed to run.
+    pub async fn publish_split_stack(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+    ) -> Result<SplitPublication> {
+        let source = Path::new(&preflight.worktree_path);
+        let document = tokio::fs::read_to_string(source.join(SPLIT_PLAN_FILE)).await?;
+        let materialization = parse_materialization(&document)?.ok_or_else(|| {
+            WisetreeError::validation("Split cannot publish before local materialization.")
+        })?;
+        if materialization.layers.len() != plan.responsibilities.len()
+            || materialization
+                .layers
+                .iter()
+                .any(|layer| !layer.ready_for_publication)
+        {
+            return Err(WisetreeError::validation(
+                "Split cannot publish an incomplete or unverified local stack.",
+            ));
+        }
+        self.verify_split_source(preflight, source).await?;
+        let branches = materialization
+            .layers
+            .iter()
+            .map(|layer| layer.branch.clone())
+            .collect::<Vec<_>>();
+        if branches.last() != Some(&preflight.identity.source_branch) {
+            return Err(WisetreeError::validation(
+                "Split cannot publish because the unchanged source branch is not the top layer.",
+            ));
+        }
+        let trunk = preflight
+            .identity
+            .base_ref
+            .strip_prefix(&format!("{}/", preflight.identity.remote))
+            .filter(|branch| !branch.is_empty())
+            .ok_or_else(|| {
+                WisetreeError::validation("Split could not derive the GitHub trunk branch.")
+            })?
+            .to_string();
+        let mut publication = parse_publication(&document)?.unwrap_or(SplitPublication {
+            repository: preflight.identity.repository.clone(),
+            trunk: trunk.clone(),
+            source_branch: preflight.identity.source_branch.clone(),
+            stack_link_completed: false,
+            status: "publishing stack".to_string(),
+            diagnostics: None,
+            pull_requests: Vec::new(),
+        });
+        if publication.repository != preflight.identity.repository
+            || publication.trunk != trunk
+            || publication.source_branch != preflight.identity.source_branch
+        {
+            return Err(WisetreeError::validation(
+                "Existing Split publication belongs to a different source identity.",
+            ));
+        }
+        publication.status = "publishing stack".to_string();
+        publication.diagnostics = None;
+        self.save_split_publication(preflight, plan, &materialization, &publication)
+            .await?;
+
+        if !publication.stack_link_completed {
+            let mut args = vec![
+                "stack".to_string(),
+                "link".to_string(),
+                "--base".to_string(),
+                trunk.clone(),
+                "--open".to_string(),
+            ];
+            args.extend(branches.iter().cloned());
+            let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            if let Err(diagnostics) = run_command(&self.gh_binary, &refs, Some(source)).await {
+                publication.status = "publication failed".to_string();
+                publication.diagnostics = Some(diagnostics.clone());
+                self.save_split_publication(preflight, plan, &materialization, &publication)
+                    .await?;
+                return Err(WisetreeError::validation(format!(
+                    "GitHub stack publication failed: {diagnostics}"
+                )));
+            }
+            publication.stack_link_completed = true;
+            publication.status = "resolving pull requests".to_string();
+            self.save_split_publication(preflight, plan, &materialization, &publication)
+                .await?;
+        }
+
+        let applied_titles = publication
+            .pull_requests
+            .iter()
+            .filter(|pull_request| pull_request.provisional_title_applied)
+            .map(|pull_request| {
+                (
+                    (
+                        pull_request.branch.clone(),
+                        pull_request.number,
+                        pull_request.url.clone(),
+                    ),
+                    pull_request.provisional_title.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut pull_requests = Vec::with_capacity(branches.len());
+        let mut numbers = BTreeSet::new();
+        let mut urls = BTreeSet::new();
+        for (index, branch) in branches.iter().enumerate() {
+            let expected_base = if index == 0 {
+                trunk.clone()
+            } else {
+                branches[index - 1].clone()
+            };
+            let raw = match run_command(
+                &self.gh_binary,
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    &preflight.identity.repository,
+                    "--head",
+                    branch,
+                    "--state",
+                    "open",
+                    "--json",
+                    "number,url,state,isDraft,headRefName,baseRefName",
+                ],
+                Some(source),
+            )
+            .await
+            {
+                Ok(raw) => raw,
+                Err(diagnostics) => {
+                    publication.pull_requests = pull_requests;
+                    publication.status = "PR resolution failed".to_string();
+                    publication.diagnostics = Some(diagnostics.clone());
+                    self.save_split_publication(preflight, plan, &materialization, &publication)
+                        .await?;
+                    return Err(WisetreeError::validation(format!(
+                        "Could not resolve Split PR for branch `{branch}`: {diagnostics}"
+                    )));
+                }
+            };
+            let metadata = match parse_split_published_pr(&raw, branch) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    let diagnostics = error.to_string();
+                    publication.pull_requests = pull_requests;
+                    publication.status = "PR resolution failed".to_string();
+                    publication.diagnostics = Some(diagnostics.clone());
+                    self.save_split_publication(preflight, plan, &materialization, &publication)
+                        .await?;
+                    return Err(WisetreeError::validation(diagnostics));
+                }
+            };
+            let repository = parse_github_slug(&metadata.url)
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
+                .unwrap_or_default();
+            if metadata.state != "OPEN"
+                || metadata.is_draft
+                || metadata.head_ref_name != *branch
+                || metadata.base_ref_name != expected_base
+                || repository != preflight.identity.repository
+                || !numbers.insert(metadata.number)
+                || !urls.insert(metadata.url.clone())
+            {
+                let diagnostics = format!(
+                    "PR #{} for `{branch}` failed verification: repository `{repository}`, head `{}`, base `{}`, state `{}`, draft {}, URL `{}`.",
+                    metadata.number,
+                    metadata.head_ref_name,
+                    metadata.base_ref_name,
+                    metadata.state,
+                    metadata.is_draft,
+                    metadata.url
+                );
+                publication.status = "verification failed".to_string();
+                publication.diagnostics = Some(diagnostics.clone());
+                self.save_split_publication(preflight, plan, &materialization, &publication)
+                    .await?;
+                return Err(WisetreeError::validation(diagnostics));
+            }
+            let provisional_title = provisional_split_title(
+                &preflight.identity.source_branch,
+                index + 1,
+                branches.len(),
+            );
+            let provisional_title_applied =
+                applied_titles.get(&(branch.clone(), metadata.number, metadata.url.clone()))
+                    == Some(&provisional_title);
+            pull_requests.push(SplitPublishedPullRequest {
+                order: index + 1,
+                branch: branch.clone(),
+                expected_base,
+                number: metadata.number,
+                url: metadata.url,
+                provisional_title,
+                provisional_title_applied,
+            });
+            publication.pull_requests = pull_requests.clone();
+            self.save_split_publication(preflight, plan, &materialization, &publication)
+                .await?;
+        }
+        publication.pull_requests = pull_requests;
+        publication.status = "applying provisional titles".to_string();
+        publication.diagnostics = None;
+        self.save_split_publication(preflight, plan, &materialization, &publication)
+            .await?;
+
+        for index in 0..publication.pull_requests.len() {
+            if publication.pull_requests[index].provisional_title_applied {
+                continue;
+            }
+            let pull_request = &publication.pull_requests[index];
+            if let Err(diagnostics) = run_command(
+                &self.gh_binary,
+                &[
+                    "pr",
+                    "edit",
+                    &pull_request.url,
+                    "--title",
+                    &pull_request.provisional_title,
+                ],
+                Some(source),
+            )
+            .await
+            {
+                publication.status = "provisional title failed".to_string();
+                publication.diagnostics = Some(diagnostics.clone());
+                self.save_split_publication(preflight, plan, &materialization, &publication)
+                    .await?;
+                return Err(WisetreeError::validation(format!(
+                    "Could not apply provisional title to PR #{}: {diagnostics}",
+                    pull_request.number
+                )));
+            }
+            publication.pull_requests[index].provisional_title_applied = true;
+            self.save_split_publication(preflight, plan, &materialization, &publication)
+                .await?;
+        }
+        publication.status = "published, verified, and provisionally titled".to_string();
+        publication.diagnostics = None;
+        self.save_split_publication(preflight, plan, &materialization, &publication)
+            .await?;
+        Ok(publication)
+    }
+
     async fn materialize_new_split_layer(
         git: &crate::git::service::GitService,
         responsibility: &crate::services::split::SplitResponsibility,
@@ -6446,8 +6695,30 @@ impl DashboardService {
         } else {
             "materializing verified layers"
         };
+        let plan_path = Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE);
+        let existing = tokio::fs::read_to_string(&plan_path)
+            .await
+            .unwrap_or_default();
+        let publication = parse_publication(&existing)?;
         let mut document = render_split_plan(preflight, plan, status);
         document.push_str(&render_materialization(materialization)?);
+        if let Some(publication) = publication {
+            document.push_str(&render_publication(&publication)?);
+        }
+        tokio::fs::write(plan_path, document).await?;
+        Ok(())
+    }
+
+    async fn save_split_publication(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+        materialization: &SplitMaterialization,
+        publication: &SplitPublication,
+    ) -> Result<()> {
+        let mut document = render_split_plan(preflight, plan, &publication.status);
+        document.push_str(&render_materialization(materialization)?);
+        document.push_str(&render_publication(publication)?);
         tokio::fs::write(
             Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE),
             document,
@@ -6472,9 +6743,13 @@ impl DashboardService {
             .await
             .unwrap_or_default();
         let materialization = parse_materialization(&existing)?;
+        let publication = parse_publication(&existing)?;
         let mut document = render_split_plan(preflight, plan, status);
         if let Some(materialization) = materialization {
             document.push_str(&render_materialization(&materialization)?);
+        }
+        if let Some(publication) = publication {
+            document.push_str(&render_publication(&publication)?);
         }
         tokio::fs::write(plan_path, document).await?;
         Ok(())
@@ -7621,6 +7896,39 @@ fn parse_split_pr_metadata(body: &str) -> Result<SplitPrMetadata> {
         return Err(WisetreeError::validation(
             "GitHub source pull-request metadata is incomplete.",
         ));
+    }
+    Ok(metadata)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SplitPublishedPrMetadata {
+    number: u64,
+    url: String,
+    state: String,
+    is_draft: bool,
+    head_ref_name: String,
+    base_ref_name: String,
+}
+
+fn parse_split_published_pr(body: &str, branch: &str) -> Result<SplitPublishedPrMetadata> {
+    let mut matches: Vec<SplitPublishedPrMetadata> =
+        serde_json::from_str(body).map_err(|error| {
+            WisetreeError::validation(format!(
+                "GitHub returned invalid PR metadata for Split branch `{branch}`: {error}"
+            ))
+        })?;
+    if matches.len() != 1 {
+        return Err(WisetreeError::validation(format!(
+            "Split expected exactly one open PR for branch `{branch}`, but GitHub returned {}.",
+            matches.len()
+        )));
+    }
+    let metadata = matches.remove(0);
+    if metadata.number == 0 || metadata.url.trim().is_empty() {
+        return Err(WisetreeError::validation(format!(
+            "GitHub returned incomplete PR metadata for Split branch `{branch}`."
+        )));
     }
     Ok(metadata)
 }
