@@ -1,9 +1,98 @@
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+use once_cell::sync::Lazy;
+use tempfile::TempDir;
+use tokio::sync::Mutex;
+use wisetree::config::schema::DashboardConfig;
 use wisetree::services::{
     build_corrective_plan_prompt, build_split_plan_prompt, describe_snapshot_changes,
-    inventory_diff, parse_numstat_totals, parse_split_plan, render_split_plan,
-    validate_split_manifest, ChangeUnit, ChangeUnitKind, SplitIdentity, SplitPreflight,
-    SplitRepositorySnapshot,
+    inventory_diff, parse_materialization, parse_numstat_totals, parse_split_plan, patch_for_units,
+    render_split_plan, validate_split_manifest, ChangeUnit, ChangeUnitKind, DashboardService,
+    SplitIdentity, SplitPlan, SplitPreflight, SplitRepositorySnapshot, SplitResponsibility,
 };
+
+mod support;
+
+use support::{git, init_repo_with_main};
+
+static HOME_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string()
+}
+
+struct RepoFixture {
+    _parent: TempDir,
+    repo: std::path::PathBuf,
+    source: std::path::PathBuf,
+    base: String,
+    head: String,
+}
+
+fn split_repo(initial: &[(&str, &[u8])], changed: &[(&str, Option<&[u8]>)]) -> RepoFixture {
+    let parent = tempfile::tempdir().unwrap();
+    let repo = parent.path().join("repo");
+    let source = parent.path().join("repo-feature");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    for (path, contents) in initial {
+        let absolute = repo.join(path);
+        fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+        fs::write(absolute, contents).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    let base = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["update-ref", "refs/remotes/origin/main", &base]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            source.to_str().unwrap(),
+            "main",
+        ],
+    );
+    for (path, contents) in changed {
+        let absolute = source.join(path);
+        if let Some(contents) = contents {
+            fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            fs::write(absolute, contents).unwrap();
+        } else {
+            fs::remove_file(absolute).unwrap();
+        }
+    }
+    git(&source, &["add", "-A"]);
+    git(&source, &["commit", "-q", "-m", "source"]);
+    let head = git_stdout(&source, &["rev-parse", "HEAD"]);
+    RepoFixture {
+        _parent: parent,
+        repo,
+        source,
+        base,
+        head,
+    }
+}
 
 fn fixture() -> SplitPreflight {
     let unit = |id: &str, path: &str, additions: u64, deletions: u64| ChangeUnit {
@@ -92,6 +181,25 @@ Binary files /dev/null and b/logo.png differ
     assert_eq!(units[3].kind, ChangeUnitKind::ModeChange);
     assert_eq!(units[4].kind, ChangeUnitKind::Binary);
     assert!(!units[4].line_counts_available);
+}
+
+#[test]
+fn selected_patch_keeps_only_assigned_hunks_from_a_shared_file() {
+    let diff = r#"diff --git a/tests/shared.txt b/tests/shared.txt
+index 1111111..2222222 100644
+--- a/tests/shared.txt
++++ b/tests/shared.txt
+@@ -1 +1 @@
+-one
++ONE
+@@ -5 +5 @@
+-five
++FIVE
+"#;
+    let patch = patch_for_units(diff, &BTreeSet::from(["CU0001".to_string()])).unwrap();
+    assert!(patch.contains("-one\n+ONE"));
+    assert!(!patch.contains("-five"));
+    assert_eq!(patch.matches("diff --git ").count(), 1);
 }
 
 #[test]
@@ -190,4 +298,241 @@ fn repository_snapshot_diff_names_head_refs_status_and_relevant_files() {
     assert!(changes.contains("refs"), "{changes}");
     assert!(changes.contains("status"), "{changes}");
     assert!(changes.contains("src/a.rs"), "{changes}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn materializes_shared_file_hunks_without_touching_the_source() {
+    let _guard = HOME_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let previous_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+
+    let original = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n";
+    let changed = b"ONE\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nNINE\n";
+    let fixture = split_repo(
+        &[("tests/shared.txt", original)],
+        &[("tests/shared.txt", Some(changed))],
+    );
+    let diff = git_stdout(
+        &fixture.source,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--find-renames",
+            "--unified=0",
+            "--no-color",
+            "--no-ext-diff",
+            &format!("{}..{}", fixture.base, fixture.head),
+        ],
+    );
+    let units = inventory_diff(&diff).unwrap();
+    assert_eq!(units.len(), 3);
+    let preflight = SplitPreflight {
+        worktree_path: fixture.source.to_string_lossy().into_owned(),
+        identity: SplitIdentity {
+            repository: "example/repo".into(),
+            remote: "origin".into(),
+            base_ref: "origin/main".into(),
+            base_sha: fixture.base.clone(),
+            source_branch: "feature".into(),
+            source_head: fixture.head.clone(),
+            max: 10,
+            additions: 3,
+            deletions: 3,
+        },
+        units,
+    };
+    let response = r#"{"responsibilities":[{"order":1,"name":"First hunk","branch_slug":"first-hunk","rationale":"Independent first-line behavior.","units":["CU0001"],"test_units":["CU0001"],"paths":["tests/shared.txt"]},{"order":2,"name":"Second hunk","branch_slug":"second-hunk","rationale":"Independent middle-line behavior.","units":["CU0002"],"test_units":["CU0002"],"paths":["tests/shared.txt"]},{"order":3,"name":"Third hunk","branch_slug":"third-hunk","rationale":"Independent last-line behavior.","units":["CU0003"],"test_units":["CU0003"],"paths":["tests/shared.txt"]}]}"#;
+    let plan = parse_split_plan(response, &preflight).unwrap();
+    let source_before = fs::read(fixture.source.join("tests/shared.txt")).unwrap();
+    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default());
+    service
+        .save_split_plan(&preflight, &plan, "approved")
+        .await
+        .unwrap();
+    service
+        .materialize_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        git_stdout(&fixture.source, &["rev-parse", "HEAD"]),
+        fixture.head
+    );
+    assert_eq!(
+        fs::read(fixture.source.join("tests/shared.txt")).unwrap(),
+        source_before
+    );
+    assert!(git_stdout(&fixture.source, &["diff", "--cached"]).is_empty());
+    assert!(git_stdout(&fixture.source, &["diff"]).is_empty());
+    let lower_path = fixture
+        .repo
+        .parent()
+        .unwrap()
+        .join("repo.worktree")
+        .join("feature.1_first-hunk");
+    assert_eq!(
+        fs::read(lower_path.join("tests/shared.txt")).unwrap(),
+        b"ONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n"
+    );
+    let second_path = fixture
+        .repo
+        .parent()
+        .unwrap()
+        .join("repo.worktree")
+        .join("feature.2_second-hunk");
+    assert_eq!(
+        fs::read(second_path.join("tests/shared.txt")).unwrap(),
+        b"ONE\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\n"
+    );
+    let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
+    let persisted = parse_materialization(&document).unwrap().unwrap();
+    assert_eq!(persisted.layers.len(), 3);
+    assert_eq!(persisted.layers[0].branch, "feature.1_first-hunk");
+    assert!(persisted.layers[0].ready_for_publication);
+
+    if let Some(value) = previous_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn materializes_deletion_rename_and_binary_and_rejects_moved_artifacts() {
+    let _guard = HOME_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let previous_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+
+    let fixture = split_repo(
+        &[
+            ("tests/delete.txt", b"remove me\n"),
+            ("tests/old-name.txt", b"rename me\n"),
+            ("tests/blob.bin", &[0, 1, 2, 3]),
+            ("tests/top.txt", b"before\n"),
+        ],
+        &[
+            ("tests/delete.txt", None),
+            ("tests/old-name.txt", None),
+            ("tests/new-name.txt", Some(b"rename me\n")),
+            ("tests/blob.bin", Some(&[0, 9, 2, 3])),
+            ("tests/top.txt", Some(b"after\n")),
+        ],
+    );
+    fs::write(fixture.repo.join(".env"), "SECRET=kept-out\n").unwrap();
+    let range = format!("{}..{}", fixture.base, fixture.head);
+    let diff = git_stdout(
+        &fixture.source,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--find-renames",
+            "--unified=0",
+            "--no-color",
+            "--no-ext-diff",
+            &range,
+        ],
+    );
+    let units = inventory_diff(&diff).unwrap();
+    assert!(units.iter().any(|unit| unit.kind == ChangeUnitKind::Binary));
+    assert!(units.iter().any(|unit| unit.kind == ChangeUnitKind::Rename));
+    assert!(units
+        .iter()
+        .any(|unit| { unit.kind == ChangeUnitKind::TextHunk && unit.new_lines == Some(0) }));
+    let (additions, deletions) = units.iter().fold((0, 0), |counts, unit| {
+        (counts.0 + unit.additions, counts.1 + unit.deletions)
+    });
+    let plan = SplitPlan {
+        responsibilities: units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| SplitResponsibility {
+                order: index + 1,
+                name: format!("Responsibility {}", index + 1),
+                branch_slug: format!("responsibility-{}", index + 1),
+                rationale: "Independent test responsibility.".into(),
+                units: vec![unit.id.clone()],
+                test_units: vec![unit.id.clone()],
+                paths: vec![unit.path.clone()],
+            })
+            .collect(),
+    };
+    let preflight = SplitPreflight {
+        worktree_path: fixture.source.to_string_lossy().into_owned(),
+        identity: SplitIdentity {
+            repository: "example/repo".into(),
+            remote: "origin".into(),
+            base_ref: "origin/main".into(),
+            base_sha: fixture.base.clone(),
+            source_branch: "feature".into(),
+            source_head: fixture.head.clone(),
+            max: 10,
+            additions,
+            deletions,
+        },
+        units,
+    };
+    parse_split_plan(&serde_json::to_string(&plan).unwrap(), &preflight).unwrap();
+    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default());
+    service
+        .save_split_plan(&preflight, &plan, "approved")
+        .await
+        .unwrap();
+    service
+        .materialize_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+    // A second pass must reuse the exact recorded identities without adding commits.
+    service
+        .materialize_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+
+    let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
+    let persisted = parse_materialization(&document).unwrap().unwrap();
+    assert_eq!(persisted.layers.len(), plan.responsibilities.len());
+    for layer in persisted.layers.iter().take(persisted.layers.len() - 1) {
+        assert!(Path::new(&layer.worktree_path).join(".env").exists());
+        assert!(git_stdout(
+            Path::new(&layer.worktree_path),
+            &["ls-tree", "--name-only", "HEAD", ".env"]
+        )
+        .is_empty());
+    }
+    assert_eq!(
+        git_stdout(&fixture.source, &["rev-parse", "HEAD"]),
+        fixture.head
+    );
+    assert!(git_stdout(&fixture.source, &["diff"]).is_empty());
+    assert!(git_stdout(&fixture.source, &["diff", "--cached"]).is_empty());
+
+    let moved = &persisted.layers[persisted.layers.len() - 2];
+    fs::write(
+        Path::new(&moved.worktree_path).join("unrelated.txt"),
+        "moved\n",
+    )
+    .unwrap();
+    git(Path::new(&moved.worktree_path), &["add", "unrelated.txt"]);
+    git(
+        Path::new(&moved.worktree_path),
+        &["commit", "-q", "-m", "unexpected"],
+    );
+    let error = service
+        .materialize_split_stack(&preflight, &plan)
+        .await
+        .expect_err("moved recorded branch must stop")
+        .to_string();
+    assert!(
+        error.contains("recorded branch or worktree moved"),
+        "{error}"
+    );
+
+    if let Some(value) = previous_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
 }

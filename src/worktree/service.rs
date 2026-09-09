@@ -81,6 +81,23 @@ impl WorktreeService {
         self.mother_worktree_path.as_deref()
     }
 
+    pub async fn split_worktree_path(
+        &self,
+        name: &str,
+        branch: &str,
+        source_branch: &str,
+    ) -> Result<PathBuf> {
+        let root = self.main_worktree_root().await?;
+        get_worktree_path(
+            &root,
+            name,
+            &self.config_service.config().worktree_path_template,
+            Some(branch),
+            Some(source_branch),
+        )
+        .map_err(|error| WisetreeError::validation(error.to_string()))
+    }
+
     /// Validate the directory is a git repo and load configuration. Must be
     /// called before `create_worktree` / `delete_worktree`.
     pub async fn initialize(&mut self) -> Result<()> {
@@ -112,7 +129,27 @@ impl WorktreeService {
         &self,
         options: &WorktreeCreateOptions,
         progress: Option<ProgressCallback<'_>>,
+        activity: Option<ActivityCallback<'_>>,
+    ) -> Result<CreateOutcome> {
+        self.create_worktree_inner(options, progress, activity, true)
+            .await
+    }
+
+    /// Create a persistent Split layer with the normal copy/link setup but
+    /// without launching user commands or terminals during the transaction.
+    pub async fn create_split_worktree(
+        &self,
+        options: &WorktreeCreateOptions,
+    ) -> Result<CreateOutcome> {
+        self.create_worktree_inner(options, None, None, false).await
+    }
+
+    async fn create_worktree_inner(
+        &self,
+        options: &WorktreeCreateOptions,
+        progress: Option<ProgressCallback<'_>>,
         mut activity: Option<ActivityCallback<'_>>,
+        run_user_actions: bool,
     ) -> Result<CreateOutcome> {
         let config = self.config_service.config().clone();
         let git_root = self.main_worktree_root().await?;
@@ -220,7 +257,7 @@ impl WorktreeService {
             source_branch: options.source_branch.clone(),
         };
 
-        if !config.post_create_cmd.is_empty() {
+        if run_user_actions && !config.post_create_cmd.is_empty() {
             let runs = execute_post_create_commands(
                 &config.post_create_cmd,
                 &variables,
@@ -231,7 +268,7 @@ impl WorktreeService {
             outcome.command_runs = runs;
         }
 
-        if !config.terminal_command.trim().is_empty() {
+        if run_user_actions && !config.terminal_command.trim().is_empty() {
             let launch = open_terminal(&config.terminal_command, &variables);
             outcome.terminal_launch = Some(launch);
         }

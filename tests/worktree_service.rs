@@ -321,6 +321,43 @@ async fn create_worktree_populates_link_report_when_link_patterns_enabled() {
     });
 }
 
+#[test]
+fn create_split_worktree_keeps_copy_and_link_setup_without_user_actions() {
+    with_isolated_home(|| {
+        let body = async {
+            let fx = build_fixture();
+            fs::write(fx.repo.join(".env"), "TOKEN=local\n").unwrap();
+            let mut svc = WorktreeService::new(Some(fx.repo.clone()));
+            svc.initialize().await.expect("init");
+            svc.config_service_mut().update(|config| {
+                config.worktree_copy_patterns = vec![".env".to_string()];
+                config.worktree_link_patterns = vec!["node_modules".to_string()];
+                config.worktree_link_strategy = LinkStrategy::CreateEmpty;
+                config.post_create_cmd = vec!["echo should-not-run > marker.txt".to_string()];
+                config.terminal_command = "false".to_string();
+            });
+            let outcome = svc
+                .create_split_worktree(&WorktreeCreateOptions {
+                    name: "split-layer".into(),
+                    source_branch: "main".into(),
+                    new_branch: "feature.1_foundation".into(),
+                    base_path: String::new(),
+                })
+                .await
+                .expect("create Split worktree");
+
+            assert!(outcome.worktree_path.join(".env").exists());
+            assert!(outcome.worktree_path.join("node_modules").exists());
+            assert!(!outcome.worktree_path.join("marker.txt").exists());
+            assert!(outcome.copy_report.is_some());
+            assert!(outcome.link_report.is_some());
+            assert!(outcome.command_runs.is_empty());
+            assert!(outcome.terminal_launch.is_none());
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(body);
+    });
+}
+
 #[tokio::test]
 async fn create_worktree_rejects_existing_branch_when_creating_new() {
     with_isolated_home(|| {
