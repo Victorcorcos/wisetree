@@ -19,7 +19,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::cli::AppMode;
 use crate::config::schema::{
@@ -50,7 +50,8 @@ use crate::services::{
     FixPreparation, FixVerdict, ImproveCheckpointIdentity, ImprovePreparation, JudgeResult,
     MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding,
     ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell,
-    ShellIntegrationStatus, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    ShellIntegrationStatus, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
+    SplitRepositorySnapshot, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::image_upload::{ImageAttachment, ImageStorage};
@@ -353,6 +354,27 @@ enum AppEvent {
         generation: u64,
         result: Result<Option<String>, String>,
     },
+    SplitPrepared {
+        operation_id: u64,
+        generation: u64,
+        result: Result<Box<SplitPreflight>, String>,
+    },
+    SplitPlanActivity {
+        operation_id: u64,
+        generation: u64,
+        line: String,
+    },
+    SplitPlanReady {
+        operation_id: u64,
+        generation: u64,
+        corrective: bool,
+        result: Result<Box<SplitPlanResult>, String>,
+    },
+    SplitApproved {
+        operation_id: u64,
+        generation: u64,
+        result: Result<(), String>,
+    },
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
     AiModelsFetched(Result<Vec<OpencodeModel>, String>),
@@ -584,6 +606,14 @@ pub struct App {
     bugkill_pr: Option<BugkillPullRequestScreen>,
     develop_pr: Option<DevelopPullRequestScreen>,
     split_pr: Option<SplitPullRequestScreen>,
+    next_split_operation_id: u64,
+    active_split_operation_id: Option<u64>,
+    next_split_generation: u64,
+    active_split_generation: Option<u64>,
+    split_cancel: Option<oneshot::Sender<()>>,
+    split_previous: Option<String>,
+    split_feedback: Option<String>,
+    split_corrective_error: Option<String>,
     next_develop_operation_id: u64,
     active_develop_operation_id: Option<u64>,
     next_develop_generation: u64,
@@ -765,6 +795,14 @@ impl App {
             bugkill_pr: None,
             develop_pr: None,
             split_pr: None,
+            next_split_operation_id: 0,
+            active_split_operation_id: None,
+            next_split_generation: 0,
+            active_split_generation: None,
+            split_cancel: None,
+            split_previous: None,
+            split_feedback: None,
+            split_corrective_error: None,
             next_develop_operation_id: 0,
             active_develop_operation_id: None,
             next_develop_generation: 0,
@@ -1548,6 +1586,15 @@ impl App {
                 .map(|screen| screen.handle_paste(&text))
                 .unwrap_or(DevelopAction::Continue);
             self.apply_develop_action(action, tx);
+            return;
+        }
+        if matches!(self.screen, Screen::SplitPullRequest) {
+            let action = self
+                .split_pr
+                .as_mut()
+                .map(|screen| screen.handle_paste(&text))
+                .unwrap_or(SplitAction::Continue);
+            self.apply_split_action(action, tx);
             return;
         }
         if matches!(self.screen, Screen::FixPullRequest) {
@@ -5416,6 +5463,12 @@ impl App {
     fn start_split_flow(&mut self, request: SplitRequest, _tx: &mpsc::UnboundedSender<AppEvent>) {
         let ai = self.current_dashboard_config().ai.split.clone();
         self.split_pr = Some(SplitPullRequestScreen::new(request, ai));
+        self.next_split_operation_id = self.next_split_operation_id.wrapping_add(1);
+        self.active_split_operation_id = Some(self.next_split_operation_id);
+        self.active_split_generation = Some(0);
+        self.split_previous = None;
+        self.split_feedback = None;
+        self.split_corrective_error = None;
         self.screen = Screen::SplitPullRequest;
     }
 
@@ -5432,6 +5485,11 @@ impl App {
         match action {
             SplitAction::Continue => {}
             SplitAction::Cancelled => {
+                if let Some(cancel) = self.split_cancel.take() {
+                    let _ = cancel.send(());
+                }
+                self.active_split_operation_id = None;
+                self.active_split_generation = None;
                 let worktree_path = self
                     .split_pr
                     .take()
@@ -5439,10 +5497,207 @@ impl App {
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             SplitAction::Confirmed(max) => {
-                // Section 3 attaches the live, stale-row-safe preflight to
-                // this state transition. Confirmation itself is mutation-free.
+                self.start_split_preflight(max, tx);
+            }
+            SplitAction::Rejected(feedback) => {
+                self.split_previous = self
+                    .split_pr
+                    .as_ref()
+                    .and_then(SplitPullRequestScreen::plan_json);
+                self.split_feedback = Some(feedback);
+                self.split_corrective_error = None;
+                self.start_split_planning(false, tx);
+            }
+            SplitAction::RetryPlanning => {
+                self.start_split_planning(true, tx);
+            }
+            SplitAction::Approved => {
+                self.start_split_approval(tx);
+            }
+        }
+    }
+
+    fn next_split_generation(&mut self) -> u64 {
+        self.next_split_generation = self.next_split_generation.wrapping_add(1);
+        self.active_split_generation = Some(self.next_split_generation);
+        self.next_split_generation
+    }
+
+    fn split_event_is_current(&self, operation_id: u64, generation: u64) -> bool {
+        self.screen == Screen::SplitPullRequest
+            && self.active_split_operation_id == Some(operation_id)
+            && self.active_split_generation == Some(generation)
+            && self.split_pr.is_some()
+    }
+
+    fn start_split_preflight(&mut self, max: u64, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(operation_id) = self.active_split_operation_id else {
+            return;
+        };
+        let Some(screen) = self.split_pr.as_mut() else {
+            return;
+        };
+        screen.start_preflight(max);
+        let request = screen.request().clone();
+        let generation = self.next_split_generation();
+        kick_off_split_preflight(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            SplitPreflightRequest {
+                worktree_path: request.worktree_path,
+                source_branch: request.branch,
+                pr_number: request.number,
+                pr_base_ref: request.pr_base_ref,
+                max,
+            },
+            operation_id,
+            generation,
+            tx.clone(),
+        );
+    }
+
+    fn start_split_planning(&mut self, corrective: bool, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if let Some(cancel) = self.split_cancel.take() {
+            let _ = cancel.send(());
+        }
+        let Some(operation_id) = self.active_split_operation_id else {
+            return;
+        };
+        let Some(preflight) = self
+            .split_pr
+            .as_ref()
+            .and_then(SplitPullRequestScreen::preflight)
+            .cloned()
+        else {
+            return;
+        };
+        let generation = self.next_split_generation();
+        if let Some(screen) = self.split_pr.as_mut() {
+            screen.start_planning(corrective);
+        }
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.split_cancel = Some(cancel_tx);
+        kick_off_split_plan(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            preflight,
+            self.split_previous.clone(),
+            self.split_feedback.clone(),
+            corrective
+                .then(|| self.split_corrective_error.clone())
+                .flatten(),
+            corrective,
+            operation_id,
+            generation,
+            cancel_rx,
+            tx.clone(),
+        );
+    }
+
+    fn start_split_approval(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(operation_id) = self.active_split_operation_id else {
+            return;
+        };
+        let Some((preflight, plan, snapshot)) = self
+            .split_pr
+            .as_ref()
+            .and_then(SplitPullRequestScreen::approval_payload)
+            .map(|(preflight, plan, snapshot)| (preflight.clone(), plan.clone(), snapshot.clone()))
+        else {
+            return;
+        };
+        if let Some(screen) = self.split_pr.as_mut() {
+            screen.start_approving();
+        }
+        let generation = self.next_split_generation();
+        kick_off_split_approval(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            preflight,
+            plan,
+            snapshot,
+            operation_id,
+            generation,
+            tx.clone(),
+        );
+    }
+
+    fn apply_split_prepared(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        result: Result<Box<SplitPreflight>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.split_event_is_current(operation_id, generation) {
+            return;
+        }
+        match result {
+            Ok(preflight) => {
                 if let Some(screen) = self.split_pr.as_mut() {
-                    screen.start_preflight(max);
+                    screen.set_preflight(*preflight);
+                }
+                self.start_split_planning(false, tx);
+            }
+            Err(message) => {
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.set_planning_error(message, false);
+                }
+            }
+        }
+    }
+
+    fn apply_split_plan_ready(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        corrective: bool,
+        result: Result<Box<SplitPlanResult>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.split_event_is_current(operation_id, generation) {
+            return;
+        }
+        self.split_cancel = None;
+        match result {
+            Ok(result) => {
+                self.split_corrective_error = None;
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.show_plan(*result);
+                }
+            }
+            Err(message) if !corrective && split_contract_error(&message) => {
+                self.split_corrective_error = Some(message);
+                self.start_split_planning(true, tx);
+            }
+            Err(message) => {
+                let retry = split_contract_error(&message);
+                self.split_corrective_error = retry.then_some(message.clone());
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.set_planning_error(message, retry);
+                }
+            }
+        }
+    }
+
+    fn apply_split_approved(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        result: Result<(), String>,
+    ) {
+        if !self.split_event_is_current(operation_id, generation) {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.mark_approved();
+                }
+            }
+            Err(message) => {
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.set_planning_error(message, true);
                 }
             }
         }
@@ -8033,6 +8288,33 @@ impl App {
                 generation,
                 result,
             } => self.apply_develop_committed(operation_id, generation, result, tx),
+            AppEvent::SplitPrepared {
+                operation_id,
+                generation,
+                result,
+            } => self.apply_split_prepared(operation_id, generation, result, tx),
+            AppEvent::SplitPlanActivity {
+                operation_id,
+                generation,
+                line,
+            } => {
+                if self.split_event_is_current(operation_id, generation) {
+                    if let Some(screen) = self.split_pr.as_mut() {
+                        screen.append_activity(line);
+                    }
+                }
+            }
+            AppEvent::SplitPlanReady {
+                operation_id,
+                generation,
+                corrective,
+                result,
+            } => self.apply_split_plan_ready(operation_id, generation, corrective, result, tx),
+            AppEvent::SplitApproved {
+                operation_id,
+                generation,
+                result,
+            } => self.apply_split_approved(operation_id, generation, result),
             AppEvent::BugkillFileWriteFailed(err) => self.show_toast(
                 ToastVariant::Warning,
                 format!("Could not write BUG_INVESTIGATION.md: {err}"),
@@ -8942,6 +9224,14 @@ impl App {
         self.bugkill_pr = None;
         self.develop_pr = None;
         self.split_pr = None;
+        if let Some(cancel) = self.split_cancel.take() {
+            let _ = cancel.send(());
+        }
+        self.active_split_operation_id = None;
+        self.active_split_generation = None;
+        self.split_previous = None;
+        self.split_feedback = None;
+        self.split_corrective_error = None;
         self.active_develop_operation_id = None;
         self.develop_watch = None;
         self.update_branch = None;
@@ -11663,6 +11953,146 @@ struct DevelopPreparePlanRequest {
     revision: Option<(String, String, Vec<ImageAttachment>)>,
     attachments: Vec<ImageAttachment>,
     corrective: bool,
+}
+
+fn kick_off_split_preflight(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    request: SplitPreflightRequest,
+    operation_id: u64,
+    generation: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::SplitPrepared {
+            operation_id,
+            generation,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .split_preflight(&request)
+            .await
+            .map(Box::new)
+            .map_err(|error| user_friendly_message(&error));
+        let _ = tx.send(AppEvent::SplitPrepared {
+            operation_id,
+            generation,
+            result,
+        });
+    });
+}
+
+// The async boundary carries the immutable run identity and frozen inputs as
+// separate owned values; grouping them would add a one-use transport type.
+#[allow(clippy::too_many_arguments)]
+fn kick_off_split_plan(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    preflight: SplitPreflight,
+    previous: Option<String>,
+    feedback: Option<String>,
+    corrective_error: Option<String>,
+    corrective: bool,
+    operation_id: u64,
+    generation: u64,
+    cancel: oneshot::Receiver<()>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::SplitPlanReady {
+            operation_id,
+            generation,
+            corrective,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
+        let event_tx = tx.clone();
+        let activity_forward = tokio::spawn(async move {
+            while let Some(line) = activity_rx.recv().await {
+                let _ = event_tx.send(AppEvent::SplitPlanActivity {
+                    operation_id,
+                    generation,
+                    line,
+                });
+            }
+        });
+        let result = service
+            .run_split_plan(
+                &preflight,
+                previous.as_deref(),
+                feedback.as_deref(),
+                corrective_error.as_deref(),
+                Some(activity_tx),
+                cancel,
+            )
+            .await
+            .map(Box::new)
+            .map_err(|error| error.to_string());
+        let _ = activity_forward.await;
+        let _ = tx.send(AppEvent::SplitPlanReady {
+            operation_id,
+            generation,
+            corrective,
+            result,
+        });
+    });
+}
+
+// Approval deliberately receives every frozen value explicitly so no live
+// screen state can be consulted after this task is spawned.
+#[allow(clippy::too_many_arguments)]
+fn kick_off_split_approval(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    preflight: SplitPreflight,
+    plan: SplitPlan,
+    snapshot: SplitRepositorySnapshot,
+    operation_id: u64,
+    generation: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::SplitApproved {
+            operation_id,
+            generation,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .approve_split_plan(&preflight, &plan, &snapshot)
+            .await
+            .map_err(|error| user_friendly_message(&error));
+        let _ = tx.send(AppEvent::SplitApproved {
+            operation_id,
+            generation,
+            result,
+        });
+    });
+}
+
+fn split_contract_error(message: &str) -> bool {
+    [
+        "Split plan must",
+        "Split responsibilities must",
+        "Split responsibility ",
+        "Split plan assigned",
+        "Split plan named",
+        "Split plan omitted",
+        "Split plan totals",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn kick_off_develop_preflight(
