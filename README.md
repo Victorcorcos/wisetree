@@ -228,6 +228,31 @@ Without the dashboard, the only way to answer "which of my five agents has somet
 
 ### Advanced Features
 
+#### Split pull request command
+
+Dashboard → Pull Request Commands → **Split** turns one large committed branch into an ordered stack of reviewable pull requests. The planner organizes layers by semantic responsibility and the Single Responsibility Principle first; `MAX` is a hard ceiling on additions plus deletions (tests included) in each parent-to-child PR diff, not a target size and not permission to cut across a responsibility. Lower PRs target the preceding dependency and the selected source branch remains unchanged as the top layer—these are stacked PRs, not sibling PRs that all target `main`.
+
+The confirmation page describes the full operation. A read-only planning AI writes a proposal to `.wisetree/split_plan.md`; Approve continues, while Reject collects feedback and regenerates the proposal with the same planner until it is approved. Configure both `dashboard.ai.split.plan` (strong semantic planner) and `dashboard.ai.split.open` (focused title/description writer). They follow the normal configuration resolution: mother-worktree `.wisetree.json`, current-worktree `.wisetree.json`, then global `~/.wisetree/settings.json`; sources are selected, never merged.
+
+```json
+{
+  "dashboard": {
+    "ai": {
+      "split": {
+        "plan": { "model": "openai/gpt-5", "thinking": "high", "harness": "opencode" },
+        "open": { "model": "openai/gpt-5-mini", "thinking": "low", "harness": "opencode" }
+      }
+    }
+  }
+}
+```
+
+Split requires an authenticated GitHub CLI and the `gh stack` preview commands (`gh stack init`, `gh stack link`, and `gh stack submit`) to be available. Publication invokes `gh stack link --base <trunk> --open <branches...>` once, with branches ordered bottom-to-top. It then verifies every live head/base/URL and applies provisional metadata before any metadata AI runs. Each final body begins with `# Description ✍️`, followed immediately by `### Split Plan 📋`: the ordered canonical URLs mark the current PR and all future dependent PRs.
+
+The durable `.wisetree/split_plan.md` records the frozen repository/remote/base/source/MAX identity, proposal and approval state, verified branches, commits and live worktree paths, publication URLs, every drafting job, metadata results, and completion. Split worktrees remain live after completion, cancellation, or failure. Starting Split again with exactly the same identity reconciles local and GitHub state and resumes the first incomplete stage: verified layers and publication are reused, valid cached drafts do not spend another AI call, and already-correct live PR metadata is not edited. If source, base, remote, MAX, a recorded branch/worktree/commit, or reviewer-edited GitHub state differs, Split reports the exact mismatch and requires reconciliation instead of overwriting it. A pre-approval cancellation leaves only the proposal; later cancellation retains every verified artifact and the plan explains what retry will reuse.
+
+Only two judgments consume AI calls: choosing SRP boundaries and drafting focused prose. Inventory, line counting, plan rendering, branch/worktree creation, commits, GitHub publication, ordered URL lists, ticket normalization, `(N/M)` title suffixes, PR-body assembly, and metadata application are deterministic and consume no AI calls.
+
 These capabilities are implemented in `wisetree` and are especially useful once you are managing real projects, pull requests, and multiple agent runs at the same time:
 
 | Advanced feature | Where to use it | What it does | Why developers care |
@@ -323,7 +348,7 @@ Dashboard sub-fields:
 
 ### AI harness configuration
 
-Every AI slot under `dashboard.ai` stores `model`, `thinking`, and `harness`. The twelve slots are `explain`, `fix.plan`, `fix.apply`, `review.strong`, `review.balanced`, `review.utility`, `update`, `bugkill.investigate`, `bugkill.fix`, `bugkill.judge`, `develop.plan`, and `develop.implement`. Omitted slots use their documented built-in defaults; an omitted `harness` in a legacy configuration means `opencode`.
+Every AI slot under `dashboard.ai` stores `model`, `thinking`, and `harness`. The fourteen slots are `explain`, `fix.plan`, `fix.apply`, `review.strong`, `review.balanced`, `review.utility`, `update`, `bugkill.investigate`, `bugkill.fix`, `bugkill.judge`, `develop.plan`, `develop.implement`, `split.plan`, and `split.open`. Omitted slots use their documented built-in defaults; an omitted `harness` in a legacy configuration means `opencode`.
 
 | Harness | Config value | Binary | Compatible model prefix | Effective permission policy |
 | --- | --- | --- | --- | --- |

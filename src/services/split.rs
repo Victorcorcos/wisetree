@@ -16,6 +16,9 @@ pub const SPLIT_PLAN_FILE: &str = ".wisetree/split_plan.md";
 pub const SPLIT_DRAFT_DIRECTORY: &str = ".wisetree/split_drafts";
 const MATERIALIZATION_MARKER: &str = "<!-- wisetree-split-materialization ";
 const PUBLICATION_MARKER: &str = "<!-- wisetree-split-publication ";
+const RUN_MARKER: &str = "<!-- wisetree-split-run ";
+const DRAFTING_MARKER: &str = "<!-- wisetree-split-drafting ";
+const SPLIT_RUN_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitPreflightRequest {
@@ -177,6 +180,26 @@ pub struct SplitDraftRecord {
     pub final_body: Option<String>,
     pub applied: bool,
     pub error: Option<String>,
+}
+
+/// Machine-readable resume identity embedded in the human-readable plan.
+/// Materialization and publication have their own records because they are
+/// updated independently after approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitRunRecord {
+    pub version: u32,
+    pub identity: SplitIdentity,
+    pub units: Vec<ChangeUnit>,
+    pub plan: SplitPlan,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitDraftingRecord {
+    pub records: Vec<SplitDraftRecord>,
+    pub completed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,6 +626,89 @@ pub fn parse_materialization(document: &str) -> Result<Option<SplitMaterializati
     serde_json::from_str(&document[json_start..json_end])
         .map(Some)
         .map_err(Into::into)
+}
+
+fn parse_marker<T: for<'de> Deserialize<'de>>(
+    document: &str,
+    marker: &str,
+    label: &str,
+) -> Result<Option<T>> {
+    let Some(start) = document.find(marker) else {
+        return Ok(None);
+    };
+    let json_start = start + marker.len();
+    let json_end = document[json_start..]
+        .find(" -->")
+        .map(|offset| json_start + offset)
+        .ok_or_else(|| WisetreeError::validation(format!("Split {label} record is truncated.")))?;
+    serde_json::from_str(&document[json_start..json_end])
+        .map(Some)
+        .map_err(|error| {
+            WisetreeError::validation(format!("Split {label} record is corrupt: {error}"))
+        })
+}
+
+pub fn parse_split_run(document: &str) -> Result<Option<SplitRunRecord>> {
+    let record = parse_marker::<SplitRunRecord>(document, RUN_MARKER, "run")?;
+    if let Some(record) = &record {
+        if record.version != SPLIT_RUN_VERSION {
+            return Err(WisetreeError::validation(format!(
+                "Split run version {} is unsupported (expected {}). Start over only after reconciling the recorded artifacts.",
+                record.version, SPLIT_RUN_VERSION
+            )));
+        }
+    }
+    Ok(record)
+}
+
+pub fn validate_split_resume(
+    document: &str,
+    preflight: &SplitPreflight,
+) -> Result<Option<SplitRunRecord>> {
+    let Some(record) = parse_split_run(document)? else {
+        return Ok(None);
+    };
+    if record.identity != preflight.identity || record.units != preflight.units {
+        return Err(WisetreeError::validation(
+            "Persisted Split input does not match the live repository, source branch, source HEAD, base SHA, remote, MAX, or change inventory. Reconcile or archive .wisetree/split_plan.md before starting over; Wisetree did not touch recorded artifacts.",
+        ));
+    }
+    parse_split_plan(&serde_json::to_string(&record.plan)?, preflight)?;
+    Ok(Some(record))
+}
+
+pub fn parse_split_drafting(document: &str) -> Result<Option<SplitDraftingRecord>> {
+    parse_marker(document, DRAFTING_MARKER, "drafting")
+}
+
+pub fn render_split_drafting(drafting: &SplitDraftingRecord) -> Result<String> {
+    let mut output = String::from(
+        "\n## PR metadata jobs\n\n| Layer | PR | Draft | Metadata update | Error |\n| ---: | ---: | --- | --- | --- |\n",
+    );
+    for record in &drafting.records {
+        output.push_str(&format!(
+            "| {} | #{} | {} | {} | {} |\n",
+            record.order,
+            record.pr_number,
+            if record.draft.is_some() {
+                "cached"
+            } else {
+                "pending"
+            },
+            if record.applied { "applied" } else { "pending" },
+            record.error.as_deref().unwrap_or("")
+        ));
+    }
+    output.push_str(&format!(
+        "\nCompletion status: **{}**\n\n{DRAFTING_MARKER}{} -->\n",
+        if drafting.completed {
+            "complete"
+        } else {
+            "incomplete; retry resumes cached work"
+        },
+        serde_json::to_string(drafting)?
+    ));
+    Ok(output)
 }
 
 pub fn render_materialization(materialization: &SplitMaterialization) -> Result<String> {
@@ -1222,5 +1328,16 @@ pub fn render_split_plan(preflight: &SplitPreflight, plan: &SplitPlan, status: &
             owners[unit.id.as_str()]
         ));
     }
+    let run = SplitRunRecord {
+        version: SPLIT_RUN_VERSION,
+        identity: preflight.identity.clone(),
+        units: preflight.units.clone(),
+        plan: plan.clone(),
+        status: status.trim().to_string(),
+    };
+    output.push_str(&format!(
+        "\n{RUN_MARKER}{} -->\n",
+        serde_json::to_string(&run).expect("Split run record is serializable")
+    ));
     output
 }

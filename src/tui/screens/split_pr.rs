@@ -12,8 +12,9 @@ use ratatui::Frame;
 use crate::config::schema::{AiModelConfig, AiSplitConfig};
 use crate::messages::colors;
 use crate::services::{
-    SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord, SplitPlan, SplitPlanResult,
-    SplitPreflight, SplitPublication, SplitRepositorySnapshot,
+    parse_materialization, SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord,
+    SplitMaterialization, SplitPlan, SplitPlanResult, SplitPreflight, SplitPublication,
+    SplitRepositorySnapshot, SPLIT_PLAN_FILE,
 };
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::widgets::{
@@ -46,6 +47,7 @@ pub enum SplitAction {
     RetryPlanning,
     RetryPublication,
     RetryDrafting,
+    Finished,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +80,8 @@ pub struct SplitPullRequestScreen {
     retry_allowed: bool,
     retry_publication: bool,
     publication: Option<SplitPublication>,
+    materialization: Option<SplitMaterialization>,
+    draft_records: Vec<SplitDraftRecord>,
     draft_jobs: Vec<SplitDraftUiJob>,
     selected_draft: usize,
     draft_row_rects: Cell<Vec<Rect>>,
@@ -126,6 +130,8 @@ impl SplitPullRequestScreen {
             retry_allowed: false,
             retry_publication: false,
             publication: None,
+            materialization: None,
+            draft_records: Vec::new(),
             draft_jobs: Vec::new(),
             selected_draft: 0,
             draft_row_rects: Cell::new(Vec::new()),
@@ -273,7 +279,7 @@ impl SplitPullRequestScreen {
     }
 
     pub fn finish_drafting(&mut self, records: Vec<SplitDraftRecord>) {
-        for record in records {
+        for record in &records {
             if let Some(job) = self
                 .draft_jobs
                 .iter_mut()
@@ -284,9 +290,17 @@ impl SplitPullRequestScreen {
                 } else {
                     SplitDraftJobStatus::Failed
                 };
-                job.error = record.error;
+                job.error = record.error.clone();
             }
         }
+        self.materialization = self.preflight.as_ref().and_then(|preflight| {
+            std::fs::read_to_string(
+                std::path::Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE),
+            )
+            .ok()
+            .and_then(|document| parse_materialization(&document).ok().flatten())
+        });
+        self.draft_records = records;
         self.error = None;
         self.step = SplitStep::Complete;
     }
@@ -454,7 +468,26 @@ impl SplitPullRequestScreen {
                 KeyCode::Esc => SplitAction::Cancelled,
                 _ => SplitAction::Continue,
             },
-            SplitStep::Complete => SplitAction::Continue,
+            SplitStep::Complete => match key.code {
+                KeyCode::Enter | KeyCode::Esc => SplitAction::Finished,
+                KeyCode::PageUp => {
+                    self.scroll = self.scroll.saturating_sub(5);
+                    SplitAction::Continue
+                }
+                KeyCode::PageDown => {
+                    self.scroll = self.scroll.saturating_add(5).min(self.max_scroll.get());
+                    SplitAction::Continue
+                }
+                KeyCode::Home => {
+                    self.scroll = 0;
+                    SplitAction::Continue
+                }
+                KeyCode::End => {
+                    self.scroll = self.max_scroll.get();
+                    SplitAction::Continue
+                }
+                _ => SplitAction::Continue,
+            },
             SplitStep::Confirm => SplitAction::Continue,
         }
     }
@@ -686,26 +719,53 @@ impl SplitPullRequestScreen {
                 let pull_requests = publication
                     .pull_requests
                     .iter()
-                    .map(|pull_request| {
+                    .enumerate()
+                    .map(|(index, pull_request)| {
+                        let layer = self
+                            .materialization
+                            .as_ref()
+                            .and_then(|materialization| materialization.layers.get(index));
+                        let record = self
+                            .draft_records
+                            .iter()
+                            .find(|record| record.order == pull_request.order);
+                        let relation = if index + 1 == publication.pull_requests.len() {
+                            "current top PR"
+                        } else {
+                            "dependency of later PRs"
+                        };
                         format!(
-                            "{}. #{} {} → {} · title applied",
+                            "{}. {} ({relation})\n   branch: {} → base: {}\n   worktree: {}\n   diff: +{} -{} · draft: {} · metadata: {}",
                             pull_request.order,
-                            pull_request.number,
+                            pull_request.url,
                             pull_request.branch,
-                            pull_request.expected_base
+                            pull_request.expected_base,
+                            layer.map(|layer| layer.worktree_path.as_str()).unwrap_or("unknown"),
+                            layer.map(|layer| layer.additions).unwrap_or(0),
+                            layer.map(|layer| layer.deletions).unwrap_or(0),
+                            if record.and_then(|record| record.draft.as_ref()).is_some() { "cached" } else { "missing" },
+                            if record.is_some_and(|record| record.applied) { "applied" } else { "incomplete" }
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    "Published and verified {} stacked pull requests (bottom to top).\n\n{pull_requests}\n\nAll canonical URLs and provisional titles are ready for drafting.",
-                    publication.pull_requests.len()
+                    "Published and verified {} stacked pull requests (bottom to top). Split complete.\nSource: +{} -{} = {} changed lines · MAX {} per layer: satisfied.\nThe selected source branch/worktree remains the unchanged top layer.\n\n{pull_requests}\n\nEnter returns to the refreshed dashboard.",
+                    publication.pull_requests.len(),
+                    self.preflight.as_ref().map(|value| value.identity.additions).unwrap_or(0),
+                    self.preflight.as_ref().map(|value| value.identity.deletions).unwrap_or(0),
+                    self.preflight.as_ref().map(|value| value.identity.additions + value.identity.deletions).unwrap_or(0),
+                    self.preflight.as_ref().map(|value| value.identity.max).unwrap_or(0),
                 )
             },
         );
+        let logical_lines = text.lines().count() as u16;
+        let max_scroll = logical_lines.saturating_sub(area.height);
+        self.max_scroll.set(max_scroll);
         frame.render_widget(
             Paragraph::new(text)
                 .style(Style::default().fg(colors::SPLIT))
+                .scroll((self.scroll.min(max_scroll), 0))
                 .wrap(Wrap { trim: true }),
             area,
         );
