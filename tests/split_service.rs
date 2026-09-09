@@ -9,9 +9,11 @@ use tokio::sync::Mutex;
 use wisetree::config::schema::DashboardConfig;
 use wisetree::services::{
     build_corrective_plan_prompt, build_split_plan_prompt, describe_snapshot_changes,
-    inventory_diff, parse_materialization, parse_numstat_totals, parse_split_plan, patch_for_units,
+    inventory_diff, parse_materialization, parse_numstat_totals, parse_publication,
+    parse_split_plan, patch_for_units, provisional_split_title, render_publication,
     render_split_plan, validate_split_manifest, ChangeUnit, ChangeUnitKind, DashboardService,
-    SplitIdentity, SplitPlan, SplitPreflight, SplitRepositorySnapshot, SplitResponsibility,
+    SplitIdentity, SplitPlan, SplitPreflight, SplitPublication, SplitPublishedPullRequest,
+    SplitRepositorySnapshot, SplitResponsibility,
 };
 
 mod support;
@@ -19,6 +21,17 @@ mod support;
 use support::{git, init_repo_with_main};
 
 static HOME_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+}
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -128,6 +141,48 @@ fn fixture() -> SplitPreflight {
             unit("CU0004", "tests/b_test.rs", 2, 0),
         ],
     }
+}
+
+#[test]
+fn provisional_titles_normalize_ticket_and_ticketless_branches() {
+    assert_eq!(
+        provisional_split_title(
+            "duv4091_save_work_orders_in_equinor_during_authorization",
+            4,
+            7
+        ),
+        "DUV-4091 Save Work Orders In Equinor During Authorization (4/7)"
+    );
+    assert_eq!(
+        provisional_split_title("feature-improve_cache-health", 2, 3),
+        "Feature Improve Cache Health (2/3)"
+    );
+    assert_eq!(provisional_split_title("duv-4091", 1, 2), "DUV-4091 (1/2)");
+}
+
+#[test]
+fn publication_record_round_trips_complete_verified_identity() {
+    let publication = SplitPublication {
+        repository: "owner/repo".into(),
+        trunk: "main".into(),
+        source_branch: "duv4091_change".into(),
+        stack_link_completed: true,
+        status: "published, verified, and provisionally titled".into(),
+        diagnostics: None,
+        pull_requests: vec![SplitPublishedPullRequest {
+            order: 1,
+            branch: "duv4091_change.1_foundation".into(),
+            expected_base: "main".into(),
+            number: 41,
+            url: "https://github.com/owner/repo/pull/41".into(),
+            provisional_title: "DUV-4091 Change (1/2)".into(),
+            provisional_title_applied: true,
+        }],
+    };
+    let rendered = render_publication(&publication).unwrap();
+    assert_eq!(parse_publication(&rendered).unwrap(), Some(publication));
+    assert!(rendered.contains("Expected base"));
+    assert!(rendered.contains("title applied") || rendered.contains("yes"));
 }
 
 #[test]
@@ -356,6 +411,62 @@ async fn materializes_shared_file_hunks_without_touching_the_source() {
         .await
         .unwrap();
 
+    let gh_log = fixture.repo.parent().unwrap().join("split-publish-gh.log");
+    let gh_path = fixture.repo.parent().unwrap().join("split-publish-gh.sh");
+    fs::write(
+        &gh_path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "stack" ] && [ "$2" = "link" ]; then exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  case "$*" in
+    *"--head feature.1_first-hunk "*) printf '[{{"number":41,"url":"https://github.com/example/repo/pull/41","state":"OPEN","isDraft":false,"headRefName":"feature.1_first-hunk","baseRefName":"main"}}]' ;;
+    *"--head feature.2_second-hunk "*) printf '[{{"number":42,"url":"https://github.com/example/repo/pull/42","state":"OPEN","isDraft":false,"headRefName":"feature.2_second-hunk","baseRefName":"feature.1_first-hunk"}}]' ;;
+    *"--head feature "*) printf '[{{"number":43,"url":"https://github.com/example/repo/pull/43","state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"feature.2_second-hunk"}}]' ;;
+  esac
+  exit 0
+fi
+exit 1
+"#,
+            log = gh_log.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+    let publishing_service =
+        DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
+            .with_gh_binary(gh_path);
+    let publication = publishing_service
+        .publish_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+    assert_eq!(publication.pull_requests.len(), 3);
+    assert!(publication
+        .pull_requests
+        .iter()
+        .all(|pull_request| pull_request.provisional_title_applied));
+    publishing_service
+        .publish_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+    let gh_calls = fs::read_to_string(&gh_log).unwrap();
+    assert_eq!(
+        gh_calls
+            .lines()
+            .filter(|line| line.starts_with("stack link "))
+            .collect::<Vec<_>>(),
+        ["stack link --base main --open feature.1_first-hunk feature.2_second-hunk feature"]
+    );
+    assert_eq!(
+        gh_calls
+            .lines()
+            .filter(|line| line.starts_with("pr edit "))
+            .count(),
+        3
+    );
+
     assert_eq!(
         git_stdout(&fixture.source, &["rev-parse", "HEAD"]),
         fixture.head
@@ -388,6 +499,16 @@ async fn materializes_shared_file_hunks_without_touching_the_source() {
     );
     let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
     let persisted = parse_materialization(&document).unwrap().unwrap();
+    let published = parse_publication(&document).unwrap().unwrap();
+    assert_eq!(
+        published.pull_requests[2].expected_base,
+        "feature.2_second-hunk"
+    );
+    assert_eq!(published.pull_requests[2].number, 43);
+    assert_eq!(
+        published.pull_requests[2].url,
+        "https://github.com/example/repo/pull/43"
+    );
     assert_eq!(persisted.layers.len(), 3);
     assert_eq!(persisted.layers[0].branch, "feature.1_first-hunk");
     assert!(persisted.layers[0].ready_for_publication);

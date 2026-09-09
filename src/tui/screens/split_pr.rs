@@ -11,7 +11,9 @@ use ratatui::Frame;
 
 use crate::config::schema::{AiModelConfig, AiSplitConfig};
 use crate::messages::colors;
-use crate::services::{SplitPlan, SplitPlanResult, SplitPreflight, SplitRepositorySnapshot};
+use crate::services::{
+    SplitPlan, SplitPlanResult, SplitPreflight, SplitPublication, SplitRepositorySnapshot,
+};
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::widgets::{
     spinner_frame, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
@@ -40,6 +42,7 @@ pub enum SplitAction {
     Approved,
     Rejected(String),
     RetryPlanning,
+    RetryPublication,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +73,8 @@ pub struct SplitPullRequestScreen {
     activity: Vec<String>,
     corrective: bool,
     retry_allowed: bool,
+    retry_publication: bool,
+    publication: Option<SplitPublication>,
     pub tick: usize,
 }
 
@@ -105,6 +110,8 @@ impl SplitPullRequestScreen {
             activity: Vec::new(),
             corrective: false,
             retry_allowed: false,
+            retry_publication: false,
+            publication: None,
             tick: 0,
         }
     }
@@ -150,6 +157,7 @@ impl SplitPullRequestScreen {
         self.step = SplitStep::Planning;
         self.corrective = corrective;
         self.retry_allowed = false;
+        self.retry_publication = false;
         self.error = None;
         self.activity.clear();
     }
@@ -190,11 +198,20 @@ impl SplitPullRequestScreen {
     pub fn set_planning_error(&mut self, message: String, retry_allowed: bool) {
         self.error = Some(message);
         self.retry_allowed = retry_allowed;
+        self.retry_publication = false;
         self.step = SplitStep::Error;
     }
 
-    pub fn mark_approved(&mut self) {
+    pub fn set_publication_error(&mut self, message: String) {
+        self.error = Some(message);
+        self.retry_allowed = true;
+        self.retry_publication = true;
+        self.step = SplitStep::Error;
+    }
+
+    pub fn mark_approved(&mut self, publication: SplitPublication) {
         self.error = None;
+        self.publication = Some(publication);
         self.step = SplitStep::Approved;
     }
 
@@ -325,6 +342,11 @@ impl SplitPullRequestScreen {
                 }
             }
             SplitStep::Error => match key.code {
+                KeyCode::Enter | KeyCode::Char('r')
+                    if self.retry_allowed && self.retry_publication =>
+                {
+                    SplitAction::RetryPublication
+                }
                 KeyCode::Enter | KeyCode::Char('r') if self.retry_allowed => {
                     SplitAction::RetryPlanning
                 }
@@ -450,19 +472,46 @@ impl SplitPullRequestScreen {
             SplitStep::Error => self.render_error(frame, area),
             SplitStep::Approving => frame.render_widget(
                 Paragraph::new(format!(
-                    "{} Revalidating identities and recording approval...",
+                    "{} Revalidating, materializing, publishing, and verifying the stack...",
                     spinner_frame(self.tick)
                 ))
                 .style(Style::default().fg(colors::SPLIT)),
                 area,
             ),
-            SplitStep::Approved => frame.render_widget(
-                Paragraph::new("Split plan approved with the frozen base and source identities. Preparing the next deterministic phase...")
-                    .style(Style::default().fg(colors::SPLIT))
-                    .wrap(Wrap { trim: true }),
-                area,
-            ),
+            SplitStep::Approved => self.render_published(frame, area),
         }
+    }
+
+    fn render_published(&self, frame: &mut Frame, area: Rect) {
+        let text = self.publication.as_ref().map_or_else(
+            || "Split publication completed.".to_string(),
+            |publication| {
+                let pull_requests = publication
+                    .pull_requests
+                    .iter()
+                    .map(|pull_request| {
+                        format!(
+                            "{}. #{} {} → {} · title applied",
+                            pull_request.order,
+                            pull_request.number,
+                            pull_request.branch,
+                            pull_request.expected_base
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "Published and verified {} stacked pull requests (bottom to top).\n\n{pull_requests}\n\nAll canonical URLs and provisional titles are ready for drafting.",
+                    publication.pull_requests.len()
+                )
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(Style::default().fg(colors::SPLIT))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
     }
 
     fn render_planning(&self, frame: &mut Frame, area: Rect) {

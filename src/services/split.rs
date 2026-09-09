@@ -14,6 +14,7 @@ use crate::errors::{Result, WisetreeError};
 pub const SPLIT_DIRECTORY: &str = ".wisetree";
 pub const SPLIT_PLAN_FILE: &str = ".wisetree/split_plan.md";
 const MATERIALIZATION_MARKER: &str = "<!-- wisetree-split-materialization ";
+const PUBLICATION_MARKER: &str = "<!-- wisetree-split-publication ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitPreflightRequest {
@@ -129,6 +130,28 @@ pub struct SplitMaterialization {
     pub source_head: String,
     pub base_sha: String,
     pub layers: Vec<SplitMaterializedLayer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitPublishedPullRequest {
+    pub order: usize,
+    pub branch: String,
+    pub expected_base: String,
+    pub number: u64,
+    pub url: String,
+    pub provisional_title: String,
+    pub provisional_title_applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitPublication {
+    pub repository: String,
+    pub trunk: String,
+    pub source_branch: String,
+    pub stack_link_completed: bool,
+    pub status: String,
+    pub diagnostics: Option<String>,
+    pub pull_requests: Vec<SplitPublishedPullRequest>,
 }
 
 pub fn split_branch_name(source: &str, order: usize, slug: &str) -> String {
@@ -262,6 +285,108 @@ pub fn render_materialization(materialization: &SplitMaterialization) -> Result<
         serde_json::to_string(materialization)?
     ));
     Ok(output)
+}
+
+pub fn parse_publication(document: &str) -> Result<Option<SplitPublication>> {
+    let Some(start) = document.find(PUBLICATION_MARKER) else {
+        return Ok(None);
+    };
+    let json_start = start + PUBLICATION_MARKER.len();
+    let json_end = document[json_start..]
+        .find(" -->")
+        .map(|offset| json_start + offset)
+        .ok_or_else(|| WisetreeError::validation("Split publication record is truncated."))?;
+    serde_json::from_str(&document[json_start..json_end])
+        .map(Some)
+        .map_err(Into::into)
+}
+
+pub fn render_publication(publication: &SplitPublication) -> Result<String> {
+    let mut output = String::from(
+        "\n## Published stack (bottom to top)\n\n| Layer | Branch | Expected base | PR | URL | Provisional title | Applied |\n| ---: | --- | --- | ---: | --- | --- | --- |\n",
+    );
+    for pull_request in &publication.pull_requests {
+        output.push_str(&format!(
+            "| {} | `{}` | `{}` | #{} | {} | {} | {} |\n",
+            pull_request.order,
+            pull_request.branch,
+            pull_request.expected_base,
+            pull_request.number,
+            pull_request.url,
+            pull_request.provisional_title,
+            if pull_request.provisional_title_applied {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+    }
+    output.push_str(&format!(
+        "\nPublication status: **{}**\n\nStack link completed: **{}**\n",
+        publication.status,
+        if publication.stack_link_completed {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    if let Some(diagnostics) = &publication.diagnostics {
+        output.push_str(&format!(
+            "\nExact diagnostics:\n\n```text\n{diagnostics}\n```\n"
+        ));
+    }
+    output.push_str(&format!(
+        "\n{PUBLICATION_MARKER}{} -->\n",
+        serde_json::to_string(publication)?
+    ));
+    Ok(output)
+}
+
+pub fn provisional_split_title(source_branch: &str, order: usize, total: usize) -> String {
+    let ticket = Regex::new(r"(?i)([a-z]+)-?(\d+)").expect("static ticket regex");
+    let (ticket, remainder) = if let Some(found) = ticket.captures(source_branch) {
+        let complete = found.get(0).expect("complete regex capture");
+        let prefix = found
+            .get(1)
+            .expect("ticket prefix")
+            .as_str()
+            .to_ascii_uppercase();
+        let number = found.get(2).expect("ticket number").as_str();
+        (
+            Some(format!("{prefix}-{number}")),
+            format!(
+                "{} {}",
+                &source_branch[..complete.start()],
+                &source_branch[complete.end()..]
+            ),
+        )
+    } else {
+        (None, source_branch.to_string())
+    };
+    let summary = remainder
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut characters = word.chars();
+            characters
+                .next()
+                .map(|first| {
+                    format!(
+                        "{}{}",
+                        first.to_uppercase(),
+                        characters.as_str().to_ascii_lowercase()
+                    )
+                })
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let stem = [ticket, (!summary.is_empty()).then_some(summary)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{stem} ({order}/{total})")
 }
 
 pub fn inventory_diff(diff: &str) -> Result<Vec<ChangeUnit>> {

@@ -51,7 +51,8 @@ use crate::services::{
     MultiSourceUpdateResult, OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding,
     ReviewPreparation, ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell,
     ShellIntegrationStatus, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
-    SplitRepositorySnapshot, UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource,
+    SplitPublication, SplitRepositorySnapshot, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
+    UpdateSource,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::image_upload::{ImageAttachment, ImageStorage};
@@ -373,7 +374,7 @@ enum AppEvent {
     SplitApproved {
         operation_id: u64,
         generation: u64,
-        result: Result<(), String>,
+        result: Result<Box<SplitPublication>, String>,
     },
     /// Result of the background fetch that powers the AI provider/model
     /// picker. The picker stays in its loading state until this lands.
@@ -5511,6 +5512,9 @@ impl App {
             SplitAction::RetryPlanning => {
                 self.start_split_planning(true, tx);
             }
+            SplitAction::RetryPublication => {
+                self.start_split_approval(tx);
+            }
             SplitAction::Approved => {
                 self.start_split_approval(tx);
             }
@@ -5684,20 +5688,20 @@ impl App {
         &mut self,
         operation_id: u64,
         generation: u64,
-        result: Result<(), String>,
+        result: Result<Box<SplitPublication>, String>,
     ) {
         if !self.split_event_is_current(operation_id, generation) {
             return;
         }
         match result {
-            Ok(()) => {
+            Ok(publication) => {
                 if let Some(screen) = self.split_pr.as_mut() {
-                    screen.mark_approved();
+                    screen.mark_approved(*publication);
                 }
             }
             Err(message) => {
                 if let Some(screen) = self.split_pr.as_mut() {
-                    screen.set_planning_error(message, true);
+                    screen.set_publication_error(message);
                 }
             }
         }
@@ -12069,10 +12073,15 @@ fn kick_off_split_approval(
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = service
-            .approve_split_plan(&preflight, &plan, &snapshot)
-            .await
-            .map_err(|error| user_friendly_message(&error));
+        let result = async {
+            service
+                .approve_split_plan(&preflight, &plan, &snapshot)
+                .await?;
+            service.publish_split_stack(&preflight, &plan).await
+        }
+        .await
+        .map(Box::new)
+        .map_err(|error| user_friendly_message(&error));
         let _ = tx.send(AppEvent::SplitApproved {
             operation_id,
             generation,
