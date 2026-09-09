@@ -13,6 +13,7 @@ use crate::errors::{Result, WisetreeError};
 
 pub const SPLIT_DIRECTORY: &str = ".wisetree";
 pub const SPLIT_PLAN_FILE: &str = ".wisetree/split_plan.md";
+pub const SPLIT_DRAFT_DIRECTORY: &str = ".wisetree/split_drafts";
 const MATERIALIZATION_MARKER: &str = "<!-- wisetree-split-materialization ";
 const PUBLICATION_MARKER: &str = "<!-- wisetree-split-publication ";
 
@@ -152,6 +153,355 @@ pub struct SplitPublication {
     pub status: String,
     pub diagnostics: Option<String>,
     pub pull_requests: Vec<SplitPublishedPullRequest>,
+}
+
+/// The deliberately small contract returned by one Split drafting call.
+/// Stack bookkeeping and template assembly remain harness-owned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitDraft {
+    pub title_summary: String,
+    pub description_content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitDraftRecord {
+    pub job_id: String,
+    pub source_head: String,
+    pub order: usize,
+    pub pr_number: u64,
+    pub pr_url: String,
+    pub correction_attempted: bool,
+    pub draft: Option<SplitDraft>,
+    pub final_title: Option<String>,
+    pub final_body: Option<String>,
+    pub applied: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDraftJobStatus {
+    Pending,
+    Drafting,
+    Correcting,
+    Drafted,
+    Applying,
+    Applied,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitDraftProgress {
+    pub operation_id: u64,
+    pub generation: u64,
+    pub layer: usize,
+    pub pr_number: u64,
+    pub status: SplitDraftJobStatus,
+    pub activity: Option<String>,
+    pub error: Option<String>,
+}
+
+pub fn split_draft_job_id(source_head: &str, order: usize, pr_number: u64) -> String {
+    let short_head = source_head.chars().take(12).collect::<String>();
+    format!("{}-layer-{order}-pr-{pr_number}", short_head)
+}
+
+pub fn split_draft_cache_path(worktree: &str, job_id: &str) -> std::path::PathBuf {
+    std::path::Path::new(worktree)
+        .join(SPLIT_DRAFT_DIRECTORY)
+        .join(format!("{job_id}.json"))
+}
+
+pub fn validate_split_publication(
+    preflight: &SplitPreflight,
+    plan: &SplitPlan,
+    publication: &SplitPublication,
+) -> Result<()> {
+    let total = plan.responsibilities.len();
+    if !publication.stack_link_completed
+        || publication.repository != preflight.identity.repository
+        || publication.source_branch != preflight.identity.source_branch
+        || publication.pull_requests.len() != total
+        || publication.diagnostics.is_some()
+        || !publication
+            .status
+            .starts_with("published, verified, and provisionally titled")
+    {
+        return Err(WisetreeError::validation(
+            "Split drafting requires the complete persisted and verified publication.",
+        ));
+    }
+    let mut numbers = BTreeSet::new();
+    let mut urls = BTreeSet::new();
+    for (index, pull_request) in publication.pull_requests.iter().enumerate() {
+        let expected_order = index + 1;
+        let expected_base = if index == 0 {
+            publication.trunk.as_str()
+        } else {
+            publication.pull_requests[index - 1].branch.as_str()
+        };
+        let expected_url = format!(
+            "https://github.com/{}/pull/{}",
+            publication.repository, pull_request.number
+        );
+        if pull_request.order != expected_order
+            || pull_request.expected_base != expected_base
+            || pull_request.url != expected_url
+            || pull_request.number == 0
+            || !pull_request.provisional_title_applied
+            || !numbers.insert(pull_request.number)
+            || !urls.insert(pull_request.url.as_str())
+        {
+            return Err(WisetreeError::validation(format!(
+                "Split PR layer {expected_order} is unresolved, unordered, or unverified."
+            )));
+        }
+    }
+    if publication
+        .pull_requests
+        .last()
+        .map(|pull_request| pull_request.branch.as_str())
+        != Some(preflight.identity.source_branch.as_str())
+    {
+        return Err(WisetreeError::validation(
+            "Split drafting requires the source branch to be the top published layer.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn build_split_open_prompt(
+    responsibility: &SplitResponsibility,
+    ticket: &str,
+    commit_log: &str,
+    diff: &str,
+    template: &str,
+) -> String {
+    include_str!("../../prompts/split_open.md")
+        .replace("RESPONSIBILITY", &responsibility.name)
+        .replace("RATIONALE", &responsibility.rationale)
+        .replace("TICKET", ticket)
+        .replace("COMMIT_LOG", commit_log)
+        .replace("VERIFIED_DIFF", diff)
+        .replace("PR_TEMPLATE", template)
+}
+
+pub fn build_corrective_split_open_prompt(prompt: &str, error: &str) -> String {
+    format!(
+        "{prompt}\n\nYour previous response failed the output contract: {}\nCorrect only that contract violation and return exactly the two-field JSON object.",
+        error.trim()
+    )
+}
+
+pub fn parse_split_draft(response: &str) -> Result<SplitDraft> {
+    let draft: SplitDraft = serde_json::from_str(response).map_err(|error| {
+        WisetreeError::validation(format!(
+            "Split draft must be exactly one JSON object matching the contract: {error}"
+        ))
+    })?;
+    let title = draft.title_summary.trim();
+    let description = draft.description_content.trim();
+    if title.is_empty() || title.lines().count() != 1 || description.is_empty() {
+        return Err(WisetreeError::validation(
+            "Split draft requires a non-empty one-line title_summary and description_content.",
+        ));
+    }
+    let forbidden = Regex::new(r"(?i)https?://|###?\s*split plan|^#\s*description")
+        .expect("static Split draft regex");
+    if forbidden.is_match(title) || forbidden.is_match(description) {
+        return Err(WisetreeError::validation(
+            "Split draft prose must not contain links or harness-owned headings.",
+        ));
+    }
+    Ok(SplitDraft {
+        title_summary: title.to_string(),
+        description_content: description.to_string(),
+    })
+}
+
+pub fn final_split_title(
+    source_branch: &str,
+    title_summary: &str,
+    order: usize,
+    total: usize,
+) -> Result<String> {
+    if order == 0 || total == 0 || order > total {
+        return Err(WisetreeError::validation(
+            "Split title requires a valid immutable layer suffix.",
+        ));
+    }
+    let numbering =
+        Regex::new(r"(?i)^\s*(?:#+\s*)?(?:\d+[.):\-]\s*)?").expect("static numbering regex");
+    let suffix = Regex::new(r"\s*\(\d+\s*/\s*\d+\)\s*").expect("static suffix regex");
+    let mut summary = numbering.replace(title_summary, "").to_string();
+    summary = suffix.replace_all(&summary, " ").to_string();
+    let ticket = normalized_ticket(source_branch).or_else(|| normalized_ticket(title_summary));
+    if let Some(ticket) = &ticket {
+        let prefix = Regex::new(&format!(r"(?i)^{}\s*[:\-–—]?\s*", regex::escape(ticket)))
+            .expect("escaped ticket regex");
+        summary = prefix.replace(&summary, "").to_string();
+    }
+    summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary.is_empty() {
+        return Err(WisetreeError::validation(
+            "Split draft title is empty after deterministic normalization.",
+        ));
+    }
+    let stem = ticket.map_or(summary.clone(), |ticket| format!("{ticket} {summary}"));
+    Ok(format!("{stem} ({order}/{total})"))
+}
+
+pub fn compose_split_body(
+    template: &str,
+    prose: &str,
+    pull_requests: &[SplitPublishedPullRequest],
+    current_order: usize,
+) -> Result<String> {
+    if prose.trim().is_empty() || current_order == 0 || current_order > pull_requests.len() {
+        return Err(WisetreeError::validation(
+            "Split body requires description prose and a valid current PR.",
+        ));
+    }
+    if Regex::new(r"(?i)https?://").unwrap().is_match(prose) {
+        return Err(WisetreeError::validation(
+            "Split AI description prose must not invent links.",
+        ));
+    }
+    let lines = template.lines().collect::<Vec<_>>();
+    let descriptions = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| is_description_heading(line))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if descriptions.len() > 1 {
+        return Err(WisetreeError::validation(
+            "The pull-request template has duplicate Description headings; repair it before Split.",
+        ));
+    }
+    if template
+        .lines()
+        .filter(|line| {
+            line.trim()
+                .to_ascii_lowercase()
+                .starts_with("### split plan")
+        })
+        .count()
+        > 0
+    {
+        return Err(WisetreeError::validation(
+            "The pull-request template already contains a Split Plan subsection.",
+        ));
+    }
+    let mut plan = String::from("### Split Plan 📋\n\n");
+    for (index, pull_request) in pull_requests.iter().enumerate() {
+        let marker = if index + 1 == current_order {
+            " **(current PR)**"
+        } else if index + 1 > current_order {
+            " **(future PR)**"
+        } else {
+            ""
+        };
+        plan.push_str(&format!("{}. {}{}\n", index + 1, pull_request.url, marker));
+    }
+    let body = if let Some(description_index) = descriptions.first().copied() {
+        let next_heading = lines[description_index + 1..]
+            .iter()
+            .position(|line| is_h1_heading(line))
+            .map(|offset| description_index + 1 + offset)
+            .unwrap_or(lines.len());
+        let before = lines[..description_index].join("\n");
+        let after = lines[next_heading..].join("\n");
+        [
+            (!before.trim().is_empty()).then_some(before.trim_end().to_string()),
+            Some("# Description ✍️".to_string()),
+            Some(plan.trim_end().to_string()),
+            Some(prose.trim().to_string()),
+            (!after.trim().is_empty()).then_some(after.trim_start().to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n")
+    } else {
+        [
+            "# Description ✍️".to_string(),
+            plan.trim_end().to_string(),
+            prose.trim().to_string(),
+            template.trim().to_string(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+    };
+    validate_split_body(&body, pull_requests, current_order)?;
+    Ok(format!("{}\n", body.trim_end()))
+}
+
+pub fn validate_split_body(
+    body: &str,
+    pull_requests: &[SplitPublishedPullRequest],
+    current_order: usize,
+) -> Result<()> {
+    let descriptions = body
+        .lines()
+        .filter(|line| is_description_heading(line))
+        .count();
+    let plans = body
+        .lines()
+        .filter(|line| line.trim() == "### Split Plan 📋")
+        .count();
+    if descriptions != 1 || plans != 1 {
+        return Err(WisetreeError::validation(
+            "Split body must contain exactly one Description and one Split Plan heading.",
+        ));
+    }
+    for (index, pull_request) in pull_requests.iter().enumerate() {
+        if body.matches(&pull_request.url).count() != 1 {
+            return Err(WisetreeError::validation(format!(
+                "Split body must contain PR URL {} exactly once.",
+                pull_request.url
+            )));
+        }
+        let expected = if index + 1 == current_order {
+            format!("{}. {} **(current PR)**", index + 1, pull_request.url)
+        } else if index + 1 > current_order {
+            format!("{}. {} **(future PR)**", index + 1, pull_request.url)
+        } else {
+            format!("{}. {}", index + 1, pull_request.url)
+        };
+        if !body.lines().any(|line| line == expected) {
+            return Err(WisetreeError::validation(
+                "Split body contains an incorrect current/future marker or URL order.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_ticket(branch: &str) -> Option<String> {
+    let ticket = Regex::new(r"(?i)([a-z]+)-?(\d+)").expect("static ticket regex");
+    let captures = ticket.captures(branch)?;
+    Some(format!(
+        "{}-{}",
+        captures.get(1)?.as_str().to_ascii_uppercase(),
+        captures.get(2)?.as_str()
+    ))
+}
+
+fn is_h1_heading(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("# ") && !trimmed.starts_with("## ")
+}
+
+fn is_description_heading(line: &str) -> bool {
+    let trimmed = line.trim();
+    is_h1_heading(trimmed)
+        && trimmed[2..]
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("description")
 }
 
 pub fn split_branch_name(source: &str, order: usize, slug: &str) -> String {

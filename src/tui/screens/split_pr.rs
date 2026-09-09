@@ -12,7 +12,8 @@ use ratatui::Frame;
 use crate::config::schema::{AiModelConfig, AiSplitConfig};
 use crate::messages::colors;
 use crate::services::{
-    SplitPlan, SplitPlanResult, SplitPreflight, SplitPublication, SplitRepositorySnapshot,
+    SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord, SplitPlan, SplitPlanResult,
+    SplitPreflight, SplitPublication, SplitRepositorySnapshot,
 };
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::widgets::{
@@ -31,7 +32,8 @@ pub enum SplitStep {
     Feedback,
     Error,
     Approving,
-    Approved,
+    Drafting,
+    Complete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +45,7 @@ pub enum SplitAction {
     Rejected(String),
     RetryPlanning,
     RetryPublication,
+    RetryDrafting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +78,18 @@ pub struct SplitPullRequestScreen {
     retry_allowed: bool,
     retry_publication: bool,
     publication: Option<SplitPublication>,
+    draft_jobs: Vec<SplitDraftUiJob>,
+    selected_draft: usize,
+    draft_row_rects: Cell<Vec<Rect>>,
     pub tick: usize,
+}
+
+struct SplitDraftUiJob {
+    layer: usize,
+    pr_number: u64,
+    status: SplitDraftJobStatus,
+    activity: Vec<String>,
+    error: Option<String>,
 }
 
 impl SplitPullRequestScreen {
@@ -112,6 +126,9 @@ impl SplitPullRequestScreen {
             retry_allowed: false,
             retry_publication: false,
             publication: None,
+            draft_jobs: Vec::new(),
+            selected_draft: 0,
+            draft_row_rects: Cell::new(Vec::new()),
             tick: 0,
         }
     }
@@ -211,8 +228,74 @@ impl SplitPullRequestScreen {
 
     pub fn mark_approved(&mut self, publication: SplitPublication) {
         self.error = None;
+        self.draft_jobs = publication
+            .pull_requests
+            .iter()
+            .map(|pull_request| SplitDraftUiJob {
+                layer: pull_request.order,
+                pr_number: pull_request.number,
+                status: SplitDraftJobStatus::Pending,
+                activity: Vec::new(),
+                error: None,
+            })
+            .collect();
         self.publication = Some(publication);
-        self.step = SplitStep::Approved;
+        self.selected_draft = 0;
+        self.step = SplitStep::Drafting;
+    }
+
+    pub fn publication(&self) -> Option<&SplitPublication> {
+        self.publication.as_ref()
+    }
+
+    pub fn resume_drafting(&mut self) {
+        self.error = None;
+        self.retry_allowed = false;
+        self.step = SplitStep::Drafting;
+    }
+
+    pub fn update_draft_progress(&mut self, event: SplitDraftProgress) {
+        let Some(job) = self
+            .draft_jobs
+            .iter_mut()
+            .find(|job| job.layer == event.layer && job.pr_number == event.pr_number)
+        else {
+            return;
+        };
+        job.status = event.status;
+        job.error = event.error;
+        if let Some(activity) = event.activity {
+            if job.activity.len() == 200 {
+                job.activity.remove(0);
+            }
+            job.activity.push(activity);
+        }
+    }
+
+    pub fn finish_drafting(&mut self, records: Vec<SplitDraftRecord>) {
+        for record in records {
+            if let Some(job) = self
+                .draft_jobs
+                .iter_mut()
+                .find(|job| job.layer == record.order && job.pr_number == record.pr_number)
+            {
+                job.status = if record.applied {
+                    SplitDraftJobStatus::Applied
+                } else {
+                    SplitDraftJobStatus::Failed
+                };
+                job.error = record.error;
+            }
+        }
+        self.error = None;
+        self.step = SplitStep::Complete;
+    }
+
+    pub fn set_drafting_error(&mut self, message: String) {
+        self.error = Some(message);
+        self.retry_allowed = true;
+        self.retry_publication = false;
+        self.step = SplitStep::Error;
     }
 
     pub fn start_approving(&mut self) {
@@ -278,11 +361,25 @@ impl SplitPullRequestScreen {
 
     fn handle_flow_key(&mut self, key: KeyEvent) -> SplitAction {
         match self.step {
-            SplitStep::Preflight | SplitStep::Planning => match key.code {
+            SplitStep::Preflight | SplitStep::Planning | SplitStep::Approving => match key.code {
                 KeyCode::Esc => SplitAction::Cancelled,
                 _ => SplitAction::Continue,
             },
-            SplitStep::Approving => SplitAction::Continue,
+            SplitStep::Drafting => match key.code {
+                KeyCode::Esc => SplitAction::Cancelled,
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.selected_draft = self.selected_draft.saturating_sub(1);
+                    SplitAction::Continue
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    if !self.draft_jobs.is_empty() {
+                        self.selected_draft =
+                            (self.selected_draft + 1).min(self.draft_jobs.len() - 1);
+                    }
+                    SplitAction::Continue
+                }
+                _ => SplitAction::Continue,
+            },
             SplitStep::Review => match key.code {
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                     self.review_focus = 1 - self.review_focus;
@@ -348,12 +445,16 @@ impl SplitPullRequestScreen {
                     SplitAction::RetryPublication
                 }
                 KeyCode::Enter | KeyCode::Char('r') if self.retry_allowed => {
-                    SplitAction::RetryPlanning
+                    if self.publication.is_some() {
+                        SplitAction::RetryDrafting
+                    } else {
+                        SplitAction::RetryPlanning
+                    }
                 }
                 KeyCode::Esc => SplitAction::Cancelled,
                 _ => SplitAction::Continue,
             },
-            SplitStep::Approved => SplitAction::Continue,
+            SplitStep::Complete => SplitAction::Continue,
             SplitStep::Confirm => SplitAction::Continue,
         }
     }
@@ -368,6 +469,17 @@ impl SplitPullRequestScreen {
     }
 
     pub fn handle_mouse_click(&mut self, position: Position) -> SplitAction {
+        if self.step == SplitStep::Drafting {
+            if let Some(index) = self
+                .draft_row_rects
+                .take()
+                .iter()
+                .position(|area| contains(*area, position))
+            {
+                self.selected_draft = index;
+            }
+            return SplitAction::Continue;
+        }
         if self.step == SplitStep::Review {
             if contains(self.approve_rect.get(), position) {
                 self.review_focus = 0;
@@ -478,8 +590,93 @@ impl SplitPullRequestScreen {
                 .style(Style::default().fg(colors::SPLIT)),
                 area,
             ),
-            SplitStep::Approved => self.render_published(frame, area),
+            SplitStep::Drafting => self.render_drafting(frame, area),
+            SplitStep::Complete => self.render_published(frame, area),
         }
+    }
+
+    fn render_drafting(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(self.draft_jobs.len() as u16),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let completed = self
+            .draft_jobs
+            .iter()
+            .filter(|job| {
+                matches!(
+                    job.status,
+                    SplitDraftJobStatus::Drafted
+                        | SplitDraftJobStatus::Applying
+                        | SplitDraftJobStatus::Applied
+                )
+            })
+            .count();
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} Split metadata · {completed}/{} completed",
+                spinner_frame(self.tick),
+                self.draft_jobs.len()
+            ))
+            .style(Style::default().fg(colors::SPLIT)),
+            chunks[0],
+        );
+        let mut row_rects = Vec::new();
+        let rows = self
+            .draft_jobs
+            .iter()
+            .enumerate()
+            .map(|(index, job)| {
+                row_rects.push(Rect::new(
+                    chunks[1].x,
+                    chunks[1].y + index as u16,
+                    chunks[1].width,
+                    1,
+                ));
+                let marker = if index == self.selected_draft {
+                    ">"
+                } else {
+                    " "
+                };
+                Line::from(format!(
+                    "{marker} {}. PR #{} · {:?}",
+                    job.layer, job.pr_number, job.status
+                ))
+            })
+            .collect::<Vec<_>>();
+        self.draft_row_rects.set(row_rects);
+        frame.render_widget(Paragraph::new(rows), chunks[1]);
+        let activity = self.draft_jobs.get(self.selected_draft).map_or_else(
+            || "Waiting for draft jobs...".to_string(),
+            |job| {
+                if job.activity.is_empty() {
+                    job.error
+                        .clone()
+                        .unwrap_or_else(|| "Launching the selected drafting AI...".to_string())
+                } else {
+                    job.activity.join("\n")
+                }
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(activity).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(colors::SPLIT))
+                    .title(" AI Activity "),
+            ),
+            chunks[2],
+        );
+        frame.render_widget(
+            Paragraph::new("↑/↓ or Tab switch PR stream · Esc cancel"),
+            chunks[3],
+        );
     }
 
     fn render_published(&self, frame: &mut Frame, area: Rect) {
