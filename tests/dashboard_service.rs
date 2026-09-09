@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
-use wisetree::config::schema::DashboardConfig;
+use wisetree::config::schema::{AiHarness, DashboardConfig};
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::services::{
     is_behind, resolve_base_ref, CheckStatus, DashboardNoticeLevel, DashboardRow, DashboardService,
     ExplainSubmitOutcome, ExplainSubmitRequest, MergeStatus, PrState, PullRequest,
+    SplitPreflightRequest,
 };
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
@@ -1022,4 +1023,69 @@ fn is_behind_true_when_merge_status_behind_with_zero_count() {
     // hasn't been refreshed yet. We still surface the option.
     let row = row_with(Some(MergeStatus::Behind), Some(0));
     assert!(is_behind(&row));
+}
+
+#[tokio::test]
+async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() {
+    let fixture = repo_with_worktree();
+    let worktree = fixture.repo.parent().unwrap().join("repo-feature");
+    fs::write(worktree.join("feature.rs"), "fn feature() {}\n").unwrap();
+    git(&worktree, &["add", "feature.rs"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    let base = rev_parse_head(&fixture.repo);
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/remotes/origin/main", &base],
+    );
+
+    let parent = fixture.repo.parent().unwrap();
+    let git_path = parent.join("split-git.sh");
+    fs::write(
+        &git_path,
+        "#!/bin/sh\nif [ \"$1\" = \"fetch\" ]; then exit 0; fi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    make_executable(&git_path);
+    let gh_log = parent.join("split-gh.log");
+    let gh_path = parent.join("split-gh.sh");
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"view\" ] && [ \"$3\" = \"--json\" ]; then printf '[]'; fi\nexit 0\n",
+            gh_log.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+    let ai_path = parent.join("split-ai.sh");
+    fs::write(&ai_path, "#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&ai_path);
+
+    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
+        .with_git_binary(git_path)
+        .with_gh_binary(gh_path)
+        .with_ai_binary(AiHarness::OpenCode, ai_path);
+    let preflight = service
+        .split_preflight(&SplitPreflightRequest {
+            worktree_path: worktree.to_string_lossy().to_string(),
+            source_branch: "feat-dashboard".to_string(),
+            pr_number: None,
+            pr_base_ref: None,
+            max: 100,
+        })
+        .await
+        .expect("split preflight");
+    assert_eq!(preflight.identity.repository, "example/repo");
+    assert_eq!(preflight.identity.base_ref, "origin/main");
+    assert_eq!(preflight.identity.source_branch, "feat-dashboard");
+    assert_eq!(preflight.units.len(), 1);
+    assert!(worktree.join(".wisetree").is_dir());
+
+    let log = fs::read_to_string(gh_log).unwrap();
+    assert!(log.contains("auth status --hostname github.com"), "{log}");
+    assert!(log.contains("stack init --help"), "{log}");
+    assert!(log.contains("stack link --help"), "{log}");
+    assert!(log.contains("stack submit --help"), "{log}");
+    assert!(!log.contains("stack init feat"), "{log}");
+    assert!(!log.contains("stack link feat"), "{log}");
 }

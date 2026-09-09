@@ -19,6 +19,7 @@ pub(crate) mod reviewer_evidence;
 pub(crate) mod reviewer_routing;
 pub(crate) mod reviewer_tests;
 pub mod shell_integration;
+pub mod split;
 pub mod update;
 
 pub use ai_models::{
@@ -69,6 +70,12 @@ pub use review_telemetry::{
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,
+};
+pub use split::{
+    build_plan_prompt as build_split_plan_prompt, inventory_diff, parse_numstat_totals,
+    parse_split_plan, render_split_plan, validate_manifest as validate_split_manifest, ChangeUnit,
+    ChangeUnitKind, SplitIdentity, SplitPlan, SplitPreflight, SplitPreflightRequest,
+    SplitResponsibility, SPLIT_DIRECTORY, SPLIT_PLAN_FILE,
 };
 pub use update::{
     check_for_updates, check_for_updates_all_sources, get_cached_update_status,

@@ -45,6 +45,11 @@ use crate::services::reviewer_routing::{relationship_groups, ReviewRouteFile};
 use crate::services::reviewer_tests::{
     build_coverage_ledger, ReviewCoverageInput, ReviewCoverageLedger,
 };
+use crate::services::split::{
+    build_plan_prompt as build_split_plan_prompt, inventory_diff, parse_numstat_totals,
+    render_split_plan, validate_manifest as validate_split_manifest, SplitIdentity, SplitPlan,
+    SplitPreflight, SplitPreflightRequest, SPLIT_DIRECTORY, SPLIT_PLAN_FILE,
+};
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
@@ -5547,6 +5552,332 @@ impl DashboardService {
     // AI is called in exactly two places: plan (once per revision, live TUI
     // watched by the turn watcher) and implement (one run per section on a
     // Ralph Loop, or a single run for the whole plan). Everything else —
+    // ── "Split" pipeline ───────────────────────────────────────────────
+
+    /// Freeze the source/base identities and inventory the complete committed
+    /// diff before any planning tokens are spent. The only writes are a ref
+    /// refresh and creation of Split's harness-owned artifact directory.
+    pub async fn split_preflight(&self, request: &SplitPreflightRequest) -> Result<SplitPreflight> {
+        if request.max == 0 {
+            return Err(WisetreeError::validation("Split MAX must be positive."));
+        }
+        let cwd = PathBuf::from(&request.worktree_path);
+        let runner = self.ai_runner();
+        for (slot, config) in [
+            ("dashboard.ai.split.plan", &self.config.ai.split.plan),
+            ("dashboard.ai.split.open", &self.config.ai.split.open),
+        ] {
+            runner
+                .preflight(&AiRunRequest {
+                    slot: slot.to_string(),
+                    config: config.clone(),
+                    prompt: String::new(),
+                    cwd: cwd.clone(),
+                    mode: AiRunMode::Captured,
+                    permission: AiPermission::Plan,
+                    timeout: Duration::from_secs(1),
+                    activity_limit: 1,
+                    session_title: None,
+                    attachments: Vec::new(),
+                })
+                .await?;
+        }
+        let status = run_command(
+            &self.git_binary,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            Some(&cwd),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        let dirty = status
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .filter(|entry| entry.get(3..) != Some(SPLIT_PLAN_FILE))
+            .collect::<Vec<_>>();
+        if !dirty.is_empty() {
+            return Err(WisetreeError::validation(format!(
+                "Split requires a clean committed source. Commit or stash these changes first: {}",
+                dirty.join(", ")
+            )));
+        }
+        tokio::fs::create_dir_all(cwd.join(SPLIT_DIRECTORY)).await?;
+        let source_branch = run_command(
+            &self.git_binary,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            Some(&cwd),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        if source_branch == "HEAD" || source_branch != request.source_branch {
+            return Err(WisetreeError::validation(format!(
+                "Split source branch changed from `{}` to `{source_branch}`; return to the dashboard and retry.",
+                request.source_branch
+            )));
+        }
+        let source_head = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+
+        self.require_gh()?;
+        run_command(
+            &self.gh_binary,
+            &["auth", "status", "--hostname", "github.com"],
+            Some(&cwd),
+        )
+        .await
+        .map_err(|error| {
+            WisetreeError::validation(format!(
+                "GitHub authentication failed; run `gh auth login`: {error}"
+            ))
+        })?;
+        for command in ["init", "add", "view", "link", "submit"] {
+            run_command(
+                &self.gh_binary,
+                &["stack", command, "--help"],
+                Some(&cwd),
+            )
+            .await
+            .map_err(|error| {
+                WisetreeError::validation(format!(
+                    "Official `gh stack {command}` is unavailable. Install or update the `github/gh-stack` extension: {error}"
+                ))
+            })?;
+        }
+        if let Ok(output) =
+            run_command(&self.gh_binary, &["stack", "view", "--json"], Some(&cwd)).await
+        {
+            let trimmed = output.trim();
+            if !trimmed.is_empty() && !matches!(trimmed, "null" | "[]" | "{}") {
+                return Err(WisetreeError::validation(
+                    "The source branch already belongs to an active GitHub stack. Unstack it or select an unstacked branch before using Split.",
+                ));
+            }
+        }
+
+        let pr_metadata = if let Some(number) = request.pr_number {
+            let number = number.to_string();
+            let raw = run_command(
+                &self.gh_binary,
+                &[
+                    "pr",
+                    "view",
+                    &number,
+                    "--json",
+                    "url,baseRefName,headRefOid,state",
+                ],
+                Some(&cwd),
+            )
+            .await
+            .map_err(|error| {
+                WisetreeError::validation(format!(
+                    "Could not revalidate source pull request #{number}: {error}"
+                ))
+            })?;
+            Some(parse_split_pr_metadata(&raw)?)
+        } else {
+            None
+        };
+        if let Some(metadata) = &pr_metadata {
+            if metadata.state != "OPEN" || metadata.head_ref_oid != source_head {
+                return Err(WisetreeError::validation(
+                    "The source pull request is no longer open at the selected source HEAD; refresh the dashboard before planning.",
+                ));
+            }
+        }
+
+        run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd))
+            .await
+            .map_err(|error| {
+                WisetreeError::validation(format!(
+                    "Split could not refresh repository refs before planning: {error}"
+                ))
+            })?;
+        let base_hint = pr_metadata
+            .as_ref()
+            .map(|metadata| metadata.base_ref_name.as_str())
+            .or(request.pr_base_ref.as_deref());
+        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd, base_hint)
+            .await
+            .ok_or_else(|| {
+                WisetreeError::validation(
+                    "Split could not resolve the existing PR base, tracked base, or a supported trunk ref.",
+                )
+            })?;
+        let base_sha = run_command(&self.git_binary, &["rev-parse", &base_ref], Some(&cwd))
+            .await
+            .map_err(|_| {
+                WisetreeError::validation(format!(
+                    "Split base ref `{base_ref}` moved or disappeared during preflight."
+                ))
+            })?;
+        let (remote, _) = base_ref.split_once('/').ok_or_else(|| {
+            WisetreeError::validation(format!(
+                "Split base `{base_ref}` is not a remote-tracking ref."
+            ))
+        })?;
+        let remote_url = run_command(&self.git_binary, &["remote", "get-url", remote], Some(&cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+        let (owner, repo) = parse_github_slug(&remote_url).ok_or_else(|| {
+            WisetreeError::validation(
+                "Split supports GitHub repositories only; the resolved base remote is not github.com.",
+            )
+        })?;
+        let repository = format!("{owner}/{repo}");
+        if let Some(metadata) = &pr_metadata {
+            let pr_repository = parse_github_slug(&metadata.url)
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
+                .ok_or_else(|| WisetreeError::validation("Source PR URL is not a GitHub URL."))?;
+            if pr_repository != repository {
+                return Err(WisetreeError::validation(
+                    "GitHub stacks require every branch and pull request to use the same repository; cross-fork stacks are unsupported.",
+                ));
+            }
+        }
+        let remote_source = format!("refs/remotes/{remote}/{source_branch}");
+        if let Ok(remote_head) = run_command(
+            &self.git_binary,
+            &["rev-parse", "--verify", "--quiet", &remote_source],
+            Some(&cwd),
+        )
+        .await
+        {
+            let counts = run_command(
+                &self.git_binary,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{remote_head}...{source_head}"),
+                ],
+                Some(&cwd),
+            )
+            .await
+            .map_err(WisetreeError::other)?;
+            let remote_only = counts
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if remote_only > 0 {
+                return Err(WisetreeError::validation(
+                    "The remote source branch has commits absent from the selected source HEAD. Synchronize it before Split.",
+                ));
+            }
+        }
+        let range = format!("{base_sha}..{source_head}");
+        let diff = run_command(
+            &self.git_binary,
+            &[
+                "diff",
+                "--binary",
+                "--full-index",
+                "--find-renames",
+                "--unified=0",
+                "--no-color",
+                "--no-ext-diff",
+                &range,
+            ],
+            Some(&cwd),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        let units = inventory_diff(&diff)?;
+        let numstat = run_command(
+            &self.git_binary,
+            &["diff", "--numstat", "-z", "--find-renames", &range],
+            Some(&cwd),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        let (additions, deletions) = parse_numstat_totals(&numstat);
+        let identity = SplitIdentity {
+            repository,
+            remote: remote.to_string(),
+            base_ref,
+            base_sha,
+            source_branch,
+            source_head,
+            max: request.max,
+            additions,
+            deletions,
+        };
+        validate_split_manifest(&identity, &units)?;
+        let final_base = run_command(
+            &self.git_binary,
+            &["rev-parse", &identity.base_ref],
+            Some(&cwd),
+        )
+        .await
+        .map_err(|_| {
+            WisetreeError::validation(
+                "The resolved Split base disappeared during preflight; retry from the dashboard.",
+            )
+        })?;
+        if final_base != identity.base_sha {
+            return Err(WisetreeError::validation(
+                "The resolved Split base moved during preflight; retry from the dashboard.",
+            ));
+        }
+        let final_head = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+        if final_head != identity.source_head {
+            return Err(WisetreeError::validation(
+                "Source HEAD changed during Split preflight; retry from the dashboard.",
+            ));
+        }
+        Ok(SplitPreflight {
+            worktree_path: request.worktree_path.clone(),
+            identity,
+            units,
+        })
+    }
+
+    /// Construct the read-only planning handoff from an already-frozen
+    /// preflight. Revision context is included only as a complete pair.
+    pub async fn prepare_split_plan(
+        &self,
+        preflight: &SplitPreflight,
+        previous_proposal: Option<&str>,
+        feedback: Option<&str>,
+    ) -> Result<AiCommand> {
+        let revision = previous_proposal.zip(feedback);
+        let prompt = build_split_plan_prompt(
+            preflight,
+            revision.map(|(proposal, _)| proposal),
+            revision.map(|(_, feedback)| feedback),
+        );
+        self.ai_command(
+            "dashboard.ai.split.plan",
+            &self.config.ai.split.plan,
+            prompt,
+            PathBuf::from(&preflight.worktree_path),
+            AiRunMode::Interactive,
+            AiPermission::Plan,
+        )
+        .await
+    }
+
+    /// Render and persist the validated proposal. The AI never receives write
+    /// permission and never chooses the artifact's formatting or status.
+    pub async fn save_split_plan(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+        status: &str,
+    ) -> Result<()> {
+        crate::services::split::parse_split_plan(&serde_json::to_string(plan)?, preflight)?;
+        tokio::fs::create_dir_all(Path::new(&preflight.worktree_path).join(SPLIT_DIRECTORY))
+            .await?;
+        tokio::fs::write(
+            Path::new(&preflight.worktree_path).join(SPLIT_PLAN_FILE),
+            render_split_plan(preflight, plan, status),
+        )
+        .await?;
+        Ok(())
+    }
+
     // gates, PLAN.md rendering/parsing, progress tracking, the approval
     // loop — is deterministic Rust. The AI never reads or writes PLAN.md.
 
@@ -6664,6 +6995,32 @@ fn parse_pr_repo_json(body: &str) -> Option<(String, String)> {
     }
     let parsed: PrUrlJson = serde_json::from_str(body).ok()?;
     parse_github_slug(&parsed.url)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SplitPrMetadata {
+    url: String,
+    base_ref_name: String,
+    head_ref_oid: String,
+    state: String,
+}
+
+fn parse_split_pr_metadata(body: &str) -> Result<SplitPrMetadata> {
+    let metadata: SplitPrMetadata = serde_json::from_str(body).map_err(|error| {
+        WisetreeError::validation(format!(
+            "GitHub returned invalid source pull-request metadata: {error}"
+        ))
+    })?;
+    if metadata.url.trim().is_empty()
+        || metadata.base_ref_name.trim().is_empty()
+        || metadata.head_ref_oid.trim().is_empty()
+    {
+        return Err(WisetreeError::validation(
+            "GitHub source pull-request metadata is incomplete.",
+        ));
+    }
+    Ok(metadata)
 }
 
 fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
