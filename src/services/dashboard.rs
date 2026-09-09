@@ -46,9 +46,11 @@ use crate::services::reviewer_tests::{
     build_coverage_ledger, ReviewCoverageInput, ReviewCoverageLedger,
 };
 use crate::services::split::{
-    build_plan_prompt as build_split_plan_prompt, inventory_diff, parse_numstat_totals,
-    render_split_plan, validate_manifest as validate_split_manifest, SplitIdentity, SplitPlan,
-    SplitPreflight, SplitPreflightRequest, SPLIT_DIRECTORY, SPLIT_PLAN_FILE,
+    build_corrective_plan_prompt, build_plan_prompt as build_split_plan_prompt,
+    describe_snapshot_changes, inventory_diff, parse_numstat_totals, render_split_plan,
+    validate_manifest as validate_split_manifest, SplitIdentity, SplitPlan, SplitPlanResult,
+    SplitPreflight, SplitPreflightRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY,
+    SPLIT_PLAN_FILE,
 };
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 
@@ -5857,6 +5859,124 @@ impl DashboardService {
             AiPermission::Plan,
         )
         .await
+    }
+
+    pub async fn snapshot_split_repository(
+        &self,
+        preflight: &SplitPreflight,
+    ) -> Result<SplitRepositorySnapshot> {
+        let cwd = Path::new(&preflight.worktree_path);
+        let status = run_command(
+            &self.git_binary,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            Some(cwd),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        let head = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(cwd))
+            .await
+            .map_err(WisetreeError::other)?;
+        let refs = run_command(
+            &self.git_binary,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/remotes",
+            ],
+            Some(cwd),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        let mut paths = preflight
+            .units
+            .iter()
+            .flat_map(|unit| [Some(unit.path.as_str()), unit.old_path.as_deref()])
+            .flatten()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        paths.insert(SPLIT_PLAN_FILE.to_string());
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let absolute = cwd.join(&path);
+            let contents = match tokio::fs::read(&absolute).await {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            files.push((path, contents));
+        }
+        Ok(SplitRepositorySnapshot {
+            status,
+            head,
+            refs,
+            files,
+        })
+    }
+
+    pub async fn run_split_plan(
+        &self,
+        preflight: &SplitPreflight,
+        previous_proposal: Option<&str>,
+        feedback: Option<&str>,
+        corrective_error: Option<&str>,
+        activity_tx: Option<mpsc::UnboundedSender<String>>,
+        cancel: oneshot::Receiver<()>,
+    ) -> Result<SplitPlanResult> {
+        let before = self.snapshot_split_repository(preflight).await?;
+        let mut prompt = build_split_plan_prompt(preflight, previous_proposal, feedback);
+        if let Some(error) = corrective_error {
+            prompt = build_corrective_plan_prompt(&prompt, error);
+        }
+        let run = self
+            .ai_runner()
+            .run_captured(
+                &AiRunRequest {
+                    slot: "dashboard.ai.split.plan".to_string(),
+                    config: self.config.ai.split.plan.clone(),
+                    prompt,
+                    cwd: PathBuf::from(&preflight.worktree_path),
+                    mode: AiRunMode::Captured,
+                    permission: AiPermission::Plan,
+                    timeout: Duration::from_secs(300),
+                    activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
+                    session_title: Some("wisetree split plan".to_string()),
+                    attachments: Vec::new(),
+                },
+                activity_tx,
+                cancel,
+            )
+            .await?;
+        let after = self.snapshot_split_repository(preflight).await?;
+        let changes = describe_snapshot_changes(&before, &after);
+        if !changes.is_empty() {
+            return Err(WisetreeError::validation(format!(
+                "Split rejected planning output because the repository mutated: {}.",
+                changes.join(", ")
+            )));
+        }
+        let plan = crate::services::split::parse_split_plan(&run.transcript, preflight)?;
+        self.save_split_plan(preflight, &plan, "awaiting approval")
+            .await?;
+        let snapshot = self.snapshot_split_repository(preflight).await?;
+        Ok(SplitPlanResult { plan, snapshot })
+    }
+
+    pub async fn approve_split_plan(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+        expected: &SplitRepositorySnapshot,
+    ) -> Result<()> {
+        let current = self.snapshot_split_repository(preflight).await?;
+        let changes = describe_snapshot_changes(expected, &current);
+        if !changes.is_empty() {
+            return Err(WisetreeError::validation(format!(
+                "Split proposal is stale because repository state changed: {}.",
+                changes.join(", ")
+            )));
+        }
+        self.save_split_plan(preflight, plan, "approved").await
     }
 
     /// Render and persist the validated proposal. The AI never receives write

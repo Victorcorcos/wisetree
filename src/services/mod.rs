@@ -72,10 +72,11 @@ pub use shell_integration::{
     install_shell_integration, remove_shell_integration, Shell, ShellIntegrationStatus,
 };
 pub use split::{
-    build_plan_prompt as build_split_plan_prompt, inventory_diff, parse_numstat_totals,
-    parse_split_plan, render_split_plan, validate_manifest as validate_split_manifest, ChangeUnit,
-    ChangeUnitKind, SplitIdentity, SplitPlan, SplitPreflight, SplitPreflightRequest,
-    SplitResponsibility, SPLIT_DIRECTORY, SPLIT_PLAN_FILE,
+    build_corrective_plan_prompt, build_plan_prompt as build_split_plan_prompt,
+    describe_snapshot_changes, inventory_diff, parse_numstat_totals, parse_split_plan,
+    render_split_plan, validate_manifest as validate_split_manifest, ChangeUnit, ChangeUnitKind,
+    SplitIdentity, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
+    SplitRepositorySnapshot, SplitResponsibility, SPLIT_DIRECTORY, SPLIT_PLAN_FILE,
 };
 pub use update::{
     check_for_updates, check_for_updates_all_sources, get_cached_update_status,

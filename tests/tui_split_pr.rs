@@ -1,9 +1,14 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::Terminal;
 
 use wisetree::config::schema::{AiHarness, AiModelConfig, AiSplitConfig};
 use wisetree::messages::colors;
+use wisetree::services::{
+    parse_split_plan, ChangeUnit, ChangeUnitKind, SplitIdentity, SplitPlanResult, SplitPreflight,
+    SplitRepositorySnapshot,
+};
 use wisetree::tui::screens::dashboard::SplitRequest;
 use wisetree::tui::screens::split_pr::{SplitAction, SplitPullRequestScreen, SplitStep};
 
@@ -60,6 +65,62 @@ fn render(screen: &mut SplitPullRequestScreen, width: u16, height: u16) -> (Stri
         text.push('\n');
     }
     (text, split_colored)
+}
+
+fn render_buffer(screen: &mut SplitPullRequestScreen, width: u16, height: u16) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| screen.render(frame, frame.area()))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn review_screen() -> SplitPullRequestScreen {
+    let unit = |id: &str, path: &str, additions: u64, deletions: u64| ChangeUnit {
+        id: id.into(),
+        path: path.into(),
+        old_path: None,
+        kind: ChangeUnitKind::TextHunk,
+        old_start: Some(1),
+        old_lines: Some(deletions),
+        new_start: Some(1),
+        new_lines: Some(additions),
+        additions,
+        deletions,
+        line_counts_available: true,
+    };
+    let preflight = SplitPreflight {
+        worktree_path: "/tmp/repo-large-change".into(),
+        identity: SplitIdentity {
+            repository: "acme/repo".into(),
+            remote: "upstream".into(),
+            base_ref: "upstream/main".into(),
+            base_sha: "base-sha".into(),
+            source_branch: "feature/large-change".into(),
+            source_head: "source-sha".into(),
+            max: 10,
+            additions: 8,
+            deletions: 2,
+        },
+        units: vec![
+            unit("CU0001", "src/a.rs", 3, 1),
+            unit("CU0002", "tests/a_test.rs", 1, 0),
+            unit("CU0003", "src/b.rs", 2, 1),
+            unit("CU0004", "tests/b_test.rs", 2, 0),
+        ],
+    };
+    let response = r#"{"responsibilities":[{"order":1,"name":"Foundation","branch_slug":"foundation","rationale":"Builds on the resolved base.","units":["CU0001","CU0002"],"test_units":["CU0002"],"paths":["src/a.rs","tests/a_test.rs"]},{"order":2,"name":"Consumer","branch_slug":"consumer","rationale":"Uses the foundation behavior.","units":["CU0003","CU0004"],"test_units":["CU0004"],"paths":["src/b.rs","tests/b_test.rs"]}]}"#;
+    let plan = parse_split_plan(response, &preflight).unwrap();
+    let snapshot = SplitRepositorySnapshot {
+        status: String::new(),
+        head: "source-sha".into(),
+        refs: "refs/heads/feature source-sha".into(),
+        files: Vec::new(),
+    };
+    let mut screen = SplitPullRequestScreen::new(request(None), config());
+    screen.set_preflight(preflight);
+    screen.show_plan(SplitPlanResult { plan, snapshot });
+    screen
 }
 
 fn focus_confirm(screen: &mut SplitPullRequestScreen) {
@@ -179,4 +240,88 @@ fn narrow_terminal_can_scroll_from_overview_to_roles_and_max() {
     assert!(bottom.contains("MAX: 1000"), "{bottom}");
     assert!(bottom.contains("Confirm"), "{bottom}");
     assert!(bottom.contains("Cancel"), "{bottom}");
+}
+
+#[test]
+fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
+    let mut screen = review_screen();
+    let (text, split_colored) = render(&mut screen, 110, 36);
+    assert!(split_colored);
+    for expected in [
+        "bottom to top",
+        "Foundation",
+        "Responsibility/dependency",
+        "src/a.rs, tests/a_test.rs",
+        "CU0001, CU0002",
+        "Related tests: CU0002",
+        "Integrity: +4 -1 = 5 · MAX 10 ✓",
+        "Aggregate integrity",
+        "+8 -2 = 10 source lines",
+        "Approve",
+        "Reject",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+    }
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::Approved
+    );
+}
+
+#[test]
+fn reject_feedback_ignores_empty_supports_multiline_and_escape_preserves_plan() {
+    let mut screen = review_screen();
+    screen.handle_key(key(KeyCode::Right));
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::Continue
+    );
+    assert_eq!(screen.step(), SplitStep::Feedback);
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::Continue
+    );
+    screen.handle_paste("Move the API unit down\nand keep its test with it");
+    match screen.handle_key(key(KeyCode::Enter)) {
+        SplitAction::Rejected(feedback) => {
+            assert!(feedback.contains("Move the API unit down\n"));
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+
+    let revised = screen
+        .approval_payload()
+        .map(|(_, plan, snapshot)| SplitPlanResult {
+            plan: plan.clone(),
+            snapshot: snapshot.clone(),
+        })
+        .unwrap();
+    screen.show_plan(revised);
+    screen.handle_key(key(KeyCode::Right));
+    screen.handle_key(key(KeyCode::Enter));
+    screen.handle_key(key(KeyCode::Char('x')));
+    assert_eq!(screen.handle_key(key(KeyCode::Esc)), SplitAction::Continue);
+    assert_eq!(screen.step(), SplitStep::Review);
+    assert!(screen.plan_json().is_some());
+}
+
+#[test]
+fn review_buttons_are_clickable_and_second_contract_failure_requires_explicit_retry() {
+    let mut screen = review_screen();
+    let buffer = render_buffer(&mut screen, 100, 30);
+    let approve = (buffer.area.height.saturating_sub(3)..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| buffer[(x, y)].symbol() == "A")
+        .expect("Approve button");
+    assert_eq!(
+        screen.handle_mouse_click(ratatui::layout::Position::new(approve.0, approve.1)),
+        SplitAction::Approved
+    );
+
+    screen.set_planning_error("malformed JSON".into(), true);
+    assert_eq!(screen.step(), SplitStep::Error);
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::RetryPlanning
+    );
 }

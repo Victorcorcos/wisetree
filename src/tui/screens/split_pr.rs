@@ -3,17 +3,19 @@
 use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::schema::{AiModelConfig, AiSplitConfig};
 use crate::messages::colors;
+use crate::services::{SplitPlan, SplitPlanResult, SplitPreflight, SplitRepositorySnapshot};
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::widgets::{
-    spinner_frame, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+    spinner_frame, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
+    InputPrompt,
 };
 
 const DEFAULT_MAX: &str = "1000";
@@ -22,6 +24,12 @@ const DEFAULT_MAX: &str = "1000";
 pub enum SplitStep {
     Confirm,
     Preflight,
+    Planning,
+    Review,
+    Feedback,
+    Error,
+    Approving,
+    Approved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +37,9 @@ pub enum SplitAction {
     Continue,
     Cancelled,
     Confirmed(u64),
+    Approved,
+    Rejected(String),
+    RetryPlanning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +60,16 @@ pub struct SplitPullRequestScreen {
     scroll: u16,
     max_scroll: Cell<u16>,
     max_rect: Cell<Rect>,
+    approve_rect: Cell<Rect>,
+    reject_rect: Cell<Rect>,
+    review_focus: usize,
+    preflight: Option<SplitPreflight>,
+    plan: Option<SplitPlan>,
+    proposal_snapshot: Option<SplitRepositorySnapshot>,
+    feedback: Option<InputPrompt>,
+    activity: Vec<String>,
+    corrective: bool,
+    retry_allowed: bool,
     pub tick: usize,
 }
 
@@ -74,6 +95,16 @@ impl SplitPullRequestScreen {
             scroll: 0,
             max_scroll: Cell::new(0),
             max_rect: Cell::new(Rect::default()),
+            approve_rect: Cell::new(Rect::default()),
+            reject_rect: Cell::new(Rect::default()),
+            review_focus: 0,
+            preflight: None,
+            plan: None,
+            proposal_snapshot: None,
+            feedback: None,
+            activity: Vec::new(),
+            corrective: false,
+            retry_allowed: false,
             tick: 0,
         }
     }
@@ -107,9 +138,78 @@ impl SplitPullRequestScreen {
         self.error = None;
     }
 
+    pub fn set_preflight(&mut self, preflight: SplitPreflight) {
+        self.preflight = Some(preflight);
+    }
+
+    pub fn preflight(&self) -> Option<&SplitPreflight> {
+        self.preflight.as_ref()
+    }
+
+    pub fn start_planning(&mut self, corrective: bool) {
+        self.step = SplitStep::Planning;
+        self.corrective = corrective;
+        self.retry_allowed = false;
+        self.error = None;
+        self.activity.clear();
+    }
+
+    pub fn append_activity(&mut self, line: String) {
+        if self.activity.len() == 200 {
+            self.activity.remove(0);
+        }
+        self.activity.push(line);
+    }
+
+    pub fn show_plan(&mut self, result: SplitPlanResult) {
+        self.plan = Some(result.plan);
+        self.proposal_snapshot = Some(result.snapshot);
+        self.review_focus = 0;
+        self.scroll = 0;
+        self.feedback = None;
+        self.error = None;
+        self.step = SplitStep::Review;
+    }
+
+    pub fn plan_json(&self) -> Option<String> {
+        self.plan
+            .as_ref()
+            .and_then(|plan| serde_json::to_string(plan).ok())
+    }
+
+    pub fn approval_payload(
+        &self,
+    ) -> Option<(&SplitPreflight, &SplitPlan, &SplitRepositorySnapshot)> {
+        Some((
+            self.preflight.as_ref()?,
+            self.plan.as_ref()?,
+            self.proposal_snapshot.as_ref()?,
+        ))
+    }
+
+    pub fn set_planning_error(&mut self, message: String, retry_allowed: bool) {
+        self.error = Some(message);
+        self.retry_allowed = retry_allowed;
+        self.step = SplitStep::Error;
+    }
+
+    pub fn mark_approved(&mut self) {
+        self.error = None;
+        self.step = SplitStep::Approved;
+    }
+
+    pub fn start_approving(&mut self) {
+        self.step = SplitStep::Approving;
+        self.error = None;
+    }
+
+    pub fn corrective(&self) -> bool {
+        self.corrective
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> SplitAction {
         if self.step != SplitStep::Confirm {
-            return SplitAction::Continue;
+            return self.handle_flow_key(key);
         }
         match key.code {
             KeyCode::Esc => return SplitAction::Cancelled,
@@ -159,7 +259,111 @@ impl SplitPullRequestScreen {
         self.apply_confirmation(outcome)
     }
 
+    fn handle_flow_key(&mut self, key: KeyEvent) -> SplitAction {
+        match self.step {
+            SplitStep::Preflight | SplitStep::Planning => match key.code {
+                KeyCode::Esc => SplitAction::Cancelled,
+                _ => SplitAction::Continue,
+            },
+            SplitStep::Approving => SplitAction::Continue,
+            SplitStep::Review => match key.code {
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                    self.review_focus = 1 - self.review_focus;
+                    SplitAction::Continue
+                }
+                KeyCode::PageUp => {
+                    self.scroll = self.scroll.saturating_sub(5);
+                    SplitAction::Continue
+                }
+                KeyCode::PageDown => {
+                    self.scroll = self.scroll.saturating_add(5).min(self.max_scroll.get());
+                    SplitAction::Continue
+                }
+                KeyCode::Home => {
+                    self.scroll = 0;
+                    SplitAction::Continue
+                }
+                KeyCode::End => {
+                    self.scroll = self.max_scroll.get();
+                    SplitAction::Continue
+                }
+                KeyCode::Enter if self.review_focus == 0 => SplitAction::Approved,
+                KeyCode::Enter => {
+                    self.feedback = Some(
+                        InputPrompt::new(
+                            "Explain what must change. The same dashboard.ai.split.plan role will revise this proposal.",
+                        )
+                        .multiline()
+                        .expand_to_fill(),
+                    );
+                    self.step = SplitStep::Feedback;
+                    SplitAction::Continue
+                }
+                KeyCode::Esc => SplitAction::Cancelled,
+                _ => SplitAction::Continue,
+            },
+            SplitStep::Feedback => {
+                let Some(input) = self.feedback.as_mut() else {
+                    self.step = SplitStep::Review;
+                    return SplitAction::Continue;
+                };
+                match input.handle_key(key) {
+                    InputOutcome::Submitted(value) => {
+                        let feedback = value.trim().to_string();
+                        if feedback.is_empty() {
+                            return SplitAction::Continue;
+                        }
+                        self.feedback = None;
+                        SplitAction::Rejected(feedback)
+                    }
+                    InputOutcome::Cancelled => {
+                        self.feedback = None;
+                        self.step = SplitStep::Review;
+                        SplitAction::Continue
+                    }
+                    InputOutcome::Pending => SplitAction::Continue,
+                }
+            }
+            SplitStep::Error => match key.code {
+                KeyCode::Enter | KeyCode::Char('r') if self.retry_allowed => {
+                    SplitAction::RetryPlanning
+                }
+                KeyCode::Esc => SplitAction::Cancelled,
+                _ => SplitAction::Continue,
+            },
+            SplitStep::Approved => SplitAction::Continue,
+            SplitStep::Confirm => SplitAction::Continue,
+        }
+    }
+
+    pub fn handle_paste(&mut self, text: &str) -> SplitAction {
+        if self.step == SplitStep::Feedback {
+            if let Some(input) = self.feedback.as_mut() {
+                input.paste(text);
+            }
+        }
+        SplitAction::Continue
+    }
+
     pub fn handle_mouse_click(&mut self, position: Position) -> SplitAction {
+        if self.step == SplitStep::Review {
+            if contains(self.approve_rect.get(), position) {
+                self.review_focus = 0;
+                return SplitAction::Approved;
+            }
+            if contains(self.reject_rect.get(), position) {
+                self.review_focus = 1;
+                self.feedback = Some(
+                    InputPrompt::new(
+                        "Explain what must change. The same dashboard.ai.split.plan role will revise this proposal.",
+                    )
+                    .multiline()
+                    .expand_to_fill(),
+                );
+                self.step = SplitStep::Feedback;
+            }
+            return SplitAction::Continue;
+        }
         if self.step != SplitStep::Confirm {
             return SplitAction::Continue;
         }
@@ -236,7 +440,216 @@ impl SplitPullRequestScreen {
                 ])),
                 area,
             ),
+            SplitStep::Planning => self.render_planning(frame, area),
+            SplitStep::Review => self.render_review(frame, area),
+            SplitStep::Feedback => {
+                if let Some(input) = self.feedback.as_ref() {
+                    input.render(frame, area, self.tick);
+                }
+            }
+            SplitStep::Error => self.render_error(frame, area),
+            SplitStep::Approving => frame.render_widget(
+                Paragraph::new(format!(
+                    "{} Revalidating identities and recording approval...",
+                    spinner_frame(self.tick)
+                ))
+                .style(Style::default().fg(colors::SPLIT)),
+                area,
+            ),
+            SplitStep::Approved => frame.render_widget(
+                Paragraph::new("Split plan approved with the frozen base and source identities. Preparing the next deterministic phase...")
+                    .style(Style::default().fg(colors::SPLIT))
+                    .wrap(Wrap { trim: true }),
+                area,
+            ),
         }
+    }
+
+    fn render_planning(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let label = if self.corrective {
+            "Correcting the planning response contract..."
+        } else {
+            "Planning the semantic stack..."
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{} {label}", spinner_frame(self.tick)))
+                .style(Style::default().fg(colors::SPLIT)),
+            chunks[0],
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(colors::SPLIT))
+            .title(" AI Activity ");
+        let text = if self.activity.is_empty() {
+            "Launching the selected planning AI...".to_string()
+        } else {
+            self.activity.join("\n")
+        };
+        frame.render_widget(
+            Paragraph::new(text).block(block).wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+        frame.render_widget(
+            Paragraph::new("Esc cancel · planning permission is read-only"),
+            chunks[2],
+        );
+    }
+
+    fn render_review(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(area);
+        let width = chunks[0].width.saturating_sub(2).max(1) as usize;
+        let lines = self.review_lines(width);
+        let max_scroll = (lines.len() as u16).saturating_sub(chunks[0].height);
+        self.max_scroll.set(max_scroll);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((self.scroll.min(max_scroll), 0)),
+            chunks[0],
+        );
+        let buttons = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(15),
+                Constraint::Length(2),
+                Constraint::Length(15),
+                Constraint::Min(0),
+            ])
+            .split(chunks[1]);
+        self.approve_rect.set(buttons[1]);
+        self.reject_rect.set(buttons[3]);
+        self.render_review_button(frame, buttons[1], "Approve", self.review_focus == 0);
+        self.render_review_button(frame, buttons[3], "Reject", self.review_focus == 1);
+    }
+
+    fn review_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let (Some(preflight), Some(plan)) = (&self.preflight, &self.plan) else {
+            return vec![Line::from("No validated Split proposal is available.")];
+        };
+        let mut lines = vec![
+            section_line("Proposed Split stack · bottom to top"),
+            Line::from(format!(
+                "{} @ {} → {} @ {} · MAX {}",
+                preflight.identity.base_ref,
+                preflight.identity.base_sha,
+                preflight.identity.source_branch,
+                preflight.identity.source_head,
+                preflight.identity.max
+            )),
+            Line::default(),
+        ];
+        for layer in &plan.responsibilities {
+            let units = layer
+                .units
+                .iter()
+                .filter_map(|id| preflight.units.iter().find(|unit| &unit.id == id))
+                .collect::<Vec<_>>();
+            let additions = units.iter().map(|unit| unit.additions).sum::<u64>();
+            let deletions = units.iter().map(|unit| unit.deletions).sum::<u64>();
+            push_wrapped_styled(
+                &mut lines,
+                &format!("{}. {}  [{}]", layer.order, layer.name, layer.branch_slug),
+                width,
+                Style::default()
+                    .fg(colors::SPLIT)
+                    .add_modifier(Modifier::BOLD),
+            );
+            push_wrapped(
+                &mut lines,
+                &format!("Responsibility/dependency: {}", layer.rationale),
+                width,
+            );
+            push_wrapped(
+                &mut lines,
+                &format!("Files: {}", layer.paths.join(", ")),
+                width,
+            );
+            push_wrapped(
+                &mut lines,
+                &format!("Change units: {}", layer.units.join(", ")),
+                width,
+            );
+            push_wrapped(
+                &mut lines,
+                &format!("Related tests: {}", layer.test_units.join(", ")),
+                width,
+            );
+            push_wrapped(
+                &mut lines,
+                &format!(
+                    "Integrity: +{additions} -{deletions} = {} · MAX {} ✓",
+                    additions + deletions,
+                    preflight.identity.max
+                ),
+                width,
+            );
+            lines.push(Line::default());
+        }
+        lines.push(section_line("Aggregate integrity"));
+        push_wrapped(
+            &mut lines,
+            &format!(
+                "{} responsibilities · {} change units assigned exactly once · +{} -{} = {} source lines",
+                plan.responsibilities.len(),
+                preflight.units.len(),
+                preflight.identity.additions,
+                preflight.identity.deletions,
+                preflight.identity.additions + preflight.identity.deletions
+            ),
+            width,
+        );
+        lines.push(Line::from("PgUp/PgDn/Home/End scroll · Esc cancel"));
+        lines
+    }
+
+    fn render_review_button(&self, frame: &mut Frame, area: Rect, label: &str, selected: bool) {
+        let style = if selected {
+            Style::default()
+                .fg(colors::SPLIT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(colors::SPLIT)
+        };
+        frame.render_widget(
+            Paragraph::new(label)
+                .alignment(Alignment::Center)
+                .style(style)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded),
+                ),
+            area,
+        );
+    }
+
+    fn render_error(&self, frame: &mut Frame, area: Rect) {
+        let retry = if self.retry_allowed {
+            "\n\nEnter/R retries explicitly · Esc cancels"
+        } else {
+            "\n\nEsc cancels"
+        };
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}{}",
+                self.error.as_deref().unwrap_or("Split planning failed."),
+                retry
+            ))
+            .style(Style::default().fg(colors::ERROR))
+            .wrap(Wrap { trim: true }),
+            area,
+        );
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {

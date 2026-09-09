@@ -92,6 +92,20 @@ pub struct SplitPlan {
     pub responsibilities: Vec<SplitResponsibility>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitRepositorySnapshot {
+    pub status: String,
+    pub head: String,
+    pub refs: String,
+    pub files: Vec<(String, Option<Vec<u8>>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitPlanResult {
+    pub plan: SplitPlan,
+    pub snapshot: SplitRepositorySnapshot,
+}
+
 pub fn inventory_diff(diff: &str) -> Result<Vec<ChangeUnit>> {
     let mut pending = Vec::new();
     for block in diff.split("diff --git ").skip(1) {
@@ -334,6 +348,41 @@ pub fn build_plan_prompt(
             "USER_FEEDBACK",
             revision.map(|(_, feedback)| feedback).unwrap_or(""),
         )
+}
+
+pub fn build_corrective_plan_prompt(prompt: &str, parser_error: &str) -> String {
+    format!(
+        "{prompt}\n\nYour previous response failed the unchanged JSON contract: {}\nCorrect only the contract violation. Return exactly one complete JSON object with the same schema and no prose.",
+        parser_error.trim()
+    )
+}
+
+pub fn describe_snapshot_changes(
+    before: &SplitRepositorySnapshot,
+    after: &SplitRepositorySnapshot,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    if before.head != after.head {
+        changed.push(format!("HEAD: {} -> {}", before.head, after.head));
+    }
+    if before.refs != after.refs {
+        changed.push("repository refs changed".to_string());
+    }
+    if before.status != after.status {
+        changed.push("Git status changed".to_string());
+    }
+    let before_files = before.files.iter().cloned().collect::<BTreeMap<_, _>>();
+    let after_files = after.files.iter().cloned().collect::<BTreeMap<_, _>>();
+    for path in before_files
+        .keys()
+        .chain(after_files.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        if before_files.get(path) != after_files.get(path) {
+            changed.push(format!("file `{path}` changed"));
+        }
+    }
+    changed
 }
 
 pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<SplitPlan> {

@@ -1,7 +1,8 @@
 use wisetree::services::{
-    build_split_plan_prompt, inventory_diff, parse_numstat_totals, parse_split_plan,
-    render_split_plan, validate_split_manifest, ChangeUnit, ChangeUnitKind, SplitIdentity,
-    SplitPreflight,
+    build_corrective_plan_prompt, build_split_plan_prompt, describe_snapshot_changes,
+    inventory_diff, parse_numstat_totals, parse_split_plan, render_split_plan,
+    validate_split_manifest, ChangeUnit, ChangeUnitKind, SplitIdentity, SplitPreflight,
+    SplitRepositorySnapshot,
 };
 
 fn fixture() -> SplitPreflight {
@@ -157,4 +158,36 @@ fn prompt_contains_frozen_manifest_and_revision_only_when_both_inputs_exist() {
     let revision = build_split_plan_prompt(&preflight, Some(valid_response()), Some("move B"));
     assert!(revision.contains(valid_response()));
     assert!(revision.contains("move B"));
+}
+
+#[test]
+fn corrective_prompt_only_reasserts_the_unchanged_contract_failure() {
+    let original = build_split_plan_prompt(&fixture(), None, None);
+    let corrected = build_corrective_plan_prompt(&original, "unknown unit CU9999");
+    assert!(corrected.starts_with(&original));
+    assert!(corrected.contains("unknown unit CU9999"));
+    assert!(corrected.contains("same schema"));
+    assert!(!corrected.contains("try a different approach"));
+}
+
+#[test]
+fn repository_snapshot_diff_names_head_refs_status_and_relevant_files() {
+    let snapshot = SplitRepositorySnapshot {
+        status: String::new(),
+        head: "head-1".into(),
+        refs: "refs/heads/feature head-1".into(),
+        files: vec![("src/a.rs".into(), Some(b"before".to_vec()))],
+    };
+    assert!(describe_snapshot_changes(&snapshot, &snapshot).is_empty());
+
+    let mut changed = snapshot.clone();
+    changed.status = " M src/a.rs".into();
+    changed.head = "head-2".into();
+    changed.refs = "refs/heads/feature head-2".into();
+    changed.files[0].1 = Some(b"after".to_vec());
+    let changes = describe_snapshot_changes(&snapshot, &changed).join("\n");
+    assert!(changes.contains("HEAD"), "{changes}");
+    assert!(changes.contains("refs"), "{changes}");
+    assert!(changes.contains("status"), "{changes}");
+    assert!(changes.contains("src/a.rs"), "{changes}");
 }
