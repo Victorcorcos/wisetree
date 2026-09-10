@@ -124,6 +124,37 @@ fn review_screen() -> SplitPullRequestScreen {
     screen
 }
 
+fn publication() -> SplitPublication {
+    SplitPublication {
+        repository: "acme/repo".into(),
+        trunk: "main".into(),
+        source_branch: "feature/large-change".into(),
+        stack_link_completed: true,
+        status: "published, verified, and provisionally titled".into(),
+        diagnostics: None,
+        pull_requests: vec![
+            SplitPublishedPullRequest {
+                order: 1,
+                branch: "feature/large-change.1_foundation".into(),
+                expected_base: "main".into(),
+                number: 91,
+                url: "https://github.com/acme/repo/pull/91".into(),
+                provisional_title: "Feature Large Change (1/2)".into(),
+                provisional_title_applied: true,
+            },
+            SplitPublishedPullRequest {
+                order: 2,
+                branch: "feature/large-change".into(),
+                expected_base: "feature/large-change.1_foundation".into(),
+                number: 92,
+                url: "https://github.com/acme/repo/pull/92".into(),
+                provisional_title: "Feature Large Change (2/2)".into(),
+                provisional_title_applied: true,
+            },
+        ],
+    }
+}
+
 fn focus_confirm(screen: &mut SplitPullRequestScreen) {
     screen.handle_key(key(KeyCode::Tab));
     screen.handle_key(key(KeyCode::Left));
@@ -337,35 +368,7 @@ fn publication_progress_and_verified_stack_are_visible() {
     let (progress, _) = render(&mut screen, 100, 20);
     assert!(progress.contains("materializing, publishing, and verifying"));
 
-    let publication = SplitPublication {
-        repository: "acme/repo".into(),
-        trunk: "main".into(),
-        source_branch: "feature/large-change".into(),
-        stack_link_completed: true,
-        status: "published, verified, and provisionally titled".into(),
-        diagnostics: None,
-        pull_requests: vec![
-            SplitPublishedPullRequest {
-                order: 1,
-                branch: "feature/large-change.1_foundation".into(),
-                expected_base: "main".into(),
-                number: 91,
-                url: "https://github.com/acme/repo/pull/91".into(),
-                provisional_title: "Feature Large Change (1/2)".into(),
-                provisional_title_applied: true,
-            },
-            SplitPublishedPullRequest {
-                order: 2,
-                branch: "feature/large-change".into(),
-                expected_base: "feature/large-change.1_foundation".into(),
-                number: 92,
-                url: "https://github.com/acme/repo/pull/92".into(),
-                provisional_title: "Feature Large Change (2/2)".into(),
-                provisional_title_applied: true,
-            },
-        ],
-    };
-    screen.mark_approved(publication);
+    screen.mark_approved(publication());
     screen.update_draft_progress(SplitDraftProgress {
         operation_id: 7,
         generation: 4,
@@ -377,7 +380,13 @@ fn publication_progress_and_verified_stack_are_visible() {
     });
     let (drafting, _) = render(&mut screen, 100, 20);
     assert!(drafting.contains("1/2 completed"), "{drafting}");
-    assert!(drafting.contains("PR #91 · Drafted"), "{drafting}");
+    // Each row says, in plain language, whether that PR's title and
+    // description are already live on GitHub.
+    assert!(
+        drafting.contains("PR #91 · drafted, not yet on GitHub"),
+        "{drafting}"
+    );
+    assert!(drafting.contains("PR #92 · queued"), "{drafting}");
     assert!(drafting.contains("AI Activity"), "{drafting}");
     screen.handle_key(key(KeyCode::Down));
     let (selected, _) = render(&mut screen, 100, 20);
@@ -408,7 +417,15 @@ fn publication_progress_and_verified_stack_are_visible() {
     );
     assert!(done.contains("feature/large-change.1_foundation"), "{done}");
     assert!(
-        done.contains("Source: +8 -2 = 10 changed lines · MAX 10"),
+        done.contains("MAX 10 per layer: every layer within it"),
+        "{done}"
+    );
+    // The done page names the title that is now live on GitHub, per PR, so
+    // "which PRs got their metadata rewritten" is answerable at a glance.
+    assert!(done.contains("title: Foundation (1/2)"), "{done}");
+    assert!(done.contains("AI title + description applied"), "{done}");
+    assert!(
+        done.contains("not drafted — still the provisional title on GitHub"),
         "{done}"
     );
     assert_eq!(
@@ -560,4 +577,49 @@ fn approve_is_green_and_reject_is_red_in_both_border_and_label() {
         border_colors.contains(&colors::MUTED),
         "unfocused Reject border is muted"
     );
+}
+
+/// The drafting stage fans out one AI call per pull request, so the only way
+/// to know which PRs already carry their new metadata is the per-PR row. Every
+/// state must read as plain language and carry a distinguishing color.
+#[test]
+fn drafting_rows_say_which_pull_requests_are_already_updated_on_github() {
+    let mut screen = review_screen();
+    screen.mark_approved(publication());
+    let progress = |layer: usize, pr_number: u64, status: SplitDraftJobStatus| SplitDraftProgress {
+        operation_id: 1,
+        generation: 1,
+        layer,
+        pr_number,
+        status,
+        activity: None,
+        error: None,
+    };
+    screen.update_draft_progress(progress(1, 91, SplitDraftJobStatus::Applied));
+    screen.update_draft_progress(progress(2, 92, SplitDraftJobStatus::Failed));
+
+    let buffer = render_buffer(&mut screen, 110, 20);
+    let mut text = String::new();
+    let mut applied_is_green = false;
+    let mut failed_is_red = false;
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            text.push_str(cell.symbol());
+            applied_is_green |= cell.symbol() == "✓" && cell.fg == colors::SUCCESS;
+            failed_is_red |= cell.symbol() == "f" && cell.fg == colors::ERROR;
+        }
+        text.push('\n');
+    }
+    assert!(
+        text.contains("PR #91 · title + description updated ✓"),
+        "{text}"
+    );
+    assert!(
+        text.contains("PR #92 · failed — provisional title kept"),
+        "{text}"
+    );
+    assert!(text.contains("1/2 completed"), "{text}");
+    assert!(applied_is_green, "an updated PR reads as success");
+    assert!(failed_is_red, "a failed PR reads as an error");
 }
