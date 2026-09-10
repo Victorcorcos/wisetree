@@ -888,7 +888,14 @@ impl SplitPullRequestScreen {
             );
             push_wrapped(
                 &mut lines,
-                &format!("Related tests: {}", layer.test_units.join(", ")),
+                &format!(
+                    "Related tests: {}",
+                    if layer.test_units.is_empty() {
+                        "no changed tests in this layer".to_string()
+                    } else {
+                        layer.test_units.join(", ")
+                    }
+                ),
                 width,
             );
             push_wrapped(
