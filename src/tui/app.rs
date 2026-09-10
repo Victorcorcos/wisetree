@@ -51,9 +51,9 @@ use crate::services::{
     ImproveCheckpointIdentity, ImprovePreparation, JudgeResult, MultiSourceUpdateResult,
     OpencodeModel, PrState, ReviewContext, ReviewFile, ReviewFinding, ReviewPreparation,
     ReviewScanMode, ReviewScanTelemetry, ReviewVerification, Shell, ShellIntegrationStatus,
-    SplitDraftProgress, SplitDraftRecord, SplitPlan, SplitPlanResult, SplitPreflight,
-    SplitPreflightRequest, SplitPublication, SplitRepositorySnapshot, UpdateBranchOutcome,
-    UpdatePhase, UpdateProgress, UpdateSource, SPLIT_PLAN_FILE,
+    SplitDraftProgress, SplitDraftRecord, SplitPlan, SplitPlanHandoff, SplitPlanResult,
+    SplitPreflight, SplitPreflightRequest, SplitPublication, SplitRepositorySnapshot,
+    UpdateBranchOutcome, UpdatePhase, UpdateProgress, UpdateSource, SPLIT_PLAN_FILE,
 };
 use crate::tui::event::{Event, EventLoop};
 use crate::tui::image_upload::{ImageAttachment, ImageStorage};
@@ -87,7 +87,7 @@ use crate::tui::screens::setup::{SetupAction, SetupScreen, SetupStep};
 use crate::tui::screens::setup_project::{
     SetupProjectAction, SetupProjectPresetValues, SetupProjectScreen, SetupProjectStep,
 };
-use crate::tui::screens::split_pr::{SplitAction, SplitPullRequestScreen};
+use crate::tui::screens::split_pr::{SplitAction, SplitPullRequestScreen, SplitStep};
 use crate::tui::screens::update_branch::UpdateBranchScreen;
 use crate::tui::screens::update_pr::{UpdateAction, UpdatePullRequestScreen, UpdateStep};
 use crate::tui::selection::{
@@ -361,10 +361,12 @@ enum AppEvent {
         generation: u64,
         result: Result<Box<SplitPreflight>, String>,
     },
-    SplitPlanActivity {
+    /// The live planning handoff is ready to spawn in the embedded terminal.
+    SplitPlanPrepared {
         operation_id: u64,
         generation: u64,
-        line: String,
+        corrective: bool,
+        result: Result<Box<SplitPlanHandoff>, String>,
     },
     SplitPlanReady {
         operation_id: u64,
@@ -619,6 +621,10 @@ pub struct App {
     next_split_generation: u64,
     active_split_generation: Option<u64>,
     split_cancel: Option<oneshot::Sender<()>>,
+    /// Watches the planning harness transcript while the planner runs in the
+    /// embedded terminal, and the snapshot its output is validated against.
+    split_watch: Option<AiTurnWatcher>,
+    split_plan_snapshot: Option<SplitRepositorySnapshot>,
     split_previous: Option<String>,
     split_feedback: Option<String>,
     split_corrective_error: Option<String>,
@@ -808,6 +814,8 @@ impl App {
             next_split_generation: 0,
             active_split_generation: None,
             split_cancel: None,
+            split_watch: None,
+            split_plan_snapshot: None,
             split_previous: None,
             split_feedback: None,
             split_corrective_error: None,
@@ -1041,6 +1049,17 @@ impl App {
                     if let Some((exited, step)) = develop_tick {
                         self.on_develop_tick(exited, step, &tx);
                     }
+                    // Same for the Split planning PTY: the planner's TUI does
+                    // not exit on its own, so the turn watcher is the primary
+                    // completion signal and an exit only means the user quit
+                    // it.
+                    let split_tick = self
+                        .split_pr
+                        .as_mut()
+                        .map(|screen| (screen.tick_pty(None), screen.step()));
+                    if let Some((exited, step)) = split_tick {
+                        self.on_split_tick(exited, step, &tx);
+                    }
                 }
                 Event::Resize(width, height) => {
                     // `Viewport::Fixed` (see `terminal::app_viewport`) does
@@ -1071,6 +1090,7 @@ impl App {
             || self.develop_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.fix_pr.as_ref().is_some_and(|s| s.has_pty())
             || self.improve_pr.as_ref().is_some_and(|s| s.has_pty())
+            || self.split_pr.as_ref().is_some_and(|s| s.has_pty())
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -1863,6 +1883,10 @@ impl App {
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             Screen::ImprovePullRequest => self
                 .improve_pr
+                .as_mut()
+                .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
+            Screen::SplitPullRequest => self
+                .split_pr
                 .as_mut()
                 .is_some_and(|screen| screen.forward_pty_mouse(mouse)),
             _ => false,
@@ -5474,6 +5498,8 @@ impl App {
         self.next_split_operation_id = self.next_split_operation_id.wrapping_add(1);
         self.active_split_operation_id = Some(self.next_split_operation_id);
         self.active_split_generation = Some(0);
+        self.split_watch = None;
+        self.split_plan_snapshot = None;
         self.split_previous = None;
         self.split_feedback = None;
         self.split_corrective_error = None;
@@ -5492,6 +5518,11 @@ impl App {
     fn apply_split_action(&mut self, action: SplitAction, tx: &mpsc::UnboundedSender<AppEvent>) {
         match action {
             SplitAction::Continue => {}
+            SplitAction::WritePty(bytes) => {
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.send_pty_input(&bytes);
+                }
+            }
             SplitAction::Cancelled => {
                 if let Some(cancel) = self.split_cancel.take() {
                     let _ = cancel.send(());
@@ -5576,10 +5607,12 @@ impl App {
         );
     }
 
+    /// Start one live planning run. The planner runs in the embedded terminal
+    /// so the developer sees its reasoning and can steer it; the plan is only
+    /// accepted once the turn completes and passes the read-only + contract
+    /// checks in `finish_split_plan`.
     fn start_split_planning(&mut self, corrective: bool, tx: &mpsc::UnboundedSender<AppEvent>) {
-        if let Some(cancel) = self.split_cancel.take() {
-            let _ = cancel.send(());
-        }
+        self.split_watch = None;
         let Some(operation_id) = self.active_split_operation_id else {
             return;
         };
@@ -5595,9 +5628,7 @@ impl App {
         if let Some(screen) = self.split_pr.as_mut() {
             screen.start_planning(corrective);
         }
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        self.split_cancel = Some(cancel_tx);
-        kick_off_split_plan(
+        kick_off_split_prepare_plan(
             self.git_root.clone(),
             self.current_dashboard_config(),
             preflight,
@@ -5609,7 +5640,143 @@ impl App {
             corrective,
             operation_id,
             generation,
-            cancel_rx,
+            tx.clone(),
+        );
+    }
+
+    /// The planning handoff is ready: watch the harness transcript, then show
+    /// the planner inside the embedded terminal.
+    fn apply_split_plan_prepared(
+        &mut self,
+        operation_id: u64,
+        generation: u64,
+        corrective: bool,
+        result: Result<Box<SplitPlanHandoff>, String>,
+    ) {
+        if !self.split_event_is_current(operation_id, generation) {
+            return;
+        }
+        match result {
+            Ok(handoff) => {
+                self.split_watch = Some(AiTurnWatcher::new(handoff.harness, &handoff.command.cwd));
+                self.split_plan_snapshot = Some(handoff.snapshot);
+                let renders_inline = handoff.harness.renders_inline();
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.spawn_planning_pty(
+                        handoff.command.binary,
+                        handoff.command.args,
+                        handoff.command.cwd,
+                        renders_inline,
+                    );
+                }
+            }
+            Err(message) => {
+                self.split_watch = None;
+                if let Some(screen) = self.split_pr.as_mut() {
+                    screen.set_planning_error(message, corrective);
+                }
+            }
+        }
+    }
+
+    /// Drive the planning terminal: a completed turn is the primary signal, a
+    /// PTY exit only the fallback for a planner the user quit manually.
+    fn on_split_tick(
+        &mut self,
+        exited: Option<i32>,
+        step: SplitStep,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if step != SplitStep::Planning {
+            return;
+        }
+        if exited.is_some() {
+            let turn = self
+                .split_watch
+                .as_mut()
+                .map(AiTurnWatcher::check_now)
+                .unwrap_or(AiTurn::Working);
+            self.on_split_plan_turn(turn, true, tx);
+            return;
+        }
+        if let Some(turn) = self.split_watch.as_mut().and_then(AiTurnWatcher::poll) {
+            self.on_split_plan_turn(turn, false, tx);
+        }
+    }
+
+    fn on_split_plan_turn(
+        &mut self,
+        turn: AiTurn,
+        pty_exited: bool,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match turn {
+            // A usage limit leaves the planner usable for a follow-up prompt,
+            // so its terminal stays alive exactly as in the other commands.
+            AiTurn::Working | AiTurn::UsageLimited { .. } if !pty_exited => {}
+            AiTurn::Working | AiTurn::UsageLimited { .. } => {
+                self.split_watch = None;
+                if let Some(screen) = self.split_pr.as_mut() {
+                    let corrective = screen.corrective();
+                    screen.set_planning_error(
+                        "The planning AI exited before the split proposal was finished."
+                            .to_string(),
+                        corrective,
+                    );
+                }
+            }
+            AiTurn::Failed { message } => {
+                self.split_watch = None;
+                if let Some(screen) = self.split_pr.as_mut() {
+                    let corrective = screen.corrective();
+                    screen.set_planning_error(
+                        format!("The planning AI reported an error: {message}"),
+                        corrective,
+                    );
+                }
+            }
+            AiTurn::Finished { transcript } => {
+                self.split_watch = None;
+                self.finish_split_plan(transcript, tx);
+            }
+        }
+    }
+
+    /// Hand the finished transcript back to the service, which re-verifies the
+    /// read-only guarantee, parses the contract and renders the plan file.
+    fn finish_split_plan(&mut self, transcript: String, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(operation_id) = self.active_split_operation_id else {
+            return;
+        };
+        let (Some(preflight), Some(snapshot)) = (
+            self.split_pr
+                .as_ref()
+                .and_then(SplitPullRequestScreen::preflight)
+                .cloned(),
+            self.split_plan_snapshot.clone(),
+        ) else {
+            return;
+        };
+        let corrective = self
+            .split_pr
+            .as_ref()
+            .map(SplitPullRequestScreen::corrective)
+            .unwrap_or(false);
+        if let Some(screen) = self.split_pr.as_mut() {
+            screen.kill_pty();
+        }
+        let generation = self
+            .active_split_generation
+            .unwrap_or_else(|| self.next_split_generation());
+        kick_off_split_finish_plan(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            preflight,
+            snapshot,
+            transcript,
+            corrective,
+            operation_id,
+            generation,
             tx.clone(),
         );
     }
@@ -8427,17 +8594,12 @@ impl App {
                 generation,
                 result,
             } => self.apply_split_prepared(operation_id, generation, result, tx),
-            AppEvent::SplitPlanActivity {
+            AppEvent::SplitPlanPrepared {
                 operation_id,
                 generation,
-                line,
-            } => {
-                if self.split_event_is_current(operation_id, generation) {
-                    if let Some(screen) = self.split_pr.as_mut() {
-                        screen.append_activity(line);
-                    }
-                }
-            }
+                corrective,
+                result,
+            } => self.apply_split_plan_prepared(operation_id, generation, corrective, result),
             AppEvent::SplitPlanReady {
                 operation_id,
                 generation,
@@ -12135,7 +12297,7 @@ fn kick_off_split_preflight(
 // The async boundary carries the immutable run identity and frozen inputs as
 // separate owned values; grouping them would add a one-use transport type.
 #[allow(clippy::too_many_arguments)]
-fn kick_off_split_plan(
+fn kick_off_split_prepare_plan(
     git_root: Option<String>,
     config: DashboardConfig,
     preflight: SplitPreflight,
@@ -12145,7 +12307,50 @@ fn kick_off_split_plan(
     corrective: bool,
     operation_id: u64,
     generation: u64,
-    cancel: oneshot::Receiver<()>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::SplitPlanPrepared {
+            operation_id,
+            generation,
+            corrective,
+            result: Err("Could not resolve git root.".to_string()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let result = service
+            .prepare_split_plan(
+                &preflight,
+                previous.as_deref(),
+                feedback.as_deref(),
+                corrective_error.as_deref(),
+            )
+            .await
+            .map(Box::new)
+            .map_err(|error| user_friendly_message(&error));
+        let _ = tx.send(AppEvent::SplitPlanPrepared {
+            operation_id,
+            generation,
+            corrective,
+            result,
+        });
+    });
+}
+
+// Validation of one finished planning turn: the transcript and the pre-run
+// snapshot are frozen inputs, so no live screen state is consulted here.
+#[allow(clippy::too_many_arguments)]
+fn kick_off_split_finish_plan(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    preflight: SplitPreflight,
+    snapshot: SplitRepositorySnapshot,
+    transcript: String,
+    corrective: bool,
+    operation_id: u64,
+    generation: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -12159,30 +12364,11 @@ fn kick_off_split_plan(
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
-        let event_tx = tx.clone();
-        let activity_forward = tokio::spawn(async move {
-            while let Some(line) = activity_rx.recv().await {
-                let _ = event_tx.send(AppEvent::SplitPlanActivity {
-                    operation_id,
-                    generation,
-                    line,
-                });
-            }
-        });
         let result = service
-            .run_split_plan(
-                &preflight,
-                previous.as_deref(),
-                feedback.as_deref(),
-                corrective_error.as_deref(),
-                Some(activity_tx),
-                cancel,
-            )
+            .finish_split_plan(&preflight, &snapshot, &transcript)
             .await
             .map(Box::new)
             .map_err(|error| error.to_string());
-        let _ = activity_forward.await;
         let _ = tx.send(AppEvent::SplitPlanReady {
             operation_id,
             generation,

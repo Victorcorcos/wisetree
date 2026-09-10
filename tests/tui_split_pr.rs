@@ -419,3 +419,64 @@ fn publication_progress_and_verified_stack_are_visible() {
         SplitAction::RetryPublication
     );
 }
+
+/// The planning stage is the one the developer watches and steers, so it
+/// renders the same embedded-terminal panel the other AI-assisted commands
+/// use rather than a passive log.
+#[test]
+fn planning_shows_the_embedded_terminal_panel_and_its_focus_controls() {
+    let mut screen = SplitPullRequestScreen::new(request(None), config());
+    screen.start_planning(false);
+    assert_eq!(screen.step(), SplitStep::Planning);
+    assert!(!screen.has_pty());
+
+    let (text, _) = render(&mut screen, 100, 20);
+    let buffer = render_buffer(&mut screen, 100, 20);
+    let accented = (0..buffer.area.height)
+        .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].fg == colors::SPLIT));
+    assert!(text.contains("Planning the semantic stack"), "{text}");
+    assert!(text.contains("AI Activity"), "{text}");
+    assert!(
+        text.contains("Launching the selected planning AI"),
+        "{text}"
+    );
+    assert!(text.contains("Focus:"), "{text}");
+    assert!(text.contains("Outer (wisetree)"), "{text}");
+    assert!(text.contains("Tab"), "{text}");
+    assert!(text.contains("Cancel planning"), "{text}");
+    assert!(accented, "the planning page keeps the Split accent");
+
+    let (corrective, _) = {
+        screen.start_planning(true);
+        render(&mut screen, 100, 20)
+    };
+    assert!(
+        corrective.contains("Correcting the planning response contract"),
+        "{corrective}"
+    );
+}
+
+/// Without a live child there is nothing to focus, so Tab is inert while the
+/// outer keys keep scrolling the planner and cancelling the run.
+#[test]
+fn planning_keys_scroll_the_planner_and_cancel_without_touching_the_plan() {
+    let mut screen = SplitPullRequestScreen::new(request(None), config());
+    screen.start_planning(false);
+
+    assert_eq!(screen.handle_key(key(KeyCode::Tab)), SplitAction::Continue);
+    assert_eq!(
+        screen.handle_key(key(KeyCode::PageUp)),
+        SplitAction::WritePty(b"\x1b[5~".to_vec())
+    );
+    assert_eq!(
+        screen.handle_key(key(KeyCode::PageDown)),
+        SplitAction::WritePty(b"\x1b[6~".to_vec())
+    );
+    assert_eq!(screen.handle_key(key(KeyCode::Esc)), SplitAction::Cancelled);
+
+    // A planning failure tears the terminal down so no orphan child survives.
+    screen.start_planning(false);
+    screen.set_planning_error("planner exited".into(), true);
+    assert!(!screen.has_pty());
+    assert_eq!(screen.step(), SplitStep::Error);
+}

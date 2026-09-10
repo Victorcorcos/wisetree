@@ -51,8 +51,9 @@ pub use dashboard::{
     PullRequestDetails, ReviewBenchmarkOutcome, ReviewComment, ReviewContext, ReviewFile,
     ReviewFinding, ReviewPreparation, ReviewScanAttempt, ReviewScanMode, ReviewSeverity,
     ReviewSkippedFile, ReviewStatus, ReviewSummaryAttempt, ReviewVerification,
-    ReviewVerificationAttempt, ReviewerSummary, UpdateBranchOutcome, UpdatePhase, UpdateProgress,
-    UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
+    ReviewVerificationAttempt, ReviewerSummary, SplitPlanHandoff, UpdateBranchOutcome, UpdatePhase,
+    UpdateProgress, UpdatePullRequestOutcome, AI_STATUS_BUDGET_MS, BASE_REF_PRIORITY,
+    PR_REFRESH_PERIOD_MS,
 };
 pub use develop::{parse_plan_transcript, summarize_transcript, DevelopPlan, PlanSection};
 pub use improve_run::{
@@ -75,15 +76,15 @@ pub use split::{
     build_corrective_plan_prompt, build_plan_prompt as build_split_plan_prompt,
     build_split_open_prompt, compose_split_body, describe_snapshot_changes, final_split_title,
     inventory_diff, normalized_patch, parse_materialization, parse_numstat_totals,
-    parse_publication, parse_split_draft, parse_split_drafting, parse_split_plan, parse_split_run,
-    patch_for_units, provisional_split_title, render_materialization, render_publication,
-    render_split_drafting, render_split_plan, split_branch_name,
-    validate_manifest as validate_split_manifest, validate_split_body, validate_split_publication,
-    validate_split_resume, ChangeUnit, ChangeUnitKind, SplitDraft, SplitDraftJobStatus,
-    SplitDraftProgress, SplitDraftRecord, SplitDraftingRecord, SplitIdentity, SplitMaterialization,
-    SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
-    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
-    SplitRunRecord, SPLIT_DIRECTORY, SPLIT_DRAFT_DIRECTORY, SPLIT_PLAN_FILE,
+    parse_publication, parse_split_draft, parse_split_drafting, parse_split_plan,
+    parse_split_plan_transcript, parse_split_run, patch_for_units, provisional_split_title,
+    render_materialization, render_publication, render_split_drafting, render_split_plan,
+    split_branch_name, validate_manifest as validate_split_manifest, validate_split_body,
+    validate_split_publication, validate_split_resume, ChangeUnit, ChangeUnitKind, SplitDraft,
+    SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord, SplitDraftingRecord, SplitIdentity,
+    SplitMaterialization, SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight,
+    SplitPreflightRequest, SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot,
+    SplitResponsibility, SplitRunRecord, SPLIT_DIRECTORY, SPLIT_DRAFT_DIRECTORY, SPLIT_PLAN_FILE,
 };
 pub use update::{
     check_for_updates, check_for_updates_all_sources, get_cached_update_status,

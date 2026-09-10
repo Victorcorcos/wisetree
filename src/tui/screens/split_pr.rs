@@ -1,12 +1,15 @@
 //! Mutation-free entry screen for the Split pull-request command.
 
 use std::cell::Cell;
+use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use ratatui::Frame;
 
 use crate::config::schema::{AiModelConfig, AiSplitConfig};
@@ -17,12 +20,15 @@ use crate::services::{
     SplitRepositorySnapshot, SPLIT_PLAN_FILE,
 };
 use crate::tui::screens::dashboard::SplitRequest;
+use crate::tui::screens::update_pr::key_event_to_pty_bytes;
 use crate::tui::widgets::{
     spinner_frame, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
-    InputPrompt,
+    InputPrompt, PtyView,
 };
 
 const DEFAULT_MAX: &str = "1000";
+const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
+const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitStep {
@@ -48,6 +54,7 @@ pub enum SplitAction {
     RetryPublication,
     RetryDrafting,
     Finished,
+    WritePty(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +82,12 @@ pub struct SplitPullRequestScreen {
     plan: Option<SplitPlan>,
     proposal_snapshot: Option<SplitRepositorySnapshot>,
     feedback: Option<InputPrompt>,
-    activity: Vec<String>,
+    /// The planning AI runs in this embedded terminal so the developer can
+    /// read its reasoning and steer it, exactly like the other AI-assisted
+    /// pull-request commands.
+    pty: Option<PtyView>,
+    pty_focused: bool,
+    ai_done: bool,
     corrective: bool,
     retry_allowed: bool,
     retry_publication: bool,
@@ -125,7 +137,9 @@ impl SplitPullRequestScreen {
             plan: None,
             proposal_snapshot: None,
             feedback: None,
-            activity: Vec::new(),
+            pty: None,
+            pty_focused: false,
+            ai_done: false,
             corrective: false,
             retry_allowed: false,
             retry_publication: false,
@@ -182,17 +196,80 @@ impl SplitPullRequestScreen {
         self.retry_allowed = false;
         self.retry_publication = false;
         self.error = None;
-        self.activity.clear();
+        self.pty = None;
+        self.pty_focused = false;
+        self.ai_done = false;
     }
 
-    pub fn append_activity(&mut self, line: String) {
-        if self.activity.len() == 200 {
-            self.activity.remove(0);
+    /// Spawn the configured planning harness inside the embedded terminal. A
+    /// spawn failure is a planning error the user can retry.
+    pub fn spawn_planning_pty(
+        &mut self,
+        binary: PathBuf,
+        args: Vec<String>,
+        cwd: PathBuf,
+        renders_inline: bool,
+    ) {
+        match PtyView::spawn(&binary, &args, Some(&cwd), &[], renders_inline) {
+            Ok(pty) => {
+                self.pty = Some(pty);
+                self.pty_focused = false;
+                self.ai_done = false;
+            }
+            Err(error) => self.set_planning_error(
+                format!("Could not spawn the planning AI in a terminal: {error}"),
+                self.corrective,
+            ),
         }
-        self.activity.push(line);
+    }
+
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
+    }
+
+    /// Poll the embedded planner for child exit and keep it sized to the
+    /// panel. Returns `Some(exit_code)` exactly once, on the tick it exits.
+    pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> Option<i32> {
+        let pty = self.pty.as_mut()?;
+        if let Some((rows, columns)) = panel_inner {
+            pty.resize(rows, columns);
+        }
+        if pty.poll_exited() {
+            if self.ai_done {
+                return None;
+            }
+            self.ai_done = true;
+            pty.exit_code()
+        } else {
+            None
+        }
+    }
+
+    pub fn kill_pty(&mut self) {
+        self.pty = None;
+        self.pty_focused = false;
+    }
+
+    pub fn send_pty_input(&mut self, bytes: &[u8]) {
+        if let Some(pty) = self.pty.as_mut() {
+            pty.send_input(bytes);
+        }
+    }
+
+    /// Forward a host mouse event to the planner while the inner panel holds
+    /// focus, so its own cursor and hover states work.
+    pub fn forward_pty_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !self.pty_focused {
+            return false;
+        }
+        self.pty
+            .as_mut()
+            .is_some_and(|pty| pty.send_mouse(mouse.kind, mouse.column, mouse.row, mouse.modifiers))
     }
 
     pub fn show_plan(&mut self, result: SplitPlanResult) {
+        self.pty = None;
+        self.pty_focused = false;
         self.plan = Some(result.plan);
         self.proposal_snapshot = Some(result.snapshot);
         self.review_focus = 0;
@@ -219,6 +296,8 @@ impl SplitPullRequestScreen {
     }
 
     pub fn set_planning_error(&mut self, message: String, retry_allowed: bool) {
+        self.pty = None;
+        self.pty_focused = false;
         self.error = Some(message);
         self.retry_allowed = retry_allowed;
         self.retry_publication = false;
@@ -373,9 +452,32 @@ impl SplitPullRequestScreen {
         self.apply_confirmation(outcome)
     }
 
+    /// While the planner runs, Tab hands the keyboard to the embedded
+    /// terminal so the developer can talk to the AI; the outer keys keep
+    /// scrolling and cancelling.
+    fn handle_planning_key(&mut self, key: KeyEvent) -> SplitAction {
+        if self.pty.is_some() && key.code == KeyCode::Tab {
+            self.pty_focused = !self.pty_focused;
+            return SplitAction::Continue;
+        }
+        if self.pty_focused {
+            if let Some(bytes) = key_event_to_pty_bytes(&key) {
+                self.send_pty_input(&bytes);
+            }
+            return SplitAction::Continue;
+        }
+        match key.code {
+            KeyCode::PageUp => SplitAction::WritePty(PTY_PAGE_UP.to_vec()),
+            KeyCode::PageDown => SplitAction::WritePty(PTY_PAGE_DOWN.to_vec()),
+            KeyCode::Esc => SplitAction::Cancelled,
+            _ => SplitAction::Continue,
+        }
+    }
+
     fn handle_flow_key(&mut self, key: KeyEvent) -> SplitAction {
         match self.step {
-            SplitStep::Preflight | SplitStep::Planning | SplitStep::Approving => match key.code {
+            SplitStep::Planning => self.handle_planning_key(key),
+            SplitStep::Preflight | SplitStep::Approving => match key.code {
                 KeyCode::Esc => SplitAction::Cancelled,
                 _ => SplitAction::Continue,
             },
@@ -546,10 +648,18 @@ impl SplitPullRequestScreen {
     }
 
     pub fn handle_mouse_scroll_up(&mut self, lines: u16) {
+        if let (SplitStep::Planning, Some(pty)) = (self.step, self.pty.as_mut()) {
+            pty.wheel_up(lines);
+            return;
+        }
         self.scroll = self.scroll.saturating_sub(lines);
     }
 
     pub fn handle_mouse_scroll_down(&mut self, lines: u16) {
+        if let (SplitStep::Planning, Some(pty)) = (self.step, self.pty.as_mut()) {
+            pty.wheel_down(lines);
+            return;
+        }
         self.scroll = self.scroll.saturating_add(lines).min(self.max_scroll.get());
     }
 
@@ -594,7 +704,7 @@ impl SplitPullRequestScreen {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         match self.step {
             SplitStep::Confirm => self.render_confirm(frame, area),
             SplitStep::Preflight => frame.render_widget(
@@ -771,7 +881,7 @@ impl SplitPullRequestScreen {
         );
     }
 
-    fn render_planning(&self, frame: &mut Frame, area: Rect) {
+    fn render_planning(&mut self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -790,24 +900,113 @@ impl SplitPullRequestScreen {
                 .style(Style::default().fg(colors::SPLIT)),
             chunks[0],
         );
+        self.render_planner_panel(frame, chunks[1]);
+        let focused_inner = self.pty.is_some() && self.pty_focused;
+        let separator = Span::styled("  ·  ", Style::default().fg(colors::MUTED));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Focus: ", Style::default().fg(colors::MUTED)),
+                Span::styled(
+                    if focused_inner {
+                        "Inner (AI)"
+                    } else {
+                        "Outer (wisetree)"
+                    },
+                    Style::default()
+                        .fg(if focused_inner {
+                            colors::SPLIT
+                        } else {
+                            colors::INFO
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                separator.clone(),
+                Span::styled("Tab ", Style::default().fg(colors::BRAND)),
+                Span::styled("Focus AI", Style::default().fg(colors::MUTED)),
+                separator.clone(),
+                Span::styled("PgUp/PgDn ", Style::default().fg(colors::BRAND)),
+                Span::styled("Scroll", Style::default().fg(colors::MUTED)),
+                separator,
+                Span::styled("Esc ", Style::default().fg(colors::ERROR)),
+                Span::styled(
+                    "Cancel planning · read-only session",
+                    Style::default().fg(colors::MUTED),
+                ),
+            ])),
+            chunks[2],
+        );
+    }
+
+    /// The embedded planning terminal, framed like the other PR commands'
+    /// AI panels but in the Split accent.
+    fn render_planner_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let focused_inner = self.pty.is_some() && self.pty_focused;
+        let mut title = vec![
+            Span::raw(" "),
+            Span::styled(
+                "AI Activity",
+                Style::default()
+                    .fg(colors::SPLIT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if self.pty.is_some() {
+            title.push(Span::styled(" · ", Style::default().fg(colors::MUTED)));
+            title.push(Span::styled(
+                if focused_inner {
+                    "inner focused"
+                } else {
+                    "outer focused"
+                },
+                Style::default()
+                    .fg(if focused_inner {
+                        colors::SPLIT
+                    } else {
+                        colors::INFO
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        title.push(Span::raw(" "));
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(colors::SPLIT))
-            .title(" AI Activity ");
-        let text = if self.activity.is_empty() {
-            "Launching the selected planning AI...".to_string()
-        } else {
-            self.activity.join("\n")
+            .border_style(Style::default().fg(if focused_inner {
+                colors::SPLIT
+            } else {
+                colors::INFO
+            }))
+            .title(Line::from(title));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let Some(pty) = self.pty.as_mut() else {
+            frame.render_widget(
+                Paragraph::new("Launching the selected planning AI...")
+                    .style(Style::default().fg(colors::MUTED))
+                    .wrap(Wrap { trim: false }),
+                inner,
+            );
+            return;
         };
-        frame.render_widget(
-            Paragraph::new(text).block(block).wrap(Wrap { trim: false }),
-            chunks[1],
-        );
-        frame.render_widget(
-            Paragraph::new("Esc cancel · planning permission is read-only"),
-            chunks[2],
-        );
+        pty.resize(inner.height, inner.width);
+        pty.render(frame, inner);
+        let scrollback = pty.scrollback_len();
+        if scrollback > 0 {
+            let position = scrollback.saturating_sub(pty.scrollback_offset());
+            let mut state = ScrollbarState::new(scrollback.saturating_add(inner.height as usize))
+                .viewport_content_length(inner.height as usize)
+                .position(position);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(Style::default().fg(colors::MUTED))
+                    .thumb_style(Style::default().fg(colors::SPLIT)),
+                inner,
+                &mut state,
+            );
+        }
     }
 
     fn render_review(&self, frame: &mut Frame, area: Rect) {
@@ -1046,7 +1245,7 @@ impl SplitPullRequestScreen {
         lines.push(section_line("Complete sequence before mutation"));
         for (index, step) in [
             "Deterministically revalidate the live worktree, base, committed diff, and source PR.",
-            "Ask the planning AI for an SRP plan organized by semantic responsibility.",
+            "Run the planning AI in an embedded terminal (Tab focuses it) for an SRP plan organized by semantic responsibility.",
             "Show the plan in an Approve/Reject loop; rejection feedback regenerates one proposal.",
             "Materialize the approved stack as local branches and worktrees.",
             "Verify every parent-to-child diff against MAX and check stack integrity.",

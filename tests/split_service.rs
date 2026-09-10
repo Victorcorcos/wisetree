@@ -11,9 +11,9 @@ use wisetree::services::{
     build_corrective_plan_prompt, build_split_open_prompt, build_split_plan_prompt,
     compose_split_body, describe_snapshot_changes, final_split_title, inventory_diff,
     parse_materialization, parse_numstat_totals, parse_publication, parse_split_draft,
-    parse_split_drafting, parse_split_plan, parse_split_run, patch_for_units,
-    provisional_split_title, render_publication, render_split_drafting, render_split_plan,
-    validate_split_body, validate_split_manifest, validate_split_publication,
+    parse_split_drafting, parse_split_plan, parse_split_plan_transcript, parse_split_run,
+    patch_for_units, provisional_split_title, render_publication, render_split_drafting,
+    render_split_plan, validate_split_body, validate_split_manifest, validate_split_publication,
     validate_split_resume, ChangeUnit, ChangeUnitKind, DashboardService, SplitDraftRecord,
     SplitDraftingRecord, SplitIdentity, SplitPlan, SplitPreflight, SplitPublication,
     SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
@@ -534,6 +534,46 @@ fn test_classification_covers_common_layouts_without_matching_lookalike_words() 
             "expected `{path}` to be classified as implementation"
         );
     }
+}
+
+/// The live planning terminal shows the harness's own chrome, so the contract
+/// object arrives fenced or wrapped in a closing remark. The transcript reader
+/// isolates it and then applies the identical strict contract.
+#[test]
+fn transcript_reader_isolates_the_contract_from_live_planner_chrome() {
+    let preflight = fixture();
+    let expected = parse_split_plan(valid_response(), &preflight).unwrap();
+
+    for transcript in [
+        valid_response().to_string(),
+        format!("Here is the split:\n\n```json\n{}\n```\n", valid_response()),
+        format!("```\n{}\n```", valid_response()),
+        format!(
+            "Thinking done.\n{}\nLet me know if you want changes.",
+            valid_response()
+        ),
+    ] {
+        assert_eq!(
+            parse_split_plan_transcript(&transcript, &preflight).expect("contract found"),
+            expected,
+            "failed on: {transcript}"
+        );
+    }
+
+    let error = parse_split_plan_transcript("I could not split this branch.", &preflight)
+        .expect_err("no JSON object")
+        .to_string();
+    assert!(error.contains("no JSON object"), "{error}");
+    // A transcript whose object is present but invalid still fails the same
+    // contract, so the corrective retry keeps its exact meaning.
+    assert!(parse_split_plan_transcript(
+        &format!(
+            "```json\n{}\n```",
+            valid_response().replace("\"CU0003\"", "\"CU9999\"")
+        ),
+        &preflight
+    )
+    .is_err());
 }
 
 #[test]

@@ -899,6 +899,16 @@ pub struct DevelopHandoff {
     pub harness: AiHarness,
 }
 
+/// Spawn parameters for the live Split planning run, plus the repository
+/// snapshot taken immediately before the spawn. `finish_split_plan` diffs the
+/// worktree against it so a planner that edits anything is still rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitPlanHandoff {
+    pub command: AiCommand,
+    pub harness: AiHarness,
+    pub snapshot: SplitRepositorySnapshot,
+}
+
 /// Inputs for one Develop planning run. `previous_plan` + `feedback` are set
 /// on a revision after the user rejects a plan; `corrective` marks the single
 /// retry after a parse failure.
@@ -5863,31 +5873,6 @@ impl DashboardService {
         })
     }
 
-    /// Construct the read-only planning handoff from an already-frozen
-    /// preflight. Revision context is included only as a complete pair.
-    pub async fn prepare_split_plan(
-        &self,
-        preflight: &SplitPreflight,
-        previous_proposal: Option<&str>,
-        feedback: Option<&str>,
-    ) -> Result<AiCommand> {
-        let revision = previous_proposal.zip(feedback);
-        let prompt = build_split_plan_prompt(
-            preflight,
-            revision.map(|(proposal, _)| proposal),
-            revision.map(|(_, feedback)| feedback),
-        );
-        self.ai_command(
-            "dashboard.ai.split.plan",
-            &self.config.ai.split.plan,
-            prompt,
-            PathBuf::from(&preflight.worktree_path),
-            AiRunMode::Interactive,
-            AiPermission::Plan,
-        )
-        .await
-    }
-
     pub async fn snapshot_split_repository(
         &self,
         preflight: &SplitPreflight,
@@ -5941,48 +5926,71 @@ impl DashboardService {
         })
     }
 
-    pub async fn run_split_plan(
+    /// Build the spawn parameters for one live planning run. Planning is the
+    /// only Split stage the developer watches and steers, so it runs in the
+    /// embedded terminal like the other AI-assisted commands instead of a
+    /// headless capture. The pre-run snapshot travels with the handoff so the
+    /// read-only guarantee is still verified against the state at spawn time.
+    pub async fn prepare_split_plan(
         &self,
         preflight: &SplitPreflight,
         previous_proposal: Option<&str>,
         feedback: Option<&str>,
         corrective_error: Option<&str>,
-        activity_tx: Option<mpsc::UnboundedSender<String>>,
-        cancel: oneshot::Receiver<()>,
-    ) -> Result<SplitPlanResult> {
-        let before = self.snapshot_split_repository(preflight).await?;
-        let mut prompt = build_split_plan_prompt(preflight, previous_proposal, feedback);
+    ) -> Result<SplitPlanHandoff> {
+        let slot = &self.config.ai.split.plan;
+        if slot.model.trim().is_empty() {
+            return Err(WisetreeError::other(
+                "ai.split.plan model is not configured.",
+            ));
+        }
+        let harness = slot.harness;
+        let config = slot.clone();
+        let snapshot = self.snapshot_split_repository(preflight).await?;
+        // Revision context only ever travels as a complete pair.
+        let revision = previous_proposal.zip(feedback);
+        let mut prompt = build_split_plan_prompt(
+            preflight,
+            revision.map(|(proposal, _)| proposal),
+            revision.map(|(_, feedback)| feedback),
+        );
         if let Some(error) = corrective_error {
             prompt = build_corrective_plan_prompt(&prompt, error);
         }
-        let run = self
-            .ai_runner()
-            .run_captured(
-                &AiRunRequest {
-                    slot: "dashboard.ai.split.plan".to_string(),
-                    config: self.config.ai.split.plan.clone(),
-                    prompt,
-                    cwd: PathBuf::from(&preflight.worktree_path),
-                    mode: AiRunMode::Captured,
-                    permission: AiPermission::Plan,
-                    timeout: Duration::from_secs(300),
-                    activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
-                    session_title: Some("wisetree split plan".to_string()),
-                    attachments: Vec::new(),
-                },
-                activity_tx,
-                cancel,
+        let command = self
+            .ai_command(
+                "dashboard.ai.split.plan",
+                &config,
+                prompt,
+                PathBuf::from(&preflight.worktree_path),
+                AiRunMode::Interactive,
+                AiPermission::Plan,
             )
             .await?;
+        Ok(SplitPlanHandoff {
+            command,
+            harness,
+            snapshot,
+        })
+    }
+
+    /// Validate one finished planning turn: the read-only guarantee first,
+    /// then the JSON contract, then the harness-owned plan file.
+    pub async fn finish_split_plan(
+        &self,
+        preflight: &SplitPreflight,
+        before: &SplitRepositorySnapshot,
+        transcript: &str,
+    ) -> Result<SplitPlanResult> {
         let after = self.snapshot_split_repository(preflight).await?;
-        let changes = describe_snapshot_changes(&before, &after);
+        let changes = describe_snapshot_changes(before, &after);
         if !changes.is_empty() {
             return Err(WisetreeError::validation(format!(
                 "Split rejected planning output because the repository mutated: {}.",
                 changes.join(", ")
             )));
         }
-        let plan = crate::services::split::parse_split_plan(&run.transcript, preflight)?;
+        let plan = crate::services::split::parse_split_plan_transcript(transcript, preflight)?;
         self.save_split_plan(preflight, &plan, "awaiting approval")
             .await?;
         let snapshot = self.snapshot_split_repository(preflight).await?;
