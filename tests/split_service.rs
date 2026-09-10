@@ -54,6 +54,15 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> String {
         .to_string()
 }
 
+fn git_succeeds(cwd: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .unwrap()
+        .success()
+}
+
 struct RepoFixture {
     _parent: TempDir,
     repo: std::path::PathBuf,
@@ -734,11 +743,17 @@ async fn materializes_shared_file_hunks_without_touching_the_source() {
     let source_before = fs::read(fixture.source.join("tests/shared.txt")).unwrap();
     let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default());
     service
-        .save_split_plan(&preflight, &plan, "approved")
+        .save_split_plan(&preflight, &plan, "awaiting approval")
         .await
         .unwrap();
+    let resumed_snapshot = SplitRepositorySnapshot {
+        status: String::new(),
+        head: fixture.head.clone(),
+        refs: String::new(),
+        files: Vec::new(),
+    };
     service
-        .materialize_split_stack(&preflight, &plan)
+        .approve_split_plan(&preflight, &plan, &resumed_snapshot)
         .await
         .unwrap();
 
@@ -908,10 +923,12 @@ exit 1
         .unwrap();
     assert_eq!(fs::read_to_string(&ai_log).unwrap().lines().count(), 3);
 
-    assert_eq!(
-        git_stdout(&fixture.source, &["rev-parse", "HEAD"]),
-        fixture.head
-    );
+    let source_head = git_stdout(&fixture.source, &["rev-parse", "HEAD"]);
+    assert_ne!(source_head, fixture.head);
+    assert!(git_succeeds(
+        &fixture.source,
+        &["merge-base", "--is-ancestor", &fixture.head, &source_head]
+    ));
     assert_eq!(
         fs::read(fixture.source.join("tests/shared.txt")).unwrap(),
         source_before
@@ -951,6 +968,16 @@ exit 1
         "https://github.com/example/repo/pull/43"
     );
     assert_eq!(persisted.layers.len(), 3);
+    assert_eq!(persisted.layers[2].commit_sha, source_head);
+    assert!(git_succeeds(
+        &fixture.source,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &persisted.layers[1].commit_sha,
+            &persisted.layers[2].commit_sha,
+        ],
+    ));
     assert_eq!(persisted.layers[0].branch, "feature.1_first-hunk");
     assert!(persisted.layers[0].ready_for_publication);
 
@@ -1066,7 +1093,7 @@ async fn materializes_deletion_rename_and_binary_and_rejects_moved_artifacts() {
     }
     assert_eq!(
         git_stdout(&fixture.source, &["rev-parse", "HEAD"]),
-        fixture.head
+        persisted.layers.last().unwrap().commit_sha
     );
     assert!(git_stdout(&fixture.source, &["diff"]).is_empty());
     assert!(git_stdout(&fixture.source, &["diff", "--cached"]).is_empty());

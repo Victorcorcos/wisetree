@@ -1482,7 +1482,7 @@ fn action_menu_never_offers_improve_for_mother_worktree() {
 }
 
 #[test]
-fn split_is_offered_only_for_a_resolved_non_empty_non_terminal_diff() {
+fn split_is_offered_for_committed_diffs_including_zero_line_changes() {
     let mut screen = DashboardScreen::new(
         true,
         true,
@@ -1499,18 +1499,26 @@ fn split_is_offered_only_for_a_resolved_non_empty_non_terminal_diff() {
         .iter()
         .any(|label| label == "Split"));
 
+    let mut zero_line = split_eligible_row("/tmp/binary", "binary-only");
+    let status = zero_line.worktree.branch_status.as_mut().unwrap();
+    status.insertions = Some(0);
+    status.deletions = Some(0);
+    let mut candidate =
+        DashboardScreen::new(true, true, true, vec!["branch".into()], Vec::new(), false);
+    candidate.set_rows(vec![zero_line]);
+    candidate.handle_key(key(KeyCode::Enter));
+    assert!(candidate
+        .pr_command_labels()
+        .iter()
+        .any(|label| label == "Split"));
+
     for mut ineligible in [
         split_eligible_row("/tmp/mother", "main"),
-        split_eligible_row("/tmp/empty", "empty"),
         split_eligible_row("/tmp/unresolved", "unresolved"),
         split_eligible_row("/tmp/dirty-only", "dirty-only"),
     ] {
         if ineligible.worktree.branch == "main" {
             ineligible.worktree.is_main = true;
-        } else if ineligible.worktree.branch == "empty" {
-            let status = ineligible.worktree.branch_status.as_mut().unwrap();
-            status.insertions = Some(0);
-            status.deletions = Some(0);
         } else if ineligible.worktree.branch == "unresolved" {
             ineligible
                 .worktree

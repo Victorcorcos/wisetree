@@ -1088,4 +1088,25 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     assert!(log.contains("stack submit --help"), "{log}");
     assert!(!log.contains("stack init feat"), "{log}");
     assert!(!log.contains("stack link feat"), "{log}");
+
+    fs::write(fixture.repo.join("base-after-feature.rs"), "fn base() {}\n").unwrap();
+    git(&fixture.repo, &["add", "base-after-feature.rs"]);
+    git(&fixture.repo, &["commit", "-q", "-m", "advance base"]);
+    let advanced_base = rev_parse_head(&fixture.repo);
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/remotes/origin/main", &advanced_base],
+    );
+    let error = service
+        .split_preflight(&SplitPreflightRequest {
+            worktree_path: worktree.to_string_lossy().to_string(),
+            source_branch: "feat-dashboard".to_string(),
+            pr_number: None,
+            pr_base_ref: None,
+            max: 100,
+        })
+        .await
+        .expect_err("a source behind its base must not be split")
+        .to_string();
+    assert!(error.contains("include the current base"), "{error}");
 }

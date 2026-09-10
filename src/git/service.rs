@@ -415,6 +415,55 @@ impl GitService {
         self.resolve_at(cwd, "HEAD").await
     }
 
+    /// Advance the checked-out source branch with a merge commit whose first
+    /// parent is the preceding Split layer and whose tree is unchanged from
+    /// the original source. Keeping the original source as the second parent
+    /// makes the update fast-forward while the first-parent PR diff remains
+    /// exactly the assigned top responsibility.
+    pub async fn commit_split_top(
+        &self,
+        cwd: &Path,
+        branch: &str,
+        source_head: &str,
+        parent_sha: &str,
+        subject: &str,
+    ) -> Result<String> {
+        let tree = self
+            .resolve_at(cwd, &format!("{source_head}^{{tree}}"))
+            .await?;
+        let result = execute_git_command(
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                parent_sha,
+                "-p",
+                source_head,
+                "-m",
+                subject,
+            ],
+            Some(cwd),
+        )
+        .await;
+        if !result.success {
+            return Err(handle_git_error(&result.stderr, "commit Split top layer"));
+        }
+        let commit_sha = result.stdout;
+        let reference = format!("refs/heads/{branch}");
+        let update = execute_git_command(
+            &["update-ref", &reference, &commit_sha, source_head],
+            Some(cwd),
+        )
+        .await;
+        if !update.success {
+            return Err(handle_git_error(
+                &update.stderr,
+                "advance Split source branch",
+            ));
+        }
+        Ok(commit_sha)
+    }
+
     pub async fn is_ancestor(&self, cwd: &Path, ancestor: &str, descendant: &str) -> bool {
         execute_git_command(
             &["merge-base", "--is-ancestor", ancestor, descendant],

@@ -5593,6 +5593,21 @@ impl DashboardService {
         }
         let cwd = PathBuf::from(&request.worktree_path);
         let has_persisted_run = cwd.join(SPLIT_PLAN_FILE).is_file();
+        let persisted_document = if has_persisted_run {
+            Some(tokio::fs::read_to_string(cwd.join(SPLIT_PLAN_FILE)).await?)
+        } else {
+            None
+        };
+        let persisted_run = persisted_document
+            .as_deref()
+            .map(parse_split_run)
+            .transpose()?
+            .flatten();
+        let persisted_materialization = persisted_document
+            .as_deref()
+            .map(parse_materialization)
+            .transpose()?
+            .flatten();
         if !has_persisted_run {
             let runner = self.ai_runner();
             for (slot, config) in [
@@ -5717,7 +5732,18 @@ impl DashboardService {
             None
         };
         if let Some(metadata) = &pr_metadata {
-            if metadata.state != "OPEN" || metadata.head_ref_oid != source_head {
+            let resumed_unpublished_top = persisted_materialization
+                .as_ref()
+                .and_then(|materialization| materialization.layers.last())
+                .is_some_and(|layer| {
+                    layer.branch == source_branch && layer.commit_sha == source_head
+                })
+                && persisted_run
+                    .as_ref()
+                    .is_some_and(|record| metadata.head_ref_oid == record.identity.source_head);
+            if metadata.state != "OPEN"
+                || (metadata.head_ref_oid != source_head && !resumed_unpublished_top)
+            {
                 return Err(WisetreeError::validation(
                     "The source pull request is no longer open at the selected source HEAD; refresh the dashboard before planning.",
                 ));
@@ -5749,6 +5775,18 @@ impl DashboardService {
                     "Split base ref `{base_ref}` moved or disappeared during preflight."
                 ))
             })?;
+        let base_is_ancestor = run_command(
+            &self.git_binary,
+            &["merge-base", "--is-ancestor", &base_sha, &source_head],
+            Some(&cwd),
+        )
+        .await
+        .is_ok();
+        if !base_is_ancestor {
+            return Err(WisetreeError::validation(
+                "Split requires the selected branch to include the current base. Update the branch before splitting so newer base changes are not mistaken for removals.",
+            ));
+        }
         let (remote, _) = base_ref.split_once('/').ok_or_else(|| {
             WisetreeError::validation(format!(
                 "Split base `{base_ref}` is not a remote-tracking ref."
@@ -5830,7 +5868,7 @@ impl DashboardService {
         .await
         .map_err(WisetreeError::other)?;
         let (additions, deletions) = parse_numstat_totals(&numstat);
-        let identity = SplitIdentity {
+        let live_identity = SplitIdentity {
             repository,
             remote: remote.to_string(),
             base_ref,
@@ -5841,7 +5879,34 @@ impl DashboardService {
             additions,
             deletions,
         };
-        validate_split_manifest(&identity, &units)?;
+        validate_split_manifest(&live_identity, &units)?;
+        let identity = if let Some(record) = persisted_run {
+            let materialized_head = persisted_materialization
+                .as_ref()
+                .and_then(|materialization| materialization.layers.last())
+                .filter(|layer| layer.branch == live_identity.source_branch)
+                .map(|layer| layer.commit_sha.as_str());
+            let source_head_matches = live_identity.source_head == record.identity.source_head
+                || materialized_head == Some(live_identity.source_head.as_str());
+            if !source_head_matches
+                || live_identity.repository != record.identity.repository
+                || live_identity.remote != record.identity.remote
+                || live_identity.base_ref != record.identity.base_ref
+                || live_identity.base_sha != record.identity.base_sha
+                || live_identity.source_branch != record.identity.source_branch
+                || live_identity.max != record.identity.max
+                || live_identity.additions != record.identity.additions
+                || live_identity.deletions != record.identity.deletions
+                || units != record.units
+            {
+                return Err(WisetreeError::validation(
+                    "Persisted Split input no longer matches the live repository or harness-created top layer. Reconcile the recorded artifacts before retrying.",
+                ));
+            }
+            record.identity
+        } else {
+            live_identity
+        };
         let final_base = run_command(
             &self.git_binary,
             &["rev-parse", &identity.base_ref],
@@ -5861,7 +5926,14 @@ impl DashboardService {
         let final_head = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
             .await
             .map_err(WisetreeError::other)?;
-        if final_head != identity.source_head {
+        let expected_live_head = persisted_materialization
+            .as_ref()
+            .and_then(|materialization| materialization.layers.last())
+            .filter(|layer| layer.branch == identity.source_branch)
+            .map_or(identity.source_head.as_str(), |layer| {
+                layer.commit_sha.as_str()
+            });
+        if final_head != expected_live_head {
             return Err(WisetreeError::validation(
                 "Source HEAD changed during Split preflight; retry from the dashboard.",
             ));
@@ -6014,7 +6086,15 @@ impl DashboardService {
         });
         if parse_materialization(&existing)?.is_none() && !already_approved {
             let current = self.snapshot_split_repository(preflight).await?;
-            let changes = describe_snapshot_changes(expected, &current);
+            // A resumed awaiting-approval plan has already passed a fresh,
+            // clean preflight but cannot reconstruct the in-memory snapshot
+            // from the original process. Empty refs/files explicitly mark
+            // that resume path; live identity and cleanliness remain checked.
+            let changes = if expected.refs.is_empty() && expected.files.is_empty() {
+                Vec::new()
+            } else {
+                describe_snapshot_changes(expected, &current)
+            };
             if !changes.is_empty() {
                 return Err(WisetreeError::validation(format!(
                     "Split proposal is stale because repository state changed: {}.",
@@ -6026,8 +6106,9 @@ impl DashboardService {
         self.materialize_split_stack(preflight, plan).await
     }
 
-    /// Build and verify the local lower layers. The selected source worktree
-    /// is used only for immutable reads and for the durable progress record.
+    /// Build and verify the local layers. Lower responsibilities receive
+    /// dedicated worktrees; the selected source advances only by the final
+    /// tree-preserving commit that gives the top PR correct ancestry.
     pub async fn materialize_split_stack(
         &self,
         preflight: &SplitPreflight,
@@ -6035,7 +6116,6 @@ impl DashboardService {
     ) -> Result<()> {
         crate::services::split::parse_split_plan(&serde_json::to_string(plan)?, preflight)?;
         let source = PathBuf::from(&preflight.worktree_path);
-        self.verify_split_source(preflight, &source).await?;
         let source_status = self.split_source_status(&source).await?;
         let range = format!(
             "{}..{}",
@@ -6082,6 +6162,15 @@ impl DashboardService {
                 "Existing Split artifacts belong to a different source identity.",
             ));
         }
+        let expected_live_head = materialization
+            .layers
+            .last()
+            .filter(|layer| layer.branch == preflight.identity.source_branch)
+            .map_or(preflight.identity.source_head.as_str(), |layer| {
+                layer.commit_sha.as_str()
+            });
+        self.verify_split_source(preflight, &source, expected_live_head)
+            .await?;
 
         let mut worktrees = WorktreeService::new(Some(source.clone()));
         worktrees.initialize().await?;
@@ -6122,6 +6211,7 @@ impl DashboardService {
                     &parent_branch,
                     &parent_sha,
                     &expected_patch,
+                    true,
                 )
                 .await
                 .map_err(|error| {
@@ -6209,6 +6299,24 @@ impl DashboardService {
         let top = plan.responsibilities.last().expect("validated Split plan");
         let top_units = top.units.iter().cloned().collect::<BTreeSet<_>>();
         let expected_top = patch_for_units(&frozen_diff, &top_units)?;
+        if let Some(recorded) = materialization.layers.get(lower_count) {
+            self.verify_recorded_split_layer(
+                git,
+                recorded,
+                top,
+                &preflight.identity.source_branch,
+                &preflight.worktree_path,
+                &parent_branch,
+                &parent_sha,
+                &expected_top,
+                false,
+            )
+            .await
+            .map_err(|error| {
+                WisetreeError::validation(format!("Split layer {}: {error}", top.order))
+            })?;
+            return Ok(());
+        }
         let actual_top = git
             .diff_at(
                 &source,
@@ -6221,14 +6329,37 @@ impl DashboardService {
                 top.order
             )));
         }
-        let (top_additions, top_deletions) = parse_numstat_totals(
-            &git.numstat_at(
+        self.verify_split_source(preflight, &source, &preflight.identity.source_head)
+            .await?;
+        let subject = format!("split: {}", top.name);
+        let top_commit = git
+            .commit_split_top(
                 &source,
-                &format!("{parent_sha}..{}", preflight.identity.source_head),
+                &preflight.identity.source_branch,
+                &preflight.identity.source_head,
+                &parent_sha,
+                &subject,
             )
-            .await?,
-        );
-        self.verify_split_source(preflight, &source).await?;
+            .await?;
+        if !git.is_ancestor(&source, &parent_sha, &top_commit).await
+            || git.resolve_at(&source, &format!("{top_commit}^")).await? != parent_sha
+        {
+            return Err(WisetreeError::validation(
+                "Split top layer has the wrong first-parent ancestry.",
+            ));
+        }
+        let top_range = format!("{parent_sha}..{top_commit}");
+        if normalized_patch(&git.diff_at(&source, &top_range).await?)
+            != normalized_patch(&expected_top)
+        {
+            return Err(WisetreeError::validation(
+                "Split top layer no longer matches its assigned change units.",
+            ));
+        }
+        let (top_additions, top_deletions) =
+            parse_numstat_totals(&git.numstat_at(&source, &top_range).await?);
+        self.verify_split_source(preflight, &source, &top_commit)
+            .await?;
         if self.split_source_status(&source).await? != source_status {
             return Err(WisetreeError::validation(
                 "Split stopped because the selected source worktree or index changed during materialization.",
@@ -6241,7 +6372,7 @@ impl DashboardService {
             worktree_path: preflight.worktree_path.clone(),
             parent_branch,
             parent_sha,
-            commit_sha: preflight.identity.source_head.clone(),
+            commit_sha: top_commit,
             tree_sha: git
                 .resolve_at(
                     &source,
@@ -6290,7 +6421,13 @@ impl DashboardService {
                 "Split cannot publish an incomplete or unverified local stack.",
             ));
         }
-        self.verify_split_source(preflight, source).await?;
+        let top_head = materialization
+            .layers
+            .last()
+            .map(|layer| layer.commit_sha.as_str())
+            .ok_or_else(|| WisetreeError::validation("Split stack has no top layer."))?;
+        self.verify_split_source(preflight, source, top_head)
+            .await?;
         let branches = materialization
             .layers
             .iter()
@@ -6298,7 +6435,7 @@ impl DashboardService {
             .collect::<Vec<_>>();
         if branches.last() != Some(&preflight.identity.source_branch) {
             return Err(WisetreeError::validation(
-                "Split cannot publish because the unchanged source branch is not the top layer.",
+                "Split cannot publish because the source branch is not the verified top layer.",
             ));
         }
         let trunk = preflight
@@ -6602,7 +6739,13 @@ impl DashboardService {
             .map_err(WisetreeError::other)?;
             let log = run_command(
                 &self.git_binary,
-                &["log", &range, "--reverse", "--format=### %s%n%n%b"],
+                &[
+                    "log",
+                    "--first-parent",
+                    &range,
+                    "--reverse",
+                    "--format=### %s%n%n%b",
+                ],
                 Some(&worktree_path),
             )
             .await
@@ -6728,9 +6871,19 @@ impl DashboardService {
             .filter(|record| record.applied)
             .map(|record| (record.order, record))
             .collect::<BTreeMap<_, _>>();
-        while let Some(joined) = applying.join_next().await {
-            let record = joined.map_err(|error| WisetreeError::other(error.to_string()))??;
-            applied.insert(record.order, record);
+        while !applying.is_empty() {
+            tokio::select! {
+                _ = &mut cancel => {
+                    applying.abort_all();
+                    return Err(WisetreeError::validation("Split metadata application was cancelled."));
+                }
+                joined = applying.join_next() => {
+                    let record = joined
+                        .ok_or_else(|| WisetreeError::other("Split metadata task disappeared."))?
+                        .map_err(|error| WisetreeError::other(error.to_string()))??;
+                    applied.insert(record.order, record);
+                }
+            }
         }
         let records = applied.into_values().collect::<Vec<_>>();
         let complete = records.iter().all(|record| record.applied);
@@ -7104,6 +7257,7 @@ impl DashboardService {
         parent_branch: &str,
         parent_sha: &str,
         expected_patch: &str,
+        require_worktree_registration: bool,
     ) -> Result<()> {
         let order = responsibility.order;
         if recorded.order != order
@@ -7135,25 +7289,35 @@ impl DashboardService {
                 "Split layer {order}: recorded branch or worktree moved."
             )));
         }
-        let matching_worktree = git.list_worktrees().await?.into_iter().any(|worktree| {
-            worktree.path == worktree_path
-                && worktree.branch == branch
-                && worktree.commit == recorded.commit_sha
-        });
-        if !matching_worktree
-            || !git
-                .is_ancestor(Path::new(worktree_path), parent_sha, &recorded.commit_sha)
-                .await
-            || git
-                .resolve_at(
-                    Path::new(worktree_path),
-                    &format!("{}^", recorded.commit_sha),
-                )
-                .await?
-                != parent_sha
+        if require_worktree_registration
+            && !git.list_worktrees().await?.into_iter().any(|worktree| {
+                worktree.path == worktree_path
+                    && worktree.branch == branch
+                    && worktree.commit == recorded.commit_sha
+            })
         {
             return Err(WisetreeError::validation(format!(
-                "Split layer {order}: recorded worktree or ancestry is invalid."
+                "Split layer {order}: recorded worktree registration is invalid."
+            )));
+        }
+        if !git
+            .is_ancestor(Path::new(worktree_path), parent_sha, &recorded.commit_sha)
+            .await
+        {
+            return Err(WisetreeError::validation(format!(
+                "Split layer {order}: recorded parent is not an ancestor."
+            )));
+        }
+        if git
+            .resolve_at(
+                Path::new(worktree_path),
+                &format!("{}^", recorded.commit_sha),
+            )
+            .await?
+            != parent_sha
+        {
+            return Err(WisetreeError::validation(format!(
+                "Split layer {order}: recorded first parent is invalid."
             )));
         }
         let range = format!("{parent_sha}..{}", recorded.commit_sha);
@@ -7169,7 +7333,12 @@ impl DashboardService {
         Ok(())
     }
 
-    async fn verify_split_source(&self, preflight: &SplitPreflight, source: &Path) -> Result<()> {
+    async fn verify_split_source(
+        &self,
+        preflight: &SplitPreflight,
+        source: &Path,
+        expected_head: &str,
+    ) -> Result<()> {
         let branch = run_command(
             &self.git_binary,
             &["rev-parse", "--abbrev-ref", "HEAD"],
@@ -7188,7 +7357,7 @@ impl DashboardService {
         .await
         .map_err(WisetreeError::other)?;
         if branch != preflight.identity.source_branch
-            || head != preflight.identity.source_head
+            || head != expected_head
             || base != preflight.identity.base_sha
         {
             return Err(WisetreeError::validation(

@@ -5929,6 +5929,7 @@ impl App {
         if !self.split_event_is_current(operation_id, generation) {
             return;
         }
+        self.split_cancel = None;
         match result {
             Ok(publication) => {
                 if let Some(screen) = self.split_pr.as_mut() {
