@@ -142,7 +142,7 @@ fn overview_names_the_full_sequence_roles_max_and_new_top_pr() {
         "SRP plan",
         "Approve/Reject loop",
         "local branches and worktrees",
-        "parent-to-child diff against MAX",
+        "MAX is a guideline",
         "gh stack link",
         "drafting AI concurrently",
         "Compose titles",
@@ -150,6 +150,7 @@ fn overview_names_the_full_sequence_roles_max_and_new_top_pr() {
         "once per proposal",
         "once per resulting PR (concurrently)",
         "MAX is additions plus deletions, including tests",
+        "guideline, not a hard limit",
         "MAX: 1000",
         "create a new top pull request",
     ] {
@@ -237,8 +238,10 @@ fn narrow_terminal_can_scroll_from_overview_to_roles_and_max() {
     assert!(top.contains("Split this branch"), "{top}");
     screen.handle_key(key(KeyCode::End));
     let (bottom, _) = render(&mut screen, 44, 24);
-    assert!(bottom.contains("openai/fast-writer"), "{bottom}");
     assert!(bottom.contains("MAX: 1000"), "{bottom}");
+    screen.handle_key(key(KeyCode::PageUp));
+    let (roles, _) = render(&mut screen, 44, 24);
+    assert!(roles.contains("openai/fast-writer"), "{roles}");
     assert!(bottom.contains("Confirm"), "{bottom}");
     assert!(bottom.contains("Cancel"), "{bottom}");
 }
@@ -255,7 +258,7 @@ fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
         "src/a.rs, tests/a_test.rs",
         "CU0001, CU0002",
         "Related tests: CU0002",
-        "Integrity: +4 -1 = 5 · MAX 10 ✓",
+        "Integrity: +4 -1 = 5 · within MAX 10 ✓",
         "Aggregate integrity",
         "+8 -2 = 10 source lines",
         "Approve",
@@ -479,4 +482,47 @@ fn planning_keys_scroll_the_planner_and_cancel_without_touching_the_plan() {
     screen.set_planning_error("planner exited".into(), true);
     assert!(!screen.has_pty());
     assert_eq!(screen.step(), SplitStep::Error);
+}
+
+/// An oversized layer must be impossible to miss on the review page: the
+/// banner counts them, each one states its overflow, and the reason it was
+/// kept whole stays next to it so Approve/Reject is an informed choice.
+#[test]
+fn review_flags_every_pull_request_that_runs_past_max_with_its_reason() {
+    let mut screen = review_screen();
+    let mut preflight = screen.preflight().expect("preflight").clone();
+    preflight.identity.max = 3;
+    screen.set_preflight(preflight);
+
+    let (text, _) = render(&mut screen, 110, 40);
+    assert!(text.contains("MAX 3 (guideline)"), "{text}");
+    assert!(text.contains("2 of 2 pull requests exceed MAX 3"), "{text}");
+    assert!(
+        text.contains("Responsibility boundaries win over size"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Over MAX: +4 -1 = 5 changed lines, 2 over MAX 3"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Kept whole to preserve this single responsibility"),
+        "{text}"
+    );
+    // The AI's own boundary reasoning is what explains the overflow.
+    assert!(text.contains("Responsibility/dependency"), "{text}");
+    // Approving an oversized plan is still allowed — it is the point.
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::Approved
+    );
+}
+
+#[test]
+fn review_reports_layers_within_max_as_within_the_guideline() {
+    let mut screen = review_screen();
+    let (text, _) = render(&mut screen, 110, 40);
+    assert!(text.contains("within MAX 10 ✓"), "{text}");
+    assert!(!text.contains("exceed MAX"), "{text}");
+    assert!(!text.contains("Over MAX"), "{text}");
 }

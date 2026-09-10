@@ -15,9 +15,9 @@ use ratatui::Frame;
 use crate::config::schema::{AiModelConfig, AiSplitConfig};
 use crate::messages::colors;
 use crate::services::{
-    parse_materialization, SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord,
-    SplitMaterialization, SplitPlan, SplitPlanResult, SplitPreflight, SplitPublication,
-    SplitRepositorySnapshot, SPLIT_PLAN_FILE,
+    parse_materialization, split_layer_sizes, SplitDraftJobStatus, SplitDraftProgress,
+    SplitDraftRecord, SplitMaterialization, SplitPlan, SplitPlanResult, SplitPreflight,
+    SplitPublication, SplitRepositorySnapshot, SPLIT_PLAN_FILE,
 };
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::screens::update_pr::key_event_to_pty_bytes;
@@ -1042,26 +1042,36 @@ impl SplitPullRequestScreen {
         let (Some(preflight), Some(plan)) = (&self.preflight, &self.plan) else {
             return vec![Line::from("No validated Split proposal is available.")];
         };
+        let sizes = split_layer_sizes(preflight, plan);
+        let oversized = sizes.iter().filter(|size| size.over_max()).count();
         let mut lines = vec![
             section_line("Proposed Split stack · bottom to top"),
             Line::from(format!(
-                "{} @ {} → {} @ {} · MAX {}",
+                "{} @ {} → {} @ {} · MAX {} (guideline)",
                 preflight.identity.base_ref,
                 preflight.identity.base_sha,
                 preflight.identity.source_branch,
                 preflight.identity.source_head,
                 preflight.identity.max
             )),
-            Line::default(),
         ];
-        for layer in &plan.responsibilities {
-            let units = layer
-                .units
-                .iter()
-                .filter_map(|id| preflight.units.iter().find(|unit| &unit.id == id))
-                .collect::<Vec<_>>();
-            let additions = units.iter().map(|unit| unit.additions).sum::<u64>();
-            let deletions = units.iter().map(|unit| unit.deletions).sum::<u64>();
+        if oversized > 0 {
+            // MAX yields to the semantic boundary, so the reviewer is told
+            // exactly which layers ran past it and why before approving.
+            push_wrapped_styled(
+                &mut lines,
+                &format!(
+                    "⚠ {oversized} of {} pull requests exceed MAX {}. Responsibility boundaries win over size: each one is flagged below with its overflow and the reason it was kept whole.",
+                    sizes.len(),
+                    preflight.identity.max
+                ),
+                width,
+                Style::default().fg(colors::WARNING),
+            );
+        }
+        lines.push(Line::default());
+        for (layer, size) in plan.responsibilities.iter().zip(&sizes) {
+            let (additions, deletions) = (size.additions, size.deletions);
             push_wrapped_styled(
                 &mut lines,
                 &format!("{}. {}  [{}]", layer.order, layer.name, layer.branch_slug),
@@ -1097,15 +1107,28 @@ impl SplitPullRequestScreen {
                 ),
                 width,
             );
-            push_wrapped(
-                &mut lines,
-                &format!(
-                    "Integrity: +{additions} -{deletions} = {} · MAX {} ✓",
-                    additions + deletions,
-                    preflight.identity.max
-                ),
-                width,
-            );
+            if size.over_max() {
+                push_wrapped_styled(
+                    &mut lines,
+                    &format!(
+                        "⚠ Over MAX: +{additions} -{deletions} = {} changed lines, {} over MAX {}. Kept whole to preserve this single responsibility — splitting it further would cut across the boundary described above.",
+                        size.changed,
+                        size.overflow(),
+                        size.max
+                    ),
+                    width,
+                    Style::default().fg(colors::WARNING),
+                );
+            } else {
+                push_wrapped(
+                    &mut lines,
+                    &format!(
+                        "Integrity: +{additions} -{deletions} = {} · within MAX {} ✓",
+                        size.changed, size.max
+                    ),
+                    width,
+                );
+            }
             lines.push(Line::default());
         }
         lines.push(section_line("Aggregate integrity"));
@@ -1248,7 +1271,7 @@ impl SplitPullRequestScreen {
             "Run the planning AI in an embedded terminal (Tab focuses it) for an SRP plan organized by semantic responsibility.",
             "Show the plan in an Approve/Reject loop; rejection feedback regenerates one proposal.",
             "Materialize the approved stack as local branches and worktrees.",
-            "Verify every parent-to-child diff against MAX and check stack integrity.",
+            "Verify every parent-to-child diff and check stack integrity (MAX is a guideline; oversized layers are flagged for you, never silently split).",
             "Publish the stack with `gh stack link`, reusing the active source PR as the top PR when present.",
             "Run the drafting AI concurrently once for each resulting pull request.",
             "Compose titles, Split Plan links, descriptions, and suffixes deterministically.",
@@ -1276,10 +1299,15 @@ impl SplitPullRequestScreen {
             width,
         );
         lines.push(Line::default());
-        lines.push(section_line("Review-size limit"));
+        lines.push(section_line("Review-size guideline"));
         push_wrapped(
             &mut lines,
             "MAX is additions plus deletions, including tests, in each parent-to-child pull-request diff.",
+            width,
+        );
+        push_wrapped(
+            &mut lines,
+            "It is a guideline, not a hard limit: responsibilities are never split to fit. Any PR over MAX is flagged for review with its overflow and reason.",
             width,
         );
         let max_style = if self.focus == SplitFocus::Max {

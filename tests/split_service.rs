@@ -13,10 +13,11 @@ use wisetree::services::{
     parse_materialization, parse_numstat_totals, parse_publication, parse_split_draft,
     parse_split_drafting, parse_split_plan, parse_split_plan_transcript, parse_split_run,
     patch_for_units, provisional_split_title, render_publication, render_split_drafting,
-    render_split_plan, validate_split_body, validate_split_manifest, validate_split_publication,
-    validate_split_resume, ChangeUnit, ChangeUnitKind, DashboardService, SplitDraftRecord,
-    SplitDraftingRecord, SplitIdentity, SplitPlan, SplitPreflight, SplitPublication,
-    SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
+    render_split_plan, split_layer_sizes, validate_split_body, validate_split_manifest,
+    validate_split_publication, validate_split_resume, ChangeUnit, ChangeUnitKind,
+    DashboardService, SplitDraftRecord, SplitDraftingRecord, SplitIdentity, SplitPlan,
+    SplitPreflight, SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot,
+    SplitResponsibility,
 };
 
 mod support;
@@ -602,17 +603,39 @@ fn parser_rejects_prose_unknown_duplicate_missing_and_ai_arithmetic() {
     .is_err());
 }
 
+/// MAX yields to the semantic boundary: an oversized responsibility — even an
+/// indivisible change larger than MAX on its own — plans, sizes and renders
+/// with its overflow and its reason instead of failing.
 #[test]
-fn indivisible_unit_over_max_names_the_exact_unit_and_path() {
+fn max_is_a_soft_ceiling_that_reports_the_overflow_and_its_reason() {
     let mut preflight = fixture();
     preflight.identity.max = 3;
     preflight.units[0].kind = ChangeUnitKind::Binary;
-    let error = validate_split_manifest(&preflight.identity, &preflight.units)
-        .expect_err("oversized atomic unit")
-        .to_string();
-    assert!(error.contains("CU0001"), "{error}");
-    assert!(error.contains("src/a.rs"), "{error}");
-    assert!(error.contains("No valid split"), "{error}");
+    validate_split_manifest(&preflight.identity, &preflight.units)
+        .expect("an indivisible change over MAX no longer blocks the split");
+
+    let plan = parse_split_plan(valid_response(), &preflight).expect("oversized plan is accepted");
+    let sizes = split_layer_sizes(&preflight, &plan);
+    assert_eq!(sizes.len(), 2);
+    assert_eq!((sizes[0].additions, sizes[0].deletions), (4, 1));
+    assert_eq!(sizes[0].changed, 5);
+    assert!(sizes[0].over_max());
+    assert_eq!(sizes[0].overflow(), 2);
+    assert!(sizes[1].over_max());
+
+    preflight.identity.max = 10;
+    let sizes = split_layer_sizes(&preflight, &plan);
+    assert!(!sizes[0].over_max() && !sizes[1].over_max());
+    assert_eq!(sizes[0].overflow(), 0);
+
+    preflight.identity.max = 3;
+    let rendered = render_split_plan(&preflight, &plan, "awaiting approval");
+    assert!(rendered.contains("| 5 | over by 2 |"), "{rendered}");
+    assert!(rendered.contains("[!WARNING]"), "{rendered}");
+    assert!(
+        rendered.contains("kept whole because splitting it would break the single responsibility"),
+        "{rendered}"
+    );
 }
 
 #[test]
