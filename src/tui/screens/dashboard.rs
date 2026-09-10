@@ -3436,13 +3436,11 @@ fn build_split_request(row: &DashboardRow) -> Option<SplitRequest> {
         .upstream_branch
         .as_ref()
         .filter(|base| !base.trim().is_empty())?;
-    let changed_lines = status
-        .insertions
-        .unwrap_or(0)
-        .saturating_add(status.deletions.unwrap_or(0));
     // `git diff <base>` also sees uncommitted working-tree edits. Require an
     // ahead commit as well so dirty-only rows never enter a PR split flow.
-    if status.ahead == 0 || changed_lines == 0 {
+    // Do not use line totals as the existence test: binary-only, pure rename,
+    // and mode-only commits legitimately report zero changed lines.
+    if status.ahead == 0 {
         return None;
     }
 
@@ -4005,8 +4003,8 @@ mod tests {
         assert_eq!(
             pr_labels(&r),
             vec![
-                "Open", "Explain", "Fix", "Review", "Improve", "Bugkill", "Develop", "Upload",
-                "Merge", "Close"
+                "Open", "Explain", "Fix", "Review", "Improve", "Bugkill", "Develop", "Split",
+                "Upload", "Merge", "Close"
             ]
         );
     }
@@ -4017,8 +4015,8 @@ mod tests {
         assert_eq!(
             pr_labels(&r),
             vec![
-                "Open", "Explain", "Fix", "Review", "Improve", "Bugkill", "Develop", "Update",
-                "Merge", "Close"
+                "Open", "Explain", "Fix", "Review", "Improve", "Bugkill", "Develop", "Split",
+                "Update", "Merge", "Close"
             ]
         );
     }

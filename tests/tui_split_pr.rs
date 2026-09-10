@@ -365,6 +365,7 @@ fn review_buttons_are_clickable_and_second_contract_failure_requires_explicit_re
 fn publication_progress_and_verified_stack_are_visible() {
     let mut screen = review_screen();
     screen.start_approving();
+    assert_eq!(screen.handle_key(key(KeyCode::Esc)), SplitAction::Continue);
     let (progress, _) = render(&mut screen, 100, 20);
     assert!(progress.contains("materializing, publishing, and verifying"));
 

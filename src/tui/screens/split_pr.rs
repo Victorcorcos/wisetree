@@ -499,10 +499,14 @@ impl SplitPullRequestScreen {
     fn handle_flow_key(&mut self, key: KeyEvent) -> SplitAction {
         match self.step {
             SplitStep::Planning => self.handle_planning_key(key),
-            SplitStep::Preflight | SplitStep::Approving => match key.code {
+            SplitStep::Preflight => match key.code {
                 KeyCode::Esc => SplitAction::Cancelled,
                 _ => SplitAction::Continue,
             },
+            // Publication mutates local refs and GitHub state in several
+            // durable checkpoints. Keep the screen attached until one of
+            // those checkpoints reports success or a recoverable error.
+            SplitStep::Approving => SplitAction::Continue,
             SplitStep::Drafting => match key.code {
                 KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R')
                     if self.drafting_error.is_some() =>
@@ -936,7 +940,7 @@ impl SplitPullRequestScreen {
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    "Published and verified {} stacked pull requests (bottom to top). Split complete.\nSource: +{} -{} = {} changed lines · MAX {max} per layer: {}.\nThe selected source branch/worktree remains the unchanged top layer.\n\n{pull_requests}\n\nEnter returns to the refreshed dashboard.",
+                    "Published and verified {} stacked pull requests (bottom to top). Split complete.\nSource: +{} -{} = {} changed lines · MAX {max} per layer: {}.\nThe selected source tree is unchanged; its branch now carries the verified top-layer commit.\n\n{pull_requests}\n\nEnter returns to the refreshed dashboard.",
                     publication.pull_requests.len(),
                     self.preflight.as_ref().map(|value| value.identity.additions).unwrap_or(0),
                     self.preflight.as_ref().map(|value| value.identity.deletions).unwrap_or(0),
@@ -1375,7 +1379,7 @@ impl SplitPullRequestScreen {
             "Deterministically revalidate the live worktree, base, committed diff, and source PR.",
             "Run the planning AI in an embedded terminal (Tab focuses it) for an SRP plan organized by semantic responsibility.",
             "Show the plan in an Approve/Reject loop; rejection feedback regenerates one proposal.",
-            "Materialize the approved stack as local branches and worktrees.",
+            "Materialize the approved stack as local branches and worktrees, then advance the source branch with a tree-preserving top-layer commit.",
             "Verify every parent-to-child diff and check stack integrity (MAX is a guideline; oversized layers are flagged for you, never silently split).",
             "Publish the stack with `gh stack link`, reusing the active source PR as the top PR when present.",
             "Run the drafting AI concurrently once for each resulting pull request.",

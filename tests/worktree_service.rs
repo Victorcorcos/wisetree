@@ -52,6 +52,22 @@ fn with_isolated_home<F: FnOnce()>(f: F) {
     }
 }
 
+fn with_isolated_home_checked<F: FnOnce()>(f: F) {
+    let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().expect("home");
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if let Some(path) = prev {
+        std::env::set_var("HOME", path);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 #[tokio::test]
 async fn initialize_rejects_non_git_directory() {
     with_isolated_home(|| {
@@ -323,7 +339,7 @@ async fn create_worktree_populates_link_report_when_link_patterns_enabled() {
 
 #[test]
 fn create_split_worktree_keeps_copy_and_link_setup_without_user_actions() {
-    with_isolated_home(|| {
+    with_isolated_home_checked(|| {
         let body = async {
             let fx = build_fixture();
             fs::write(fx.repo.join(".env"), "TOKEN=local\n").unwrap();
