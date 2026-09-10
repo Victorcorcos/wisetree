@@ -623,3 +623,71 @@ fn drafting_rows_say_which_pull_requests_are_already_updated_on_github() {
     assert!(applied_is_green, "an updated PR reads as success");
     assert!(failed_is_red, "a failed PR reads as an error");
 }
+
+/// One failed drafting job must not hide the five that worked: the board stays
+/// up with the failed PR selected, its error readable, and a retry that only
+/// re-runs the incomplete work.
+#[test]
+fn a_failed_drafting_job_stays_on_the_board_and_is_retryable_in_place() {
+    let mut screen = review_screen();
+    screen.mark_approved(publication());
+    let progress = |layer: usize, pr_number: u64, status, error: Option<&str>| SplitDraftProgress {
+        operation_id: 1,
+        generation: 1,
+        layer,
+        pr_number,
+        status,
+        activity: None,
+        error: error.map(str::to_string),
+    };
+    screen.update_draft_progress(progress(1, 91, SplitDraftJobStatus::Applied, None));
+    screen.update_draft_progress(progress(
+        2,
+        92,
+        SplitDraftJobStatus::Failed,
+        Some("gh pr edit: server error"),
+    ));
+    screen.set_drafting_error(
+        "Split metadata update for PR #92 failed; successful updates were retained.".into(),
+    );
+
+    // Still the board, not a bare error page.
+    assert_eq!(screen.step(), SplitStep::Drafting);
+    let (text, _) = render(&mut screen, 110, 24);
+    assert!(text.contains("PR #92 failed"), "{text}");
+    assert!(
+        text.contains("1/2 pull requests already carry their AI metadata"),
+        "{text}"
+    );
+    assert!(
+        text.contains("re-runs only what is still incomplete"),
+        "{text}"
+    );
+    // The successful PR keeps its result visible next to the failure.
+    assert!(
+        text.contains("PR #91 · title + description updated ✓"),
+        "{text}"
+    );
+    assert!(
+        text.contains("PR #92 · failed — provisional title kept"),
+        "{text}"
+    );
+    // The failed job is auto-selected, so its error is the visible stream.
+    assert!(text.contains("gh pr edit: server error"), "{text}");
+
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::RetryDrafting
+    );
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Char('r'))),
+        SplitAction::RetryDrafting
+    );
+    screen.resume_drafting();
+    assert!(screen.drafting_error().is_none());
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::Continue,
+        "a running board must not retry on Enter"
+    );
+}

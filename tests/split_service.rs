@@ -13,11 +13,11 @@ use wisetree::services::{
     parse_materialization, parse_numstat_totals, parse_publication, parse_split_draft,
     parse_split_drafting, parse_split_plan, parse_split_plan_transcript, parse_split_run,
     patch_for_units, provisional_split_title, render_publication, render_split_drafting,
-    render_split_plan, split_layer_sizes, validate_split_body, validate_split_manifest,
-    validate_split_publication, validate_split_resume, ChangeUnit, ChangeUnitKind,
-    DashboardService, SplitDraftRecord, SplitDraftingRecord, SplitIdentity, SplitPlan,
-    SplitPreflight, SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot,
-    SplitResponsibility,
+    render_split_plan, split_draft_cache_path, split_draft_job_id, split_layer_sizes,
+    validate_split_body, validate_split_manifest, validate_split_publication,
+    validate_split_resume, ChangeUnit, ChangeUnitKind, DashboardService, SplitDraft,
+    SplitDraftRecord, SplitDraftingRecord, SplitIdentity, SplitPlan, SplitPreflight,
+    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
 };
 
 mod support;
@@ -1097,4 +1097,52 @@ async fn materializes_deletion_rename_and_binary_and_rejects_moved_artifacts() {
     } else {
         std::env::remove_var("HOME");
     }
+}
+
+/// A drafting failure is scoped to one pull request. The cache key is per
+/// source-head + layer + PR, so a retry reuses every valid cached draft (no
+/// second AI call, no second `gh pr edit`) and re-runs only the incomplete
+/// job — including the case where drafting succeeded but applying did not.
+#[test]
+fn draft_cache_identity_scopes_a_retry_to_the_incomplete_pull_request() {
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    let first = split_draft_job_id(head, 1, 91);
+    let second = split_draft_job_id(head, 2, 92);
+    assert_ne!(first, second);
+    assert!(
+        first.contains("layer-1") && first.contains("pr-91"),
+        "{first}"
+    );
+    // A different source head can never reuse another run's drafts.
+    assert_ne!(split_draft_job_id("f".repeat(40).as_str(), 1, 91), first);
+
+    let path = split_draft_cache_path("/tmp/worktree", &first);
+    assert!(
+        path.ends_with(format!(".wisetree/split_drafts/{first}.json")),
+        "{path:?}"
+    );
+    assert_ne!(path, split_draft_cache_path("/tmp/worktree", &second));
+
+    // A draft that succeeded but failed to apply keeps its prose, so the retry
+    // costs no tokens — only the GitHub update is repeated.
+    let applied_but_failed = SplitDraftRecord {
+        job_id: second.clone(),
+        source_head: head.into(),
+        order: 2,
+        pr_number: 92,
+        pr_url: "https://github.com/owner/repo/pull/92".into(),
+        correction_attempted: false,
+        draft: Some(SplitDraft {
+            title_summary: "Add the consumer".into(),
+            description_content: "Details".into(),
+        }),
+        final_title: Some("Add the consumer (2/2)".into()),
+        final_body: Some("body".into()),
+        applied: false,
+        error: Some("gh pr edit: server error".into()),
+    };
+    let round_tripped: SplitDraftRecord =
+        serde_json::from_str(&serde_json::to_string(&applied_but_failed).unwrap()).unwrap();
+    assert_eq!(round_tripped, applied_but_failed);
+    assert!(round_tripped.draft.is_some() && !round_tripped.applied);
 }
