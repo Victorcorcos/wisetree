@@ -1136,6 +1136,31 @@ pub fn describe_snapshot_changes(
     changed
 }
 
+/// Parse a plan out of a live planning transcript. The embedded terminal shows
+/// the harness's own chrome, so the contract object can arrive wrapped in a
+/// fenced block or trailed by a closing remark: isolate the JSON object, then
+/// apply the identical strict contract.
+pub fn parse_split_plan_transcript(
+    transcript: &str,
+    preflight: &SplitPreflight,
+) -> Result<SplitPlan> {
+    let fenced = transcript
+        .split("```")
+        .map(|block| block.strip_prefix("json").unwrap_or(block).trim())
+        .find(|block| block.starts_with('{') && block.ends_with('}'));
+    let candidate = fenced.or_else(|| {
+        let start = transcript.find('{')?;
+        let end = transcript.rfind('}')?;
+        (end > start).then(|| transcript[start..=end].trim())
+    });
+    let candidate = candidate.ok_or_else(|| {
+        WisetreeError::validation(
+            "Split plan must be exactly one JSON response matching the contract: the planning transcript contains no JSON object.",
+        )
+    })?;
+    parse_split_plan(candidate, preflight)
+}
+
 pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<SplitPlan> {
     let mut plan: SplitPlan = serde_json::from_str(response).map_err(|error| {
         WisetreeError::validation(format!(
