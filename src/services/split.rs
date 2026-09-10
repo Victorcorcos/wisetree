@@ -88,6 +88,9 @@ pub struct SplitResponsibility {
     pub branch_slug: String,
     pub rationale: String,
     pub units: Vec<String>,
+    /// Derived by [`parse_split_plan`] from the manifest, never trusted from
+    /// the planning AI: it is recorded for the plan file and the review screen.
+    #[serde(default)]
     pub test_units: Vec<String>,
     pub paths: Vec<String>,
 }
@@ -1061,8 +1064,17 @@ pub fn build_plan_prompt(
                 "binary-counts-unavailable".to_string()
             };
             format!(
-                "{} | {:?} | {} | {}{}",
-                unit.id, unit.kind, unit.path, counts, range
+                "{} | {:?} | {} | {} | {}{}",
+                unit.id,
+                unit.kind,
+                unit.path,
+                if is_test_path(&unit.path) {
+                    "test"
+                } else {
+                    "implementation"
+                },
+                counts,
+                range
             )
         })
         .collect::<Vec<_>>()
@@ -1125,7 +1137,7 @@ pub fn describe_snapshot_changes(
 }
 
 pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<SplitPlan> {
-    let plan: SplitPlan = serde_json::from_str(response).map_err(|error| {
+    let mut plan: SplitPlan = serde_json::from_str(response).map_err(|error| {
         WisetreeError::validation(format!(
             "Split plan must be exactly one JSON response matching the contract: {error}"
         ))
@@ -1145,6 +1157,7 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
     let mut slugs = BTreeSet::new();
     let mut total_additions = 0u64;
     let mut total_deletions = 0u64;
+    let mut derived_test_units = Vec::with_capacity(plan.responsibilities.len());
     for (index, responsibility) in plan.responsibilities.iter().enumerate() {
         if responsibility.order != index + 1 {
             return Err(WisetreeError::validation(
@@ -1199,33 +1212,17 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
                 responsibility.order
             )));
         }
-        if responsibility.test_units.is_empty() {
-            return Err(WisetreeError::validation(format!(
-                "Split responsibility {} is missing associated changed tests.",
-                responsibility.order
-            )));
-        }
-        let layer_ids = responsibility.units.iter().collect::<BTreeSet<_>>();
-        let distinct_test_ids = responsibility.test_units.iter().collect::<BTreeSet<_>>();
-        if distinct_test_ids.len() != responsibility.test_units.len() {
-            return Err(WisetreeError::validation(format!(
-                "Split responsibility {} contains a duplicate test change unit.",
-                responsibility.order
-            )));
-        }
-        for test_id in &responsibility.test_units {
-            let unit = manifest.get(test_id.as_str()).ok_or_else(|| {
-                WisetreeError::validation(format!(
-                    "Split plan named unknown test unit `{test_id}`."
-                ))
-            })?;
-            if !layer_ids.contains(test_id) || !is_test_path(&unit.path) {
-                return Err(WisetreeError::validation(format!(
-                    "Split responsibility {} identifies `{test_id}` as a test, but it is not an assigned test change.",
-                    responsibility.order
-                )));
-            }
-        }
+        // The AI never declares which units are tests: whether a path is a test
+        // is deterministic, so the harness derives it and echoing it back would
+        // only be a way for the model to be wrong.
+        derived_test_units.push(
+            responsibility
+                .units
+                .iter()
+                .filter(|id| is_test_path(&manifest[id.as_str()].path))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         let changed = layer_additions.saturating_add(layer_deletions);
         if changed > preflight.identity.max {
             return Err(WisetreeError::validation(format!(
@@ -1251,19 +1248,63 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
             "Split plan totals do not match the frozen source diff.",
         ));
     }
+    for (responsibility, test_units) in plan.responsibilities.iter_mut().zip(derived_test_units) {
+        responsibility.test_units = test_units;
+    }
     Ok(plan)
 }
 
-fn is_test_path(path: &str) -> bool {
+/// Directory names that hold tests in every ecosystem Wisetree splits.
+const TEST_DIRECTORIES: [&str; 7] = [
+    "test",
+    "tests",
+    "spec",
+    "specs",
+    "__tests__",
+    "e2e",
+    "cypress",
+];
+
+/// Deterministic test classification for a changed path.
+///
+/// The harness — not the planning AI — decides which change units are tests:
+/// the manifest labels each unit and [`parse_split_plan`] derives every
+/// layer's `test_units` from this function. It therefore has to cover the
+/// languages a real repository uses (RSpec `spec/**/*_spec.rb`, pytest
+/// `test_*.py`, Go `*_test.go`, JVM `FooTest.java`, `*.test.tsx`, …), not just
+/// this repository's own `tests/*_test.rs` layout.
+pub fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.starts_with("tests/")
-        || lower.contains("/tests/")
-        || lower.contains("/test/")
-        || lower.ends_with("_test.rs")
-        || lower.ends_with(".test.js")
-        || lower.ends_with(".test.ts")
-        || lower.ends_with(".spec.js")
-        || lower.ends_with(".spec.ts")
+    let mut segments = lower.split('/').collect::<Vec<_>>();
+    let Some(file) = segments.pop() else {
+        return false;
+    };
+    if segments
+        .iter()
+        .any(|segment| TEST_DIRECTORIES.contains(segment))
+    {
+        return true;
+    }
+    // `foo.test.tsx` and `user_spec.rb` both reduce to a stem that carries the
+    // marker; `latest.rb` must not, so only suffixed markers count.
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    if ["_test", "_tests", "_spec", "_specs", ".test", ".spec"]
+        .iter()
+        .any(|marker| stem.ends_with(marker))
+    {
+        return true;
+    }
+    if file.starts_with("test_") || file == "conftest.py" || file.ends_with(".feature") {
+        return true;
+    }
+    // JVM/.NET/Swift name test classes in camel case (`PaymentTest.java`,
+    // `PaymentSpec.scala`), which the lowercase stem cannot distinguish from
+    // words like "latest" — match the original casing instead.
+    let original = path.rsplit('/').next().unwrap_or(path);
+    let original_stem = original.rsplit_once('.').map_or(original, |(stem, _)| stem);
+    ["Test", "Tests", "Spec", "Specs"]
+        .iter()
+        .any(|marker| original_stem.ends_with(marker) && original_stem.len() > marker.len())
 }
 
 pub fn render_split_plan(preflight: &SplitPreflight, plan: &SplitPlan, status: &str) -> String {

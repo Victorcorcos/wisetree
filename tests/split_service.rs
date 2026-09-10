@@ -454,6 +454,88 @@ fn strict_plan_parser_accepts_complete_srp_assignment_and_renders_integrity() {
     assert!(rendered.contains("| 2 | Consumer | `consumer`"));
 }
 
+/// A Rails/RSpec branch (`spec/**/*_spec.rb`) and a layer that legitimately
+/// changes no tests at all must both plan successfully: the harness classifies
+/// tests, so the planner cannot be wrong about them.
+#[test]
+fn harness_derives_test_units_for_every_ecosystem_and_testless_layers() {
+    let mut preflight = fixture();
+    preflight.units[1].path = "spec/models/user_spec.rb".to_string();
+    preflight.units[3].path = "db/migrate/001_add_column.rb".to_string();
+    let response = r#"{"responsibilities":[{"order":1,"name":"Model","branch_slug":"model","rationale":"Builds directly on the resolved base.","units":["CU0001","CU0002"],"paths":["src/a.rs","spec/models/user_spec.rb"]},{"order":2,"name":"Migration","branch_slug":"migration","rationale":"Persists what the model expects.","units":["CU0003","CU0004"],"paths":["src/b.rs","db/migrate/001_add_column.rb"]}]}"#;
+    let plan = parse_split_plan(response, &preflight).expect("rails-shaped plan");
+    assert_eq!(plan.responsibilities[0].test_units, vec!["CU0002"]);
+    assert!(plan.responsibilities[1].test_units.is_empty());
+
+    // A stale `test_units` from the AI is overwritten, never trusted.
+    let lying = response.replace(
+        r#""units":["CU0003","CU0004"]"#,
+        r#""units":["CU0003","CU0004"],"test_units":["CU0003"]"#,
+    );
+    assert!(parse_split_plan(&lying, &preflight)
+        .expect("declared test units are ignored")
+        .responsibilities[1]
+        .test_units
+        .is_empty());
+
+    let prompt = build_split_plan_prompt(&preflight, None, None);
+    assert!(
+        prompt.contains("spec/models/user_spec.rb | test"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("db/migrate/001_add_column.rb | implementation"),
+        "{prompt}"
+    );
+}
+
+#[test]
+fn test_classification_covers_common_layouts_without_matching_lookalike_words() {
+    let response_for = |path: &str| {
+        valid_response()
+            .replace("tests/a_test.rs", path)
+            .to_string()
+    };
+    let mut preflight = fixture();
+    for path in [
+        "spec/models/user_spec.rb",
+        "test/user_test.rb",
+        "internal/handler_test.go",
+        "api/test_client.py",
+        "conftest.py",
+        "src/App.test.tsx",
+        "src/App.spec.jsx",
+        "lib/parser_test.exs",
+        "src/main/java/PaymentTest.java",
+        "Sources/PaymentTests.swift",
+        "features/login.feature",
+        "__tests__/render.js",
+        "e2e/checkout.ts",
+        "cypress/e2e/login.js",
+    ] {
+        preflight.units[1].path = path.to_string();
+        let plan = parse_split_plan(&response_for(path), &preflight).expect("valid plan");
+        assert_eq!(
+            plan.responsibilities[0].test_units,
+            vec!["CU0002"],
+            "expected `{path}` to be classified as a test"
+        );
+    }
+    for path in [
+        "src/latest.rb",
+        "app/models/protest.rb",
+        "src/testament.py",
+        "config/routes.rb",
+    ] {
+        preflight.units[1].path = path.to_string();
+        let plan = parse_split_plan(&response_for(path), &preflight).expect("valid plan");
+        assert!(
+            plan.responsibilities[0].test_units.is_empty(),
+            "expected `{path}` to be classified as implementation"
+        );
+    }
+}
+
 #[test]
 fn parser_rejects_prose_unknown_duplicate_missing_and_ai_arithmetic() {
     let preflight = fixture();
@@ -498,7 +580,8 @@ fn prompt_contains_frozen_manifest_and_revision_only_when_both_inputs_exist() {
     let preflight = fixture();
     let first = build_split_plan_prompt(&preflight, None, None);
     assert!(first.contains("origin/main"));
-    assert!(first.contains("CU0001 | TextHunk | src/a.rs | +3 -1"));
+    assert!(first.contains("CU0001 | TextHunk | src/a.rs | implementation | +3 -1"));
+    assert!(first.contains("CU0002 | TextHunk | tests/a_test.rs | test | +1 -0"));
     assert!(first.contains("Do not write files"));
     let incomplete_revision = build_split_plan_prompt(&preflight, Some("stale"), None);
     assert!(!incomplete_revision.contains("stale"));

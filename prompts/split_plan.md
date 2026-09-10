@@ -29,10 +29,10 @@ Rejection feedback (empty on the first proposal):
 USER_FEEDBACK
 ```
 
-Create at least two bottom-to-top responsibilities. Each responsibility must follow the Single Responsibility Principle, group implementation with its associated changed tests, explain why it depends on the layer below it, and have a short lowercase kebab-case branch slug. Assign every change-unit ID exactly once. `test_units` must be a non-empty subset of `units` and contain only manifest units whose paths are tests. `paths` must exactly list the paths represented by `units`.
+Each manifest row is labelled `test` or `implementation`. Create at least two bottom-to-top responsibilities. Each responsibility must follow the Single Responsibility Principle, keep every `test` unit in the same responsibility as the implementation it covers, explain why it depends on the layer below it, and have a short lowercase kebab-case branch slug. Assign every change-unit ID exactly once. `paths` must exactly list the paths represented by `units`.
 
-Do not supply or calculate additions, deletions, totals, or integrity data. Do not write files, edit code, commit, create branches or worktrees, run GitHub operations, draft PR titles or descriptions, invent URLs, transform binary content, or render the plan file.
+Do not supply or calculate additions, deletions, totals, integrity data, or which units are tests. Do not write files, edit code, commit, create branches or worktrees, run GitHub operations, draft PR titles or descriptions, invent URLs, transform binary content, or render the plan file.
 
 Reply with exactly one JSON object and no Markdown fences or prose. Use this exact schema; do not add fields:
 
-{"responsibilities":[{"order":1,"name":"one non-empty line","branch_slug":"short-kebab-slug","rationale":"why this responsibility is coherent and depends on the layer below (or the resolved base for order 1)","units":["CU0001"],"test_units":["CU0002"],"paths":["path/from/manifest"]}]}
+{"responsibilities":[{"order":1,"name":"one non-empty line","branch_slug":"short-kebab-slug","rationale":"why this responsibility is coherent and depends on the layer below (or the resolved base for order 1)","units":["CU0001"],"paths":["path/from/manifest"]}]}
