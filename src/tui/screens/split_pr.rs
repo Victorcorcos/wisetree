@@ -786,10 +786,21 @@ impl SplitPullRequestScreen {
                 } else {
                     " "
                 };
-                Line::from(format!(
-                    "{marker} {}. PR #{} · {:?}",
-                    job.layer, job.pr_number, job.status
-                ))
+                let (label, color) = draft_status_label(job.status);
+                Line::from(vec![
+                    Span::styled(
+                        format!("{marker} {}. PR #{} · ", job.layer, job.pr_number),
+                        Style::default().fg(if index == self.selected_draft {
+                            colors::SPLIT
+                        } else {
+                            colors::EMPHASIS
+                        }),
+                    ),
+                    Span::styled(
+                        label.to_string(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                ])
             })
             .collect::<Vec<_>>();
         self.draft_row_rects.set(row_rects);
@@ -817,7 +828,9 @@ impl SplitPullRequestScreen {
             chunks[2],
         );
         frame.render_widget(
-            Paragraph::new("↑/↓ or Tab switch PR stream · Esc cancel"),
+            Paragraph::new(
+                "↑/↓ or Tab switch PR stream · rows show which PRs already have their AI title and description on GitHub · Esc cancel",
+            ),
             chunks[3],
         );
     }
@@ -826,6 +839,18 @@ impl SplitPullRequestScreen {
         let text = self.publication.as_ref().map_or_else(
             || "Split publication completed.".to_string(),
             |publication| {
+                let max = self
+                    .preflight
+                    .as_ref()
+                    .map(|preflight| preflight.identity.max)
+                    .unwrap_or(0);
+                let over_max = self.materialization.as_ref().map_or(0, |materialization| {
+                    materialization
+                        .layers
+                        .iter()
+                        .filter(|layer| layer.additions.saturating_add(layer.deletions) > max)
+                        .count()
+                });
                 let pull_requests = publication
                     .pull_requests
                     .iter()
@@ -844,8 +869,16 @@ impl SplitPullRequestScreen {
                         } else {
                             "dependency of later PRs"
                         };
+                        let changed = layer
+                            .map(|layer| layer.additions.saturating_add(layer.deletions))
+                            .unwrap_or(0);
+                        let size = if changed > max {
+                            format!(" ({} over MAX {max}, kept whole)", changed - max)
+                        } else {
+                            String::new()
+                        };
                         format!(
-                            "{}. {} ({relation})\n   branch: {} → base: {}\n   worktree: {}\n   diff: +{} -{} · draft: {} · metadata: {}",
+                            "{}. {} ({relation})\n   branch: {} → base: {}\n   worktree: {}\n   diff: +{} -{}{size}\n   title: {}\n   metadata: {}",
                             pull_request.order,
                             pull_request.url,
                             pull_request.branch,
@@ -853,19 +886,31 @@ impl SplitPullRequestScreen {
                             layer.map(|layer| layer.worktree_path.as_str()).unwrap_or("unknown"),
                             layer.map(|layer| layer.additions).unwrap_or(0),
                             layer.map(|layer| layer.deletions).unwrap_or(0),
-                            if record.and_then(|record| record.draft.as_ref()).is_some() { "cached" } else { "missing" },
-                            if record.is_some_and(|record| record.applied) { "applied" } else { "incomplete" }
+                            record
+                                .and_then(|record| record.final_title.as_deref())
+                                .unwrap_or(pull_request.provisional_title.as_str()),
+                            if record.is_some_and(|record| record.applied) {
+                                "AI title + description applied"
+                            } else if record.and_then(|record| record.final_title.as_ref()).is_some() {
+                                "drafted but not applied — still the provisional title on GitHub"
+                            } else {
+                                "not drafted — still the provisional title on GitHub"
+                            }
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    "Published and verified {} stacked pull requests (bottom to top). Split complete.\nSource: +{} -{} = {} changed lines · MAX {} per layer: satisfied.\nThe selected source branch/worktree remains the unchanged top layer.\n\n{pull_requests}\n\nEnter returns to the refreshed dashboard.",
+                    "Published and verified {} stacked pull requests (bottom to top). Split complete.\nSource: +{} -{} = {} changed lines · MAX {max} per layer: {}.\nThe selected source branch/worktree remains the unchanged top layer.\n\n{pull_requests}\n\nEnter returns to the refreshed dashboard.",
                     publication.pull_requests.len(),
                     self.preflight.as_ref().map(|value| value.identity.additions).unwrap_or(0),
                     self.preflight.as_ref().map(|value| value.identity.deletions).unwrap_or(0),
                     self.preflight.as_ref().map(|value| value.identity.additions + value.identity.deletions).unwrap_or(0),
-                    self.preflight.as_ref().map(|value| value.identity.max).unwrap_or(0),
+                    if over_max == 0 {
+                        "every layer within it".to_string()
+                    } else {
+                        format!("{over_max} layer(s) kept whole past it to preserve a responsibility")
+                    },
                 )
             },
         );
@@ -1422,6 +1467,20 @@ fn push_wrapped_styled(lines: &mut Vec<Line<'static>>, text: &str, width: usize,
     }
     if !current.is_empty() {
         lines.push(Line::from(Span::styled(current, style)));
+    }
+}
+
+/// Plain-language status for one drafting job, colored so a glance separates
+/// "already live on GitHub" from "still running" and "failed".
+fn draft_status_label(status: SplitDraftJobStatus) -> (&'static str, ratatui::style::Color) {
+    match status {
+        SplitDraftJobStatus::Pending => ("queued", colors::MUTED),
+        SplitDraftJobStatus::Drafting => ("drafting title + description", colors::INFO),
+        SplitDraftJobStatus::Correcting => ("correcting its response", colors::WARNING),
+        SplitDraftJobStatus::Drafted => ("drafted, not yet on GitHub", colors::EMPHASIS),
+        SplitDraftJobStatus::Applying => ("updating the PR on GitHub", colors::INFO),
+        SplitDraftJobStatus::Applied => ("title + description updated ✓", colors::SUCCESS),
+        SplitDraftJobStatus::Failed => ("failed — provisional title kept", colors::ERROR),
     }
 }
 
