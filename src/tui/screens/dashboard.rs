@@ -1110,10 +1110,7 @@ impl DashboardScreen {
         // open PR exposes *except* Merge — GitHub refuses to merge a PR
         // while it's still in draft.
         let is_active = matches!(state, Some(PrState::Open | PrState::Draft));
-        if matches!(
-            state,
-            Some(PrState::Open | PrState::Draft | PrState::Merged)
-        ) {
+        if row.pull_request.is_some() {
             commands.push(PrCommand {
                 label: "Open",
                 choice: ActionChoice::OpenPullRequest,
@@ -4112,6 +4109,27 @@ mod tests {
         assert!(matches!(action, DashboardAction::OpenPullRequest(_)));
         assert!(screen.pr_commands.is_empty());
         assert_eq!(screen.action_pr_focus, None);
+    }
+
+    #[test]
+    fn open_command_dispatches_for_closed_and_merged_prs() {
+        for state in [PrState::Closed, PrState::Merged] {
+            let mut screen = screen_with_row(dashboard_row_with_pr(state, 42, "Terminal PR"));
+            screen.handle_key(key_event(KeyCode::Enter));
+
+            assert_eq!(
+                screen.pr_command_labels().first().map(String::as_str),
+                Some("Open")
+            );
+
+            screen.handle_key(key_event(KeyCode::Tab));
+            let action = screen.handle_key(key_event(KeyCode::Enter));
+            assert!(matches!(
+                action,
+                DashboardAction::OpenPullRequest(ref url)
+                    if url == "https://github.com/example/repo/pull/42"
+            ));
+        }
     }
 
     #[test]
