@@ -1022,21 +1022,56 @@ pub fn validate_manifest(identity: &SplitIdentity, units: &[ChangeUnit]) -> Resu
             identity.additions, identity.deletions
         )));
     }
-    if let Some(unit) = units
-        .iter()
-        .find(|unit| unit.changed_lines() > identity.max)
-    {
-        return Err(WisetreeError::validation(format!(
-            "Indivisible change {} for `{}` is {} lines (+{} -{}), exceeding MAX {}. No valid split can satisfy this limit.",
-            unit.id,
-            unit.path,
-            unit.changed_lines(),
-            unit.additions,
-            unit.deletions,
-            identity.max
-        )));
-    }
     Ok(())
+}
+
+/// One layer's deterministic size, and whether it runs past the soft `MAX`
+/// ceiling. The harness computes this for the review screen, the plan file and
+/// the materialization record so the AI never does arithmetic — and so an
+/// oversized layer is always presented with its exact overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitLayerSize {
+    pub order: usize,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed: u64,
+    pub max: u64,
+}
+
+impl SplitLayerSize {
+    pub fn over_max(&self) -> bool {
+        self.changed > self.max
+    }
+
+    pub fn overflow(&self) -> u64 {
+        self.changed.saturating_sub(self.max)
+    }
+}
+
+/// Size every layer of a validated plan against the frozen manifest.
+pub fn split_layer_sizes(preflight: &SplitPreflight, plan: &SplitPlan) -> Vec<SplitLayerSize> {
+    let manifest = preflight
+        .units
+        .iter()
+        .map(|unit| (unit.id.as_str(), unit))
+        .collect::<BTreeMap<_, _>>();
+    plan.responsibilities
+        .iter()
+        .map(|layer| {
+            let (additions, deletions) = layer.units.iter().fold((0u64, 0u64), |(a, d), id| {
+                manifest
+                    .get(id.as_str())
+                    .map_or((a, d), |unit| (a + unit.additions, d + unit.deletions))
+            });
+            SplitLayerSize {
+                order: layer.order,
+                additions,
+                deletions,
+                changed: additions.saturating_add(deletions),
+                max: preflight.identity.max,
+            }
+        })
+        .collect()
 }
 
 pub fn build_plan_prompt(
@@ -1248,13 +1283,10 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-        let changed = layer_additions.saturating_add(layer_deletions);
-        if changed > preflight.identity.max {
-            return Err(WisetreeError::validation(format!(
-                "Split responsibility {} is {changed} lines (+{layer_additions} -{layer_deletions}), exceeding MAX {}.",
-                responsibility.order, preflight.identity.max
-            )));
-        }
+        // MAX is a soft ceiling. A responsibility that only fits under it by
+        // cutting across a semantic boundary is a worse pull request than an
+        // oversized coherent one, so an overflow is surfaced to the reviewer
+        // (see `split_layer_sizes`) instead of failing the plan.
         total_additions += layer_additions;
         total_deletions += layer_deletions;
     }
@@ -1348,28 +1380,33 @@ pub fn render_split_plan(preflight: &SplitPreflight, plan: &SplitPlan, status: &
         identity.additions + identity.deletions,
         status.trim()
     );
-    let manifest = preflight
-        .units
-        .iter()
-        .map(|unit| (unit.id.as_str(), unit))
-        .collect::<BTreeMap<_, _>>();
-    output.push_str("\n| Layer | Responsibility | Branch slug | Units | + | - | Total |\n| ---: | --- | --- | --- | ---: | ---: | ---: |\n");
-    for layer in &plan.responsibilities {
-        let (additions, deletions) = layer.units.iter().fold((0u64, 0u64), |(a, d), id| {
-            let unit = manifest[id.as_str()];
-            (a + unit.additions, d + unit.deletions)
-        });
+    let sizes = split_layer_sizes(preflight, plan);
+    output.push_str("\n| Layer | Responsibility | Branch slug | Units | + | - | Total | MAX |\n| ---: | --- | --- | --- | ---: | ---: | ---: | --- |\n");
+    for (layer, size) in plan.responsibilities.iter().zip(&sizes) {
         output.push_str(&format!(
-            "| {} | {} | `{}` | {} | {} | {} | {} |\n",
+            "| {} | {} | `{}` | {} | {} | {} | {} | {} |\n",
             layer.order,
             layer.name,
             layer.branch_slug,
             layer.units.join(", "),
-            additions,
-            deletions,
-            additions + deletions
+            size.additions,
+            size.deletions,
+            size.changed,
+            if size.over_max() {
+                format!("over by {}", size.overflow())
+            } else {
+                "within".to_string()
+            }
         ));
         output.push_str(&format!("\nDependency rationale: {}\n\n", layer.rationale));
+        if size.over_max() {
+            output.push_str(&format!(
+                "> [!WARNING]\n> This responsibility is {} changed lines, {} over the MAX of {}. It was kept whole because splitting it would break the single responsibility described above.\n\n",
+                size.changed,
+                size.overflow(),
+                size.max
+            ));
+        }
     }
     output.push_str("## Deterministic integrity\n\n| Unit | Kind | Path | Old range | New range | + | - | Layer |\n| --- | --- | --- | --- | --- | ---: | ---: | ---: |\n");
     let owners = plan

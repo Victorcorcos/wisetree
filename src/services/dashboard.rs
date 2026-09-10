@@ -6122,7 +6122,6 @@ impl DashboardService {
                     &parent_branch,
                     &parent_sha,
                     &expected_patch,
-                    preflight.identity.max,
                 )
                 .await
                 .map_err(|error| {
@@ -6175,7 +6174,6 @@ impl DashboardService {
                 &parent_sha,
                 &expected_patch,
                 &allowed_paths,
-                preflight.identity.max,
             )
             .await;
             let (commit_sha, tree_sha, additions, deletions) = match layer_result {
@@ -6230,14 +6228,6 @@ impl DashboardService {
             )
             .await?,
         );
-        if top_additions.saturating_add(top_deletions) > preflight.identity.max {
-            return Err(WisetreeError::validation(format!(
-                "Split top layer {} is {} changed lines (+{top_additions} -{top_deletions}), exceeding MAX {}.",
-                top.order,
-                top_additions + top_deletions,
-                preflight.identity.max
-            )));
-        }
         self.verify_split_source(preflight, &source).await?;
         if self.split_source_status(&source).await? != source_status {
             return Err(WisetreeError::validation(
@@ -7047,7 +7037,6 @@ impl DashboardService {
         parent_sha: &str,
         expected_patch: &str,
         allowed_paths: &BTreeSet<String>,
-        max: u64,
     ) -> Result<(String, String, u64, u64)> {
         if git.resolve_at(path, "HEAD").await? != parent_sha {
             return Err(WisetreeError::validation(
@@ -7099,14 +7088,6 @@ impl DashboardService {
             &git.numstat_at(path, &format!("{parent_sha}..{commit_sha}"))
                 .await?,
         );
-        if counts.0.saturating_add(counts.1) > max {
-            return Err(WisetreeError::validation(format!(
-                "verified diff is {} changed lines (+{} -{}), exceeding MAX {max}",
-                counts.0 + counts.1,
-                counts.0,
-                counts.1
-            )));
-        }
         Ok((commit_sha, tree_sha, counts.0, counts.1))
     }
 
@@ -7123,7 +7104,6 @@ impl DashboardService {
         parent_branch: &str,
         parent_sha: &str,
         expected_patch: &str,
-        max: u64,
     ) -> Result<()> {
         let order = responsibility.order;
         if recorded.order != order
@@ -7181,7 +7161,6 @@ impl DashboardService {
         let counts = parse_numstat_totals(&git.numstat_at(Path::new(worktree_path), &range).await?);
         if normalized_patch(&actual) != normalized_patch(expected_patch)
             || counts != (recorded.additions, recorded.deletions)
-            || counts.0.saturating_add(counts.1) > max
         {
             return Err(WisetreeError::validation(format!(
                 "Split layer {order}: recorded tree or verified counts no longer match."
