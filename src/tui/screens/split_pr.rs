@@ -95,6 +95,10 @@ pub struct SplitPullRequestScreen {
     materialization: Option<SplitMaterialization>,
     draft_records: Vec<SplitDraftRecord>,
     draft_jobs: Vec<SplitDraftUiJob>,
+    /// A failed drafting run keeps the per-PR board on screen with this
+    /// banner, so the one job that failed stays selectable and retryable
+    /// next to the ones that already succeeded.
+    drafting_error: Option<String>,
     selected_draft: usize,
     draft_row_rects: Cell<Vec<Rect>>,
     pub tick: usize,
@@ -147,6 +151,7 @@ impl SplitPullRequestScreen {
             materialization: None,
             draft_records: Vec::new(),
             draft_jobs: Vec::new(),
+            drafting_error: None,
             selected_draft: 0,
             draft_row_rects: Cell::new(Vec::new()),
             tick: 0,
@@ -313,6 +318,7 @@ impl SplitPullRequestScreen {
 
     pub fn mark_approved(&mut self, publication: SplitPublication) {
         self.error = None;
+        self.drafting_error = None;
         self.draft_jobs = publication
             .pull_requests
             .iter()
@@ -335,6 +341,7 @@ impl SplitPullRequestScreen {
 
     pub fn resume_drafting(&mut self) {
         self.error = None;
+        self.drafting_error = None;
         self.retry_allowed = false;
         self.step = SplitStep::Drafting;
     }
@@ -384,11 +391,26 @@ impl SplitPullRequestScreen {
         self.step = SplitStep::Complete;
     }
 
+    /// A drafting failure is per pull request, and retrying only re-runs what
+    /// is still incomplete — so the board stays up with the failed job
+    /// selected instead of collapsing to a single error page.
     pub fn set_drafting_error(&mut self, message: String) {
-        self.error = Some(message);
+        self.drafting_error = Some(message);
+        self.error = None;
         self.retry_allowed = true;
         self.retry_publication = false;
-        self.step = SplitStep::Error;
+        self.step = SplitStep::Drafting;
+        if let Some(index) = self
+            .draft_jobs
+            .iter()
+            .position(|job| job.status == SplitDraftJobStatus::Failed)
+        {
+            self.selected_draft = index;
+        }
+    }
+
+    pub fn drafting_error(&self) -> Option<&str> {
+        self.drafting_error.as_deref()
     }
 
     pub fn start_approving(&mut self) {
@@ -482,6 +504,11 @@ impl SplitPullRequestScreen {
                 _ => SplitAction::Continue,
             },
             SplitStep::Drafting => match key.code {
+                KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R')
+                    if self.drafting_error.is_some() =>
+                {
+                    SplitAction::RetryDrafting
+                }
                 KeyCode::Esc => SplitAction::Cancelled,
                 KeyCode::Up | KeyCode::BackTab => {
                     self.selected_draft = self.selected_draft.saturating_sub(1);
@@ -742,7 +769,7 @@ impl SplitPullRequestScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(if self.drafting_error.is_some() { 5 } else { 2 }),
                 Constraint::Length(self.draft_jobs.len() as u16),
                 Constraint::Min(3),
                 Constraint::Length(1),
@@ -760,15 +787,21 @@ impl SplitPullRequestScreen {
                 )
             })
             .count();
-        frame.render_widget(
-            Paragraph::new(format!(
+        let header = match self.drafting_error.as_deref() {
+            Some(error) => Paragraph::new(format!(
+                "{error}\n{completed}/{} pull requests already carry their AI metadata. Enter/R re-runs only what is still incomplete · Esc cancels",
+                self.draft_jobs.len()
+            ))
+            .style(Style::default().fg(colors::ERROR))
+            .wrap(Wrap { trim: true }),
+            None => Paragraph::new(format!(
                 "{} Split metadata · {completed}/{} completed",
                 spinner_frame(self.tick),
                 self.draft_jobs.len()
             ))
             .style(Style::default().fg(colors::SPLIT)),
-            chunks[0],
-        );
+        };
+        frame.render_widget(header, chunks[0]);
         let mut row_rects = Vec::new();
         let rows = self
             .draft_jobs
@@ -828,9 +861,11 @@ impl SplitPullRequestScreen {
             chunks[2],
         );
         frame.render_widget(
-            Paragraph::new(
-                "↑/↓ or Tab switch PR stream · rows show which PRs already have their AI title and description on GitHub · Esc cancel",
-            ),
+            Paragraph::new(if self.drafting_error.is_some() {
+                "↑/↓ or Tab inspect a PR's failure · Enter/R retries only the incomplete PRs · Esc cancel"
+            } else {
+                "↑/↓ or Tab switch PR stream · rows show which PRs already have their AI title and description on GitHub · Esc cancel"
+            }),
             chunks[3],
         );
     }
