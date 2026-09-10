@@ -415,11 +415,10 @@ impl GitService {
         self.resolve_at(cwd, "HEAD").await
     }
 
-    /// Advance the checked-out source branch with a merge commit whose first
-    /// parent is the preceding Split layer and whose tree is unchanged from
-    /// the original source. Keeping the original source as the second parent
-    /// makes the update fast-forward while the first-parent PR diff remains
-    /// exactly the assigned top responsibility.
+    /// Rewrite the checked-out source branch as the linear top of the Split
+    /// stack while preserving the original source tree exactly. The original
+    /// source commit deliberately is not retained as a second parent: GitHub
+    /// stacked pull requests require a linear chain between every layer.
     pub async fn commit_split_top(
         &self,
         cwd: &Path,
@@ -432,16 +431,7 @@ impl GitService {
             .resolve_at(cwd, &format!("{source_head}^{{tree}}"))
             .await?;
         let result = execute_git_command(
-            &[
-                "commit-tree",
-                &tree,
-                "-p",
-                parent_sha,
-                "-p",
-                source_head,
-                "-m",
-                subject,
-            ],
+            &["commit-tree", &tree, "-p", parent_sha, "-m", subject],
             Some(cwd),
         )
         .await;

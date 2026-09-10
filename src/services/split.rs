@@ -167,7 +167,7 @@ pub struct SplitPublication {
 #[serde(deny_unknown_fields)]
 pub struct SplitDraft {
     pub title_summary: String,
-    pub description_content: String,
+    pub body_content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,22 +326,36 @@ pub fn parse_split_draft(response: &str) -> Result<SplitDraft> {
         ))
     })?;
     let title = draft.title_summary.trim();
-    let description = draft.description_content.trim();
-    if title.is_empty() || title.lines().count() != 1 || description.is_empty() {
+    let body = draft.body_content.trim();
+    if title.is_empty() || title.lines().count() != 1 || body.is_empty() {
         return Err(WisetreeError::validation(
-            "Split draft requires a non-empty one-line title_summary and description_content.",
+            "Split draft requires a non-empty one-line title_summary and body_content.",
         ));
     }
-    let forbidden = Regex::new(r"(?i)https?://|###?\s*split plan|^#\s*description")
-        .expect("static Split draft regex");
-    if forbidden.is_match(title) || forbidden.is_match(description) {
+    let forbidden =
+        Regex::new(r"(?i)https?://|###?\s*split plan").expect("static Split draft regex");
+    if forbidden.is_match(title) || forbidden.is_match(body) {
         return Err(WisetreeError::validation(
-            "Split draft prose must not contain links or harness-owned headings.",
+            "Split draft must not contain links or the harness-owned Split Plan heading.",
+        ));
+    }
+    if body
+        .lines()
+        .filter(|line| is_description_heading(line))
+        .count()
+        != 1
+        || !body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(is_description_heading)
+    {
+        return Err(WisetreeError::validation(
+            "Split body_content must begin with exactly one Description heading.",
         ));
     }
     Ok(SplitDraft {
         title_summary: title.to_string(),
-        description_content: description.to_string(),
+        body_content: body.to_string(),
     })
 }
 
@@ -379,21 +393,21 @@ pub fn final_split_title(
 
 pub fn compose_split_body(
     template: &str,
-    prose: &str,
+    filled_body: &str,
     pull_requests: &[SplitPublishedPullRequest],
     current_order: usize,
 ) -> Result<String> {
-    if prose.trim().is_empty() || current_order == 0 || current_order > pull_requests.len() {
+    if filled_body.trim().is_empty() || current_order == 0 || current_order > pull_requests.len() {
         return Err(WisetreeError::validation(
             "Split body requires description prose and a valid current PR.",
         ));
     }
-    if Regex::new(r"(?i)https?://").unwrap().is_match(prose) {
+    if Regex::new(r"(?i)https?://").unwrap().is_match(filled_body) {
         return Err(WisetreeError::validation(
             "Split AI description prose must not invent links.",
         ));
     }
-    let lines = template.lines().collect::<Vec<_>>();
+    let lines = filled_body.lines().collect::<Vec<_>>();
     let descriptions = lines
         .iter()
         .enumerate()
@@ -402,10 +416,21 @@ pub fn compose_split_body(
         .collect::<Vec<_>>();
     if descriptions.len() > 1 {
         return Err(WisetreeError::validation(
-            "The pull-request template has duplicate Description headings; repair it before Split.",
+            "Split body_content must contain exactly one Description heading.",
         ));
     }
-    if template
+    if descriptions.len() != 1
+        || !lines
+            .iter()
+            .copied()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(is_description_heading)
+    {
+        return Err(WisetreeError::validation(
+            "Split body_content must begin with exactly one Description heading.",
+        ));
+    }
+    if filled_body
         .lines()
         .filter(|line| {
             line.trim()
@@ -416,9 +441,16 @@ pub fn compose_split_body(
         > 0
     {
         return Err(WisetreeError::validation(
-            "The pull-request template already contains a Split Plan subsection.",
+            "Split body_content must not contain the harness-owned Split Plan subsection.",
         ));
     }
+    validate_split_draft_template(
+        template,
+        &SplitDraft {
+            title_summary: "validated separately".to_string(),
+            body_content: filled_body.to_string(),
+        },
+    )?;
     let mut plan = String::from("### Split Plan 📋\n\n");
     for (index, pull_request) in pull_requests.iter().enumerate() {
         let marker = if index + 1 == current_order {
@@ -430,39 +462,65 @@ pub fn compose_split_body(
         };
         plan.push_str(&format!("{}. {}{}\n", index + 1, pull_request.url, marker));
     }
-    let body = if let Some(description_index) = descriptions.first().copied() {
-        let next_heading = lines[description_index + 1..]
-            .iter()
-            .position(|line| is_h1_heading(line))
-            .map(|offset| description_index + 1 + offset)
-            .unwrap_or(lines.len());
-        let before = lines[..description_index].join("\n");
-        let after = lines[next_heading..].join("\n");
-        [
-            (!before.trim().is_empty()).then_some(before.trim_end().to_string()),
-            Some("# Description ✍️".to_string()),
-            Some(plan.trim_end().to_string()),
-            Some(prose.trim().to_string()),
-            (!after.trim().is_empty()).then_some(after.trim_start().to_string()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n\n")
-    } else {
-        [
-            "# Description ✍️".to_string(),
-            plan.trim_end().to_string(),
-            prose.trim().to_string(),
-            template.trim().to_string(),
-        ]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-    };
+    let description_index = descriptions[0];
+    let after_description = lines[description_index + 1..].join("\n");
+    let body = [
+        "# Description ✍️".to_string(),
+        plan.trim_end().to_string(),
+        after_description.trim().to_string(),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
     validate_split_body(&body, pull_requests, current_order)?;
     Ok(format!("{}\n", body.trim_end()))
+}
+
+pub fn validate_split_draft_template(template: &str, draft: &SplitDraft) -> Result<()> {
+    let lines = draft.body_content.lines().collect::<Vec<_>>();
+    for heading in template.lines().filter(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with('#')
+            && !is_description_heading(trimmed)
+            && !trimmed.to_ascii_lowercase().contains("ticket")
+    }) {
+        if lines
+            .iter()
+            .filter(|line| line.trim() == heading.trim())
+            .count()
+            != 1
+        {
+            return Err(WisetreeError::validation(format!(
+                "Split body_content must fill the template section `{}` exactly once.",
+                heading.trim()
+            )));
+        }
+    }
+    for placeholder in template
+        .lines()
+        .map(str::trim)
+        .filter(|line| looks_like_template_placeholder(line))
+    {
+        if lines.iter().any(|line| line.trim() == placeholder) {
+            return Err(WisetreeError::validation(format!(
+                "Split body_content left the template placeholder `{placeholder}` unchanged."
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_template_placeholder(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    !line.is_empty()
+        && (line.contains("{{")
+            || lower.contains("placeholder")
+            || lower.contains("brief explanation")
+            || lower.contains("overview of the feature")
+            || lower.contains("step-by-step process")
+            || lower == "- [ ] example"
+            || lower == "todo")
 }
 
 pub fn validate_split_body(

@@ -402,7 +402,7 @@ fn publication_progress_and_verified_stack_are_visible() {
         correction_attempted: false,
         draft: Some(SplitDraft {
             title_summary: "Foundation".into(),
-            description_content: "Details".into(),
+            body_content: "# Description ✍️\n\nDetails".into(),
         }),
         final_title: Some("Foundation (1/2)".into()),
         final_body: Some("body".into()),

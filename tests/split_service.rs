@@ -312,7 +312,7 @@ fn split_draft_contract_prompt_and_title_keep_ai_out_of_bookkeeping() {
     assert!(!prompt.contains("https://github.com/owner/repo/pull/41"));
 
     let draft = parse_split_draft(
-        r#"{"title_summary":"2. DUV-4091 Add the contract (9/9)","description_content":"Adds the contract and explains how to test it."}"#,
+        r##"{"title_summary":"2. DUV-4091 Add the contract (9/9)","body_content":"# Description ✍️\n\nAdds the contract and explains how to test it."}"##,
     )
     .unwrap();
     assert_eq!(
@@ -320,18 +320,18 @@ fn split_draft_contract_prompt_and_title_keep_ai_out_of_bookkeeping() {
         "DUV-4091 Add the contract (2/3)"
     );
     assert!(parse_split_draft(
-        r#"{"title_summary":"x","description_content":"See https://example.test"}"#
+        r##"{"title_summary":"x","body_content":"# Description ✍️\n\nSee https://example.test"}"##
     )
     .is_err());
 }
 
 #[test]
-fn split_body_is_deterministic_and_preserves_non_description_template_sections() {
+fn split_body_is_deterministic_and_requires_filled_template_sections() {
     let publication = published_stack();
     let template = "# Description ✍️\n\nplaceholder\n\n# Overview 🔍\n\nkeep overview\n\n# Test Guidance 🦮\n\nkeep tests\n\n# Custom\n\nkeep custom";
     let body = compose_split_body(
         template,
-        "This layer introduces the shared contract.",
+        "# Description ✍️\n\nThis layer introduces the shared contract.\n\n# Overview 🔍\n\nShows the contract flow.\n\n# Test Guidance 🦮\n\n1. Exercise the contract.\n\n# Custom\n\nCustom evidence.",
         &publication.pull_requests,
         2,
     )
@@ -341,27 +341,38 @@ fn split_body_is_deterministic_and_preserves_non_description_template_sections()
     assert!(body.contains("2. https://github.com/owner/repo/pull/42 **(current PR)**"));
     assert!(body.contains("3. https://github.com/owner/repo/pull/43 **(future PR)**"));
     assert!(body.find("### Split Plan 📋").unwrap() < body.find("This layer").unwrap());
-    assert!(body.contains("keep overview"));
-    assert!(body.contains("keep tests"));
-    assert!(body.contains("keep custom"));
+    assert!(body.contains("Shows the contract flow."));
+    assert!(body.contains("1. Exercise the contract."));
+    assert!(body.contains("Custom evidence."));
+    assert!(!body.contains("keep overview"));
+    assert!(!body.contains("keep tests"));
+    assert!(!body.contains("keep custom"));
     assert!(!body.contains("placeholder"));
 
     assert!(compose_split_body(
-        "# Description\n\na\n# Description ✍️\n\nb",
-        "prose",
+        template,
+        "# Description ✍️\n\nplaceholder\n\n# Overview 🔍\n\nkeep overview\n\n# Test Guidance 🦮\n\nkeep tests\n\n# Custom\n\nkeep custom",
+        &publication.pull_requests,
+        1,
+    )
+    .is_err());
+
+    assert!(compose_split_body(
+        "# Description\n\nplaceholder",
+        "# Description\n\nprose\n\n# Description ✍️\n\nduplicate",
         &publication.pull_requests,
         1,
     )
     .is_err());
     let without = compose_split_body(
         "# Overview\n\nmedia stays",
-        "prose",
+        "# Description ✍️\n\nprose\n\n# Overview\n\nmedia is explained",
         &publication.pull_requests,
         1,
     )
     .unwrap();
     assert!(without.starts_with("# Description ✍️\n\n### Split Plan 📋"));
-    assert!(without.contains("# Overview\n\nmedia stays"));
+    assert!(without.contains("# Overview\n\nmedia is explained"));
 }
 
 #[test]
@@ -762,7 +773,7 @@ async fn materializes_shared_file_hunks_without_touching_the_source() {
     fs::write(
         &gh_path,
         format!(
-            r#"#!/bin/sh
+            r##"#!/bin/sh
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "stack" ] && [ "$2" = "link" ]; then exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi
@@ -775,7 +786,7 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   exit 0
 fi
 exit 1
-"#,
+"##,
             log = gh_log.display()
         ),
     )
@@ -803,7 +814,7 @@ exit 1
             .lines()
             .filter(|line| line.starts_with("stack link "))
             .collect::<Vec<_>>(),
-        ["stack link --base main --open feature.1_first-hunk feature.2_second-hunk feature"]
+        ["stack link --base main --remote origin --open feature.1_first-hunk feature.2_second-hunk feature"]
     );
     assert_eq!(
         gh_calls
@@ -823,7 +834,7 @@ exit 1
     fs::write(
         &ai_path,
         format!(
-            r#"#!/bin/sh
+            r##"#!/bin/sh
 if [ "$1" = "--version" ]; then printf 'opencode 1.0\n'; exit 0; fi
 printf '%s\n' "$PWD" >> "{log}"
 touch "{barrier}/$$"
@@ -833,8 +844,8 @@ while [ "$(find "{barrier}" -type f | wc -l | tr -d ' ')" -lt 3 ]; do
   if [ "$i" -gt 200 ]; then printf 'drafts were serialized' >&2; exit 1; fi
   sleep 0.01
 done
-printf '%s\n' '{{"title_summary":"Focused layer metadata","description_content":"Explains this layer responsibility and its focused test guidance."}}'
-"#,
+printf '%s\n' '{{"title_summary":"Focused layer metadata","body_content":"# Description ✍️\n\nExplains this layer responsibility.\n\n# Overview 🔍\n\nExplains the affected flow.\n\n# Test Guidance 🦮\n\n1. Verify this layer and its regressions."}}'
+"##,
             log = ai_log.display(),
             barrier = barrier.display(),
         ),
@@ -925,7 +936,7 @@ exit 1
 
     let source_head = git_stdout(&fixture.source, &["rev-parse", "HEAD"]);
     assert_ne!(source_head, fixture.head);
-    assert!(git_succeeds(
+    assert!(!git_succeeds(
         &fixture.source,
         &["merge-base", "--is-ancestor", &fixture.head, &source_head]
     ));
@@ -1161,7 +1172,7 @@ fn draft_cache_identity_scopes_a_retry_to_the_incomplete_pull_request() {
         correction_attempted: false,
         draft: Some(SplitDraft {
             title_summary: "Add the consumer".into(),
-            description_content: "Details".into(),
+            body_content: "# Description ✍️\n\nDetails".into(),
         }),
         final_title: Some("Add the consumer (2/2)".into()),
         final_body: Some("body".into()),

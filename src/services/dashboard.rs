@@ -672,6 +672,7 @@ pub struct ExplainSubmitRequest {
 struct SplitDraftRequest {
     record: SplitDraftRecord,
     prompt: String,
+    template: String,
     worktree_path: PathBuf,
     source_worktree: String,
 }
@@ -5761,13 +5762,25 @@ impl DashboardService {
             .as_ref()
             .map(|metadata| metadata.base_ref_name.as_str())
             .or(request.pr_base_ref.as_deref());
-        let base_ref = resolve_base_ref_with_binary(&self.git_binary, &cwd, base_hint)
+        let base_ref = if let Some(metadata) = &pr_metadata {
+            let repository = parse_github_slug(&metadata.url)
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
+                .ok_or_else(|| WisetreeError::validation("Source PR URL is not a GitHub URL."))?;
+            resolve_github_repository_ref(
+                &self.git_binary,
+                &cwd,
+                &metadata.base_ref_name,
+                &repository,
+            )
             .await
-            .ok_or_else(|| {
-                WisetreeError::validation(
-                    "Split could not resolve the existing PR base, tracked base, or a supported trunk ref.",
-                )
-            })?;
+        } else {
+            resolve_base_ref_with_binary(&self.git_binary, &cwd, base_hint).await
+        }
+        .ok_or_else(|| {
+            WisetreeError::validation(
+                "Split could not resolve the existing PR base on its GitHub repository, tracked base, or a supported trunk ref.",
+            )
+        })?;
         let base_sha = run_command(&self.git_binary, &["rev-parse", &base_ref], Some(&cwd))
             .await
             .map_err(|_| {
@@ -5836,7 +5849,16 @@ impl DashboardService {
                 .next()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0);
-            if remote_only > 0 {
+            let expected_unpublished_rewrite = persisted_materialization
+                .as_ref()
+                .and_then(|materialization| materialization.layers.last())
+                .is_some_and(|layer| {
+                    layer.branch == source_branch && layer.commit_sha == source_head
+                })
+                && persisted_run
+                    .as_ref()
+                    .is_some_and(|record| remote_head == record.identity.source_head);
+            if remote_only > 0 && !expected_unpublished_rewrite {
                 return Err(WisetreeError::validation(
                     "The remote source branch has commits absent from the selected source HEAD. Synchronize it before Split.",
                 ));
@@ -6475,6 +6497,8 @@ impl DashboardService {
                 "link".to_string(),
                 "--base".to_string(),
                 trunk.clone(),
+                "--remote".to_string(),
+                preflight.identity.remote.clone(),
                 "--open".to_string(),
             ];
             args.extend(branches.iter().cloned());
@@ -6721,7 +6745,12 @@ impl DashboardService {
                         serde_json::to_string(draft)
                             .ok()
                             .and_then(|json| parse_split_draft(&json).ok())
-                            .is_some()
+                            .is_some_and(|draft| {
+                                crate::services::split::validate_split_draft_template(
+                                    &template, &draft,
+                                )
+                                .is_ok()
+                            })
                     })
             });
             if let Some(record) = cached {
@@ -6780,6 +6809,7 @@ impl DashboardService {
             requests.push(SplitDraftRequest {
                 record,
                 prompt,
+                template: template.clone(),
                 worktree_path,
                 source_worktree: preflight.worktree_path.clone(),
             });
@@ -6848,7 +6878,7 @@ impl DashboardService {
             )?);
             record.final_body = Some(compose_split_body(
                 &template,
-                &draft.description_content,
+                &draft.body_content,
                 &publication.pull_requests,
                 record.order,
             )?);
@@ -6964,7 +6994,10 @@ impl DashboardService {
         forwarder.abort();
         let draft = match run {
             Err(error) => Err(error),
-            Ok(run) => match parse_split_draft(&run.transcript) {
+            Ok(run) => match parse_split_draft(&run.transcript).and_then(|draft| {
+                crate::services::split::validate_split_draft_template(&request.template, &draft)?;
+                Ok(draft)
+            }) {
                 Ok(draft) => Ok(draft),
                 Err(first_error) => {
                     record.correction_attempted = true;
@@ -7003,6 +7036,13 @@ impl DashboardService {
                         )
                         .await
                         .and_then(|run| parse_split_draft(&run.transcript))
+                        .and_then(|draft| {
+                            crate::services::split::validate_split_draft_template(
+                                &request.template,
+                                &draft,
+                            )?;
+                            Ok(draft)
+                        })
                 }
             },
         };
@@ -9471,6 +9511,55 @@ pub(crate) async fn resolve_base_ref_with_binary(
     for candidate in BASE_REF_PRIORITY {
         if ref_is_reachable(git_binary, cwd, candidate).await {
             return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Resolve a branch only through a remote that points at the repository which
+/// owns an existing pull request. This avoids mapping `main` to an unrelated
+/// canonical `upstream` when the PR and its stack live in the user's fork.
+async fn resolve_github_repository_ref(
+    git_binary: &Path,
+    cwd: &Path,
+    branch: &str,
+    repository: &str,
+) -> Option<String> {
+    let remotes = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(git_binary, &["remote"], Some(cwd)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut candidates = remotes
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|remote| match *remote {
+        "origin" => 0,
+        "upstream" => 1,
+        _ => 2,
+    });
+    for remote in candidates {
+        let url = match time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(git_binary, &["remote", "get-url", remote], Some(cwd)),
+        )
+        .await
+        {
+            Ok(Ok(url)) => url,
+            _ => continue,
+        };
+        let remote_repository =
+            parse_github_slug(&url).map(|(owner, repo)| format!("{owner}/{repo}"));
+        if remote_repository.as_deref() != Some(repository) {
+            continue;
+        }
+        let candidate = format!("{remote}/{}", branch.trim());
+        if ref_is_reachable(git_binary, cwd, &candidate).await {
+            return Some(candidate);
         }
     }
     None
@@ -17156,6 +17245,50 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
                 "control byte escaped into activity: {text:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn split_base_resolution_stays_in_the_pull_request_repository() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repo = directory.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join("seed.txt"), "seed\n").expect("seed");
+        git(repo, &["add", "seed.txt"]);
+        git(repo, &["commit", "-q", "-m", "seed"]);
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/acme/project.git",
+            ],
+        );
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:developer/project.git",
+            ],
+        );
+        git(repo, &["update-ref", "refs/remotes/upstream/main", &head]);
+        git(repo, &["update-ref", "refs/remotes/origin/main", &head]);
+
+        assert_eq!(
+            resolve_github_repository_ref(Path::new("git"), repo, "main", "developer/project")
+                .await
+                .as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(
+            resolve_github_repository_ref(Path::new("git"), repo, "main", "acme/project")
+                .await
+                .as_deref(),
+            Some("upstream/main")
+        );
     }
 
     // Hermetic git helper: never depend on the machine's global identity/config.
