@@ -1034,8 +1034,20 @@ impl SplitPullRequestScreen {
             .split(chunks[1]);
         self.approve_rect.set(buttons[1]);
         self.reject_rect.set(buttons[3]);
-        self.render_review_button(frame, buttons[1], "Approve", self.review_focus == 0);
-        self.render_review_button(frame, buttons[3], "Reject", self.review_focus == 1);
+        self.render_review_button(
+            frame,
+            buttons[1],
+            "Approve",
+            colors::SUCCESS,
+            self.review_focus == 0,
+        );
+        self.render_review_button(
+            frame,
+            buttons[3],
+            "Reject",
+            colors::ERROR,
+            self.review_focus == 1,
+        );
     }
 
     fn review_lines(&self, width: usize) -> Vec<Line<'static>> {
@@ -1148,22 +1160,35 @@ impl SplitPullRequestScreen {
         lines
     }
 
-    fn render_review_button(&self, frame: &mut Frame, area: Rect, label: &str, selected: bool) {
-        let style = if selected {
-            Style::default()
-                .fg(colors::SPLIT)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            Style::default().fg(colors::SPLIT)
-        };
+    /// Approve/Reject follow the palette every other pull-request command uses
+    /// for a decision pair — success green and error red — rather than the
+    /// command's own accent, so the safe and the destructive choice never look
+    /// alike. The border follows the canonical focus affordance; the label
+    /// carries the same color so each button reads correctly unfocused too.
+    fn render_review_button(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &str,
+        color: ratatui::style::Color,
+        selected: bool,
+    ) {
+        let mut label_style = Style::default().fg(color);
+        if selected {
+            label_style = label_style.add_modifier(Modifier::BOLD);
+        }
         frame.render_widget(
-            Paragraph::new(label)
+            Paragraph::new(Span::styled(label.to_string(), label_style))
                 .alignment(Alignment::Center)
-                .style(style)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded),
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(if selected {
+                            color
+                        } else {
+                            colors::MUTED
+                        })),
                 ),
             area,
         );
