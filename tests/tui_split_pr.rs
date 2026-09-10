@@ -526,3 +526,38 @@ fn review_reports_layers_within_max_as_within_the_guideline() {
     assert!(!text.contains("exceed MAX"), "{text}");
     assert!(!text.contains("Over MAX"), "{text}");
 }
+
+/// The decision pair uses the same palette as every other pull-request
+/// command: green to approve, red to reject — never the command accent, which
+/// would make the safe and the destructive choice look identical.
+#[test]
+fn approve_is_green_and_reject_is_red_in_both_border_and_label() {
+    let mut screen = review_screen();
+    let buffer = render_buffer(&mut screen, 100, 30);
+    let color_of = |needle: char| {
+        (buffer.area.height.saturating_sub(3)..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].symbol() == needle.to_string())
+            .map(|(x, y)| buffer[(x, y)].fg)
+            .expect("button label")
+    };
+    // Approve is focused by default, so its border carries the accent too.
+    assert_eq!(color_of('A'), colors::SUCCESS);
+    assert_eq!(color_of('R'), colors::ERROR);
+    assert_ne!(colors::SUCCESS, colors::SPLIT);
+    assert_ne!(colors::ERROR, colors::SPLIT);
+
+    let border_colors: Vec<_> = (buffer.area.height.saturating_sub(3)..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| buffer[(x, y)].symbol() == "─")
+        .map(|(x, y)| buffer[(x, y)].fg)
+        .collect();
+    assert!(
+        border_colors.contains(&colors::SUCCESS),
+        "focused Approve border is green"
+    );
+    assert!(
+        border_colors.contains(&colors::MUTED),
+        "unfocused Reject border is muted"
+    );
+}
