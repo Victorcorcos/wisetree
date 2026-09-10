@@ -16,3 +16,9 @@ Cargo.lock.bak
 # AI related
 local/
 .wisetree.json
+
+# Scratch artifacts written into a worktree by Wisetree's own PR commands
+# (Develop writes PLAN.md, Bugkill writes BUG_INVESTIGATION.md). They describe
+# one local run, and the work they produced is already in the git history.
+PLAN.md
+BUG_INVESTIGATION.md
