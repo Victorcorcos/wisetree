@@ -113,6 +113,9 @@ pub mod colors {
     pub const GRAY_LIGHT: Color = Color::Rgb(0xd9, 0xd9, 0xd2);
     /// Pink `#ff0071` — error messages and destructive states.
     pub const PINK: Color = Color::Rgb(0xff, 0x00, 0x71);
+    /// Whiter pink `#ffc2e0` — the softened Split pink. Deliberately far
+    /// from [`PINK`] so the Split command never reads as destructive.
+    pub const PINK_LIGHT: Color = Color::Rgb(0xff, 0xc2, 0xe0);
     /// Green `#94e400` — success messages and positive states.
     pub const GREEN: Color = Color::Rgb(0x94, 0xe4, 0x00);
     /// Teal `#1cdbf2` — informational text and titles like
@@ -151,9 +154,10 @@ pub mod colors {
     /// Mint accent reserved for the local "Improve" command and its
     /// confirmation screen.
     pub const IMPROVE: Color = MINT;
-    /// Split pink `#f92672` — reserved for the Split pull-request command.
-    /// It is deliberately distinct from the brighter destructive/error pink.
-    pub const SPLIT: Color = Color::Rgb(0xf9, 0x26, 0x72);
+    /// Split pink `#ffc2e0` — reserved for the Split pull-request command.
+    /// It is deliberately distinct from the brighter destructive/error pink,
+    /// which is what the Close command uses.
+    pub const SPLIT: Color = PINK_LIGHT;
 
     // ── Background colors ───────────────────────────────────────────────
 

@@ -9,6 +9,7 @@ Gray (darker → for annotation texts like `Version 1.0.0 | Active Repo:`): #909
 Gray (medium → between darker and lighter; for the `Drafted` PR status): #b4b5ae
 Gray (lighter → for more important annotation texts like `~/Desktop/repositories/wisetree`): #d9d9d2
 Pink (error → for error messages and similar things): #ff0071
+Whiter Pink (for the `Split` pull request command → so it never reads like the error/`Close` pink): #ffc2e0
 Green (success → for success messages and similar things): #94e400
 Teal (info → for titles like `Choose wisely...`): #1cdbf2
 Yellow (warning → for warning messages and similar things, example: `Directory name cannot be empty`): #eada61
