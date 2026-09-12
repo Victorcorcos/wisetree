@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
@@ -1313,6 +1313,100 @@ impl AiSlot {
     }
 }
 
+/// A PR command owning one or more consecutive [`AiSlot`]s. The AI Models
+/// screen draws each group as a rounded box around its slots, titled and
+/// bordered in the command's own color, so the roles of one command
+/// (`review_strong` / `review_balanced` / …) read as a unit instead of a
+/// flat list.
+struct AiCommandGroup {
+    /// Command name shown in the box's top-left corner.
+    label: &'static str,
+    /// The command's color, as used by its dashboard button.
+    color: Color,
+    /// Index of the group's first slot in [`AiSlot::ALL`].
+    first: usize,
+    /// How many consecutive slots the group owns.
+    count: usize,
+}
+
+/// Groups in slot order; together they must cover [`AiSlot::ALL`] exactly.
+/// Single-slot commands are boxed too, so the grouping reads as "one box per
+/// command" rather than "a box means more than one model".
+const AI_COMMAND_GROUPS: [AiCommandGroup; 7] = [
+    AiCommandGroup {
+        label: "Explain",
+        color: colors::BRAND,
+        first: 0,
+        count: 1,
+    },
+    AiCommandGroup {
+        label: "Fix",
+        color: colors::CYAN,
+        first: 1,
+        count: 2,
+    },
+    AiCommandGroup {
+        label: "Review",
+        color: colors::NAVY,
+        first: 3,
+        count: 3,
+    },
+    AiCommandGroup {
+        label: "Update",
+        color: colors::WARNING,
+        first: 6,
+        count: 1,
+    },
+    AiCommandGroup {
+        label: "Bugkill",
+        color: colors::DARK_GREEN,
+        first: 7,
+        count: 3,
+    },
+    AiCommandGroup {
+        label: "Develop",
+        color: colors::ORANGE,
+        first: 10,
+        count: 2,
+    },
+    AiCommandGroup {
+        label: "Split",
+        color: colors::SPLIT,
+        first: 12,
+        count: 2,
+    },
+];
+
+/// Rows one slot occupies: a 3-row rectangle plus its 1-row hint.
+const AI_SLOT_ROW_HEIGHT: u16 = 4;
+
+/// Widest a command group box gets. The slot rectangles used to span the
+/// whole terminal, which drowned the grouping on wide screens; capping and
+/// centering them keeps the boxes readable while still fitting the longest
+/// slot hint on one line.
+const AI_GROUP_MAX_WIDTH: u16 = 100;
+
+/// The groups intersecting `range`, each paired with the slots of that group
+/// actually inside the window. A partially scrolled group still gets its own
+/// box (and therefore its own pair of border rows) around the visible part.
+fn ai_visible_groups(range: Range<usize>) -> Vec<(&'static AiCommandGroup, Range<usize>)> {
+    AI_COMMAND_GROUPS
+        .iter()
+        .filter_map(|group| {
+            let start = group.first.max(range.start);
+            let end = (group.first + group.count).min(range.end);
+            (start < end).then_some((group, start..end))
+        })
+        .collect()
+}
+
+/// Rows needed to render `range`: every slot plus two border rows per group
+/// box drawn around them.
+fn ai_window_rows(range: Range<usize>) -> u16 {
+    let groups = ai_visible_groups(range.clone()).len() as u16;
+    (range.len() as u16) * AI_SLOT_ROW_HEIGHT + groups * 2
+}
+
 /// The fourteen leaf models in slot order — used by the dashboard `ai` summary and
 /// the AI Settings editor.
 fn ai_slot_models(ai: &AiConfig) -> [&AiModelConfig; 14] {
@@ -1397,20 +1491,31 @@ impl AiSettingsEditor {
         Self::slot(self.target_idx()).get(&self.ai).clone()
     }
 
-    /// Slot indices to render given the rows capacity, keeping the active
-    /// slot in view. Mirrors [`PostCmdEditor::visible_range`].
-    fn visible_range(&self, max_visible: usize) -> Range<usize> {
+    /// Slot indices to render in `rows` terminal rows, keeping the active
+    /// slot in view. Counts rows rather than slots (unlike
+    /// [`PostCmdEditor::visible_range`]) because each command group box adds
+    /// two border rows, so how many slots fit depends on where the window
+    /// falls relative to the group boundaries.
+    fn visible_range(&self, rows: u16) -> Range<usize> {
         let total = AiSlot::ALL.len();
-        if max_visible == 0 {
+        if rows < AI_SLOT_ROW_HEIGHT + 2 {
             return 0..0;
         }
-        if total <= max_visible {
+        if ai_window_rows(0..total) <= rows {
             return 0..total;
         }
+        // Grow around the active slot, upwards first so scrolling down lands
+        // it at the bottom of the window, then downwards with whatever rows
+        // the group borders left over.
         let active = self.target_idx();
-        let start = active.saturating_add(1).saturating_sub(max_visible);
-        let end = (start + max_visible).min(total);
-        end.saturating_sub(max_visible)..end
+        let (mut start, mut end) = (active, active + 1);
+        while start > 0 && ai_window_rows(start - 1..end) <= rows {
+            start -= 1;
+        }
+        while end < total && ai_window_rows(start..end + 1) <= rows {
+            end += 1;
+        }
+        start..end
     }
 
     /// Stamp a picked model + thinking into the targeted slot (Modified, not
@@ -3840,9 +3945,10 @@ impl SettingsScreen {
 
     fn ai_settings_preferred_height(&self) -> u16 {
         // Title + description + slot rectangles (3 rows each) + hint rows
-        // + chip row + chip hint + spacer + Save button (3 rows) + footer hint.
-        let rects = AiSlot::ALL.len() as u16;
-        2 + rects * 3 + rects + 2 + 1 + 3 + 1
+        // + the two border rows of every command group box + chip row
+        // + chip hint + spacer + Save button (3 rows) + footer hint.
+        let slots = ai_window_rows(0..AiSlot::ALL.len());
+        2 + slots + 2 + 1 + 3 + 1
     }
 
     fn path_template_preferred_height(&self) -> u16 {
@@ -4689,9 +4795,10 @@ impl SettingsScreen {
     }
 
     /// Render the AI Settings sub-screen: one rectangle per AI command (model +
-    /// thinking strength), a shared free-model chip row, and a Save button.
-    /// The slot rectangles scroll as a window (keeping the active slot in
-    /// view) since the slot count can exceed the terminal height.
+    /// thinking strength) grouped into a box per PR command, a shared
+    /// free-model chip row, and a Save button. The slot rectangles scroll as a
+    /// window (keeping the active slot in view) since the slot count can
+    /// exceed the terminal height.
     fn render_ai_settings(&self, frame: &mut Frame, area: Rect) {
         let editor = match &self.ai_settings_editor {
             Some(e) => e,
@@ -4704,9 +4811,6 @@ impl SettingsScreen {
         let muted_style = Style::default().fg(colors::MUTED);
         let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
 
-        // Each visible slot occupies a 3-row rectangle plus a 1-row hint.
-        const SLOT_ROW_HEIGHT: u16 = 4;
-
         // The free-model chip row wraps instead of clipping, so it can span
         // more than one terminal row once enough models are cached.
         let chip_row_height = self.free_model_chip_lines(area.width).len().max(1) as u16;
@@ -4716,7 +4820,7 @@ impl SettingsScreen {
             .constraints([
                 Constraint::Length(1),               // title
                 Constraint::Length(1),               // description
-                Constraint::Min(SLOT_ROW_HEIGHT),    // scrollable slot rectangles
+                Constraint::Min(AI_SLOT_ROW_HEIGHT), // scrollable slot rectangles
                 Constraint::Length(1),               // scroll indicator
                 Constraint::Length(chip_row_height), // chips line(s)
                 Constraint::Length(1),               // chip-action hint
@@ -4738,26 +4842,41 @@ impl SettingsScreen {
         );
 
         let slot_area = chunks[2];
-        let rows_capacity = (slot_area.height / SLOT_ROW_HEIGHT) as usize;
-        let visible_range = editor.visible_range(rows_capacity);
+        let visible_range = editor.visible_range(slot_area.height);
         let hidden_above = visible_range.start;
         let hidden_below = AiSlot::ALL.len().saturating_sub(visible_range.end);
         let is_scrollable = hidden_above > 0 || hidden_below > 0;
 
-        for (row, i) in visible_range.enumerate() {
-            let rect_area = Rect {
-                x: slot_area.x,
-                y: slot_area.y + (row as u16) * SLOT_ROW_HEIGHT,
-                width: slot_area.width,
-                height: 3,
+        let group_width = slot_area.width.min(AI_GROUP_MAX_WIDTH);
+        let group_x = slot_area.x + (slot_area.width - group_width) / 2;
+        let mut group_y = slot_area.y;
+        for (group, slots) in ai_visible_groups(visible_range) {
+            let group_area = Rect {
+                x: group_x,
+                y: group_y,
+                width: group_width,
+                height: slots.len() as u16 * AI_SLOT_ROW_HEIGHT + 2,
             };
-            let hint_area = Rect {
-                x: slot_area.x,
-                y: rect_area.y + 3,
-                width: slot_area.width,
-                height: 1,
-            };
-            self.render_ai_settings_rectangle(frame, rect_area, hint_area, editor, i);
+            self.render_ai_command_group(frame, group_area, group);
+
+            for (row, i) in slots.enumerate() {
+                let rect_area = Rect {
+                    // Inside the group's border, with a blank column either
+                    // side so the box reads as a container.
+                    x: group_area.x + 2,
+                    y: group_area.y + 1 + (row as u16) * AI_SLOT_ROW_HEIGHT,
+                    width: group_area.width.saturating_sub(4),
+                    height: 3,
+                };
+                let hint_area = Rect {
+                    x: rect_area.x,
+                    y: rect_area.y + 3,
+                    width: rect_area.width,
+                    height: 1,
+                };
+                self.render_ai_settings_rectangle(frame, rect_area, hint_area, editor, i);
+            }
+            group_y += group_area.height;
         }
 
         if is_scrollable {
@@ -4777,6 +4896,22 @@ impl SettingsScreen {
             "↑↓ move • ← → choose field • Space change value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
         };
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
+    }
+
+    /// The rounded box around one PR command's slots, bordered and titled
+    /// with the command name in that command's color.
+    fn render_ai_command_group(&self, frame: &mut Frame, area: Rect, group: &AiCommandGroup) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(group.color))
+            .title(Span::styled(
+                format!(" {} ", group.label),
+                Style::default()
+                    .fg(group.color)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(block, area);
     }
 
     fn render_ai_settings_rectangle(
@@ -6953,7 +7088,7 @@ mod tests {
         assert_eq!(dash.statuses[idx], DashboardRectStatus::Modified);
     }
 
-    fn render_dump(screen: &SettingsScreen, w: u16, h: u16) -> String {
+    fn render_buffer(screen: &SettingsScreen, w: u16, h: u16) -> ratatui::buffer::Buffer {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let backend = TestBackend::new(w, h);
@@ -6961,15 +7096,21 @@ mod tests {
         terminal
             .draw(|f| screen.render_ai_settings(f, f.area()))
             .unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
+    }
+
+    fn render_dump(screen: &SettingsScreen, w: u16, h: u16) -> String {
+        buffer_rows(&render_buffer(screen, w, h)).join("\n")
     }
 
     /// At a terminal height too short for all slots, the focused (first)
@@ -7014,7 +7155,7 @@ mod tests {
     #[test]
     fn ai_settings_tall_terminal_shows_all_slots_unscrolled() {
         let screen = ai_settings_screen(vec![]);
-        let dump = render_dump(&screen, 100, 70);
+        let dump = render_dump(&screen, 100, 85);
         for slot in AiSlot::ALL {
             assert!(
                 dump.contains(slot.label()),
@@ -7024,6 +7165,94 @@ mod tests {
         }
         assert!(!dump.contains("above"));
         assert!(!dump.contains("below"));
+    }
+
+    /// Every slot belongs to exactly one command group, in slot order —
+    /// otherwise a slot would render outside any box (or twice).
+    #[test]
+    fn ai_command_groups_cover_every_slot_once() {
+        let mut next = 0;
+        for group in &AI_COMMAND_GROUPS {
+            assert_eq!(group.first, next, "gap or overlap before '{}'", group.label);
+            assert!(group.count > 0, "'{}' owns no slot", group.label);
+            next = group.first + group.count;
+        }
+        assert_eq!(next, AiSlot::ALL.len());
+    }
+
+    /// The slots of one PR command share a box titled with the command name,
+    /// and that box is narrower than the terminal and centered rather than
+    /// spanning it edge to edge.
+    #[test]
+    fn ai_settings_wraps_one_command_slots_in_a_centered_box() {
+        let screen = ai_settings_screen(vec![]);
+        let buffer = render_buffer(&screen, 140, 85);
+        let rows = buffer_rows(&buffer);
+        let box_x = (140 - AI_GROUP_MAX_WIDTH) / 2;
+
+        let strong_y = rows
+            .iter()
+            .position(|row| row.contains("review_strong"))
+            .expect("review_strong rectangle missing");
+        let utility_y = rows
+            .iter()
+            .position(|row| row.contains("review_utility"))
+            .expect("review_utility rectangle missing");
+
+        // The group title sits on the box's top border, above its first slot.
+        assert!(
+            rows[strong_y - 1].contains("╭ Review "),
+            "expected a rounded box titled 'Review' above review_strong:\n{}",
+            rows[strong_y - 1]
+        );
+
+        // Every Review slot sits between the same pair of side borders, so
+        // the box really wraps all three.
+        for y in [strong_y, utility_y] {
+            assert_eq!(
+                buffer[(box_x, y as u16)].symbol(),
+                "│",
+                "row {y} is not inside the Review box"
+            );
+        }
+
+        // Centered: nothing drawn either side of the box. Compare by column,
+        // not by byte — the row is full of multi-byte box-drawing glyphs.
+        let columns: Vec<char> = rows[strong_y].chars().collect();
+        assert!(columns[..box_x as usize].iter().all(|c| *c == ' '));
+        assert!(columns[(box_x + AI_GROUP_MAX_WIDTH) as usize..]
+            .iter()
+            .all(|c| *c == ' '));
+    }
+
+    /// Each box is bordered in its own command's color, so neighbouring
+    /// groups read as separate commands rather than one continuous panel.
+    #[test]
+    fn ai_settings_borders_each_command_group_in_its_own_color() {
+        let screen = ai_settings_screen(vec![]);
+        let buffer = render_buffer(&screen, 140, 85);
+        let rows = buffer_rows(&buffer);
+        let box_x = (140 - AI_GROUP_MAX_WIDTH) / 2;
+
+        for (label, color) in [
+            ("explain", colors::BRAND),
+            ("fix_plan", colors::CYAN),
+            ("review_strong", colors::NAVY),
+            ("update", colors::WARNING),
+            ("bugkill_fix", colors::DARK_GREEN),
+            ("develop_plan", colors::ORANGE),
+            ("split_open", colors::SPLIT),
+        ] {
+            let y = rows
+                .iter()
+                .position(|row| row.contains(label))
+                .unwrap_or_else(|| panic!("slot '{label}' missing from the render"));
+            assert_eq!(
+                buffer[(box_x, y as u16)].fg,
+                color,
+                "slot '{label}' is not inside a box bordered in its command's color"
+            );
+        }
     }
 
     #[test]
