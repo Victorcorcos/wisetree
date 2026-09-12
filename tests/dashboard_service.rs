@@ -1032,6 +1032,23 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     fs::write(worktree.join("feature.rs"), "fn feature() {}\n").unwrap();
     git(&worktree, &["add", "feature.rs"]);
     git(&worktree, &["commit", "-q", "-m", "feature"]);
+    let published_head = rev_parse_head(&worktree);
+    git(
+        &fixture.repo,
+        &[
+            "update-ref",
+            "refs/remotes/origin/feat-dashboard",
+            &published_head,
+        ],
+    );
+    fs::write(
+        worktree.join("feature.rs"),
+        "fn feature() {}\nfn local() {}\n",
+    )
+    .unwrap();
+    git(&worktree, &["add", "feature.rs"]);
+    git(&worktree, &["commit", "-q", "-m", "local ahead"]);
+    let local_head = rev_parse_head(&worktree);
     let base = rev_parse_head(&fixture.repo);
     git(
         &fixture.repo,
@@ -1047,12 +1064,20 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     .unwrap();
     make_executable(&git_path);
     let gh_log = parent.join("split-gh.log");
+    let gh_metadata = parent.join("split-pr.json");
+    let pr_metadata = |head: &str, state: &str| {
+        format!(
+            r#"{{"url":"https://github.com/example/repo/pull/7","baseRefName":"main","headRefOid":"{head}","state":"{state}"}}"#
+        )
+    };
+    fs::write(&gh_metadata, pr_metadata(&published_head, "OPEN")).unwrap();
     let gh_path = parent.join("split-gh.sh");
     fs::write(
         &gh_path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"view\" ] && [ \"$3\" = \"--json\" ]; then printf '[]'; fi\nexit 0\n",
-            gh_log.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then cat \"{}\"; exit 0; fi\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"view\" ] && [ \"$3\" = \"--json\" ]; then printf '[]'; fi\nexit 0\n",
+            gh_log.display(),
+            gh_metadata.display(),
         ),
     )
     .unwrap();
@@ -1069,7 +1094,7 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
         .split_preflight(&SplitPreflightRequest {
             worktree_path: worktree.to_string_lossy().to_string(),
             source_branch: "feat-dashboard".to_string(),
-            pr_number: None,
+            pr_number: Some(7),
             pr_base_ref: None,
             max: 100,
         })
@@ -1078,6 +1103,7 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     assert_eq!(preflight.identity.repository, "example/repo");
     assert_eq!(preflight.identity.base_ref, "origin/main");
     assert_eq!(preflight.identity.source_branch, "feat-dashboard");
+    assert_eq!(preflight.identity.source_head, local_head);
     // The MAX confirmed on the Split screen is frozen into the identity every
     // later stage (planner prompt, layer sizing, plan file) reads from.
     assert_eq!(preflight.identity.max, 100);
@@ -1092,6 +1118,20 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     assert!(!log.contains("stack init feat"), "{log}");
     assert!(!log.contains("stack link feat"), "{log}");
 
+    fs::write(&gh_metadata, pr_metadata(&published_head, "CLOSED")).unwrap();
+    let error = service
+        .split_preflight(&SplitPreflightRequest {
+            worktree_path: worktree.to_string_lossy().to_string(),
+            source_branch: "feat-dashboard".to_string(),
+            pr_number: Some(7),
+            pr_base_ref: None,
+            max: 100,
+        })
+        .await
+        .expect_err("a closed pull request must not be split")
+        .to_string();
+    assert!(error.contains("no longer open"), "{error}");
+
     fs::write(fixture.repo.join("base-after-feature.rs"), "fn base() {}\n").unwrap();
     git(&fixture.repo, &["add", "base-after-feature.rs"]);
     git(&fixture.repo, &["commit", "-q", "-m", "advance base"]);
@@ -1100,11 +1140,26 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
         &fixture.repo,
         &["update-ref", "refs/remotes/origin/main", &advanced_base],
     );
+    fs::write(&gh_metadata, pr_metadata(&advanced_base, "OPEN")).unwrap();
     let error = service
         .split_preflight(&SplitPreflightRequest {
             worktree_path: worktree.to_string_lossy().to_string(),
             source_branch: "feat-dashboard".to_string(),
-            pr_number: None,
+            pr_number: Some(7),
+            pr_base_ref: None,
+            max: 100,
+        })
+        .await
+        .expect_err("a divergent pull request head must not be split")
+        .to_string();
+    assert!(error.contains("moved away"), "{error}");
+
+    fs::write(&gh_metadata, pr_metadata(&published_head, "OPEN")).unwrap();
+    let error = service
+        .split_preflight(&SplitPreflightRequest {
+            worktree_path: worktree.to_string_lossy().to_string(),
+            source_branch: "feat-dashboard".to_string(),
+            pr_number: Some(7),
             pr_base_ref: None,
             max: 100,
         })

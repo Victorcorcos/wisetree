@@ -5732,6 +5732,13 @@ impl DashboardService {
         } else {
             None
         };
+        run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd))
+            .await
+            .map_err(|error| {
+                WisetreeError::validation(format!(
+                    "Split could not refresh repository refs before planning: {error}"
+                ))
+            })?;
         if let Some(metadata) = &pr_metadata {
             let resumed_unpublished_top = persisted_materialization
                 .as_ref()
@@ -5742,22 +5749,31 @@ impl DashboardService {
                 && persisted_run
                     .as_ref()
                     .is_some_and(|record| metadata.head_ref_oid == record.identity.source_head);
-            if metadata.state != "OPEN"
-                || (metadata.head_ref_oid != source_head && !resumed_unpublished_top)
+            if metadata.state != "OPEN" {
+                return Err(WisetreeError::validation(
+                    "The source pull request is no longer open; refresh the dashboard before planning.",
+                ));
+            }
+            if metadata.head_ref_oid != source_head
+                && !resumed_unpublished_top
+                && run_command(
+                    &self.git_binary,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        &metadata.head_ref_oid,
+                        &source_head,
+                    ],
+                    Some(&cwd),
+                )
+                .await
+                .is_err()
             {
                 return Err(WisetreeError::validation(
-                    "The source pull request is no longer open at the selected source HEAD; refresh the dashboard before planning.",
+                    "The source pull request moved away from the selected source HEAD; refresh the dashboard and synchronize the branch before planning.",
                 ));
             }
         }
-
-        run_command(&self.git_binary, &["fetch", "--all", "--prune"], Some(&cwd))
-            .await
-            .map_err(|error| {
-                WisetreeError::validation(format!(
-                    "Split could not refresh repository refs before planning: {error}"
-                ))
-            })?;
         let base_hint = pr_metadata
             .as_ref()
             .map(|metadata| metadata.base_ref_name.as_str())
