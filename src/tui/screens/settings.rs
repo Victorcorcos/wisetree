@@ -1617,9 +1617,7 @@ impl AiSettingsEditor {
     }
 
     fn mark_saved(&mut self) {
-        for status in &mut self.statuses {
-            *status = DashboardRectStatus::Saved;
-        }
+        self.statuses.fill(DashboardRectStatus::Saved);
         self.base_ai = normalize_ai(&self.ai);
         self.ai = self.base_ai.clone();
     }
