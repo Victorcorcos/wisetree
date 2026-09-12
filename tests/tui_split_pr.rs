@@ -341,17 +341,22 @@ fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
         "Details",
         "Responsibility/dependency",
         "src/a.rs, tests/a_test.rs",
-        "CU0001, CU0002",
+        "Changes",
+        "src/a.rs:1-3 (+3 -1)",
+        "tests/a_test.rs:1 (+1 -0)",
         "Related tests",
+        "tests/a_test.rs:1 (+1 -0)",
         "Integrity",
         "+4 -1 = 5 · within MAX 10 ✓",
         "Aggregate integrity",
+        "all 4 changed sections accounted for",
         "+8 -2 = 10 source lines",
         "Approve",
         "Reject",
     ] {
         assert!(text.contains(expected), "missing {expected:?}:\n{text}");
     }
+    assert!(!text.contains("CU0001"), "{text}");
     assert_eq!(
         screen.handle_key(key(KeyCode::Enter)),
         SplitAction::Approved
@@ -567,21 +572,49 @@ fn review_flags_every_pull_request_that_runs_past_max_with_its_reason() {
     preflight.identity.max = 3;
     screen.set_preflight(preflight);
 
-    let (text, _) = render(&mut screen, 110, 40);
+    let buffer = render_buffer(&mut screen, 110, 40);
+    let mut text = String::new();
+    let mut addition_is_green = false;
+    let mut deletion_is_red = false;
+    let mut total_is_yellow = false;
+    let mut srp_explanation_is_teal = false;
+    for y in 0..buffer.area.height {
+        let row = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>();
+        addition_is_green |= row.contains("+4")
+            && (0..buffer.area.width)
+                .any(|x| buffer[(x, y)].symbol() == "+" && buffer[(x, y)].fg == colors::SUCCESS);
+        deletion_is_red |= row.contains("-1")
+            && (0..buffer.area.width)
+                .any(|x| buffer[(x, y)].symbol() == "-" && buffer[(x, y)].fg == colors::ERROR);
+        total_is_yellow |= row.contains("= 5 · 2 over MAX 3.")
+            && (0..buffer.area.width)
+                .any(|x| buffer[(x, y)].symbol() == "=" && buffer[(x, y)].fg == colors::WARNING);
+        srp_explanation_is_teal |= row.contains("Single Responsibility")
+            && (0..buffer.area.width)
+                .any(|x| buffer[(x, y)].symbol() == "S" && buffer[(x, y)].fg == colors::INFO);
+        text.push_str(&row);
+        text.push('\n');
+    }
     assert!(text.contains("MAX 3 (guideline)"), "{text}");
     assert!(text.contains("2 of 2 pull requests exceed MAX 3"), "{text}");
     assert!(
         text.contains("Responsibility boundaries win over size"),
         "{text}"
     );
+    assert!(text.contains("+4 -1 = 5 · 2 over MAX 3."), "{text}");
     assert!(
-        text.contains("Over MAX: +4 -1 = 5 changed lines, 2 over MAX 3"),
+        text.contains("Kept whole to preserve Single Responsibility"),
         "{text}"
     );
-    assert!(text.contains("Kept whole to preserve this"), "{text}");
+    assert!(text.contains("Principle across Pull Requests."), "{text}");
+    assert!(addition_is_green, "oversized additions should be green");
+    assert!(deletion_is_red, "oversized deletions should be red");
+    assert!(total_is_yellow, "oversized total should be yellow");
     assert!(
-        text.contains("single responsibility — splitting it further"),
-        "{text}"
+        srp_explanation_is_teal,
+        "oversized SRP explanation should be teal"
     );
     // The AI's own boundary reasoning is what explains the overflow.
     assert!(text.contains("Responsibility/dependency"), "{text}");
