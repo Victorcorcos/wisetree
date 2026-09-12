@@ -1318,7 +1318,12 @@ impl SplitPullRequestScreen {
             ])
             .ai_roles(vec![
                 AiRoleRow::from_config("plan", colors::SPLIT, &named_model(&self.ai.plan), "Edit files"),
-                AiRoleRow::from_config("open", colors::PINK, &named_model(&self.ai.open), "Edit files"),
+                AiRoleRow::from_config(
+                    "open",
+                    colors::NAVY,
+                    &named_model(&self.ai.open),
+                    "Edit files",
+                ),
             ])
             .options(Some(
                 OptionsGroup::new(vec![OptionsGroupItem::value(
