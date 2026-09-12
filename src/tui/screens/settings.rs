@@ -13,7 +13,7 @@
 use std::cell::RefCell;
 use std::ops::Range;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -1381,10 +1381,78 @@ const AI_COMMAND_GROUPS: [AiCommandGroup; 7] = [
 const AI_SLOT_ROW_HEIGHT: u16 = 4;
 
 /// Widest a command group box gets. The slot rectangles used to span the
-/// whole terminal, which drowned the grouping on wide screens; capping and
-/// centering them keeps the boxes readable while still fitting the longest
-/// slot hint on one line.
+/// whole terminal, which drowned the grouping on wide screens; capping them
+/// keeps the boxes readable while still fitting the longest slot hint on one
+/// line.
 const AI_GROUP_MAX_WIDTH: u16 = 100;
+
+/// Narrowest a column may get before the screen drops back to one column:
+/// wide enough for the longest slot hint to render whole, since a truncated
+/// description costs more than the second column buys.
+fn ai_min_column_width() -> u16 {
+    let longest = AiSlot::ALL
+        .iter()
+        .map(|slot| slot.hint().chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    // The hint's "  ↳ " prefix, plus the group border and inset either side.
+    longest + 8
+}
+
+/// Blank columns between the two side-by-side columns.
+const AI_COLUMN_GAP: u16 = 2;
+
+/// Group index the right column starts at, chosen so the two columns come
+/// out as close in height as possible without splitting a command group.
+fn ai_column_split() -> usize {
+    let heights: Vec<u16> = AI_COMMAND_GROUPS
+        .iter()
+        .map(|group| group.count as u16 * AI_SLOT_ROW_HEIGHT + 2)
+        .collect();
+    let total: u16 = heights.iter().sum();
+    let mut left = 0;
+    let mut best = (u16::MAX, 1);
+    for (i, height) in heights.iter().enumerate().take(heights.len() - 1) {
+        left += height;
+        let imbalance = left.abs_diff(total - left);
+        if imbalance < best.0 {
+            best = (imbalance, i + 1);
+        }
+    }
+    best.1
+}
+
+/// The slots each column owns. Groups are contiguous and ordered, so a column
+/// is always a contiguous slot range — which lets the scroll window treat a
+/// column exactly like the whole list.
+fn ai_column_bounds() -> [Range<usize>; 2] {
+    let right = AI_COMMAND_GROUPS[ai_column_split()].first;
+    [0..right, right..AiSlot::ALL.len()]
+}
+
+/// Where the group boxes go: two side-by-side columns when the terminal is
+/// wide enough to keep both readable, otherwise a single centered one. Either
+/// way each returned rect is exactly one box wide.
+fn ai_column_areas(area: Rect) -> Vec<Rect> {
+    if area.width < ai_min_column_width() * 2 + AI_COLUMN_GAP {
+        let width = area.width.min(AI_GROUP_MAX_WIDTH);
+        return vec![Rect {
+            x: area.x + (area.width - width) / 2,
+            width,
+            ..area
+        }];
+    }
+    let width = ((area.width - AI_COLUMN_GAP) / 2).min(AI_GROUP_MAX_WIDTH);
+    let x = area.x + (area.width - (width * 2 + AI_COLUMN_GAP)) / 2;
+    vec![
+        Rect { x, width, ..area },
+        Rect {
+            x: x + width + AI_COLUMN_GAP,
+            width,
+            ..area
+        },
+    ]
+}
 
 /// The groups intersecting `range`, each paired with the slots of that group
 /// actually inside the window. A partially scrolled group still gets its own
@@ -1491,28 +1559,34 @@ impl AiSettingsEditor {
         Self::slot(self.target_idx()).get(&self.ai).clone()
     }
 
-    /// Slot indices to render in `rows` terminal rows, keeping the active
-    /// slot in view. Counts rows rather than slots (unlike
-    /// [`PostCmdEditor::visible_range`]) because each command group box adds
-    /// two border rows, so how many slots fit depends on where the window
-    /// falls relative to the group boundaries.
-    fn visible_range(&self, rows: u16) -> Range<usize> {
-        let total = AiSlot::ALL.len();
+    /// Slot indices of one column (`bounds`) to render in `rows` terminal
+    /// rows, keeping the active slot in view when it belongs to that column.
+    /// Counts rows rather than slots (unlike [`PostCmdEditor::visible_range`])
+    /// because each command group box adds two border rows, so how many slots
+    /// fit depends on where the window falls relative to the group
+    /// boundaries.
+    fn visible_range(&self, bounds: Range<usize>, rows: u16) -> Range<usize> {
         if rows < AI_SLOT_ROW_HEIGHT + 2 {
-            return 0..0;
+            return bounds.start..bounds.start;
         }
-        if ai_window_rows(0..total) <= rows {
-            return 0..total;
+        if ai_window_rows(bounds.clone()) <= rows {
+            return bounds;
         }
         // Grow around the active slot, upwards first so scrolling down lands
         // it at the bottom of the window, then downwards with whatever rows
-        // the group borders left over.
+        // the group borders left over. A column without the cursor in it
+        // anchors at its top instead.
         let active = self.target_idx();
-        let (mut start, mut end) = (active, active + 1);
-        while start > 0 && ai_window_rows(start - 1..end) <= rows {
+        let anchor = if bounds.contains(&active) {
+            active
+        } else {
+            bounds.start
+        };
+        let (mut start, mut end) = (anchor, anchor + 1);
+        while start > bounds.start && ai_window_rows(start - 1..end) <= rows {
             start -= 1;
         }
-        while end < total && ai_window_rows(start..end + 1) <= rows {
+        while end < bounds.end && ai_window_rows(start..end + 1) <= rows {
             end += 1;
         }
         start..end
@@ -3380,12 +3454,15 @@ impl SettingsScreen {
                 AiSettingsSelection::Save => self.save_ai_settings(),
             },
             KeyCode::Char(' ') => {
+                // Shift walks the same ladder backwards, so a value overshot
+                // by one press costs one press to get back to.
+                let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
                 match editor.selection {
                     AiSettingsSelection::Rect(_) if editor.field == AiSettingsField::Thinking => {
-                        self.ai_settings_cycle_thinking();
+                        self.ai_settings_cycle_thinking(forward);
                     }
                     AiSettingsSelection::Rect(_) if editor.field == AiSettingsField::Harness => {
-                        if let Some(toast) = self.ai_settings_cycle_harness() {
+                        if let Some(toast) = self.ai_settings_cycle_harness(forward) {
                             return toast;
                         }
                     }
@@ -3637,7 +3714,7 @@ impl SettingsScreen {
         true
     }
 
-    fn ai_settings_cycle_thinking(&mut self) {
+    fn ai_settings_cycle_thinking(&mut self, forward: bool) {
         let (idx, pair, current, harness) = {
             let Some(editor) = self.ai_settings_editor.as_ref() else {
                 return;
@@ -3660,9 +3737,11 @@ impl SettingsScreen {
         if ladder.is_empty() {
             return;
         }
+        let count = reasoning_level_count(&ladder);
+        let step = if forward { 1 } else { count - 1 };
         let next = reasoning_level_at(
             &ladder,
-            (reasoning_level_index(&ladder, &current) + 1) % reasoning_level_count(&ladder),
+            (reasoning_level_index(&ladder, &current) + step) % count,
         )
         .unwrap_or_default();
         let Some(editor) = self.ai_settings_editor.as_mut() else {
@@ -3675,12 +3754,13 @@ impl SettingsScreen {
         }
     }
 
-    /// Cycles the focused slot's harness to the next value its model's
-    /// provider supports (`openai/*` → opencode/codex, `anthropic/*` →
-    /// opencode/claude-code, anything else → opencode only). Returns a toast
-    /// action when the provider doesn't support any alternative, so the
-    /// no-op is explained instead of silently doing nothing.
-    fn ai_settings_cycle_harness(&mut self) -> Option<SettingsAction> {
+    /// Cycles the focused slot's harness to the next (`forward`) or previous
+    /// value its model's provider supports (`openai/*` → opencode/codex,
+    /// `anthropic/*` → opencode/claude-code, anything else → opencode only).
+    /// Returns a toast action when the provider doesn't support any
+    /// alternative, so the no-op is explained instead of silently doing
+    /// nothing.
+    fn ai_settings_cycle_harness(&mut self, forward: bool) -> Option<SettingsAction> {
         let (idx, model, harness, thinking) = {
             let editor = self.ai_settings_editor.as_ref()?;
             let AiSettingsSelection::Rect(idx) = editor.selection else {
@@ -3702,10 +3782,11 @@ impl SettingsScreen {
                     .to_string(),
             ));
         }
+        let step = if forward { 1 } else { accepted.len() - 1 };
         let next = accepted
             .iter()
             .position(|candidate| *candidate == harness)
-            .map(|i| accepted[(i + 1) % accepted.len()])
+            .map(|i| accepted[(i + step) % accepted.len()])
             .unwrap_or(AiHarness::OpenCode);
         let ladder = self.ai_thinking_ladder(next, &model);
         let thinking = if ladder.iter().any(|level| level == &thinking) {
@@ -3947,7 +4028,14 @@ impl SettingsScreen {
         // Title + description + slot rectangles (3 rows each) + hint rows
         // + the two border rows of every command group box + chip row
         // + chip hint + spacer + Save button (3 rows) + footer hint.
-        let slots = ai_window_rows(0..AiSlot::ALL.len());
+        //
+        // Asks for the two-column height: the width isn't known here, and a
+        // terminal too narrow for two columns is already one that scrolls.
+        let slots = ai_column_bounds()
+            .into_iter()
+            .map(ai_window_rows)
+            .max()
+            .unwrap_or(0);
         2 + slots + 2 + 1 + 3 + 1
     }
 
@@ -4842,19 +4930,58 @@ impl SettingsScreen {
         );
 
         let slot_area = chunks[2];
-        let visible_range = editor.visible_range(slot_area.height);
-        let hidden_above = visible_range.start;
-        let hidden_below = AiSlot::ALL.len().saturating_sub(visible_range.end);
+        let columns = ai_column_areas(slot_area);
+        // One column owns every slot; two split them between the columns.
+        let bounds: Vec<Range<usize>> = if columns.len() == 2 {
+            ai_column_bounds().to_vec()
+        } else {
+            std::iter::once(0..AiSlot::ALL.len()).collect()
+        };
+
+        let mut hidden_above = 0;
+        let mut hidden_below = 0;
+        for (column, bound) in columns.iter().zip(bounds) {
+            let visible = editor.visible_range(bound.clone(), column.height);
+            hidden_above += visible.start - bound.start;
+            hidden_below += bound.end - visible.end;
+            self.render_ai_slot_column(frame, *column, editor, visible);
+        }
         let is_scrollable = hidden_above > 0 || hidden_below > 0;
 
-        let group_width = slot_area.width.min(AI_GROUP_MAX_WIDTH);
-        let group_x = slot_area.x + (slot_area.width - group_width) / 2;
-        let mut group_y = slot_area.y;
-        for (group, slots) in ai_visible_groups(visible_range) {
+        if is_scrollable {
+            self.render_scroll_indicator(frame, chunks[3], hidden_above, hidden_below);
+        }
+
+        self.render_ai_settings_free_models(frame, chunks[4], chunks[5]);
+
+        self.render_ai_settings_save_button(frame, chunks[6], editor);
+
+        let on_chips = matches!(editor.selection, AiSettingsSelection::FreeModels(_));
+        let hint = if on_chips {
+            "← → cycle chips • Enter stages into ✎﹏ command • Tab/⇧Tab change zone • Esc back to Dashboard"
+        } else if is_scrollable {
+            "▲/▼ scroll • ← → choose field • Space/⇧Space change value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
+        } else {
+            "↑↓ move • ← → choose field • Space/⇧Space change value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
+        };
+        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
+    }
+
+    /// Stack one column's visible slots, boxed by command, from the top of
+    /// `area` down. `area` is exactly one group box wide.
+    fn render_ai_slot_column(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        editor: &AiSettingsEditor,
+        visible: Range<usize>,
+    ) {
+        let mut group_y = area.y;
+        for (group, slots) in ai_visible_groups(visible) {
             let group_area = Rect {
-                x: group_x,
+                x: area.x,
                 y: group_y,
-                width: group_width,
+                width: area.width,
                 height: slots.len() as u16 * AI_SLOT_ROW_HEIGHT + 2,
             };
             self.render_ai_command_group(frame, group_area, group);
@@ -4878,24 +5005,6 @@ impl SettingsScreen {
             }
             group_y += group_area.height;
         }
-
-        if is_scrollable {
-            self.render_scroll_indicator(frame, chunks[3], hidden_above, hidden_below);
-        }
-
-        self.render_ai_settings_free_models(frame, chunks[4], chunks[5]);
-
-        self.render_ai_settings_save_button(frame, chunks[6], editor);
-
-        let on_chips = matches!(editor.selection, AiSettingsSelection::FreeModels(_));
-        let hint = if on_chips {
-            "← → cycle chips • Enter stages into ✎﹏ command • Tab/⇧Tab change zone • Esc back to Dashboard"
-        } else if is_scrollable {
-            "▲/▼ scroll • ← → choose field • Space change value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
-        } else {
-            "↑↓ move • ← → choose field • Space change value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
-        };
-        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
     }
 
     /// The rounded box around one PR command's slots, bordered and titled
@@ -6517,7 +6626,11 @@ mod tests {
     use ratatui::Terminal;
 
     fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     fn focus_ai(screen: &mut SettingsScreen) {
@@ -6870,6 +6983,68 @@ mod tests {
         assert_eq!(slot_thinking(&screen), "");
     }
 
+    /// Shift+Space walks the thinking ladder the other way, so overshooting
+    /// a level costs one press to undo rather than a full lap.
+    #[test]
+    fn shift_space_cycles_thinking_backwards() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 1);
+        set_slot_model(&mut screen, 1, "opencode-go/glm-5.2");
+        screen.set_ai_model_variants(std::collections::HashMap::from([(
+            "opencode-go/glm-5.2".to_string(),
+            vec!["high".to_string(), "max".to_string()],
+        )]));
+
+        let slot_thinking = |s: &SettingsScreen| {
+            AiSlot::ALL[1]
+                .get(&s.ai_settings_editor.as_ref().unwrap().ai)
+                .thinking
+                .clone()
+        };
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+
+        // Two presses forward, then two back, retracing the same ladder.
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
+        assert_eq!(slot_thinking(&screen), "max");
+        let _ = screen.handle_ai_settings(shift_key(KeyCode::Char(' ')));
+        assert_eq!(slot_thinking(&screen), "high");
+        let _ = screen.handle_ai_settings(shift_key(KeyCode::Char(' ')));
+        assert_eq!(slot_thinking(&screen), "");
+        // And wraps the other way round the ladder's end.
+        let _ = screen.handle_ai_settings(shift_key(KeyCode::Char(' ')));
+        assert_eq!(slot_thinking(&screen), "max");
+    }
+
+    /// The harness field cycles both ways too, over whatever its provider
+    /// accepts.
+    #[test]
+    fn shift_space_cycles_harness_backwards() {
+        let mut screen = ai_settings_screen(vec![]);
+        focus_ai_slot(&mut screen, 1);
+        set_slot_model(&mut screen, 1, "openai/gpt-5.6-sol");
+
+        let slot_harness = |s: &SettingsScreen| {
+            AiSlot::ALL[1]
+                .get(&s.ai_settings_editor.as_ref().unwrap().ai)
+                .harness
+        };
+        // Move the cursor onto the harness field (model → thinking → harness).
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+        let _ = screen.handle_ai_settings(key(KeyCode::Right));
+
+        let start = slot_harness(&screen);
+        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
+        let forward = slot_harness(&screen);
+        assert_ne!(forward, start, "Space should have changed the harness");
+        let _ = screen.handle_ai_settings(shift_key(KeyCode::Char(' ')));
+        assert_eq!(
+            slot_harness(&screen),
+            start,
+            "Shift+Space should have stepped back to where Space started"
+        );
+    }
+
     #[test]
     fn arrows_are_inert_for_models_with_no_reasoning_variants() {
         // Kimi is reasoning-capable on models.dev but opencode exposes no
@@ -7180,15 +7355,31 @@ mod tests {
         assert_eq!(next, AiSlot::ALL.len());
     }
 
+    /// Column the given box title starts at, by terminal column rather than
+    /// byte offset — the rows are full of multi-byte box-drawing glyphs, and
+    /// with two columns a single row can hold two boxes.
+    fn title_column(rows: &[String], title: &str) -> usize {
+        let needle: Vec<char> = title.chars().collect();
+        rows.iter()
+            .find_map(|row| {
+                let columns: Vec<char> = row.chars().collect();
+                columns
+                    .windows(needle.len())
+                    .position(|window| window == needle.as_slice())
+            })
+            .unwrap_or_else(|| panic!("box titled '{title}' missing from the render"))
+    }
+
     /// The slots of one PR command share a box titled with the command name,
     /// and that box is narrower than the terminal and centered rather than
     /// spanning it edge to edge.
     #[test]
     fn ai_settings_wraps_one_command_slots_in_a_centered_box() {
+        // Too narrow for two columns, so everything stacks in one.
         let screen = ai_settings_screen(vec![]);
-        let buffer = render_buffer(&screen, 140, 85);
+        let buffer = render_buffer(&screen, 110, 85);
         let rows = buffer_rows(&buffer);
-        let box_x = (140 - AI_GROUP_MAX_WIDTH) / 2;
+        let box_x = (110 - AI_GROUP_MAX_WIDTH) / 2;
 
         let strong_y = rows
             .iter()
@@ -7230,9 +7421,9 @@ mod tests {
     #[test]
     fn ai_settings_borders_each_command_group_in_its_own_color() {
         let screen = ai_settings_screen(vec![]);
-        let buffer = render_buffer(&screen, 140, 85);
+        let buffer = render_buffer(&screen, 110, 85);
         let rows = buffer_rows(&buffer);
-        let box_x = (140 - AI_GROUP_MAX_WIDTH) / 2;
+        let box_x = (110 - AI_GROUP_MAX_WIDTH) / 2;
 
         for (label, color) in [
             ("explain", colors::BRAND),
@@ -7253,6 +7444,78 @@ mod tests {
                 "slot '{label}' is not inside a box bordered in its command's color"
             );
         }
+    }
+
+    /// The split between the two columns lands where their heights are
+    /// closest, so neither column is left with a long tail the other has room
+    /// for.
+    #[test]
+    fn ai_columns_are_split_to_balance_their_heights() {
+        let [left, right] = ai_column_bounds();
+        assert!(!left.is_empty() && !right.is_empty());
+        assert_eq!(left.end, right.start, "columns must not skip a slot");
+        assert_eq!(right.end, AiSlot::ALL.len());
+        assert!(
+            ai_window_rows(left).abs_diff(ai_window_rows(right)) <= AI_SLOT_ROW_HEIGHT,
+            "columns differ by more than a slot's worth of rows"
+        );
+    }
+
+    /// On a wide terminal every command is on screen at once: the later
+    /// commands move into a second column instead of below the fold.
+    #[test]
+    fn ai_settings_wide_terminal_shows_every_command_in_two_columns() {
+        let screen = ai_settings_screen(vec![]);
+        let rows = buffer_rows(&render_buffer(&screen, 200, 50));
+
+        for slot in AiSlot::ALL {
+            assert!(
+                rows.iter().any(|row| row.contains(slot.label())),
+                "slot '{}' is missing — it should not need scrolling here",
+                slot.label()
+            );
+        }
+        assert!(!rows.iter().any(|row| row.contains("above")));
+        assert!(!rows.iter().any(|row| row.contains("below")));
+
+        // Explain/Fix/Review/Update share the left column; Bugkill/Develop/
+        // Split share the right one.
+        let left = title_column(&rows, "╭ Explain ");
+        let right = title_column(&rows, "╭ Bugkill ");
+        assert!(right > left, "the second column must sit to the right");
+        for title in ["╭ Fix ", "╭ Review ", "╭ Update "] {
+            assert_eq!(
+                title_column(&rows, title),
+                left,
+                "'{title}' left its column"
+            );
+        }
+        for title in ["╭ Develop ", "╭ Split "] {
+            assert_eq!(
+                title_column(&rows, title),
+                right,
+                "'{title}' left its column"
+            );
+        }
+    }
+
+    /// A single column must itself be wide enough for the longest hint,
+    /// otherwise no layout renders one whole.
+    #[test]
+    fn ai_group_box_fits_the_longest_hint() {
+        assert!(AI_GROUP_MAX_WIDTH >= ai_min_column_width());
+    }
+
+    /// Below the width two readable columns need, everything falls back into
+    /// a single column rather than being squeezed.
+    #[test]
+    fn ai_settings_narrow_terminal_falls_back_to_one_column() {
+        let screen = ai_settings_screen(vec![]);
+        let rows = buffer_rows(&render_buffer(&screen, 110, 85));
+        assert_eq!(
+            title_column(&rows, "╭ Split "),
+            title_column(&rows, "╭ Explain "),
+        );
     }
 
     #[test]
