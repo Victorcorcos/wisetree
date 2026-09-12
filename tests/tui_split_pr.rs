@@ -169,20 +169,27 @@ fn overview_names_the_full_sequence_roles_max_and_new_top_pr() {
         "Split heading/modal should use its own color"
     );
     for expected in [
-        "Deterministically revalidate",
-        "SRP plan",
-        "Approve/Reject loop",
+        "Will run:",
+        "Revalidate the worktree",
+        "SRP stack",
+        "Approve or reject the plan",
         "local branches and worktrees",
-        "MAX is a guideline",
+        "flag layers over",
         "gh stack link",
-        "drafting AI concurrently",
-        "Compose titles",
-        "Apply the final PR metadata",
-        "once per proposal",
-        "once per resulting PR (concurrently)",
-        "MAX is additions plus deletions, including tests",
-        "guideline, not a hard limit",
-        "MAX: 1000",
+        "concurrently",
+        "Apply the final metadata",
+        // Centered AI roles table, one row per configured role.
+        "Role",
+        "Thinking",
+        "Harness",
+        "Permission",
+        "openai/strong-planner",
+        "openai/fast-writer",
+        // MAX lives in the bordered `options` group as an editable field.
+        "options",
+        "MAX",
+        "1000",
+        "a guideline",
         "create a new top pull request",
     ] {
         assert!(text.contains(expected), "missing {expected:?}:\n{text}");
@@ -193,7 +200,8 @@ fn overview_names_the_full_sequence_roles_max_and_new_top_pr() {
 fn active_source_pr_is_shown_as_the_reused_top_pr() {
     let mut screen = SplitPullRequestScreen::new(request(Some(91)), config());
     let (text, _) = render(&mut screen, 120, 52);
-    assert!(text.contains("Top PR: reuse #91 — Large change"), "{text}");
+    assert!(text.contains("Top PR"), "{text}");
+    assert!(text.contains("reuse #91 — Large change"), "{text}");
     assert!(
         text.contains("https://github.com/acme/repo/pull/91"),
         "{text}"
@@ -229,7 +237,7 @@ fn missing_model_is_readable_and_confirmation_fails_safely() {
     cfg.plan.model = "  ".into();
     let mut screen = SplitPullRequestScreen::new(request(None), cfg);
     let (text, _) = render(&mut screen, 100, 48);
-    assert!(text.contains("plan: (not configured)"), "{text}");
+    assert!(text.contains("(not configured)"), "{text}");
 
     focus_confirm(&mut screen);
     assert_eq!(
@@ -263,18 +271,62 @@ fn confirm_hands_validated_max_to_preflight_and_cancel_stays_mutation_free() {
 }
 
 #[test]
-fn narrow_terminal_can_scroll_from_overview_to_roles_and_max() {
+fn confirm_page_fits_details_roles_max_and_buttons_on_a_small_terminal() {
     let mut screen = SplitPullRequestScreen::new(request(None), config());
-    let (top, _) = render(&mut screen, 44, 24);
-    assert!(top.contains("Split this branch"), "{top}");
-    screen.handle_key(key(KeyCode::End));
-    let (bottom, _) = render(&mut screen, 44, 24);
-    assert!(bottom.contains("MAX: 1000"), "{bottom}");
-    screen.handle_key(key(KeyCode::PageUp));
-    let (roles, _) = render(&mut screen, 44, 24);
-    assert!(roles.contains("openai/fast-writer"), "{roles}");
-    assert!(bottom.contains("Confirm"), "{bottom}");
-    assert!(bottom.contains("Cancel"), "{bottom}");
+    let (text, _) = render(&mut screen, 80, 40);
+    for expected in [
+        "Split this branch",
+        "Branch",
+        "Will run:",
+        "openai/fast-writer",
+        "options",
+        "MAX",
+        "1000",
+        "Confirm",
+        "Cancel",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+    }
+}
+
+#[test]
+fn max_field_is_typed_in_place_and_only_takes_digits() {
+    let mut screen = SplitPullRequestScreen::new(request(None), config());
+    for _ in 0..4 {
+        screen.handle_key(key(KeyCode::Backspace));
+    }
+    assert_eq!(screen.max_input(), "");
+    for code in [
+        KeyCode::Char('2'),
+        KeyCode::Char('x'),
+        KeyCode::Char('5'),
+        KeyCode::Char('0'),
+    ] {
+        screen.handle_key(key(code));
+    }
+    assert_eq!(screen.max_input(), "250");
+
+    let (text, _) = render(&mut screen, 100, 40);
+    assert!(text.contains("250"), "{text}");
+
+    focus_confirm(&mut screen);
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::Confirmed(250)
+    );
+}
+
+#[test]
+fn an_empty_max_reports_the_problem_inside_the_options_group() {
+    let mut screen = SplitPullRequestScreen::new(request(None), config());
+    screen.set_max_input("");
+    focus_confirm(&mut screen);
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        SplitAction::Continue
+    );
+    let (text, _) = render(&mut screen, 100, 40);
+    assert!(text.contains("MAX must be a positive integer"), "{text}");
 }
 
 #[test]

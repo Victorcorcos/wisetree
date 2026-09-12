@@ -324,8 +324,9 @@ impl<'a> PrConfirmView<'a> {
         height
     }
 
-    /// Draw the full confirm panel into `area`.
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    /// The vertical slots this view lays `area` out into: one per section, in
+    /// render order, each preceded by its blank separator.
+    fn section_areas(&self, area: Rect) -> std::rc::Rc<[Rect]> {
         let table_height = self.ai_table_height();
 
         let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
@@ -347,10 +348,31 @@ impl<'a> PrConfirmView<'a> {
         }
         constraints.push(Constraint::Min(0));
 
-        let chunks = Layout::default()
+        Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
-            .split(area);
+            .split(area)
+    }
+
+    /// Where the options block lands inside `area`, so a screen with an
+    /// interactive option (Split's `MAX` field) can hit-test mouse clicks
+    /// against the same rows this view draws.
+    pub fn options_area(&self, area: Rect) -> Option<Rect> {
+        self.options.as_ref()?;
+        let chunks = self.section_areas(area);
+        // Sections are `[blank, content]` pairs after the title; options come
+        // after every text block and the AI table.
+        let mut idx = 1 + self.blocks.len() * 2;
+        if self.ai_table_height() > 0 {
+            idx += 2;
+        }
+        chunks.get(idx + 1).copied()
+    }
+
+    /// Draw the full confirm panel into `area`.
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let table_height = self.ai_table_height();
+        let chunks = self.section_areas(area);
 
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

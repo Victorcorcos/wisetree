@@ -1,7 +1,10 @@
-//! Grouped checkbox options panel.
+//! Grouped options panel.
 //!
-//! Renders a bordered block titled `options` containing one or more checkbox
-//! rows. Each row shows a ☒/☐ glyph, an option name, and a short explanation.
+//! Renders a bordered block titled `options` containing one or more rows. A
+//! checkbox row shows a ☒/☐ glyph, an option name, and a short explanation; a
+//! value row (Split's `MAX`) swaps the glyph for the current value in an
+//! editable chip. An optional error line under the rows carries validation
+//! feedback for those values.
 //! The design follows the `worktreeLinkPatterns` group from the Link Patterns
 //! settings page: a plain bordered block with a teal title, but the option rows
 //! use the gray palette so they read as secondary configuration rather than
@@ -15,12 +18,16 @@ use ratatui::Frame;
 
 use crate::messages::colors;
 
-/// One checkbox row inside an [`OptionsGroup`].
+/// One row inside an [`OptionsGroup`]: either a checkbox toggle or an
+/// editable value field (e.g. Split's `MAX` review-size guideline).
 #[derive(Debug, Clone)]
 pub struct OptionsGroupItem {
     pub checked: bool,
     pub label: String,
     pub description: String,
+    /// `Some` turns the row into a value field: the ☒/☐ glyph is replaced by
+    /// the value rendered as an editable chip.
+    pub value: Option<String>,
 }
 
 impl OptionsGroupItem {
@@ -29,6 +36,23 @@ impl OptionsGroupItem {
             checked,
             label: label.into(),
             description: description.into(),
+            value: None,
+        }
+    }
+
+    /// A row whose option is a typed value rather than a toggle. The value is
+    /// drawn as a chip after the label, and gains a caret while the row is the
+    /// focused one.
+    pub fn value(
+        label: impl Into<String>,
+        value: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            checked: false,
+            label: label.into(),
+            description: description.into(),
+            value: Some(value.into()),
         }
     }
 }
@@ -42,6 +66,8 @@ pub struct OptionsGroup {
     items: Vec<OptionsGroupItem>,
     focused_index: Option<usize>,
     hint: Option<String>,
+    hint_key: String,
+    error: Option<String>,
 }
 
 impl OptionsGroup {
@@ -52,6 +78,8 @@ impl OptionsGroup {
             items,
             focused_index: None,
             hint: None,
+            hint_key: "Space".to_string(),
+            error: None,
         }
     }
 
@@ -69,10 +97,28 @@ impl OptionsGroup {
         self
     }
 
+    /// Replace the key named in front of the hint. Defaults to `Space`, which
+    /// is what toggles a checkbox; a value field names the keys that edit it.
+    pub fn with_hint_key(mut self, key: impl Into<String>) -> Self {
+        self.hint_key = key.into();
+        self
+    }
+
+    /// Show a validation message under the rows, in the error color. Use it
+    /// for value fields whose current content cannot be accepted (e.g. a
+    /// non-numeric `MAX`), so the complaint sits next to the field it is about.
+    pub fn with_error(mut self, error: Option<String>) -> Self {
+        self.error = error;
+        self
+    }
+
     /// Rows the group needs inside the parent layout, including the bordered
     /// block. Callers still add any blank separators they want around it.
     pub fn content_height(&self) -> u16 {
         let mut height = self.items.len() as u16 + 2; // rows + top/bottom border
+        if self.error.is_some() {
+            height += 1;
+        }
         if self.hint.is_some() {
             height += 2; // blank separator + hint line
         }
@@ -113,6 +159,9 @@ impl OptionsGroup {
 
         let mut constraints: Vec<Constraint> =
             self.items.iter().map(|_| Constraint::Length(1)).collect();
+        if self.error.is_some() {
+            constraints.push(Constraint::Length(1)); // error
+        }
         if self.hint.is_some() {
             constraints.push(Constraint::Length(1)); // blank
             constraints.push(Constraint::Length(1)); // hint
@@ -132,12 +181,27 @@ impl OptionsGroup {
             }
         }
 
+        if let Some(error) = self.error.as_ref() {
+            if let Some(chunk) = chunks.get(self.items.len()) {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("  {error}"),
+                        Style::default().fg(colors::ERROR),
+                    ))),
+                    *chunk,
+                );
+            }
+        }
+
         if let Some(hint) = self.hint.as_ref() {
-            let hint_idx = self.items.len() + 1;
+            let hint_idx = self.items.len() + usize::from(self.error.is_some()) + 1;
             if let Some(chunk) = chunks.get(hint_idx) {
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
-                        Span::styled("Space ", Style::default().fg(colors::GRAY_MEDIUM)),
+                        Span::styled(
+                            format!("{} ", self.hint_key),
+                            Style::default().fg(colors::GRAY_MEDIUM),
+                        ),
                         Span::styled(
                             hint.clone(),
                             Style::default()
@@ -166,6 +230,10 @@ fn build_option_line(item: &OptionsGroupItem, focused: bool) -> Line<'static> {
         Span::styled("  ", Style::default())
     };
 
+    if let Some(value) = item.value.as_ref() {
+        return build_value_line(item, value, focused, marker);
+    }
+
     let checkbox = if item.checked {
         Span::styled(
             "☒ ",
@@ -190,6 +258,43 @@ fn build_option_line(item: &OptionsGroupItem, focused: bool) -> Line<'static> {
     );
 
     Line::from(vec![marker, checkbox, label, description])
+}
+
+/// Render a value field row: `▸ MAX  1000 ▏ — description`. The value sits in
+/// a chip so it reads as editable text rather than a printed setting; while the
+/// row is focused the chip lights up and grows a caret.
+fn build_value_line(
+    item: &OptionsGroupItem,
+    value: &str,
+    focused: bool,
+    marker: Span<'static>,
+) -> Line<'static> {
+    let label = Span::styled(
+        format!("{} ", item.label),
+        Style::default()
+            .fg(colors::GRAY_LIGHT)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let chip_style = if focused {
+        Style::default()
+            .fg(colors::WHITE)
+            .bg(colors::BG_FOCUS)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(colors::ACCENT).bg(colors::CODE_BG)
+    };
+    let chip = Span::styled(
+        format!(" {value}{} ", if focused { "▏" } else { "" }),
+        chip_style,
+    );
+
+    let description = Span::styled(
+        format!(" — {}", item.description),
+        Style::default().fg(colors::GRAY_DARK),
+    );
+
+    Line::from(vec![marker, label, chip, description])
 }
 
 #[cfg(test)]
@@ -265,6 +370,43 @@ mod tests {
         let dump = render(&group, 80, 8);
         assert!(dump.contains("Space"), "expected Space hint in:\n{dump}");
         assert!(dump.contains("Toggle"), "expected hint text in:\n{dump}");
+    }
+
+    #[test]
+    fn value_row_shows_the_value_as_an_editable_chip() {
+        let group = OptionsGroup::new(vec![OptionsGroupItem::value(
+            "MAX",
+            "1000",
+            "changed lines per pull request",
+        )])
+        .with_focused_index(Some(0));
+        let dump = render(&group, 80, 6);
+        assert!(dump.contains("MAX"), "expected label in:\n{dump}");
+        assert!(dump.contains("1000"), "expected value in:\n{dump}");
+        assert!(
+            dump.contains("▏"),
+            "expected caret while focused in:\n{dump}"
+        );
+        assert!(
+            !dump.contains("☐") && !dump.contains("☒"),
+            "value rows have no checkbox:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn error_replaces_nothing_and_sits_above_the_hint() {
+        let group = OptionsGroup::new(vec![OptionsGroupItem::value("MAX", "", "guideline")])
+            .with_error(Some("MAX must be a positive integer.".to_string()))
+            .with_hint_key("0-9")
+            .with_hint("edits MAX");
+        let dump = render(&group, 80, 8);
+        assert!(
+            dump.contains("MAX must be a positive integer."),
+            "expected error in:\n{dump}"
+        );
+        assert!(dump.contains("0-9 edits MAX"), "expected hint in:\n{dump}");
+        // rows + error + blank + hint + both borders
+        assert_eq!(group.content_height(), 6);
     }
 
     #[test]

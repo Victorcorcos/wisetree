@@ -22,11 +22,15 @@ use crate::services::{
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::screens::update_pr::key_event_to_pty_bytes;
 use crate::tui::widgets::{
-    spinner_frame, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome,
-    InputPrompt, PtyView,
+    labeled_line, labeled_spans, spinner_frame, AiRoleRow, ConfirmationChoice, ConfirmationModal,
+    ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup, OptionsGroupItem, PrConfirmView,
+    PtyView,
 };
 
 const DEFAULT_MAX: &str = "1000";
+/// Widest `MAX` a reviewer could plausibly mean; also keeps the field from
+/// growing past the option row it lives in.
+const MAX_INPUT_DIGITS: usize = 9;
 const PTY_PAGE_UP: &[u8] = b"\x1b[5~";
 const PTY_PAGE_DOWN: &[u8] = b"\x1b[6~";
 
@@ -428,22 +432,6 @@ impl SplitPullRequestScreen {
         }
         match key.code {
             KeyCode::Esc => return SplitAction::Cancelled,
-            KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_sub(5);
-                return SplitAction::Continue;
-            }
-            KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(5).min(self.max_scroll.get());
-                return SplitAction::Continue;
-            }
-            KeyCode::Home => {
-                self.scroll = 0;
-                return SplitAction::Continue;
-            }
-            KeyCode::End => {
-                self.scroll = self.max_scroll.get();
-                return SplitAction::Continue;
-            }
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
                 self.focus = match self.focus {
                     SplitFocus::Max => SplitFocus::Buttons,
@@ -456,8 +444,12 @@ impl SplitPullRequestScreen {
 
         if self.focus == SplitFocus::Max {
             match key.code {
-                KeyCode::Char(character) => {
-                    self.max_input.push(character);
+                // The field only ever holds a positive line count, so digits
+                // are the only characters worth accepting.
+                KeyCode::Char(character) if character.is_ascii_digit() => {
+                    if self.max_input.len() < MAX_INPUT_DIGITS {
+                        self.max_input.push(character);
+                    }
                     self.error = None;
                 }
                 KeyCode::Backspace | KeyCode::Delete => {
@@ -1296,157 +1288,143 @@ impl SplitPullRequestScreen {
         );
     }
 
+    /// The Split entry page now shares the PR-command confirm layout used by
+    /// Bugkill/Improve: title, labeled details, numbered `Will run:` preview,
+    /// the centered AI roles table, the `options` group holding the editable
+    /// `MAX` field, and the confirmation modal.
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
-        let modal_height = 12.min(area.height.saturating_sub(1));
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(modal_height)])
-            .split(area);
-        let width = chunks[0].width.saturating_sub(2).max(1) as usize;
-        let lines = self.confirm_lines(width);
-        let max_scroll = (lines.len() as u16).saturating_sub(chunks[0].height);
-        self.max_scroll.set(max_scroll);
-        let scroll = self.scroll.min(max_scroll);
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), chunks[0]);
-
-        let visible_max_line = self.max_line_index(width) as u16;
+        let view = self.confirm_view();
         self.max_rect.set(
-            if visible_max_line >= scroll
-                && visible_max_line < scroll.saturating_add(chunks[0].height)
-            {
-                Rect::new(
-                    chunks[0].x,
-                    chunks[0].y + visible_max_line - scroll,
-                    chunks[0].width,
-                    1,
-                )
-            } else {
-                Rect::default()
-            },
+            view.options_area(area)
+                .map(|options| Rect::new(options.x, options.y + 1, options.width, 1))
+                .unwrap_or_default(),
         );
-        self.confirm.render(frame, chunks[1]);
+        view.render(frame, area);
     }
 
-    fn confirm_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled(
-            "Split this branch into stacked pull requests?",
-            Style::default()
-                .fg(colors::SPLIT)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::default());
-        push_wrapped(
-            &mut lines,
-            &format!("Branch: {}", self.request.branch),
-            width,
-        );
-        push_wrapped(
-            &mut lines,
-            &format!("Worktree: {}", self.request.worktree_path),
-            width,
-        );
-        push_wrapped(
-            &mut lines,
-            &format!(
-                "Base context: {}{}",
-                self.request.base_ref.as_deref().unwrap_or("(not resolved)"),
+    fn confirm_view(&self) -> PrConfirmView<'_> {
+        PrConfirmView::new("Split this branch into stacked pull requests?")
+            .title_color(colors::SPLIT)
+            .block(self.detail_lines())
+            .steps(&[
+                "Revalidate the worktree, base, committed diff, and source pull request.",
+                "Plan an SRP stack with the planning AI in an embedded terminal (`Tab` focuses it).",
+                "Approve or reject the plan; rejection feedback regenerates one proposal.",
+                "Materialize the stack as local branches and worktrees, then advance the source branch.",
+                "Verify every parent-to-child diff and flag layers over `MAX` instead of splitting them.",
+                "Publish the stack with `gh stack link`, reusing the active pull request as the top PR.",
+                "Draft a title and description for every resulting pull request, concurrently.",
+                "Apply the final metadata and report each branch, worktree, and pull request.",
+            ])
+            .ai_roles(vec![
+                AiRoleRow::from_config("plan", colors::SPLIT, &named_model(&self.ai.plan), "Edit files"),
+                AiRoleRow::from_config("open", colors::PINK, &named_model(&self.ai.open), "Edit files"),
+            ])
+            .options(Some(
+                OptionsGroup::new(vec![OptionsGroupItem::value(
+                    "MAX",
+                    &self.max_input,
+                    "changed lines per pull request (adds + deletes, tests included); a guideline, \
+                     never a hard limit",
+                )])
+                .with_focused_index((self.focus == SplitFocus::Max).then_some(0))
+                .with_error(self.error.clone())
+                .with_hint_key("0-9")
+                .with_hint("edits MAX · Tab moves to Confirm / Cancel"),
+            ))
+            .modal(Some(&self.confirm))
+    }
+
+    fn detail_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![labeled_line(
+            "Branch",
+            Span::styled(
+                self.request.branch.clone(),
+                Style::default()
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None,
+        )];
+        lines.push(labeled_line(
+            "Worktree",
+            Span::styled(
+                self.request.worktree_path.clone(),
+                Style::default().fg(colors::EMPHASIS),
+            ),
+            None,
+        ));
+        lines.push(labeled_line(
+            "Base ref",
+            Span::styled(
                 self.request
-                    .pr_base_ref
-                    .as_deref()
-                    .map(|base| format!(" (GitHub base: {base})"))
-                    .unwrap_or_default()
+                    .base_ref
+                    .clone()
+                    .unwrap_or_else(|| "(not resolved)".to_string()),
+                Style::default().fg(colors::EMPHASIS),
             ),
-            width,
-        );
-        let top_pr = match (
-            self.request.number,
-            self.request.title.as_deref(),
-            self.request.url.as_deref(),
-        ) {
-            (Some(number), title, url) => format!(
-                "Top PR: reuse #{}{}{}",
-                number,
-                title.map(|value| format!(" — {value}")).unwrap_or_default(),
-                url.map(|value| format!(" ({value})")).unwrap_or_default()
+            self.request.pr_base_ref.as_deref().map(|base| {
+                Span::styled(
+                    format!("  GitHub base: {base}"),
+                    Style::default()
+                        .fg(colors::MUTED)
+                        .add_modifier(Modifier::DIM),
+                )
+            }),
+        ));
+        lines.push(match self.request.number {
+            Some(number) => labeled_spans(
+                "Top PR",
+                vec![
+                    Span::styled(
+                        format!("reuse #{number}"),
+                        Style::default()
+                            .fg(colors::INFO)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        self.request
+                            .title
+                            .as_deref()
+                            .map(|title| format!(" — {title}"))
+                            .unwrap_or_default(),
+                        Style::default().fg(colors::WHITE),
+                    ),
+                    Span::styled(
+                        self.request
+                            .url
+                            .as_deref()
+                            .map(|url| format!("  {url}"))
+                            .unwrap_or_default(),
+                        Style::default()
+                            .fg(colors::MUTED)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                ],
             ),
-            _ => "Top PR: create a new top pull request for this branch".to_string(),
-        };
-        push_wrapped(&mut lines, &top_pr, width);
-        lines.push(Line::default());
-        lines.push(section_line("Complete sequence before mutation"));
-        for (index, step) in [
-            "Deterministically revalidate the live worktree, base, committed diff, and source PR.",
-            "Run the planning AI in an embedded terminal (Tab focuses it) for an SRP plan organized by semantic responsibility.",
-            "Show the plan in an Approve/Reject loop; rejection feedback regenerates one proposal.",
-            "Materialize the approved stack as local branches and worktrees, then advance the source branch with a tree-preserving top-layer commit.",
-            "Verify every parent-to-child diff and check stack integrity (MAX is a guideline; oversized layers are flagged for you, never silently split).",
-            "Publish the stack with `gh stack link`, reusing the active source PR as the top PR when present.",
-            "Run the drafting AI concurrently once for each resulting pull request.",
-            "Compose titles, Split Plan links, descriptions, and suffixes deterministically.",
-            "Apply the final PR metadata and report every branch, worktree, and pull request.",
-        ]
-        .iter()
-        .enumerate()
-        {
-            push_wrapped(&mut lines, &format!("{}. {step}", index + 1), width);
-        }
-        lines.push(Line::default());
-        lines.push(section_line("AI roles"));
-        push_ai_role(
-            &mut lines,
-            "plan",
-            &self.ai.plan,
-            "once per proposal",
-            width,
-        );
-        push_ai_role(
-            &mut lines,
-            "open",
-            &self.ai.open,
-            "once per resulting PR (concurrently)",
-            width,
-        );
-        lines.push(Line::default());
-        lines.push(section_line("Review-size guideline"));
-        push_wrapped(
-            &mut lines,
-            "MAX is additions plus deletions, including tests, in each parent-to-child pull-request diff.",
-            width,
-        );
-        push_wrapped(
-            &mut lines,
-            "It is a guideline, not a hard limit: responsibilities are never split to fit. Any PR over MAX is flagged for review with its overflow and reason.",
-            width,
-        );
-        let max_style = if self.focus == SplitFocus::Max {
-            Style::default()
-                .fg(colors::SPLIT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(colors::EMPHASIS)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("MAX: {}", self.max_input),
-            max_style,
-        )));
-        if let Some(error) = &self.error {
-            push_wrapped_styled(&mut lines, error, width, Style::default().fg(colors::ERROR));
-        }
-        lines.push(Line::from(Span::styled(
-            "Tab/↑/↓ focus · PgUp/PgDn scroll · Esc cancel",
-            Style::default()
-                .fg(colors::MUTED)
-                .add_modifier(Modifier::DIM),
-        )));
+            None => labeled_line(
+                "Top PR",
+                Span::styled(
+                    "create a new top pull request for this branch".to_string(),
+                    Style::default().fg(colors::EMPHASIS),
+                ),
+                None,
+            ),
+        });
         lines
     }
+}
 
-    fn max_line_index(&self, width: usize) -> usize {
-        self.confirm_lines(width)
-            .iter()
-            .position(|line| line.to_string().starts_with("MAX:"))
-            .unwrap_or(0)
+/// An unset model would leave an empty cell in the roles table; spell out that
+/// it still needs configuring so the failed confirmation has a visible cause.
+fn named_model(config: &AiModelConfig) -> AiModelConfig {
+    if config.model.trim().is_empty() {
+        AiModelConfig {
+            model: "(not configured)".to_string(),
+            ..config.clone()
+        }
+    } else {
+        config.clone()
     }
 }
 
@@ -1457,33 +1435,6 @@ fn section_line(text: &str) -> Line<'static> {
             .fg(colors::SPLIT)
             .add_modifier(Modifier::BOLD),
     ))
-}
-
-fn push_ai_role(
-    lines: &mut Vec<Line<'static>>,
-    role: &str,
-    config: &AiModelConfig,
-    frequency: &str,
-    width: usize,
-) {
-    let model = if config.model.trim().is_empty() {
-        "(not configured)"
-    } else {
-        config.model.trim()
-    };
-    let thinking = if config.thinking.trim().is_empty() {
-        "default"
-    } else {
-        config.thinking.trim()
-    };
-    push_wrapped(
-        lines,
-        &format!(
-            "{role}: {model} · {thinking} thinking · {} · {frequency}",
-            config.harness.display_name()
-        ),
-        width,
-    );
 }
 
 fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
