@@ -5610,26 +5610,7 @@ impl DashboardService {
             .transpose()?
             .flatten();
         if !has_persisted_run {
-            let runner = self.ai_runner();
-            for (slot, config) in [
-                ("dashboard.ai.split.plan", &self.config.ai.split.plan),
-                ("dashboard.ai.split.open", &self.config.ai.split.open),
-            ] {
-                runner
-                    .preflight(&AiRunRequest {
-                        slot: slot.to_string(),
-                        config: config.clone(),
-                        prompt: String::new(),
-                        cwd: cwd.clone(),
-                        mode: AiRunMode::Captured,
-                        permission: AiPermission::Plan,
-                        timeout: Duration::from_secs(1),
-                        activity_limit: 1,
-                        session_title: None,
-                        attachments: Vec::new(),
-                    })
-                    .await?;
-            }
+            self.preflight_split_ai(&cwd).await?;
         }
         let status = run_command(
             &self.git_binary,
@@ -5697,16 +5678,7 @@ impl DashboardService {
             })?;
         }
         if !has_persisted_run {
-            if let Ok(output) =
-                run_command(&self.gh_binary, &["stack", "view", "--json"], Some(&cwd)).await
-            {
-                let trimmed = output.trim();
-                if !trimmed.is_empty() && !matches!(trimmed, "null" | "[]" | "{}") {
-                    return Err(WisetreeError::validation(
-                        "The source branch already belongs to an active GitHub stack. Unstack it or select an unstacked branch before using Split.",
-                    ));
-                }
-            }
+            self.ensure_split_source_unstacked(&cwd).await?;
         }
 
         let pr_metadata = if let Some(number) = request.pr_number {
@@ -5924,34 +5896,38 @@ impl DashboardService {
                 .and_then(|materialization| materialization.layers.last())
                 .filter(|layer| layer.branch == live_identity.source_branch)
                 .map(|layer| layer.commit_sha.as_str());
-            // A recorded run was planned under its own MAX, so a new one cannot
-            // be honored here. It is also the one mismatch the developer just
-            // caused by typing on the confirm screen — name it instead of
-            // reporting the generic "input no longer matches".
-            if live_identity.max != record.identity.max {
+            let source_head_matches = live_identity.source_head == record.identity.source_head
+                || materialized_head == Some(live_identity.source_head.as_str());
+            let input_matches = source_head_matches
+                && live_identity.repository == record.identity.repository
+                && live_identity.remote == record.identity.remote
+                && live_identity.base_ref == record.identity.base_ref
+                && live_identity.base_sha == record.identity.base_sha
+                && live_identity.source_branch == record.identity.source_branch
+                && live_identity.max == record.identity.max
+                && live_identity.additions == record.identity.additions
+                && live_identity.deletions == record.identity.deletions
+                && units == record.units;
+            if !input_matches
+                && record.status == "awaiting approval"
+                && persisted_materialization.is_none()
+            {
+                archive_stale_split_plan(&cwd, &record.identity.source_head).await?;
+                self.preflight_split_ai(&cwd).await?;
+                self.ensure_split_source_unstacked(&cwd).await?;
+                live_identity
+            } else if live_identity.max != record.identity.max {
                 return Err(WisetreeError::validation(format!(
                     "This worktree already has a Split run recorded with MAX {}. Finish it, or archive .wisetree/split_plan.md, before splitting again with MAX {}.",
                     record.identity.max, live_identity.max
                 )));
-            }
-            let source_head_matches = live_identity.source_head == record.identity.source_head
-                || materialized_head == Some(live_identity.source_head.as_str());
-            if !source_head_matches
-                || live_identity.repository != record.identity.repository
-                || live_identity.remote != record.identity.remote
-                || live_identity.base_ref != record.identity.base_ref
-                || live_identity.base_sha != record.identity.base_sha
-                || live_identity.source_branch != record.identity.source_branch
-                || live_identity.max != record.identity.max
-                || live_identity.additions != record.identity.additions
-                || live_identity.deletions != record.identity.deletions
-                || units != record.units
-            {
+            } else if !input_matches {
                 return Err(WisetreeError::validation(
                     "Persisted Split input no longer matches the live repository or harness-created top layer. Reconcile the recorded artifacts before retrying.",
                 ));
+            } else {
+                record.identity
             }
-            record.identity
         } else {
             live_identity
         };
@@ -5991,6 +5967,44 @@ impl DashboardService {
             identity,
             units,
         })
+    }
+
+    async fn preflight_split_ai(&self, cwd: &Path) -> Result<()> {
+        let runner = self.ai_runner();
+        for (slot, config) in [
+            ("dashboard.ai.split.plan", &self.config.ai.split.plan),
+            ("dashboard.ai.split.open", &self.config.ai.split.open),
+        ] {
+            runner
+                .preflight(&AiRunRequest {
+                    slot: slot.to_string(),
+                    config: config.clone(),
+                    prompt: String::new(),
+                    cwd: cwd.to_path_buf(),
+                    mode: AiRunMode::Captured,
+                    permission: AiPermission::Plan,
+                    timeout: Duration::from_secs(1),
+                    activity_limit: 1,
+                    session_title: None,
+                    attachments: Vec::new(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_split_source_unstacked(&self, cwd: &Path) -> Result<()> {
+        if let Ok(output) =
+            run_command(&self.gh_binary, &["stack", "view", "--json"], Some(cwd)).await
+        {
+            let trimmed = output.trim();
+            if !trimmed.is_empty() && !matches!(trimmed, "null" | "[]" | "{}") {
+                return Err(WisetreeError::validation(
+                    "The source branch already belongs to an active GitHub stack. Unstack it or select an unstacked branch before using Split.",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub async fn snapshot_split_repository(
@@ -8652,6 +8666,24 @@ fn parse_pr_repo_json(body: &str) -> Option<(String, String)> {
     }
     let parsed: PrUrlJson = serde_json::from_str(body).ok()?;
     parse_github_slug(&parsed.url)
+}
+
+async fn archive_stale_split_plan(cwd: &Path, source_head: &str) -> Result<PathBuf> {
+    let short_head = source_head.chars().take(8).collect::<String>();
+    let directory = cwd.join(SPLIT_DIRECTORY);
+    let archive = (0u32..)
+        .map(|index| {
+            let suffix = if index == 0 {
+                String::new()
+            } else {
+                format!(".{index}")
+            };
+            directory.join(format!("split_plan.{short_head}{suffix}.md"))
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("an unused Split archive path");
+    tokio::fs::rename(cwd.join(SPLIT_PLAN_FILE), &archive).await?;
+    Ok(archive)
 }
 
 #[derive(Deserialize)]

@@ -7,8 +7,8 @@ use wisetree::config::schema::{AiHarness, DashboardConfig};
 use wisetree::git::types::{BranchStatus, GitWorktree};
 use wisetree::services::{
     is_behind, resolve_base_ref, CheckStatus, DashboardNoticeLevel, DashboardRow, DashboardService,
-    ExplainSubmitOutcome, ExplainSubmitRequest, MergeStatus, PrState, PullRequest,
-    SplitPreflightRequest,
+    ExplainSubmitOutcome, ExplainSubmitRequest, MergeStatus, PrState, PullRequest, SplitPlan,
+    SplitPreflightRequest, SplitResponsibility,
 };
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
@@ -1030,7 +1030,8 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     let fixture = repo_with_worktree();
     let worktree = fixture.repo.parent().unwrap().join("repo-feature");
     fs::write(worktree.join("feature.rs"), "fn feature() {}\n").unwrap();
-    git(&worktree, &["add", "feature.rs"]);
+    fs::write(worktree.join("feature_test.rs"), "fn feature_test() {}\n").unwrap();
+    git(&worktree, &["add", "feature.rs", "feature_test.rs"]);
     git(&worktree, &["commit", "-q", "-m", "feature"]);
     let published_head = rev_parse_head(&worktree);
     git(
@@ -1107,8 +1108,62 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     // The MAX confirmed on the Split screen is frozen into the identity every
     // later stage (planner prompt, layer sizing, plan file) reads from.
     assert_eq!(preflight.identity.max, 100);
-    assert_eq!(preflight.units.len(), 1);
+    assert_eq!(preflight.units.len(), 2);
     assert!(worktree.join(".wisetree").is_dir());
+
+    let plan = SplitPlan {
+        responsibilities: preflight
+            .units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| SplitResponsibility {
+                order: index + 1,
+                name: format!("Apply {}", unit.path),
+                branch_slug: format!("layer-{}", index + 1),
+                rationale: if index == 0 {
+                    "Applies directly to the resolved base.".to_string()
+                } else {
+                    "Depends on the first layer.".to_string()
+                },
+                units: vec![unit.id.clone()],
+                test_units: Vec::new(),
+                paths: vec![unit.path.clone()],
+            })
+            .collect(),
+    };
+    service
+        .save_split_plan(&preflight, &plan, "awaiting approval")
+        .await
+        .expect("save awaiting-approval plan");
+    fs::write(
+        worktree.join("feature.rs"),
+        "fn feature() {}\nfn local() {}\nfn newer() {}\n",
+    )
+    .unwrap();
+    git(&worktree, &["add", "feature.rs"]);
+    git(
+        &worktree,
+        &["commit", "-q", "-m", "advance rejected source"],
+    );
+    let advanced_source = rev_parse_head(&worktree);
+
+    let recovered = service
+        .split_preflight(&SplitPreflightRequest {
+            worktree_path: worktree.to_string_lossy().to_string(),
+            source_branch: "feat-dashboard".to_string(),
+            pr_number: Some(7),
+            pr_base_ref: None,
+            max: 100,
+        })
+        .await
+        .expect("stale pre-approval plan should restart safely");
+    assert_eq!(recovered.identity.source_head, advanced_source);
+    assert!(!worktree.join(".wisetree/split_plan.md").exists());
+    let archived_plan = worktree.join(format!(".wisetree/split_plan.{}.md", &local_head[..8]));
+    assert!(archived_plan.is_file());
+    assert!(fs::read_to_string(archived_plan)
+        .unwrap()
+        .contains(&local_head));
 
     let log = fs::read_to_string(gh_log).unwrap();
     assert!(log.contains("auth status --hostname github.com"), "{log}");
