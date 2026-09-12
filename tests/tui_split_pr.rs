@@ -345,8 +345,6 @@ fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
         "soft limit; responsibility boundaries take",
         "priority",
         "╭─ PR 1 · Add the shared foundation",
-        "Field",
-        "Details",
         "Responsibility",
         "Add the shared foundation",
         "Dependency",
@@ -367,7 +365,23 @@ fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
     ] {
         assert!(text.contains(expected), "missing {expected:?}:\n{text}");
     }
-    assert!(text.contains("│ Field"), "{text}");
+    assert!(!text.contains("Field"), "{text}");
+    assert!(!text.contains("Details"), "{text}");
+    let title_row = text
+        .lines()
+        .position(|line| line.contains("╭─ PR 1 · Add the shared foundation"))
+        .expect("first PR title row");
+    let spacer = text
+        .lines()
+        .nth(title_row + 1)
+        .expect("PR title spacer row");
+    assert_eq!(
+        spacer
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>(),
+        "││"
+    );
     assert!(text.contains("╰────────────────"), "{text}");
     assert!(!text.contains("CU0001"), "{text}");
     assert_eq!(

@@ -1194,7 +1194,7 @@ impl SplitPullRequestScreen {
                     .join(", ")
             };
             let (additions, deletions) = (size.additions, size.deletions);
-            push_review_table_header(&mut layer_lines);
+            layer_lines.push(Line::default());
             push_review_table_row(
                 &mut layer_lines,
                 "Responsibility",
@@ -1553,16 +1553,6 @@ fn push_wrapped_styled(lines: &mut Vec<Line<'static>>, text: &str, width: usize,
 }
 
 const REVIEW_FIELD_WIDTH: usize = 27;
-
-fn push_review_table_header(lines: &mut Vec<Line<'static>>) {
-    let style = Style::default()
-        .fg(colors::GRAY_DARK)
-        .add_modifier(Modifier::BOLD);
-    lines.push(Line::from(vec![
-        Span::styled(format!("{:<REVIEW_FIELD_WIDTH$}", "Field"), style),
-        Span::styled("  Details", style),
-    ]));
-}
 
 fn push_review_group(
     lines: &mut Vec<Line<'static>>,
