@@ -3453,10 +3453,14 @@ impl SettingsScreen {
                 }
                 AiSettingsSelection::Save => self.save_ai_settings(),
             },
-            KeyCode::Char(' ') => {
-                // Shift walks the same ladder backwards, so a value overshot
-                // by one press costs one press to get back to.
-                let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
+            KeyCode::Char(' ' | 'b' | 'B') => {
+                // `b` walks the same ladder backwards (as in `less`), so a
+                // value overshot by one press costs one press to get back to.
+                // Shift+Space does the same where the terminal reports the
+                // modifier — Terminal.app sends a bare space, so it cannot be
+                // the only way back.
+                let forward = matches!(key.code, KeyCode::Char(' '))
+                    && !key.modifiers.contains(KeyModifiers::SHIFT);
                 match editor.selection {
                     AiSettingsSelection::Rect(_) if editor.field == AiSettingsField::Thinking => {
                         self.ai_settings_cycle_thinking(forward);
@@ -4960,9 +4964,9 @@ impl SettingsScreen {
         let hint = if on_chips {
             "← → cycle chips • Enter stages into ✎﹏ command • Tab/⇧Tab change zone • Esc back to Dashboard"
         } else if is_scrollable {
-            "▲/▼ scroll • ← → choose field • Space/⇧Space change value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
+            "▲/▼ scroll • ← → choose field • Space/b next/prev value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
         } else {
-            "↑↓ move • ← → choose field • Space/⇧Space change value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
+            "↑↓ move • ← → choose field • Space/b next/prev value • Tab/⇧Tab cycle zones • Enter pick model/Save • Esc back"
         };
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
     }
@@ -6983,43 +6987,47 @@ mod tests {
         assert_eq!(slot_thinking(&screen), "");
     }
 
-    /// Shift+Space walks the thinking ladder the other way, so overshooting
-    /// a level costs one press to undo rather than a full lap.
+    /// `b` (and Shift+Space, where the terminal reports the modifier) walks
+    /// the thinking ladder the other way, so overshooting a level costs one
+    /// press to undo rather than a full lap.
     #[test]
-    fn shift_space_cycles_thinking_backwards() {
-        let mut screen = ai_settings_screen(vec![]);
-        focus_ai_slot(&mut screen, 1);
-        set_slot_model(&mut screen, 1, "opencode-go/glm-5.2");
-        screen.set_ai_model_variants(std::collections::HashMap::from([(
-            "opencode-go/glm-5.2".to_string(),
-            vec!["high".to_string(), "max".to_string()],
-        )]));
-
+    fn b_and_shift_space_cycle_thinking_backwards() {
         let slot_thinking = |s: &SettingsScreen| {
             AiSlot::ALL[1]
                 .get(&s.ai_settings_editor.as_ref().unwrap().ai)
                 .thinking
                 .clone()
         };
-        let _ = screen.handle_ai_settings(key(KeyCode::Right));
 
-        // Two presses forward, then two back, retracing the same ladder.
-        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
-        let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
-        assert_eq!(slot_thinking(&screen), "max");
-        let _ = screen.handle_ai_settings(shift_key(KeyCode::Char(' ')));
-        assert_eq!(slot_thinking(&screen), "high");
-        let _ = screen.handle_ai_settings(shift_key(KeyCode::Char(' ')));
-        assert_eq!(slot_thinking(&screen), "");
-        // And wraps the other way round the ladder's end.
-        let _ = screen.handle_ai_settings(shift_key(KeyCode::Char(' ')));
-        assert_eq!(slot_thinking(&screen), "max");
+        // GLM-5.2's ladder is default → high → max, so two presses forward
+        // lands on "max" and each back key must retrace it a step at a time,
+        // wrapping round the end the other way.
+        for back in [key(KeyCode::Char('b')), shift_key(KeyCode::Char(' '))] {
+            let mut screen = ai_settings_screen(vec![]);
+            focus_ai_slot(&mut screen, 1);
+            set_slot_model(&mut screen, 1, "opencode-go/glm-5.2");
+            screen.set_ai_model_variants(std::collections::HashMap::from([(
+                "opencode-go/glm-5.2".to_string(),
+                vec!["high".to_string(), "max".to_string()],
+            )]));
+            let _ = screen.handle_ai_settings(key(KeyCode::Right));
+
+            let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
+            let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
+            assert_eq!(slot_thinking(&screen), "max");
+            let _ = screen.handle_ai_settings(back);
+            assert_eq!(slot_thinking(&screen), "high");
+            let _ = screen.handle_ai_settings(back);
+            assert_eq!(slot_thinking(&screen), "");
+            let _ = screen.handle_ai_settings(back);
+            assert_eq!(slot_thinking(&screen), "max");
+        }
     }
 
     /// The harness field cycles both ways too, over whatever its provider
     /// accepts.
     #[test]
-    fn shift_space_cycles_harness_backwards() {
+    fn b_cycles_harness_backwards() {
         let mut screen = ai_settings_screen(vec![]);
         focus_ai_slot(&mut screen, 1);
         set_slot_model(&mut screen, 1, "openai/gpt-5.6-sol");
@@ -7037,11 +7045,11 @@ mod tests {
         let _ = screen.handle_ai_settings(key(KeyCode::Char(' ')));
         let forward = slot_harness(&screen);
         assert_ne!(forward, start, "Space should have changed the harness");
-        let _ = screen.handle_ai_settings(shift_key(KeyCode::Char(' ')));
+        let _ = screen.handle_ai_settings(key(KeyCode::Char('b')));
         assert_eq!(
             slot_harness(&screen),
             start,
-            "Shift+Space should have stepped back to where Space started"
+            "b should have stepped back to where Space started"
         );
     }
 
