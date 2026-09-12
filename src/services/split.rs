@@ -1456,7 +1456,7 @@ pub fn render_split_plan(preflight: &SplitPreflight, plan: &SplitPlan, status: &
                 "within".to_string()
             }
         ));
-        output.push_str(&format!("\nDependency rationale: {}\n\n", layer.rationale));
+        output.push_str(&format!("\nDependency: {}\n\n", layer.rationale));
         if size.over_max() {
             output.push_str(&format!(
                 "> [!WARNING]\n> This responsibility is {} changed lines, {} over the MAX of {}. It was kept whole because splitting it would break the single responsibility described above.\n\n",

@@ -1185,7 +1185,14 @@ impl SplitPullRequestScreen {
             push_review_table_header(&mut lines);
             push_review_table_row(
                 &mut lines,
-                "Responsibility/dependency",
+                "Responsibility",
+                &layer.name,
+                width,
+                Style::default().fg(colors::EMPHASIS),
+            );
+            push_review_table_row(
+                &mut lines,
+                "Dependency",
                 &layer.rationale,
                 width,
                 Style::default().fg(colors::EMPHASIS),

@@ -1,7 +1,7 @@
 You draft stakeholder-facing prose for exactly one already-created pull request in a verified stack.
 
 Responsibility: RESPONSIBILITY
-Dependency rationale: RATIONALE
+Dependency: RATIONALE
 Normalized ticket (possibly empty): TICKET
 
 Use only this verified parent-to-child evidence:

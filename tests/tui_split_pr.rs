@@ -110,7 +110,7 @@ fn review_screen() -> SplitPullRequestScreen {
             unit("CU0004", "tests/b_test.rs", 2, 0),
         ],
     };
-    let response = r#"{"responsibilities":[{"order":1,"name":"Foundation","branch_slug":"foundation","rationale":"Builds on the resolved base.","units":["CU0001","CU0002"],"test_units":["CU0002"],"paths":["src/a.rs","tests/a_test.rs"]},{"order":2,"name":"Consumer","branch_slug":"consumer","rationale":"Uses the foundation behavior.","units":["CU0003","CU0004"],"test_units":["CU0004"],"paths":["src/b.rs","tests/b_test.rs"]}]}"#;
+    let response = r#"{"responsibilities":[{"order":1,"name":"Add the shared foundation","branch_slug":"shared-foundation","rationale":"Applies directly to the resolved base and has no stack dependency.","units":["CU0001","CU0002"],"test_units":["CU0002"],"paths":["src/a.rs","tests/a_test.rs"]},{"order":2,"name":"Add the foundation consumer","branch_slug":"foundation-consumer","rationale":"Depends on the shared foundation behavior from PR 1.","units":["CU0003","CU0004"],"test_units":["CU0004"],"paths":["src/b.rs","tests/b_test.rs"]}]}"#;
     let plan = parse_split_plan(response, &preflight).unwrap();
     let snapshot = SplitRepositorySnapshot {
         status: String::new(),
@@ -336,10 +336,13 @@ fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
     assert!(split_colored);
     for expected in [
         "bottom to top",
-        "PR 1 · Foundation",
+        "PR 1 · Add the shared foundation",
         "Field",
         "Details",
-        "Responsibility/dependency",
+        "Responsibility",
+        "Add the shared foundation",
+        "Dependency",
+        "Applies directly to the resolved base and has no stack dependency.",
         "src/a.rs, tests/a_test.rs",
         "Changes",
         "src/a.rs:1-3 (+3 -1)",
@@ -616,8 +619,8 @@ fn review_flags_every_pull_request_that_runs_past_max_with_its_reason() {
         srp_explanation_is_teal,
         "oversized SRP explanation should be teal"
     );
-    // The AI's own boundary reasoning is what explains the overflow.
-    assert!(text.contains("Responsibility/dependency"), "{text}");
+    assert!(text.contains("Responsibility"), "{text}");
+    assert!(text.contains("Dependency"), "{text}");
     // Approving an oversized plan is still allowed — it is the point.
     assert_eq!(
         screen.handle_key(key(KeyCode::Enter)),

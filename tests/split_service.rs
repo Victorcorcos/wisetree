@@ -696,6 +696,10 @@ fn prompt_contains_frozen_manifest_and_revision_only_when_both_inputs_exist() {
     assert!(first.contains("CU0001 | TextHunk | src/a.rs | implementation | +3 -1"));
     assert!(first.contains("CU0002 | TextHunk | tests/a_test.rs | test | +1 -0"));
     assert!(first.contains("Do not write files"));
+    assert!(first.contains("`name` is the responsibility"));
+    assert!(first.contains("Make it intuitive without reading the diff"));
+    assert!(first.contains("`rationale` is the dependency"));
+    assert!(first.contains("Do not repeat the responsibility"));
     let incomplete_revision = build_split_plan_prompt(&preflight, Some("stale"), None);
     assert!(!incomplete_revision.contains("stale"));
 
