@@ -336,7 +336,15 @@ fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
     assert!(split_colored);
     for expected in [
         "bottom to top",
-        "PR 1 · Add the shared foundation",
+        "Source branch",
+        "feature/large-change · commit source-sha",
+        "Stack base",
+        "upstream/main · commit base-sha",
+        "Size guideline",
+        "up to 10 changed lines per PR",
+        "soft limit; responsibility boundaries take",
+        "priority",
+        "╭─ PR 1 · Add the shared foundation",
         "Field",
         "Details",
         "Responsibility",
@@ -359,6 +367,8 @@ fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
     ] {
         assert!(text.contains(expected), "missing {expected:?}:\n{text}");
     }
+    assert!(text.contains("│ Field"), "{text}");
+    assert!(text.contains("╰────────────────"), "{text}");
     assert!(!text.contains("CU0001"), "{text}");
     assert_eq!(
         screen.handle_key(key(KeyCode::Enter)),
@@ -600,7 +610,7 @@ fn review_flags_every_pull_request_that_runs_past_max_with_its_reason() {
         text.push_str(&row);
         text.push('\n');
     }
-    assert!(text.contains("MAX 3 (guideline)"), "{text}");
+    assert!(text.contains("up to 3 changed lines per PR"), "{text}");
     assert!(text.contains("2 of 2 pull requests exceed MAX 3"), "{text}");
     assert!(
         text.contains("Responsibility boundaries win over size"),

@@ -1132,17 +1132,42 @@ impl SplitPullRequestScreen {
         };
         let sizes = split_layer_sizes(preflight, plan);
         let oversized = sizes.iter().filter(|size| size.over_max()).count();
-        let mut lines = vec![
-            section_line("Proposed Split stack · bottom to top"),
-            Line::from(format!(
-                "{} @ {} → {} @ {} · MAX {} (guideline)",
-                preflight.identity.base_ref,
-                preflight.identity.base_sha,
-                preflight.identity.source_branch,
-                preflight.identity.source_head,
-                preflight.identity.max
-            )),
-        ];
+        let mut lines = vec![section_line("Proposed Split stack · bottom to top")];
+        push_review_table_styled_row(
+            &mut lines,
+            "Source branch",
+            vec![
+                (preflight.identity.source_branch.clone(), code_style()),
+                ("· commit".to_string(), Style::default().fg(colors::MUTED)),
+                (short_commit(&preflight.identity.source_head), code_style()),
+            ],
+            width,
+        );
+        push_review_table_styled_row(
+            &mut lines,
+            "Stack base",
+            vec![
+                (preflight.identity.base_ref.clone(), code_style()),
+                ("· commit".to_string(), Style::default().fg(colors::MUTED)),
+                (short_commit(&preflight.identity.base_sha), code_style()),
+            ],
+            width,
+        );
+        push_review_table_styled_row(
+            &mut lines,
+            "Size guideline",
+            vec![
+                (
+                    format!("up to {} changed lines per PR", preflight.identity.max),
+                    Style::default().fg(colors::INFO),
+                ),
+                (
+                    "· soft limit; responsibility boundaries take priority".to_string(),
+                    Style::default().fg(colors::MUTED),
+                ),
+            ],
+            width,
+        );
         if oversized > 0 {
             // MAX yields to the semantic boundary, so the reviewer is told
             // exactly which layers ran past it and why before approving.
@@ -1159,6 +1184,8 @@ impl SplitPullRequestScreen {
         }
         lines.push(Line::default());
         for (layer, size) in plan.responsibilities.iter().zip(&sizes) {
+            let inner_width = width.saturating_sub(4).max(1);
+            let mut layer_lines = Vec::new();
             let describe_units = |ids: &[String]| {
                 ids.iter()
                     .filter_map(|id| preflight.units.iter().find(|unit| unit.id == *id))
@@ -1167,48 +1194,33 @@ impl SplitPullRequestScreen {
                     .join(", ")
             };
             let (additions, deletions) = (size.additions, size.deletions);
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("PR {}", layer.order),
-                    Style::default()
-                        .fg(colors::SPLIT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" · {}  ", layer.name),
-                    Style::default()
-                        .fg(colors::WHITE)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" {} ", layer.branch_slug), code_style()),
-            ]));
-            push_review_table_header(&mut lines);
+            push_review_table_header(&mut layer_lines);
             push_review_table_row(
-                &mut lines,
+                &mut layer_lines,
                 "Responsibility",
                 &layer.name,
-                width,
+                inner_width,
                 Style::default().fg(colors::EMPHASIS),
             );
             push_review_table_row(
-                &mut lines,
+                &mut layer_lines,
                 "Dependency",
                 &layer.rationale,
-                width,
+                inner_width,
                 Style::default().fg(colors::EMPHASIS),
             );
             push_review_table_row(
-                &mut lines,
+                &mut layer_lines,
                 "Files",
                 &layer.paths.join(", "),
-                width,
+                inner_width,
                 code_style(),
             );
             push_review_table_row(
-                &mut lines,
+                &mut layer_lines,
                 "Changes",
                 &describe_units(&layer.units),
-                width,
+                inner_width,
                 Style::default().fg(colors::INFO),
             );
             let related_tests = if layer.test_units.is_empty() {
@@ -1217,10 +1229,10 @@ impl SplitPullRequestScreen {
                 describe_units(&layer.test_units)
             };
             push_review_table_row(
-                &mut lines,
+                &mut layer_lines,
                 "Related tests",
                 &related_tests,
-                width,
+                inner_width,
                 if layer.test_units.is_empty() {
                     Style::default().fg(colors::MUTED)
                 } else {
@@ -1229,17 +1241,31 @@ impl SplitPullRequestScreen {
             );
             if size.over_max() {
                 push_over_max_integrity_table_row(
-                    &mut lines,
+                    &mut layer_lines,
                     additions,
                     deletions,
                     size.changed,
                     size.overflow(),
                     size.max,
-                    width,
+                    inner_width,
                 );
             } else {
-                push_integrity_table_row(&mut lines, additions, deletions, size.changed, size.max);
+                push_integrity_table_row(
+                    &mut layer_lines,
+                    additions,
+                    deletions,
+                    size.changed,
+                    size.max,
+                );
             }
+            push_review_group(
+                &mut lines,
+                layer_lines,
+                width,
+                layer.order,
+                &layer.name,
+                &layer.branch_slug,
+            );
             lines.push(Line::default());
         }
         lines.push(section_line("Aggregate integrity"));
@@ -1536,6 +1562,70 @@ fn push_review_table_header(lines: &mut Vec<Line<'static>>) {
         Span::styled(format!("{:<REVIEW_FIELD_WIDTH$}", "Field"), style),
         Span::styled("  Details", style),
     ]));
+}
+
+fn push_review_group(
+    lines: &mut Vec<Line<'static>>,
+    content: Vec<Line<'static>>,
+    width: usize,
+    order: usize,
+    name: &str,
+    branch_slug: &str,
+) {
+    let border_style = Style::default().fg(colors::SPLIT);
+    let prefix = format!("PR {order} · ");
+    let slug = format!(" {branch_slug} ");
+    let fixed_width = 3 + prefix.chars().count() + 2 + slug.chars().count() + 2;
+    let visible_name = truncate_review_title(name, width.saturating_sub(fixed_width));
+    let used_width =
+        3 + prefix.chars().count() + visible_name.chars().count() + 2 + slug.chars().count() + 1;
+    lines.push(Line::from(vec![
+        Span::styled("╭─ ", border_style),
+        Span::styled(
+            prefix,
+            Style::default()
+                .fg(colors::SPLIT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            visible_name,
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(slug, code_style()),
+        Span::styled("─".repeat(width.saturating_sub(used_width)), border_style),
+        Span::styled("╮", border_style),
+    ]));
+
+    let inner_width = width.saturating_sub(4);
+    for line in content {
+        let padding = inner_width.saturating_sub(line.width());
+        let mut spans = vec![Span::styled("│ ", border_style)];
+        spans.extend(line.spans);
+        spans.push(Span::raw(" ".repeat(padding)));
+        spans.push(Span::styled(" │", border_style));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
+        border_style,
+    )));
+}
+
+fn truncate_review_title(title: &str, width: usize) -> String {
+    if title.chars().count() <= width {
+        return title.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    format!("{}…", title.chars().take(width - 1).collect::<String>())
+}
+
+fn short_commit(sha: &str) -> String {
+    sha.chars().take(12).collect()
 }
 
 fn push_review_table_row(
