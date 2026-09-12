@@ -13,9 +13,9 @@
 //!   that database too.
 //! - `ResumePrompt`: native buttons for the preflight prompts — Resume /
 //!   Start fresh, Overwrite / Cancel, plan-complete / Cancel.
-//! - `PlanReview`  : the rendered plan in a scrollable panel + Yes / No.
-//!   No opens `Feedback`; the plan AI revises and the loop repeats until
-//!   the user answers Yes.
+//! - `PlanReview`  : the rendered plan in scrollable section panels + Approve /
+//!   Reject. Reject opens `Feedback`; the plan AI revises and the loop repeats
+//!   until the user approves it.
 //! - `Feedback`    : multiline "why not?" input feeding the revision run.
 //! - `Implementing`: the embedded opencode PTY building section(s). With
 //!   Ralph Loop each section gets its own fresh run (the App closes the
@@ -32,7 +32,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -49,9 +49,10 @@ use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::DevelopRequest;
 use crate::tui::screens::update_pr::{button_paragraph, contains_position, key_event_to_pty_bytes};
 use crate::tui::widgets::{
-    abort_run_modal, code_span, labeled_line, render_summary_table, spinner_frame, AiRoleRow,
-    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt,
-    OptionsGroup, OptionsGroupItem, PrConfirmView, PtyView, Status, StatusIndicator, SummaryRow,
+    abort_run_modal, code_span, code_spans, code_style, labeled_line, render_summary_table,
+    spinner_frame, AiRoleRow, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+    InputOutcome, InputPrompt, OptionsGroup, OptionsGroupItem, PrConfirmView, PtyView, Status,
+    StatusIndicator, SummaryRow,
 };
 
 /// CSI sequences forwarded to opencode for page scrolling while it owns the
@@ -1976,129 +1977,109 @@ impl DevelopPullRequestScreen {
     }
 
     fn render_plan_review(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(plan) = self.plan.as_ref() else {
+        if self.plan.is_none() {
             return;
-        };
+        }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // title
-                Constraint::Length(1), // subtitle
-                Constraint::Length(1), // blank
-                Constraint::Min(5),    // plan panel
-                Constraint::Length(1), // question
-                Constraint::Length(3), // buttons
-                Constraint::Length(1), // hint
-            ])
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(area);
+        let width = chunks[0].width.saturating_sub(2).max(1) as usize;
+        let lines = self.plan_review_lines(width);
+        let max_scroll = (lines.len() as u16).saturating_sub(chunks[0].height);
+        self.review_scroll = self.review_scroll.min(max_scroll);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "🗺️ Proposed Plan — review before any code is written",
-                Style::default()
-                    .fg(colors::ORANGE)
-                    .add_modifier(Modifier::BOLD),
-            ))),
+            Paragraph::new(lines).scroll((self.review_scroll, 0)),
             chunks[0],
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(
-                    "{} · {} section(s) · complexity {} points · PLAN.md written to the \
-                     worktree root",
-                    self.request.branch,
-                    plan.sections.len(),
-                    plan.complexity
-                ),
-                Style::default().fg(colors::GRAY_DARK),
-            ))),
-            chunks[1],
-        );
-        self.review_scroll = render_text_panel(
-            frame,
-            chunks[3],
-            self.plan_review_lines(),
-            self.review_scroll,
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Do you approve this plan?".to_string(),
-                Style::default()
-                    .fg(colors::WHITE)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .alignment(ratatui::layout::Alignment::Center),
-            chunks[4],
-        );
-        // Yes (green) / No (pink).
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(0),
-                Constraint::Length(11),
+                Constraint::Length(15),
                 Constraint::Length(2),
-                Constraint::Length(10),
+                Constraint::Length(15),
                 Constraint::Min(0),
             ])
-            .split(chunks[5]);
+            .split(chunks[1]);
         frame.render_widget(
-            button_paragraph("  Yes  ", colors::GREEN, self.review_focus == 0),
+            plan_review_button("Approve", colors::SUCCESS, self.review_focus == 0),
             cols[1],
         );
         frame.render_widget(
-            button_paragraph("  No  ", colors::PINK, self.review_focus == 1),
+            plan_review_button("Reject", colors::ERROR, self.review_focus == 1),
             cols[3],
         );
         self.review_button_rects.set([cols[1], cols[3]]);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("← → ".to_string(), Style::default().fg(colors::INFO)),
-                Span::styled("Switch".to_string(), muted_dim()),
-                Span::styled("  ·  ".to_string(), muted_dim()),
-                Span::styled("↵ ".to_string(), Style::default().fg(colors::SUCCESS)),
-                Span::styled("Answer".to_string(), muted_dim()),
-                Span::styled("  ·  ".to_string(), muted_dim()),
-                Span::styled("PgUp PgDn ".to_string(), Style::default().fg(colors::INFO)),
-                Span::styled("Scroll plan".to_string(), muted_dim()),
-                Span::styled("  ·  ".to_string(), muted_dim()),
-                Span::styled("No ".to_string(), Style::default().fg(colors::ERROR)),
-                Span::styled("asks why and revises the plan".to_string(), muted_dim()),
-            ])),
-            chunks[6],
-        );
     }
 
-    /// The whole plan, readable inside the review panel: task description,
-    /// then each section header + body.
-    fn plan_review_lines(&self) -> Vec<Line<'static>> {
+    fn plan_review_lines(&self, width: usize) -> Vec<Line<'static>> {
         let Some(plan) = self.plan.as_ref() else {
             return Vec::new();
         };
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::from(Span::styled(
-            "Task".to_string(),
-            Style::default()
-                .fg(colors::INFO)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for raw in plan.task_description.lines() {
-            lines.push(Line::from(Span::styled(
-                format!("  {raw}"),
-                Style::default().fg(colors::WHITE),
-            )));
+        let mut lines = vec![develop_review_heading(
+            "Proposed Develop plan · review before code is written",
+        )];
+        push_develop_review_row(
+            &mut lines,
+            "Source branch",
+            vec![(self.request.branch.clone(), code_style())],
+            width,
+        );
+        push_develop_review_row(
+            &mut lines,
+            "Implementation",
+            vec![(
+                format!("{} ordered sections", plan.sections.len()),
+                Style::default().fg(colors::INFO),
+            )],
+            width,
+        );
+        push_develop_review_row(
+            &mut lines,
+            "Complexity",
+            vec![
+                (
+                    format!("{} points", plan.complexity),
+                    Style::default().fg(colors::INFO),
+                ),
+                (
+                    "· PLAN.md in the worktree root".to_string(),
+                    Style::default().fg(colors::MUTED),
+                ),
+            ],
+            width,
+        );
+        for (index, raw) in plan.task_description.lines().enumerate() {
+            push_develop_review_row(
+                &mut lines,
+                if index == 0 { "Task" } else { "" },
+                develop_value_segments(raw, Style::default().fg(colors::EMPHASIS)),
+                width,
+            );
         }
+        lines.push(Line::default());
         for section in &plan.sections {
+            let inner_width = width.saturating_sub(4).max(1);
+            let content = develop_section_lines(&section.body, inner_width);
+            push_develop_review_group(
+                &mut lines,
+                content,
+                width,
+                section.number,
+                &section.name,
+                section.done,
+            );
             lines.push(Line::default());
-            let done = if section.done { " ✅" } else { "" };
-            lines.push(Line::from(Span::styled(
-                format!("Section {} — {}{done}", section.number, section.name),
-                Style::default()
-                    .fg(colors::ORANGE)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for raw in section.body.lines() {
-                lines.push(styled_body_line(raw));
-            }
         }
+        lines.push(develop_review_heading("Approval"));
+        push_develop_wrapped(
+            &mut lines,
+            "Approve starts implementation in the order above. Reject asks for feedback and revises the plan.",
+            width,
+            Style::default().fg(colors::EMPHASIS),
+        );
+        lines.push(Line::from("PgUp/PgDn/Home/End scroll · Esc cancel"));
         lines
     }
 
@@ -2344,49 +2325,274 @@ impl DevelopPullRequestScreen {
     }
 }
 
-/// Style one section-body line for the review panel: `**Field**:` labels
-/// render as bold info labels (asterisks stripped), `- [ ]` / `- [x]` items
-/// as ☐ / ☑ checkboxes, everything else as plain body text.
-fn styled_body_line(raw: &str) -> Line<'static> {
-    let trimmed = raw.trim_start();
-    for label in ["Goal", "Files", "Acceptance criteria", "Edge cases"] {
-        if let Some(rest) = trimmed.strip_prefix(&format!("**{label}**:")) {
-            return Line::from(vec![
-                Span::styled(
-                    format!("  {label}: "),
-                    Style::default()
-                        .fg(colors::INFO)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    rest.trim_start().to_string(),
-                    Style::default().fg(colors::WHITE),
-                ),
-            ]);
+const DEVELOP_REVIEW_FIELD_WIDTH: usize = 27;
+
+fn develop_review_heading(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        title.to_string(),
+        Style::default()
+            .fg(colors::ORANGE)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn develop_section_lines(body: &str, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default()];
+    let mut current_field = "";
+    let mut field_shown = true;
+
+    for raw in body.lines() {
+        let trimmed = raw.trim_start();
+        if let Some((label, value)) = ["Goal", "Files", "Acceptance criteria", "Edge cases"]
+            .iter()
+            .find_map(|label| {
+                trimmed
+                    .strip_prefix(&format!("**{label}**:"))
+                    .map(|value| (*label, value.trim_start()))
+            })
+        {
+            current_field = label;
+            field_shown = false;
+            if !value.is_empty() {
+                let style = if label == "Files" {
+                    code_style()
+                } else {
+                    Style::default().fg(colors::EMPHASIS)
+                };
+                let segments = if label == "Files" {
+                    vec![(value.to_string(), style)]
+                } else {
+                    develop_value_segments(value, style)
+                };
+                push_develop_review_row(&mut lines, label, segments, width);
+                field_shown = true;
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (marker, marker_style, value) = if let Some(item) = trimmed.strip_prefix("- [ ]") {
+            ("☐", muted_dim(), item.trim_start())
+        } else if let Some(item) = trimmed.strip_prefix("- [x]") {
+            ("☑", Style::default().fg(colors::SUCCESS), item.trim_start())
+        } else {
+            ("", Style::default(), trimmed)
+        };
+        let field = if field_shown { "" } else { current_field };
+        let mut segments = Vec::new();
+        if !marker.is_empty() {
+            segments.push((marker.to_string(), marker_style));
+        }
+        segments.extend(develop_value_segments(
+            value,
+            Style::default().fg(colors::GRAY_LIGHT),
+        ));
+        push_develop_review_row(&mut lines, field, segments, width);
+        field_shown = true;
+    }
+    lines
+}
+
+fn develop_value_segments(value: &str, base_style: Style) -> Vec<(String, Style)> {
+    code_spans(value, base_style, code_style())
+        .into_iter()
+        .map(|span| (span.content.into_owned(), span.style))
+        .collect()
+}
+
+fn push_develop_review_group(
+    lines: &mut Vec<Line<'static>>,
+    content: Vec<Line<'static>>,
+    width: usize,
+    number: usize,
+    name: &str,
+    done: bool,
+) {
+    let border_style = Style::default().fg(colors::ORANGE);
+    let prefix = format!("Section {number} · ");
+    let status = if done { " complete " } else { " pending " };
+    let status_style = if done {
+        Style::default().fg(colors::SUCCESS).bg(colors::CODE_BG)
+    } else {
+        code_style()
+    };
+    let fixed_width = 3 + prefix.chars().count() + 2 + status.chars().count() + 2;
+    let visible_name = truncate_develop_review_title(name, width.saturating_sub(fixed_width));
+    let used_width =
+        3 + prefix.chars().count() + visible_name.chars().count() + 2 + status.chars().count() + 1;
+    lines.push(Line::from(vec![
+        Span::styled("╭─ ", border_style),
+        Span::styled(
+            prefix,
+            Style::default()
+                .fg(colors::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            visible_name,
+            Style::default()
+                .fg(colors::WHITE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(status, status_style),
+        Span::styled("─".repeat(width.saturating_sub(used_width)), border_style),
+        Span::styled("╮", border_style),
+    ]));
+
+    let inner_width = width.saturating_sub(4);
+    for line in content {
+        let padding = inner_width.saturating_sub(line.width());
+        let mut spans = vec![Span::styled("│ ", border_style)];
+        spans.extend(line.spans);
+        spans.push(Span::raw(" ".repeat(padding)));
+        spans.push(Span::styled(" │", border_style));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
+        border_style,
+    )));
+}
+
+fn truncate_develop_review_title(title: &str, width: usize) -> String {
+    if title.chars().count() <= width {
+        return title.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    format!("{}…", title.chars().take(width - 1).collect::<String>())
+}
+
+fn push_develop_review_row(
+    lines: &mut Vec<Line<'static>>,
+    field: &str,
+    segments: Vec<(String, Style)>,
+    width: usize,
+) {
+    let field_width = DEVELOP_REVIEW_FIELD_WIDTH.min(width.saturating_sub(3));
+    let detail_width = width.saturating_sub(field_width + 2).max(1);
+    let field_style = Style::default()
+        .fg(colors::GRAY_DARK)
+        .add_modifier(Modifier::BOLD);
+    let mut detail = Vec::new();
+    let mut detail_len = 0;
+    let mut show_field = true;
+
+    for (text, style) in segments {
+        for word in text.split_whitespace() {
+            let word_len = word.chars().count();
+            if word_len > detail_width {
+                if !detail.is_empty() {
+                    push_develop_styled_line(
+                        lines,
+                        field,
+                        show_field,
+                        field_width,
+                        field_style,
+                        detail,
+                    );
+                    show_field = false;
+                    detail = Vec::new();
+                    detail_len = 0;
+                }
+                let chars = word.chars().collect::<Vec<_>>();
+                for chunk in chars.chunks(detail_width) {
+                    push_develop_styled_line(
+                        lines,
+                        field,
+                        show_field,
+                        field_width,
+                        field_style,
+                        vec![Span::styled(chunk.iter().collect::<String>(), style)],
+                    );
+                    show_field = false;
+                }
+                continue;
+            }
+            let separator = usize::from(detail_len > 0);
+            if detail_len + separator + word_len > detail_width && !detail.is_empty() {
+                push_develop_styled_line(
+                    lines,
+                    field,
+                    show_field,
+                    field_width,
+                    field_style,
+                    detail,
+                );
+                show_field = false;
+                detail = Vec::new();
+                detail_len = 0;
+            }
+            if detail_len > 0 {
+                detail.push(Span::raw(" "));
+                detail_len += 1;
+            }
+            detail.push(Span::styled(word.to_string(), style));
+            detail_len += word_len;
         }
     }
-    if let Some(item) = trimmed.strip_prefix("- [ ]") {
-        return Line::from(vec![
-            Span::styled("    ☐ ".to_string(), muted_dim()),
-            Span::styled(
-                item.trim_start().to_string(),
-                Style::default().fg(colors::GRAY_LIGHT),
-            ),
-        ]);
+    if !detail.is_empty() || show_field {
+        push_develop_styled_line(lines, field, show_field, field_width, field_style, detail);
     }
-    if let Some(item) = trimmed.strip_prefix("- [x]") {
-        return Line::from(vec![
-            Span::styled("    ☑ ".to_string(), Style::default().fg(colors::SUCCESS)),
-            Span::styled(
-                item.trim_start().to_string(),
-                Style::default().fg(colors::GRAY_LIGHT),
-            ),
-        ]);
+}
+
+fn push_develop_styled_line(
+    lines: &mut Vec<Line<'static>>,
+    field: &str,
+    show_field: bool,
+    field_width: usize,
+    field_style: Style,
+    detail: Vec<Span<'static>>,
+) {
+    let label = if show_field { field } else { "" };
+    let mut spans = vec![
+        Span::styled(format!("{label:<field_width$}"), field_style),
+        Span::raw("  "),
+    ];
+    spans.extend(detail);
+    lines.push(Line::from(spans));
+}
+
+fn push_develop_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    let width = width.max(1);
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() || current.chars().count() + 1 + word.chars().count() <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        } else {
+            lines.push(Line::from(Span::styled(current, style)));
+            current = word.to_string();
+        }
     }
-    Line::from(Span::styled(
-        format!("  {raw}"),
-        Style::default().fg(colors::GRAY_LIGHT),
-    ))
+    if !current.is_empty() {
+        lines.push(Line::from(Span::styled(current, style)));
+    }
+}
+
+fn plan_review_button(
+    label: &str,
+    color: ratatui::style::Color,
+    selected: bool,
+) -> Paragraph<'static> {
+    let mut label_style = Style::default().fg(color);
+    if selected {
+        label_style = label_style.add_modifier(Modifier::BOLD);
+    }
+    Paragraph::new(Span::styled(label.to_string(), label_style))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if selected { color } else { colors::MUTED })),
+        )
 }
 
 fn muted_dim() -> Style {
@@ -2536,7 +2742,9 @@ mod tests {
         PlanSection {
             number,
             name: name.to_string(),
-            body: format!("**Goal**: goal {number}\n**Acceptance criteria**:\n- [ ] works"),
+            body: format!(
+                "**Goal**: goal {number} with `CsvWriter`\n**Files**: src/export_{number}.rs\n**Acceptance criteria**:\n- [ ] works"
+            ),
             done: false,
         }
     }
@@ -2851,19 +3059,37 @@ mod tests {
     fn review_renders_plan_and_answers_via_buttons() {
         let mut s = screen_on_review();
         let dump = render_dump(&mut s, 110, 32);
-        assert!(dump.contains("Proposed Plan"), "{dump}");
-        // The subtitle leads with the branch, like Bugkill's Select page.
-        assert!(dump.contains("feat/csv-export · 2 section(s)"), "{dump}");
-        assert!(dump.contains("complexity 5 points"), "{dump}");
-        assert!(dump.contains("Section 1 — Data model"), "{dump}");
-        // Body fields render styled (asterisks stripped, checkboxes drawn).
-        assert!(dump.contains("Goal: goal 1"), "{dump}");
+        assert!(dump.contains("Proposed Develop plan"), "{dump}");
+        assert!(
+            dump.contains("Source branch                feat/csv-export"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("Implementation               2 ordered sections"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("Complexity                   5 points"),
+            "{dump}"
+        );
+        assert!(dump.contains("╭─ Section 1 · Data model"), "{dump}");
+        assert!(
+            dump.contains("│ Goal                         goal 1"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("│ Files                        src/export_1.rs"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("│ Acceptance criteria          ☐ works"),
+            "{dump}"
+        );
+        assert!(dump.contains("╰────────────────"), "{dump}");
         assert!(!dump.contains("**Goal**"), "{dump}");
-        assert!(dump.contains("☐ works"), "{dump}");
-        assert!(dump.contains("Do you approve this plan?"), "{dump}");
-        assert!(dump.contains("Yes"), "{dump}");
-        assert!(dump.contains("No"), "{dump}");
-        // Yes is the default focus.
+        assert!(dump.contains("Approve"), "{dump}");
+        assert!(dump.contains("Reject"), "{dump}");
+        // Approve is the default focus.
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
             DevelopAction::PlanApproved
@@ -2927,23 +3153,39 @@ mod tests {
     }
 
     #[test]
-    fn plan_review_scrollbar_reaches_the_bottom_with_the_last_section() {
-        let mut s = wrapping_plan_on_review();
-        for _ in 0..40 {
-            s.handle_key(key(KeyCode::PageDown));
-        }
+    fn plan_review_uses_develop_colors_and_code_highlighting() {
+        let s = screen_on_review();
+        let lines = s.plan_review_lines(108);
+        let title = lines
+            .iter()
+            .find(|line| line.to_string().contains("Section 1 · Data model"))
+            .expect("first section title");
+        assert_eq!(title.spans[0].style.fg, Some(colors::ORANGE));
+        assert_eq!(title.spans[1].style.fg, Some(colors::ORANGE));
+        assert_eq!(title.spans[2].style.fg, Some(colors::WHITE));
+        assert_ne!(title.spans[0].style.fg, Some(colors::SPLIT));
 
-        let buffer = render_buffer(&mut s, 100, 20);
-        let bottom_arrow = (0..buffer.area.height)
-            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
-            .find(|&(x, y)| buffer[(x, y)].symbol() == "▼")
-            .expect("overflowing plan should render a bottom scrollbar arrow");
+        let files = lines
+            .iter()
+            .find(|line| line.to_string().contains("src/export_1.rs"))
+            .expect("Files row");
+        let path = files
+            .spans
+            .iter()
+            .find(|span| span.content.contains("src/export_1.rs"))
+            .expect("highlighted file path");
+        assert_eq!(path.style, code_style());
 
-        assert_eq!(
-            buffer[(bottom_arrow.0, bottom_arrow.1 - 1)].symbol(),
-            "█",
-            "at the last section, the scrollbar thumb should touch the bottom arrow"
-        );
+        let goal = lines
+            .iter()
+            .find(|line| line.to_string().contains("CsvWriter"))
+            .expect("Goal row");
+        let symbol = goal
+            .spans
+            .iter()
+            .find(|span| span.content.contains("CsvWriter"))
+            .expect("highlighted inline code");
+        assert_eq!(symbol.style, code_style());
     }
 
     #[test]
@@ -3272,14 +3514,25 @@ mod tests {
     #[test]
     fn plan_review_mouse_buttons_approve_or_open_feedback() {
         let mut s = screen_on_review();
-        let dump = render_dump(&mut s, 110, 32);
-        let yes_pos = click_position(&dump, "Yes");
-        assert_eq!(s.handle_mouse_click(yes_pos), DevelopAction::PlanApproved);
+        render_dump(&mut s, 110, 32);
+        let [approve_rect, _] = s.review_button_rects.get();
+        let approve_pos = Position {
+            x: approve_rect.x + 1,
+            y: approve_rect.y + 1,
+        };
+        assert_eq!(
+            s.handle_mouse_click(approve_pos),
+            DevelopAction::PlanApproved
+        );
 
         let mut s = screen_on_review();
-        let dump = render_dump(&mut s, 110, 32);
-        let no_pos = click_position(&dump, "No");
-        assert_eq!(s.handle_mouse_click(no_pos), DevelopAction::Continue);
+        render_dump(&mut s, 110, 32);
+        let [_, reject_rect] = s.review_button_rects.get();
+        let reject_pos = Position {
+            x: reject_rect.x + 1,
+            y: reject_rect.y + 1,
+        };
+        assert_eq!(s.handle_mouse_click(reject_pos), DevelopAction::Continue);
         assert_eq!(s.step(), DevelopStep::Feedback);
         assert!(s.input.is_some());
     }
