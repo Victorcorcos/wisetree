@@ -658,6 +658,36 @@ fn max_is_a_soft_ceiling_that_reports_the_overflow_and_its_reason() {
     );
 }
 
+/// The MAX typed on the confirm screen travels as `identity.max` and must
+/// reach every surface that reasons about review size: the planner prompt, the
+/// per-layer sizing, and the rendered Split Plan.
+#[test]
+fn the_confirmed_max_reaches_the_prompt_the_sizes_and_the_plan_file() {
+    let mut preflight = fixture();
+    preflight.identity.max = 137;
+
+    let prompt = build_split_plan_prompt(&preflight, None, None);
+    assert!(
+        prompt.contains("137 per layer (a guideline, not a limit)"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("MAX"),
+        "no MAX placeholder may survive substitution:\n{prompt}"
+    );
+
+    let plan = parse_split_plan(valid_response(), &preflight).expect("plan");
+    assert!(split_layer_sizes(&preflight, &plan)
+        .iter()
+        .all(|size| size.max == 137));
+
+    let rendered = render_split_plan(&preflight, &plan, "awaiting approval");
+    assert!(
+        rendered.contains("| MAX | 137 changed lines |"),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn prompt_contains_frozen_manifest_and_revision_only_when_both_inputs_exist() {
     let preflight = fixture();

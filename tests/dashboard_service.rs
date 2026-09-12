@@ -1078,6 +1078,9 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     assert_eq!(preflight.identity.repository, "example/repo");
     assert_eq!(preflight.identity.base_ref, "origin/main");
     assert_eq!(preflight.identity.source_branch, "feat-dashboard");
+    // The MAX confirmed on the Split screen is frozen into the identity every
+    // later stage (planner prompt, layer sizing, plan file) reads from.
+    assert_eq!(preflight.identity.max, 100);
     assert_eq!(preflight.units.len(), 1);
     assert!(worktree.join(".wisetree").is_dir());
 

@@ -5908,6 +5908,16 @@ impl DashboardService {
                 .and_then(|materialization| materialization.layers.last())
                 .filter(|layer| layer.branch == live_identity.source_branch)
                 .map(|layer| layer.commit_sha.as_str());
+            // A recorded run was planned under its own MAX, so a new one cannot
+            // be honored here. It is also the one mismatch the developer just
+            // caused by typing on the confirm screen — name it instead of
+            // reporting the generic "input no longer matches".
+            if live_identity.max != record.identity.max {
+                return Err(WisetreeError::validation(format!(
+                    "This worktree already has a Split run recorded with MAX {}. Finish it, or archive .wisetree/split_plan.md, before splitting again with MAX {}.",
+                    record.identity.max, live_identity.max
+                )));
+            }
             let source_head_matches = live_identity.source_head == record.identity.source_head
                 || materialized_head == Some(live_identity.source_head.as_str());
             if !source_head_matches
