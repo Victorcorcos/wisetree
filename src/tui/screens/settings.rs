@@ -5005,7 +5005,14 @@ impl SettingsScreen {
                     width: rect_area.width,
                     height: 1,
                 };
-                self.render_ai_settings_rectangle(frame, rect_area, hint_area, editor, i);
+                self.render_ai_settings_rectangle(
+                    frame,
+                    rect_area,
+                    hint_area,
+                    editor,
+                    i,
+                    group.color,
+                );
             }
             group_y += group_area.height;
         }
@@ -5034,9 +5041,13 @@ impl SettingsScreen {
         hint_area: Rect,
         editor: &AiSettingsEditor,
         idx: usize,
+        command_color: Color,
     ) {
         let muted_style = Style::default().fg(colors::MUTED);
-        let info_style = Style::default().fg(colors::INFO);
+        // The slot's name carries its command's color, the same one the group
+        // box around it is drawn in, so a role is traceable to its command
+        // without reading the box title.
+        let label_style = Style::default().fg(command_color);
 
         let slot = AiSlot::ALL[idx];
         let model = slot.get(&editor.ai);
@@ -5100,10 +5111,10 @@ impl SettingsScreen {
                     POST_CMD_SELECTION_MARKER,
                     Style::default().fg(colors::ACCENT),
                 ),
-                Span::styled(format!("{} ", slot.label()), info_style),
+                Span::styled(format!("{} ", slot.label()), label_style),
             ])
         } else {
-            Line::from(Span::styled(format!(" {} ", slot.label()), info_style))
+            Line::from(Span::styled(format!(" {} ", slot.label()), label_style))
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -7503,6 +7514,38 @@ mod tests {
                 title_column(&rows, title),
                 right,
                 "'{title}' left its column"
+            );
+        }
+    }
+
+    /// A slot's own name is drawn in its command's color too, so a role is
+    /// traceable to its command without reading the group box title.
+    #[test]
+    fn ai_settings_colors_each_slot_label_with_its_command_color() {
+        let screen = ai_settings_screen(vec![]);
+        let buffer = render_buffer(&screen, 110, 85);
+        let rows = buffer_rows(&buffer);
+
+        for (label, color) in [
+            ("explain", colors::BRAND),
+            ("fix_apply", colors::CYAN),
+            ("review_strong", colors::NAVY),
+            ("review_balanced", colors::NAVY),
+            ("review_utility", colors::NAVY),
+            ("update", colors::WARNING),
+            ("bugkill_judge", colors::DARK_GREEN),
+            ("develop_implement", colors::ORANGE),
+            ("split_plan", colors::SPLIT),
+        ] {
+            let y = rows
+                .iter()
+                .position(|row| row.contains(label))
+                .unwrap_or_else(|| panic!("slot '{label}' missing from the render"));
+            let x = title_column(&rows, label);
+            assert_eq!(
+                buffer[(x as u16, y as u16)].fg,
+                color,
+                "slot label '{label}' is not in its command's color"
             );
         }
     }
