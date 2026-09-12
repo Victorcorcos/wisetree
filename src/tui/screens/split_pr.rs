@@ -22,9 +22,9 @@ use crate::services::{
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::screens::update_pr::key_event_to_pty_bytes;
 use crate::tui::widgets::{
-    labeled_line, labeled_spans, spinner_frame, AiRoleRow, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup, OptionsGroupItem, PrConfirmView,
-    PtyView,
+    code_style, labeled_line, labeled_spans, spinner_frame, AiRoleRow, ConfirmationChoice,
+    ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup,
+    OptionsGroupItem, PrConfirmView, PtyView,
 };
 
 const DEFAULT_MAX: &str = "1000";
@@ -1160,44 +1160,63 @@ impl SplitPullRequestScreen {
         lines.push(Line::default());
         for (layer, size) in plan.responsibilities.iter().zip(&sizes) {
             let (additions, deletions) = (size.additions, size.deletions);
-            push_wrapped_styled(
-                &mut lines,
-                &format!("{}. {}  [{}]", layer.order, layer.name, layer.branch_slug),
-                width,
-                Style::default()
-                    .fg(colors::SPLIT)
-                    .add_modifier(Modifier::BOLD),
-            );
-            push_wrapped(
-                &mut lines,
-                &format!("Responsibility/dependency: {}", layer.rationale),
-                width,
-            );
-            push_wrapped(
-                &mut lines,
-                &format!("Files: {}", layer.paths.join(", ")),
-                width,
-            );
-            push_wrapped(
-                &mut lines,
-                &format!("Change units: {}", layer.units.join(", ")),
-                width,
-            );
-            push_wrapped(
-                &mut lines,
-                &format!(
-                    "Related tests: {}",
-                    if layer.test_units.is_empty() {
-                        "no changed tests in this layer".to_string()
-                    } else {
-                        layer.test_units.join(", ")
-                    }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("PR {}", layer.order),
+                    Style::default()
+                        .fg(colors::SPLIT)
+                        .add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(
+                    format!(" · {}  ", layer.name),
+                    Style::default()
+                        .fg(colors::WHITE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {} ", layer.branch_slug), code_style()),
+            ]));
+            push_review_table_header(&mut lines);
+            push_review_table_row(
+                &mut lines,
+                "Responsibility/dependency",
+                &layer.rationale,
                 width,
+                Style::default().fg(colors::EMPHASIS),
+            );
+            push_review_table_row(
+                &mut lines,
+                "Files",
+                &layer.paths.join(", "),
+                width,
+                code_style(),
+            );
+            push_review_table_row(
+                &mut lines,
+                "Change units",
+                &layer.units.join(", "),
+                width,
+                Style::default().fg(colors::INFO),
+            );
+            let related_tests = if layer.test_units.is_empty() {
+                "no changed tests in this layer".to_string()
+            } else {
+                layer.test_units.join(", ")
+            };
+            push_review_table_row(
+                &mut lines,
+                "Related tests",
+                &related_tests,
+                width,
+                if layer.test_units.is_empty() {
+                    Style::default().fg(colors::MUTED)
+                } else {
+                    Style::default().fg(colors::INFO)
+                },
             );
             if size.over_max() {
-                push_wrapped_styled(
+                push_review_table_row(
                     &mut lines,
+                    "Integrity",
                     &format!(
                         "⚠ Over MAX: +{additions} -{deletions} = {} changed lines, {} over MAX {}. Kept whole to preserve this single responsibility — splitting it further would cut across the boundary described above.",
                         size.changed,
@@ -1208,14 +1227,7 @@ impl SplitPullRequestScreen {
                     Style::default().fg(colors::WARNING),
                 );
             } else {
-                push_wrapped(
-                    &mut lines,
-                    &format!(
-                        "Integrity: +{additions} -{deletions} = {} · within MAX {} ✓",
-                        size.changed, size.max
-                    ),
-                    width,
-                );
+                push_integrity_table_row(&mut lines, additions, deletions, size.changed, size.max);
             }
             lines.push(Line::default());
         }
@@ -1463,6 +1475,95 @@ fn push_wrapped_styled(lines: &mut Vec<Line<'static>>, text: &str, width: usize,
     if !current.is_empty() {
         lines.push(Line::from(Span::styled(current, style)));
     }
+}
+
+const REVIEW_FIELD_WIDTH: usize = 27;
+
+fn push_review_table_header(lines: &mut Vec<Line<'static>>) {
+    let style = Style::default()
+        .fg(colors::GRAY_DARK)
+        .add_modifier(Modifier::BOLD);
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<REVIEW_FIELD_WIDTH$}", "Field"), style),
+        Span::styled("  Details", style),
+    ]));
+}
+
+fn push_review_table_row(
+    lines: &mut Vec<Line<'static>>,
+    field: &str,
+    value: &str,
+    width: usize,
+    value_style: Style,
+) {
+    let detail_width = width.saturating_sub(REVIEW_FIELD_WIDTH + 2).max(1);
+    let wrapped = wrap_words(value, detail_width);
+    let field_style = Style::default()
+        .fg(colors::GRAY_DARK)
+        .add_modifier(Modifier::BOLD);
+
+    for (index, detail) in wrapped.into_iter().enumerate() {
+        let label = if index == 0 { field } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<REVIEW_FIELD_WIDTH$}"), field_style),
+            Span::raw("  "),
+            Span::styled(detail, value_style),
+        ]));
+    }
+}
+
+fn push_integrity_table_row(
+    lines: &mut Vec<Line<'static>>,
+    additions: u64,
+    deletions: u64,
+    changed: u64,
+    max: u64,
+) {
+    let field_style = Style::default()
+        .fg(colors::GRAY_DARK)
+        .add_modifier(Modifier::BOLD);
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<REVIEW_FIELD_WIDTH$}", "Integrity"), field_style),
+        Span::raw("  "),
+        Span::styled(
+            format!("+{additions}"),
+            Style::default().fg(colors::SUCCESS),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("-{deletions}"), Style::default().fg(colors::ERROR)),
+        Span::styled(
+            format!(" = {changed} · "),
+            Style::default().fg(colors::EMPHASIS),
+        ),
+        Span::styled(
+            format!("within MAX {max} ✓"),
+            Style::default().fg(colors::INFO),
+        ),
+    ]));
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            wrapped.push(current);
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    wrapped
 }
 
 /// Plain-language status for one drafting job, colored so a glance separates

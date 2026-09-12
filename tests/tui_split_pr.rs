@@ -336,12 +336,15 @@ fn review_renders_complete_bottom_to_top_integrity_and_keyboard_actions() {
     assert!(split_colored);
     for expected in [
         "bottom to top",
-        "Foundation",
+        "PR 1 · Foundation",
+        "Field",
+        "Details",
         "Responsibility/dependency",
         "src/a.rs, tests/a_test.rs",
         "CU0001, CU0002",
-        "Related tests: CU0002",
-        "Integrity: +4 -1 = 5 · within MAX 10 ✓",
+        "Related tests",
+        "Integrity",
+        "+4 -1 = 5 · within MAX 10 ✓",
         "Aggregate integrity",
         "+8 -2 = 10 source lines",
         "Approve",
@@ -575,8 +578,9 @@ fn review_flags_every_pull_request_that_runs_past_max_with_its_reason() {
         text.contains("Over MAX: +4 -1 = 5 changed lines, 2 over MAX 3"),
         "{text}"
     );
+    assert!(text.contains("Kept whole to preserve this"), "{text}");
     assert!(
-        text.contains("Kept whole to preserve this single responsibility"),
+        text.contains("single responsibility — splitting it further"),
         "{text}"
     );
     // The AI's own boundary reasoning is what explains the overflow.
@@ -591,10 +595,33 @@ fn review_flags_every_pull_request_that_runs_past_max_with_its_reason() {
 #[test]
 fn review_reports_layers_within_max_as_within_the_guideline() {
     let mut screen = review_screen();
-    let (text, _) = render(&mut screen, 110, 40);
+    let buffer = render_buffer(&mut screen, 110, 40);
+    let mut text = String::new();
+    let mut addition_is_green = false;
+    let mut deletion_is_red = false;
+    let mut within_max_is_blue = false;
+    for y in 0..buffer.area.height {
+        let row = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>();
+        addition_is_green |= row.contains("+4")
+            && (0..buffer.area.width)
+                .any(|x| buffer[(x, y)].symbol() == "+" && buffer[(x, y)].fg == colors::SUCCESS);
+        deletion_is_red |= row.contains("-1")
+            && (0..buffer.area.width)
+                .any(|x| buffer[(x, y)].symbol() == "-" && buffer[(x, y)].fg == colors::ERROR);
+        within_max_is_blue |= row.contains("within MAX 10 ✓")
+            && (0..buffer.area.width)
+                .any(|x| buffer[(x, y)].symbol() == "w" && buffer[(x, y)].fg == colors::INFO);
+        text.push_str(&row);
+        text.push('\n');
+    }
     assert!(text.contains("within MAX 10 ✓"), "{text}");
     assert!(!text.contains("exceed MAX"), "{text}");
     assert!(!text.contains("Over MAX"), "{text}");
+    assert!(addition_is_green, "additions should be green");
+    assert!(deletion_is_red, "deletions should be red");
+    assert!(within_max_is_blue, "within-MAX status should be blue");
 }
 
 /// The decision pair uses the same palette as every other pull-request
