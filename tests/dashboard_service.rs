@@ -1057,6 +1057,16 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
     );
 
     let parent = fixture.repo.parent().unwrap();
+    let empty_excludes = parent.join("empty-git-excludes");
+    fs::write(&empty_excludes, "").unwrap();
+    git(
+        &fixture.repo,
+        &[
+            "config",
+            "core.excludesFile",
+            empty_excludes.to_str().unwrap(),
+        ],
+    );
     let git_path = parent.join("split-git.sh");
     fs::write(
         &git_path,

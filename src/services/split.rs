@@ -13,6 +13,7 @@ use crate::errors::{Result, WisetreeError};
 
 pub const SPLIT_DIRECTORY: &str = ".wisetree";
 pub const SPLIT_PLAN_FILE: &str = ".wisetree/split_plan.md";
+pub const SPLIT_PLAN_ARCHIVE_PREFIX: &str = ".wisetree/split_plan.";
 pub const SPLIT_DRAFT_DIRECTORY: &str = ".wisetree/split_drafts";
 const MATERIALIZATION_MARKER: &str = "<!-- wisetree-split-materialization ";
 const PUBLICATION_MARKER: &str = "<!-- wisetree-split-publication ";

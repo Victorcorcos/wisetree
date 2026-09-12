@@ -58,7 +58,7 @@ use crate::services::split::{
     SplitDraftingRecord, SplitIdentity, SplitMaterialization, SplitMaterializedLayer, SplitPlan,
     SplitPlanResult, SplitPreflight, SplitPreflightRequest, SplitPublication,
     SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY, SPLIT_DRAFT_DIRECTORY,
-    SPLIT_PLAN_FILE,
+    SPLIT_PLAN_ARCHIVE_PREFIX, SPLIT_PLAN_FILE,
 };
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 use crate::worktree::WorktreeService;
@@ -5624,7 +5624,9 @@ impl DashboardService {
             .filter(|entry| !entry.is_empty())
             .filter(|entry| {
                 entry.get(3..).map_or(true, |path| {
-                    path != SPLIT_PLAN_FILE && !path.starts_with(SPLIT_DRAFT_DIRECTORY)
+                    path != SPLIT_PLAN_FILE
+                        && !path.starts_with(SPLIT_PLAN_ARCHIVE_PREFIX)
+                        && !path.starts_with(SPLIT_DRAFT_DIRECTORY)
                 })
             })
             .collect::<Vec<_>>();
@@ -8670,7 +8672,6 @@ fn parse_pr_repo_json(body: &str) -> Option<(String, String)> {
 
 async fn archive_stale_split_plan(cwd: &Path, source_head: &str) -> Result<PathBuf> {
     let short_head = source_head.chars().take(8).collect::<String>();
-    let directory = cwd.join(SPLIT_DIRECTORY);
     let archive = (0u32..)
         .map(|index| {
             let suffix = if index == 0 {
@@ -8678,7 +8679,9 @@ async fn archive_stale_split_plan(cwd: &Path, source_head: &str) -> Result<PathB
             } else {
                 format!(".{index}")
             };
-            directory.join(format!("split_plan.{short_head}{suffix}.md"))
+            cwd.join(format!(
+                "{SPLIT_PLAN_ARCHIVE_PREFIX}{short_head}{suffix}.md"
+            ))
         })
         .find(|candidate| !candidate.exists())
         .expect("an unused Split archive path");
