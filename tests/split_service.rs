@@ -1731,3 +1731,248 @@ fn two_chains_that_share_a_path_are_absorbed_into_one() {
     assert_eq!(split_chains(&parsed), vec![vec![0, 1, 2, 3]]);
     assert!(split_reuses_source_branch(&parsed));
 }
+
+/// A `gh` stand-in that remembers the pull requests it opens, so a test can
+/// assert which branches were stacked, which were opened straight against the
+/// trunk, and what base each one ended up with.
+fn stateful_fake_gh(log: &Path, state: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+STATE="{state}"
+next_number() {{
+  n=$(cat "$STATE/.counter" 2>/dev/null || echo 100)
+  n=$((n + 1))
+  echo "$n" > "$STATE/.counter"
+  echo "$n"
+}}
+emit_pr() {{
+  set -- $(cat "$STATE/$1")
+  printf '[{{"number":%s,"url":"https://github.com/example/repo/pull/%s","state":"OPEN","isDraft":false,"headRefName":"%s","baseRefName":"%s"}}]' "$1" "$1" "$2" "$3"
+}}
+if [ "$1" = "stack" ] && [ "$2" = "link" ]; then
+  shift 2
+  base=""; branches=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base) base="$2"; shift 2 ;;
+      --remote) shift 2 ;;
+      --open) shift ;;
+      *) branches="$branches $1"; shift ;;
+    esac
+  done
+  prev="$base"
+  for b in $branches; do
+    if [ ! -f "$STATE/$b" ]; then
+      printf '%s %s %s' "$(next_number)" "$b" "$prev" > "$STATE/$b"
+    fi
+    prev="$b"
+  done
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  shift 2; head=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --head) head="$2"; shift 2 ;; *) shift ;; esac
+  done
+  if [ -f "$STATE/$head" ]; then emit_pr "$head"; else printf '[]'; fi
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  shift 2; head=""; base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="$2"; shift 2 ;;
+      --base) base="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf '%s %s %s' "$(next_number)" "$head" "$base" > "$STATE/$head"
+  printf 'https://github.com/example/repo/pull/%s\n' "$(cut -d' ' -f1 "$STATE/$head")"
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi
+printf '[]'
+"#,
+        log = log.display(),
+        state = state.display()
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn publishing_a_forest_stacks_the_chains_and_opens_the_leaf_against_the_trunk() {
+    let _guard = HOME_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let previous_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+
+    // chain A: alpha_bottom -> alpha_top | leaf: deps | chain B: beta_bottom -> beta_top
+    let fixture = split_repo(
+        &[
+            ("src/alpha_bottom.txt", b"alpha bottom before\n"),
+            ("src/alpha_top.txt", b"alpha top before\n"),
+            ("config/deps.txt", b"dependency before\n"),
+            ("src/beta_bottom.txt", b"beta bottom before\n"),
+            ("src/beta_top.txt", b"beta top before\n"),
+        ],
+        &[
+            ("src/alpha_bottom.txt", Some(b"alpha bottom after\n")),
+            ("src/alpha_top.txt", Some(b"alpha top after\n")),
+            ("config/deps.txt", Some(b"dependency after\n")),
+            ("src/beta_bottom.txt", Some(b"beta bottom after\n")),
+            ("src/beta_top.txt", Some(b"beta top after\n")),
+        ],
+    );
+    // A real remote, so the push the harness performs for a one-layer chain is
+    // genuinely exercised rather than faked away.
+    let remote = fixture.repo.parent().unwrap().join("origin.git");
+    Command::new("git")
+        .args(["init", "--bare", "-q", remote.to_str().unwrap()])
+        .status()
+        .unwrap();
+    git(
+        &fixture.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&fixture.repo, &["push", "-q", "origin", "main"]);
+
+    let range = format!("{}..{}", fixture.base, fixture.head);
+    let diff = git_stdout(
+        &fixture.source,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--find-renames",
+            "--unified=0",
+            "--no-color",
+            "--no-ext-diff",
+            &range,
+        ],
+    );
+    let units = inventory_diff(&diff).unwrap();
+    let unit_for = |path: &str| units.iter().find(|unit| unit.path == path).unwrap().clone();
+    let (additions, deletions) = units.iter().fold((0, 0), |counts, unit| {
+        (counts.0 + unit.additions, counts.1 + unit.deletions)
+    });
+    let plan = SplitPlan {
+        responsibilities: vec![
+            independence_layer(1, &unit_for("src/alpha_bottom.txt"), false),
+            independence_layer(2, &unit_for("src/alpha_top.txt"), false),
+            independence_layer(3, &unit_for("config/deps.txt"), true),
+            independence_layer(4, &unit_for("src/beta_bottom.txt"), true),
+            independence_layer(5, &unit_for("src/beta_top.txt"), false),
+        ],
+    };
+    let preflight = SplitPreflight {
+        worktree_path: fixture.source.to_string_lossy().into_owned(),
+        identity: SplitIdentity {
+            repository: "example/repo".into(),
+            remote: "origin".into(),
+            base_ref: "origin/main".into(),
+            base_sha: fixture.base.clone(),
+            source_branch: "feature".into(),
+            source_head: fixture.head.clone(),
+            max: 100,
+            additions,
+            deletions,
+        },
+        units,
+    };
+
+    let log = fixture.repo.parent().unwrap().join("gh.log");
+    let state = fixture.repo.parent().unwrap().join("gh-state");
+    fs::create_dir_all(&state).unwrap();
+    let gh = fixture.repo.parent().unwrap().join("fake-gh.sh");
+    fs::write(&gh, stateful_fake_gh(&log, &state)).unwrap();
+    make_executable(&gh);
+    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default())
+        .with_gh_binary(gh.clone());
+
+    service
+        .save_split_plan(&preflight, &plan, "approved")
+        .await
+        .unwrap();
+    service
+        .materialize_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+    let publication = service
+        .publish_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+
+    let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
+    let layers = parse_materialization(&document).unwrap().unwrap().layers;
+    let branches = layers
+        .iter()
+        .map(|layer| layer.branch.clone())
+        .collect::<Vec<_>>();
+
+    // Every pull request targets the base its chain dictates.
+    assert_eq!(publication.pull_requests.len(), 5);
+    let expected = split_publication_bases(&plan, &branches, "main");
+    for (pull_request, expected_base) in publication.pull_requests.iter().zip(&expected) {
+        assert_eq!(
+            pull_request.expected_base, *expected_base,
+            "PR for `{}` targets the wrong base",
+            pull_request.branch
+        );
+    }
+    assert_eq!(expected[0], "main");
+    assert_eq!(expected[1], branches[0]);
+    assert_eq!(expected[2], "main");
+    assert_eq!(expected[3], "main");
+    assert_eq!(expected[4], branches[3]);
+    assert_eq!(
+        publication
+            .pull_requests
+            .iter()
+            .map(|pull_request| pull_request.independent)
+            .collect::<Vec<_>>(),
+        vec![false, false, true, true, false]
+    );
+
+    // The two chains were stacked; only the one-layer chain was opened directly.
+    let invocations = fs::read_to_string(&log).unwrap();
+    let stack_links = invocations
+        .lines()
+        .filter(|line| line.starts_with("stack link"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stack_links.len(),
+        2,
+        "one per multi-layer chain: {stack_links:?}"
+    );
+    assert!(stack_links[0].ends_with(&format!("{} {}", branches[0], branches[1])));
+    assert!(stack_links[1].ends_with(&format!("{} {}", branches[3], branches[4])));
+    let creates = invocations
+        .lines()
+        .filter(|line| line.starts_with("pr create"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        creates.len(),
+        1,
+        "only the leaf is opened directly: {creates:?}"
+    );
+    assert!(creates[0].contains(&branches[2]) && creates[0].contains("--base main"));
+
+    // The leaf's branch really reached the remote.
+    assert!(git_succeeds(
+        &fixture.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/remotes/origin/{}", branches[2])
+        ]
+    ));
+
+    // And the gate that guards drafting accepts the result.
+    validate_split_publication(&preflight, &plan, &publication).unwrap();
+
+    if let Some(value) = previous_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+}
