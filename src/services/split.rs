@@ -94,6 +94,11 @@ pub struct SplitResponsibility {
     #[serde(default)]
     pub test_units: Vec<String>,
     pub paths: Vec<String>,
+    /// Proposed by the planning AI and demoted by [`parse_split_plan`] whenever
+    /// the deterministic path-disjointness test fails. Stacked is the safe
+    /// default: independence is a promotion that has to be proved.
+    #[serde(default)]
+    pub independent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +154,10 @@ pub struct SplitPublishedPullRequest {
     pub url: String,
     pub provisional_title: String,
     pub provisional_title_applied: bool,
+    /// Mirrors the approved plan: this pull request targets the trunk and is
+    /// mergeable without any sibling in the split.
+    #[serde(default)]
+    pub independent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +248,35 @@ pub fn split_draft_cache_path(worktree: &str, job_id: &str) -> std::path::PathBu
         .join(format!("{job_id}.json"))
 }
 
+/// `gh stack link` needs at least two branches, so a chain that shrank to one
+/// is published exactly like an independent layer: straight against the trunk.
+pub fn split_uses_stack_link(plan: &SplitPlan) -> bool {
+    plan.responsibilities
+        .iter()
+        .filter(|layer| !layer.independent)
+        .count()
+        >= 2
+}
+
+/// The base branch every published pull request must target, in plan order.
+///
+/// Publication and the gate that verifies it share this, because computing the
+/// same chain twice is precisely how the two drifted apart.
+pub fn split_publication_bases(plan: &SplitPlan, branches: &[String], trunk: &str) -> Vec<String> {
+    let stacked = split_uses_stack_link(plan);
+    let mut previous_chain: Option<String> = None;
+    let mut bases = Vec::with_capacity(plan.responsibilities.len());
+    for (index, layer) in plan.responsibilities.iter().enumerate() {
+        if layer.independent || !stacked {
+            bases.push(trunk.to_string());
+            continue;
+        }
+        bases.push(previous_chain.clone().unwrap_or_else(|| trunk.to_string()));
+        previous_chain = branches.get(index).cloned();
+    }
+    bases
+}
+
 pub fn validate_split_publication(
     preflight: &SplitPreflight,
     plan: &SplitPlan,
@@ -260,19 +298,22 @@ pub fn validate_split_publication(
     }
     let mut numbers = BTreeSet::new();
     let mut urls = BTreeSet::new();
+    let branches = publication
+        .pull_requests
+        .iter()
+        .map(|pull_request| pull_request.branch.clone())
+        .collect::<Vec<_>>();
+    let expected_bases = split_publication_bases(plan, &branches, &publication.trunk);
     for (index, pull_request) in publication.pull_requests.iter().enumerate() {
         let expected_order = index + 1;
-        let expected_base = if index == 0 {
-            publication.trunk.as_str()
-        } else {
-            publication.pull_requests[index - 1].branch.as_str()
-        };
+        let expected_base = expected_bases[index].as_str();
         let expected_url = format!(
             "https://github.com/{}/pull/{}",
             publication.repository, pull_request.number
         );
         if pull_request.order != expected_order
             || pull_request.expected_base != expected_base
+            || pull_request.independent != plan.responsibilities[index].independent
             || pull_request.url != expected_url
             || pull_request.number == 0
             || !pull_request.provisional_title_applied
@@ -284,11 +325,15 @@ pub fn validate_split_publication(
             )));
         }
     }
-    if publication
-        .pull_requests
-        .last()
-        .map(|pull_request| pull_request.branch.as_str())
-        != Some(preflight.identity.source_branch.as_str())
+    // Only the all-stacked shape ends on the source branch. With an independent
+    // layer the source branch was never moved and never published, so demanding
+    // it here would reject every correct forest.
+    if split_reuses_source_branch(plan)
+        && publication
+            .pull_requests
+            .last()
+            .map(|pull_request| pull_request.branch.as_str())
+            != Some(preflight.identity.source_branch.as_str())
     {
         return Err(WisetreeError::validation(
             "Split drafting requires the source branch to be the top published layer.",
@@ -454,14 +499,8 @@ pub fn compose_split_body(
     )?;
     let mut plan = String::from("### Split Plan 📋\n\n");
     for (index, pull_request) in pull_requests.iter().enumerate() {
-        let marker = if index + 1 == current_order {
-            " **(current PR)**"
-        } else if index + 1 > current_order {
-            " **(future PR)**"
-        } else {
-            ""
-        };
-        plan.push_str(&format!("{}. {}{}\n", index + 1, pull_request.url, marker));
+        plan.push_str(&split_plan_entry(index, pull_request, current_order));
+        plan.push('\n');
     }
     let description_index = descriptions[0];
     let after_description = lines[description_index + 1..].join("\n");
@@ -524,6 +563,27 @@ fn looks_like_template_placeholder(line: &str) -> bool {
             || lower == "todo")
 }
 
+/// One line of the harness-owned Split Plan list. Composition and validation
+/// share it so the rendered body and the contract can never drift.
+///
+/// An independent pull request is not "future" work: it targets the trunk and
+/// can merge at any time, so it is labelled for what it is.
+fn split_plan_entry(
+    index: usize,
+    pull_request: &SplitPublishedPullRequest,
+    current_order: usize,
+) -> String {
+    let number = index + 1;
+    let marker = match (number == current_order, pull_request.independent) {
+        (true, true) => " **(current PR — independent)**",
+        (true, false) => " **(current PR)**",
+        (false, true) => " **(independent PR)**",
+        (false, false) if number > current_order => " **(future PR)**",
+        (false, false) => "",
+    };
+    format!("{number}. {}{marker}", pull_request.url)
+}
+
 pub fn validate_split_body(
     body: &str,
     pull_requests: &[SplitPublishedPullRequest],
@@ -549,13 +609,7 @@ pub fn validate_split_body(
                 pull_request.url
             )));
         }
-        let expected = if index + 1 == current_order {
-            format!("{}. {} **(current PR)**", index + 1, pull_request.url)
-        } else if index + 1 > current_order {
-            format!("{}. {} **(future PR)**", index + 1, pull_request.url)
-        } else {
-            format!("{}. {}", index + 1, pull_request.url)
-        };
+        let expected = split_plan_entry(index, pull_request, current_order);
         if !body.lines().any(|line| line == expected) {
             return Err(WisetreeError::validation(
                 "Split body contains an incorrect current/future marker or URL order.",
@@ -1133,6 +1187,44 @@ pub fn split_layer_sizes(preflight: &SplitPreflight, plan: &SplitPlan) -> Vec<Sp
         .collect()
 }
 
+/// Where one materialized layer is rooted.
+///
+/// A layer is either stacked on the layer below it, or independent: cut
+/// straight from the resolved base so its pull request targets the trunk and
+/// can merge without waiting for any sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitLayerBase {
+    ResolvedBase,
+    Layer(usize),
+}
+
+/// Resolve every layer's parent from the validated plan.
+///
+/// Independent layers are leaves rooted at the resolved base. The remaining
+/// layers keep their bottom-to-top chain, skipping over the independent ones.
+pub fn split_layer_bases(plan: &SplitPlan) -> Vec<SplitLayerBase> {
+    let mut chain_tip: Option<usize> = None;
+    plan.responsibilities
+        .iter()
+        .map(|layer| {
+            if layer.independent {
+                return SplitLayerBase::ResolvedBase;
+            }
+            let base = chain_tip.map_or(SplitLayerBase::ResolvedBase, SplitLayerBase::Layer);
+            chain_tip = Some(layer.order);
+            base
+        })
+        .collect()
+}
+
+/// The source branch may only be reused as the chain tip when the chain holds
+/// every change unit — that is what makes its tree identical to the source
+/// tree. As soon as one layer leaves the stack, the chain is a strict subset
+/// of the source and every layer is materialized in its own worktree instead.
+pub fn split_reuses_source_branch(plan: &SplitPlan) -> bool {
+    plan.responsibilities.iter().all(|layer| !layer.independent)
+}
+
 pub fn build_plan_prompt(
     preflight: &SplitPreflight,
     previous_proposal: Option<&str>,
@@ -1277,6 +1369,7 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
     let mut total_additions = 0u64;
     let mut total_deletions = 0u64;
     let mut derived_test_units = Vec::with_capacity(plan.responsibilities.len());
+    let mut touched: Vec<BTreeSet<&str>> = Vec::with_capacity(plan.responsibilities.len());
     for (index, responsibility) in plan.responsibilities.iter().enumerate() {
         if responsibility.order != index + 1 {
             return Err(WisetreeError::validation(
@@ -1305,6 +1398,7 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
         let mut layer_additions = 0u64;
         let mut layer_deletions = 0u64;
         let mut layer_paths = BTreeSet::new();
+        let mut touched_paths = BTreeSet::new();
         for id in &responsibility.units {
             let unit = manifest.get(id.as_str()).ok_or_else(|| {
                 WisetreeError::validation(format!(
@@ -1319,7 +1413,14 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
             layer_additions += unit.additions;
             layer_deletions += unit.deletions;
             layer_paths.insert(unit.path.as_str());
+            // A rename retires its old path too, so independence has to be
+            // judged against both sides of the change.
+            touched_paths.insert(unit.path.as_str());
+            if let Some(old_path) = unit.old_path.as_deref() {
+                touched_paths.insert(old_path);
+            }
         }
+        touched.push(touched_paths);
         let declared_paths = responsibility
             .paths
             .iter()
@@ -1363,6 +1464,26 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
         return Err(WisetreeError::validation(
             "Split plan totals do not match the frozen source diff.",
         ));
+    }
+    // Independence is a promotion the harness has to prove, never a claim it
+    // accepts. A layer may only leave the stack when no other layer touches any
+    // of its paths: a shared path means the trunk-targeted branch and the chain
+    // would each carry half of that file's final content, and no ordering of
+    // the merges reproduces the source. Anything unproven is demoted back into
+    // the chain, which is always safe.
+    let independent_is_disjoint = |index: usize| {
+        touched
+            .iter()
+            .enumerate()
+            .all(|(other, paths)| other == index || paths.is_disjoint(&touched[index]))
+    };
+    let demoted = (0..plan.responsibilities.len())
+        .filter(|&index| {
+            plan.responsibilities[index].independent && !independent_is_disjoint(index)
+        })
+        .collect::<Vec<_>>();
+    for index in demoted {
+        plan.responsibilities[index].independent = false;
     }
     for (responsibility, test_units) in plan.responsibilities.iter_mut().zip(derived_test_units) {
         responsibility.test_units = test_units;
@@ -1440,13 +1561,18 @@ pub fn render_split_plan(preflight: &SplitPreflight, plan: &SplitPlan, status: &
         status.trim()
     );
     let sizes = split_layer_sizes(preflight, plan);
-    output.push_str("\n| Layer | Responsibility | Branch slug | Units | + | - | Total | MAX |\n| ---: | --- | --- | --- | ---: | ---: | ---: | --- |\n");
-    for (layer, size) in plan.responsibilities.iter().zip(&sizes) {
+    let bases = split_layer_bases(plan);
+    output.push_str("\n| Layer | Responsibility | Branch slug | Targets | Units | + | - | Total | MAX |\n| ---: | --- | --- | --- | --- | ---: | ---: | ---: | --- |\n");
+    for ((layer, size), base) in plan.responsibilities.iter().zip(&sizes).zip(&bases) {
         output.push_str(&format!(
-            "| {} | {} | `{}` | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | `{}` | {} | {} | {} | {} | {} | {} |\n",
             layer.order,
             layer.name,
             layer.branch_slug,
+            match base {
+                SplitLayerBase::ResolvedBase => format!("`{}`", identity.base_ref),
+                SplitLayerBase::Layer(order) => format!("layer {order}"),
+            },
             layer.units.join(", "),
             size.additions,
             size.deletions,
@@ -1457,7 +1583,14 @@ pub fn render_split_plan(preflight: &SplitPreflight, plan: &SplitPlan, status: &
                 "within".to_string()
             }
         ));
-        output.push_str(&format!("\nDependency: {}\n\n", layer.rationale));
+        if layer.independent {
+            output.push_str(&format!(
+                "\nDependency: independent — no other layer touches its paths, so it applies directly to `{}` and can merge on its own.\n\n",
+                identity.base_ref
+            ));
+        } else {
+            output.push_str(&format!("\nDependency: {}\n\n", layer.rationale));
+        }
         if size.over_max() {
             output.push_str(&format!(
                 "> [!WARNING]\n> This responsibility is {} changed lines, {} over the MAX of {}. It was kept whole because splitting it would break the single responsibility described above.\n\n",

@@ -1138,6 +1138,7 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
                 units: vec![unit.id.clone()],
                 test_units: Vec::new(),
                 paths: vec![unit.path.clone()],
+                independent: false,
             })
             .collect(),
     };

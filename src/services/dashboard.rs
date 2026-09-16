@@ -53,12 +53,13 @@ use crate::services::split::{
     parse_numstat_totals, parse_publication, parse_split_draft, parse_split_drafting,
     parse_split_run, patch_for_units, provisional_split_title, render_materialization,
     render_publication, render_split_drafting, render_split_plan, split_branch_name,
-    split_draft_cache_path, split_draft_job_id, validate_manifest as validate_split_manifest,
-    validate_split_publication, SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord,
-    SplitDraftingRecord, SplitIdentity, SplitMaterialization, SplitMaterializedLayer, SplitPlan,
-    SplitPlanResult, SplitPreflight, SplitPreflightRequest, SplitPublication,
-    SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY, SPLIT_DRAFT_DIRECTORY,
-    SPLIT_PLAN_ARCHIVE_PREFIX, SPLIT_PLAN_FILE,
+    split_draft_cache_path, split_draft_job_id, split_publication_bases,
+    split_reuses_source_branch, split_uses_stack_link,
+    validate_manifest as validate_split_manifest, validate_split_publication, SplitDraftJobStatus,
+    SplitDraftProgress, SplitDraftRecord, SplitDraftingRecord, SplitIdentity, SplitMaterialization,
+    SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
+    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY,
+    SPLIT_DRAFT_DIRECTORY, SPLIT_PLAN_ARCHIVE_PREFIX, SPLIT_PLAN_FILE,
 };
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 use crate::worktree::WorktreeService;
@@ -6178,7 +6179,12 @@ impl DashboardService {
         preflight: &SplitPreflight,
         plan: &SplitPlan,
     ) -> Result<()> {
-        crate::services::split::parse_split_plan(&serde_json::to_string(plan)?, preflight)?;
+        // Materialize the *normalized* plan, never the caller's copy: validation
+        // is also what demotes an unproven independence claim back into the
+        // stack, so discarding its result would let the claim through.
+        let normalized =
+            crate::services::split::parse_split_plan(&serde_json::to_string(plan)?, preflight)?;
+        let plan = &normalized;
         let source = PathBuf::from(&preflight.worktree_path);
         let source_status = self.split_source_status(&source).await?;
         let range = format!(
@@ -6239,12 +6245,32 @@ impl DashboardService {
         let mut worktrees = WorktreeService::new(Some(source.clone()));
         worktrees.initialize().await?;
         let git = worktrees.git_service();
-        let mut parent_branch = preflight.identity.base_ref.clone();
-        let mut parent_sha = preflight.identity.base_sha.clone();
-        let lower_count = plan.responsibilities.len() - 1;
+        // The chain walks bottom to top, skipping independent layers: those are
+        // leaves cut straight from the resolved base.
+        let mut chain_branch = preflight.identity.base_ref.clone();
+        let mut chain_sha = preflight.identity.base_sha.clone();
+        // The source branch may only become the chain tip when the chain owns
+        // every change unit, because `commit_split_top` bakes the whole source
+        // tree into that commit. With an independent layer the chain is a
+        // strict subset of the source, so every layer gets its own worktree and
+        // the source branch is left exactly where the developer put it.
+        let reuse_source = split_reuses_source_branch(plan);
+        let lower_count = if reuse_source {
+            plan.responsibilities.len() - 1
+        } else {
+            plan.responsibilities.len()
+        };
 
         for responsibility in plan.responsibilities.iter().take(lower_count) {
             let order = responsibility.order;
+            let (parent_branch, parent_sha) = if responsibility.independent {
+                (
+                    preflight.identity.base_ref.clone(),
+                    preflight.identity.base_sha.clone(),
+                )
+            } else {
+                (chain_branch.clone(), chain_sha.clone())
+            };
             let branch = split_branch_name(
                 &preflight.identity.source_branch,
                 order,
@@ -6281,8 +6307,10 @@ impl DashboardService {
                 .map_err(|error| {
                     WisetreeError::validation(format!("Split layer {order}: {error}"))
                 })?;
-                parent_branch = branch;
-                parent_sha = recorded.commit_sha.clone();
+                if !responsibility.independent {
+                    chain_branch = branch;
+                    chain_sha = recorded.commit_sha.clone();
+                }
                 continue;
             }
             if materialization.layers.len() != order - 1 {
@@ -6356,10 +6384,30 @@ impl DashboardService {
             });
             self.save_split_materialization(preflight, plan, &materialization)
                 .await?;
-            parent_branch = branch;
-            parent_sha = commit_sha;
+            if !responsibility.independent {
+                chain_branch = branch;
+                chain_sha = commit_sha;
+            }
         }
 
+        if !reuse_source {
+            self.verify_split_source(preflight, &source, &preflight.identity.source_head)
+                .await?;
+            if self.split_source_status(&source).await? != source_status {
+                return Err(WisetreeError::validation(
+                    "Split stopped because the selected source worktree or index changed during materialization.",
+                ));
+            }
+            self.verify_split_partition(preflight, plan, &materialization, &source)
+                .await?;
+            return self
+                .save_split_materialization(preflight, plan, &materialization)
+                .await;
+        }
+
+        // Reuse mode only: the chain holds every layer below the top, and the
+        // source branch is about to become the tip.
+        let (parent_branch, parent_sha) = (chain_branch, chain_sha);
         let top = plan.responsibilities.last().expect("validated Split plan");
         let top_units = top.units.iter().cloned().collect::<BTreeSet<_>>();
         let expected_top = patch_for_units(&frozen_diff, &top_units)?;
@@ -6470,6 +6518,11 @@ impl DashboardService {
         preflight: &SplitPreflight,
         plan: &SplitPlan,
     ) -> Result<SplitPublication> {
+        // Publish the same normalized plan that was materialized, so an
+        // unproven independence claim cannot reach the GitHub bases either.
+        let normalized =
+            crate::services::split::parse_split_plan(&serde_json::to_string(plan)?, preflight)?;
+        let plan = &normalized;
         let source = Path::new(&preflight.worktree_path);
         let document = tokio::fs::read_to_string(source.join(SPLIT_PLAN_FILE)).await?;
         let materialization = parse_materialization(&document)?.ok_or_else(|| {
@@ -6485,19 +6538,26 @@ impl DashboardService {
                 "Split cannot publish an incomplete or unverified local stack.",
             ));
         }
-        let top_head = materialization
-            .layers
-            .last()
-            .map(|layer| layer.commit_sha.as_str())
-            .ok_or_else(|| WisetreeError::validation("Split stack has no top layer."))?;
-        self.verify_split_source(preflight, source, top_head)
+        let reuse_source = split_reuses_source_branch(plan);
+        // With an independent layer the source branch was never moved, so the
+        // expected head is the developer's own commit rather than a chain tip.
+        let expected_source_head = if reuse_source {
+            materialization
+                .layers
+                .last()
+                .map(|layer| layer.commit_sha.as_str())
+                .ok_or_else(|| WisetreeError::validation("Split stack has no top layer."))?
+        } else {
+            preflight.identity.source_head.as_str()
+        };
+        self.verify_split_source(preflight, source, expected_source_head)
             .await?;
         let branches = materialization
             .layers
             .iter()
             .map(|layer| layer.branch.clone())
             .collect::<Vec<_>>();
-        if branches.last() != Some(&preflight.identity.source_branch) {
+        if reuse_source && branches.last() != Some(&preflight.identity.source_branch) {
             return Err(WisetreeError::validation(
                 "Split cannot publish because the source branch is not the verified top layer.",
             ));
@@ -6533,26 +6593,63 @@ impl DashboardService {
         self.save_split_publication(preflight, plan, &materialization, &publication)
             .await?;
 
+        // Independent layers never enter the stack: they are pushed and opened
+        // straight against the trunk. `gh stack link` also needs at least two
+        // branches, so a chain that shrank to one is published the same way.
+        let chain_branches = plan
+            .responsibilities
+            .iter()
+            .filter(|responsibility| !responsibility.independent)
+            .map(|responsibility| branches[responsibility.order - 1].clone())
+            .collect::<Vec<_>>();
+        let use_stack_link = split_uses_stack_link(plan);
+        let standalone = plan
+            .responsibilities
+            .iter()
+            .filter(|responsibility| responsibility.independent || !use_stack_link)
+            .map(|responsibility| {
+                (
+                    responsibility.order,
+                    branches[responsibility.order - 1].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
         if !publication.stack_link_completed {
-            let mut args = vec![
-                "stack".to_string(),
-                "link".to_string(),
-                "--base".to_string(),
-                trunk.clone(),
-                "--remote".to_string(),
-                preflight.identity.remote.clone(),
-                "--open".to_string(),
-            ];
-            args.extend(branches.iter().cloned());
-            let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-            if let Err(diagnostics) = run_command(&self.gh_binary, &refs, Some(source)).await {
-                publication.status = "publication failed".to_string();
-                publication.diagnostics = Some(diagnostics.clone());
-                self.save_split_publication(preflight, plan, &materialization, &publication)
-                    .await?;
-                return Err(WisetreeError::validation(format!(
-                    "GitHub stack publication failed: {diagnostics}"
-                )));
+            if use_stack_link {
+                let mut args = vec![
+                    "stack".to_string(),
+                    "link".to_string(),
+                    "--base".to_string(),
+                    trunk.clone(),
+                    "--remote".to_string(),
+                    preflight.identity.remote.clone(),
+                    "--open".to_string(),
+                ];
+                args.extend(chain_branches.iter().cloned());
+                let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+                if let Err(diagnostics) = run_command(&self.gh_binary, &refs, Some(source)).await {
+                    publication.status = "publication failed".to_string();
+                    publication.diagnostics = Some(diagnostics.clone());
+                    self.save_split_publication(preflight, plan, &materialization, &publication)
+                        .await?;
+                    return Err(WisetreeError::validation(format!(
+                        "GitHub stack publication failed: {diagnostics}"
+                    )));
+                }
+            }
+            for (order, branch) in &standalone {
+                if let Err(diagnostics) = self
+                    .publish_independent_split_branch(preflight, plan, &trunk, *order, branch)
+                    .await
+                {
+                    let diagnostics = diagnostics.to_string();
+                    publication.status = "publication failed".to_string();
+                    publication.diagnostics = Some(diagnostics.clone());
+                    self.save_split_publication(preflight, plan, &materialization, &publication)
+                        .await?;
+                    return Err(WisetreeError::validation(diagnostics));
+                }
             }
             publication.stack_link_completed = true;
             publication.status = "resolving pull requests".to_string();
@@ -6578,12 +6675,10 @@ impl DashboardService {
         let mut pull_requests = Vec::with_capacity(branches.len());
         let mut numbers = BTreeSet::new();
         let mut urls = BTreeSet::new();
+        let expected_bases = split_publication_bases(plan, &branches, &trunk);
         for (index, branch) in branches.iter().enumerate() {
-            let expected_base = if index == 0 {
-                trunk.clone()
-            } else {
-                branches[index - 1].clone()
-            };
+            let independent = plan.responsibilities[index].independent;
+            let expected_base = expected_bases[index].clone();
             let raw = match run_command(
                 &self.gh_binary,
                 &[
@@ -6668,6 +6763,7 @@ impl DashboardService {
                 url: metadata.url,
                 provisional_title,
                 provisional_title_applied,
+                independent,
             });
             publication.pull_requests = pull_requests.clone();
             self.save_split_publication(preflight, plan, &materialization, &publication)
@@ -7411,6 +7507,151 @@ impl DashboardService {
             return Err(WisetreeError::validation(format!(
                 "Split layer {order}: recorded tree or verified counts no longer match."
             )));
+        }
+        Ok(())
+    }
+
+    /// Push one trunk-targeted Split branch and open its pull request.
+    ///
+    /// `gh stack link` owns the chained branches; this covers the layers that
+    /// deliberately left the stack. The title is the same provisional
+    /// `(i/N)` title the stack linker gets, and the body is a placeholder the
+    /// drafting step overwrites, so both publication paths converge on exactly
+    /// the same state before any AI runs.
+    async fn publish_independent_split_branch(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+        trunk: &str,
+        order: usize,
+        branch: &str,
+    ) -> Result<()> {
+        let source = Path::new(&preflight.worktree_path);
+        let existing = run_command(
+            &self.gh_binary,
+            &[
+                "pr",
+                "list",
+                "--repo",
+                &preflight.identity.repository,
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "number",
+            ],
+            Some(source),
+        )
+        .await
+        .map_err(WisetreeError::other)?;
+        // A resumed run finds its own pull request already open; the shared
+        // resolution loop below verifies it either way.
+        if existing.trim() != "[]" {
+            return Ok(());
+        }
+        run_command(
+            &self.git_binary,
+            &["push", "-u", &preflight.identity.remote, branch],
+            Some(source),
+        )
+        .await
+        .map_err(|diagnostics| {
+            WisetreeError::validation(format!(
+                "Could not push independent Split branch `{branch}`: {diagnostics}"
+            ))
+        })?;
+        let title = provisional_split_title(
+            &preflight.identity.source_branch,
+            order,
+            plan.responsibilities.len(),
+        );
+        run_command(
+            &self.gh_binary,
+            &[
+                "pr",
+                "create",
+                "--repo",
+                &preflight.identity.repository,
+                "--head",
+                branch,
+                "--base",
+                trunk,
+                "--title",
+                &title,
+                "--body",
+                "Wisetree Split is drafting this description.",
+            ],
+            Some(source),
+        )
+        .await
+        .map_err(|diagnostics| {
+            WisetreeError::validation(format!(
+                "Could not open the independent Split pull request for `{branch}`: {diagnostics}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Prove that a forest of layers still reproduces the source exactly.
+    ///
+    /// When the source branch is reused as the chain tip, integrity is implied:
+    /// `commit_split_top` builds that commit from the source tree itself, so
+    /// tip and source are byte-identical by construction. An independent layer
+    /// breaks that — the chain no longer carries every change unit — so the
+    /// guarantee is re-established per path instead: every leaf must already
+    /// hold the source's final content for each path it owns, and the plan
+    /// guarantees the leaves partition the changed paths between them.
+    async fn verify_split_partition(
+        &self,
+        preflight: &SplitPreflight,
+        plan: &SplitPlan,
+        materialization: &SplitMaterialization,
+        source: &Path,
+    ) -> Result<()> {
+        let mut leaves: Vec<(String, BTreeSet<String>)> = Vec::new();
+        let mut chain_paths = BTreeSet::new();
+        let mut chain_tip: Option<String> = None;
+        for (index, responsibility) in plan.responsibilities.iter().enumerate() {
+            let layer = materialization.layers.get(index).ok_or_else(|| {
+                WisetreeError::validation("Split partition check is missing a materialized layer.")
+            })?;
+            let paths = preflight
+                .units
+                .iter()
+                .filter(|unit| responsibility.units.contains(&unit.id))
+                .flat_map(|unit| [Some(unit.path.clone()), unit.old_path.clone()])
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            if responsibility.independent {
+                leaves.push((layer.commit_sha.clone(), paths));
+            } else {
+                chain_paths.extend(paths);
+                chain_tip = Some(layer.commit_sha.clone());
+            }
+        }
+        if let Some(tip) = chain_tip {
+            leaves.push((tip, chain_paths));
+        }
+        for (commit, paths) in leaves {
+            let mut args = vec![
+                "diff".to_string(),
+                "--name-only".to_string(),
+                commit.clone(),
+                preflight.identity.source_head.clone(),
+                "--".to_string(),
+            ];
+            args.extend(paths);
+            let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let differing = run_command(&self.git_binary, &refs, Some(source))
+                .await
+                .map_err(WisetreeError::other)?;
+            if !differing.trim().is_empty() {
+                return Err(WisetreeError::validation(format!(
+                    "Split layers do not reproduce the source: `{commit}` differs from the source at {}.",
+                    differing.split_whitespace().collect::<Vec<_>>().join(", ")
+                )));
+            }
         }
         Ok(())
     }

@@ -141,6 +141,7 @@ fn publication() -> SplitPublication {
                 url: "https://github.com/acme/repo/pull/91".into(),
                 provisional_title: "Feature Large Change (1/2)".into(),
                 provisional_title_applied: true,
+                independent: false,
             },
             SplitPublishedPullRequest {
                 order: 2,
@@ -150,6 +151,7 @@ fn publication() -> SplitPublication {
                 url: "https://github.com/acme/repo/pull/92".into(),
                 provisional_title: "Feature Large Change (2/2)".into(),
                 provisional_title_applied: true,
+                independent: false,
             },
         ],
     }

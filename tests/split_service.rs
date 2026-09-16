@@ -13,11 +13,13 @@ use wisetree::services::{
     parse_materialization, parse_numstat_totals, parse_publication, parse_split_draft,
     parse_split_drafting, parse_split_plan, parse_split_plan_transcript, parse_split_run,
     patch_for_units, provisional_split_title, render_publication, render_split_drafting,
-    render_split_plan, split_draft_cache_path, split_draft_job_id, split_layer_sizes,
+    render_split_plan, split_draft_cache_path, split_draft_job_id, split_layer_bases,
+    split_layer_sizes, split_publication_bases, split_reuses_source_branch, split_uses_stack_link,
     validate_split_body, validate_split_manifest, validate_split_publication,
     validate_split_resume, ChangeUnit, ChangeUnitKind, DashboardService, SplitDraft,
-    SplitDraftRecord, SplitDraftingRecord, SplitIdentity, SplitPlan, SplitPreflight,
-    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
+    SplitDraftRecord, SplitDraftingRecord, SplitIdentity, SplitLayerBase, SplitPlan,
+    SplitPreflight, SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot,
+    SplitResponsibility,
 };
 
 mod support;
@@ -251,6 +253,7 @@ fn publication_record_round_trips_complete_verified_identity() {
             url: "https://github.com/owner/repo/pull/41".into(),
             provisional_title: "DUV-4091 Change (1/2)".into(),
             provisional_title_applied: true,
+            independent: false,
         }],
     };
     let rendered = render_publication(&publication).unwrap();
@@ -284,6 +287,7 @@ fn published_stack() -> SplitPublication {
                 url: format!("https://github.com/owner/repo/pull/{}", 40 + order),
                 provisional_title: format!("DUV-4091 Change ({order}/3)"),
                 provisional_title_applied: true,
+                independent: false,
             })
             .collect(),
     }
@@ -299,6 +303,7 @@ fn split_draft_contract_prompt_and_title_keep_ai_out_of_bookkeeping() {
         units: vec!["CU0001".into()],
         test_units: vec!["CU0001".into()],
         paths: vec!["tests/a.rs".into()],
+        independent: false,
     };
     let prompt = build_split_open_prompt(
         &responsibility,
@@ -1091,6 +1096,7 @@ async fn materializes_deletion_rename_and_binary_and_rejects_moved_artifacts() {
                 units: vec![unit.id.clone()],
                 test_units: vec![unit.id.clone()],
                 paths: vec![unit.path.clone()],
+                independent: false,
             })
             .collect(),
     };
@@ -1217,4 +1223,464 @@ fn draft_cache_identity_scopes_a_retry_to_the_incomplete_pull_request() {
         serde_json::from_str(&serde_json::to_string(&applied_but_failed).unwrap()).unwrap();
     assert_eq!(round_tripped, applied_but_failed);
     assert!(round_tripped.draft.is_some() && !round_tripped.applied);
+}
+
+fn independence_unit(id: &str, path: &str) -> ChangeUnit {
+    ChangeUnit {
+        id: id.into(),
+        path: path.into(),
+        old_path: None,
+        kind: ChangeUnitKind::TextHunk,
+        old_start: Some(1),
+        old_lines: Some(1),
+        new_start: Some(1),
+        new_lines: Some(1),
+        additions: 1,
+        deletions: 1,
+        line_counts_available: true,
+    }
+}
+
+fn independence_preflight(units: Vec<ChangeUnit>) -> SplitPreflight {
+    let (additions, deletions) = units.iter().fold((0, 0), |counts, unit| {
+        (counts.0 + unit.additions, counts.1 + unit.deletions)
+    });
+    SplitPreflight {
+        worktree_path: "/tmp/source".into(),
+        identity: SplitIdentity {
+            repository: "example/repo".into(),
+            remote: "origin".into(),
+            base_ref: "origin/main".into(),
+            base_sha: "b".repeat(40),
+            source_branch: "feature".into(),
+            source_head: "a".repeat(40),
+            max: 1000,
+            additions,
+            deletions,
+        },
+        units,
+    }
+}
+
+fn independence_layer(order: usize, unit: &ChangeUnit, independent: bool) -> SplitResponsibility {
+    SplitResponsibility {
+        order,
+        name: format!("Change {}", unit.path),
+        branch_slug: format!("layer-{order}"),
+        rationale: "Test responsibility.".into(),
+        units: vec![unit.id.clone()],
+        test_units: Vec::new(),
+        paths: vec![unit.path.clone()],
+        independent,
+    }
+}
+
+#[test]
+fn independence_survives_only_when_no_other_layer_touches_the_same_paths() {
+    let units = vec![
+        independence_unit("CU0001", "src/shared.rs"),
+        independence_unit("CU0002", "config/deps.toml"),
+        independence_unit("CU0003", "src/shared.rs"),
+    ];
+    let preflight = independence_preflight(units.clone());
+    let plan = SplitPlan {
+        responsibilities: vec![
+            independence_layer(1, &units[0], false),
+            // Touches a file nobody else touches: the claim holds.
+            independence_layer(2, &units[1], true),
+            // Shares `src/shared.rs` with layer 1: the claim cannot hold, because
+            // neither branch alone would carry that file's final content.
+            independence_layer(3, &units[2], true),
+        ],
+    };
+    let parsed = parse_split_plan(&serde_json::to_string(&plan).unwrap(), &preflight).unwrap();
+
+    assert!(!parsed.responsibilities[0].independent);
+    assert!(parsed.responsibilities[1].independent);
+    assert!(
+        !parsed.responsibilities[2].independent,
+        "a layer sharing a path with another layer must be demoted back into the stack"
+    );
+    assert!(!split_reuses_source_branch(&parsed));
+    assert_eq!(
+        split_layer_bases(&parsed),
+        vec![
+            SplitLayerBase::ResolvedBase,
+            SplitLayerBase::ResolvedBase,
+            SplitLayerBase::Layer(1),
+        ]
+    );
+
+    let rendered = render_split_plan(&preflight, &parsed, "awaiting approval");
+    assert!(rendered.contains("independent — no other layer touches its paths"));
+    assert!(rendered.contains("| 3 | Change src/shared.rs | `layer-3` | layer 1 |"));
+}
+
+#[test]
+fn a_rename_keeps_both_of_its_paths_out_of_an_independence_claim() {
+    let mut renamed = independence_unit("CU0002", "src/new.rs");
+    renamed.old_path = Some("src/old.rs".into());
+    renamed.kind = ChangeUnitKind::Rename;
+    let units = vec![independence_unit("CU0001", "src/old.rs"), renamed];
+    let preflight = independence_preflight(units.clone());
+    let plan = SplitPlan {
+        responsibilities: vec![
+            independence_layer(1, &units[0], false),
+            independence_layer(2, &units[1], true),
+        ],
+    };
+
+    let parsed = parse_split_plan(&serde_json::to_string(&plan).unwrap(), &preflight).unwrap();
+
+    assert!(
+        !parsed.responsibilities[1].independent,
+        "the retired side of a rename collides with layer 1 and must demote the claim"
+    );
+    assert!(split_reuses_source_branch(&parsed));
+}
+
+#[test]
+fn a_plan_with_no_independent_layer_keeps_reusing_the_source_branch() {
+    let units = vec![
+        independence_unit("CU0001", "src/a.rs"),
+        independence_unit("CU0002", "src/b.rs"),
+    ];
+    let preflight = independence_preflight(units.clone());
+    let plan = SplitPlan {
+        responsibilities: vec![
+            independence_layer(1, &units[0], false),
+            independence_layer(2, &units[1], false),
+        ],
+    };
+
+    let parsed = parse_split_plan(&serde_json::to_string(&plan).unwrap(), &preflight).unwrap();
+
+    assert!(split_reuses_source_branch(&parsed));
+    assert_eq!(
+        split_layer_bases(&parsed),
+        vec![SplitLayerBase::ResolvedBase, SplitLayerBase::Layer(1)]
+    );
+}
+
+#[test]
+fn an_independent_pull_request_is_labelled_for_what_it_is_in_every_split_body() {
+    let pull_requests = vec![
+        SplitPublishedPullRequest {
+            order: 1,
+            branch: "duv4091_change.1_layer".into(),
+            expected_base: "main".into(),
+            number: 41,
+            url: "https://github.com/owner/repo/pull/41".into(),
+            provisional_title: "DUV-4091 Change (1/3)".into(),
+            provisional_title_applied: true,
+            independent: false,
+        },
+        SplitPublishedPullRequest {
+            order: 2,
+            branch: "duv4091_change.2_bump".into(),
+            expected_base: "main".into(),
+            number: 42,
+            url: "https://github.com/owner/repo/pull/42".into(),
+            provisional_title: "DUV-4091 Change (2/3)".into(),
+            provisional_title_applied: true,
+            independent: true,
+        },
+        SplitPublishedPullRequest {
+            order: 3,
+            branch: "duv4091_change".into(),
+            expected_base: "duv4091_change.1_layer".into(),
+            number: 43,
+            url: "https://github.com/owner/repo/pull/43".into(),
+            provisional_title: "DUV-4091 Change (3/3)".into(),
+            provisional_title_applied: true,
+            independent: false,
+        },
+    ];
+    let template = "# Description ✍️\n\nWhat changed.\n";
+    let filled = "# Description ✍️\n\nThe dependency bump lands on its own.\n";
+
+    let body = compose_split_body(template, filled, &pull_requests, 1).unwrap();
+
+    assert!(body.contains("1. https://github.com/owner/repo/pull/41 **(current PR)**"));
+    assert!(
+        body.contains("2. https://github.com/owner/repo/pull/42 **(independent PR)**"),
+        "an independent PR is never 'future' work: {body}"
+    );
+    assert!(body.contains("3. https://github.com/owner/repo/pull/43 **(future PR)**"));
+    validate_split_body(&body, &pull_requests, 1).unwrap();
+
+    let current_independent = compose_split_body(template, filled, &pull_requests, 2).unwrap();
+    assert!(current_independent
+        .contains("2. https://github.com/owner/repo/pull/42 **(current PR — independent)**"));
+    validate_split_body(&current_independent, &pull_requests, 2).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_independent_layer_is_cut_from_the_base_and_leaves_the_source_branch_alone() {
+    let _guard = HOME_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let previous_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+
+    let fixture = split_repo(
+        &[
+            ("src/chain_bottom.txt", b"bottom before\n"),
+            ("config/deps.txt", b"dependency before\n"),
+            ("src/chain_top.txt", b"top before\n"),
+        ],
+        &[
+            ("src/chain_bottom.txt", Some(b"bottom after\n")),
+            ("config/deps.txt", Some(b"dependency after\n")),
+            ("src/chain_top.txt", Some(b"top after\n")),
+        ],
+    );
+    let range = format!("{}..{}", fixture.base, fixture.head);
+    let diff = git_stdout(
+        &fixture.source,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--find-renames",
+            "--unified=0",
+            "--no-color",
+            "--no-ext-diff",
+            &range,
+        ],
+    );
+    let units = inventory_diff(&diff).unwrap();
+    let unit_for = |path: &str| {
+        units
+            .iter()
+            .find(|unit| unit.path == path)
+            .unwrap_or_else(|| panic!("no change unit for {path}"))
+            .clone()
+    };
+    let (additions, deletions) = units.iter().fold((0, 0), |counts, unit| {
+        (counts.0 + unit.additions, counts.1 + unit.deletions)
+    });
+    let plan = SplitPlan {
+        responsibilities: vec![
+            independence_layer(1, &unit_for("src/chain_bottom.txt"), false),
+            independence_layer(2, &unit_for("config/deps.txt"), true),
+            independence_layer(3, &unit_for("src/chain_top.txt"), false),
+        ],
+    };
+    let preflight = SplitPreflight {
+        worktree_path: fixture.source.to_string_lossy().into_owned(),
+        identity: SplitIdentity {
+            repository: "example/repo".into(),
+            remote: "origin".into(),
+            base_ref: "origin/main".into(),
+            base_sha: fixture.base.clone(),
+            source_branch: "feature".into(),
+            source_head: fixture.head.clone(),
+            max: 100,
+            additions,
+            deletions,
+        },
+        units,
+    };
+    let service = DashboardService::new(fixture.repo.clone(), DashboardConfig::default());
+    service
+        .save_split_plan(&preflight, &plan, "approved")
+        .await
+        .unwrap();
+    service
+        .materialize_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+    // Resuming must reuse every recorded identity instead of adding commits.
+    service
+        .materialize_split_stack(&preflight, &plan)
+        .await
+        .unwrap();
+
+    let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
+    let layers = parse_materialization(&document).unwrap().unwrap().layers;
+    assert_eq!(layers.len(), 3);
+
+    // The source branch is no longer the chain tip, so it must be exactly where
+    // the developer left it — every layer lives in a worktree of its own.
+    assert_eq!(
+        git_stdout(&fixture.source, &["rev-parse", "HEAD"]),
+        fixture.head
+    );
+    assert!(git_stdout(&fixture.source, &["diff"]).is_empty());
+    assert!(git_stdout(&fixture.source, &["diff", "--cached"]).is_empty());
+    for layer in &layers {
+        assert_ne!(layer.worktree_path, preflight.worktree_path);
+        assert_ne!(layer.branch, "feature");
+    }
+
+    // The independent layer hangs off the base; the chain skips over it.
+    assert_eq!(layers[0].parent_sha, fixture.base);
+    assert_eq!(layers[1].parent_sha, fixture.base);
+    assert_eq!(layers[1].parent_branch, "origin/main");
+    assert_eq!(layers[2].parent_sha, layers[0].commit_sha);
+    assert_eq!(layers[2].parent_branch, layers[0].branch);
+
+    // Per-path integrity: each leaf already holds the source's final content
+    // for every path it owns, so the leaves reproduce the source between them.
+    assert!(git_stdout(
+        &fixture.source,
+        &[
+            "diff",
+            "--name-only",
+            &layers[1].commit_sha,
+            &fixture.head,
+            "--",
+            "config/deps.txt",
+        ],
+    )
+    .is_empty());
+    assert!(git_stdout(
+        &fixture.source,
+        &[
+            "diff",
+            "--name-only",
+            &layers[2].commit_sha,
+            &fixture.head,
+            "--",
+            "src/chain_bottom.txt",
+            "src/chain_top.txt",
+        ],
+    )
+    .is_empty());
+    // And the chain genuinely does not carry the independent layer's work.
+    assert!(!git_stdout(
+        &fixture.source,
+        &[
+            "diff",
+            "--name-only",
+            &layers[2].commit_sha,
+            &fixture.head,
+            "--",
+            "config/deps.txt",
+        ],
+    )
+    .is_empty());
+
+    if let Some(value) = previous_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+}
+
+/// A realistic mixed split: eight responsibilities, three of them independent,
+/// five forming the stack. This is the shape the publication gate used to
+/// reject outright, because it recomputed the chain assuming every layer was
+/// stacked and demanded the source branch on top.
+fn mixed_eight_layer_plan() -> (SplitPreflight, SplitPlan) {
+    let paths = [
+        "src/one.rs",
+        "config/two.toml",
+        "src/three.rs",
+        "src/four.rs",
+        "docs/five.md",
+        "src/six.rs",
+        "src/seven.rs",
+        "config/eight.toml",
+    ];
+    let independent = [false, true, false, false, true, false, false, true];
+    let units = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| independence_unit(&format!("CU{:04}", index + 1), path))
+        .collect::<Vec<_>>();
+    let preflight = independence_preflight(units.clone());
+    let plan = SplitPlan {
+        responsibilities: units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| independence_layer(index + 1, unit, independent[index]))
+            .collect(),
+    };
+    let plan = parse_split_plan(&serde_json::to_string(&plan).unwrap(), &preflight).unwrap();
+    (preflight, plan)
+}
+
+#[test]
+fn a_mixed_stack_resolves_every_base_and_keeps_the_source_branch_unpublished() {
+    let (preflight, plan) = mixed_eight_layer_plan();
+    for (index, expected) in [false, true, false, false, true, false, false, true]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            plan.responsibilities[index].independent,
+            *expected,
+            "layer {} kept the wrong independence after validation",
+            index + 1
+        );
+    }
+    assert!(!split_reuses_source_branch(&plan));
+    assert!(split_uses_stack_link(&plan));
+    assert_eq!(
+        split_layer_bases(&plan),
+        vec![
+            SplitLayerBase::ResolvedBase, // 1 — chain root
+            SplitLayerBase::ResolvedBase, // 2 — independent
+            SplitLayerBase::Layer(1),
+            SplitLayerBase::Layer(3),
+            SplitLayerBase::ResolvedBase, // 5 — independent
+            SplitLayerBase::Layer(4),
+            SplitLayerBase::Layer(6),
+            SplitLayerBase::ResolvedBase, // 8 — independent
+        ]
+    );
+
+    let branches = (1..=8)
+        .map(|order| format!("feature.{order}_layer-{order}"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        split_publication_bases(&plan, &branches, "main"),
+        vec![
+            "main".to_string(),
+            "main".to_string(),
+            branches[0].clone(),
+            branches[2].clone(),
+            "main".to_string(),
+            branches[3].clone(),
+            branches[5].clone(),
+            "main".to_string(),
+        ]
+    );
+
+    // The gate that guards drafting must accept this publication.
+    let publication = SplitPublication {
+        repository: "example/repo".into(),
+        trunk: "main".into(),
+        source_branch: "feature".into(),
+        stack_link_completed: true,
+        status: "published, verified, and provisionally titled".into(),
+        diagnostics: None,
+        pull_requests: split_publication_bases(&plan, &branches, "main")
+            .into_iter()
+            .enumerate()
+            .map(|(index, expected_base)| SplitPublishedPullRequest {
+                order: index + 1,
+                branch: branches[index].clone(),
+                expected_base,
+                number: 100 + index as u64,
+                url: format!("https://github.com/example/repo/pull/{}", 100 + index),
+                provisional_title: format!("Feature ({}/8)", index + 1),
+                provisional_title_applied: true,
+                independent: plan.responsibilities[index].independent,
+            })
+            .collect(),
+    };
+
+    validate_split_publication(&preflight, &plan, &publication).unwrap();
+
+    // A drifted independence flag must still be caught.
+    let mut drifted = publication.clone();
+    drifted.pull_requests[4].independent = false;
+    assert!(validate_split_publication(&preflight, &plan, &drifted).is_err());
+
+    // So must a base that silently reverts to the all-stacked chain.
+    let mut chained = publication;
+    chained.pull_requests[4].expected_base = branches[3].clone();
+    assert!(validate_split_publication(&preflight, &plan, &chained).is_err());
 }

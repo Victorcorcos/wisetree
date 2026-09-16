@@ -15,9 +15,10 @@ use ratatui::Frame;
 use crate::config::schema::{AiModelConfig, AiSplitConfig};
 use crate::messages::colors;
 use crate::services::{
-    parse_materialization, split_layer_sizes, ChangeUnit, ChangeUnitKind, SplitDraftJobStatus,
-    SplitDraftProgress, SplitDraftRecord, SplitMaterialization, SplitPlan, SplitPlanResult,
-    SplitPreflight, SplitPublication, SplitRepositorySnapshot, SPLIT_PLAN_FILE,
+    parse_materialization, split_layer_bases, split_layer_sizes, ChangeUnit, ChangeUnitKind,
+    SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord, SplitLayerBase,
+    SplitMaterialization, SplitPlan, SplitPlanResult, SplitPreflight, SplitPublication,
+    SplitRepositorySnapshot, SPLIT_PLAN_FILE,
 };
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::screens::update_pr::key_event_to_pty_bytes;
@@ -1131,6 +1132,7 @@ impl SplitPullRequestScreen {
             return vec![Line::from("No validated Split proposal is available.")];
         };
         let sizes = split_layer_sizes(preflight, plan);
+        let bases = split_layer_bases(plan);
         let oversized = sizes.iter().filter(|size| size.over_max()).count();
         let mut lines = vec![section_line("Proposed Split stack · bottom to top")];
         push_review_table_styled_row(
@@ -1202,12 +1204,33 @@ impl SplitPullRequestScreen {
                 inner_width,
                 Style::default().fg(colors::EMPHASIS),
             );
+            // An independent layer's dependency sentence describes a stack it
+            // is not in, so the harness states the resolved truth instead.
+            let dependency = if layer.independent {
+                "independent — merges on its own, no other layer touches its files".to_string()
+            } else {
+                layer.rationale.clone()
+            };
             push_review_table_row(
                 &mut layer_lines,
                 "Dependency",
-                &layer.rationale,
+                &dependency,
                 inner_width,
                 Style::default().fg(colors::EMPHASIS),
+            );
+            push_review_table_row(
+                &mut layer_lines,
+                "Targets",
+                &match bases[layer.order - 1] {
+                    SplitLayerBase::ResolvedBase => preflight.identity.base_ref.clone(),
+                    SplitLayerBase::Layer(order) => format!("layer {order}"),
+                },
+                inner_width,
+                if layer.independent {
+                    Style::default().fg(colors::SUCCESS)
+                } else {
+                    Style::default().fg(colors::INFO)
+                },
             );
             push_review_table_row(
                 &mut layer_lines,
