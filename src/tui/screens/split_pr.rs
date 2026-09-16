@@ -1207,7 +1207,7 @@ impl SplitPullRequestScreen {
             // An independent layer's dependency sentence describes a stack it
             // is not in, so the harness states the resolved truth instead.
             let dependency = if layer.independent {
-                "independent — merges on its own, no other layer touches its files".to_string()
+                "independent — starts a new chain, does not wait for any earlier layer".to_string()
             } else {
                 layer.rationale.clone()
             };

@@ -248,31 +248,21 @@ pub fn split_draft_cache_path(worktree: &str, job_id: &str) -> std::path::PathBu
         .join(format!("{job_id}.json"))
 }
 
-/// `gh stack link` needs at least two branches, so a chain that shrank to one
-/// is published exactly like an independent layer: straight against the trunk.
-pub fn split_uses_stack_link(plan: &SplitPlan) -> bool {
-    plan.responsibilities
-        .iter()
-        .filter(|layer| !layer.independent)
-        .count()
-        >= 2
-}
-
 /// The base branch every published pull request must target, in plan order.
 ///
 /// Publication and the gate that verifies it share this, because computing the
 /// same chain twice is precisely how the two drifted apart.
 pub fn split_publication_bases(plan: &SplitPlan, branches: &[String], trunk: &str) -> Vec<String> {
-    let stacked = split_uses_stack_link(plan);
-    let mut previous_chain: Option<String> = None;
-    let mut bases = Vec::with_capacity(plan.responsibilities.len());
-    for (index, layer) in plan.responsibilities.iter().enumerate() {
-        if layer.independent || !stacked {
-            bases.push(trunk.to_string());
-            continue;
+    let mut bases = vec![trunk.to_string(); plan.responsibilities.len()];
+    for chain in split_chains(plan) {
+        // The root of every chain targets the trunk; the rest stack on the
+        // branch directly below them, whether or not the chain is long enough
+        // for `gh stack link` to publish it.
+        for pair in chain.windows(2) {
+            if let (Some(base), Some(slot)) = (branches.get(pair[0]), bases.get_mut(pair[1])) {
+                *slot = base.clone();
+            }
         }
-        bases.push(previous_chain.clone().unwrap_or_else(|| trunk.to_string()));
-        previous_chain = branches.get(index).cloned();
     }
     bases
 }
@@ -498,8 +488,14 @@ pub fn compose_split_body(
         },
     )?;
     let mut plan = String::from("### Split Plan 📋\n\n");
+    let chains = published_chain_ids(pull_requests);
     for (index, pull_request) in pull_requests.iter().enumerate() {
-        plan.push_str(&split_plan_entry(index, pull_request, current_order));
+        plan.push_str(&split_plan_entry(
+            index,
+            pull_request,
+            current_order,
+            &chains,
+        ));
         plan.push('\n');
     }
     let description_index = descriptions[0];
@@ -563,23 +559,49 @@ fn looks_like_template_placeholder(line: &str) -> bool {
             || lower == "todo")
 }
 
+/// Chain membership for each published pull request, derived from the same rule
+/// [`split_chains`] uses: a chain starts at the first entry and at every
+/// independent one, and runs contiguously from there.
+fn published_chain_ids(pull_requests: &[SplitPublishedPullRequest]) -> Vec<usize> {
+    let mut chain = 0;
+    pull_requests
+        .iter()
+        .enumerate()
+        .map(|(index, pull_request)| {
+            if index > 0 && pull_request.independent {
+                chain += 1;
+            }
+            chain
+        })
+        .collect()
+}
+
 /// One line of the harness-owned Split Plan list. Composition and validation
 /// share it so the rendered body and the contract can never drift.
 ///
-/// An independent pull request is not "future" work: it targets the trunk and
-/// can merge at any time, so it is labelled for what it is.
+/// The marker states the relationship to the pull request being described. Only
+/// work stacked above it in the *same* chain is "future": a pull request in
+/// another chain targets the trunk on its own schedule, and one below it in the
+/// same chain is a prerequisite rather than pending work.
 fn split_plan_entry(
     index: usize,
     pull_request: &SplitPublishedPullRequest,
     current_order: usize,
+    chains: &[usize],
 ) -> String {
     let number = index + 1;
-    let marker = match (number == current_order, pull_request.independent) {
-        (true, true) => " **(current PR — independent)**",
-        (true, false) => " **(current PR)**",
-        (false, true) => " **(independent PR)**",
-        (false, false) if number > current_order => " **(future PR)**",
-        (false, false) => "",
+    let same_chain = chains
+        .get(index)
+        .zip(chains.get(current_order.saturating_sub(1)))
+        .is_some_and(|(entry, current)| entry == current);
+    let marker = if number == current_order {
+        " **(current PR)**"
+    } else if !same_chain {
+        " **(independent PR)**"
+    } else if number > current_order {
+        " **(future PR)**"
+    } else {
+        ""
     };
     format!("{number}. {}{marker}", pull_request.url)
 }
@@ -602,6 +624,7 @@ pub fn validate_split_body(
             "Split body must contain exactly one Description and one Split Plan heading.",
         ));
     }
+    let chains = published_chain_ids(pull_requests);
     for (index, pull_request) in pull_requests.iter().enumerate() {
         if body.matches(&pull_request.url).count() != 1 {
             return Err(WisetreeError::validation(format!(
@@ -609,7 +632,7 @@ pub fn validate_split_body(
                 pull_request.url
             )));
         }
-        let expected = split_plan_entry(index, pull_request, current_order);
+        let expected = split_plan_entry(index, pull_request, current_order, &chains);
         if !body.lines().any(|line| line == expected) {
             return Err(WisetreeError::validation(
                 "Split body contains an incorrect current/future marker or URL order.",
@@ -1207,7 +1230,10 @@ pub fn split_layer_bases(plan: &SplitPlan) -> Vec<SplitLayerBase> {
     plan.responsibilities
         .iter()
         .map(|layer| {
+            // An independent layer roots a *new* chain rather than ending the
+            // previous one: later layers may still stack on it.
             if layer.independent {
+                chain_tip = Some(layer.order);
                 return SplitLayerBase::ResolvedBase;
             }
             let base = chain_tip.map_or(SplitLayerBase::ResolvedBase, SplitLayerBase::Layer);
@@ -1217,12 +1243,31 @@ pub fn split_layer_bases(plan: &SplitPlan) -> Vec<SplitLayerBase> {
         .collect()
 }
 
+/// Group the plan into chains: maximal runs of layers that stack on each other,
+/// each rooted at the resolved base. Returned as 0-based indexes, bottom to top,
+/// in plan order.
+///
+/// A layer is either a continuation of the chain below it or the root of a new
+/// one, so a chain is always a contiguous run — which is exactly what
+/// `gh stack link` can publish and what the review screen presents.
+pub fn split_chains(plan: &SplitPlan) -> Vec<Vec<usize>> {
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    for (index, layer) in plan.responsibilities.iter().enumerate() {
+        if index == 0 || layer.independent || chains.is_empty() {
+            chains.push(vec![index]);
+        } else {
+            chains.last_mut().expect("non-empty chains").push(index);
+        }
+    }
+    chains
+}
+
 /// The source branch may only be reused as the chain tip when the chain holds
 /// every change unit — that is what makes its tree identical to the source
 /// tree. As soon as one layer leaves the stack, the chain is a strict subset
 /// of the source and every layer is materialized in its own worktree instead.
 pub fn split_reuses_source_branch(plan: &SplitPlan) -> bool {
-    plan.responsibilities.iter().all(|layer| !layer.independent)
+    split_chains(plan).len() == 1
 }
 
 pub fn build_plan_prompt(
@@ -1466,24 +1511,31 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
         ));
     }
     // Independence is a promotion the harness has to prove, never a claim it
-    // accepts. A layer may only leave the stack when no other layer touches any
-    // of its paths: a shared path means the trunk-targeted branch and the chain
-    // would each carry half of that file's final content, and no ordering of
-    // the merges reproduces the source. Anything unproven is demoted back into
-    // the chain, which is always safe.
-    let independent_is_disjoint = |index: usize| {
-        touched
+    // accepts. Layers inside one chain may share paths freely — stacking is
+    // exactly what makes that safe. Two different chains may not: each is rooted
+    // at the resolved base, so a shared path would leave neither branch carrying
+    // that file's final content, and no ordering of the merges reproduces the
+    // source. When two chains collide, the later one is absorbed into the chain
+    // below it and the check runs again, until the chains are pairwise disjoint.
+    // Absorbing only ever over-stacks, so the loop is safe and terminates: it
+    // removes one chain each time round.
+    loop {
+        let chains = split_chains(&plan);
+        let chain_paths = chains
             .iter()
-            .enumerate()
-            .all(|(other, paths)| other == index || paths.is_disjoint(&touched[index]))
-    };
-    let demoted = (0..plan.responsibilities.len())
-        .filter(|&index| {
-            plan.responsibilities[index].independent && !independent_is_disjoint(index)
-        })
-        .collect::<Vec<_>>();
-    for index in demoted {
-        plan.responsibilities[index].independent = false;
+            .map(|chain| {
+                chain
+                    .iter()
+                    .flat_map(|index| touched[*index].iter().copied())
+                    .collect::<BTreeSet<&str>>()
+            })
+            .collect::<Vec<_>>();
+        let collision = (1..chains.len())
+            .find(|j| (0..*j).any(|i| !chain_paths[i].is_disjoint(&chain_paths[*j])));
+        match collision {
+            Some(j) => plan.responsibilities[chains[j][0]].independent = false,
+            None => break,
+        }
     }
     for (responsibility, test_units) in plan.responsibilities.iter_mut().zip(derived_test_units) {
         responsibility.test_units = test_units;
@@ -1585,7 +1637,7 @@ pub fn render_split_plan(preflight: &SplitPreflight, plan: &SplitPlan, status: &
         ));
         if layer.independent {
             output.push_str(&format!(
-                "\nDependency: independent — no other layer touches its paths, so it applies directly to `{}` and can merge on its own.\n\n",
+                "\nDependency: independent — starts a new chain on `{}`, so it does not wait for any earlier pull request.\n\n",
                 identity.base_ref
             ));
         } else {
